@@ -56,7 +56,8 @@ public sealed class ElementWiseAnalyzer : DiagnosticAnalyzer
         "{0}",
         "ElementWise", DiagnosticSeverity.Error, isEnabledByDefault: true,
         description: "ElementWiseBaseline.txt is an exact, shrink-only inventory of the element-wise occurrences that "
-                     + "existed when the gate was introduced.");
+                     + "existed when the gate was introduced.",
+        customTags: WellKnownDiagnosticTags.CompilationEnd);
 
     private static readonly ImmutableHashSet<string> TensorTypes = ImmutableHashSet.Create(StringComparer.Ordinal,
         "Tensor", "TensorBase", "Vector", "VectorBase", "Matrix", "MatrixBase");

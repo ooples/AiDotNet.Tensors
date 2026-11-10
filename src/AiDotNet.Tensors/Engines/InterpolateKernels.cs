@@ -204,7 +204,7 @@ internal static class InterpolateKernels
 
                 Advance(idx, t.DstDims);
             }
-        });
+        }, deterministicSafe: true);
     }
 
     private static void Backward<T, TConv>(T[] gout, int goutBase, T[] gin, int ginBase, int planes, Tables t, TConv conv)
@@ -244,7 +244,7 @@ internal static class InterpolateKernels
                     gin[off] = conv.Add(gin[off], conv.FromDouble(weight * g));
                 }
             }
-        });
+        }, deterministicSafe: true);
     }
 
     /// <summary>Steps a row-major multi-index by one.</summary>

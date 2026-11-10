@@ -83,7 +83,7 @@ internal static partial class SimdGemm
             if (allowParallel && work >= ParallelWorkThreshold && chunks > 1)
             {
                 t_skinnyTransBParallelRuns++;
-                CpuParallelSettings.ParallelForOrSerial(0, chunks, work, Chunk);
+                CpuParallelSettings.ParallelForOrSerial(0, chunks, work, Chunk, deterministicSafe: true);
             }
             else
                 for (int chunk = 0; chunk < chunks; chunk++) Chunk(chunk);

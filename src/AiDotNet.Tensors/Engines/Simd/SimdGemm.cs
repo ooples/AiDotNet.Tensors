@@ -2197,12 +2197,6 @@ internal static partial class SimdGemm
                 c.Length, m, k, n);
         }
 
-        // batch=1 / small-M, large-N, no-transpose: parallelize over N (output features). The
-        // small-matmul fast path below requires m >= Mr and SgemmDirectParallelM requires m >= 64,
-        // so a tiny-M GEMM (foundation-model batch=1 / decode forward, fused QKV/FFN projections)
-        // otherwise runs single-threaded over a huge N. N-partitioning saturates the cores even at
-        // m=1. Gated above ParallelWorkThreshold so small GEMMs stay serial (dispatch would
-        // dominate). Race-free: each worker owns a disjoint column range (overwrite or accumulate).
         // A few rows of A against a B stored [n, k]: one dot product per output, B streamed once (see
         // SgemmSkinnyTransB). Every path below materialized a transposed copy of B per call for this shape.
         if (QualifiesForSkinnyTransB(transA, transB, m, k, n))
@@ -2211,6 +2205,12 @@ internal static partial class SimdGemm
             return;
         }
 
+        // batch=1 / small-M, large-N, no-transpose: parallelize over N (output features). The
+        // small-matmul fast path below requires m >= Mr and SgemmDirectParallelM requires m >= 64,
+        // so a tiny-M GEMM (foundation-model batch=1 / decode forward, fused QKV/FFN projections)
+        // otherwise runs single-threaded over a huge N. N-partitioning saturates the cores even at
+        // m=1. Gated above ParallelWorkThreshold so small GEMMs stay serial (dispatch would
+        // dominate). Race-free: each worker owns a disjoint column range (overwrite or accumulate).
         if (allowParallel && !transA && !transB
             && m > 0 && m <= NParallelSmallMMaxM && n >= Nr
             && (long)m * k * n >= ParallelWorkThreshold)
