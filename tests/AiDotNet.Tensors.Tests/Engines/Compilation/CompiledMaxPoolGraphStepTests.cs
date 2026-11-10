@@ -76,6 +76,8 @@ public class CompiledMaxPoolGraphStepTests : IDisposable
             {
                 Rand(x.Shape.ToArray(), 100 + s, 1f).AsSpan().CopyTo(x.AsWritableSpan());
                 Rand(y.Shape.ToArray(), 200 + s, 1f).AsSpan().CopyTo(y.AsWritableSpan());
+                // Reading the loss to the host waits for the step's stream, so the parameters read below already hold
+                // the first update even on a device plan (ToArray materializes on the same stream as well).
                 losses[s] = plan.Step().ToArray()[0];
                 if (s == 0)
                     firstUpdate = parameters.Select((p, i) =>
@@ -84,9 +86,10 @@ public class CompiledMaxPoolGraphStepTests : IDisposable
                         return now.Select((v, j) => v - initial[i][j]).ToArray();
                     }).ToArray();
             }
+            var graphExecField = typeof(CompiledTrainingPlan<float>)
+                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance);
             bool replayed = plan is CompiledTrainingPlan<float> concrete
-                && (IntPtr)typeof(CompiledTrainingPlan<float>)
-                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)! != IntPtr.Zero;
+                && graphExecField?.GetValue(concrete) is IntPtr graphExec && graphExec != IntPtr.Zero;
             return (losses, parameters.Select(p => p.ToArray()).ToArray(), firstUpdate, replayed);
         }
     }

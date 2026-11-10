@@ -9277,9 +9277,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (see DetectConvBiasActivationFusion). Off under grad pooling, whose re-zero schedule is planned per
         // backward action of the unfused stream, and on GPU engines, which keep the capturable generic path.
         // The tensors whose gradient can matter: the parameters and everything computed from one. A tensor outside
-        // this set (the network input, a constant) feeds no parameter's gradient, and the plan exposes only the
-        // parameters' gradients, so a backward may skip computing the gradient INTO it. Used by the Conv2D
-        // backwards below, where the input gradient of the first layer is a whole extra convolution.
+        // this set (the network input, a constant) feeds no parameter's gradient, so a backward may skip computing the
+        // gradient INTO it. Used by the Conv2D backwards below, where the input gradient of the first layer is a whole
+        // extra convolution. With AIDOTNET_COMPILED_INPUT_GRADS=1 the plan also exposes the external leaves' gradients,
+        // so they join the set; every pass that reads it (the shortcut pair, the conv-epilogue fusion's needInputGrad,
+        // the gradRequired pruning) then treats them like parameter-derived tensors, which is what makes .Grad appear.
         var requiresGradTensors = new HashSet<Tensor<T>>(parameters);
         // AIDOTNET_COMPILED_INPUT_GRADS=1 (#1096 follow-up): also treat the graph's external leaves (the network input,
         // labels, masks) as gradient sources, so the compiled step sets .Grad on them the way the eager tape does.
@@ -9289,9 +9291,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var producedByStep = new HashSet<Tensor<T>>();
             foreach (var fwdStep in forwardSteps) producedByStep.Add(fwdStep.OutputBuffer);
             foreach (var fwdStep in forwardSteps)
-                foreach (var fwdInput in fwdStep.Inputs)
-                    if (fwdInput is not null && !producedByStep.Contains(fwdInput))
-                        requiresGradTensors.Add(fwdInput);
+                foreach (var fwdInput in fwdStep.Inputs.OfType<Tensor<T>>().Where(input => !producedByStep.Contains(input)))
+                    requiresGradTensors.Add(fwdInput);
         }
         foreach (var fwdStep in forwardSteps)
             foreach (var fwdInput in fwdStep.Inputs)
@@ -9318,6 +9319,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             claimedElsewhere.UnionWith(slicePrefixBackwardSpecs.Keys);
             claimedElsewhere.UnionWith(skippableReduceSumIndices);
             claimedElsewhere.UnionWith(skippableReduceSumForwardIndices);
+            // The backward loop skips reshape-aliased steps before it reaches the chain backwards, so a chain step that
+            // were also aliased would run the fused forward and silently drop the chain backward. No chain op is a
+            // Reshape and the GPU channel-bias alias never meets this CPU-only pass, but exclude them for a hard guarantee.
+            if (aliasedReshapeSteps is not null)
+                for (int stepIndex = 0; stepIndex < forwardSteps.Count; stepIndex++)
+                    if (aliasedReshapeSteps.Contains(forwardSteps[stepIndex])) claimedElsewhere.Add(stepIndex);
             DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap, requiresGradTensors,
                 convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue, convEpilogueChains,
                 convEpilogueDeadInternals, claimedElsewhere);

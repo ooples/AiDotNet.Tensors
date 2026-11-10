@@ -113,4 +113,74 @@ public sealed class ConvShortcutPairPlanTests : IClassFixture<DirectGpuTensorEng
             }
         _out.WriteLine($"pair launches {onLaunches}; max |unfused - pair| / max|grad| = {worst:E2}");
     }
+
+    // The network input itself feeds both convolutions. It is no parameter, so the pair forms only when input gradients
+    // are requested (AIDOTNET_COMPILED_INPUT_GRADS); then the pair's launch must write x.Grad, matching the unfused plan.
+    private (float[] InputGrad, long PairLaunches) TrainExternalInputPair(DirectGpuTensorEngine gpu, bool fuse, int batch,
+        int c, int k, int size)
+    {
+        var previousEngine = AiDotNetEngine.Current;
+        var previousFlag = Environment.GetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION");
+        bool? previousInputGrads = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
+        AiDotNetEngine.Current = gpu;
+        Environment.SetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION", fuse ? null : "0");
+        CompiledTrainingPlan<float>.CompiledInputGradientsForTests = true;
+        try
+        {
+            var x = Make(new[] { batch, c, size, size }, 1, 1f).Gpu();
+            var w3 = Make(new[] { k, c, 3, 3 }, 3, 0.1f).Gpu();
+            var w1 = Make(new[] { k, c, 1, 1 }, 4, 0.2f).Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var main = gpu.Conv2D(x, w3, new[] { 2, 2 }, new[] { 1, 1 }, new[] { 1, 1 });
+                var shortcut = gpu.Conv2D(x, w1, new[] { 2, 2 }, new[] { 0, 0 }, new[] { 1, 1 });
+                var s = gpu.TensorAdd(main, shortcut);
+                gpu.ReduceSum(gpu.TensorMultiply(s, s), new[] { 0, 1, 2, 3 }, keepDims: false);
+                plan = scope.CompileTraining(new[] { w3, w1 });
+            }
+            long before = DirectGpuTensorEngine.ShortcutPairLaunches;
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+                plan.Step();
+                if (x.Grad is not { } g)
+                {
+                    Assert.Fail($"fuse={fuse}: the requested input gradient was not set");
+                    return (Array.Empty<float>(), 0);
+                }
+                return (g.ToArray(), DirectGpuTensorEngine.ShortcutPairLaunches - before);
+            }
+        }
+        finally
+        {
+            CompiledTrainingPlan<float>.CompiledInputGradientsForTests = previousInputGrads;
+            Environment.SetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION", previousFlag);
+            AiDotNetEngine.Current = previousEngine;
+        }
+    }
+
+    [SkippableFact]
+    public void ExternalInputPair_WritesTheRequestedInputGradient()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No DirectGpu backend available.");
+        var gpu = _fixture.Engine;
+        Skip.If(gpu is null, "No DirectGpu engine.");
+        const int batch = 2, c = 16, k = 24, size = 16;
+        Skip.IfNot(gpu.SupportsConv2DBackwardInputShortcutPair(new[] { batch, c, size, size }, new[] { k, c, 3, 3 },
+            new[] { k, c, 1, 1 }, size / 2, size / 2), "The backend does not compute the shortcut pair.");
+
+        var (unfused, offLaunches) = TrainExternalInputPair(gpu, fuse: false, batch, c, k, size);
+        var (fused, onLaunches) = TrainExternalInputPair(gpu, fuse: true, batch, c, k, size);
+
+        Assert.Equal(0, offLaunches);
+        Assert.True(onLaunches >= 1, "the pair did not form over the external input although its gradient was requested");
+        Assert.Equal(unfused.Length, fused.Length);
+        double scale = 0;
+        foreach (var v in unfused) scale = Math.Max(scale, Math.Abs(v));
+        Assert.True(scale > 0, "the unfused input gradient is zero (test setup)");
+        for (int i = 0; i < unfused.Length; i++)
+            Assert.True(Math.Abs(unfused[i] - fused[i]) / scale < 1e-4,
+                $"dX[{i}]: unfused {unfused[i]} vs pair {fused[i]} (max |grad| {scale})");
+    }
 }

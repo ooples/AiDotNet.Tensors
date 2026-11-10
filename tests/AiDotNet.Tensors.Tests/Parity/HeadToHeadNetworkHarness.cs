@@ -392,13 +392,6 @@ internal static class HeadToHeadNetworkHarness
 
     private sealed record TrainRun(IReadOnlyDictionary<string, PhaseStats> Phases, IReadOnlyList<double> Losses, string? Note = null);
 
-    /// <summary>
-    /// Trains the spec's network with Tensors in every mode, each from the weights PyTorch wrote. With
-    /// <paramref name="gpu"/> the whole step runs on the device: data and parameters are uploaded once and the
-    /// update is the device-side SGD kernel. The phase-synchronised eager run is the reported breakdown; the
-    /// fastest mode whose losses agree with <paramref name="reference"/> is the gated best. A mode that throws is
-    /// a Tensors defect and fails the case.
-    /// </summary>
     /// <summary>The spec's loss-agreement bounds (first step, later steps); the FP32 defaults when it sets none.</summary>
     internal static (double First, double Later) LossTolerance(JsonElement spec)
     {
@@ -420,20 +413,30 @@ internal static class HeadToHeadNetworkHarness
         return value;
     }
 
+    /// <summary>
+    /// Trains the spec's network with Tensors in every mode, each from the weights PyTorch wrote. With
+    /// <paramref name="gpu"/> the whole step runs on the device: data and parameters are uploaded once and the
+    /// update is the device-side SGD kernel. The phase-synchronised eager run is the reported breakdown; the
+    /// fastest mode whose losses agree with <paramref name="reference"/> is the gated best. A mode that throws is
+    /// a Tensors defect and fails the case.
+    /// </summary>
     private static SideResult RunTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, IReadOnlyList<double> reference)
     {
-        // The CPU case must run on the CPU engine: on a machine with a GPU the default engine is the GPU engine, so the
-        // "cpu" case trained and timed the GPU engine over host tensors.
-        var previous = AiDotNetEngine.Current;
-        AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
+        // Parse the spec before touching process-global state: a malformed spec throws here, and nothing is left
+        // swapped (the engine, or a disposed GPU engine, would otherwise leak into every later test).
         var (firstTolerance, laterTolerance) = LossTolerance(spec);
-        // The compiled plan opens its autocast scope from AIDOTNET_AUTOCAST at every step (CompiledTrainingPlan.StepCore);
-        // the eager loop opens one itself (TrainTensors). Restored after, so later cases run FP32.
         string? autocast = AutocastOf(spec);
+        var previous = AiDotNetEngine.Current;
         string? previousAutocast = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
-        if (autocast is not null) Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", autocast);
         try
         {
+            // The CPU case must run on the CPU engine: on a machine with a GPU the default engine is the GPU engine, so
+            // the "cpu" case trained and timed the GPU engine over host tensors.
+            AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
+            // The compiled plan opens its autocast scope from AIDOTNET_AUTOCAST at every step (CompiledTrainingPlan.StepCore);
+            // the eager loop opens one itself (TrainTensors). Set from the spec unconditionally, so an FP32 spec clears an
+            // ambient value instead of silently training under it, and restored after.
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", autocast);
             var phased = TrainTensors(spec, work, gpu, TensorsMode.PhaseSynchronized);
             var runs = new List<(string Name, TrainRun Run)> { ("eager", phased) };
             // On the CPU nothing synchronises, so the phase-synchronised run already is the plain eager step.
@@ -486,8 +489,29 @@ internal static class HeadToHeadNetworkHarness
         finally
         {
             AiDotNetEngine.Current = previous;
-            if (autocast is not null) Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", previousAutocast);
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", previousAutocast);
         }
+    }
+
+    // More than any spec's parameter count (ResNet-18: 11.2M) and batch; readers consume what they need.
+    private const int RandomParameterFloats = 12_000_000, RandomDataFloats = 2_000_000;
+    private const float RandomParameterScale = 0.05f;
+
+    /// <summary>
+    /// Writes <c>weights.bin</c> and <c>data.bin</c> into <paramref name="work"/> from the spec's seed: uniform values in
+    /// [-0.05, 0.05] for the parameters and [-1, 1] for the data. For measurements that need no PyTorch run.
+    /// </summary>
+    private static void WriteRandomWeightsAndData(JsonElement spec, string work)
+    {
+        Directory.CreateDirectory(work);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(spec.GetProperty("seed").GetInt32());
+        void WriteRandom(string file, int count, float scale)
+        {
+            using var writer = new BinaryWriter(File.Create(Path.Combine(work, file)));
+            for (int i = 0; i < count; i++) writer.Write((float)((rng.NextDouble() * 2 - 1) * scale));
+        }
+        WriteRandom("weights.bin", RandomParameterFloats, RandomParameterScale);
+        WriteRandom("data.bin", RandomDataFloats, 1f);
     }
 
     /// <summary>
@@ -499,18 +523,7 @@ internal static class HeadToHeadNetworkHarness
     {
         var spec = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-residency", network);
-        Directory.CreateDirectory(work);
-        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(spec.GetProperty("seed").GetInt32());
-        void WriteRandom(string file, int count, float scale)
-        {
-            using var writer = new BinaryWriter(File.Create(Path.Combine(work, file)));
-            for (int i = 0; i < count; i++) writer.Write((float)((rng.NextDouble() * 2 - 1) * scale));
-        }
-        // More than any spec's parameter count (ResNet-18: 11.2M) and batch; readers consume what they need.
-        const int RandomParameterFloats = 12_000_000, RandomDataFloats = 2_000_000;
-        const float ParameterScale = 0.05f;
-        WriteRandom("weights.bin", RandomParameterFloats, ParameterScale);
-        WriteRandom("data.bin", RandomDataFloats, 1f);
+        WriteRandomWeightsAndData(spec, work);
         var previous = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu;
         try
@@ -536,15 +549,7 @@ internal static class HeadToHeadNetworkHarness
     {
         var spec = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-stepcounts", network + "-" + (gpu is null ? "cpu" : "cuda"));
-        Directory.CreateDirectory(work);
-        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(spec.GetProperty("seed").GetInt32());
-        void WriteRandom(string file, int count, float scale)
-        {
-            using var writer = new BinaryWriter(File.Create(Path.Combine(work, file)));
-            for (int i = 0; i < count; i++) writer.Write((float)((rng.NextDouble() * 2 - 1) * scale));
-        }
-        WriteRandom("weights.bin", 12_000_000, 0.05f);
-        WriteRandom("data.bin", 2_000_000, 1f);
+        WriteRandomWeightsAndData(spec, work);
 
         var previous = AiDotNetEngine.Current;
         int previousThreads = CpuParallelSettings.MaxDegreeOfParallelism;

@@ -61,16 +61,20 @@ public class Issue1096FollowUpTests
         Assert.Equal(2, ws.CompletedForwards);
     }
 
-    private static Tensor<float> ConvLoss(CpuEngine engine, Tensor<float> x, Tensor<float> w, Tensor<float> b)
+    // Conv2D -> channel-bias add -> ReLU, optionally into a tiling max pool: the chain the conv-epilogue fusion detects,
+    // and with the pool, the pooled-fusion backward that runs at the pool's position.
+    private static Tensor<float> ConvLoss(CpuEngine engine, Tensor<float> x, Tensor<float> w, Tensor<float> b, bool pooled)
     {
         var y = engine.FusedConv2D(x, w, b, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
+        if (pooled) y = engine.MaxPool2D(y, 2);
         return engine.ReduceSum(engine.TensorMultiply(y, y), null);
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void CompiledConv_InputGradient_IsOptIn_AndMatchesTheEagerTape(bool requested)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void CompiledConv_InputGradient_IsOptIn_AndMatchesTheEagerTape(bool requested, bool pooled)
     {
         var engine = new CpuEngine();
         int[] xShape = { 2, 32, 8, 8 }, wShape = { 32, 32, 3, 3 };
@@ -81,7 +85,7 @@ public class Issue1096FollowUpTests
         float[] eagerInputGrad;
         using (var tape = new GradientTape<float>())
         {
-            var loss = ConvLoss(engine, x0, w0, b0);
+            var loss = ConvLoss(engine, x0, w0, b0, pooled);
             var grads = tape.ComputeGradients(loss, sources: new[] { x0, w0, b0 });
             eagerInputGrad = grads[x0].ToArray();
         }
@@ -95,7 +99,7 @@ public class Issue1096FollowUpTests
         try
         {
             using var scope = GraphMode.Enable();
-            ConvLoss(engine, x, w, b);
+            ConvLoss(engine, x, w, b, pooled);
             plan = scope.CompileTraining(new[] { w, b });   // the input is not a parameter
         }
         finally
@@ -114,9 +118,12 @@ public class Issue1096FollowUpTests
                     Assert.True(x.Grad is null, $"step {step}: the input received a gradient although none was requested");
                     continue;
                 }
-                var g = x.Grad;
-                Assert.True(g is not null, $"step {step}: the requested input gradient was not set");
-                var actual = g!.ToArray();
+                if (x.Grad is not { } g)
+                {
+                    Assert.Fail($"step {step}: the requested input gradient was not set");
+                    return;
+                }
+                var actual = g.ToArray();
                 Assert.Equal(eagerInputGrad.Length, actual.Length);
                 double maxAbs = 0;
                 foreach (float v in eagerInputGrad) maxAbs = Math.Max(maxAbs, Math.Abs(v));
