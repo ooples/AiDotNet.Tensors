@@ -1320,8 +1320,8 @@ fn adam(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Bias correction
         let step = f32(opt_params.t);
-        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, step));
-        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, step));
+        let m_hat = momentum[idx] / (wgsl_bias_correction(opt_params.beta1, step));
+        let v_hat = velocity[idx] / (wgsl_bias_correction(opt_params.beta2, step));
 
         // Update parameters
         params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
@@ -1340,15 +1340,15 @@ fn adamw(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Bias correction
         let step = f32(opt_params.t);
-        let m_hat = momentum[idx] / (1.0 - pow(opt_params.beta1, step));
-        let v_hat = velocity[idx] / (1.0 - pow(opt_params.beta2, step));
+        let m_hat = momentum[idx] / (wgsl_bias_correction(opt_params.beta1, step));
+        let v_hat = velocity[idx] / (wgsl_bias_correction(opt_params.beta2, step));
 
         // AdamW: decoupled weight decay
         params_arr[idx] = params_arr[idx] * (1.0 - opt_params.lr * opt_params.weight_decay);
         params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
     }
 }
-";
+" + WebGpuBiasCorrection.Wgsl;
 
     public const string CompressedOptimizerBf16Source = @"
 @group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
@@ -1439,8 +1439,8 @@ fn adam_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_m(idx, float_to_bf16_rne(m_new));
     store_v(idx, float_to_bf16_rne(v_new));
 
-    let m_hat = m_new / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
-    let v_hat = v_new / (1.0 - pow(opt_params.beta2, f32(opt_params.t)));
+    let m_hat = m_new / (wgsl_bias_correction(opt_params.beta1, f32(opt_params.t)));
+    let v_hat = v_new / (wgsl_bias_correction(opt_params.beta2, f32(opt_params.t)));
     params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
 
@@ -1464,11 +1464,11 @@ fn adamw_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_m(idx, float_to_bf16_rne(m_new));
     store_v(idx, float_to_bf16_rne(v_new));
 
-    let m_hat = m_new / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
-    let v_hat = v_new / (1.0 - pow(opt_params.beta2, f32(opt_params.t)));
+    let m_hat = m_new / (wgsl_bias_correction(opt_params.beta1, f32(opt_params.t)));
+    let v_hat = v_new / (wgsl_bias_correction(opt_params.beta2, f32(opt_params.t)));
     params_arr[idx] = params_arr[idx] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
-";
+" + WebGpuBiasCorrection.Wgsl;
 
     public static readonly string CompressedOptimizerInt8Source = Compilation.DynamicQuantizationCodebook.KernelPrelude(Compilation.DynamicQuantizationCodebook.KernelLanguage.Wgsl) + @"
 @group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
@@ -2867,7 +2867,7 @@ fn adamax(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        let bc1 = 1.0 - pow(opt_params.beta1, f32(opt_params.t));
+        let bc1 = wgsl_bias_correction(opt_params.beta1, f32(opt_params.t));
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = max(opt_params.beta2 * state2[idx], abs(grad));
         params_arr[idx] = params_arr[idx] - opt_params.lr / bc1 * state1[idx] / (state2[idx] + opt_params.epsilon);
@@ -2890,9 +2890,9 @@ fn nadam(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
         let step = f32(opt_params.t);
-        let bc1 = 1.0 - pow(opt_params.beta1, step);
-        let bc1_next = 1.0 - pow(opt_params.beta1, step + 1.0);
-        let bc2 = 1.0 - pow(opt_params.beta2, step);
+        let bc1 = wgsl_bias_correction(opt_params.beta1, step);
+        let bc1_next = wgsl_bias_correction(opt_params.beta1, step + 1.0);
+        let bc2 = wgsl_bias_correction(opt_params.beta2, step);
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
         let v_hat = state2[idx] / bc2;
@@ -2900,7 +2900,7 @@ fn nadam(@builtin(global_invocation_id) gid: vec3<u32>) {
         params_arr[idx] = params_arr[idx] - opt_params.lr * (opt_params.beta1 * state1[idx] / bc1_next + (1.0 - opt_params.beta1) * grad / bc1) / (sqrt(v_hat) + opt_params.epsilon);
     }
 }
-";
+" + WebGpuBiasCorrection.Wgsl;
 
     /// <summary>
     /// AMSGrad optimizer (needs 5 buffers: params, gradients, m, v, v_max).
@@ -2930,8 +2930,8 @@ fn amsgrad(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
         let step = f32(opt_params.t);
-        let bc1 = 1.0 - pow(opt_params.beta1, step);
-        let bc2 = 1.0 - pow(opt_params.beta2, step);
+        let bc1 = wgsl_bias_correction(opt_params.beta1, step);
+        let bc2 = wgsl_bias_correction(opt_params.beta2, step);
         m[idx] = opt_params.beta1 * m[idx] + (1.0 - opt_params.beta1) * grad;
         v[idx] = opt_params.beta2 * v[idx] + (1.0 - opt_params.beta2) * grad * grad;
         // v_max stored at offset size
@@ -2940,7 +2940,7 @@ fn amsgrad(@builtin(global_invocation_id) gid: vec3<u32>) {
         params_arr[idx] = params_arr[idx] - opt_params.lr * (m[idx] / bc1) / (sqrt(v[vm_idx] / bc2) + opt_params.epsilon);
     }
 }
-";
+" + WebGpuBiasCorrection.Wgsl;
 
     /// <summary>
     /// AMSGrad optimizer with 5 separate storage buffers (params, gradients, m, v, v_max).
@@ -2971,15 +2971,15 @@ fn amsgrad5(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < opt_params.size) {
         let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
         let step = f32(opt_params.t);
-        let bc1 = 1.0 - pow(opt_params.beta1, step);
-        let bc2 = 1.0 - pow(opt_params.beta2, step);
+        let bc1 = wgsl_bias_correction(opt_params.beta1, step);
+        let bc2 = wgsl_bias_correction(opt_params.beta2, step);
         m[idx] = opt_params.beta1 * m[idx] + (1.0 - opt_params.beta1) * grad;
         v[idx] = opt_params.beta2 * v[idx] + (1.0 - opt_params.beta2) * grad * grad;
         v_max[idx] = max(v_max[idx], v[idx]);
         params_arr[idx] = params_arr[idx] - opt_params.lr * (m[idx] / bc1) / (sqrt(v_max[idx] / bc2) + opt_params.epsilon);
     }
 }
-";
+" + WebGpuBiasCorrection.Wgsl;
 
     /// <summary>
     /// Sparse optimizer scatter-update kernels. One invocation per non-zero gradient.
@@ -3063,8 +3063,8 @@ fn sparse_adam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
     state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
     let step = f32(opt_params.t);
-    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
-    let v_hat = state2[i] / (1.0 - pow(opt_params.beta2, step));
+    let m_hat = state1[i] / (wgsl_bias_correction(opt_params.beta1, step));
+    let v_hat = state2[i] / (wgsl_bias_correction(opt_params.beta2, step));
     var update = opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
     if (opt_params.weight_decay > 0.0) { update = update + opt_params.lr * opt_params.weight_decay * params_arr[i]; }
     params_arr[i] = params_arr[i] - update;
@@ -3081,8 +3081,8 @@ fn sparse_adamw_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
     state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
     let step = f32(opt_params.t);
-    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
-    let v_hat = state2[i] / (1.0 - pow(opt_params.beta2, step));
+    let m_hat = state1[i] / (wgsl_bias_correction(opt_params.beta1, step));
+    let v_hat = state2[i] / (wgsl_bias_correction(opt_params.beta2, step));
     params_arr[i] = p - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
 
@@ -3146,8 +3146,8 @@ fn sparse_amsgrad_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
     state3[i] = max(state3[i], state2[i]);
     let step = f32(opt_params.t);
-    let m_hat = state1[i] / (1.0 - pow(opt_params.beta1, step));
-    let v_hat = state3[i] / (1.0 - pow(opt_params.beta2, step));
+    let m_hat = state1[i] / (wgsl_bias_correction(opt_params.beta1, step));
+    let v_hat = state3[i] / (wgsl_bias_correction(opt_params.beta2, step));
     params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
 
@@ -3160,7 +3160,7 @@ fn sparse_adamax_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
     state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
     state2[i] = max(opt_params.beta2 * state2[i], abs(grad));
-    let lr_adj = opt_params.lr / (1.0 - pow(opt_params.beta1, f32(opt_params.t)));
+    let lr_adj = opt_params.lr / (wgsl_bias_correction(opt_params.beta1, f32(opt_params.t)));
     params_arr[i] = params_arr[i] - lr_adj * state1[i] / (state2[i] + opt_params.epsilon);
 }
 
@@ -3186,9 +3186,9 @@ fn sparse_nadam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
     state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
     let step = f32(opt_params.t);
-    let bc1 = 1.0 - pow(opt_params.beta1, step);
-    let bc2 = 1.0 - pow(opt_params.beta2, step);
-    let m_hat = opt_params.beta1 * state1[i] / (1.0 - pow(opt_params.beta1, step + 1.0)) + (1.0 - opt_params.beta1) * grad / bc1;
+    let bc1 = wgsl_bias_correction(opt_params.beta1, step);
+    let bc2 = wgsl_bias_correction(opt_params.beta2, step);
+    let m_hat = opt_params.beta1 * state1[i] / (wgsl_bias_correction(opt_params.beta1, step + 1.0)) + (1.0 - opt_params.beta1) * grad / bc1;
     let v_hat = state2[i] / bc2;
     params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
@@ -3228,7 +3228,7 @@ fn sparse_proximal_l1_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         params_arr[i] = 0.0;
     }
 }
-";
+" + WebGpuBiasCorrection.Wgsl;
 
     /// <summary>
     /// Dropout forward and backward kernels.
@@ -4679,8 +4679,8 @@ fn lamb_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         // extra = pre-computed ratio = param_norm / update_norm
         let ratio = opt_params.extra;
         let step = f32(opt_params.t);
-        let bc1 = 1.0 - pow(opt_params.beta1, step);
-        let bc2 = 1.0 - pow(opt_params.beta2, step);
+        let bc1 = wgsl_bias_correction(opt_params.beta1, step);
+        let bc2 = wgsl_bias_correction(opt_params.beta2, step);
         let grad = gradients[idx];
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
@@ -4707,7 +4707,7 @@ fn ftrl_update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 }
-";
+" + WebGpuBiasCorrection.Wgsl;
 
     /// <summary>
     /// Scaled dot-product attention kernel.
