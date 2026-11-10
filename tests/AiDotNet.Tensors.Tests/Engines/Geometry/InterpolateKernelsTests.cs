@@ -128,8 +128,11 @@ public class InterpolateKernelsTests
         for (int i = 0; i < gradStored.Length; i++) gradStored[i] = (float)(random.NextDouble() * 2 - 1);
         var gradView = gradStored.Transpose(new[] { 0, 1, 3, 2 });
         Assert.False(gradView.IsContiguous);
-        var gradFromView = InterpolateKernels.TryBackward(gradView, view, mode, alignCorners)!;
-        var gradFromCopy = InterpolateKernels.TryBackward(gradView.Contiguous(), copy, mode, alignCorners)!;
+        var gradFromView = InterpolateKernels.TryBackward(gradView, view, mode, alignCorners);
+        var gradFromCopy = InterpolateKernels.TryBackward(gradView.Contiguous(), copy, mode, alignCorners);
+        Assert.NotNull(gradFromView);
+        Assert.NotNull(gradFromCopy);
+        if (gradFromView is null || gradFromCopy is null) return;
         Assert.Equal(gradFromCopy.ToArray(), gradFromView.ToArray());
     }
 
@@ -218,5 +221,59 @@ public class InterpolateKernelsTests
         }
 
         return (forward, backward);
+    }
+}
+
+/// <summary>
+/// The plane loops are marked deterministic-safe, so DeterministicReductions leaves them parallel: each plane reads and
+/// writes only itself, in a fixed order. Forward and backward must then be bit-identical on one thread and many, for a
+/// case far above the parallel cut-off.
+/// </summary>
+[CollectionDefinition("InterpolateParallelSettingsSerial", DisableParallelization = true)]
+public sealed class InterpolateParallelSettingsCollection
+{
+}
+
+[Collection("InterpolateParallelSettingsSerial")]
+public class InterpolateKernelsDeterministicParallelTests
+{
+    [Theory]
+    [InlineData(InterpolateMode.Nearest, false)]
+    [InlineData(InterpolateMode.Bilinear, false)]
+    [InlineData(InterpolateMode.Bilinear, true)]
+    public void DeterministicMode_ForwardAndBackward_AreBitIdenticalOnOneThreadAndMany(InterpolateMode mode, bool alignCorners)
+    {
+        var random = RandomHelper.CreateSeededRandom(91);
+        var input = new Tensor<float>(new[] { 4, 32, 48, 48 });
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
+        var sizes = new[] { 96, 80 };
+        var gradOutput = new Tensor<float>(new[] { 4, 32, 96, 80 });
+        for (int i = 0; i < gradOutput.Length; i++) gradOutput[i] = (float)(random.NextDouble() * 2 - 1);
+
+        bool previousDeterministic = CpuParallelSettings.DeterministicReductions;
+        int previousThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            CpuParallelSettings.DeterministicReductions = true;
+            (float[] Forward, float[] Backward) Run(int threads)
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                var output = new Tensor<float>(new[] { 4, 32, 96, 80 });
+                Assert.True(InterpolateKernels.TryForward(input, output, mode, alignCorners));
+                var gradient = InterpolateKernels.TryBackward(gradOutput, input, mode, alignCorners);
+                Assert.NotNull(gradient);
+                return (output.ToArray(), gradient is null ? Array.Empty<float>() : gradient.ToArray());
+            }
+
+            var serial = Run(1);
+            var parallel = Run(Math.Max(Environment.ProcessorCount, 4));
+            Assert.Equal(serial.Forward, parallel.Forward);
+            Assert.Equal(serial.Backward, parallel.Backward);
+        }
+        finally
+        {
+            CpuParallelSettings.DeterministicReductions = previousDeterministic;
+            CpuParallelSettings.MaxDegreeOfParallelism = previousThreads;
+        }
     }
 }

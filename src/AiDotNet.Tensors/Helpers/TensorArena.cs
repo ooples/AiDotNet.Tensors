@@ -933,6 +933,14 @@ public sealed class TensorArena : IDisposable
         return log;
     }
 
+    /// <summary>True when <paramref name="array"/> was pinned as persistent model state (<see cref="PinExistingTensor"/>).</summary>
+    internal bool IsPinned(Array array)
+    {
+        for (int i = 0; i < _pinnedArrays.Count; i++)
+            if (ReferenceEquals(_pinnedArrays[i], array)) return true;
+        return false;
+    }
+
     /// <summary>
     /// Makes a buffer issued this step available to the next rent of its size before the step ends. The caller must
     /// have proven that nothing reads or writes it any more: the arena reissues the same array, under a new tensor
@@ -943,8 +951,7 @@ public sealed class TensorArena : IDisposable
         if (_disposed) return;
         // A buffer pinned since it was issued belongs to the model now (PinExistingTensor), however dead the step's
         // last use of it looked.
-        for (int i = 0; i < _pinnedArrays.Count; i++)
-            if (ReferenceEquals(_pinnedArrays[i], buffer.Array)) return;
+        if (IsPinned(buffer.Array)) return;
         var key = (buffer.Array.GetType().GetElementType()!, buffer.Array.Length);
         _poolFree ??= new Dictionary<(Type, int), Stack<Array>>();
         if (!_poolFree.TryGetValue(key, out var arrays))

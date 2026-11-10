@@ -136,7 +136,13 @@ public class ArenaWithheldGradientsTests
         // in parallel change, so an early step can withhold fewer (measured [1, 0, 2, 2, 2, 2] under a full run). The
         // leak this guards (AiDotNet#2322) adds a set per step: [2, 4, 6, ...].
         const int gradientsPerStep = 2;
-        for (int step = 0; step < counts!.Length; step++)
+        Assert.NotNull(counts);
+        if (counts is null) return;
+        // Not vacuous: a run that never withheld anything would pass the bound without testing it. The steady state
+        // withholds the step's arena-issued gradients, so some step must hold at least one.
+        Assert.True(Array.Exists(counts, count => count > 0),
+            $"Withheld arrays per step: [{string.Join(", ", counts)}]; no step withheld a gradient, so the bound was not exercised.");
+        for (int step = 0; step < counts.Length; step++)
             Assert.True(counts[step] <= gradientsPerStep,
                 $"Withheld arrays per step: [{string.Join(", ", counts)}]; step {step} holds {counts[step]}, more than the {gradientsPerStep} of one step.");
     }

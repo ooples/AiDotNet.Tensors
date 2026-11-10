@@ -287,6 +287,9 @@ internal sealed class BackwardRecycler<T>
 
     private void Release(in TensorArena.IssuedBuffer buffer)
     {
+        // Pinned since it was issued (a layer registered it as persistent): model state, not a dead buffer. Poisoning it
+        // in the diagnostic modes would overwrite the model's values; the arena would not reissue it anyway.
+        if (_arena.IsPinned(buffer.Array)) return;
         if (_poisoned is not null)
         {
             ResultBufferTracker.Poison(buffer.Array);

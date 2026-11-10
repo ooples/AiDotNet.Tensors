@@ -376,7 +376,7 @@ internal sealed class RoIAlignPlan
         where TElement : struct, IRoiElement<TNum>
     {
         var element = default(TElement);
-        long work = (long)Rois * channels * Bins * 16;
+        long work = (long)Rois * channels * Bins * TapsPerBin();
         CpuParallelSettings.ParallelForOrSerial(0, Rois * channels, work, item =>
         {
             int r = item / channels, c = item % channels;
@@ -438,52 +438,69 @@ internal sealed class RoIAlignPlan
             scratchBase[r] = slot * plane;
         }
 
-        long work = (long)Rois * channels * Bins * 16;
+        long work = (long)Rois * channels * Bins * TapsPerBin();
+        int scratchLength = images.Count * plane;
         CpuParallelSettings.ParallelForOrSerial(0, channels, work, c =>
         {
-            var scratch = new double[images.Count * plane];
-            for (int r = 0; r < Rois; r++)
+            // Pooled: a fresh plane per channel put images * plane doubles on the large object heap for every channel.
+            var scratch = System.Buffers.ArrayPool<double>.Shared.Rent(scratchLength);
+            try
             {
-                int planeBase = scratchBase[r];
-                int gradBase = (((FirstRoi + r) * channels) + c) * Bins;
-                for (int bin = 0; bin < Bins; bin++)
+                Array.Clear(scratch, 0, scratchLength);
+                for (int r = 0; r < Rois; r++)
                 {
-                    double g = element.ToDouble(gradOutput[gradBase + bin]);
-                    if (g == 0) continue;
-                    if (IsDirect)
+                    int planeBase = scratchBase[r];
+                    int gradBase = (((FirstRoi + r) * channels) + c) * Bins;
+                    for (int bin = 0; bin < Bins; bin++)
                     {
-                        int ph = bin / _outputWidth, pw = bin % _outputWidth;
-                        double average = Average(_grid);
-                        for (int iy = 0; iy < _grid.Ry; iy++)
+                        double g = element.ToDouble(gradOutput[gradBase + bin]);
+                        if (g == 0) continue;
+                        if (IsDirect)
                         {
-                            double sy = SampleY(_grid, ph, iy);
-                            for (int ix = 0; ix < _grid.Rx; ix++)
+                            int ph = bin / _outputWidth, pw = bin % _outputWidth;
+                            double average = Average(_grid);
+                            for (int iy = 0; iy < _grid.Ry; iy++)
                             {
-                                if (!Corners(sy, SampleX(_grid, pw, ix), _height, _width, average, out var tap)) continue;
-                                scratch[planeBase + tap.O0] += tap.W0 * g;
-                                scratch[planeBase + tap.O1] += tap.W1 * g;
-                                scratch[planeBase + tap.O2] += tap.W2 * g;
-                                scratch[planeBase + tap.O3] += tap.W3 * g;
+                                double sy = SampleY(_grid, ph, iy);
+                                for (int ix = 0; ix < _grid.Rx; ix++)
+                                {
+                                    if (!Corners(sy, SampleX(_grid, pw, ix), _height, _width, average, out var tap)) continue;
+                                    scratch[planeBase + tap.O0] += tap.W0 * g;
+                                    scratch[planeBase + tap.O1] += tap.W1 * g;
+                                    scratch[planeBase + tap.O2] += tap.W2 * g;
+                                    scratch[planeBase + tap.O3] += tap.W3 * g;
+                                }
                             }
                         }
-                    }
-                    else
-                    {
-                        int end = TapStart[(r * Bins) + bin + 1];
-                        for (int t = TapStart[(r * Bins) + bin]; t < end; t++)
-                            scratch[planeBase + Offsets[t]] += Weights[t] * g;
+                        else
+                        {
+                            int end = TapStart[(r * Bins) + bin + 1];
+                            for (int t = TapStart[(r * Bins) + bin]; t < end; t++)
+                                scratch[planeBase + Offsets[t]] += Weights[t] * g;
+                        }
                     }
                 }
-            }
 
-            for (int i = 0; i < images.Count; i++)
+                for (int i = 0; i < images.Count; i++)
+                {
+                    int target = ((images[i] * channels) + c) * plane, source = i * plane;
+                    for (int p = 0; p < plane; p++)
+                        gradInput[target + p] = element.FromDouble(element.ToDouble(gradInput[target + p]) + scratch[source + p]);
+                }
+            }
+            finally
             {
-                int target = ((images[i] * channels) + c) * plane, source = i * plane;
-                for (int p = 0; p < plane; p++)
-                    gradInput[target + p] = element.FromDouble(element.ToDouble(gradInput[target + p]) + scratch[source + p]);
+                System.Buffers.ArrayPool<double>.Shared.Return(scratch);
             }
         }, deterministicSafe: true);
     }
+
+    // The work per (RoI, channel, bin), in multiply-adds, for the parallel cut-off: a direct plan computes its samples' four
+    // taps (plus their positions), a table plan reads its average taps per bin.
+    private long TapsPerBin()
+        => IsDirect
+            ? 8L * Math.Max((long)_grid.Ry * _grid.Rx, 1)
+            : Math.Max(Offsets.Length / Math.Max((long)Rois * Bins, 1), 1) + 1;
 
     /// <summary>Reads and writes one element type as double; a struct per type keeps the kernels typed.</summary>
     internal interface IRoiElement<TNum>
