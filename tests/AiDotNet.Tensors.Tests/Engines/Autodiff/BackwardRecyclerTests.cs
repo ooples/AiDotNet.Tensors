@@ -124,7 +124,8 @@ public class BackwardRecyclerTests
         for (int i = 0; i < 3; i++)
         {
             var next = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
-            Assert.DoesNotContain(next.GetBackingArrayForCacheLookupUnsafe(), pinnedArrays);
+            var array = next.GetBackingArrayForCacheLookupUnsafe();
+            Assert.False(Array.Exists(pinnedArrays, pinned => ReferenceEquals(pinned, array)), $"rent {i} reissued a pinned buffer");
         }
 
         Assert.All(pinnedBefore.ToArray(), value => Assert.Equal(7f, value));
