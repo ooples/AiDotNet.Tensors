@@ -55,9 +55,8 @@ public partial class CpuEngine
         if (K == 0) return new Tensor<T>(new[] { K, C, outputHeight, outputWidth });
 
         // Taps once per (RoI, bin), then a parallel gather over (RoI, channel); see RoIAlignPlan.
-        var plan = RoIAlignPlan.Build(RoIAlignPlan.ReadBoxes(boxes), N, H, W,
-            outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
-        var pooled = plan.Forward(RoIAlignPlan.ToDoubles(input), C, H * W);
+        var pooled = RoIAlignPlan.Forward(RoIAlignPlan.ReadBoxes(boxes), N, H, W,
+            outputHeight, outputWidth, spatialScale, samplingRatio, aligned, RoIAlignPlan.ToDoubles(input), C);
         return RoIAlignPlan.FromDoubles<T>(pooled, new[] { K, C, outputHeight, outputWidth });
     }
 

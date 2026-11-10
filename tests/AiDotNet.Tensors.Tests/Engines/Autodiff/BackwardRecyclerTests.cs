@@ -32,7 +32,7 @@ public class BackwardRecyclerTests
         var log = new List<TensorArena.IssuedBuffer>();
         arena.OpenIssueLog(log);
         var first = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
-        arena.CloseIssueLog();
+        arena.CloseIssueLog(log);
         Assert.Single(log);
 
         arena.ReturnIssued(log[0]);
@@ -49,6 +49,26 @@ public class BackwardRecyclerTests
         Assert.NotSame(afterReset1, afterReset2);
     }
 
+    // The arena has one issue log. A second owner (a recycler of another element type on the same thread) must not
+    // take it over, nor close it for the owner that opened it.
+    [Fact]
+    public void IssueLog_HasOneOwner()
+    {
+        using var arena = TensorArena.Create();
+        var owner = new List<TensorArena.IssuedBuffer>();
+        var other = new List<TensorArena.IssuedBuffer>();
+        Assert.True(arena.OpenIssueLog(owner));
+        Assert.False(arena.OpenIssueLog(other));
+        arena.CloseIssueLog(other);
+        TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        arena.CloseIssueLog(owner);
+        TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        Assert.Single(owner);
+        Assert.Empty(other);
+        Assert.True(arena.OpenIssueLog(other));
+        arena.CloseIssueLog(other);
+    }
+
     [Fact]
     public void ReturnedScratchArray_IsReissuedWithinTheStep_AndNotTwiceAfterReset()
     {
@@ -56,7 +76,7 @@ public class BackwardRecyclerTests
         var log = new List<TensorArena.IssuedBuffer>();
         arena.OpenIssueLog(log);
         var first = arena.TryAllocate<float>(5000)!;
-        arena.CloseIssueLog();
+        arena.CloseIssueLog(log);
         Assert.Single(log);
         first[7] = 3f;
 

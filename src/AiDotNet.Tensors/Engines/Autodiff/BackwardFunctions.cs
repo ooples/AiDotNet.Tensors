@@ -9673,8 +9673,8 @@ internal static class BackwardFunctions<T>
         if (boxes._shape[0] == 0) return new Tensor<T>(input._shape);
 
         // The forward's taps scattered back, parallel over channels so overlapping RoIs never race; see RoIAlignPlan.
-        var plan = RoIAlignPlan.Build(RoIAlignPlan.ReadBoxes(boxes), N, H, W, outH, outW, spatialScale, samplingRatio, aligned);
-        var gradInput = plan.Backward(RoIAlignPlan.ToDoubles(gradOutput), N, C, H * W);
+        var gradInput = RoIAlignPlan.Backward(RoIAlignPlan.ReadBoxes(boxes), N, H, W, outH, outW, spatialScale,
+            samplingRatio, aligned, RoIAlignPlan.ToDoubles(gradOutput), C);
         return RoIAlignPlan.FromDoubles<T>(gradInput, input._shape);
     }
 

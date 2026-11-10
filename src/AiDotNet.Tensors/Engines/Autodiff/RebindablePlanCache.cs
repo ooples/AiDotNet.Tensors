@@ -192,11 +192,12 @@ internal static class RebindablePlanCache<T>
         var indices = _cachedReverseTopoIndices;
         // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
-        if (recycler is not null)
-            foreach (int noted in indices)
-                if (noted >= 0 && noted < currentEntries.Count) recycler.NoteOutput(currentEntries[noted].Output);
         try
         {
+            // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
+            if (recycler is not null)
+                foreach (int noted in indices)
+                    if (noted >= 0 && noted < currentEntries.Count) recycler.NoteOutput(currentEntries[noted].Output);
             for (int i = 0; i < indices.Length; i++)
             {
                 int idx = indices[i];

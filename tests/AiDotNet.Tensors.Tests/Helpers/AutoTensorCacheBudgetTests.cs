@@ -5,6 +5,14 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers;
 
+// The collection these cache tests share. AutoTensorCache's byte budget is process-wide and Clear empties every
+// thread's pools, which other classes call (TensorConcatenateTests); a Clear between a Return and its Assert.Same
+// failed the test intermittently, so the collection runs with no other test in parallel.
+[CollectionDefinition("DeferredMaterializerRegistrySerial", DisableParallelization = true)]
+public sealed class AutoTensorCacheSerialCollection
+{
+}
+
 // AutoTensorCache is process-wide; keep these off the parallel runner so another test's rentals cannot interleave.
 [Collection("DeferredMaterializerRegistrySerial")]
 public class AutoTensorCacheBudgetTests
@@ -93,6 +101,52 @@ public class AutoTensorCacheBudgetTests
             var after = new Tensor<float>(shape);
             AutoTensorCache.Return(after);
             Assert.Same(after, AutoTensorCache.RentOrAllocate<float>(shape));
+        }
+        finally
+        {
+            AutoTensorCache.MaxPooledBytes = prior;
+            AutoTensorCache.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Clear races the pools' other users, which take no lock. It used to zero the byte total and then empty the
+    /// pools, so a return counted in between was dropped still counted, and a rent subtracted after the zeroing took
+    /// the total below zero; either way the total no longer matched what the pools held.
+    /// </summary>
+    [Fact]
+    public void Clear_DuringConcurrentReturnsAndRents_KeepsTheByteTotalExact()
+    {
+        long prior = AutoTensorCache.MaxPooledBytes;
+        try
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.MaxPooledBytes = AutoTensorCache.DefaultMaxPooledBytes;
+            var shape = new[] { 8, 8 };
+            int stop = 0;
+            var workers = new Thread[4];
+            for (int w = 0; w < workers.Length; w++)
+            {
+                workers[w] = new Thread(() =>
+                {
+                    // Several tensors pooled at a time, so a Clear finds pools to empty while returns and rents run.
+                    while (Volatile.Read(ref stop) == 0)
+                    {
+                        for (int i = 0; i < 8; i++) AutoTensorCache.Return(new Tensor<float>(shape));
+                        for (int i = 0; i < 8; i++) AutoTensorCache.RentOrAllocate<float>(shape);
+                    }
+                });
+                workers[w].Start();
+            }
+
+            for (int i = 0; i < 20000; i++) AutoTensorCache.Clear();
+            Volatile.Write(ref stop, 1);
+            foreach (var worker in workers) worker.Join();
+
+            // Nothing runs now, so the running total must be what the pools hold; a final Clear would hide drift.
+            Assert.Equal(AutoTensorCache.CountPooledBytes(), AutoTensorCache.PooledBytes);
+            AutoTensorCache.Clear();
+            Assert.Equal(0, AutoTensorCache.PooledBytes);
         }
         finally
         {

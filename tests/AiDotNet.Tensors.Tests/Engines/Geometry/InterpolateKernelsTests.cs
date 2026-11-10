@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -62,6 +63,74 @@ public class InterpolateKernelsTests
         for (int i = 0; i < values.Length; i++) values[i] = input[i];
         var (expected, _) = Reference(values, shape, new double[output.Length], output.Shape.ToArray(), mode, alignCorners);
         for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], output[i]);
+    }
+
+    // An element type with no typed span view runs the generic converter (INumericOperations to and from double); the
+    // table arithmetic is in double either way, so it must give the double path's values.
+    [Theory]
+    [MemberData(nameof(Cases))]
+    public void Decimal_ForwardAndBackward_EqualTheDoublePath(int[] shape, int[] sizes, InterpolateMode mode, bool alignCorners)
+    {
+        var random = RandomHelper.CreateSeededRandom(shape.Length * 13 + sizes[0]);
+        var asDouble = new Tensor<double>(shape);
+        var asDecimal = new Tensor<decimal>(shape);
+        for (int i = 0; i < asDouble.Length; i++)
+        {
+            double v = random.Next(-64, 65) / 32.0;
+            asDouble[i] = v;
+            asDecimal[i] = (decimal)v;
+        }
+
+        var expected = Engine.Interpolate(asDouble, sizes, mode, alignCorners);
+        var actual = Engine.Interpolate(asDecimal, sizes, mode, alignCorners);
+        Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - (double)actual[i]) <= 1e-12, $"forward [{i}] double {expected[i]:R}, decimal {actual[i]}");
+
+        var gradDouble = new Tensor<double>(expected.Shape.ToArray());
+        var gradDecimal = new Tensor<decimal>(expected.Shape.ToArray());
+        for (int i = 0; i < gradDouble.Length; i++)
+        {
+            double g = random.Next(-64, 65) / 32.0;
+            gradDouble[i] = g;
+            gradDecimal[i] = (decimal)g;
+        }
+
+        var expectedGrad = InterpolateKernels.TryBackward(gradDouble, asDouble, mode, alignCorners)!;
+        var actualGrad = InterpolateKernels.TryBackward(gradDecimal, asDecimal, mode, alignCorners)!;
+        for (int i = 0; i < expectedGrad.Length; i++)
+            Assert.True(Math.Abs(expectedGrad[i] - (double)actualGrad[i]) <= 1e-12,
+                $"backward [{i}] double {expectedGrad[i]:R}, decimal {actualGrad[i]}");
+    }
+
+    // A permuted view as the input and as the output gradient: the kernels copy it contiguous first, so the result
+    // must be the contiguous copy's, bit for bit.
+    [Theory]
+    [InlineData(InterpolateMode.Nearest, false)]
+    [InlineData(InterpolateMode.Bilinear, false)]
+    [InlineData(InterpolateMode.Bilinear, true)]
+    public void NonContiguousInputAndGradient_EqualTheContiguousCopy(InterpolateMode mode, bool alignCorners)
+    {
+        var random = RandomHelper.CreateSeededRandom(77);
+        var stored = new Tensor<float>(new[] { 2, 3, 13, 9 });
+        for (int i = 0; i < stored.Length; i++) stored[i] = (float)(random.NextDouble() * 2 - 1);
+        var view = stored.Transpose(new[] { 0, 1, 3, 2 });
+        Assert.False(view.IsContiguous);
+        var copy = view.Contiguous();
+        var sizes = new[] { 14, 20 };
+
+        var fromView = Engine.Interpolate(view, sizes, mode, alignCorners);
+        var fromCopy = Engine.Interpolate(copy, sizes, mode, alignCorners);
+        Assert.Equal(fromCopy.ToArray(), fromView.ToArray());
+
+        // The output gradient as a view too: stored [2, 3, 20, 14], read [2, 3, 14, 20].
+        var gradStored = new Tensor<float>(new[] { 2, 3, 20, 14 });
+        for (int i = 0; i < gradStored.Length; i++) gradStored[i] = (float)(random.NextDouble() * 2 - 1);
+        var gradView = gradStored.Transpose(new[] { 0, 1, 3, 2 });
+        Assert.False(gradView.IsContiguous);
+        var gradFromView = InterpolateKernels.TryBackward(gradView, view, mode, alignCorners)!;
+        var gradFromCopy = InterpolateKernels.TryBackward(gradView.Contiguous(), copy, mode, alignCorners)!;
+        Assert.Equal(gradFromCopy.ToArray(), gradFromView.ToArray());
     }
 
     private static double[] Read(Tensor<float> tensor)

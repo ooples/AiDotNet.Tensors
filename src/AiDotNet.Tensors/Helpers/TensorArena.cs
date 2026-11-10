@@ -859,11 +859,23 @@ public sealed class TensorArena : IDisposable
     private Stack<int>?[]? _ringFree;
     private Dictionary<(Type, int), Stack<Array>>? _poolFree;
 
-    /// <summary>Records every buffer issued from now on into <paramref name="log"/>, until <see cref="CloseIssueLog"/>.</summary>
-    internal void OpenIssueLog(List<IssuedBuffer> log) => _issueLog = log;
+    /// <summary>
+    /// Records every buffer issued from now on into <paramref name="log"/>, until <see cref="CloseIssueLog"/>. Returns
+    /// false, recording nothing, when another log is already open: the arena has one log, and a second owner (a
+    /// recycler of another element type on the same thread) would take it over and later close it for the first.
+    /// </summary>
+    internal bool OpenIssueLog(List<IssuedBuffer> log)
+    {
+        if (_issueLog is not null) return false;
+        _issueLog = log;
+        return true;
+    }
 
-    /// <summary>Stops recording issued buffers.</summary>
-    internal void CloseIssueLog() => _issueLog = null;
+    /// <summary>Stops recording issued buffers into <paramref name="log"/>; a log another owner opened stays open.</summary>
+    internal void CloseIssueLog(List<IssuedBuffer> log)
+    {
+        if (ReferenceEquals(_issueLog, log)) _issueLog = null;
+    }
 
     /// <summary>
     /// Makes a buffer issued this step available to the next rent of its size before the step ends. The caller must
