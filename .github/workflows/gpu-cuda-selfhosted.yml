@@ -172,16 +172,44 @@ jobs:
     # workspace, built once per pinned set and wheel index and reused, since the service account cannot install into
     # the machine's Python. torch is the CUDA build: the allocator comparison and the CUDA DLPack round trips need a
     # device, and AIDOTNET_REQUIRE_TORCH_CUDA makes a torch that cannot reach one fail instead of skip.
+    # The venv is built from Python 3.13, not the machine's python: torch 2.9's torch.compile refuses Python 3.14+
+    # ("torch.compile is not supported on Python 3.14+"), so on a 3.14 runner every step-time ratchet deferred with no
+    # compiled PyTorch mode measured (#1703). The launcher's 3.13 is used when installed; otherwise uv (installed into
+    # the workspace, no admin needed) downloads a 3.13 into the workspace once. triton-windows is torch.compile's CUDA
+    # backend on Windows; 3.5.x is the line built for torch 2.9.
     - name: Python packages
       run: |
-        $pins = 'numpy==2.3.4', 'torch==2.9.0'
+        $pins = 'numpy==2.3.4', 'torch==2.9.0', 'triton-windows<3.6'
         $index = 'https://download.pytorch.org/whl/cu128'
+        $pythonVersion = '3.13'
         $venv = Join-Path $env:GITHUB_WORKSPACE 'pyenv'
-        $marker = Join-Path $venv ('ok-' + ((($pins + (Split-Path $index -Leaf)) -join '_') -replace '[^A-Za-z0-9_.]', '-'))
+        $marker = Join-Path $venv ('ok-' + ((($pins + (Split-Path $index -Leaf) + "py$pythonVersion") -join '_') -replace '[^A-Za-z0-9_.]', '-'))
         $py = Join-Path $venv 'Scripts\python.exe'
         if (-not (Test-Path $marker)) {
+          $base = $null
+          if (Get-Command py -ErrorAction SilentlyContinue) {
+            $found = & py "-$pythonVersion" -c 'import sys; print(sys.executable)' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $found) { $base = "$found".Trim() }
+          }
+          if (-not $base) {
+            $uvRoot = Join-Path $env:GITHUB_WORKSPACE 'uv'
+            $uvVenv = Join-Path $uvRoot 'tool'
+            $uv = Join-Path $uvVenv 'Scripts\uv.exe'
+            if (-not (Test-Path $uv)) {
+              python -m venv $uvVenv
+              if ($LASTEXITCODE -ne 0) { Write-Output "::error::Creating the uv tool environment failed."; exit 1 }
+              & (Join-Path $uvVenv 'Scripts\python.exe') -m pip install --disable-pip-version-check -q uv
+              if ($LASTEXITCODE -ne 0) { Write-Output "::error::Installing uv failed."; exit 1 }
+            }
+            $env:UV_PYTHON_INSTALL_DIR = Join-Path $uvRoot 'python'
+            & $uv python install $pythonVersion
+            if ($LASTEXITCODE -ne 0) { Write-Output "::error::uv could not install Python $pythonVersion."; exit 1 }
+            $base = "$(& $uv python find $pythonVersion)".Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $base) { Write-Output "::error::uv installed Python $pythonVersion but cannot find it."; exit 1 }
+          }
+          Write-Output "Building the venv from $base"
           if (Test-Path $venv) { Remove-Item -Recurse -Force $venv }
-          python -m venv $venv
+          & $base -m venv $venv
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::Creating the Python virtual environment failed."; exit 1 }
           & $py -m pip install --disable-pip-version-check -q $pins --extra-index-url $index
           if ($LASTEXITCODE -ne 0) { Write-Output "::error::Installing $($pins -join ', ') failed."; exit 1 }
@@ -191,7 +219,7 @@ jobs:
         if ($cuda -ne 'True') { Write-Output "::error::The CUDA build of torch cannot reach a device here (is_available: $cuda)."; exit 1 }
         "PARITY_PYTHON=$py", "AIDOTNET_TORCH_PYTHON=$py", 'AIDOTNET_REQUIRE_TORCH_CUDA=1' |
           Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
-        "Python packages (numpy, torch): $(& $py -I -c 'import numpy, torch; print(numpy.__version__, torch.__version__, torch.version.cuda)')" |
+        "Python packages (python, numpy, torch, cuda): $(& $py -I -c 'import sys, numpy, torch; print(sys.version.split()[0], numpy.__version__, torch.__version__, torch.version.cuda)')" |
           Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     # The harness steps below serve only the model-family step, which runs on SM86; the SM75 job skips them all.
@@ -543,6 +571,23 @@ jobs:
       env:
         RATCHET_FILTER: ${{ inputs.ratchet_filter }}
       run: |
+        # torch.compile's inductor builds C++ with MSVC on Windows: load the x64 build environment (vcvars64.bat of the
+        # newest Visual Studio with the VC tools) into this step. Without it every ratchet defers, so fail here, naming
+        # what the runner lacks, instead of reporting six deferrals.
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        $vs = if (Test-Path $vswhere) {
+          & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        }
+        $vcvars = if ($vs) { Join-Path "$vs".Trim() 'VC\Auxiliary\Build\vcvars64.bat' }
+        if (-not $vcvars -or -not (Test-Path $vcvars)) {
+          Write-Output "::error::torch.compile needs MSVC (Visual Studio 2022 or Build Tools with the C++ x64 tools and a Windows SDK); this runner has none."
+          exit 1
+        }
+        foreach ($line in (cmd /c "`"$vcvars`" >nul && set")) {
+          if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+        }
+        if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { Write-Output "::error::vcvars64.bat ran but cl.exe is not on PATH."; exit 1 }
+        Write-Output "MSVC: $vs"
         if ($env:RATCHET_FILTER -and $env:RATCHET_FILTER -notmatch '^[A-Za-z0-9_.]+$') {
           Write-Output "::error::ratchet_filter may hold only letters, digits, '_' and '.' (got '$env:RATCHET_FILTER')."; exit 1
         }
