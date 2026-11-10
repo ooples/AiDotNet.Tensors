@@ -40,6 +40,38 @@ internal static class AutoTensorCache
     [ThreadStatic]
     private static Dictionary<long, int>? _poolCounts;
 
+    // Bytes this thread's pools hold, against MaxPooledBytes.
+    [ThreadStatic]
+    private static long _pooledBytes;
+
+    // Clear() empties every thread's pools but can only reset the calling thread's counters; a thread whose epoch is
+    // behind resets its own on its next rent or return, instead of refusing buffers against counts of emptied pools.
+    private static int s_clearEpoch;
+    [ThreadStatic]
+    private static int _seenClearEpoch;
+
+    /// <summary>
+    /// Most bytes one thread's cache holds across all shapes (default 64 MB; <c>AIDOTNET_AUTOTENSORCACHE_MAX_BYTES</c>).
+    /// </summary>
+    /// <remarks>
+    /// The per-shape copy limits bounded each shape, not the total: every distinct shape a model ever produced kept
+    /// its copies for the life of the thread. AiDotNet's FasterRCNN training held 438 MB here, on top of the arena that
+    /// actually served its steps. Large results already recycle through ResultBufferTracker, whose free list has the
+    /// same 64 MB cap.
+    /// </remarks>
+    internal static long MaxPooledBytes { get; set; } =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_AUTOTENSORCACHE_MAX_BYTES"), out var maxBytes)
+            && maxBytes >= 0 ? maxBytes : 64L << 20;
+
+    private static void SyncClearEpoch()
+    {
+        int epoch = System.Threading.Volatile.Read(ref s_clearEpoch);
+        if (_seenClearEpoch == epoch) return;
+        _seenClearEpoch = epoch;
+        _poolCounts?.Clear();
+        _pooledBytes = 0;
+    }
+
     // Track all thread-local pools so Clear() can flush all threads, not just the caller's
     private static readonly List<WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>> _allPools = new();
 
@@ -173,10 +205,12 @@ internal static class AutoTensorCache
             lock (_allPools) { _allPools.Add(new WeakReference<ConcurrentDictionary<long, ConcurrentQueue<object>>>(pools)); }
         }
         long key = ComputeKey<T>(shape);
+        SyncClearEpoch();
 
         if (pools.TryGetValue(key, out var pool) && pool.TryDequeue(out var obj))
         {
             var tensor = (Tensor<T>)obj;
+            _pooledBytes -= (long)tensor.Length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
             // Decrement O(1) counter
             var counts = _poolCounts;
             if (counts is not null && counts.TryGetValue(key, out var cnt) && cnt > 0)
@@ -191,6 +225,7 @@ internal static class AutoTensorCache
                 return tensor;
             }
             pool.Enqueue(obj);
+            _pooledBytes += (long)tensor.Length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
             if (counts is not null)
                 counts[key] = (counts.TryGetValue(key, out var _cv) ? _cv : 0) + 1;
         }
@@ -230,6 +265,12 @@ internal static class AutoTensorCache
         // long test process. TensorPool refuses these tensors for the same reason (PR #638).
         if (tensor._gpuBuffer is not null || tensor._device != TensorDevice.CPU) return;
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } backing && HostSync.IsPending(backing)) return;
+        // Arena memory belongs to the arena, which reissues it after every step boundary (and, with
+        // Engines.Autodiff.BackwardRecycler, within a step once nothing reads it), while this cache outlives the step.
+        // Keeping it here put one buffer behind two owners: Conv2DBackwardInputInto's flipped kernel came back from
+        // this cache in a later conv backward while the arena had handed it to another, corrupting FasterRCNN's
+        // gradients. TensorPool refuses arena buffers for the same reason.
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } owned && TensorArena.IsArenaIssued(owned)) return;
 
         long elements = tensor.Length;
         if (elements > MaxElementsPerTensor)
@@ -246,13 +287,16 @@ internal static class AutoTensorCache
         var pool = pools.GetOrAdd(key, _ => new ConcurrentQueue<object>());
 
         // Use O(1) counter instead of O(n) pool.Count
+        SyncClearEpoch();
         var counts = _poolCounts ??= new Dictionary<long, int>();
         int currentCount = (counts.TryGetValue(key, out var _cv) ? _cv : 0);
         int maxCopies = GetMaxPerShape(elements);
-        if (currentCount < maxCopies)
+        long bytes = elements * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        if (currentCount < maxCopies && _pooledBytes + bytes <= MaxPooledBytes)
         {
             pool.Enqueue(tensor);
             counts[key] = currentCount + 1;
+            _pooledBytes += bytes;
         }
     }
 
@@ -261,6 +305,8 @@ internal static class AutoTensorCache
     {
         _pools?.Clear();
         _poolCounts?.Clear(); // Reset O(1) counters so Return() accepts buffers again
+        _pooledBytes = 0;
+        System.Threading.Interlocked.Increment(ref s_clearEpoch);
         lock (_allPools)
         {
             for (int i = _allPools.Count - 1; i >= 0; i--)
