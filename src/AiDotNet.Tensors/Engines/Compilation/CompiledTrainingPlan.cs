@@ -1950,16 +1950,23 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // The graph's external leaves (inputs no step produces) when AIDOTNET_COMPILED_INPUT_GRADS asks for their gradients;
     // empty otherwise.
+    // Computed once per compile (the flag read once, so every pass sees the same set) and cleared by Compile.
+    [ThreadStatic] private static HashSet<Tensor<T>>? t_requestedInputGradientLeaves;
+    [ThreadStatic] private static IReadOnlyList<CompiledStep<T>>? t_requestedInputGradientSteps;
+
     private static IEnumerable<Tensor<T>> RequestedInputGradientLeaves(IReadOnlyList<CompiledStep<T>> forwardSteps)
     {
-        if (!CompiledInputGradientsRequested) return Array.Empty<Tensor<T>>();
+        if (t_requestedInputGradientLeaves is { } cached && ReferenceEquals(t_requestedInputGradientSteps, forwardSteps))
+            return cached;
+        t_requestedInputGradientSteps = forwardSteps;
+        if (!CompiledInputGradientsRequested) return t_requestedInputGradientLeaves = new HashSet<Tensor<T>>();
         var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         foreach (var fwdStep in forwardSteps) produced.Add(fwdStep.OutputBuffer);
         var leaves = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         foreach (var fwdStep in forwardSteps)
             foreach (var leaf in fwdStep.Inputs.OfType<Tensor<T>>().Where(input => !produced.Contains(input)))
                 leaves.Add(leaf);
-        return leaves;
+        return t_requestedInputGradientLeaves = leaves;
     }
 
     private static int[][] BuildPooledGradMap(
@@ -8973,6 +8980,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             t_gradPlaceholders = null;
+            t_requestedInputGradientLeaves = null;
+            t_requestedInputGradientSteps = null;
         }
     }
 
@@ -9312,14 +9321,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // AIDOTNET_COMPILED_INPUT_GRADS=1 (#1096 follow-up): also treat the graph's external leaves (the network input,
         // labels, masks) as gradient sources, so the compiled step sets .Grad on them the way the eager tape does.
         // Saliency maps and adversarial examples need the input gradient; training does not, so it stays off.
-        if (CompiledInputGradientsRequested)
-        {
-            var producedByStep = new HashSet<Tensor<T>>();
-            foreach (var fwdStep in forwardSteps) producedByStep.Add(fwdStep.OutputBuffer);
-            foreach (var fwdStep in forwardSteps)
-                foreach (var fwdInput in fwdStep.Inputs.OfType<Tensor<T>>().Where(input => !producedByStep.Contains(input)))
-                    requiresGradTensors.Add(fwdInput);
-        }
+        requiresGradTensors.UnionWith(RequestedInputGradientLeaves(forwardSteps));
         foreach (var fwdStep in forwardSteps)
             foreach (var fwdInput in fwdStep.Inputs)
                 if (fwdInput is not null && requiresGradTensors.Contains(fwdInput))

@@ -61,8 +61,6 @@ public class Issue1096FollowUpTests
         Assert.Equal(2, ws.CompletedForwards);
     }
 
-    // Conv2D -> channel-bias add -> ReLU, optionally into a tiling max pool: the chain the conv-epilogue fusion detects,
-    // and with the pool, the pooled-fusion backward that runs at the pool's position.
     // Two external leaves into one same-shape add (each with a single consumer): the reshape/add gradient aliasing
     // shares their gradient buffers and skips the add's backward, and the gradient pool may give same-shaped leaves one
     // buffer. Both leaves must still publish their own .Grad, equal to the eager tape's, on every step.
@@ -197,6 +195,8 @@ public class Issue1096FollowUpTests
         }
     }
 
+    // Conv2D -> channel-bias add -> ReLU, optionally into a tiling max pool: the chain the conv-epilogue fusion detects,
+    // and with the pool, the pooled-fusion backward that runs at the pool's position.
     private static Tensor<float> ConvLoss(CpuEngine engine, Tensor<float> x, Tensor<float> w, Tensor<float> b, bool pooled)
     {
         var y = engine.FusedConv2D(x, w, b, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);

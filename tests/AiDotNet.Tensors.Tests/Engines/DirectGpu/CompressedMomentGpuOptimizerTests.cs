@@ -703,8 +703,10 @@ public sealed class CompressedMomentGpuOptimizerTests :
         const float eps = 1e-10f;
         const double relativeTolerance = 2e-5;
         var grad = Gradient(length);
-        float[] betas = { 0.9f, 0.99f, 0.999f, 0.9999f };
-        int[] steps = { 1, 2, 10, 1000 };
+        // 0.5 is the series' edge (|s| = 1/3) and 0.45 takes the library-log branch; t = 3, 4 at beta 0.9 and t = 35 at
+        // beta 0.99 put x = t log(beta) on either side of the -0.35 switch from Taylor to 1 - exp(x).
+        float[] betas = { 0.45f, 0.5f, 0.9f, 0.99f, 0.999f, 0.9999f };
+        int[] steps = { 1, 2, 3, 4, 10, 35, 1000 };
         foreach (float beta1 in betas)
         foreach (float beta2 in betas)
         foreach (int step in steps)
