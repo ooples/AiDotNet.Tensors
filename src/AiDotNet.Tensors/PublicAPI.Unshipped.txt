@@ -100,7 +100,6 @@ AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanRegularizationOrder
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanRegularizationOrder.SetL2Regularization(double strength, AiDotNet.Tensors.Engines.Compilation.GradientRegularizationOrder order) -> void
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
-AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
@@ -109,7 +108,6 @@ static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuAuditKernels.Int32ToFloat
 virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
-AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
@@ -120,3 +118,9 @@ override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.CDist(AiDotNet.Tensors
 override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.Int32ToFloat(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! raw, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n) -> void
 override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.PDist(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! input, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int n, int d, float p) -> void
 override AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend.ScatterPositions(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int srcDim, int inner, int n) -> void
+virtual AiDotNet.Tensors.Engines.CpuEngine.CausalDepthwiseConv1D<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.CausalDepthwiseConv1DBackwardInput<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.CausalDepthwiseConv1DBackwardKernel<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, int taps) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1D<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardInput<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardKernel<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, int taps) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!

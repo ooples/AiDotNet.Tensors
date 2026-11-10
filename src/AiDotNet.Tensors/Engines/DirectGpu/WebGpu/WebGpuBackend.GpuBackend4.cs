@@ -820,7 +820,7 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
         => DispatchRecurrence("gla", WebGpuRecurrenceKernels.GlaScan, batch * numHeads * headDim,
             new[] { q, k, v, gate, output }, new[] { batch, seqLen, modelDim, numHeads, headDim });
 
-    // GLA BPTT backward — real WGSL kernels (recompute trajectory + reverse sweep with bitcast-CAS
+    // GLA BPTT backward — real WGSL kernel (checkpointed recompute + reverse sweep with bitcast-CAS
     // u32 float atomics for the cross-row dQ/dK/dG). dQ/dK/dG must be pre-zeroed (the accumulators).
     public void GlaScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
@@ -829,29 +829,26 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
     {
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
-        int hh = headDim * headDim;
         long totalLong = checked((long)batch * numHeads * headDim);
-        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
-        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+        if (totalLong > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed WebGPU launch/buffer limits.");
         int total = (int)totalLong;
-        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // dQ/dK/dG are atomic accumulators in the backward kernel; zero them here so the
         // method is self-contained and correct even if the caller reuses dirty buffers.
         Fill(dQ, 0f, batch * seqLen * modelDim);
         Fill(dK, 0f, batch * seqLen * modelDim);
         Fill(dG, 0f, batch * seqLen * numHeads);
-        using var traj = AllocateBuffer((int)trajLenLong);
-        var pc = new[] { batch, seqLen, modelDim, numHeads, headDim };
-        DispatchRecurrence("gla_recompute", WebGpuRecurrenceKernels.GlaRecompute, total,
-            new[] { k, v, gate, traj }, pc);
-        // Q|K and gate|trajectory are packed: 8 storage bindings, WebGPU's guaranteed per-stage limit.
+        // State checkpoints every `chunk` steps plus one chunk of recomputed states instead of the full
+        // batch*heads*seqLen*headDim^2 trajectory (GlaScanCheckpoint).
+        var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        var pc = new[] { batch, seqLen, modelDim, numHeads, headDim, chunk };
+        // Q|K and gate|checkpoints|scratch are packed: 8 storage bindings, WebGPU's guaranteed per-stage limit.
         int qkCount = checked(batch * seqLen * modelDim), gateCount = checked(batch * seqLen * numHeads);
         using var qk = PackPair(q, k, qkCount);
-        using var gateTraj = AllocateBuffer(checked(gateCount + (int)trajLenLong));
-        Copy(gate, 0, gateTraj, 0, gateCount);
-        Copy(traj, 0, gateTraj, gateCount, (int)trajLenLong);
-        DispatchRecurrence("gla_backward", WebGpuRecurrenceKernels.GlaBackward, total,
-            new[] { dOut, qk, v, gateTraj, dQ, dK, dV, dG }, pc);
+        using var gcs = AllocateBuffer(checked(gateCount + ckptLen + scratchLen));
+        Copy(gate, 0, gcs, 0, gateCount);
+        DispatchRecurrence("gla_backward_ckpt", WebGpuRecurrenceKernels.GlaBackwardCheckpointed, total,
+            new[] { dOut, qk, v, gcs, dQ, dK, dV, dG }, pc);
     }
 
     public void XLstmScanForward(

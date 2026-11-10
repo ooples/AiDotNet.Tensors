@@ -178,6 +178,23 @@ public class CompiledCustomKernelCaptureTests
     }
 
     [Fact]
+    public void CausalDepthwiseConv1D_IsCapturedWithGradientsAndLiveReplay()
+    {
+        var p = new[] { Values(new[] { 2, 5, 3 }), Values(new[] { 3, 3 }, 0.21f) };
+        AssertCompiledParity("causal depthwise conv", p, (e, x) => e.CausalDepthwiseConv1D(x[0], x[1]));
+    }
+
+    [Fact]
+    public void DirectGpuCausalDepthwiseConv1D_IsCapturedWithGradientsAndLiveReplay()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var p = new[] { Values(new[] { 2, 5, 3 }), Values(new[] { 3, 3 }, 0.21f) };
+        AssertCompiledParity(
+            "DirectGpu causal depthwise conv", p, (e, x) => e.CausalDepthwiseConv1D(x[0], x[1]),
+            lossTolerance: 4e-4f, gradientTolerance: 3e-3f, executionEngine: engine);
+    }
+
+    [Fact]
     public void Interpolate_IsCapturedWithGradientsAndLiveReplay()
     {
         var p = new[] { Values(new[] { 1, 1, 2, 2 }, 0.1f, 0.17f) };

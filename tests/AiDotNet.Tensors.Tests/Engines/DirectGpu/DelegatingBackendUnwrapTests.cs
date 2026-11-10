@@ -27,5 +27,30 @@ public class DelegatingBackendUnwrapTests
         while (backend is DelegatingGpuBackend wrapper) backend = wrapper.InnerBackend;
         Assert.Same(physical, backend);
     }
+
+    // Every wrapper implements the index conversions by forwarding, so a recording wrapper over a backend without them
+    // used to record the conversion and fail only when the graph replayed, outside the engine's capability fallback.
+    [Fact]
+    public void Recording_an_index_conversion_the_physical_backend_lacks_fails_at_record_time()
+    {
+        var physical = MockDirectGpuBackend.Create(new MockBackendState());
+        var recording = new RecordingGpuBackend(new DelegatingGpuBackend(physical)) { ExecuteWhileRecording = false };
+        using var graph = new AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder();
+        var raw = new MockGpuBuffer(new float[4]);
+        var output = new MockGpuBuffer(new float[4]);
+        recording.BeginRecording(graph);
+        try
+        {
+            Assert.Throws<AiDotNet.Tensors.Engines.DirectGpu.GpuCapabilityUnavailableException>(
+                () => recording.Int32ToFloat(raw, output, 4));
+            Assert.Throws<AiDotNet.Tensors.Engines.DirectGpu.GpuCapabilityUnavailableException>(
+                () => recording.ScatterPositions(output, 2, 2, 4));
+            Assert.Equal(0, graph.NodeCount);
+        }
+        finally
+        {
+            recording.EndRecording();
+        }
+    }
 }
 #endif
