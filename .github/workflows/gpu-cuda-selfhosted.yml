@@ -27,6 +27,20 @@ on:
   schedule:
     - cron: '30 6 * * *'
   workflow_dispatch:
+    inputs:
+      # The step-time ratchets run only after every earlier step passes, and the GPU suites alone can fill their
+      # watchdog, so a dispatch could never reach them to record a baseline (#1703). ratchets_only builds the tests and
+      # runs just the ratchet step on the RTX 3080: no GPU suites, torch interop host, skip gate or model families.
+      ratchets_only:
+        description: Run only the CUDA step-time ratchets on the RTX 3080 (skips the GPU suites and model families)
+        type: boolean
+        default: false
+      # Narrows the ratchet step to matching tests (a FullyQualifiedName substring, e.g. Fp16 or Resnet18), so recording
+      # one network's baseline does not hold the shared runner for every network's PyTorch compile.
+      ratchet_filter:
+        description: Optional FullyQualifiedName substring that narrows the ratchet tests (empty runs them all)
+        type: string
+        default: ''
   # Pull requests run this workflow through ci.yml, as one job of the pull request's single CI run, when ci.yml's
   # changes job finds a file matching its path filter (cuda in .github/ci-path-filters.yml). Pushes to main do not
   # run it: the nightly schedule covers main.
@@ -81,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJSON(github.event_name == 'pull_request' && '["sm86"]' || '["sm86","sm75"]') }}
+        arch: ${{ fromJSON((github.event_name == 'pull_request' || inputs.ratchets_only) && '["sm86"]' || '["sm86","sm75"]') }}
     name: ${{ matrix.arch == 'sm86' && 'cuda' || format('cuda-{0}', matrix.arch) }}
     # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86 or sm75); a runner registered before
     # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
@@ -182,7 +196,7 @@ jobs:
 
     # The harness steps below serve only the model-family step, which runs on SM86; the SM75 job skips them all.
     - name: Check out AiDotNet beside this checkout
-      if: matrix.arch == 'sm86'
+      if: matrix.arch == 'sm86' && !inputs.ratchets_only
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: ooples/AiDotNet
@@ -195,7 +209,7 @@ jobs:
     # and MobileNetV2 training. Checked first, so a lane enabled without a harness that defines them fails in its first
     # minute with the fix in the message, not after the GPU suites.
     - name: Check the AiDotNet harness defines every model family
-      if: matrix.arch == 'sm86'
+      if: matrix.arch == 'sm86' && !inputs.ratchets_only
       run: |
         $program = Get-Content aidn/benchmarks/AiDotNet.PyTorchParity/Program.cs -Raw
         $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
@@ -242,12 +256,14 @@ jobs:
         "cuDNN: $version (CUDA 13) at $($dll.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     - name: Check the lane selects every GPU test class
+      if: ${{ !inputs.ratchets_only }}
       run: python AiDotNet.Tensors/scripts/ci/check-cuda-lane-coverage.py --filter ($env:CUDA_LANE_FILTER -replace "\s", "") AiDotNet.Tensors/tests
 
     - name: Build tests (net10.0)
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
     - name: GPU suites (DirectGpu, Autodiff, Compilation, Parity)
+      if: ${{ !inputs.ratchets_only }}
       env:
         # cuDNN's own error log, uploaded with the TRX. A cuDNN failure such as CUDNN_STATUS_EXECUTION_FAILED_CUDART
         # then names the CUDA runtime call that failed, which the exception does not.
@@ -421,7 +437,7 @@ jobs:
     # ours first, torch's cudnn_cnn64_9.dll bound to our modules and failed with WinError 127, so every test of the
     # class failed. In a host of its own, torch is imported before the class creates an engine.
     - name: Embedded torch interop (own test host)
-      if: ${{ !cancelled() }}
+      if: ${{ !cancelled() && !inputs.ratchets_only }}
       # Eight tests and one interpreter start: seconds. The bound leaves the model families' ~18 minutes and the upload
       # inside the job limit even when the suites end at the watchdog deadline (about 123 minutes into the job).
       timeout-minutes: 5
@@ -460,7 +476,7 @@ jobs:
         if ($searchErrors.Count -gt 0) { Write-Output "::error::The dump search was incomplete; unreachable dumps were not analysed."; exit 1 }
 
     - name: Fail on unexplained skips
-      if: always()
+      if: ${{ always() && !inputs.ratchets_only }}
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
@@ -490,7 +506,7 @@ jobs:
 
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
-      if: matrix.arch == 'sm86'
+      if: matrix.arch == 'sm86' && !inputs.ratchets_only
       # About 18 minutes in a passing run; bounded so the job budget above holds.
       timeout-minutes: 22
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
@@ -524,10 +540,15 @@ jobs:
     - name: CUDA step-time ratchets (nightly)
       if: ${{ success() && matrix.arch == 'sm86' && github.event_name != 'pull_request' }}
       timeout-minutes: 360
+      env:
+        RATCHET_FILTER: ${{ inputs.ratchet_filter }}
       run: |
+        if ($env:RATCHET_FILTER -and $env:RATCHET_FILTER -notmatch '^[A-Za-z0-9_.]+$') {
+          Write-Output "::error::ratchet_filter may hold only letters, digits, '_' and '.' (got '$env:RATCHET_FILTER')."; exit 1
+        }
         dotnet test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj `
           --configuration Release --no-build --framework net10.0 `
-          --filter "FullyQualifiedName~.HeadToHeadGpuNetworkTests.&Category=PyTorchParityGpu" `
+          --filter "FullyQualifiedName~.HeadToHeadGpuNetworkTests.&Category=PyTorchParityGpu$(if ($env:RATCHET_FILTER) { "&FullyQualifiedName~$env:RATCHET_FILTER" })" `
           --results-directory "${{ runner.temp }}/ratchets" --logger "trx;LogFileName=cuda-ratchets.trx" `
           --blame-hang --blame-hang-timeout 75m --blame-crash
         $tests = $LASTEXITCODE
@@ -540,7 +561,12 @@ jobs:
             if ($r.outcome -in 'Passed', 'Failed') { $ran[$r.testName] = $true }
           }
         }
-        $missing = @('Mlp', 'Cnn', 'Lstm', 'Gru', 'Transformer', 'Resnet18' |
+        # A filtered dispatch selects only some networks on purpose; the full set must report only on an unfiltered run.
+        $networks = if ($env:RATCHET_FILTER) { @() } else { @('Mlp', 'Cnn', 'Lstm', 'Gru', 'Transformer', 'Resnet18') }
+        if ($env:RATCHET_FILTER -and $ran.Count -eq 0) {
+          Write-Output "::error::ratchet_filter '$env:RATCHET_FILTER' ran no ratchet test."; exit 1
+        }
+        $missing = @($networks |
           ForEach-Object { "AiDotNet.Tensors.Tests.Parity.HeadToHeadGpuNetworkTests.$($_)_Cuda_DoesNotRegress" } |
           Where-Object { -not $ran.ContainsKey($_) })
         foreach ($name in $missing) { Write-Output "::error::Ratchet $name did not run (no pass or failure in the results)." }
