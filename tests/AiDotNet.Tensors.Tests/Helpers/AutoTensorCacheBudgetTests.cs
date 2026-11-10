@@ -1,3 +1,4 @@
+using System;
 using System.Threading;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -153,5 +154,43 @@ public class AutoTensorCacheBudgetTests
             AutoTensorCache.MaxPooledBytes = prior;
             AutoTensorCache.Clear();
         }
+    }
+
+    /// <summary>
+    /// A thread that exits leaves its pooled tensors unreachable. Their bytes must leave the shared budget when its
+    /// pools are reaped (on the next thread's first use, or a Clear), or the budget shrinks by them for good.
+    /// </summary>
+    [Fact]
+    public void ExitedThreadsPooledBytes_LeaveTheBudget()
+    {
+        long prior = AutoTensorCache.MaxPooledBytes;
+        try
+        {
+            AutoTensorCache.Clear();
+            AutoTensorCache.MaxPooledBytes = AutoTensorCache.DefaultMaxPooledBytes;
+            RunOnExitingThread(() => AutoTensorCache.Return(new Tensor<float>(new[] { 25, 40 })));
+            Assert.Equal(1000L * sizeof(float), AutoTensorCache.PooledBytes);
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            // A new thread's first use reaps the exited thread's pools.
+            RunOnExitingThread(() => AutoTensorCache.RentOrAllocate<float>(new[] { 3, 3 }));
+            Assert.Equal(AutoTensorCache.CountPooledBytes(), AutoTensorCache.PooledBytes);
+            Assert.Equal(0, AutoTensorCache.PooledBytes);
+        }
+        finally
+        {
+            AutoTensorCache.MaxPooledBytes = prior;
+            AutoTensorCache.Clear();
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void RunOnExitingThread(ThreadStart work)
+    {
+        var thread = new Thread(work);
+        thread.Start();
+        thread.Join();
     }
 }
