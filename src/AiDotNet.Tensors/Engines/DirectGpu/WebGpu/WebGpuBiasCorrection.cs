@@ -9,12 +9,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// <remarks>
 /// The same series as <see cref="Vulkan.VulkanBiasCorrection"/>, which documents the error bounds. WGSL's <c>log</c> has the
 /// same 2^-21 absolute bound on [0.5, 2] as GLSL's, and the naive <c>1.0 - pow(beta, t)</c> loses ~3e-4 relative at
-/// beta = 0.9999, t = 2.
+/// beta = 0.9999, t = 2. beta = 0 returns 1 (1 - 0^t for t &gt;= 1), since WGSL's log(0) is implementation-defined.
 /// </remarks>
 internal static class WebGpuBiasCorrection
 {
     internal const string Wgsl = @"
 fn wgsl_bias_correction(beta: f32, t: f32) -> f32 {
+    if (beta <= 0.0) {
+        return 1.0;
+    }
     var l: f32;
     if (beta >= 0.5) {
         let d = 1.0 - beta;

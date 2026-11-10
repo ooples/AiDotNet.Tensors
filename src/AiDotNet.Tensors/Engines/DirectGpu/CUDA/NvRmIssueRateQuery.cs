@@ -183,9 +183,11 @@ internal sealed class NvRmIssueRateQuery : ISmIssueRateQuery
         {
             return TryQueryLinux(pciDomain, pciBus, pciDevice, out modifier, out failure);
         }
-        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or MarshalDirectiveException)
+        catch (Exception ex) when (ex is not OutOfMemoryException)
         {
-            failure = "libc ioctl is unavailable: " + ex.Message;
+            // Best effort: the caller measures instead. Any P/Invoke failure (a missing or non-ELF libc, a marshaling
+            // error) must report false here, not escape into the GEMM call that asked for the rate.
+            failure = "the driver query failed (" + ex.GetType().Name + "): " + ex.Message;
             return false;
         }
     }

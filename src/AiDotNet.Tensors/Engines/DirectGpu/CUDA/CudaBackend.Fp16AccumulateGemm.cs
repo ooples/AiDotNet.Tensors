@@ -368,8 +368,12 @@ public sealed partial class CudaBackend
     {
         if (Fp16AccumulateCacheUnavailableForTests) return false;
         // No rate class, no verdict: one stored under "unknown" could be reused at a different rate after an unlock.
-        // False takes the same path as a refusing cache (deterministic mode falls back to cuBLAS).
-        if (MmaRate() is not { } rate) return false;
+        // False takes the same path as a refusing cache (deterministic mode falls back to cuBLAS). Read under the tune
+        // lock: TuneFp16AccumulateRouteAsync reaches here outside it, and a concurrent first GEMM would start a second
+        // probe whose launches disturb the first one's timings.
+        PtxMmaRateProbe.Result? measured;
+        lock (_fp16AccumulateTuneLock) measured = MmaRate();
+        if (measured is not { } rate) return false;
         try
         {
             var parameters = new Dictionary<string, string>(StringComparer.Ordinal)

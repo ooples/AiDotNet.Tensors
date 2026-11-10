@@ -738,6 +738,73 @@ public sealed class CompressedMomentGpuOptimizerTests :
         }
     }
 
+    // The same isolation for the other kernels the cancellation-free correction changed: AMSGrad (its running max of v
+    // is v itself from zero state), Nadam (whose look-ahead also corrects with step + 1) and the sparse Adam scatter
+    // (every index present, so it is the dense update). beta1 = 0 is a valid Adam setting whose correction is exactly 1:
+    // GLSL and WGSL leave log(0) undefined, so the helpers return 1 for it before taking the log.
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void BiasCorrectionNearBetaOne_HoldsForAmsgradNadamAndSparseAdam_OnMetalVulkanAndCuda(BackendKind kind)
+    {
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
+
+        const int length = 37;
+        const float lr = 0.01f;
+        const float eps = 1e-10f;
+        const double relativeTolerance = 2e-5;
+        var grad = Gradient(length);
+        var indices = Enumerable.Range(0, length).Select(i => (float)i).ToArray();
+        float[] betas1 = { 0f, 0.5f, 0.9f, 0.999f, 0.9999f };
+        float[] betas2 = { 0.5f, 0.9f, 0.999f, 0.9999f };
+        int[] steps = { 1, 2, 35, 1000 };
+        foreach (float beta1 in betas1)
+        foreach (float beta2 in betas2)
+        foreach (int step in steps)
+        {
+            double c1 = 1 - Math.Pow(beta1, step), c1Next = 1 - Math.Pow(beta1, step + 1), c2 = 1 - Math.Pow(beta2, step);
+            var adam = new double[length];
+            var nadam = new double[length];
+            for (int i = 0; i < length; i++)
+            {
+                double m = (1.0 - beta1) * grad[i], v = (1.0 - beta2) * grad[i] * (double)grad[i];
+                double denominator = Math.Sqrt(v / c2) + eps;
+                adam[i] = -lr * (m / c1) / denominator;
+                nadam[i] = -lr * ((beta1 * m / c1Next) + ((1.0 - beta1) * grad[i] / c1)) / denominator;
+            }
+
+            string at = $"b1={beta1} b2={beta2} t={step}";
+            using (var param = backend.AllocateBuffer(new float[length]))
+            using (var g = backend.AllocateBuffer(grad))
+            using (var m = backend.AllocateBuffer(new float[length]))
+            using (var v = backend.AllocateBuffer(new float[length]))
+            using (var vMax = backend.AllocateBuffer(new float[length]))
+            {
+                backend.AmsgradUpdate(param, g, m, v, vMax, lr, beta1, beta2, eps, 0f, step, length);
+                AssertRelative(adam, backend.DownloadBuffer(param), relativeTolerance, $"{kind} AMSGrad {at}");
+            }
+
+            using (var param = backend.AllocateBuffer(new float[length]))
+            using (var g = backend.AllocateBuffer(grad))
+            using (var m = backend.AllocateBuffer(new float[length]))
+            using (var v = backend.AllocateBuffer(new float[length]))
+            {
+                backend.NadamUpdate(param, g, m, v, lr, beta1, beta2, eps, 0f, step, length);
+                AssertRelative(nadam, backend.DownloadBuffer(param), relativeTolerance, $"{kind} Nadam {at}");
+            }
+
+            using (var param = backend.AllocateBuffer(new float[length]))
+            using (var m = backend.AllocateBuffer(new float[length]))
+            using (var v = backend.AllocateBuffer(new float[length]))
+            using (var sparseIndices = backend.AllocateBuffer(indices))
+            using (var sparseValues = backend.AllocateBuffer(grad))
+            {
+                backend.SparseAdamUpdate(param, m, v, sparseIndices, sparseValues, length, lr, beta1, beta2, eps, 0f, step);
+                AssertRelative(adam, backend.DownloadBuffer(param), relativeTolerance, $"{kind} sparse Adam {at}");
+            }
+        }
+    }
+
     private static void AssertRelative(double[] expected, float[] actual, double tolerance, string label)
     {
         for (int i = 0; i < expected.Length; i++)
