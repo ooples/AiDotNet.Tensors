@@ -4683,7 +4683,7 @@ public partial class DirectGpuTensorEngine
             return GetOrAllocateBuffer(backend, indices);
         using var raw = GetOrAllocateBuffer(backend, indices);
         var numeric = AllocateOutputBuffer(backend, Math.Max(1, indices.Length));
-        backend.Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
+        IndexConversion.Of(backend).Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
         return numeric;
     }
 
@@ -9643,7 +9643,7 @@ public partial class DirectGpuTensorEngine
     {
         int n = outer * dstDim * inner, m = outer * srcDim * inner;
         // Each write's position j along the axis, generated on the device (no host upload, so graph capture holds).
-        backend.ScatterPositions(positions, srcDim, inner, m);
+        IndexConversion.Of(backend).ScatterPositions(positions, srcDim, inner, m);
         backend.Fill(claims, -1f, n);
         backend.ScatterReduce(claims, positions, int32Index, outer, srcDim, dstDim, inner, 2);
         backend.TakeAlongDim(claims, floatIndex, winners, outer, srcDim, inner, dstDim);
