@@ -119,6 +119,9 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
         return Array.Empty<ILazyNode>();
     }
 
+    // A cross-type node writes a fresh output of another element type, never a tensor in place.
+    public bool SavePersistentWrite(HashSet<object> saved, List<Action> restores) => false;
+
     public void ClearOutputLazySource()
     {
         Output.LazySource = null;

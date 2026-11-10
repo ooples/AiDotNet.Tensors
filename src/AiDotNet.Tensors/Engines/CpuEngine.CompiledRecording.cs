@@ -54,13 +54,16 @@ public partial class CpuEngine
 
         Tensor<T> traced;
         GraphMode.SetCurrent(null);
+        var restore = SaveOperandWrites(operands);
         try
         {
+            RealizeOperands(operands);
             using (new NoGradScope<T>())
                 traced = OwnedOutput(forward(this));
         }
         finally
         {
+            restore();
             GraphMode.SetCurrent(scope);
         }
 
@@ -96,6 +99,43 @@ public partial class CpuEngine
         return operands.Count == 0 ? null : current;
     }
 
+    // The trace-time run materializes the node's output, and the plan builds on that value. Its kernels read operands
+    // through accessors that deliberately do not realize a lazy node (compile-time code reads placeholders through
+    // them), so an operand recorded earlier in this trace and not yet run was read as whatever its buffer held:
+    // uninitialized memory under a compiled step's fresh allocations, and a first-step loss that changed run to run.
+    private static void RealizeOperands<T>(List<Tensor<T>> operands)
+    {
+        foreach (var node in operands.Select(operand => operand.LazySource).OfType<ILazyNode>().Where(lazy => !lazy.IsRealized))
+            node.Realize(node.RecordingEngine);
+    }
+
+    // Realizing the operands also runs the in-place writes they depend on, and the plan runs those again every step:
+    // a write to a persistent tensor (a running statistic) would then land twice in the first step. Each such tensor
+    // is copied before the operands are realized; the returned action puts it back and marks its writes unrun, so
+    // the tensor leaves the trace as the trace found it.
+    private static Action SaveOperandWrites<T>(List<Tensor<T>> operands)
+    {
+        var seen = new HashSet<ILazyNode>();
+        var pending = new Stack<ILazyNode>(operands.Select(operand => operand.LazySource).OfType<ILazyNode>());
+        var saved = new HashSet<object>();
+        var restores = new List<Action>();
+        var writes = new List<ILazyNode>();
+        while (pending.Count > 0)
+        {
+            var node = pending.Pop();
+            if (node.IsRealized || !seen.Add(node)) continue;
+            if (node.SavePersistentWrite(saved, restores)) writes.Add(node);
+            foreach (var input in node.GetInputNodes()) pending.Push(input);
+        }
+
+        if (writes.Count == 0) return static () => { };
+        return () =>
+        {
+            foreach (var putBack in restores) putBack();
+            foreach (var write in writes) write.IsRealized = false;
+        };
+    }
+
     // A plan's buffers have the trace's shapes. An op whose output shape depends on data (MaskedSelect counts its
     // mask) is recorded with the trace's shape; a replay whose data changed that shape fails here, loudly.
     private static Tensor<T> CheckReplayShape<T>(string opName, Tensor<T> fresh, Tensor<T> output)
@@ -129,8 +169,10 @@ public partial class CpuEngine
         Tensor<T> traced;
         TAux tracedAux;
         GraphMode.SetCurrent(null);
+        var restore = SaveOperandWrites(operands);
         try
         {
+            RealizeOperands(operands);
             using (new NoGradScope<T>())
             {
                 var (r, a) = forward(this);
@@ -140,6 +182,7 @@ public partial class CpuEngine
         }
         finally
         {
+            restore();
             GraphMode.SetCurrent(scope);
         }
 
