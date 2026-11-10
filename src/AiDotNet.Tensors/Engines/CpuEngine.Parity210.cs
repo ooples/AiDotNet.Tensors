@@ -269,6 +269,10 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         axes ??= new[] { 0, 1 };
         if (axes.Length != 2) throw new ArgumentException("Rot90 requires exactly 2 axes");
+        // torch.rot90 takes negative axes from the end; anything outside the rank has no plane to rotate.
+        axes = new[] { axes[0] < 0 ? axes[0] + tensor.Rank : axes[0], axes[1] < 0 ? axes[1] + tensor.Rank : axes[1] };
+        if (axes[0] < 0 || axes[0] >= tensor.Rank || axes[1] < 0 || axes[1] >= tensor.Rank)
+            throw new ArgumentOutOfRangeException(nameof(axes), $"Rot90 axes must lie in a rank-{tensor.Rank} tensor.");
         if (axes[0] == axes[1]) throw new ArgumentException("Rot90 axes must be different");
 
         // k mod 4; if k<0, adjust to positive rotation count.
@@ -280,8 +284,6 @@ public partial class CpuEngine
         //                    k=3 ≡ flip(axes[0]) then transpose(axes).
         var result = tensor;
         int a0 = axes[0], a1 = axes[1];
-        if (a0 < 0) a0 += tensor.Rank;
-        if (a1 < 0) a1 += tensor.Rank;
 
         for (int s = 0; s < steps; s++)
         {
@@ -801,6 +803,7 @@ public partial class CpuEngine
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.TensorPDist(input, p));
         if (input.Rank != 2) throw new ArgumentException("PDist requires rank-2 input");
+        ValidateNormOrder(p);
         int n = input._shape[0];
         int d = input._shape[1];
         if (n == 0) return new Tensor<T>(new[] { 0 });
@@ -842,10 +845,13 @@ public partial class CpuEngine
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
                 new[] { x1, x2 }, engine => engine.TensorCDist(x1, x2, p));
-        if (x1.Rank != 2 || x2.Rank != 2)
-            throw new ArgumentException("CDist requires rank-2 inputs");
-        if (x1._shape[1] != x2._shape[1])
+        if (x1.Rank < 2 || x2.Rank < 2)
+            throw new ArgumentException("CDist needs inputs of shape [..., P, M] and [..., R, M].");
+        ValidateNormOrder(p);
+        if (x1._shape[x1.Rank - 1] != x2._shape[x2.Rank - 1])
             throw new ArgumentException("CDist: feature dim must match");
+        // torch.cdist: leading batch dims broadcast; the output is [batch..., P, R].
+        var batchShape = CDistBatchLayout(x1._shape, x2._shape, out var base1, out var base2);
 
         var ops = MathHelper.GetNumericOperations<T>();
         // #257: preserve the user-facing refs before .Contiguous() discards GradFn.
@@ -857,14 +863,22 @@ public partial class CpuEngine
         var a = aLease.Span;
         using var bLease = x2.Lease();
         var b = bLease.Span;
-        int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
+        int m = x1._shape[x1.Rank - 2], n = x2._shape[x2.Rank - 2], d = x1._shape[x1.Rank - 1];
 
-        var result = new Tensor<T>(new[] { m, n });
+        var outShape = new int[batchShape.Length + 2];
+        Array.Copy(batchShape, outShape, batchShape.Length);
+        outShape[batchShape.Length] = m;
+        outShape[batchShape.Length + 1] = n;
+        var result = new Tensor<T>(outShape);
         using var dstLease = result.LeaseWritable();
         var dst = dstLease.Span;
-        for (int i = 0; i < m; i++)
-            for (int j = 0; j < n; j++)
-                dst[i * n + j] = PNormCross(ops, a, i * d, b, j * d, d, p);
+        for (int bi = 0; bi < base1.Length; bi++)
+        {
+            int o1 = base1[bi] * m * d, o2 = base2[bi] * n * d, oo = bi * m * n;
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    dst[oo + i * n + j] = PNormCross(ops, a, o1 + i * d, b, o2 + j * d, d, p);
+        }
 
         // Tape registration — this op recorded nothing, so neither input received a gradient
         // despite OpRegistry classifying TensorCDist as differentiable.
@@ -873,6 +887,45 @@ public partial class CpuEngine
             BackwardFunctions<T>.CDistBackward,
             savedState: new object[] { p });
         return result;
+    }
+
+    /// <summary>
+    /// Batch layout of <c>cdist</c> on [b1..., P, M] and [b2..., R, M]: the broadcast batch shape, and for each
+    /// output batch (row-major) the index of the matrix it reads in each input.
+    /// </summary>
+    internal static int[] CDistBatchLayout(int[] s1, int[] s2, out int[] base1, out int[] base2)
+    {
+        int r1 = s1.Length - 2, r2 = s2.Length - 2, r = Math.Max(r1, r2);
+        var shape = new int[r];
+        for (int k = 0; k < r; k++)
+        {
+            int k1 = k - (r - r1), k2 = k - (r - r2);
+            int a = k1 >= 0 ? s1[k1] : 1, b = k2 >= 0 ? s2[k2] : 1;
+            if (a != b && a != 1 && b != 1)
+                throw new ArgumentException($"CDist: batch dim {k} is {a} vs {b}; they do not broadcast.");
+            // A singleton broadcasts to the other size, 0 included: batches 0 and 1 give 0, not Math.Max's 1.
+            shape[k] = a == 1 ? b : a;
+        }
+        int count = 1;
+        foreach (var v in shape) count *= v;
+        base1 = new int[count];
+        base2 = new int[count];
+        var idx = new int[r];
+        for (int bi = 0; bi < count; bi++)
+        {
+            int rem = bi;
+            for (int k = r - 1; k >= 0; k--) { idx[k] = rem % shape[k]; rem /= shape[k]; }
+            int f1 = 0, f2 = 0;
+            for (int k = 0; k < r; k++)
+            {
+                int k1 = k - (r - r1), k2 = k - (r - r2);
+                if (k1 >= 0) f1 = f1 * s1[k1] + (s1[k1] == 1 ? 0 : idx[k]);
+                if (k2 >= 0) f2 = f2 * s2[k2] + (s2[k2] == 1 ? 0 : idx[k]);
+            }
+            base1[bi] = f1;
+            base2[bi] = f2;
+        }
+        return shape;
     }
 
     private static T PNorm<T>(Interfaces.INumericOperations<T> ops, System.ReadOnlySpan<T> s,
@@ -884,19 +937,13 @@ public partial class CpuEngine
         // here diverged from the fp32 GPU kernel by ~1% at d≈129 — the recorded GPU/CPU parity
         // failure (TensorPDist on [129,129]: max_abs_err 1.37e-2 > tol 1e-2). Float-vs-float is
         // bit-consistent (same sequential op order as the kernel).
+        var order = ClassifyNormOrder(p);
         if (typeof(T) == typeof(float))
         {
-            float pf = (float)p;
             float sumF = 0f;
             for (int k = 0; k < d; k++)
-            {
-                float diff = System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k]));
-                if (pf == 1f) sumF += diff;
-                else if (pf == 2f) sumF += diff * diff;
-                else sumF += (float)System.Math.Pow(diff, p);
-            }
-            float resF = pf == 1f ? sumF : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
-            return ops.FromFloat(resF);
+                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(s[offA + k]) - ops.ToFloat(s[offB + k])), order, p);
+            return ops.FromFloat(FinishNormF(sumF, order, p));
         }
 
         // Non-float T keeps the double path (higher precision; no GPU bit-equivalence committed).
@@ -904,9 +951,9 @@ public partial class CpuEngine
         for (int k = 0; k < d; k++)
         {
             double diff = System.Convert.ToDouble(s[offA + k]) - System.Convert.ToDouble(s[offB + k]);
-            acc += System.Math.Pow(System.Math.Abs(diff), p);
+            acc = AccumulateNorm(acc, System.Math.Abs(diff), order, p);
         }
-        return ops.FromDouble(System.Math.Pow(acc, 1.0 / p));
+        return ops.FromDouble(FinishNorm(acc, order, p));
     }
 
     private static T PNormCross<T>(Interfaces.INumericOperations<T> ops,
@@ -918,6 +965,7 @@ public partial class CpuEngine
         // by exactly the fp32 rounding noise of d squared-diff terms — ~1% at
         // d=129 — and force every consumer-GPU CDist call to either pay 32-64×
         // FP64 throughput penalty or accept the mismatch).
+        var order = ClassifyNormOrder(p);
         if (typeof(T) == typeof(float))
         {
             // Accumulate in float (not double) to match the GPU's fp32 parity210_cdist.
@@ -926,17 +974,10 @@ public partial class CpuEngine
             // INumericOperations seam (ops.ToFloat / ops.FromFloat) — the codebase's
             // constraint-free conversion mechanism — which for typeof(T)==float is the exact
             // float value with no precision loss.
-            float pf = (float)p;
             float sumF = 0f;
             for (int k = 0; k < d; k++)
-            {
-                float diff = System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k]));
-                if (pf == 1f) sumF += diff;
-                else if (pf == 2f) sumF += diff * diff;
-                else sumF += (float)System.Math.Pow(diff, p);
-            }
-            float resF = pf == 1f ? sumF : pf == 2f ? (float)System.Math.Sqrt(sumF) : (float)System.Math.Pow(sumF, 1.0 / p);
-            return ops.FromFloat(resF);
+                sumF = AccumulateNormF(sumF, System.Math.Abs(ops.ToFloat(a[offA + k]) - ops.ToFloat(b[offB + k])), order, p);
+            return ops.FromFloat(FinishNormF(sumF, order, p));
         }
 
         // Non-float T (e.g. double) keeps the double-precision path — the
@@ -946,9 +987,65 @@ public partial class CpuEngine
         for (int k = 0; k < d; k++)
         {
             double diff = System.Convert.ToDouble(a[offA + k]) - System.Convert.ToDouble(b[offB + k]);
-            acc += System.Math.Pow(System.Math.Abs(diff), p);
+            acc = AccumulateNorm(acc, System.Math.Abs(diff), order, p);
         }
-        return ops.FromDouble(System.Math.Pow(acc, 1.0 / p));
+        return ops.FromDouble(FinishNorm(acc, order, p));
+    }
+
+    /// <summary>
+    /// The kind of a torch p-norm order, decided once per distance. p = 0 counts differing coordinates and p = +inf
+    /// keeps the largest difference; 1 and 2 have their own float arithmetic; any other p sums |diff|^p. The kind is
+    /// chosen on the double p, so a positive p that rounds to float 0 or +inf is still the p-norm the backward
+    /// differentiates.
+    /// </summary>
+    internal enum NormOrder { Count, Manhattan, Euclidean, Max, General }
+
+    internal static NormOrder ClassifyNormOrder(double p) =>
+        double.IsPositiveInfinity(p) ? NormOrder.Max
+        : p == 0 ? NormOrder.Count
+        : p == 1 ? NormOrder.Manhattan
+        : p == 2 ? NormOrder.Euclidean
+        : NormOrder.General;
+
+    // A difference counts when it is not zero; NaN counts too (NaN != 0), as in torch. |diff| is never negative.
+    private static bool Differs(double absDiff) => absDiff > 0 || double.IsNaN(absDiff);
+
+    /// <summary>
+    /// One coordinate of a double p-norm distance. A NaN difference propagates through the maximum. Orders 1 and 2
+    /// take the general |diff|^p form here, as the double path always has.
+    /// </summary>
+    private static double AccumulateNorm(double acc, double absDiff, NormOrder order, double p) => order switch
+    {
+        NormOrder.Count => acc + (Differs(absDiff) ? 1 : 0),
+        NormOrder.Max => absDiff > acc || double.IsNaN(absDiff) ? absDiff : acc,
+        _ => acc + System.Math.Pow(absDiff, p),
+    };
+
+    private static double FinishNorm(double acc, NormOrder order, double p) =>
+        order is NormOrder.Count or NormOrder.Max ? acc : System.Math.Pow(acc, 1.0 / p);
+
+    /// <summary><see cref="AccumulateNorm"/> in float, the GPU kernels' arithmetic.</summary>
+    private static float AccumulateNormF(float sum, float absDiff, NormOrder order, double p) => order switch
+    {
+        NormOrder.Manhattan => sum + absDiff,
+        NormOrder.Euclidean => sum + absDiff * absDiff,
+        NormOrder.Count => sum + (Differs(absDiff) ? 1f : 0f),
+        NormOrder.Max => absDiff > sum || float.IsNaN(absDiff) ? absDiff : sum,
+        _ => sum + (float)System.Math.Pow(absDiff, p),
+    };
+
+    private static float FinishNormF(float sum, NormOrder order, double p) => order switch
+    {
+        NormOrder.Euclidean => (float)System.Math.Sqrt(sum),
+        NormOrder.General => (float)System.Math.Pow(sum, 1.0 / p),
+        _ => sum,
+    };
+
+    /// <summary>torch.cdist / pdist take p in [0, +inf]; a negative or NaN p has no norm.</summary>
+    internal static void ValidateNormOrder(double p)
+    {
+        if (double.IsNaN(p) || p < 0)
+            throw new ArgumentOutOfRangeException(nameof(p), $"The p-norm order must be in [0, +inf]; got {p}.");
     }
 
     /// <inheritdoc/>
@@ -3550,6 +3647,51 @@ public partial class CpuEngine
         return new Tensor<T>(outArr, new[] { outArr.Length });
     }
 
+    /// <summary>
+    /// torch.searchsorted with an N-D sorted sequence [..., S]: values [..., V] share its leading dims, and each
+    /// row of values is searched in its own row of the sequence.
+    /// </summary>
+    private Tensor<int> SearchSortedBatched<T>(Tensor<T> sortedSequence, Tensor<T> values, bool right)
+    {
+        int rank = sortedSequence.Rank;
+        if (values.Rank != rank)
+            throw new ArgumentException($"SearchSorted: values must have the sorted sequence's rank {rank}; got {values.Rank}.");
+        for (int d = 0; d < rank - 1; d++)
+            if (values._shape[d] != sortedSequence._shape[d])
+                throw new ArgumentException($"SearchSorted: leading dim {d} is {values._shape[d]} vs {sortedSequence._shape[d]}.");
+        int s = sortedSequence._shape[rank - 1], v = values._shape[rank - 1], rows = values.Length / Math.Max(1, v);
+        var seq = sortedSequence.GetFlattenedData();
+        var vals = values.GetFlattenedData();
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = new Tensor<int>(values._shape);
+        var dst = result.GetDataArrayUnmarked();
+        // torch's comparisons on every row (the count kernels disagree with them when a NaN is involved).
+        for (int r = 0; r < rows; r++)
+            for (int j = 0; j < v; j++)
+            {
+                var x = vals[r * v + j];
+                int lo = 0, hi = s;
+                while (lo < hi)
+                {
+                    int mid = lo + ((hi - lo) >> 1);
+                    var e = seq[r * s + mid];
+                    // The rank-one search's comparisons: right = false splits at x <= seq, right = true at x < seq. Both
+                    // are false for NaN, so a NaN value lands after every element, as it does at rank one.
+                    bool beforeMid = right ? numOps.LessThan(x, e) : numOps.LessThanOrEquals(x, e);
+                    if (beforeMid) hi = mid; else lo = mid + 1;
+                }
+                dst[r * v + j] = lo;
+            }
+        return result;
+    }
+
+    private static bool SequenceHasNaN(ReadOnlySpan<float> sequence)
+    {
+        for (int i = 0; i < sequence.Length; i++)
+            if (float.IsNaN(sequence[i])) return true;
+        return false;
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<int> TensorSearchSorted<T>(
         Tensor<T> sortedSequence, Tensor<T> values, bool right = false)
@@ -3558,8 +3700,10 @@ public partial class CpuEngine
 
         if (sortedSequence == null) throw new ArgumentNullException(nameof(sortedSequence));
         if (values == null) throw new ArgumentNullException(nameof(values));
-        if (sortedSequence.Rank != 1)
-            throw new ArgumentException("SearchSorted expects a 1-D sorted sequence");
+        if (sortedSequence.Rank == 0)
+            throw new ArgumentException("SearchSorted expects a sorted sequence of rank >= 1");
+        if (sortedSequence.Rank > 1)
+            return SearchSortedBatched(sortedSequence, values, right);
 
         if (!sortedSequence.IsContiguous) sortedSequence = sortedSequence.Contiguous();
         if (!values.IsContiguous) values = values.Contiguous();
@@ -3570,16 +3714,22 @@ public partial class CpuEngine
         // Float32 fast path: route through SortKernels which uses AVX2
         // popcount-masked comparison for short sequences and a branchless
         // binary search for longer ones.
-        if (typeof(T) == typeof(float))
+        // The kernels count elements below the value, which is torch's answer only when the sequence holds no NaN:
+        // torch's binary search moves right past a NaN element, so such a sequence takes the search loop below.
+        if (typeof(T) == typeof(float) && !SequenceHasNaN(((Tensor<float>)(object)sortedSequence).AsSpan()))
         {
             using var seqArrLease = sortedSequence.LeaseArray();
             float[] seqArr = (float[])(object)seqArrLease.Array;
             float[] vsArr = (float[])(object)values.GetDataArray();
             ReadOnlySpan<float> seqSpan = seqArr;
+            // A NaN value lands after every element (torch.searchsorted, and the search loop below); the kernels'
+            // comparisons are all false for NaN and would place it first.
             if (right)
-                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++)
+                    dst[i] = float.IsNaN(vsArr[i]) ? seqSpan.Length : Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
             else
-                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++)
+                    dst[i] = float.IsNaN(vsArr[i]) ? seqSpan.Length : Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
             return result;
         }
 
@@ -4302,8 +4452,10 @@ public partial class CpuEngine
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double y = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            if (y >= 1.0) return ops.FromDouble(double.PositiveInfinity);
-            if (y <= -1.0) return ops.FromDouble(double.NegativeInfinity);
+            // torch.erfinv: +-inf at +-1, NaN outside [-1, 1] (and for NaN input).
+            if (double.IsNaN(y) || y > 1.0 || y < -1.0) return ops.FromDouble(double.NaN);
+            if (y == 1.0) return ops.FromDouble(double.PositiveInfinity);
+            if (y == -1.0) return ops.FromDouble(double.NegativeInfinity);
             // Seed: Winitzki's approximation, good to ~5 digits.
             double ln = System.Math.Log(1.0 - y * y);
             double a = 0.147;

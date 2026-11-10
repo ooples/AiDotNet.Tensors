@@ -7897,6 +7897,10 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Ceiling", tensor._shape); if (ac is not null) return ac.Execute(); }
 
 
+        // The kernels below read the storage directly: materialize a strided view's logical layout. The tape and the
+        // tracer keep the caller's tensor (#257).
+        var tensorOrig = tensor;
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         if (typeof(T) == typeof(float))
         {
@@ -7935,9 +7939,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 dest[i] = numOps.Ceiling(src[i]);
         }
 
-        DifferentiableOps.RecordUnary("Ceiling", result, tensor,
+        DifferentiableOps.RecordUnary("Ceiling", result, tensorOrig,
             BackwardFunctions<T>.SignBackward);
-        { var c = tensor; AutoTracer.RecordOp("Ceiling", result, eng => eng.TensorCeiling(c)); }
+        { var c = tensorOrig; AutoTracer.RecordOp("Ceiling", result, eng => eng.TensorCeiling(c)); }
         return result;
     }
 
@@ -10449,6 +10453,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
+        var kernelOrig = kernel;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!kernel.IsContiguous) kernel = kernel.Contiguous();
         if (input.Rank != 4)
         {
             throw new ArgumentException($"Conv2D input requires a 4D tensor [batch, in_channels, height, width]. Got rank {input.Rank}.");
@@ -10533,9 +10539,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, stride, padding, padding, dilation, dilation,
                 outputHeight, outputWidth);
-            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernelOrig,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernelOrig, stride, padding, dilation));
             return result;
         }
 
@@ -10635,9 +10641,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         outChannels, kernelHeight, kernelWidth, stride, stride,
                         padding, padding, dilation, dilation);
                 }
-                DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
+                DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernelOrig,
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-                if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
+                if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernelOrig, stride, padding, dilation));
                 return result;
             }
 #endif
@@ -10650,9 +10656,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, padding, dilation,
                 outputHeight, outputWidth);
-            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernelOrig,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernelOrig, stride, padding, dilation));
             return result;
         }
 
@@ -10663,9 +10669,9 @@ public partial class CpuEngine : ITensorLevelEngine
             stride, padding, dilation,
             outputHeight, outputWidth);
 
-        DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
+        DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernelOrig,
             BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
-        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
+        if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernelOrig, stride, padding, dilation));
         return result;
     }
 
@@ -13554,6 +13560,75 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Elementwise backward rule: element i of the gradient pairs with element i of the saved forward tensor, so both
+    /// must hold the same number of elements. A shorter saved tensor was read past its end (garbage or an
+    /// out-of-bounds fault); a shorter gradient silently gave a short result.
+    /// </summary>
+    internal static void ValidateElementwisePair<T>(string op, Tensor<T> first, Tensor<T> second)
+    {
+        if (first is null) throw new ArgumentNullException(nameof(first));
+        if (second is null) throw new ArgumentNullException(nameof(second));
+        if (first.Length != second.Length)
+            throw new ArgumentException($"{op}: the two tensors must have the same number of elements; got [{string.Join(", ", first._shape)}] and [{string.Join(", ", second._shape)}].");
+    }
+
+    /// <summary>Row-structured backward rule (softmax family): the gradient must have the saved output's shape.</summary>
+    internal static void ValidateSameShapePair<T>(string op, Tensor<T> gradOutput, Tensor<T> output)
+    {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        bool same = gradOutput._shape.Length == output._shape.Length;
+        for (int d = 0; same && d < output._shape.Length; d++) same = gradOutput._shape[d] == output._shape[d];
+        if (!same)
+            throw new ArgumentException($"{op}: gradOutput must have the forward output's shape; got [{string.Join(", ", gradOutput._shape)}] for output [{string.Join(", ", output._shape)}].", nameof(gradOutput));
+    }
+
+    /// <summary>
+    /// Cross-entropy layout, as in torch: logits [N, C, d1..dk] (class axis 1) with either class-index targets
+    /// [N, d1..dk] or probability targets of the logits' shape. Returns N, C, the trailing size d1*..*dk and whether
+    /// the targets are class indices. Any other layout was indexed as if it were [N, C].
+    /// </summary>
+    internal static void CrossEntropyLayout<T>(Tensor<T> predictions, Tensor<T> targets, out int batch, out int classes,
+        out int inner, out bool sparse)
+    {
+        if (predictions is null) throw new ArgumentNullException(nameof(predictions));
+        if (targets is null) throw new ArgumentNullException(nameof(targets));
+        var p = predictions._shape;
+        var t = targets._shape;
+        if (p.Length < 2)
+            throw new ArgumentException($"Cross-entropy needs [batch, classes, ...] predictions; got [{string.Join(", ", p)}].", nameof(predictions));
+        batch = p[0];
+        classes = p[1];
+        inner = 1;
+        for (int d = 2; d < p.Length; d++) inner *= p[d];
+        bool dense = t.Length == p.Length;
+        for (int d = 0; dense && d < p.Length; d++) dense = t[d] == p[d];
+        sparse = t.Length == p.Length - 1 && t[0] == p[0];
+        for (int d = 1; sparse && d < t.Length; d++) sparse = t[d] == p[d + 1];
+        if (!dense && !sparse)
+            throw new ArgumentException($"Cross-entropy targets must be class indices [{string.Join(", ", p.Where((_, d) => d != 1))}] or probabilities [{string.Join(", ", p)}]; got [{string.Join(", ", t)}].", nameof(targets));
+    }
+
+    /// <summary>Shape check for <see cref="IEngine.CrossEntropyBackward{T}"/>; see <see cref="CrossEntropyLayout{T}"/>.</summary>
+    internal static void ValidateCrossEntropyPair<T>(Tensor<T> predictions, Tensor<T> targets) =>
+        CrossEntropyLayout(predictions, targets, out _, out _, out _, out _);
+
+    /// <summary>
+    /// GLU-family backward shape rule: gradOutput is the forward output, i.e. the input's shape with the gated axis
+    /// halved. A gradient of the wrong shape (for example the input's own) was read at the wrong offsets.
+    /// </summary>
+    internal static void ValidateGatedGradShape(string op, int[] gradOutput, int[] input, int axis)
+    {
+        if (axis < 0 || axis >= input.Length)
+            throw new ArgumentOutOfRangeException("dim", $"{op}: dim {axis} is out of range for a rank-{input.Length} input.");
+        bool ok = gradOutput.Length == input.Length;
+        for (int d = 0; ok && d < input.Length; d++)
+            ok = gradOutput[d] == (d == axis ? input[d] / 2 : input[d]);
+        if (!ok)
+            throw new ArgumentException($"{op} needs gradOutput of the forward output's shape (the input's with dim {axis} halved); got [{string.Join(", ", gradOutput)}] for input [{string.Join(", ", input)}].", "gradOutput");
+    }
+
+    /// <summary>
     /// GLU backward pass.
     /// </summary>
     public Tensor<T> GLUBackward<T>(Tensor<T> gradOutput, Tensor<T> input, int dim = -1)
@@ -13568,6 +13643,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("GLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -13693,6 +13769,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("GeGLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -13826,6 +13903,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("SwiGLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -13951,6 +14029,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int actualDim = dim < 0 ? input.Rank + dim : dim;
+        ValidateGatedGradShape("ReGLUBackward", gradOutput._shape, input._shape, actualDim);
         int dimSize = input._shape[actualDim];
         int halfSize = dimSize / 2;
 
@@ -25128,6 +25207,11 @@ public partial class CpuEngine : ITensorLevelEngine
         { var autoCompiled = AutoTracer.TryGetCompiledPlan<T>("Softmax", input._shape, paramHash: axis);
           if (autoCompiled is not null) return autoCompiled.Execute(); }
 
+        // The kernels below read the storage directly: materialize a strided view's logical layout. The tape and the
+        // tracer keep the caller's tensor (#257).
+        var inputOrig = input;
+        if (!input.IsContiguous) input = input.Contiguous();
+
         // Compute outer and inner sizes
         int outerSize = 1, axisSize = input._shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
@@ -25146,8 +25230,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
-            DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-            if (AutoTracer.ShouldRecord) { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
+            DifferentiableOps.RecordUnary("Softmax", result, inputOrig, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = inputOrig; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
             return result;
         }
 
@@ -25195,8 +25279,8 @@ public partial class CpuEngine : ITensorLevelEngine
                             axisSize);
                 }
             }
-            DifferentiableOps.RecordUnary("Softmax", result, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-            if (AutoTracer.ShouldRecord) { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
+            DifferentiableOps.RecordUnary("Softmax", result, inputOrig, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = inputOrig; int ax = axis; AutoTracer.RecordOp("Softmax", result, eng => eng.Softmax(c, ax), paramHash: ax); }
             return result;
         }
 
@@ -25236,8 +25320,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
-        DifferentiableOps.RecordUnary("Softmax", result2, input, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
-        if (AutoTracer.ShouldRecord) { var c = input; int ax = axis; AutoTracer.RecordOp("Softmax", result2, eng => eng.Softmax(c, ax), paramHash: ax); }
+        DifferentiableOps.RecordUnary("Softmax", result2, inputOrig, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+        if (AutoTracer.ShouldRecord) { var c = inputOrig; int ax = axis; AutoTracer.RecordOp("Softmax", result2, eng => eng.Softmax(c, ax), paramHash: ax); }
         return result2;
     }
 
@@ -25437,6 +25521,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
+        ValidateSameShapePair("SoftmaxBackward", gradOutput, output);
 
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
@@ -25942,6 +26027,9 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
+        // An empty softmax axis has no row to normalize (the per-row max would read element 0 of an empty row); the
+        // result is the empty tensor already allocated.
+        if (axisSize > 0)
         CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
@@ -26167,7 +26255,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (output == null) throw new ArgumentNullException(nameof(output));
-        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        ValidateSameShapePair("SparsemaxBackward", gradOutput, output);
+        if (!output.IsContiguous) output = output.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = output.Rank;
@@ -26288,7 +26377,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (output == null) throw new ArgumentNullException(nameof(output));
-        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        if (!output.IsContiguous) output = output.Contiguous();
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -30585,8 +30674,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
         int headDim = input._shape[rank - 1];
         int seqLen = input._shape[rank - 2];
-        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
-            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        if (headDim <= 0 || seqLen < 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires a positive, even headDim.", nameof(input));
+        // An empty sequence (or batch) has nothing to rotate.
+        if (input.Length == 0) return new Tensor<T>((int[])input._shape.Clone());
         int halfDim = headDim / 2;
 
         if (GraphMode.IsActive)
@@ -42581,6 +42672,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for tensor of rank {destination.Rank}.");
         if (index < 0 || index >= destination._shape[axis])
             throw new ArgumentOutOfRangeException(nameof(index), $"Index {index} is out of range for axis {axis} with size {destination._shape[axis]}.");
+        ValidateSliceSourceShape(destination._shape, source._shape, axis);
 
         if (!destination.IsContiguous) throw new InvalidOperationException("TensorSetSliceAxis requires contiguous destination tensor.");
         var sourceOrig = source;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -42668,6 +42760,11 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // The kernels below read the storage directly: materialize a strided view's logical layout. The tape and the
+        // tracer keep the caller's tensor (#257).
+        var tensorOrig = tensor;
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+
         // Compute outer and inner sizes relative to the axis
         int outerSize = 1, axisSize = tensor._shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
@@ -42686,9 +42783,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
-            DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
+            DifferentiableOps.RecordUnary("LogSoftmax", result, tensorOrig,
                 BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
-            if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", result, eng => eng.TensorLogSoftmax(c, ca)); }
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("LogSoftmax", result, eng => eng.TensorLogSoftmax(c, ca)); }
             return result;
         }
         // Double primitive fast path for last-axis log-softmax. Inline 3-pass
@@ -42721,9 +42818,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 };
                 CpuParallelSettings.ParallelForOrSerial(0, outerSz, (long)outerSz * axisSz, rowKernel);
             }
-            DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensor,
+            DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensorOrig,
                 BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
-            if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", resultD, eng => eng.TensorLogSoftmax(c, ca)); }
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("LogSoftmax", resultD, eng => eng.TensorLogSoftmax(c, ca)); }
             return resultD;
         }
 
@@ -42766,9 +42863,9 @@ public partial class CpuEngine : ITensorLevelEngine
         });
 
         var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, outputData);
-        DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
+        DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensorOrig,
             BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
-        if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => eng.TensorLogSoftmax(c, ca)); }
+        if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => eng.TensorLogSoftmax(c, ca)); }
         return logSoftmaxResult;
     }
 
@@ -42820,11 +42917,63 @@ public partial class CpuEngine : ITensorLevelEngine
         if (axis < 0) axis = tensor.Rank + axis;
 
         if (axis < 0 || axis >= tensor.Rank)
-            throw new ArgumentException($"Invalid axis {axis} for tensor with {tensor.Rank} dimensions", nameof(axis));
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{tensor.Rank} tensor.");
         // Any rank and axis (torch.topk): k is clamped to the axis length, the largest values come first.
         var (values, selected) = TopK(tensor, Math.Min(k, tensor._shape[axis]), axis, largest: true);
         indices = selected;
         return values;
+    }
+
+    /// <summary>
+    /// torch.scatter shape rules: indices and source have the destination's rank and one shape, which equals the
+    /// destination's on every dimension but the (normalized) axis.
+    /// </summary>
+    internal static void ValidateTensorScatterShapes(int[] destination, int[] indices, int[] source, int axis)
+    {
+        int rank = destination.Length;
+        if (indices.Length != rank || source.Length != rank)
+            throw new ArgumentException($"TensorScatter needs indices and source of the destination's rank {rank}; got {indices.Length} and {source.Length}.");
+        for (int d = 0; d < rank; d++)
+        {
+            if (indices[d] != source[d])
+                throw new ArgumentException($"TensorScatter needs indices and source of one shape; dimension {d} is {indices[d]} vs {source[d]}.");
+            if (d != axis && indices[d] != destination[d])
+                throw new ArgumentException($"TensorScatter needs indices to match the destination off the axis; dimension {d} is {indices[d]} vs {destination[d]}.");
+        }
+    }
+
+    /// <summary>
+    /// TensorSetSliceAxis shape rule: the source is one slice, the destination's shape without the axis (or with it at
+    /// length 1). A larger source used to be read in part.
+    /// </summary>
+    internal static void ValidateSliceSourceShape(int[] destination, int[] source, int axis)
+    {
+        bool removed = source.Length == destination.Length - 1, kept = source.Length == destination.Length;
+        for (int d = 0, s = 0; (removed || kept) && d < destination.Length; d++)
+        {
+            if (d == axis) { if (kept && source[s++] != 1) kept = false; continue; }
+            if (source[s++] != destination[d]) { removed = false; kept = false; }
+        }
+        if (!removed && !kept)
+            throw new ArgumentException($"TensorSetSliceAxis needs a source of the destination's shape without axis {axis}; got [{string.Join(", ", source)}] for [{string.Join(", ", destination)}].", "source");
+    }
+
+    /// <summary>
+    /// index_copy / index_add shape rule: values has the input's shape with the axis length replaced by the index count.
+    /// </summary>
+    internal static void ValidateIndexedValuesShape(string op, int[] input, int indexCount, int[] values, int axis)
+    {
+        bool ok = values.Length == input.Length;
+        for (int d = 0; ok && d < input.Length; d++)
+        {
+            ok = values[d] == (d == axis ? indexCount : input[d]);
+        }
+        if (!ok)
+        {
+            var expected = (int[])input.Clone();
+            expected[axis] = indexCount;
+            throw new ArgumentException($"{op} needs values of shape [{string.Join(", ", expected)}] ({indexCount} slices along axis {axis}); got [{string.Join(", ", values)}].", "values");
+        }
     }
 
     /// <inheritdoc/>
@@ -42837,29 +42986,77 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));
 
-        var result = destination.Clone();
+        int rank = destination.Rank;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{rank} tensor.");
+        ValidateTensorScatterShapes(destination._shape, indices._shape, source._shape, axis);
 
-        // For 2D with axis=1: result[b, indices[b, i]] = source[b, i]
-        if (result.Rank == 2 && axis == 1)
+        // Training-graph capture: record a lazy node with the scatter backward, so a compiled plan propagates
+        // gradients to both operands instead of treating the result as a constant.
+        if (GraphMode.IsActive)
         {
-            int batch = result._shape[0];
-            int numIndices = indices._shape[1];
-
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numIndices, [MethodImpl(Hot)] (b) =>
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
+            if (scope is not null)
             {
-                for (int i = 0; i < numIndices; i++)
+                RequireConcreteIndices(indices, "TensorScatter");
+                var cd = destination; var ci = indices; var cs = source; int ca = axis;
+                return scope.RecordBinary(LazyNodeType.Custom, "TensorScatter", destination, source, (int[])destination._shape.Clone(),
+                    (eng, output) => { var r = eng.TensorScatter(cd, ci, cs, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    BackwardFunctions<T>.TensorScatterBackward, new object[] { indices, axis });
+            }
+        }
+
+        var result = destination.Clone();
+        int outer = 1, inner = 1, dstAxis = result._shape[axis], idxAxis = indices._shape[axis];
+        for (int d = 0; d < axis; d++) outer *= result._shape[d];
+        for (int d = axis + 1; d < rank; d++) inner *= result._shape[d];
+        var indexData = indices.GetFlattenedData();
+        // Only the logical elements: an offset-zero view of a larger array can hand back the whole backing array.
+        for (int i = 0; i < indices.Length; i++)
+            if ((uint)indexData[i] >= (uint)dstAxis)
+                throw new IndexOutOfRangeException($"Index {indexData[i]} is out of bounds for axis size {dstAxis}");
+        var sourceData = source.GetFlattenedData();
+        using (var lease = result.LeaseArray())
+        {
+            var dst = lease.Array;
+            // Each outer slice writes only its own block of the result, so slices run in parallel; inside one, writes
+            // run in order, so a repeated index keeps its last source value.
+            CpuParallelSettings.ParallelForOrSerial(0, outer, (long)outer * idxAxis * inner, [MethodImpl(Hot)] (o) =>
+            {
+                for (int j = 0; j < idxAxis; j++)
                 {
-                    int idx = indices[b, i];
-                    result[b, idx] = source[b, i];
+                    int srcBase = (o * idxAxis + j) * inner;
+                    for (int k = 0; k < inner; k++)
+                        dst[(o * dstAxis + indexData[srcBase + k]) * inner + k] = sourceData[srcBase + k];
                 }
             });
         }
-        else
-        {
-            throw new NotSupportedException("TensorScatter currently only supports 2D tensors with axis=1.");
-        }
 
+        // The backward reads the indices this forward used: a caller editing its tensor afterwards must not change
+        // the gradient, so the tape keeps a copy.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            var savedIndices = new int[indices.Length];
+            Array.Copy(indexData, savedIndices, savedIndices.Length);
+            DifferentiableOps.RecordBinary("TensorScatter", result, destination, source,
+                BackwardFunctions<T>.TensorScatterBackward,
+                new object[] { new Tensor<int>(savedIndices, (int[])indices._shape.Clone()), axis });
+        }
         return result;
+    }
+
+    /// <summary>
+    /// A captured indexed op reads its indices when the plan runs, but the plan schedules only its float operands:
+    /// indices still to be produced by another captured op would be read before they are computed. Such a capture
+    /// cannot replay, so it is rejected rather than run on uninitialized indices.
+    /// </summary>
+    private static void RequireConcreteIndices(Tensor<int> indices, string opName)
+    {
+        if (indices.LazySource is ILazyNode node && !node.IsRealized)
+            throw new NotSupportedException(
+                $"{opName} cannot be captured with indices produced inside the same graph; compute the indices "
+                + "before entering graph mode.");
     }
 
     /// <inheritdoc/>
@@ -42875,8 +43072,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
-            if (scope != null && tensor.Rank == 2)
+            if (scope != null && tensor.Rank >= 1 && axis >= 0 && axis < tensor.Rank)
             {
+                RequireConcreteIndices(indices, "TensorIndexSelect");
                 var captured = tensor;
                 var capIndices = indices;
                 int capAxis = axis;
@@ -42908,7 +43106,7 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { TapeIndexCopy<T>(indices), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
@@ -42933,13 +43131,41 @@ public partial class CpuEngine : ITensorLevelEngine
             });
 
             DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
-                BackwardFunctions<T>.IndexSelectBackward, new object[] { indices, axis });
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { TapeIndexCopy<T>(indices), axis });
             AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
             return result;
         }
         else
         {
-            throw new NotSupportedException("TensorIndexSelect currently only supports 2D tensors.");
+            // Any rank, any axis: the tensor is [outer, axisSize, inner] around the axis, and each selected slice is a
+            // contiguous run of `inner` elements, so the output is outer x numIndices block copies. Same contract as the
+            // GPU kernel (IResidentIndexBackend.IndexSelect) and IndexSelectBackward, which were already rank-general.
+            if (axis < 0 || axis >= tensor.Rank)
+                throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{tensor.Rank} tensor.");
+            int axisSize = tensor._shape[axis], numIndices = indices.Length;
+            int outer = 1, inner = 1;
+            for (int d = 0; d < axis; d++) outer *= tensor._shape[d];
+            for (int d = axis + 1; d < tensor.Rank; d++) inner *= tensor._shape[d];
+            var indicesData = indices.GetFlattenedData();
+            for (int i = 0; i < numIndices; i++)
+                if ((uint)indicesData[i] >= (uint)axisSize)
+                    throw new IndexOutOfRangeException($"Index {indicesData[i]} is out of bounds for axis size {axisSize}");
+            var outShape = (int[])tensor._shape.Clone();
+            outShape[axis] = numIndices;
+            var result = TensorAllocator.Rent<T>(outShape);
+            var tensorData = tensor.GetFlattenedData();
+            using var resultDataLease = result.LeaseArray();
+            var resultData = resultDataLease.Array;
+            CpuParallelSettings.ParallelForOrSerial(0, outer * numIndices, result.Length, b =>
+            {
+                int o = b / numIndices, i = b - o * numIndices;
+                Array.Copy(tensorData, ((long)o * axisSize + indicesData[i]) * inner, resultData, (long)b * inner, inner);
+            });
+
+            DifferentiableOps.RecordUnary("TensorIndexSelect", result, tensor,
+                BackwardFunctions<T>.IndexSelectBackward, new object[] { TapeIndexCopy<T>(indices), axis });
+            AutoTracer.RecordOp("TensorIndexSelect", result, eng => eng.TensorIndexSelect(tensor, indices, axis));
+            return result;
         }
     }
 
@@ -43667,7 +43893,26 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> SpiralConvBackwardBias<T>(Tensor<T> outputGradient)
     {
+        if (outputGradient == null) throw new ArgumentNullException(nameof(outputGradient));
+        RequireRank(outputGradient, 2, "SpiralConvBackwardBias", "[vertices, channels]");
         return MeshConvolutionOperations.SpiralConvBackwardBias(outputGradient);
+    }
+
+    /// <summary>
+    /// The indices a tape entry keeps: a copy, so a caller editing its tensor after the forward does not change the
+    /// gradient. With no tape recording nothing is kept, so no copy is made.
+    /// </summary>
+    internal static Tensor<int> TapeIndexCopy<T>(Tensor<int> indices) =>
+        DifferentiableOps.IsTapeActiveForThread<T>() ? indices.Clone() : indices;
+
+    /// <summary>
+    /// Rejects an input whose rank a kernel does not take, before the kernel indexes dimensions the shape lacks.
+    /// </summary>
+    internal static void RequireRank<T>(Tensor<T> tensor, int rank, string op, string layout)
+    {
+        if (tensor.Rank != rank)
+            throw new ArgumentException(
+                $"{op} needs a rank-{rank} {layout} tensor; got shape [{string.Join(", ", tensor._shape)}].", nameof(tensor));
     }
 
     /// <inheritdoc/>
@@ -43921,6 +44166,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }, deterministicSafe: true);
 
+        DifferentiableOps.RecordUnary("TopK", values, input,
+            BackwardFunctions<T>.TopKBackward, new object[] { TapeIndexCopy<T>(indices), axis });
         return (values, indices);
     }
 
@@ -44111,6 +44358,9 @@ public partial class CpuEngine : ITensorLevelEngine
         int axisSize = input._shape[axis];
         int innerSize = 1;
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
+        // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
+        // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
+        ValidateIndexedValuesShape("Scatter", input._shape, indices.Length, values._shape, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -44165,6 +44415,9 @@ public partial class CpuEngine : ITensorLevelEngine
         int axisSize = input._shape[axis];
         int innerSize = 1;
         for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
+        // index_copy / index_add semantics: values holds one slice per index, so it has the input's shape with the
+        // axis length replaced by the index count. A larger tensor used to be read in part, at the wrong offsets.
+        ValidateIndexedValuesShape("ScatterAdd", input._shape, indices.Length, values._shape, axis);
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -47282,7 +47535,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-        if (typeof(T) == typeof(float) && gradOutput.Length == output.Length)
+        ValidateElementwisePair("SigmoidBackward", gradOutput, output);
+        if (typeof(T) == typeof(float))
         {
             unsafe
             {
@@ -47476,7 +47730,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
-        if (typeof(T) == typeof(float) && gradOutput.Length == output.Length)
+        ValidateElementwisePair("TanhBackward", gradOutput, output);
+        if (typeof(T) == typeof(float))
         {
             unsafe
             {
@@ -47703,8 +47958,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
-        if (gradOutput.Length != input.Length)
-            throw new ArgumentException($"Shape mismatch: gradOutput length {gradOutput.Length} != input length {input.Length}");
+        ValidateElementwisePair("SwishBackward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         using var gDataLease = gradOutput.LeaseArray();
@@ -47772,6 +48026,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> MishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("MishBackward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         using var gDataLease = gradOutput.LeaseArray();
@@ -47822,6 +48077,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> SoftplusBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SoftplusBackward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         using var gDataLease = gradOutput.LeaseArray();
@@ -47868,6 +48124,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> HardswishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("HardswishBackward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         using var gDataLease = gradOutput.LeaseArray();
@@ -47886,6 +48143,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SeluBackward", gradOutput, input);
         const double alpha = 1.6732632423543772;
         const double scale = 1.0507009873554805;
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -47906,6 +48164,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("HardsigmoidBackward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         using var gDataLease = gradOutput.LeaseArray();
@@ -47939,6 +48198,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Relu6Backward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("Relu6Backward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
         using var gDataLease = gradOutput.LeaseArray();
@@ -47995,6 +48255,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        ValidateElementwisePair("ReciprocalBackward", gradOutput, output);
         // d/dx(1/x) = -1/x^2 = -(1/x)^2 = -output^2
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new T[gradOutput.Length];
@@ -48599,56 +48860,57 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public T CrossEntropyLoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        CrossEntropyLayout(predictions, targets, out int batchSize, out int numClasses, out int inner, out bool sparseTargets);
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batchSize = predictions._shape[0];
-        int numClasses = predictions._shape[1];
+        int rows = batchSize * inner;
 
         var predData = predictions.GetFlattenedData();
         var targetData = targets.GetFlattenedData();
 
         // Parallel batch processing with thread-local accumulators
         double totalLoss = 0;
-        bool sparseTargets = targets.Rank == 1;
 
-        if (batchSize > 32)
+        if (rows > 32)
         {
             object lockObj = new object();
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize,
-                (long)batchSize * numClasses,
+            CpuParallelSettings.ParallelForOrSerial(0, rows,
+                (long)rows * numClasses,
                 () => 0.0,
                 (b, _, localLoss) =>
                 {
-                    return localLoss + ComputeCrossEntropyBatch(numOps, predData, targetData, b, numClasses, sparseTargets);
+                    return localLoss + ComputeCrossEntropyBatch(numOps, predData, targetData, b, numClasses, inner, sparseTargets);
                 },
                 localLoss => { lock (lockObj) { totalLoss += localLoss; } });
         }
         else
         {
-            for (int b = 0; b < batchSize; b++)
+            for (int b = 0; b < rows; b++)
             {
-                totalLoss += ComputeCrossEntropyBatch(numOps, predData, targetData, b, numClasses, sparseTargets);
+                totalLoss += ComputeCrossEntropyBatch(numOps, predData, targetData, b, numClasses, inner, sparseTargets);
             }
         }
 
-        return numOps.FromDouble(totalLoss / batchSize);
+        // torch's mean reduction: over every (batch, d1..dk) position.
+        return numOps.FromDouble(rows == 0 ? 0 : totalLoss / rows);
     }
 
-    private static double ComputeCrossEntropyBatch<T>(INumericOperations<T> numOps, T[] predData, T[] targetData, int b, int numClasses, bool sparseTargets)
+    private static double ComputeCrossEntropyBatch<T>(INumericOperations<T> numOps, T[] predData, T[] targetData, int b, int numClasses, int inner, bool sparseTargets)
     {
-        int offset = b * numClasses;
+        // Row b is the (n, i) position b = n*inner + i; class c sits at (n*C + c)*inner + i.
+        int offset = (b / inner) * numClasses * inner + b % inner;
 
         // Compute log-sum-exp for numerical stability
         double maxVal = double.NegativeInfinity;
         for (int c = 0; c < numClasses; c++)
         {
-            double val = numOps.ToDouble(predData[offset + c]);
+            double val = numOps.ToDouble(predData[offset + c * inner]);
             if (val > maxVal) maxVal = val;
         }
 
         double sumExp = 0;
         for (int c = 0; c < numClasses; c++)
         {
-            sumExp += Math.Exp(numOps.ToDouble(predData[offset + c]) - maxVal);
+            sumExp += Math.Exp(numOps.ToDouble(predData[offset + c * inner]) - maxVal);
         }
         double logSumExp = maxVal + Math.Log(sumExp);
 
@@ -48658,16 +48920,16 @@ public partial class CpuEngine : ITensorLevelEngine
             int targetClass = (int)numOps.ToDouble(targetData[b]);
             if (targetClass < 0 || targetClass >= numClasses)
                 throw new ArgumentOutOfRangeException(nameof(targetData), $"Target class {targetClass} is out of range [0, {numClasses}).");
-            loss = -(numOps.ToDouble(predData[offset + targetClass]) - logSumExp);
+            loss = -(numOps.ToDouble(predData[offset + targetClass * inner]) - logSumExp);
         }
         else
         {
             for (int c = 0; c < numClasses; c++)
             {
-                double targetVal = numOps.ToDouble(targetData[b * numClasses + c]);
+                double targetVal = numOps.ToDouble(targetData[offset + c * inner]);
                 if (targetVal > 0)
                 {
-                    loss -= targetVal * (numOps.ToDouble(predData[offset + c]) - logSumExp);
+                    loss -= targetVal * (numOps.ToDouble(predData[offset + c * inner]) - logSumExp);
                 }
             }
         }
@@ -48677,29 +48939,29 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        CrossEntropyLayout(predictions, targets, out int batchSize, out int numClasses, out int inner, out bool sparseTargets);
         var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
         var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batchSize = predictions._shape[0];
-        int numClasses = predictions._shape[1];
-
         var predData = predictions.GetFlattenedData();
         var targetData = targets.GetFlattenedData();
         var gradData = new T[predictions.Length];
-        bool sparseTargets = targets.Rank == 1;
+        int rows = batchSize * inner;
+        // torch's mean reduction: over every (batch, d1..dk) position.
+        double scale = rows == 0 ? 0 : 1.0 / rows;
 
-        // Parallelize batch processing
-        Action<int> processBatch = b =>
+        // One row per (n, i) position; class c of row r = n*inner + i sits at (n*C + c)*inner + i.
+        Action<int> processBatch = r =>
         {
-            int offset = b * numClasses;
+            int offset = (r / inner) * numClasses * inner + r % inner;
 
             // Compute softmax
             double maxVal = double.NegativeInfinity;
             for (int c = 0; c < numClasses; c++)
             {
-                double val = numOps.ToDouble(predData[offset + c]);
+                double val = numOps.ToDouble(predData[offset + c * inner]);
                 if (val > maxVal) maxVal = val;
             }
 
@@ -48707,7 +48969,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var probs = new double[numClasses];
             for (int c = 0; c < numClasses; c++)
             {
-                probs[c] = Math.Exp(numOps.ToDouble(predData[offset + c]) - maxVal);
+                probs[c] = Math.Exp(numOps.ToDouble(predData[offset + c * inner]) - maxVal);
                 sumExp += probs[c];
             }
             double invSumExp = 1.0 / sumExp;
@@ -48717,31 +48979,33 @@ public partial class CpuEngine : ITensorLevelEngine
             // Gradient
             if (sparseTargets)
             {
-                int targetClass = (int)numOps.ToDouble(targetData[b]);
+                int targetClass = (int)numOps.ToDouble(targetData[r]);
+                if (targetClass < 0 || targetClass >= numClasses)
+                    throw new ArgumentOutOfRangeException(nameof(targets), $"Target class {targetClass} is out of range [0, {numClasses}).");
                 for (int c = 0; c < numClasses; c++)
                 {
                     double grad = probs[c] - (c == targetClass ? 1.0 : 0.0);
-                    gradData[offset + c] = numOps.FromDouble(grad / batchSize);
+                    gradData[offset + c * inner] = numOps.FromDouble(grad * scale);
                 }
             }
             else
             {
                 for (int c = 0; c < numClasses; c++)
                 {
-                    double targetVal = numOps.ToDouble(targetData[b * numClasses + c]);
+                    double targetVal = numOps.ToDouble(targetData[offset + c * inner]);
                     double grad = probs[c] - targetVal;
-                    gradData[offset + c] = numOps.FromDouble(grad / batchSize);
+                    gradData[offset + c * inner] = numOps.FromDouble(grad * scale);
                 }
             }
         };
 
-        if (batchSize > 32)
+        if (rows > 32)
         {
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * numClasses, processBatch);
+            CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * numClasses, processBatch);
         }
         else
         {
-            for (int b = 0; b < batchSize; b++) processBatch(b);
+            for (int r = 0; r < rows; r++) processBatch(r);
         }
 
         return TensorAllocator.Rent<T>(predictions._shape, gradData);
@@ -48770,6 +49034,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> MseBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        ValidateElementwisePair("MseBackward", predictions, targets);
         var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
         var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -48798,6 +49063,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // head got no gradient for anything upstream of the pool.
         if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
             return AdaptiveAvgPool2D(input, 1, 1);
+        RequireRank(input, 4, "GlobalAvgPool2D", "[batch, channels, height, width]");
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -48889,6 +49155,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.GlobalMaxPool2D(input));
+        RequireRank(input, 4, "GlobalMaxPool2D", "[batch, channels, height, width]");
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -49779,6 +50046,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>MSE loss: mean((pred - target)^2). Returns scalar tensor for tape.</summary>
     public virtual Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorMSELoss", predictions, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MSELoss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
@@ -49853,6 +50122,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>L1 loss: mean(|pred - target|). Returns scalar tensor for tape.</summary>
     public virtual Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorL1Loss", predictions, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("L1Loss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
@@ -49921,6 +50192,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>Huber loss: smooth L1 that transitions from L2 to L1 at delta=1.</summary>
     public virtual Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta = 1.0)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorHuberLoss", predictions, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("HuberLoss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50007,6 +50280,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>BCE with logits: sigmoid cross-entropy loss.</summary>
     public virtual Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
+        // Elementwise over both: a shorter operand would be read past its end.
+        ValidateElementwisePair("TensorBCEWithLogitsLoss", logits, targets);
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("BCEWithLogitsLoss", logits._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50090,6 +50365,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>Cross-entropy loss with softmax (differentiable). Returns scalar tensor.</summary>
     public virtual Tensor<T> TensorCrossEntropyLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
+        if (logits == null) throw new ArgumentNullException(nameof(logits));
+        if (targets == null) throw new ArgumentNullException(nameof(targets));
+        // The kernel reads one class vector per batch row; spatial dims after the classes are not supported.
+        RequireRank(logits, 2, "TensorCrossEntropyLoss", "[batch, classes]");
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("CrossEntropyLoss", logits._shape); if (ac is not null) return ac.Execute(); }
 
@@ -50106,10 +50385,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        int batchSize = logits._shape[0];
-        int numClasses = logits._shape[1];
+        // Rank 2 is enforced above; this checks the targets are [batch] class indices or [batch, classes] probabilities.
+        CrossEntropyLayout(logits, targets, out int batchSize, out int numClasses, out _, out bool sparse);
         T totalLoss = numOps.Zero;
-        bool sparse = targets.Rank == 1;
 
         // Hoist data arrays outside loop — GetFlattenedData() copies the entire array
         var logitsOrig = logits;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -50124,7 +50402,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int b = 0; b < batchSize; b++)
         {
             totalLoss = numOps.Add(totalLoss,
-                numOps.FromDouble(ComputeCrossEntropyBatch(numOps, logitData, targetData, b, numClasses, sparse)));
+                numOps.FromDouble(ComputeCrossEntropyBatch(numOps, logitData, targetData, b, numClasses, 1, sparse)));
         }
         T mean = numOps.Divide(totalLoss, numOps.FromDouble(batchSize));
         var result = new Tensor<T>(new[] { mean }, [1]);
@@ -50137,6 +50415,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>NLL loss: -sum(target * log_probs) / batch_size. Expects log-probabilities.</summary>
     public virtual Tensor<T> TensorNLLLoss<T>(Tensor<T> logProbs, Tensor<T> targets)
     {
+        if (logProbs == null) throw new ArgumentNullException(nameof(logProbs));
+        if (targets == null) throw new ArgumentNullException(nameof(targets));
+        // The kernel reads one class vector per batch row; spatial dims after the classes are not supported.
+        RequireRank(logProbs, 2, "TensorNLLLoss", "[batch, classes]");
         if (GraphMode.IsActive)
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NLLLoss", logProbs._shape); if (ac is not null) return ac.Execute(); }
 
@@ -52957,6 +53239,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (input.Rank != 2) throw new ArgumentException($"NativeNormalizeRows requires a 2D tensor. Got rank {input.Rank}.", nameof(input));
 
+        if (!input.IsContiguous || input._storageOffset != 0)
+        {
+            // The kernel reads (and in place, writes) the storage array directly; a strided view would be read in
+            // storage order. Out of place, materialize the view; in place, normalize a materialized copy and write it
+            // back through the view, so the caller's storage holds the result at the view's own offset and strides.
+            if (inPlace)
+            {
+                var normalized = NativeNormalizeRows(input.Contiguous(), inPlace: false);
+                input.CopyFromArray(normalized.ToArray());
+                return input;
+            }
+            input = input.Contiguous();
+        }
         int rows = input._shape[0];
         int cols = input._shape[1];
         var result = inPlace ? input : new Tensor<T>(input._shape);
@@ -53193,6 +53488,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.NativeTanh(input));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
 
@@ -53245,6 +53543,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.NativeExp(input));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
 
@@ -53318,6 +53619,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     $"imag and real must have the same shape; differ at axis {d}: imag={imag._shape[d]}, real={real._shape[d]}.",
                     nameof(real));
         }
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!imag.IsContiguous || imag._storageOffset != 0) imag = imag.Contiguous();
+        if (!real.IsContiguous || real._storageOffset != 0) real = real.Contiguous();
         var result = new Tensor<T>(imag._shape);
         int n = imag.Length;
 
@@ -54092,6 +54397,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int rows = input._shape[0];
         int cols = input._shape[1];
         var result = new Tensor<T>(input._shape);
+        // Empty rows have nothing to normalize (the row max would read element 0 of an empty row).
+        if (cols == 0) return result;
 
         for (int r = 0; r < rows; r++)
         {
@@ -54993,6 +55300,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (filter is null) throw new ArgumentNullException(nameof(filter));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
+        if (!filter.IsContiguous || filter._storageOffset != 0) filter = filter.Contiguous();
         if (input.Rank < 2)
             throw new ArgumentException("NativeSpectralFilter requires at least a 2D input tensor.", nameof(input));
         if (filter.Rank < 2)
@@ -55142,6 +55453,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (filter is null) throw new ArgumentNullException(nameof(filter));
+        // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
+        // storage order: materialize its logical layout first.
+        if (!input.IsContiguous || input._storageOffset != 0) input = input.Contiguous();
+        if (!filter.IsContiguous || filter._storageOffset != 0) filter = filter.Contiguous();
         if (input.Rank != 4)
             throw new ArgumentException(
                 $"NativeSpectralFilterBatch requires 4D input [B,C,H,W]. Got rank {input.Rank}.",

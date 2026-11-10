@@ -303,6 +303,59 @@ public class CompiledTrainingCowIsolationTests
         Assert.Equal(new[] { 1.0, 2.0, 3.0, 4.0 }, peer.ToArray());
     }
 
+    /// <summary>
+    /// #1705: a MaxPool recorded as a compiled custom node, read through the view a Flatten takes of it, must give the
+    /// eager loss on every compiled step. The node's output used to be a copy-on-write share of the trace's eager
+    /// result: the compiled loss was garbage (1e13..1e35, or ln 10 for all-zero logits) and differed step to step.
+    /// </summary>
+    [Fact]
+    public void CompiledMaxPoolThroughAFlattenView_GivesTheEagerLossOnEveryStep()
+    {
+        var engine = new CpuEngine();
+        var random = new Random(1705);
+        Tensor<float> Fill(params int[] shape)
+        {
+            var t = new Tensor<float>(shape);
+            for (int i = 0; i < t.Length; i++) t[i] = (float)(random.NextDouble() * 2 - 1);
+            return t;
+        }
+
+        // The CNN that failed in AiDotNet: conv + bias + ReLU feeding the pool, a Flatten view, a dense layer.
+        var input = Fill(4, 1, 14, 14);
+        var kernel = Fill(8, 1, 3, 3);
+        var bias = Fill(8);
+        var weight = Fill(8 * 7 * 7, 10);
+        Tensor<float> Loss()
+        {
+            var conv = engine.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+            var activation = engine.ReLU(engine.TensorChannelBiasAdd(conv, bias));
+            var pooled = engine.MaxPool2DWithTensorIndices(activation, new[] { 2, 2 }, new[] { 2, 2 }, out _);
+            var flat = engine.Reshape(pooled, new[] { 4, 8 * 7 * 7 });
+            var y = engine.TensorMatMul(flat, weight);
+            return engine.ReduceSum(engine.TensorMultiply(y, y), null);
+        }
+
+        float eager = Loss()[0];
+        var parameters = new[] { kernel, bias, weight };
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+            plan = scope.CompileTraining(parameters, Loss());
+        using (plan)
+        {
+            // A zero learning rate keeps the parameters, so every step's loss is the eager loss.
+            plan.ConfigureOptimizer(OptimizerType.SGD, 0f, 0.9f, 0.999f, 1e-8f, 0f);
+            for (int step = 0; step < 3; step++)
+            {
+                // Pooled tensors of the pool's output shape, rented and dropped between steps.
+                for (int churn = 0; churn < 4; churn++)
+                    engine.MaxPool2DWithTensorIndices(Fill(4, 8, 14, 14), new[] { 2, 2 }, new[] { 2, 2 }, out _);
+                float compiled = plan.Step()[0];
+                Assert.True(Math.Abs(compiled - eager) <= 1e-5f * Math.Max(1f, Math.Abs(eager)),
+                    $"step {step}: compiled loss {compiled:R}, eager {eager:R}");
+            }
+        }
+    }
+
     private static ICompiledTrainingPlan<double> CompileSquaredError(
         CpuEngine engine,
         Tensor<double> input,

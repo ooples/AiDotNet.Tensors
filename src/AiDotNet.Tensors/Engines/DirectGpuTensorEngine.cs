@@ -7931,6 +7931,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // GPU-RESIDENT compiled-step path first (no upload/download → capture-safe). Falls through to the
         // upload+compute+download path below when not on the resident step or not last-axis.
         if (TrySoftmaxResidentInto(destination, input, axis)) return;
+        {
+            int ea = axis < 0 ? input.Rank + axis : axis;
+            // The row kernel below is last-axis only; any other axis ran as if it were last and wrote wrong values.
+            if (ea >= 0 && ea < input.Rank && InnerSize(input, ea) != 1)
+            {
+                // The device permutation converts through float; any other T keeps its precision on the host.
+                if (typeof(T) != typeof(float))
+                {
+                    base.SoftmaxInto(destination, input, axis);
+                    return;
+                }
+                // As the host SoftmaxInto: a destination of another shape is rejected, not filled in flat order.
+                if (destination is null) throw new ArgumentNullException(nameof(destination));
+                if (!ShapesEqual(destination._shape, input._shape))
+                    throw new ArgumentException(
+                        $"Destination shape [{string.Join(", ", destination._shape)}] must match the input shape [{string.Join(", ", input._shape)}].",
+                        nameof(destination));
+                // The softmax here is a temporary copied into the destination; it is not a value the tape tracks.
+                Tensor<T> softmax;
+                using (new Autodiff.NoGradScope<T>())
+                    softmax = AlongLastAxis(input, ea, t => ((IEngine)this).Softmax(t, -1));
+                ((IEngine)this).TensorCopy(softmax, destination);
+                return;
+            }
+        }
         // Try GPU softmax: upload input, compute on GPU, download to destination
         if (typeof(T) == typeof(float) && TryGetBackend(out var gpuBackend))
         {
@@ -14405,8 +14430,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentException("RoPE input must have rank >= 2 ([.., seqLen, headDim]).", nameof(input));
         int headDim = input.Shape._dims[rank - 1];
         int seqLen = input.Shape._dims[rank - 2];
-        if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
-            throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
+        if (headDim <= 0 || seqLen < 0 || (headDim & 1) != 0)
+            throw new ArgumentException("RoPE requires a positive, even headDim.", nameof(input));
+        // An empty sequence (or batch) has nothing to rotate.
+        if (input.Length == 0) return new Tensor<T>((int[])input.Shape._dims.Clone());
 
         int rows = input.Length / headDim;
 
@@ -15711,6 +15738,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </remarks>
     Tensor<T> IEngine.SoftmaxBackward<T>(Tensor<T> gradOutput, Tensor<T> output, int axis)
     {
+        ValidateSameShapePair("SoftmaxBackward", gradOutput, output);
         using var __gpuOp = EnterGpuOp();
         if (IsTapeActive<T>())
             return base.SoftmaxBackward(gradOutput, output, axis);
@@ -18833,6 +18861,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.CrossEntropyBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        ValidateCrossEntropyPair(predictions, targets);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return base.CrossEntropyBackward(predictions, targets);
@@ -18867,6 +18896,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.MseBackward<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        ValidateElementwisePair("MseBackward", predictions, targets);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return base.MseBackward(predictions, targets);
@@ -22958,6 +22988,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("ReluBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23026,6 +23057,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        ValidateElementwisePair("SigmoidBackward", gradOutput, output);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23049,6 +23081,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        ValidateElementwisePair("TanhBackward", gradOutput, output);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23076,6 +23109,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("GeluBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23144,6 +23178,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SwishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SwishBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23166,6 +23201,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> MishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("MishBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23188,6 +23224,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SoftplusBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SoftplusBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23210,6 +23247,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> HardswishBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("HardswishBackward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23232,6 +23270,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> SeluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("SeluBackward", gradOutput, input);
         using var __gpuOp = EnterGpuOp();
         // #775: the selu_backward kernel/backend arg mismatch is fixed (kernel takes 4 args with
         // hardcoded SELU consts and uses >= to match CpuEngine deriv = x>=0 ? scale :
@@ -23259,6 +23298,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> HardsigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("HardsigmoidBackward", gradOutput, input);
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.HardsigmoidBackward(gradOutput, input);
 
@@ -23284,6 +23324,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Relu6Backward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
+        ValidateElementwisePair("Relu6Backward", gradOutput, input);
         try
         {
             using var __gpuOp = EnterGpuOp();
@@ -23328,6 +23369,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ReciprocalBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        ValidateElementwisePair("ReciprocalBackward", gradOutput, output);
         using var __gpuOp = EnterGpuOp();
         // #775: the reciprocal_backward kernel now computes -gradOutput * output^2 (it previously
         // DIVIDED by output^2, which was wrong, so this was routed to base). grad = -gradOutput *
@@ -24012,7 +24054,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (Compilation.GraphMode.IsActive)
             return base.TensorWhere(condition, x, y);
 
-        if (!TryGetBackend(out var backend))
+        // An empty select has nothing to compute, and a backend may reject zero-sized buffers.
+        if (x.Length == 0 || !TryGetBackend(out var backend))
             return base.TensorWhere(condition, x, y);
 
         try
@@ -25616,6 +25659,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorMSELoss", predictions, targets);
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
         // Composed from device ops the tape records -- mean((p - t)^2) = sum((p - t)^2) / n -- so the loss and its
@@ -25675,6 +25720,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorL1Loss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorL1Loss", predictions, targets);
         if (IsTapeActive<T>()) return base.TensorL1Loss(predictions, targets);
         if (!TryGetBackend(out var backend))
             return base.TensorL1Loss(predictions, targets);
@@ -25699,6 +25746,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorHuberLoss<T>(Tensor<T> predictions, Tensor<T> targets, double delta)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorHuberLoss", predictions, targets);
         if (IsTapeActive<T>()) return base.TensorHuberLoss(predictions, targets, delta);
         if (!TryGetBackend(out var backend))
             return base.TensorHuberLoss(predictions, targets, delta);
@@ -25722,6 +25771,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorBCEWithLogitsLoss<T>(Tensor<T> logits, Tensor<T> targets)
     {
         using var __gpuOp = EnterGpuOp();
+        // The kernels run over the first operand's length: a shorter second operand would be read past its end.
+        ValidateElementwisePair("TensorBCEWithLogitsLoss", logits, targets);
         // #775: the per-element BCE-with-logits kernel matches CpuEngine element-wise (the #775 loss is
         // clean cross-engine); the only mismatch was aggregation — CpuEngine returns the scalar mean.
         // Run the per-element kernel then reduce to the mean over all elements (ScalarMeanResult), same
@@ -27354,7 +27405,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
         int normalizedAxis = axis < 0 ? tensor.Rank + axis : axis;
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Graph capture records its lazy node in the host implementation; a tape does not stop the kernel, which records
+        // its own entry below.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= tensor.Rank || !TryGetBackend(out var backend)
             || backend is not IResidentIndexBackend indexBackend)
             return base.TensorIndexSelect(tensor, indices, axis);
@@ -27389,9 +27442,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var output = DispatchDeferredGpuOp<T>(backend, total, outShape, result =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, result,
                     outerSize, axisSize, numIndices, innerSize));
-            Autodiff.DifferentiableOps.RecordUnary("IndexSelect", output, tensor,
-                Autodiff.BackwardFunctions<T>.IndexSelectBackward,
-                new object[] { indices, normalizedAxis, tensor.Shape._dims });
+            if (IsTapeActive<T>())
+                Autodiff.DifferentiableOps.RecordUnary("IndexSelect", output, tensor,
+                    Autodiff.BackwardFunctions<T>.IndexSelectBackward,
+                    new object[] { SnapshotIndices(backend, contiguousIndices), normalizedAxis });
             return output;
         }
         catch (Exception)
@@ -27660,6 +27714,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
             AliasDiag($"SetSliceAxis ENTRY residentStep={ResidentStepActive} float={typeof(T) == typeof(float)} dstContig={destination.IsContiguous} axis={axis} idx={index} dst=[{string.Join(",", destination._shape)}]");
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (axis >= 0 && axis < destination.Rank)
+            CpuEngine.ValidateSliceSourceShape(destination._shape, source._shape, axis);
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && destination.IsContiguous && axis >= 0 && axis < destination.Rank
             && index >= 0 && index < destination.Shape._dims[axis] && TryGetBackend(out var backend))
@@ -28426,7 +28484,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     var outShape = new int[rank - 1];
                     for (int i = 0, j = 0; i < rank; i++)
                         if (i != normalizedAxis) outShape[j++] = tensor.Shape._dims[i];
-                    if (outShape.Length == 0) outShape = new[] { 1 };
+                    // A rank-1 input reduces to a 0-d tensor, as on the CPU engine and in torch.
                     return result.Reshape(outShape);
                 }
                 catch
@@ -29913,6 +29971,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // TensorBinaryCrossEntropy has 3-param signature (includes epsilon) — handled in base
 
+    /// <summary>Product of the dims after <paramref name="axis"/>: 1 exactly when a row kernel can run along it.</summary>
+    private static int InnerSize<T>(Tensor<T> t, int axis)
+    {
+        int inner = 1;
+        for (int d = axis + 1; d < t.Rank; d++) inner *= t.Shape._dims[d];
+        return inner;
+    }
+
+    private static int[] AxisLastPermutation(int rank, int axis)
+    {
+        var perm = new int[rank];
+        for (int d = 0, k = 0; d < rank; d++) if (d != axis) perm[k++] = d;
+        perm[rank - 1] = axis;
+        return perm;
+    }
+
+    private static int[] InversePermutation(int[] perm)
+    {
+        var inv = new int[perm.Length];
+        for (int i = 0; i < perm.Length; i++) inv[perm[i]] = i;
+        return inv;
+    }
+
+    /// <summary>The permutation materialized contiguously on the device (TensorPermuteInto), not a strided view.</summary>
+    private Tensor<T> PermutedContiguous<T>(Tensor<T> t, int[] perm)
+    {
+        var dims = new int[perm.Length];
+        for (int i = 0; i < perm.Length; i++) dims[i] = t.Shape._dims[perm[i]];
+        var output = new Tensor<T>(new T[t.Length], dims);
+        TensorPermuteInto(output, t, perm);
+        return output;
+    }
+
+    /// <summary>Runs a last-axis row op along <paramref name="axis"/>: move the axis last, apply, move it back.</summary>
+    private Tensor<T> AlongLastAxis<T>(Tensor<T> input, int axis, Func<Tensor<T>, Tensor<T>> lastAxisOp)
+    {
+        var perm = AxisLastPermutation(input.Rank, axis);
+        var permuted = PermutedContiguous(input, perm);
+        var rows = lastAxisOp(permuted);
+        var result = PermutedContiguous(rows, InversePermutation(perm));
+        // The two permuted intermediates are dead once the queued work that reads them runs: free them then rather
+        // than leaving their device memory to the collector. A tape or graph capture may still reference them.
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive)
+        {
+            if (!ReferenceEquals(rows, permuted)) ReleaseDeadDeviceStorage(rows, afterQueuedWork: true);
+            ReleaseDeadDeviceStorage(permuted, afterQueuedWork: true);
+        }
+        return result;
+    }
+
     Tensor<T> IEngine.GLU<T>(Tensor<T> input, int axis)
     {
         using var __gpuOp = EnterGpuOp();
@@ -29923,6 +30031,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = input.Rank;
                 int ea = axis < 0 ? rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.GLU(input, axis);
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.GLU(input, axis);
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).GLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -29948,6 +30066,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = input.Rank;
                 int ea = axis < 0 ? rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.GeGLU(input, axis);
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.GeGLU(input, axis);
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).GeGLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -29972,6 +30100,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int ea = axis < 0 ? input.Rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.ReGLU(input, axis);
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.ReGLU(input, axis);
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).ReGLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -29996,6 +30134,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 int ea = axis < 0 ? input.Rank + axis : axis;
+                // An odd split dimension has no halves: the host implementation rejects it.
+                if (ea < 0 || ea >= input.Rank || input.Shape._dims[ea] % 2 != 0) return base.SwiGLU(input, axis);
+                // The kernel gates along contiguous rows, i.e. the last axis. Any other axis is moved last on the device
+                // and back: before, it ran with the trailing dims folded away and returned wrong values.
+                if (InnerSize(input, ea) != 1)
+                {
+                    // The device permutation converts through float; any other T keeps its precision on the host.
+                    if (typeof(T) != typeof(float)) return base.SwiGLU(input, axis);
+                    return AlongLastAxis(input, ea, t => ((IEngine)this).SwiGLU(t, -1));
+                }
                 int halfDim = input.Shape._dims[ea] / 2;
                 int outerSize = 1;
                 for (int i = 0; i < ea; i++) outerSize *= input.Shape._dims[i];
@@ -30318,10 +30466,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                var gso=UploadTensorRaw(b, softmaxOutput);
-                var ggo=UploadTensorRaw(b, gradOutput);
                 int rank=softmaxOutput.Rank;
                 int ea=axis<0?rank+axis:axis;
+                // Row kernel (last axis). Any other axis: move it last on the device for both operands, then back.
+                // The permutation reads the operands itself, so they are uploaded only on the row-kernel path.
+                if (InnerSize(softmaxOutput, ea) != 1)
+                {
+                    var perm = AxisLastPermutation(rank, ea);
+                    var r = ((IEngine)this).TensorSoftmaxBackward(PermutedContiguous(softmaxOutput, perm), PermutedContiguous(gradOutput, perm), -1);
+                    return PermutedContiguous(r, InversePermutation(perm));
+                }
+                var gso=UploadTensorRaw(b, softmaxOutput);
+                var ggo=UploadTensorRaw(b, gradOutput);
                 int features=softmaxOutput.Shape._dims[ea];
                 int outerSize=softmaxOutput.Length/features;
                 return DispatchDeferredGpuOp<T>(b,softmaxOutput.Length,softmaxOutput.Shape.ToArray(),

@@ -8583,6 +8583,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
     public unsafe void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         var kernel = ResolveParity210Kernel("parity210_cdist");
         int __total = m*n; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -8594,6 +8595,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
     public unsafe void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         var kernel = ResolveParity210Kernel("parity210_pdist");
         int __total = n*n; if (__total <= 0) return;
         uint gsz = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -8633,6 +8635,28 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IntPtr la0 = src.Handle; IntPtr la1 = dst.Handle; int la2 = srcRowLen; int la3 = dstRowLen; int la4 = numRows; int la5 = copyLen;
         void** args = stackalloc void*[6];
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+        Synchronize();
+    }
+    public unsafe void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_int32_to_float");
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
+        uint gsz = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = raw.Handle; IntPtr la1 = output.Handle; int la2 = n;
+        void** args = stackalloc void*[3];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2;
+        LaunchKernel(kernel, gsz, DefaultBlockSize, args);
+        Synchronize();
+    }
+    public unsafe void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
+    {
+        var kernel = ResolveParity210Kernel("parity210_scatter_positions");
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
+        uint gsz = (uint)((n + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = output.Handle; int la1 = srcDim; int la2 = inner; int la3 = n;
+        void** args = stackalloc void*[4];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3;
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
