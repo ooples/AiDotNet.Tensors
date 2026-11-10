@@ -185,7 +185,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     {
         array = null;
         if (LazySource is ILazyNode node && !node.IsRealized) return false;
-        array = _data.GetBackingArrayIdentity();
+        // Any offset: a slice of an arena slab is a use of the whole slab, and GetBackingArrayIdentity names only
+        // arrays that start at the tensor's first element, so the recycler would hand back a slab a slice still reads.
+        array = _data.TryGetBackingArrayIdentity(out var backing, out _) ? backing : null;
         return true;
     }
 

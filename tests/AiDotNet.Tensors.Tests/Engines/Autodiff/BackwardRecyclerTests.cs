@@ -49,6 +49,37 @@ public class BackwardRecyclerTests
         Assert.NotSame(afterReset1, afterReset2);
     }
 
+    // Pinning a ring wrapper (a layer registering a persistent tensor) removes it from its bucket and moves every later
+    // wrapper down one position. A returned wrapper must still be found by identity: a stored position would name the
+    // next live wrapper (handing out a tensor still in use) or run past the bucket. A returned wrapper that has since
+    // been pinned belongs to the model and must not be reissued at all.
+    [Fact]
+    public void ReturnedRingTensor_IsFoundByIdentity_AfterAnEarlierOneIsPinned()
+    {
+        using var arena = TensorArena.Create();
+        var log = new List<TensorArena.IssuedBuffer>();
+        arena.OpenIssueLog(log);
+        var pinned = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        var returned = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        var live = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        arena.CloseIssueLog(log);
+        Assert.Equal(3, log.Count);
+        pinned.Fill(7f);
+
+        arena.ReturnIssued(log[0]);
+        arena.ReturnIssued(log[2]);
+        arena.ReturnIssued(log[1]);
+        arena.PinExistingTensor(pinned);
+
+        Assert.Same(returned, TensorAllocator.RentUninitialized<float>(new[] { 64, 64 }));
+        Assert.Same(live, TensorAllocator.RentUninitialized<float>(new[] { 64, 64 }));
+        var fresh = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        Assert.NotSame(pinned, fresh);
+        Assert.NotSame(returned, fresh);
+        Assert.NotSame(live, fresh);
+        Assert.All(pinned.ToArray(), value => Assert.Equal(7f, value));
+    }
+
     // The arena has one issue log. A second owner (a recycler of another element type on the same thread) must not
     // take it over, nor close it for the owner that opened it.
     [Fact]
@@ -293,6 +324,21 @@ public class BackwardRecyclerTests
             }
         }
         Assert.Equal(releaseAtDispose, reused);
+    }
+
+    // The recycler marks a step's reads by backing array. A tensor over part of an array (a slice of a shared slab)
+    // reads that array: naming no array would let the recycler hand the slab back while a later step still reads it.
+    [Fact]
+    public void OffsetSlice_NamesItsBackingArrayAsAUse()
+    {
+        var slab = new float[64];
+        var slice = Tensor<float>.FromMemory(new Memory<float>(slab, 8, 16), new[] { 16 });
+        var whole = Tensor<float>.FromMemory(new Memory<float>(slab), new[] { 64 });
+
+        Assert.True(((IBackingArraySource)slice).TryGetBackingArray(out var sliceArray));
+        Assert.Same(slab, sliceArray);
+        Assert.True(((IBackingArraySource)whole).TryGetBackingArray(out var wholeArray));
+        Assert.Same(slab, wholeArray);
     }
 
     [Fact]

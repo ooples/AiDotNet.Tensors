@@ -756,7 +756,7 @@ public sealed class TensorArena : IDisposable
         {
             var returned = (T[])freeArrays.Pop();
             if (clear) Array.Clear(returned, 0, elementCount);
-            _issueLog?.Add(new IssuedBuffer(returned, -1, 0));
+            _issueLog?.Add(new IssuedBuffer(returned, -1, null));
             return returned;
         }
 
@@ -771,7 +771,7 @@ public sealed class TensorArena : IDisposable
             var existing = (T[])bucket[cursor];
             _cursor[key] = cursor + 1;
             if (clear) Array.Clear(existing, 0, elementCount);
-            _issueLog?.Add(new IssuedBuffer(existing, -1, 0));
+            _issueLog?.Add(new IssuedBuffer(existing, -1, null));
             return existing;
         }
 
@@ -790,7 +790,7 @@ public sealed class TensorArena : IDisposable
         bucket.Add(arr);
         TrackBackingBytes<T>(elementCount);
         _cursor[key] = cursor + 1;
-        _issueLog?.Add(new IssuedBuffer(arr, -1, 0));
+        _issueLog?.Add(new IssuedBuffer(arr, -1, null));
         return arr;
     }
 
@@ -838,11 +838,11 @@ public sealed class TensorArena : IDisposable
     /// <summary>A buffer this arena issued while an issue log was open, and where it lives for <see cref="ReturnIssued"/>.</summary>
     internal readonly struct IssuedBuffer
     {
-        internal IssuedBuffer(Array array, int ringSlot, int position)
+        internal IssuedBuffer(Array array, int ringSlot, object? wrapper)
         {
             Array = array;
             RingSlot = ringSlot;
-            Position = position;
+            Wrapper = wrapper;
         }
 
         /// <summary>The backing array.</summary>
@@ -851,12 +851,15 @@ public sealed class TensorArena : IDisposable
         /// <summary>The tensor-ring slot of its wrapper, or -1 for an array from the scratch pool.</summary>
         internal readonly int RingSlot;
 
-        /// <summary>The wrapper's position in its ring bucket.</summary>
-        internal readonly int Position;
+        /// <summary>
+        /// The tensor-ring wrapper, by identity: its position in the bucket moves when a wrapper before it is pinned
+        /// (<see cref="PinExistingTensor"/>), so a stored position could name another live wrapper, or none.
+        /// </summary>
+        internal readonly object? Wrapper;
     }
 
     private List<IssuedBuffer>? _issueLog;
-    private Stack<int>?[]? _ringFree;
+    private Stack<object>?[]? _ringFree;
     private Dictionary<(Type, int), Stack<Array>>? _poolFree;
 
     /// <summary>
@@ -925,8 +928,9 @@ public sealed class TensorArena : IDisposable
         if (_disposed) return;
         if (buffer.RingSlot >= 0)
         {
-            var free = _ringFree ??= new Stack<int>?[MaxTensorRingSlots];
-            (free[buffer.RingSlot] ??= new Stack<int>()).Push(buffer.Position);
+            if (buffer.Wrapper is null) return;
+            var free = _ringFree ??= new Stack<object>?[MaxTensorRingSlots];
+            (free[buffer.RingSlot] ??= new Stack<object>()).Push(buffer.Wrapper);
             return;
         }
         var key = (buffer.Array.GetType().GetElementType()!, buffer.Array.Length);
@@ -984,9 +988,14 @@ public sealed class TensorArena : IDisposable
                 && ReferenceEquals(_tensorRingTypes![i], typeof(T))
                 && _tensorRing[i] is List<object> bucket)
             {
-                // A wrapper returned earlier this step (ReturnIssued) is free again before the cursor's next one.
-                if (_ringFree?[i] is { Count: > 0 } freePositions)
-                    return ReissueRingTensor<T>(bucket, freePositions.Pop(), i, totalSize, shape);
+                // A wrapper returned earlier this step (ReturnIssued) is free again before the cursor's next one, if the
+                // ring still owns it: a pinned wrapper has left the bucket and belongs to the model.
+                if (_ringFree?[i] is { Count: > 0 } freeWrappers)
+                    while (freeWrappers.Count > 0)
+                    {
+                        int position = PositionIn(bucket, freeWrappers.Pop());
+                        if (position >= 0) return ReissueRingTensor<T>(bucket, position, i, totalSize, shape);
+                    }
                 int cursor = _tensorRingCursors![i];
                 // Skip wrappers a finished step handed to its caller (see ResetKeeping); they are still in use, and
                 // reissuing one would reshape and overwrite a tensor the caller holds.
@@ -1008,7 +1017,7 @@ public sealed class TensorArena : IDisposable
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
                 bucket.Add(newTensor);
                 _tensorRingCursors[i] = cursor + 1;
-                _issueLog?.Add(new IssuedBuffer(newArr, i, bucket.Count - 1));
+                _issueLog?.Add(new IssuedBuffer(newArr, i, newTensor));
                 return newTensor;
             }
         }
@@ -1027,7 +1036,7 @@ public sealed class TensorArena : IDisposable
             _tensorRingTypes![idx] = typeof(T);
             _tensorRingSizes![idx] = totalSize;
             _tensorRingCursors![idx] = 1;
-            _issueLog?.Add(new IssuedBuffer(arr, idx, 0));
+            _issueLog?.Add(new IssuedBuffer(arr, idx, tensor));
             return tensor;
         }
 
@@ -1096,8 +1105,15 @@ public sealed class TensorArena : IDisposable
         // it, so ReluBackward's uniform fast path read a recycled ReduceSum-backward ones tensor as all ones after
         // LayerNorm's backward had written its gradient into it (#1702).
         cached.UniformFillValue = null;
-        _issueLog?.Add(new IssuedBuffer(BackingArrayOf(cached), slot, position));
+        _issueLog?.Add(new IssuedBuffer(BackingArrayOf(cached), slot, cached));
         return cached;
+    }
+
+    private static int PositionIn(List<object> bucket, object wrapper)
+    {
+        for (int i = 0; i < bucket.Count; i++)
+            if (ReferenceEquals(bucket[i], wrapper)) return i;
+        return -1;
     }
 
     private static Array BackingArrayOf<T>(LinearAlgebra.Tensor<T> tensor)
