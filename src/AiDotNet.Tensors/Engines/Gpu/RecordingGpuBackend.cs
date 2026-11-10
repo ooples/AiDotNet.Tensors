@@ -964,7 +964,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     public override void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
     {
         RecordOrExecute(KernelType.ElementWise, new[] { raw }, new[] { output },
-            () => Inner.Int32ToFloat(raw, output, n));
+            () => IndexConversion.Of(Inner).Int32ToFloat(raw, output, n));
     }
 
     /// <inheritdoc/>
@@ -972,7 +972,7 @@ public class RecordingGpuBackend : DelegatingGpuBackend
     {
         // Reads nothing; the output is the node's dependency, so a recorded writer of the same buffer keeps its order.
         RecordOrExecute(KernelType.ElementWise, System.Array.Empty<IGpuBuffer>(), new[] { output },
-            () => Inner.ScatterPositions(output, srcDim, inner, n));
+            () => IndexConversion.Of(Inner).ScatterPositions(output, srcDim, inner, n));
     }
 
     #endregion
