@@ -40,6 +40,13 @@ internal interface ILazyNode
     void ClearOutputLazySource();
 
     /// <summary>
+    /// When this node writes in place to a tensor that no node of the trace produced (a persistent tensor: a running
+    /// statistic, an optimizer moment), adds to <paramref name="restores"/> a copy of that tensor and how to put it
+    /// back, and returns true; false for any other node. <paramref name="saved"/> holds the tensors already copied.
+    /// </summary>
+    bool SavePersistentWrite(HashSet<object> saved, List<Action> restores);
+
+    /// <summary>
     /// Detaches this node from its output when its trace is abandoned, restoring any producer
     /// that the node temporarily replaced.
     /// </summary>
