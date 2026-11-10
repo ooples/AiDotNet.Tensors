@@ -26,10 +26,10 @@ if (-not (Test-Path $sarif)) { throw "The build produced no SARIF log at $sarif.
 
 $log = Get-Content $sarif -Raw | ConvertFrom-Json
 # Any other error (a compile error) means the analysis is partial, and a baseline written from it would undercount. The
-# log is kept for diagnosis.
+# log is kept for diagnosis. A result suppressed in source (a pragma) is in the log too, but did not fail the build.
 $otherErrors = @(foreach ($run in $log.runs) {
     foreach ($result in $run.results) {
-        if ($result.level -eq 'error' -and $result.ruleId -notin @('TENS0010', 'TENS0011', 'TENS0012')) {
+        if ($result.level -eq 'error' -and -not $result.suppressions -and $result.ruleId -notin @('TENS0010', 'TENS0011', 'TENS0012')) {
             "$($result.ruleId): $($result.message.text)"
         }
     }
