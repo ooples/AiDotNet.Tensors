@@ -28,6 +28,8 @@ internal static class OptimizerKernels
 // grows by 1/(1 - beta), 1000x for beta2 = 0.999 at step 1.
 static inline float ocl_opt_bias_correction(float beta, float t)
 {
+    // beta = 0 (a valid Adam setting): 1 - 0^t = 1 for t >= 1, without relying on log(0) = -inf.
+    if (beta <= 0.0f) return 1.0f;
     return -expm1(t * log1p(-(1.0f - beta)));
 }
 

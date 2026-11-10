@@ -26,6 +26,8 @@ internal static class CudaOptimizerKernels
 // beta2 = 0.999 at step 1) and moved an AMSGrad step by 1.7e-4 relative. log1pf and expm1f are not remapped.
 __device__ __forceinline__ float bias_correction(float beta, float t)
 {
+    // beta = 0 (a valid Adam setting): 1 - 0^t = 1 for t >= 1, without relying on log(0) = -inf.
+    if (beta <= 0.0f) return 1.0f;
     return -expm1f(t * log1pf(-(1.0f - beta)));
 }
 

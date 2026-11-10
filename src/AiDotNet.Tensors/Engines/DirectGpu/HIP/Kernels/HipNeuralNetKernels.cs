@@ -12,6 +12,8 @@ internal static class HipNeuralNetKernels
 // 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction).
 __device__ __forceinline__ float hip_nn_bias_correction(float beta, float t)
 {
+    // beta = 0 (a valid Adam setting): 1 - 0^t = 1 for t >= 1, without relying on log(0) = -inf.
+    if (beta <= 0.0f) return 1.0f;
     return -expm1f(t * log1pf(-(1.0f - beta)));
 }
 // HIP RTC Compatibility - no includes needed, device intrinsics are built-in

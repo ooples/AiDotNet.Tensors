@@ -19,6 +19,8 @@ internal static class MetalBiasCorrectionPrelude
 #include <metal_stdlib>
 using namespace metal;
 static inline float mtl_bias_correction(float beta, float t) {
+    // beta = 0 (a valid Adam setting): 1 - 0^t = 1 for t >= 1, without relying on log(0) = -inf.
+    if (beta <= 0.0f) return 1.0f;
     float l;
     if (beta >= 0.5f) {
         float d = 1.0f - beta;

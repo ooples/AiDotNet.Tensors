@@ -730,8 +730,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Keeps THIS plan's captured SGD update in place (one step graph): the oracle for the ping-pong update.</summary>
     internal void DisablePingPongForTesting() => _pingPongRejected = true;
 
-    /// <summary>True while the plan holds a captured step graph (it replays it instead of launching the step).</summary>
-    internal bool HasStepGraph => _stepGraphExec != IntPtr.Zero;
+    /// <summary>
+    /// The node counts of this plan's captured step graph, read when it was captured; null while the plan has none (no
+    /// capture ran, it failed, or the backend has no device graphs).
+    /// </summary>
+    internal Engines.DirectGpu.GraphNodeCounts? StepGraphNodeCounts { get; private set; }
 
     /// <summary>True while the plan replays a graph per replay parity.</summary>
     internal bool ReplaysParityGraphs => _stepGraphExecOdd != IntPtr.Zero;
@@ -1364,6 +1367,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
+        StepGraphNodeCounts = null;
         _stepGraphExecOdd = IntPtr.Zero;
         _graphStepCalls = 0;
         DisposeStepIo();   // before the rollback below, which may read the loss
@@ -3930,6 +3934,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 0));
+                        StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;
                     }
                     catch (Exception captureFailure)
                     {

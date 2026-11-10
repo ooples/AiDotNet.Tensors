@@ -643,17 +643,16 @@ internal static class HeadToHeadNetworkHarness
             long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < counts.MeasuredSteps; i++) { plan.Step(); Sync(); }
             counts.AllocatedBytesPerStep = (GC.GetAllocatedBytesForCurrentThread() - before) / counts.MeasuredSteps;
-            if (gpu?.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda)
+            if (gpu is not null)
             {
                 counts.GraphCaptureFailure = plan.GraphCaptureFailureReason;
-                // Only when this plan holds a graph: no failure reason does not mean a capture ran
-                // (AIDOTNET_CUDA_GRAPH_STEP=0 skips it), and then the backend's last counts are another capture's.
-                // This plan is the only one stepping here, so a graph it holds is the backend's last capture.
-                if (plan.HasStepGraph)
+                // This plan's own graph, counted when it was captured: no failure reason does not mean a capture ran
+                // (AIDOTNET_CUDA_GRAPH_STEP=0 skips it), and a backend's last counts can be another capture's.
+                if (plan.StepGraphNodeCounts is { } nodes)
                 {
-                    counts.KernelNodes = cuda.LastCaptureKernelNodeCount;
-                    counts.MemcpyNodes = cuda.LastCaptureMemcpyNodeCount;
-                    counts.MemsetNodes = cuda.LastCaptureMemsetNodeCount;
+                    counts.KernelNodes = nodes.Kernel;
+                    counts.MemcpyNodes = nodes.Memcpy;
+                    counts.MemsetNodes = nodes.Memset;
                 }
             }
             return new TrainRun(new Dictionary<string, PhaseStats>(), Array.Empty<double>());
