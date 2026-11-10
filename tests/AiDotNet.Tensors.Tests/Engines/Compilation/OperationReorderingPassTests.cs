@@ -161,6 +161,7 @@ public sealed class OperationReorderingPassTests
         public void Realize(IEngine engine) { }
         public ILazyNode[] GetInputNodes() => _inputs;
         public void ClearOutputLazySource() { }
+        public bool SavePersistentWrite(HashSet<object> saved, List<Action> restores) => false;
         public void RestoreOutputLazySource() { }
         public void AddStorageLeases(TensorStorageLeaseSet leases) { }
         public override string ToString() => Name;

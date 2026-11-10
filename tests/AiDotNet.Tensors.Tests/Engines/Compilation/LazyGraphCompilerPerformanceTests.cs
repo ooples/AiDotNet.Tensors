@@ -57,6 +57,7 @@ public sealed class LazyGraphCompilerPerformanceTests
         public void Realize(IEngine engine) => IsRealized = true;
         public ILazyNode[] GetInputNodes() => _inputs;
         public void ClearOutputLazySource() { }
+        public bool SavePersistentWrite(HashSet<object> saved, List<Action> restores) => false;
         public void RestoreOutputLazySource() { }
         public void AddStorageLeases(TensorStorageLeaseSet leases) { }
     }
