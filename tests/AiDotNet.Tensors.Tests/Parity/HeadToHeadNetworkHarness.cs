@@ -553,10 +553,15 @@ internal static class HeadToHeadNetworkHarness
 
         var previous = AiDotNetEngine.Current;
         int previousThreads = CpuParallelSettings.MaxDegreeOfParallelism;
-        AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
-        if (gpu is null) CpuParallelSettings.MaxDegreeOfParallelism = 1;
+        // The spec decides autocast, not the caller's environment: an inherited AIDOTNET_AUTOCAST=fp16 would otherwise
+        // count an autocast step against an FP32 baseline.
+        string? autocast = AutocastOf(spec);
+        string? previousAutocast = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
         try
         {
+            AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
+            if (gpu is null) CpuParallelSettings.MaxDegreeOfParallelism = 1;
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", autocast);
             var counts = new StepCounts(warmupSteps, measuredSteps);
             TrainTensors(spec, work, gpu, TensorsMode.Compiled, counts: counts);
             return counts;
@@ -565,6 +570,7 @@ internal static class HeadToHeadNetworkHarness
         {
             AiDotNetEngine.Current = previous;
             CpuParallelSettings.MaxDegreeOfParallelism = previousThreads;
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", previousAutocast);
         }
     }
 
