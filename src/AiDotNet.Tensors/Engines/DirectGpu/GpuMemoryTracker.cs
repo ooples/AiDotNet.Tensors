@@ -257,6 +257,11 @@ public static class GpuMemoryTracker
         }
     }
 
+    // Frames recorded per allocation site (AIDOTNET_GPU_MEMTRACK_DEPTH, default 7). Engine-internal frames
+    // (dispatch, reclaim, deferred ops) can use all 7, hiding the owning layer; raise it to see the model frame.
+    private static readonly int SiteDepth =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_GPU_MEMTRACK_DEPTH"), out int d) && d > 0 ? d : 7;
+
     private static string CaptureSite()
     {
         // Skip the tracker frame + the immediate backend alloc wrapper; show the next several callers so the
@@ -264,7 +269,7 @@ public static class GpuMemoryTracker
         var st = new StackTrace(2, false);
         var sb = new StringBuilder();
         int shown = 0;
-        for (int i = 0; i < st.FrameCount && shown < 7; i++)
+        for (int i = 0; i < st.FrameCount && shown < SiteDepth; i++)
         {
             var m = st.GetFrame(i)?.GetMethod();
             if (m is null) continue;

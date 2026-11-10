@@ -20236,7 +20236,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T>? TryRunGeneralBroadcastBinary<T>(
         Tensor<T> a,
         Tensor<T> b,
-        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> operation)
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> operation,
+        BroadcastBinaryOp ndOp)
     {
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
@@ -20278,19 +20279,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var inputA = GetOrAllocateBuffer(backend, a);
         using var inputB = GetOrAllocateBuffer(backend, b);
+
         var temporaries = new List<OwnedBuffer>();
 
         try
         {
-            IGpuBuffer Expand(IGpuBuffer input, int[] currentShape, int currentLength)
+            // Expands `input` (shape `currentShape`, left-padded to `rank`) to `target` with TileAxis, one
+            // stretched axis at a time; every differing source dimension is one (CanBroadcast above).
+            IGpuBuffer Expand(IGpuBuffer input, int[] currentShape, int currentLength, int[] target)
             {
                 IGpuBuffer current = input;
                 for (int axis = 0; axis < rank; axis++)
                 {
-                    if (currentShape[axis] == outputShape[axis])
+                    if (currentShape[axis] == target[axis])
                         continue;
 
-                    // CanBroadcast above proves every differing source dimension is one.
                     int outerSize = 1;
                     for (int d = 0; d < axis; d++)
                         outerSize = checked(outerSize * currentShape[d]);
@@ -20298,7 +20301,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int d = axis + 1; d < rank; d++)
                         innerSize = checked(innerSize * currentShape[d]);
 
-                    int repeats = outputShape[axis];
+                    int repeats = target[axis];
                     int expandedLength = checked(currentLength * repeats);
                     var expandedLease = AllocateFullyWrittenOutputBuffer(backend, expandedLength);
                     temporaries.Add(expandedLease);
@@ -20311,8 +20314,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return current;
             }
 
-            IGpuBuffer expandedA = Expand(inputA.Buffer, shapeA, a.Length);
-            IGpuBuffer expandedB = Expand(inputB.Buffer, shapeB, b.Length);
+            // One operand already has the output shape: broadcast the other over its leading run of size-1 axes
+            // with the last-axis kernels (every backend has them), tiling it only over the remaining trailing axes.
+            // That temporary is output / outer elements, not a full output-sized copy per operand (e.g. a
+            // [1, F, 1] spectral filter times [N, F, 2] tiles F x 2 floats instead of N x F x 2).
+            bool aFull = shapeA.AsSpan().SequenceEqual(outputShape);
+            bool bFull = shapeB.AsSpan().SequenceEqual(outputShape);
+            if (aFull != bFull && (aFull || ndOp is BroadcastBinaryOp.Add or BroadcastBinaryOp.Multiply))
+            {
+                int[] smallShape = aFull ? shapeB : shapeA;
+                int lead = 0;
+                while (lead < rank && smallShape[lead] == 1) lead++;
+                if (lead > 0)
+                {
+                    int outer = 1;
+                    for (int d = 0; d < lead; d++) outer = checked(outer * outputShape[d]);
+                    int inner = outputLength / outer;
+                    var target = (int[])outputShape.Clone();
+                    for (int d = 0; d < lead; d++) target[d] = 1;
+                    IGpuBuffer full = aFull ? inputA.Buffer : inputB.Buffer;
+                    IGpuBuffer row = Expand(aFull ? inputB.Buffer : inputA.Buffer, (int[])smallShape.Clone(),
+                        aFull ? b.Length : a.Length, target);
+                    // full op row; a small first operand reaches here only for the commutative add / multiply.
+                    return DispatchDeferredGpuOp<T>(backend, outputLength, outputShape, output =>
+                    {
+                        switch (ndOp)
+                        {
+                            case BroadcastBinaryOp.Add: backend.BroadcastAddLast(full, row, output, outer, inner); break;
+                            case BroadcastBinaryOp.Subtract: backend.BroadcastSubLast(full, row, output, outer, inner); break;
+                            case BroadcastBinaryOp.Multiply: backend.BroadcastMulLast(full, row, output, outer, inner); break;
+                            default: backend.BroadcastDivLast(full, row, output, outer, inner); break;
+                        }
+                    }, fullyWritten: true);
+                }
+            }
+
+            IGpuBuffer expandedA = Expand(inputA.Buffer, shapeA, a.Length, outputShape);
+            IGpuBuffer expandedB = Expand(inputB.Buffer, shapeB, b.Length, outputShape);
             return DispatchDeferredGpuOp<T>(backend, outputLength, outputShape,
                 output => operation(backend, expandedA, expandedB, output, outputLength));
         }
@@ -20440,7 +20478,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // TileAxis + Multiply are part of IDirectGpuBackend, so this remains native on all six
             // direct GPU backends instead of silently downloading complex broadcast shapes to CPU.
             if (TryRunGeneralBroadcastBinary(a, b,
-                    static (be, left, right, output, size) => be.Multiply(left, right, output, size)) is { } general)
+                    static (be, left, right, output, size) => be.Multiply(left, right, output, size), BroadcastBinaryOp.Multiply) is { } general)
                 return RecordGpuResult(general);
 
             GpuLaunchProbe.OnFallback($"TensorBroadcastMultiply:incompatible a={string.Join("x", a.Shape._dims)} b={string.Join("x", b.Shape._dims)}", null);
@@ -26976,7 +27014,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             if (TryRunGeneralBroadcastBinary(a, b,
-                    static (be, left, right, output, size) => be.Add(left, right, output, size)) is { } general)
+                    static (be, left, right, output, size) => be.Add(left, right, output, size), BroadcastBinaryOp.Add) is { } general)
                 return RecordGpuResult(general);
         }
         catch (Exception ex)
@@ -27049,7 +27087,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             if (TryRunGeneralBroadcastBinary(a, b,
-                    static (be, left, right, output, size) => be.Subtract(left, right, output, size)) is { } general)
+                    static (be, left, right, output, size) => be.Subtract(left, right, output, size), BroadcastBinaryOp.Subtract) is { } general)
                 return RecordGpuResult(general);
         }
         catch (Exception ex)
@@ -27123,7 +27161,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             if (TryRunGeneralBroadcastBinary(a, b,
-                    static (be, left, right, output, size) => be.Divide(left, right, output, size)) is { } general)
+                    static (be, left, right, output, size) => be.Divide(left, right, output, size), BroadcastBinaryOp.Divide) is { } general)
                 return RecordGpuResult(general);
         }
         catch (Exception ex)
