@@ -67,8 +67,9 @@ public class SkinnyTransBGemmTests
             for (int j = 0; j < n; j++)
             {
                 double expected = 1;
-                for (int p = 0; p < k; p++) expected += a[i * lda + p] * b[j * k + p];
-                Assert.Equal(expected, c[i * n + j], 4);
+                for (int p = 0; p < k; p++) expected += (double)a[i * lda + p] * b[j * k + p];
+                Assert.True(Math.Abs(expected - c[i * n + j]) <= 1e-4 * (1 + Math.Abs(expected)),
+                    $"C[{i}, {j}] = {c[i * n + j]:R}, reference {expected:R}");
             }
         }
     }

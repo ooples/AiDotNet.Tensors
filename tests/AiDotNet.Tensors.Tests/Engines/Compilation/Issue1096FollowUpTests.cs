@@ -61,6 +61,35 @@ public class Issue1096FollowUpTests
         Assert.Equal(2, ws.CompletedForwards);
     }
 
+    // The forward wrapper itself must abort the workspace when the arithmetic throws, not only a caller that aborts it
+    // by hand: an output span too short for the hidden outputs makes the core throw part-way through the recurrence.
+    [Fact]
+    public void LstmForward_ThatThrows_LeavesTheWorkspaceUnbackpropagatable_UntilAForwardCompletes()
+    {
+        const int batch = 2, seqLen = 3, inFeatures = 4, hidden = 5, G = 4 * hidden;
+        var ws = new CpuEngine.LstmTrainWorkspace(batch, seqLen, inFeatures, hidden);
+        float[] input = Filled(new[] { batch * seqLen * inFeatures }, 31, 1f).ToArray();
+        float[] wIh = Filled(new[] { G * inFeatures }, 32, 0.5f).ToArray();
+        float[] wHh = Filled(new[] { G * hidden }, 33, 0.5f).ToArray();
+        var output = new float[batch * seqLen * hidden];
+
+        void Forward(Span<float> outSpan) => CpuEngine.LstmTrainForwardCoreFloat(
+            input, wIh, wHh, null, null, null, null, returnSequences: true, ws, outSpan);
+
+        Forward(output);
+        Assert.Equal(1, ws.CompletedForwards);
+
+        Assert.ThrowsAny<Exception>(() => Forward(new float[hidden]));
+        var partial = Assert.Throws<InvalidOperationException>(() => ws.BeginBackward());
+        Assert.Contains("partial", partial.Message);
+        Assert.Equal(1, ws.CompletedForwards);
+
+        Forward(output);
+        ws.BeginBackward();
+        ws.EndBackward();
+        Assert.Equal(2, ws.CompletedForwards);
+    }
+
     // Two external leaves into one same-shape add (each with a single consumer): the reshape/add gradient aliasing
     // shares their gradient buffers and skips the add's backward, and the gradient pool may give same-shaped leaves one
     // buffer. Both leaves must still publish their own .Grad, equal to the eager tape's, on every step.

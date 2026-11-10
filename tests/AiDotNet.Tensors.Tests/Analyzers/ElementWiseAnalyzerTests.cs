@@ -80,7 +80,9 @@ public sealed class ElementWiseAnalyzerTests
     {
         const string body = "double s = 0; for (int i = 0; i < t.Length; i++) s = ops.Add(s, t[i]); return s;";
 
-        Assert.Equal(Analyze(body).Length, Analyze(body, attribute: attribute).Length);
+        var unattributed = Analyze(body);
+        Assert.NotEmpty(unattributed);
+        Assert.Equal(unattributed.Length, Analyze(body, attribute: attribute).Length);
     }
 
     [Fact]

@@ -235,7 +235,7 @@ public partial class CpuEngine
     /// workspace per call, a compiled-plan node one workspace it reuses every step. Requires seqLen &gt; 0.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void LstmTrainForwardCoreFloat(
+    internal static unsafe void LstmTrainForwardCoreFloat(
         float[] inArr, float[] wIhArr, float[] wHhArr,
         float[]? bIhArr, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
         bool returnSequences, LstmTrainWorkspace ws, Span<float> outSpan)
