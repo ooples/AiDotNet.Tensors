@@ -304,65 +304,125 @@ struct P { N: i32, d: i32, vocab: i32 };
     rowLoss[r] = -rl;
 }";
 
-    // GLA BPTT backward: recompute the state trajectory, then reverse-sweep. WGSL has no float
-    // atomics, so dQ/dK/dG are bound as atomic<u32> and accumulated via a bitcast CAS loop; dV is a
-    // plain per-thread store. dQ/dK/dG must be pre-zeroed.
-    public const string GlaRecompute = @"
-@group(0) @binding(0) var<storage, read> K: array<f32>;
-@group(0) @binding(1) var<storage, read> Vd: array<f32>;
-@group(0) @binding(2) var<storage, read> G: array<f32>;
-@group(0) @binding(3) var<storage, read_write> Straj: array<f32>;
-struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
-@group(0) @binding(4) var<uniform> p: P;
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    let gid = i32(gid3.x);
-    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
-    if (gid >= B*NH*HD) { return; }
-    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
-    var Srow: array<f32, 256>;
-    for (var ki: i32 = 0; ki < HD; ki = ki+1) { Srow[ki] = 0.0; }
-    for (var t: i32 = 0; t < SL; t = t+1) {
-        let baseOff = (b*SL+t)*MD + hOff;
-        let g = G[(b*SL+t)*NH + h]; let vd = Vd[baseOff+di];
-        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let s = g*Srow[ki] + vd*K[baseOff+ki]; Srow[ki] = s; Straj[trajBase+ki] = s; }
-    }
-}";
-
-    public const string GlaBackward = @"
+    // GLA BPTT backward, checkpointed: pass 1 re-runs the forward scan saving the state entering each chunk of
+    // `chunk` steps (Ckpt, B*H*nChunks*d^2); pass 2 walks chunks in reverse, recomputes the chunk's states into
+    // Scratch (B*H*chunk*d^2) and reverse-sweeps it: O(sqrt(S)) state memory instead of the O(S) trajectory
+    // (GlaScanCheckpoint). WGSL has no float atomics, so dQ/dK/dG are bound as atomic<u32> and accumulated via a
+    // bitcast CAS loop; dV is a plain per-thread store. dQ/dK/dG must be pre-zeroed.
+    public const string GlaBackwardCheckpointed = @"
 @group(0) @binding(0) var<storage, read> dOut: array<f32>;
-// QKpk = Q|K and GSpk = G|Straj, each packed: 8 storage buffers, WebGPU's guaranteed per-stage limit.
+// QKpk = Q|K and GCS = G|Ckpt|Scratch, each packed: 8 storage buffers, WebGPU's guaranteed per-stage limit.
 @group(0) @binding(1) var<storage, read> QKpk: array<f32>;
 @group(0) @binding(2) var<storage, read> Vd: array<f32>;
-@group(0) @binding(3) var<storage, read> GSpk: array<f32>;
+@group(0) @binding(3) var<storage, read_write> GCS: array<f32>;
 @group(0) @binding(4) var<storage, read_write> dQ: array<atomic<u32>>;
 @group(0) @binding(5) var<storage, read_write> dK: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> dV: array<f32>;
 @group(0) @binding(7) var<storage, read_write> dG: array<atomic<u32>>;
-struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32, chunk: i32 };
 @group(0) @binding(8) var<uniform> p: P;
 fn addDQ(idx: i32, val: f32) { var old = atomicLoad(&dQ[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dQ[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
 fn addDK(idx: i32, val: f32) { var old = atomicLoad(&dK[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dK[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
 fn addDG(idx: i32, val: f32) { var old = atomicLoad(&dG[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dG[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let gid = i32(gid3.x);
-    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
+    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim; let CH = p.chunk;
     if (gid >= B*NH*HD) { return; }
     let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
+    let bh = b*NH + h; let rowOff = di*HD; let nChunks = (SL + CH - 1) / CH;
+    let kOff = B*SL*MD;
+    let ckBase = B*SL*NH;
+    let scBase = ckBase + B*NH*nChunks*hh;
+    var Srow: array<f32, 256>;
     var dSrow: array<f32, 256>;
-    for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
-    for (var t: i32 = SL-1; t >= 0; t = t-1) {
-        let baseOff = (b*SL+t)*MD + hOff; let gOff = (b*SL+t)*NH + h; let g = GSpk[gOff];
-        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        let sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
-        let dOutVal = dOut[baseOff+di];
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let sval = GSpk[p.batch*p.seqLen*p.numHeads+trajBase+ki]; addDQ(baseOff+ki, dOutVal*sval); dSrow[ki] = dSrow[ki] + dOutVal*QKpk[baseOff+ki]; }
-        let vd = Vd[baseOff+di]; var dg: f32 = 0.0; var dVacc: f32 = 0.0;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let dStv = dSrow[ki]; var sprev: f32 = 0.0; if (t > 0) { sprev = GSpk[p.batch*p.seqLen*p.numHeads+sprevBase+ki]; } dg = dg + dStv*sprev; addDK(baseOff+ki, dStv*vd); dVacc = dVacc + dStv*QKpk[p.batch*p.seqLen*p.modelDim+baseOff+ki]; }
-        dV[baseOff+di] = dVacc;
-        addDG(gOff, dg);
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = dSrow[ki] * g; }
+    for (var ki: i32 = 0; ki < HD; ki = ki+1) { Srow[ki] = 0.0; }
+    for (var t: i32 = 0; t < SL; t = t+1) {
+        if (t % CH == 0) { let ck = ckBase + (bh*nChunks + t/CH)*hh + rowOff; for (var ki: i32 = 0; ki < HD; ki = ki+1) { GCS[ck+ki] = Srow[ki]; } }
+        let baseOff = (b*SL+t)*MD + hOff;
+        let g = GCS[(b*SL+t)*NH + h]; let vd = Vd[baseOff+di];
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { Srow[ki] = g*Srow[ki] + vd*QKpk[kOff+baseOff+ki]; }
     }
+    for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
+    for (var c: i32 = nChunks-1; c >= 0; c = c-1) {
+        let t0 = c*CH; let t1 = min(SL, t0+CH);
+        let ck = ckBase + (bh*nChunks + c)*hh + rowOff;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { Srow[ki] = GCS[ck+ki]; }
+        for (var t: i32 = t0; t < t1; t = t+1) {
+            let baseOff = (b*SL+t)*MD + hOff;
+            let g = GCS[(b*SL+t)*NH + h]; let vd = Vd[baseOff+di];
+            let sc = scBase + (bh*CH + (t-t0))*hh + rowOff;
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { let s = g*Srow[ki] + vd*QKpk[kOff+baseOff+ki]; Srow[ki] = s; GCS[sc+ki] = s; }
+        }
+        for (var t: i32 = t1-1; t >= t0; t = t-1) {
+            let baseOff = (b*SL+t)*MD + hOff; let gOff = (b*SL+t)*NH + h; let g = GCS[gOff];
+            let sc = scBase + (bh*CH + (t-t0))*hh + rowOff;
+            var sp: i32 = ck;
+            if (t > t0) { sp = scBase + (bh*CH + (t-1-t0))*hh + rowOff; }
+            let dOutVal = dOut[baseOff+di];
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { addDQ(baseOff+ki, dOutVal*GCS[sc+ki]); dSrow[ki] = dSrow[ki] + dOutVal*QKpk[baseOff+ki]; }
+            let vd = Vd[baseOff+di]; var dg: f32 = 0.0; var dVacc: f32 = 0.0;
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { let dStv = dSrow[ki]; dg = dg + dStv*GCS[sp+ki]; addDK(baseOff+ki, dStv*vd); dVacc = dVacc + dStv*QKpk[kOff+baseOff+ki]; }
+            dV[baseOff+di] = dVacc;
+            addDG(gOff, dg);
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = dSrow[ki] * g; }
+        }
+    }
+}";
+
+    // Channels-last causal depthwise conv (ICausalDepthwiseConvBackend): x, y, dy, dx are [rows, seqLen, C]; w, dw
+    // are [K, C]; tap j reads j steps back. Every output element is written and nothing is atomic: deterministic.
+    public const string CausalConvForward = @"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+struct P { rows: i32, seqLen: i32, channels: i32, taps: i32 };
+@group(0) @binding(3) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let idx = i32(gid3.x);
+    let SL = p.seqLen; let C = p.channels; let K = p.taps;
+    if (idx >= p.rows*SL*C) { return; }
+    let c = idx % C; let t = (idx / C) % SL;
+    let maxJ = min(K - 1, t);
+    var acc: f32 = 0.0;
+    for (var j: i32 = 0; j <= maxJ; j = j+1) { acc = acc + w[j*C + c] * x[idx - j*C]; }
+    y[idx] = acc;
+}";
+
+    public const string CausalConvBackwardInput = @"
+@group(0) @binding(0) var<storage, read> dy: array<f32>;
+@group(0) @binding(1) var<storage, read> w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dx: array<f32>;
+struct P { rows: i32, seqLen: i32, channels: i32, taps: i32 };
+@group(0) @binding(3) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let idx = i32(gid3.x);
+    let SL = p.seqLen; let C = p.channels; let K = p.taps;
+    if (idx >= p.rows*SL*C) { return; }
+    let c = idx % C; let t = (idx / C) % SL;
+    let maxJ = min(K - 1, SL - 1 - t);
+    var acc: f32 = 0.0;
+    for (var j: i32 = 0; j <= maxJ; j = j+1) { acc = acc + w[j*C + c] * dy[idx + j*C]; }
+    dx[idx] = acc;
+}";
+
+    // One invocation per (tap j, channel c), summing every row and step in ascending order.
+    public const string CausalConvBackwardKernel = @"
+@group(0) @binding(0) var<storage, read> dy: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dw: array<f32>;
+struct P { rows: i32, seqLen: i32, channels: i32, taps: i32 };
+@group(0) @binding(3) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let jc = i32(gid3.x);
+    let SL = p.seqLen; let C = p.channels; let K = p.taps;
+    if (jc >= K*C) { return; }
+    let j = jc / C; let c = jc % C;
+    var acc: f32 = 0.0;
+    for (var r: i32 = 0; r < p.rows; r = r+1) {
+        let rowBase = r*SL*C;
+        for (var t: i32 = j; t < SL; t = t+1) { acc = acc + dy[rowBase + t*C + c] * x[rowBase + (t-j)*C + c]; }
+    }
+    dw[jc] = acc;
 }";
 
     public const string GatedDeltaRecompute = @"

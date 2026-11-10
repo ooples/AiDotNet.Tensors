@@ -70,7 +70,7 @@ internal static class DirectPtxRecurrentCoverageManifest
         Backend("IDirectGpuBackend.GruBackwardSequence", "gru_backward_sequence (NVRTC cooperative)", "GRU BPTT", "saved states/gates and gradients", "FP32", "deterministic backward family"),
         Backend("IDirectGpuBackend.GruCellBackward", "gru_cell_backward_unified + gru_backward_prevh_unified (NVRTC)", "single-cell GRU backward", "[B,H] gates/state", "FP32", "single-launch fused cell backward"),
         Backend("IDirectGpuBackend.GlaScanForward", "gla_scan_forward (NVRTC)", "GLA forward scan", "dense token/head", "FP32", "persistent state-row forward"),
-        Backend("IDirectGpuBackend.GlaScanBackward", "gla_scan_recompute + gla_scan_backward (NVRTC)", "GLA recompute BPTT", "trajectory workspace", "FP32", "chunked zero-avoidable-workspace backward"),
+        Backend("IDirectGpuBackend.GlaScanBackward", "gla_scan_backward_ckpt (NVRTC)", "GLA checkpointed BPTT", "sqrt(S) state checkpoints + one recomputed chunk", "FP32", "chunked zero-avoidable-workspace backward"),
         Backend("IDirectGpuBackend.XLstmScanForward", "xlstm_scan_forward (NVRTC)", "xLSTM forward", "dense token/head", "FP32", "head-persistent forward"),
         Backend("IDirectGpuBackend.GatedDeltaNetScanForward", "gated_delta_scan_forward (NVRTC)", "delta-rule forward", "dense token/head", "FP32", "row-persistent forward"),
         new("IDirectGpuBackend.RgLruScanForward", "rglru_scan_forward (NVRTC)", "RG-LRU forward", "dense [B,S,D], decay [D]", "FP32",
