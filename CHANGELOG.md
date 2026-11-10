@@ -11,7 +11,7 @@
 ### Bug Fixes
 
 * **ci:** print hung test host stacks and stop gc pauses tripping wgsl translation ([#1690](https://github.com/ooples/AiDotNet.Tensors/issues/1690)) ([c3fe3a1](https://github.com/ooples/AiDotNet.Tensors/commit/c3fe3a1fae1b6968390d97d2b80b3c0417fd92bd))
-* **simd:** extend FastExpDouble256 Taylor expansion to degree 13 (&lt;0.5 ULP across +-ln2/2) ([#1692](https://github.com/ooples/AiDotNet.Tensors/issues/1692)) ([3ff6e9c](https://github.com/ooples/AiDotNet.Tensors/commit/3ff6e9c51bf1b98da00ba3d6f970d67bf7228621))
+* **simd:** extend FastExpDouble256 Taylor expansion to degree 13 (about 1 ULP: measured max 1.001 ULP over x in [-700, 700]; the release note originally claimed &lt;0.5 ULP, which rounding in the polynomial does not reach) ([#1692](https://github.com/ooples/AiDotNet.Tensors/issues/1692)) ([3ff6e9c](https://github.com/ooples/AiDotNet.Tensors/commit/3ff6e9c51bf1b98da00ba3d6f970d67bf7228621))
 
 
 ### Performance

@@ -534,6 +534,11 @@ public partial class CpuEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        RequireRank(input, 3, "TensorConvTranspose1D", "[batch, in_channels, length]");
+        RequireRank(kernel, 3, "TensorConvTranspose1D", "[in_channels, out_channels, kernel_size]");
+        if (kernel._shape[0] != input._shape[1])
+            throw new ArgumentException(
+                $"TensorConvTranspose1D: the kernel has {kernel._shape[0]} input channels; the input has {input._shape[1]}.", nameof(kernel));
         int n = input._shape[0], cin = input._shape[1], length = input._shape[2], cout = kernel._shape[1], k = kernel._shape[2];
         var y = ConvTranspose2D(Reshape(input, new[] { n, cin, 1, length }), Reshape(kernel, new[] { cin, cout, 1, k }),
             new[] { 1, stride }, new[] { 0, padding }, new[] { 0, outputPadding });
