@@ -142,14 +142,30 @@ public sealed class ConvShortcutPairPlanTests : IClassFixture<DirectGpuTensorEng
             long before = DirectGpuTensorEngine.ShortcutPairLaunches;
             using (plan)
             {
-                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
-                plan.Step();
-                if (x.Grad is not { } g)
+                // The weights move every step, so a replayed step that skipped the pair's x.Grad write would leave the
+                // step-one gradient, which differs from the last one. Steps after the first replay where captured.
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.01f);
+                float[] first = Array.Empty<float>();
+                for (int step = 0; step < 3; step++)
+                {
+                    plan.Step();
+                    if (x.Grad is not { } g)
+                    {
+                        Assert.Fail($"fuse={fuse}: the requested input gradient was not set at step {step}");
+                        return (Array.Empty<float>(), 0);
+                    }
+                    if (step == 0) first = g.ToArray();
+                }
+                if (x.Grad is not { } last)
                 {
                     Assert.Fail($"fuse={fuse}: the requested input gradient was not set");
                     return (Array.Empty<float>(), 0);
                 }
-                return (g.ToArray(), DirectGpuTensorEngine.ShortcutPairLaunches - before);
+                var final = last.ToArray();
+                double moved = 0;
+                for (int i = 0; i < final.Length; i++) moved = Math.Max(moved, Math.Abs(final[i] - first[i]));
+                Assert.True(moved > 0, $"fuse={fuse}: x.Grad after three steps equals step one's (test cannot see a stale write)");
+                return (final, DirectGpuTensorEngine.ShortcutPairLaunches - before);
             }
         }
         finally
