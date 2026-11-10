@@ -99,7 +99,7 @@ internal static class DeterministicGradientNorm
             return;
         }
         var p = (IntPtr)data;
-        System.Threading.Tasks.Parallel.For(0, chunks, c =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel(chunks, c =>
         {
             var basePtr = (float*)p;
             dest[offset + c] = ChunkPartial(new ReadOnlySpan<float>(basePtr + (long)c * Chunk, Math.Min(Chunk, length - c * Chunk)), tensor);
@@ -119,7 +119,7 @@ internal static class DeterministicGradientNorm
         }
         var p = (IntPtr)data;
         int blocks = (length + 65535) / 65536;
-        System.Threading.Tasks.Parallel.For(0, blocks, b =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel(blocks, b =>
         {
             var q = (uint*)p;
             int end = Math.Min(length, (b + 1) * 65536);
