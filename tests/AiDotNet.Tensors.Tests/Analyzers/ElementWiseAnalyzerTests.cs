@@ -70,6 +70,19 @@ public sealed class ElementWiseAnalyzerTests
         Assert.Empty(Analyze(body, attribute: "[AiDotNet.Tensors.Helpers.ScalarKernel(\"a reference kernel\")]"));
     }
 
+    // The attribute's constructor rejects a blank reason only under reflection, so the analyzer must: a blank reason,
+    // or an attribute of the same name from another namespace, leaves every occurrence reported.
+    [Theory]
+    [InlineData("[AiDotNet.Tensors.Helpers.ScalarKernel(\"\")]")]
+    [InlineData("[AiDotNet.Tensors.Helpers.ScalarKernel(\"   \")]")]
+    [InlineData("[Elsewhere.ScalarKernel(\"a reference kernel\")]")]
+    public void ScalarKernelWithoutAReasonOrFromElsewhere_IsNotExempt(string attribute)
+    {
+        const string body = "double s = 0; for (int i = 0; i < t.Length; i++) s = ops.Add(s, t[i]); return s;";
+
+        Assert.Equal(Analyze(body).Length, Analyze(body, attribute: attribute).Length);
+    }
+
     [Fact]
     public void GateRunsOnlyOnTheNewestFramework()
     {
@@ -142,6 +155,11 @@ namespace AiDotNet.Tensors.Interfaces
     public interface INumericOperations<T> { T Add(T a, T b); }
 }
 namespace AiDotNet.Tensors.Helpers
+{
+    [System.AttributeUsage(System.AttributeTargets.All)]
+    public sealed class ScalarKernelAttribute : System.Attribute { public ScalarKernelAttribute(string reason) { } }
+}
+namespace Elsewhere
 {
     [System.AttributeUsage(System.AttributeTargets.All)]
     public sealed class ScalarKernelAttribute : System.Attribute { public ScalarKernelAttribute(string reason) { } }

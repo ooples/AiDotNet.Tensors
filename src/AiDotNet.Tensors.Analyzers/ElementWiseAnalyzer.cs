@@ -102,10 +102,12 @@ public sealed class ElementWiseAnalyzer : DiagnosticAnalyzer
             {
                 start.RegisterOperationAction(operation =>
                 {
+                    // The loop walk is cheaper than the interface scan, and most invocations are not in a loop.
+                    if (!IsInsideLoop(operation.Operation)) return;
                     var invocation = (IInvocationOperation)operation.Operation;
                     var declaring = invocation.TargetMethod.ContainingType?.OriginalDefinition;
                     if (declaring is null || !IsNumericOperations(declaring, numericOperations)) return;
-                    if (!IsInsideLoop(operation.Operation) || IsExempt(operation.ContainingSymbol)) return;
+                    if (IsExempt(operation.ContainingSymbol)) return;
                     string member = MemberKey(operation.ContainingSymbol);
                     string key = NumericOperationInLoop.Id + "|" + member;
                     counts.AddOrUpdate(key, 1, (_, n) => n + 1);
@@ -194,12 +196,22 @@ public sealed class ElementWiseAnalyzer : DiagnosticAnalyzer
     {
         for (var current = symbol; current is not null; current = current.ContainingSymbol)
         {
-            if (current.GetAttributes().Any(a => a.AttributeClass?.Name == "ScalarKernelAttribute")) return true;
+            if (current.GetAttributes().Any(IsScalarKernel)) return true;
             if (current is INamespaceSymbol) break;
         }
 
         return false;
     }
+
+    // The exemption is AiDotNet.Tensors.Helpers.ScalarKernelAttribute with a stated reason. Its constructor rejects a
+    // blank reason only when the attribute is read by reflection, which a build never does, so the check is made here:
+    // a blank reason, or a namesake from another namespace, exempts nothing.
+    private static bool IsScalarKernel(AttributeData attribute) =>
+        attribute.AttributeClass is { Name: "ScalarKernelAttribute" } type
+        && type.ContainingNamespace?.ToDisplayString() == "AiDotNet.Tensors.Helpers"
+        && attribute.ConstructorArguments.Length > 0
+        && attribute.ConstructorArguments[0].Value is string reason
+        && !string.IsNullOrWhiteSpace(reason);
 
     /// <summary>The baseline key of an occurrence: its outermost containing member, with parameter types.</summary>
     internal static string MemberKey(ISymbol? symbol)

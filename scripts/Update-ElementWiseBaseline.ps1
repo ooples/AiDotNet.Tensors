@@ -25,6 +25,18 @@ $sarif = Join-Path ([System.IO.Path]::GetTempPath()) "elementwise-$([guid]::NewG
 if (-not (Test-Path $sarif)) { throw "The build produced no SARIF log at $sarif." }
 
 $log = Get-Content $sarif -Raw | ConvertFrom-Json
+# Any other error (a compile error) means the analysis is partial, and a baseline written from it would undercount. The
+# log is kept for diagnosis.
+$otherErrors = @(foreach ($run in $log.runs) {
+    foreach ($result in $run.results) {
+        if ($result.level -eq 'error' -and $result.ruleId -notin @('TENS0010', 'TENS0011', 'TENS0012')) {
+            "$($result.ruleId): $($result.message.text)"
+        }
+    }
+})
+if ($otherErrors.Count -gt 0) {
+    throw "The build failed with $($otherErrors.Count) error(s) besides the gate rules, so the baseline was not written (log: $sarif):`n$(($otherErrors | Select-Object -First 20) -join "`n")"
+}
 $seen = [System.Collections.Generic.HashSet[string]]::new()
 $counts = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
 foreach ($run in $log.runs) {
