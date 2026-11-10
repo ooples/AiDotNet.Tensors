@@ -130,10 +130,14 @@ public class ArenaWithheldGradientsTests
         thread.Join();
         if (failure is not null) throw new InvalidOperationException("The training steps threw.", failure);
 
-        // One step's handed-over gradients may be withheld at a time; later steps must not add to them.
-        int bound = Math.Max(counts![0], 1);
-        for (int step = 1; step < counts.Length; step++)
-            Assert.True(counts[step] <= bound,
-                $"Withheld arrays per step: [{string.Join(", ", counts)}]; step {step} holds {counts[step]}, more than the {bound} of one step.");
+        // One step's handed-over gradients may be withheld at a time; later steps must not add to them. A step hands
+        // over its two gradients (w1, w2), so that is the bound. The first step's count is not: only gradients the arena
+        // itself issued are withheld, and whether it issues one depends on process-wide pool state that tests running
+        // in parallel change, so an early step can withhold fewer (measured [1, 0, 2, 2, 2, 2] under a full run). The
+        // leak this guards (AiDotNet#2322) adds a set per step: [2, 4, 6, ...].
+        const int gradientsPerStep = 2;
+        for (int step = 0; step < counts!.Length; step++)
+            Assert.True(counts[step] <= gradientsPerStep,
+                $"Withheld arrays per step: [{string.Join(", ", counts)}]; step {step} holds {counts[step]}, more than the {gradientsPerStep} of one step.");
     }
 }
