@@ -18,8 +18,9 @@ public class RoIAlignPlanTests
 {
     private const int N = 2, C = 3, H = 7, W = 9, OutH = 3, OutW = 2;
 
-    // [batch, x1, y1, x2, y2]: overlapping boxes on image 0, one on image 1, one past the right and bottom edges, and
-    // one smaller than a pixel.
+    // [batch, x1, y1, x2, y2]: overlapping boxes on image 0, one on image 1, one past the right and bottom edges, one
+    // smaller than a pixel, one of zero width and one inverted (x2 < x1, y2 < y1). Aligned, the last two have an empty
+    // sampling grid when the ratio is adaptive.
     private static readonly double[] Boxes =
     {
         0, 0.5, 0.25, 6.0, 5.5,
@@ -27,6 +28,8 @@ public class RoIAlignPlanTests
         1, 1.25, 0.75, 4.0, 3.5,
         1, 5.0, 4.0, 11.0, 9.5,
         0, 3.1, 2.2, 3.4, 2.6,
+        1, 4.0, 3.0, 4.0, 5.0,
+        0, 6.0, 2.0, 5.5, 1.5,
     };
 
     private static double[] Image() =>
@@ -59,8 +62,9 @@ public class RoIAlignPlanTests
             double x2 = Boxes[(r * 5) + 3] * scale - shift, y2 = Boxes[(r * 5) + 4] * scale - shift;
             double rw = aligned ? x2 - x1 : Math.Max(x2 - x1, 1), rh = aligned ? y2 - y1 : Math.Max(y2 - y1, 1);
             double bh = rh / OutH, bw = rw / OutW;
-            int gy = Math.Max(1, ratio > 0 ? ratio : (int)Math.Ceiling(rh / OutH));
-            int gx = Math.Max(1, ratio > 0 ? ratio : (int)Math.Ceiling(rw / OutW));
+            // torchvision's count = max(grid_h * grid_w, 1): an empty grid averages to 0.
+            int gy = ratio > 0 ? ratio : (int)Math.Ceiling(rh / OutH);
+            int gx = ratio > 0 ? ratio : (int)Math.Ceiling(rw / OutW);
             for (int c = 0; c < C; c++)
             for (int ph = 0; ph < OutH; ph++)
             for (int pw = 0; pw < OutW; pw++)
@@ -69,7 +73,7 @@ public class RoIAlignPlanTests
                 for (int iy = 0; iy < gy; iy++)
                 for (int ix = 0; ix < gx; ix++)
                     sum += Sample(x, (n * C + c) * H * W, y1 + ph * bh + (iy + 0.5) * bh / gy, x1 + pw * bw + (ix + 0.5) * bw / gx);
-                output[(((r * C) + c) * OutH + ph) * OutW + pw] = sum / (gy * gx);
+                output[(((r * C) + c) * OutH + ph) * OutW + pw] = sum / Math.Max(gy * gx, 1);
             }
         }
 
@@ -109,6 +113,17 @@ public class RoIAlignPlanTests
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-12, $"[{i}] reference {expected[i]} vs {actual[i]}");
+    }
+
+    [Fact]
+    public void Aligned_degenerate_rois_average_to_zero_as_torchvision()
+    {
+        // torchvision.ops.roi_align(aligned=True, sampling_ratio=-1) on a zero-width box: ceil(0 / out) = 0 samples,
+        // count = max(0, 1) = 1, so every bin is 0. Sampling the box edge instead gave the image's values there.
+        var input = new Tensor<double>(Image(), new[] { N, C, H, W });
+        var boxes = new Tensor<double>(new double[] { 1, 4.0, 3.0, 4.0, 5.0, 0, 6.0, 2.0, 5.5, 1.5 }, new[] { 2, 5 });
+        var output = new CpuEngine().RoIAlign(input, boxes, OutH, OutW, 1.0f, 0, true).ToArray();
+        Assert.All(output, v => Assert.Equal(0.0, v));
     }
 
     [Fact]

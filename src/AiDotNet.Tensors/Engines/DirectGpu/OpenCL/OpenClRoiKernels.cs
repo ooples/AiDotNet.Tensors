@@ -58,8 +58,7 @@ __kernel void roi_align(
     float binW = roiW / outW;
     int ry = samplingRatio > 0 ? samplingRatio : (int)ceil(roiH / outH);
     int rx = samplingRatio > 0 ? samplingRatio : (int)ceil(roiW / outW);
-    if (ry < 1) ry = 1;
-    if (rx < 1) rx = 1;
+    // torchvision: an aligned RoI of zero or negative size has an empty sampling grid and averages to 0.
 
     int planeBase = (n * C + c) * H * W;
     float acc = 0;
@@ -70,7 +69,7 @@ __kernel void roi_align(
             acc += bilinear_sample(input, planeBase, sy, sx, H, W);
         }
     }
-    output[gid] = acc / (ry * rx);
+    output[gid] = acc / max(ry * rx, 1);
 }
 
 __kernel void roi_pool(
