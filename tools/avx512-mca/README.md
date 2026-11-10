@@ -2,7 +2,7 @@
 
 `Run-Avx512Mca.ps1` models the AVX-512 direct-conv inner loops on Sapphire Rapids, Ice Lake Server and Zen 4. It needs no AVX-512 hardware:
 
-1. **Compile.** crossgen2 compiles verbatim copies of the loops (`Tiles.cs`) for `x86-64-v4`, with the framework in the version bubble, so the code matches what the tier-1 JIT emits on an AVX-512 host.
+1. **Compile.** crossgen2 compiles hand-reduced copies of the loops (`Tiles.cs`: the same loads, joins and FMAs per iteration, with the surrounding tap loops flattened or fixed) for `x86-64-v4`, with the framework in the version bubble, so the code matches what the tier-1 JIT emits on an AVX-512 host.
 2. **Model.** llvm-mca models each hot loop.
 
 ```powershell
@@ -11,10 +11,13 @@
 
 - **crossgen2:** from the `microsoft.netcore.app.crossgen2.win-x64` NuGet package, `tools/crossgen2.exe`.
 - **llvm-mca:** from any LLVM release.
+- **Host:** Windows. The script compiles with `--targetos windows`, so it needs the `win-x64` crossgen2 package and a Windows shared framework.
 
 ## Results (crossgen2 10.0.14, LLVM 23.1.5)
 
-Cycles per loop iteration.
+Cycles per loop iteration, for `Tiles.cs` as of commit c12ad4c9d.
+
+This is a model, not a hardware measurement. The Zen 4 column is llvm-mca output. The Intel column is hand-computed as (F + S) / 2 from the instruction counts (see below), and it has not been checked on AVX-512 hardware. The executed-instruction counts under Intel SDE further down confirm the shuffle counts, not the cycle figures.
 
 | loop | FMAs | port-5 shuffles | Zen 4 (llvm-mca) | Intel server (port count) |
 |---|---:|---:|---:|---:|

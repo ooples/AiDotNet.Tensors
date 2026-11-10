@@ -1,7 +1,10 @@
 using System.Runtime.Intrinsics;
 
-// Verbatim copies of DirectConvAvx2's AVX-512 weight-gradient inner loop, before (#1445: two 256-bit loads joined per
-// 16 lanes) and after (one 512-bit load), without [MethodImpl(AggressiveOptimization)] so crossgen2 precompiles them.
+// Hand-reduced copies of DirectConvAvx2's AVX-512 weight-gradient inner loop, before (#1445: two 256-bit loads
+// joined per 16 lanes) and after (one 512-bit load). Not verbatim: each keeps the shipped loop's per-iteration loads,
+// joins and FMAs, but the surrounding tap loops are flattened or fixed (JoinedThree fixes columns at 3 and takes
+// planeIn; the sextets run one loop over n). They drop [MethodImpl(AggressiveOptimization)] so crossgen2 precompiles
+// them.
 public static unsafe class Tiles
 {
     const int Block = 8;

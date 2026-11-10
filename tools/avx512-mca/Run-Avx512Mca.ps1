@@ -4,7 +4,7 @@
   (#1445).
 
 .DESCRIPTION
-  1. Builds Tiles.cs, which holds verbatim copies of DirectConvAvx2's inner loops, before and after #1445. The copies
+  1. Builds Tiles.cs, which holds hand-reduced copies (same per-iteration loads, joins and FMAs) of DirectConvAvx2's inner loops, before and after #1445. The copies
      drop [MethodImpl(AggressiveOptimization)], because crossgen2 never precompiles such methods.
   2. Compiles them with crossgen2 for x86-64-v4. The framework is put in the version bubble, so Vector512 helpers inline
      exactly as the tier-1 JIT inlines them. Each method's JIT disassembly is captured.
@@ -34,15 +34,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $work = Join-Path ([IO.Path]::GetTempPath()) "avx512-mca-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Force $work | Out-Null
+try {
 dotnet build (Join-Path $PSScriptRoot 'Avx512Mca.Tiles.csproj') -c Release -nologo -clp:ErrorsOnly -o (Join-Path $work 'bin') | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
-$dll = Join-Path $work 'bin\Avx512Mca.Tiles.dll'
+$dll = Join-Path (Join-Path $work 'bin') 'Avx512Mca.Tiles.dll'
 
 foreach ($method in $Methods) {
     $asm = Join-Path $work "$method.asm"
     & $Crossgen2 $dll -o (Join-Path $work "r2r_$method.dll") -r "$Framework\*.dll" --inputbubble --inputbubbleref "$Framework\*.dll" `
         --targetos windows --targetarch x64 -O --instruction-set 'x86-64-v4,vectort512' --parallelism 1 `
         --codegenopt "JitDisasm=Tiles:$method" --codegenopt "JitStdOutFile=$asm" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "crossgen2 failed for $method (exit $LASTEXITCODE)" }
+    if (-not (Test-Path $asm)) { throw "crossgen2 wrote no disassembly for $method" }
     $lines = Get-Content $asm
     # The hot loop: the block a backward conditional jump targets, up to that jump.
     $jumpIdx = -1; $labelIdx = -1
@@ -65,8 +68,15 @@ foreach ($method in $Methods) {
     "{0,-18} {1,3} instructions, {2,2} FMAs, {3} port-5 shuffles" -f $method, $body.Count, $fma, $shuffles
     foreach ($cpu in $Cpus) {
         $out = & $LlvmMca "-mcpu=$cpu" "-iterations=$Iterations" $source 2>&1
-        $cycles = [double](($out | Select-String 'Total Cycles:\s+(\d+)').Matches[0].Groups[1].Value)
+        $total = $out | Select-String 'Total Cycles:\s+(\d+)' | Select-Object -First 1
+        if ($LASTEXITCODE -ne 0 -or $null -eq $total) {
+            throw "llvm-mca failed for $method on $cpu (exit $LASTEXITCODE):`n$($out -join "`n")"
+        }
+        $cycles = [double]$total.Matches[0].Groups[1].Value
         "    {0,-15} {1,7:F2} cycles/iteration" -f $cpu, ($cycles / $Iterations)
     }
 }
-Remove-Item -Recurse -Force $work
+}
+finally {
+    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+}
