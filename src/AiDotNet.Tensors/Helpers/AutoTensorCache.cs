@@ -283,6 +283,8 @@ internal static class AutoTensorCache
                 tensor.Grad = null;
                 tensor.LazySource = null;
                 tensor.GradFn = null;
+                // A uniform-fill tag describes the previous owner's contents; the new owner writes its own.
+                tensor.UniformFillValue = null;
                 return tensor;
             }
             pool.Enqueue(obj);

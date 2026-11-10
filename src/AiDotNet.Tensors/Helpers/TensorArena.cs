@@ -1092,6 +1092,10 @@ public sealed class TensorArena : IDisposable
         cached.GradFn = null;
         cached.Grad = null;
         cached.LazySource = null;
+        // Nor its previous contents' uniform-fill tag: a kernel that writes the buffer through a lease does not clear
+        // it, so ReluBackward's uniform fast path read a recycled ReduceSum-backward ones tensor as all ones after
+        // LayerNorm's backward had written its gradient into it (#1702).
+        cached.UniformFillValue = null;
         _issueLog?.Add(new IssuedBuffer(BackingArrayOf(cached), slot, position));
         return cached;
     }
