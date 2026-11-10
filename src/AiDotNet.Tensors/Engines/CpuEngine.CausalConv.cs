@@ -127,59 +127,124 @@ public partial class CpuEngine
         return data;
     }
 
-    // Each (row, step) writes its own output row, so rows of the flattened [rows * seqLen, channels] grid split freely.
+    // The sums below run on float and double through typed arithmetic the JIT specializes per struct; other element
+    // types go through INumericOperations one element at a time (GenericCausalMath).
     private static void CausalConvForwardHost<T>(T[] x, int xOff, T[] w, int wOff, T[] y,
         int rows, int seqLen, int channels, int taps)
     {
-        var ops = MathHelper.GetNumericOperations<T>();
+        if (x is float[] xf && w is float[] wf && y is float[] yf)
+            CausalConvForward<float, FloatCausalMath>(xf, xOff, wf, wOff, yf, rows, seqLen, channels, taps, default);
+        else if (x is double[] xd && w is double[] wd && y is double[] yd)
+            CausalConvForward<double, DoubleCausalMath>(xd, xOff, wd, wOff, yd, rows, seqLen, channels, taps, default);
+        else
+            CausalConvForward(x, xOff, w, wOff, y, rows, seqLen, channels, taps, new GenericCausalMath<T>(MathHelper.GetNumericOperations<T>()));
+    }
+
+    private static void CausalConvBackwardInputHost<T>(T[] g, int gOff, T[] w, int wOff, T[] dx,
+        int rows, int seqLen, int channels, int taps)
+    {
+        if (g is float[] gf && w is float[] wf && dx is float[] df)
+            CausalConvBackwardInput<float, FloatCausalMath>(gf, gOff, wf, wOff, df, rows, seqLen, channels, taps, default);
+        else if (g is double[] gd && w is double[] wd && dx is double[] dd)
+            CausalConvBackwardInput<double, DoubleCausalMath>(gd, gOff, wd, wOff, dd, rows, seqLen, channels, taps, default);
+        else
+            CausalConvBackwardInput(g, gOff, w, wOff, dx, rows, seqLen, channels, taps, new GenericCausalMath<T>(MathHelper.GetNumericOperations<T>()));
+    }
+
+    private static void CausalConvBackwardKernelHost<T>(T[] g, int gOff, T[] x, int xOff, T[] dw,
+        int rows, int seqLen, int channels, int taps)
+    {
+        if (g is float[] gf && x is float[] xf && dw is float[] df)
+            CausalConvBackwardKernel<float, FloatCausalMath>(gf, gOff, xf, xOff, df, rows, seqLen, channels, taps, default);
+        else if (g is double[] gd && x is double[] xd && dw is double[] dd)
+            CausalConvBackwardKernel<double, DoubleCausalMath>(gd, gOff, xd, xOff, dd, rows, seqLen, channels, taps, default);
+        else
+            CausalConvBackwardKernel(g, gOff, x, xOff, dw, rows, seqLen, channels, taps, new GenericCausalMath<T>(MathHelper.GetNumericOperations<T>()));
+    }
+
+    // Each (row, step) writes its own output row, so rows of the flattened [rows * seqLen, channels] grid split freely.
+    private static void CausalConvForward<TNum, TMath>(TNum[] x, int xOff, TNum[] w, int wOff, TNum[] y,
+        int rows, int seqLen, int channels, int taps, TMath math)
+        where TMath : struct, ICausalMath<TNum>
+    {
         Parallel.For(0, rows * seqLen, rt =>
         {
             int t = rt % seqLen, outBase = rt * channels;
             int maxJ = Math.Min(taps - 1, t);
             for (int c = 0; c < channels; c++)
             {
-                T acc = ops.Zero;
+                TNum acc = math.Zero;
                 for (int j = 0; j <= maxJ; j++)
-                    acc = ops.Add(acc, ops.Multiply(w[wOff + j * channels + c], x[xOff + outBase - j * channels + c]));
+                    acc = math.MultiplyAdd(acc, w[wOff + j * channels + c], x[xOff + outBase - j * channels + c]);
                 y[outBase + c] = acc;
             }
         });
     }
 
-    private static void CausalConvBackwardInputHost<T>(T[] g, int gOff, T[] w, int wOff, T[] dx,
-        int rows, int seqLen, int channels, int taps)
+    private static void CausalConvBackwardInput<TNum, TMath>(TNum[] g, int gOff, TNum[] w, int wOff, TNum[] dx,
+        int rows, int seqLen, int channels, int taps, TMath math)
+        where TMath : struct, ICausalMath<TNum>
     {
-        var ops = MathHelper.GetNumericOperations<T>();
         Parallel.For(0, rows * seqLen, rt =>
         {
             int t = rt % seqLen, rowBase = rt * channels;
             int maxJ = Math.Min(taps - 1, seqLen - 1 - t);
             for (int c = 0; c < channels; c++)
             {
-                T acc = ops.Zero;
+                TNum acc = math.Zero;
                 for (int j = 0; j <= maxJ; j++)
-                    acc = ops.Add(acc, ops.Multiply(w[wOff + j * channels + c], g[gOff + rowBase + j * channels + c]));
+                    acc = math.MultiplyAdd(acc, w[wOff + j * channels + c], g[gOff + rowBase + j * channels + c]);
                 dx[rowBase + c] = acc;
             }
         });
     }
 
     // One (tap, channel) cell per work item, summed over rows then steps in ascending order: deterministic.
-    private static void CausalConvBackwardKernelHost<T>(T[] g, int gOff, T[] x, int xOff, T[] dw,
-        int rows, int seqLen, int channels, int taps)
+    private static void CausalConvBackwardKernel<TNum, TMath>(TNum[] g, int gOff, TNum[] x, int xOff, TNum[] dw,
+        int rows, int seqLen, int channels, int taps, TMath math)
+        where TMath : struct, ICausalMath<TNum>
     {
-        var ops = MathHelper.GetNumericOperations<T>();
         Parallel.For(0, taps * channels, jc =>
         {
             int j = jc / channels, c = jc % channels;
-            T acc = ops.Zero;
+            TNum acc = math.Zero;
             for (int r = 0; r < rows; r++)
             {
                 int rowBase = r * seqLen * channels;
                 for (int t = j; t < seqLen; t++)
-                    acc = ops.Add(acc, ops.Multiply(g[gOff + rowBase + t * channels + c], x[xOff + rowBase + (t - j) * channels + c]));
+                    acc = math.MultiplyAdd(acc, g[gOff + rowBase + t * channels + c], x[xOff + rowBase + (t - j) * channels + c]);
             }
             dw[jc] = acc;
         });
+    }
+
+    // acc + a * b in the element type's own arithmetic (no fused multiply-add, matching INumericOperations).
+    private interface ICausalMath<TNum>
+    {
+        TNum Zero { get; }
+        TNum MultiplyAdd(TNum acc, TNum a, TNum b);
+    }
+
+    private readonly struct FloatCausalMath : ICausalMath<float>
+    {
+        public float Zero => 0f;
+        public float MultiplyAdd(float acc, float a, float b) => acc + (a * b);
+    }
+
+    private readonly struct DoubleCausalMath : ICausalMath<double>
+    {
+        public double Zero => 0.0;
+        public double MultiplyAdd(double acc, double a, double b) => acc + (a * b);
+    }
+
+    [ScalarKernel("Element types other than float and double have no typed arithmetic; the causal convolution falls back to INumericOperations per element.")]
+    private readonly struct GenericCausalMath<TNum> : ICausalMath<TNum>
+    {
+        private readonly Interfaces.INumericOperations<TNum> _ops;
+
+        public GenericCausalMath(Interfaces.INumericOperations<TNum> ops) => _ops = ops;
+
+        public TNum Zero => _ops.Zero;
+        public TNum MultiplyAdd(TNum acc, TNum a, TNum b) => _ops.Add(acc, _ops.Multiply(a, b));
     }
 }

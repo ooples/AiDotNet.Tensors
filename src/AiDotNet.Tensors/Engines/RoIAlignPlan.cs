@@ -95,24 +95,25 @@ internal sealed class RoIAlignPlan
         int images = input._shape[0], channels = input._shape[1], height = input._shape[2], width = input._shape[3];
         var boxValues = ToDoubles(boxes);
         var shape = new[] { boxValues.Length / 5, channels, outputHeight, outputWidth };
+        // The result is computed into an array this call owns and then wrapped, so no write goes through a tensor
+        // accessor that could hand back a copy; the input is only read, so a copy-on-write peer stays shared.
+        int outputLength = shape[0] * channels * outputHeight * outputWidth;
         if (input is Tensor<float> floats)
         {
-            var output = new Tensor<float>(shape);
-            using (var source = floats.LeaseArray())
-            using (var target = output.LeaseArray())
+            var output = new float[outputLength];
+            using (new KeepAliveScope(floats))
                 Forward<float, FloatElement>(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
-                    samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
-            return (Tensor<T>)(object)output;
+                    samplingRatio, aligned, floats.GetReadOnlyDataArray(), channels, output, TapBudget);
+            return (Tensor<T>)(object)Tensor<float>.FromMemory(new Memory<float>(output), shape);
         }
 
         if (input is Tensor<double> doubles)
         {
-            var output = new Tensor<double>(shape);
-            using (var source = doubles.LeaseArray())
-            using (var target = output.LeaseArray())
+            var output = new double[outputLength];
+            using (new KeepAliveScope(doubles))
                 Forward<double, DoubleElement>(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
-                    samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
-            return (Tensor<T>)(object)output;
+                    samplingRatio, aligned, doubles.GetReadOnlyDataArray(), channels, output, TapBudget);
+            return (Tensor<T>)(object)Tensor<double>.FromMemory(new Memory<double>(output), shape);
         }
 
         var pooled = Forward(boxValues, images, height, width, outputHeight, outputWidth, spatialScale, samplingRatio,
@@ -126,24 +127,23 @@ internal sealed class RoIAlignPlan
     {
         int images = inputShape[0], channels = inputShape[1], height = inputShape[2], width = inputShape[3];
         var boxValues = ToDoubles(boxes);
+        int inputLength = images * channels * height * width;
         if (gradOutput is Tensor<float> floats)
         {
-            var gradInput = new Tensor<float>(inputShape);
-            using (var source = floats.LeaseArray())
-            using (var target = gradInput.LeaseArray())
+            var gradInput = new float[inputLength];
+            using (new KeepAliveScope(floats))
                 Backward<float, FloatElement>(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
-                    samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
-            return (Tensor<T>)(object)gradInput;
+                    samplingRatio, aligned, floats.GetReadOnlyDataArray(), channels, gradInput, TapBudget);
+            return (Tensor<T>)(object)Tensor<float>.FromMemory(new Memory<float>(gradInput), (int[])inputShape.Clone());
         }
 
         if (gradOutput is Tensor<double> doubles)
         {
-            var gradInput = new Tensor<double>(inputShape);
-            using (var source = doubles.LeaseArray())
-            using (var target = gradInput.LeaseArray())
+            var gradInput = new double[inputLength];
+            using (new KeepAliveScope(doubles))
                 Backward<double, DoubleElement>(boxValues, images, height, width, outputHeight, outputWidth,
-                    spatialScale, samplingRatio, aligned, source.Array, channels, target.Array, TapBudget);
-            return (Tensor<T>)(object)gradInput;
+                    spatialScale, samplingRatio, aligned, doubles.GetReadOnlyDataArray(), channels, gradInput, TapBudget);
+            return (Tensor<T>)(object)Tensor<double>.FromMemory(new Memory<double>(gradInput), (int[])inputShape.Clone());
         }
 
         var gradients = Backward(boxValues, images, height, width, outputHeight, outputWidth, spatialScale,
