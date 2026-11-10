@@ -233,16 +233,17 @@ internal sealed class CompiledDelegateChain<T>
 
         // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
-        if (recycler is not null)
-            for (int i = 0; i < _count; i++)
-            {
-                ref var noted = ref _steps[i];
-                recycler.NoteOutput(noted.Output);
-                if (recycler.TracksForward)
-                    recycler.NoteStep(i, noted.Output, null, null, null, noted.Inputs, noted.SavedState, noted.Backward);
-            }
         try
         {
+            // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
+            if (recycler is not null)
+                for (int i = 0; i < _count; i++)
+                {
+                    ref var noted = ref _steps[i];
+                    recycler.NoteOutput(noted.Output);
+                    if (recycler.TracksForward)
+                        recycler.NoteStep(i, noted.Output, null, null, null, noted.Inputs, noted.SavedState, noted.Backward);
+                }
             for (int i = 0; i < _count; i++)
             {
                 ref var step = ref _steps[i];

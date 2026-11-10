@@ -1189,6 +1189,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        bool needsInputGradient = DifferentiableOps.IsGradientRequired(inputs[0]);
+        bool needsWeightGradient = DifferentiableOps.IsGradientRequired(inputs[1]);
+        if (!needsInputGradient && !needsWeightGradient) return;
+
         // Float32 + 2D fast paths: A: [M,K], B: [N,K] (stored row-major), gradC: [M,N].
         // CPU-only (!engine.SupportsGpu), like MatMulBackward: on a GPU engine this path called GetDataArray() on
         // device tensors -- a download per operand -- and ran the GEMMs with host SimdGemm, so every eager GPU
@@ -1205,46 +1209,60 @@ internal static class BackwardFunctions<T>
             && !engine.SupportsGpu)
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
-            var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
-            var bArr = (inputs[1] as Tensor<float>)?.GetDataArray();
-            if (dCArr is not null && aArr is not null && bArr is not null)
+            var aArr = needsWeightGradient ? (inputs[0] as Tensor<float>)?.GetDataArray() : null;
+            var bArr = needsInputGradient ? (inputs[1] as Tensor<float>)?.GetDataArray() : null;
+            if (dCArr is not null && (!needsWeightGradient || aArr is not null) && (!needsInputGradient || bArr is not null))
             {
                 int M = inputs[0]._shape[0];
                 int K = inputs[0]._shape[1];
                 int N = inputs[1]._shape[0];
 
-                var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-                var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                using var gradADataLease = gradATensor.LeaseArray();
-                var gradAData = (float[])(object)gradADataLease.Array;
-                using var gradBDataLease = gradBTensor.LeaseArray();
-                var gradBData = (float[])(object)gradBDataLease.Array;
-
                 // Large: the parallel packed BLAS first. SimdGemm's transposed-A path ran the tied LM head's
                 // dTable = gradCᵀ[49152,1024] · A[1024,512] in 993 ms vs 87 ms through TryGemmEx (3990X).
-                // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
-                BlasProvider.GemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, K, false, gradAData, 0, K);
-                // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
-                BlasProvider.GemmEx(N, K, M, dCArr, 0, N, true, aArr, 0, K, false, gradBData, 0, K);
+                if (needsInputGradient)
+                {
+                    var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                    using (var gradADataLease = gradATensor.LeaseArray())
+                    {
+                        var gradAData = (float[])(object)gradADataLease.Array;
+                        // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
+                        BlasProvider.GemmEx(M, K, N, dCArr, 0, N, false, bArr!, 0, K, false, gradAData, 0, K);
+                    }
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                }
 
-                DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
-                DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                if (needsWeightGradient)
+                {
+                    var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                    using (var gradBDataLease = gradBTensor.LeaseArray())
+                    {
+                        var gradBData = (float[])(object)gradBDataLease.Array;
+                        // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
+                        BlasProvider.GemmEx(N, K, M, dCArr, 0, N, true, aArr!, 0, K, false, gradBData, 0, K);
+                    }
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                }
                 return;
-
             }
         }
 
         // Generic fallback: gradA = gradOut · B, gradB = gradOutᵀ · A.
         // No transpose on B (it's already in [N,K] form), but we need
         // gradOutᵀ for gradB.
-        var gradAFallback = engine.TensorMatMul(gradOutput, inputs[1]);
-        var gradOutT = TransposeLastTwoDims(gradOutput, engine);
-        var gradBFallback = engine.TensorMatMul(gradOutT, inputs[0]);
-        // Phase B.2: gradOutT is a local transpose buffer, consumed by
-        // TensorMatMul. Mirror the MatMulBackward ND×2D path's pool-return.
-        TensorPool<T>.Return(gradOutT);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
+        if (needsInputGradient)
+        {
+            var gradAFallback = engine.TensorMatMul(gradOutput, inputs[1]);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
+        }
+        if (needsWeightGradient)
+        {
+            var gradOutT = TransposeLastTwoDims(gradOutput, engine);
+            var gradBFallback = engine.TensorMatMul(gradOutT, inputs[0]);
+            // Phase B.2: gradOutT is a local transpose buffer, consumed by
+            // TensorMatMul. Mirror the MatMulBackward ND×2D path's pool-return.
+            TensorPool<T>.Return(gradOutT);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
+        }
     }
 
     /// <summary>d(A^T)/dA = transpose(grad)</summary>
@@ -3772,6 +3790,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps.IsGradientRequired(inputs[0])) return;
         var indicesTensor = savedState[0] as Tensor<int> ?? new Tensor<int>((int[])savedState[0], new[] { ((int[])savedState[0]).Length });
         int dim = (int)savedState[1];
         var inShape = inputs[0]._shape;
@@ -9673,8 +9692,8 @@ internal static class BackwardFunctions<T>
         if (boxes._shape[0] == 0) return new Tensor<T>(input._shape);
 
         // The forward's taps scattered back, parallel over channels so overlapping RoIs never race; see RoIAlignPlan.
-        var plan = RoIAlignPlan.Build(RoIAlignPlan.ReadBoxes(boxes), N, H, W, outH, outW, spatialScale, samplingRatio, aligned);
-        var gradInput = plan.Backward(RoIAlignPlan.ToDoubles(gradOutput), N, C, H * W);
+        var gradInput = RoIAlignPlan.Backward(RoIAlignPlan.ReadBoxes(boxes), N, H, W, outH, outW, spatialScale,
+            samplingRatio, aligned, RoIAlignPlan.ToDoubles(gradOutput), C);
         return RoIAlignPlan.FromDoubles<T>(gradInput, input._shape);
     }
 

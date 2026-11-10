@@ -341,9 +341,12 @@ public sealed class GradientTape<T> : IDisposable
             _ownsArena = true;
         }
 
-        // Record what the forward rents, so the backward can hand each activation back after its last use.
+        // Record what the forward rents, so the backward can hand each activation back after its last use. Not gated on
+        // this tape's engine: that is the process default until the first op binds the engine the ops really run on
+        // (BindEngineIfUnset), so a CPU model on a machine whose default is a GPU engine never recorded its forward.
+        // The recycler declines a GPU backward itself, and the backward and Dispose take the log back either way.
         if (_options.ReleaseActivationsDuringBackward && _parent is null && !_options.SuppressArenaScope
-            && !_engine.SupportsGpu && Helpers.TensorArena.Current is { } activationArena)
+            && Helpers.TensorArena.Current is { } activationArena)
         {
             _activationLog = new Helpers.TensorArena.ForwardActivationLog();
             _activationLogArena = activationArena;

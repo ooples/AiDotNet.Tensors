@@ -32,7 +32,7 @@ public class BackwardRecyclerTests
         var log = new List<TensorArena.IssuedBuffer>();
         arena.OpenIssueLog(log);
         var first = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
-        arena.CloseIssueLog();
+        arena.CloseIssueLog(log);
         Assert.Single(log);
         var array = first.GetBackingArrayForCacheLookupUnsafe();
 
@@ -95,6 +95,54 @@ public class BackwardRecyclerTests
         Assert.Equal(Gradient(false), recycled);
     }
 
+    // The arena has one issue log. A second owner (a recycler of another element type on the same thread) must not
+    // take it over, nor close it for the owner that opened it.
+    [Fact]
+    public void IssueLog_HasOneOwner()
+    {
+        using var arena = TensorArena.Create();
+        var owner = new List<TensorArena.IssuedBuffer>();
+        var other = new List<TensorArena.IssuedBuffer>();
+        Assert.True(arena.OpenIssueLog(owner));
+        Assert.False(arena.OpenIssueLog(other));
+        arena.CloseIssueLog(other);
+        TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        arena.CloseIssueLog(owner);
+        TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        Assert.Single(owner);
+        Assert.Empty(other);
+        Assert.True(arena.OpenIssueLog(other));
+        arena.CloseIssueLog(other);
+    }
+
+    // ReduceSum's backward hands back a Fill-ed ones tensor, tagged as uniform so ReluBackward can read one scalar. The
+    // recycler returned that wrapper, LayerNorm's backward was given it and wrote its gradient through a lease, and the
+    // ReLU then read the stale tag: every gradient below it came out as if the upstream gradient were all ones (#1702).
+    [Fact]
+    public void ReissuedRingTensor_DropsThePreviousOwnersUniformFill()
+    {
+        var engine = new CpuEngine();
+        using var arena = TensorArena.Create();
+        var log = new List<TensorArena.IssuedBuffer>();
+        arena.OpenIssueLog(log);
+        var ones = TensorAllocator.RentUninitialized<float>(new[] { 4, 8 });
+        arena.CloseIssueLog(log);
+        ones.Fill(1f);
+        Assert.Single(log);
+
+        arena.ReturnIssued(log[0]);
+        var gradient = TensorAllocator.RentUninitialized<float>(new[] { 4, 8 });
+        Assert.Same(ones, gradient);
+        using (var lease = gradient.LeaseArray())
+            for (int i = 0; i < gradient.Length; i++) lease.Array[i] = 0.25f * (i + 1);
+
+        var input = new Tensor<float>(new[] { 4, 8 });
+        for (int i = 0; i < input.Length; i++) input.SetFlat(i, i % 3 == 0 ? -1f : 1f);
+        var result = engine.ReluBackward(gradient, input);
+        for (int i = 0; i < result.Length; i++)
+            Assert.Equal(i % 3 == 0 ? 0f : 0.25f * (i + 1), result.GetFlat(i));
+    }
+
     [Fact]
     public void ReturnedScratchArray_IsReissuedWithinTheStep_AndNotTwiceAfterReset()
     {
@@ -102,7 +150,7 @@ public class BackwardRecyclerTests
         var log = new List<TensorArena.IssuedBuffer>();
         arena.OpenIssueLog(log);
         var first = arena.TryAllocate<float>(5000)!;
-        arena.CloseIssueLog();
+        arena.CloseIssueLog(log);
         Assert.Single(log);
         first[7] = 3f;
 

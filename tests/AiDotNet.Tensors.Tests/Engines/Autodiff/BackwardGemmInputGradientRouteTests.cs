@@ -66,6 +66,10 @@ public class BackwardGemmInputGradientRouteTests
     [InlineData(false, 128, 784, 512)]
     [InlineData(false, 128, 256, 10)]
     [InlineData(false, 128, 512, 256)]   // not routed: the transposed-B path, still correct
+    // A weight over the transpose cap (2M elements) through the dispatcher: the same width and depth as a routed case,
+    // so only the size keeps it off the explicit transpose; the counters prove the dispatcher made that decision.
+    [InlineData(false, 128, 2048, 1024)]
+    [InlineData(true, 128, 2048, 1024)]
     public void InputGradient_MatchesReference_AndTakesTheExpectedRoute(bool vector512, int m, int k, int n)
     {
         Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "direct GEMM requires FMA");

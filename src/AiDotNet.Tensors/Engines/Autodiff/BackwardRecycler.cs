@@ -117,7 +117,11 @@ internal sealed class BackwardRecycler<T>
             || DifferentiableOps._isBackwardCreateGraph || DifferentiableOps._indexedGrads is not null
             || TensorArena.Current is not { } arena)
             return null;
+        // t_active is per element type; the arena's log is per arena, so a pass of another type may already hold it.
+        // Checked before the forward activation log is taken, so a declined pass leaves that log to its owner.
+        if (arena.IssueLogOpen) return null;
         var recycler = new BackwardRecycler<T>(arena, StressOverride ?? s_stress, arena.TakeForwardActivationLog());
+        if (!arena.OpenIssueLog(recycler._issued)) return null;
         recycler._keep.Add(loss);
         foreach (var source in sources.Where(s => s is not null))
             recycler._keep.Add(source);
@@ -127,7 +131,6 @@ internal sealed class BackwardRecycler<T>
             foreach (var tensor in recycler._keep)
                 if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) kept.Add(array);
         t_active = true;
-        arena.OpenIssueLog(recycler._issued);
         return recycler;
     }
 
@@ -298,7 +301,7 @@ internal sealed class BackwardRecycler<T>
     private void Stop()
     {
         _stopped = true;
-        _arena.CloseIssueLog();
+        _arena.CloseIssueLog(_issued);
         _issued.Clear();
     }
 
@@ -332,7 +335,7 @@ internal sealed class BackwardRecycler<T>
     /// <summary>Ends the pass. Buffers still referenced by gradients stay issued until the step boundary.</summary>
     internal void End()
     {
-        _arena.CloseIssueLog();
+        _arena.CloseIssueLog(_issued);
         _issued.Clear();
         FinishPass(ReturnedCount, ForwardReturnedCount);
         if (_poisoned is not null) ThrowIfPoisonOverwritten(_poisoned);

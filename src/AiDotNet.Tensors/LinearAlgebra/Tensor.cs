@@ -4690,9 +4690,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         long block = sourceShape[axis] * inner;
         if (outer * block == 0) return;
 
-        // A strided view is materialized once, without recording a view op: the concatenation is the recorded op.
+        // A strided view is materialized once, without recording a view op: the concatenation is the recorded op. A
+        // sparse tensor has no dense storage to copy (Contiguous rejects it), so it is densified first.
         Tensor<T> contiguous = source;
-        if (!source.IsContiguous)
+        if (source is SparseTensor<T> sparse)
+        {
+            contiguous = sparse.ToDense();
+        }
+        else if (!source.IsContiguous)
         {
             using (Engines.Autodiff.DifferentiableOps.SuppressTensorViewRecording())
                 contiguous = source.Contiguous();

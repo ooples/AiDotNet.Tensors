@@ -863,11 +863,29 @@ public sealed class TensorArena : IDisposable
     private List<IssuedBuffer>? _issueLog;
     private Dictionary<(Type, int), Stack<Array>>? _poolFree;
 
-    /// <summary>Records every buffer issued from now on into <paramref name="log"/>, until <see cref="CloseIssueLog"/>.</summary>
-    internal void OpenIssueLog(List<IssuedBuffer> log) => _issueLog = log;
+    /// <summary>
+    /// Records every buffer issued from now on into <paramref name="log"/>, until <see cref="CloseIssueLog"/>. Returns
+    /// false, recording nothing, when another log is already open: the arena has one log, and a second owner (a
+    /// recycler of another element type on the same thread) would take it over and later close it for the first.
+    /// </summary>
+    internal bool OpenIssueLog(List<IssuedBuffer> log)
+    {
+        if (_issueLog is not null) return false;
+        _issueLog = log;
+        return true;
+    }
 
-    /// <summary>Stops recording issued buffers.</summary>
-    internal void CloseIssueLog() => _issueLog = null;
+    /// <summary>
+    /// Whether another pass holds the issue log, so a second owner can decline before taking anything else. The forward
+    /// activation log records through the same slot until a recycler takes it, so it is not another pass's log.
+    /// </summary>
+    internal bool IssueLogOpen => _issueLog is not null && !ReferenceEquals(_issueLog, _forwardLog?.Buffers);
+
+    /// <summary>Stops recording issued buffers into <paramref name="log"/>; a log another owner opened stays open.</summary>
+    internal void CloseIssueLog(List<IssuedBuffer> log)
+    {
+        if (ReferenceEquals(_issueLog, log)) _issueLog = null;
+    }
 
     /// <summary>
     /// The buffers a training step's forward pass rented, for a tape that hands its activations back during backward
@@ -1075,6 +1093,10 @@ public sealed class TensorArena : IDisposable
         cached.GradFn = null;
         cached.Grad = null;
         cached.LazySource = null;
+        // Nor its previous contents' uniform-fill tag: a kernel that writes the buffer through a lease does not clear
+        // it, so ReluBackward's uniform fast path read a recycled ReduceSum-backward ones tensor as all ones after
+        // LayerNorm's backward had written its gradient into it (#1702).
+        cached.UniformFillValue = null;
         _issueLog?.Add(new IssuedBuffer(BackingArrayOf(cached), slot, position));
         return cached;
     }

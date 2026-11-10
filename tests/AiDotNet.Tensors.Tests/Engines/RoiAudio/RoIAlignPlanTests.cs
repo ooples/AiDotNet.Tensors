@@ -4,6 +4,7 @@ using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -163,5 +164,49 @@ public class RoIAlignPlanTests
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-12, $"[{i}] reference {expected[i]} vs {actual[i]}");
+    }
+
+    // Adaptive sampling grows a RoI's taps with its area, so the taps are built one budgeted run of RoIs at a time.
+    // 150 RoIs of 120x120 at 18x18 samples per bin need about 9.5 million taps, over two budgets: the runs must each
+    // fit the budget, and together give what each RoI gives alone, forward and (summed) backward.
+    [Fact]
+    public void Large_adaptive_rois_run_in_budgeted_plans_that_match_each_roi_alone()
+    {
+        const int images = 1, channels = 2, height = 128, width = 128, outH = 7, outW = 7, rois = 150;
+        var rng = RandomHelper.CreateSeededRandom(5);
+        var input = Enumerable.Range(0, images * channels * height * width).Select(_ => rng.NextDouble() - 0.5).ToArray();
+        var boxes = new double[rois * 5];
+        for (int r = 0; r < rois; r++)
+        {
+            double x = rng.NextDouble() * 6, y = rng.NextDouble() * 6;
+            boxes[(r * 5) + 1] = x;
+            boxes[(r * 5) + 2] = y;
+            boxes[(r * 5) + 3] = x + 120;
+            boxes[(r * 5) + 4] = y + 120;
+        }
+
+        var plans = RoIAlignPlan.Plans(boxes, images, height, width, outH, outW, 1.0f, 0, false).ToList();
+        Assert.True(plans.Count > 1, $"{plans.Count} plan(s)");
+        Assert.Equal(rois, plans.Sum(p => p.Rois));
+        Assert.All(plans, p => Assert.True(p.Rois == 1 || p.Offsets.Length <= RoIAlignPlan.TapBudget, $"{p.Offsets.Length} taps"));
+
+        var forward = RoIAlignPlan.Forward(boxes, images, height, width, outH, outW, 1.0f, 0, false, input, channels);
+        var gradOutput = Enumerable.Range(0, forward.Length).Select(i => Math.Sin(i * 0.37)).ToArray();
+        var backward = RoIAlignPlan.Backward(boxes, images, height, width, outH, outW, 1.0f, 0, false, gradOutput, channels);
+        int perRoi = channels * outH * outW;
+        var summed = new double[backward.Length];
+        for (int r = 0; r < rois; r++)
+        {
+            var one = boxes.Skip(r * 5).Take(5).ToArray();
+            var alone = RoIAlignPlan.Forward(one, images, height, width, outH, outW, 1.0f, 0, false, input, channels);
+            for (int i = 0; i < perRoi; i++)
+                Assert.Equal(alone[i], forward[(r * perRoi) + i]);
+            var gradAlone = RoIAlignPlan.Backward(one, images, height, width, outH, outW, 1.0f, 0, false,
+                gradOutput.Skip(r * perRoi).Take(perRoi).ToArray(), channels);
+            for (int i = 0; i < summed.Length; i++) summed[i] += gradAlone[i];
+        }
+
+        for (int i = 0; i < summed.Length; i++)
+            Assert.True(Math.Abs(summed[i] - backward[i]) <= 1e-9 * (1 + Math.Abs(summed[i])), $"[{i}] {summed[i]} vs {backward[i]}");
     }
 }

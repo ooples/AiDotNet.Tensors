@@ -33,6 +33,23 @@ public class TensorConcatenateTests
         Assert.Equal(2048, r.Shape[1]);
     }
 
+    // A sparse input has no dense storage for the block copy, so it joins as its dense values.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void Concatenate_SparseInput_JoinsItsDenseValues(int axis)
+    {
+        var sparse = new SparseTensor<double>(2, 3, new[] { 0, 1, 1 }, new[] { 2, 0, 1 }, new[] { 4.0, -1.5, 7.0 });
+        var dense = new Tensor<double>(new[] { 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 }, new[] { 2, 3 });
+
+        var actual = Tensor<double>.Concatenate(new Tensor<double>[] { sparse, dense }, axis);
+        var expected = Tensor<double>.Concatenate(new[] { sparse.ToDense(), dense }, axis);
+
+        Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
+        Assert.Equal(expected.ToArray(), actual.ToArray());
+        Assert.Equal(new[] { 0.0, 0.0, 4.0, -1.5, 7.0, 0.0 }, sparse.ToDense().ToArray());
+    }
+
     [Fact]
     public void Concatenate_InvalidPositiveAxis_ThrowsWithDiagnosticMessage()
     {

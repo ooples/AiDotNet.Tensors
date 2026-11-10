@@ -13,7 +13,13 @@ internal static partial class SimdGemm
     private const int SkinnyTransBChunk = 256;
 
     /// <summary>The fewest B rows per parallel work item: below this the per-item dispatch outweighs the dots.</summary>
-    private const int SkinnyTransBMinChunk = 32;
+    internal const int SkinnyTransBMinChunk = 32;
+
+    /// <summary>Calls of <see cref="SgemmSkinnyTransB"/> on this thread; a test probe.</summary>
+    [ThreadStatic] internal static int t_skinnyTransBRuns;
+
+    /// <summary>Calls of <see cref="SgemmSkinnyTransB"/> on this thread that split B over parallel work items; a test probe.</summary>
+    [ThreadStatic] internal static int t_skinnyTransBParallelRuns;
 
     /// <summary>
     /// Whether C += A·Bᵀ should take <see cref="SgemmSkinnyTransB"/>: a few rows of A against a B stored [n, k].
@@ -31,10 +37,22 @@ internal static partial class SimdGemm
     /// C[i, j] += dot(A[i, :], B[j, :]) for A [m, k] (row stride <paramref name="lda"/>) and B stored [n, k] (row stride
     /// <paramref name="ldb"/>); C is [m, n] with row stride n.
     /// </summary>
+    /// <exception cref="ArgumentException">A stride is shorter than a row, or a span is shorter than its operand.</exception>
     internal static unsafe void SgemmSkinnyTransB(
         ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int m, int k, int n,
         bool allowParallel)
     {
+        // The kernel walks raw pointers, so an operand that does not fit its span would read or write out of bounds
+        // (an AccessViolationException ends the process) rather than throw. Checked here, once per call.
+        if (m <= 0 || n <= 0) return;
+        if (k < 0 || lda < k || ldb < k)
+            throw new ArgumentException($"SgemmSkinnyTransB: k={k} needs lda and ldb of at least k (lda={lda}, ldb={ldb}).");
+        if (a.Length < ((long)(m - 1) * lda) + k || b.Length < ((long)(n - 1) * ldb) + k || c.Length < (long)m * n)
+            throw new ArgumentException(
+                $"SgemmSkinnyTransB: spans a={a.Length}, b={b.Length}, c={c.Length} are too short for m={m}, k={k}, " +
+                $"n={n}, lda={lda}, ldb={ldb}.");
+
+        t_skinnyTransBRuns++;
         fixed (float* pa = a, pb = b, pc = c)
         {
             var aPointer = (IntPtr)pa;
@@ -63,7 +81,10 @@ internal static partial class SimdGemm
 
             long work = (long)m * k * n;
             if (allowParallel && work >= ParallelWorkThreshold && chunks > 1)
+            {
+                t_skinnyTransBParallelRuns++;
                 CpuParallelSettings.ParallelForOrSerial(0, chunks, work, Chunk);
+            }
             else
                 for (int chunk = 0; chunk < chunks; chunk++) Chunk(chunk);
         }
