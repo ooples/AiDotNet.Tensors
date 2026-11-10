@@ -621,7 +621,10 @@ float p210_lgamma(float x) {
 void main() {
 
     int idx = int(gl_GlobalInvocationID.x); if (idx >= numValues) return; float v = values[idx]; int lo=0, hi=seqLen;
-    while (lo < hi) { int mid=(lo+hi)>>1; bool cond=(right!=0)?(seq[mid]<=v):(seq[mid]<v); if (cond) lo=mid+1; else hi=mid; }
+    // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+    // moves right; the NaN test reads the bits so the compiler cannot fold it away.
+    bool vNan = (floatBitsToUint(v) & 0x7FFFFFFFu) > 0x7F800000u;
+    while (lo < hi) { int mid=(lo+hi)>>1; float s=seq[mid]; bool nan=vNan||((floatBitsToUint(s)&0x7FFFFFFFu)>0x7F800000u); bool cond=nan||((right!=0)?(s<=v):(s<v)); if (cond) lo=mid+1; else hi=mid; }
     outputValues[idx] = float(lo);
 
 }";
@@ -715,8 +718,8 @@ float p210_lgamma(float x) {
 void main() {
 
     int idx = int(gl_GlobalInvocationID.x); if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0;
-    for (int k=0;k<d;k++){ float diff=abs(x1[i*d+k]-x2[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else sum+=pow(diff,p); }
-    outputValues[idx]=(p==1.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p);
+    for (int k=0;k<d;k++){ float diff=abs(x1[i*d+k]-x2[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else if (p==0.0) sum+=(diff!=0.0)?1.0:0.0; else if (p<0.0) sum=(diff>sum||(floatBitsToUint(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=pow(diff,p); }
+    outputValues[idx]=(p==1.0||p==0.0||p<0.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p);
 
 }";
 
@@ -742,8 +745,8 @@ float p210_lgamma(float x) {
 void main() {
 
     int flatIndex = int(gl_GlobalInvocationID.x); if (flatIndex>=n*n) return; int j=flatIndex%n; int i=flatIndex/n; if (i>=j) return; float sum=0.0;
-    for (int k=0;k<d;k++){ float diff=abs(inputValues[i*d+k]-inputValues[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else sum+=pow(diff,p); }
-    float dist=(p==1.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); outputValues[outIdx]=dist;
+    for (int k=0;k<d;k++){ float diff=abs(inputValues[i*d+k]-inputValues[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else if (p==0.0) sum+=(diff!=0.0)?1.0:0.0; else if (p<0.0) sum=(diff>sum||(floatBitsToUint(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=pow(diff,p); }
+    float dist=(p==1.0||p==0.0||p<0.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); outputValues[outIdx]=dist;
 
 }";
 
@@ -879,6 +882,31 @@ void main() {
 
     int gid = int(gl_GlobalInvocationID.x); if (gid>=numRows*copyLen) return; int i=gid%copyLen; int r=gid/copyLen; dst[r*dstRowLen+i]=src[r*srcRowLen+i];
 
+}";
+
+    public static string Int32ToFloat => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { int raw[]; };
+layout(set=0, binding=1) buffer B1 { float outputValues[]; };
+layout(push_constant) uniform PC {
+    int n;
+};
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid >= n) return; outputValues[gid] = float(raw[gid]);
+}";
+
+    public static string ScatterPositions => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { float outputValues[]; };
+layout(push_constant) uniform PC {
+    int srcDim;
+    int inner;
+    int n;
+};
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid >= n) return; outputValues[gid] = float((gid / inner) % srcDim);
 }";
 
     public static string IotaPad => @"#version 450
