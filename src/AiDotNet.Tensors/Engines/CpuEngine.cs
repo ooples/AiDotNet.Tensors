@@ -21641,6 +21641,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradInput = AutoTensorCache.RentOrAllocate<T>(inputShape);
         using var gradInputDataLease = gradInput.LeaseArray();
         var gradInputData = gradInputDataLease.Array;
+        // Accumulated below, and a rented buffer may hold a previous tensor's values.
+        Array.Clear(gradInputData, 0, (int)gradInput.Length);
         using var gradOutputDataLease = gradOutput.LeaseArray();
         var gradOutputData = gradOutputDataLease.Array;
         using var kernelDataLease = kernel.LeaseArray();
@@ -21926,6 +21928,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradKernel = AutoTensorCache.RentOrAllocate<T>(kernelShape);
         using var gradKernelDataLease = gradKernel.LeaseArray();
         var gradKernelData = gradKernelDataLease.Array;
+        // Accumulated below, and a rented buffer may hold a previous tensor's values.
+        Array.Clear(gradKernelData, 0, (int)gradKernel.Length);
         using var gradOutputDataLease = gradOutput.LeaseArray();
         var gradOutputData = gradOutputDataLease.Array;
         using var inputDataLease = input.LeaseArray();

@@ -42,6 +42,15 @@ internal sealed class BackwardRecycler<T>
     private static readonly bool s_stress =
         Environment.GetEnvironmentVariable("AIDOTNET_BACKWARD_RECYCLE_STRESS") is "1" or "true" or "True";
 
+    // Diagnostic: fill each returned buffer with NaN and still hand it out again, so a kernel that reads a rented
+    // buffer before writing it (relying on fresh arrays being zero) turns its output NaN. Stress mode never reuses a
+    // released buffer, so it cannot find those.
+    private static readonly bool s_dirty =
+        Environment.GetEnvironmentVariable("AIDOTNET_BACKWARD_RECYCLE_DIRTY") is "1" or "true" or "True";
+
+    /// <summary>Test override for the dirty-reuse mode; null follows <c>AIDOTNET_BACKWARD_RECYCLE_DIRTY</c>.</summary>
+    internal static bool? DirtyOverride;
+
     [ThreadStatic] private static bool t_active;
 
     private readonly TensorArena _arena;
@@ -279,8 +288,10 @@ internal sealed class BackwardRecycler<T>
         {
             ResultBufferTracker.Poison(buffer.Array);
             _poisoned.Add(buffer.Array);
+            return;
         }
-        else _arena.ReturnIssued(buffer);
+        if (DirtyOverride ?? s_dirty) ResultBufferTracker.Poison(buffer.Array);
+        _arena.ReturnIssued(buffer);
     }
 
     // Stops returning buffers for the rest of the pass; those already returned were proven dead.

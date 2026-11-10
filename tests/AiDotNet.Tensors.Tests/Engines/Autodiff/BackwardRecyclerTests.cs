@@ -26,7 +26,7 @@ public class BackwardRecyclerTests
     }
 
     [Fact]
-    public void ReturnedRingTensor_IsReissuedWithinTheStep_AndNotTwiceAfterReset()
+    public void ReturnedRingTensor_ArrayIsReissuedUnderANewTensor_AndNotTwiceAfterReset()
     {
         using var arena = TensorArena.Create();
         var log = new List<TensorArena.IssuedBuffer>();
@@ -34,19 +34,65 @@ public class BackwardRecyclerTests
         var first = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         arena.CloseIssueLog();
         Assert.Single(log);
+        var array = first.GetBackingArrayForCacheLookupUnsafe();
 
+        // The array comes back within the step, but never the wrapper: state on the old object described its first
+        // owner, and handing the object on corrupted LayerNorm and BatchNorm gradients.
         arena.ReturnIssued(log[0]);
         var again = TensorAllocator.RentUninitialized<float>(new[] { 32, 128 });
-        Assert.Same(first, again);
+        Assert.NotSame(first, again);
+        Assert.Same(array, again.GetBackingArrayForCacheLookupUnsafe());
         Assert.Equal(new[] { 32, 128 }, again.Shape.ToArray());
 
-        // Returned, then the step ends: the cursor hands it out once, and the stale free entry must not a second time.
+        // Returned, then the step ends: the cursor hands the wrapper out once, and the stale free entry must not hand
+        // its array out a second time.
         arena.ReturnIssued(log[0]);
         arena.Reset();
         var afterReset1 = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         var afterReset2 = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         Assert.Same(first, afterReset1);
-        Assert.NotSame(afterReset1, afterReset2);
+        Assert.NotSame(afterReset1.GetBackingArrayForCacheLookupUnsafe(), afterReset2.GetBackingArrayForCacheLookupUnsafe());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NormBackward_AfterARecycledGradient_MatchesTheUnrecycledGradient(bool batchNorm)
+    {
+        // The loss gradient a Multiply backward consumes is returned and taken by the norm's input gradient. Reissuing
+        // the same wrapper object there gave LayerNorm a kernel gradient of 2.0577 against -0.0271.
+        var rng = new Random(13);
+        var x = Random(new[] { 2, 1, 4, 4 }, rng, 1f);
+        var k = Random(new[] { 8, 1, 3, 3 }, rng, 1f);
+        var b = Random(new[] { 8 }, rng, 1f);
+        var scale = Random(batchNorm ? new[] { 8 } : new[] { 4 }, rng, 1f);
+        var shift = Random(batchNorm ? new[] { 8 } : new[] { 4 }, rng, 1f);
+        var w = Random(new[] { 2, 8, 4, 4 }, rng, 1f);
+        var one = new[] { 1, 1 };
+        float[] Gradient(bool recycle)
+        {
+            var prior = BackwardRecycler<float>.EnabledOverride;
+            BackwardRecycler<float>.EnabledOverride = recycle;
+            try
+            {
+                using var tape = new GradientTape<float>();
+                var h = _engine.ReLU(_engine.TensorChannelBiasAdd(_engine.Conv2D(x, k, one, one, one), b));
+                var y = batchNorm
+                    ? _engine.BatchNorm(h, scale, shift, 1e-5, out _, out _)
+                    : _engine.LayerNorm(h, scale, shift, 1e-5, out _, out _);
+                var loss = _engine.ReduceSum(_engine.TensorMultiply(y, w), null, false);
+                return tape.ComputeGradients(loss, new[] { k, b })[k].ToArray();
+            }
+            finally
+            {
+                BackwardRecycler<float>.EnabledOverride = prior;
+            }
+        }
+
+        BackwardRecycler<float>.LastPassReturned = 0;
+        var recycled = Gradient(true);
+        Assert.True(BackwardRecycler<float>.LastPassReturned > 0, "nothing was recycled");
+        Assert.Equal(Gradient(false), recycled);
     }
 
     [Fact]
