@@ -756,7 +756,7 @@ public partial class CpuEngine
         int workers = Math.Min(Environment.ProcessorCount, batch / 8);
         if (workers <= 1 || (long)batch * hidden < 4096) { body(0, batch); return; }
         int size = (batch + workers - 1) / workers;
-        System.Threading.Tasks.Parallel.For(0, workers, w =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel(workers, w =>
         {
             int b0 = w * size, b1 = Math.Min(batch, b0 + size);
             if (b0 < b1) body(b0, b1);
