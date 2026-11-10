@@ -63,6 +63,140 @@ public class Issue1096FollowUpTests
 
     // Conv2D -> channel-bias add -> ReLU, optionally into a tiling max pool: the chain the conv-epilogue fusion detects,
     // and with the pool, the pooled-fusion backward that runs at the pool's position.
+    // Two external leaves into one same-shape add (each with a single consumer): the reshape/add gradient aliasing
+    // shares their gradient buffers and skips the add's backward, and the gradient pool may give same-shaped leaves one
+    // buffer. Both leaves must still publish their own .Grad, equal to the eager tape's, on every step.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CompiledInputGradient_TwoLeavesIntoOneAdd_EachGetsItsGradient(bool gradPool)
+    {
+        var engine = new CpuEngine();
+        int[] shape = { 4, 16 };
+        float[] eagerA, eagerB;
+        {
+            var a0 = Filled(shape, 21, 1f);
+            var b0 = Filled(shape, 22, 1f);
+            var w0 = Filled(new[] { 16, 8 }, 23, 0.3f);
+            var y0 = Filled(new[] { 4, 8 }, 24, 1f);
+            using var tape = new GradientTape<float>();
+            var loss = engine.TensorMSELoss(engine.FusedLinear(engine.TensorAdd(a0, b0), w0, null, FusedActivationType.None), y0);
+            var grads = tape.ComputeGradients(loss, sources: new[] { a0, b0, w0 });
+            eagerA = grads[a0].ToArray();
+            eagerB = grads[b0].ToArray();
+        }
+
+        var a = Filled(shape, 21, 1f);
+        var b = Filled(shape, 22, 1f);
+        var w = Filled(new[] { 16, 8 }, 23, 0.3f);
+        var y = Filled(new[] { 4, 8 }, 24, 1f);
+        ICompiledTrainingPlan<float> plan;
+        bool? previous = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
+        string? previousPool = Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL");
+        CompiledTrainingPlan<float>.CompiledInputGradientsForTests = true;
+        Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL", gradPool ? "1" : null);
+        try
+        {
+            using var scope = GraphMode.Enable();
+            engine.TensorMSELoss(engine.FusedLinear(engine.TensorAdd(a, b), w, null, FusedActivationType.None), y);
+            plan = scope.CompileTraining(new[] { w });
+        }
+        finally
+        {
+            CompiledTrainingPlan<float>.CompiledInputGradientsForTests = previous;
+            Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL", previousPool);
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            for (int step = 0; step < 2; step++)
+            {
+                plan.Step();
+                foreach (var (leaf, expected, name) in new[] { (a, eagerA, "a"), (b, eagerB, "b") })
+                {
+                    if (leaf.Grad is not { } g)
+                    {
+                        Assert.Fail($"step {step}: leaf {name} got no .Grad");
+                        return;
+                    }
+                    var actual = g.ToArray();
+                    Assert.Equal(expected.Length, actual.Length);
+                    for (int i = 0; i < expected.Length; i++)
+                        Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),
+                            $"step {step}: {name}.Grad[{i}] {actual[i]} vs eager {expected[i]}");
+                }
+            }
+        }
+    }
+
+    // Same-shaped leaves whose gradients are written by separate backward actions (one linear each): the liveness pool
+    // must not give them one buffer, or both .Grad would show the last writer's value.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CompiledInputGradient_LeavesOfSeparateLinears_KeepTheirOwnGradients(bool gradPool)
+    {
+        var engine = new CpuEngine();
+        int[] shape = { 4, 16 };
+        Tensor<float> Loss(Tensor<float> a, Tensor<float> b, Tensor<float> w1, Tensor<float> w2, Tensor<float> y) =>
+            engine.TensorMSELoss(engine.TensorAdd(
+                engine.FusedLinear(a, w1, null, FusedActivationType.None),
+                engine.FusedLinear(b, w2, null, FusedActivationType.ReLU)), y);
+        float[] eagerA, eagerB;
+        {
+            var a0 = Filled(shape, 31, 1f); var b0 = Filled(shape, 32, 1f);
+            var w10 = Filled(new[] { 16, 8 }, 33, 0.3f); var w20 = Filled(new[] { 16, 8 }, 34, 0.3f);
+            var y0 = Filled(new[] { 4, 8 }, 35, 1f);
+            using var tape = new GradientTape<float>();
+            var grads = tape.ComputeGradients(Loss(a0, b0, w10, w20, y0), sources: new[] { a0, b0, w10, w20 });
+            eagerA = grads[a0].ToArray();
+            eagerB = grads[b0].ToArray();
+        }
+
+        var a = Filled(shape, 31, 1f); var b = Filled(shape, 32, 1f);
+        var w1 = Filled(new[] { 16, 8 }, 33, 0.3f); var w2 = Filled(new[] { 16, 8 }, 34, 0.3f);
+        var y = Filled(new[] { 4, 8 }, 35, 1f);
+        ICompiledTrainingPlan<float> plan;
+        bool? previous = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
+        string? previousPool = Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL");
+        CompiledTrainingPlan<float>.CompiledInputGradientsForTests = true;
+        Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL", gradPool ? "1" : null);
+        try
+        {
+            using var scope = GraphMode.Enable();
+            Loss(a, b, w1, w2, y);
+            plan = scope.CompileTraining(new[] { w1, w2 });
+        }
+        finally
+        {
+            CompiledTrainingPlan<float>.CompiledInputGradientsForTests = previous;
+            Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL", previousPool);
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            for (int step = 0; step < 2; step++)
+            {
+                plan.Step();
+                foreach (var (leaf, expected, name) in new[] { (a, eagerA, "a"), (b, eagerB, "b") })
+                {
+                    if (leaf.Grad is not { } g)
+                    {
+                        Assert.Fail($"step {step}: leaf {name} got no .Grad");
+                        return;
+                    }
+                    var actual = g.ToArray();
+                    for (int i = 0; i < expected.Length; i++)
+                        Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),
+                            $"step {step}: {name}.Grad[{i}] {actual[i]} vs eager {expected[i]}");
+                }
+                Assert.False(ReferenceEquals(a.Grad, b.Grad), "both leaves expose one gradient buffer");
+            }
+        }
+    }
+
     private static Tensor<float> ConvLoss(CpuEngine engine, Tensor<float> x, Tensor<float> w, Tensor<float> b, bool pooled)
     {
         var y = engine.FusedConv2D(x, w, b, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);

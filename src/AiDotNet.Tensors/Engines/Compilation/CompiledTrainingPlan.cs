@@ -1596,6 +1596,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var persistent = new bool[tensorCount];
             foreach (var p in parameters)
                 if (idOf.TryGetValue(p, out var pid)) persistent[pid] = true;
+            // Requested input gradients (AIDOTNET_COMPILED_INPUT_GRADS) are read through .Grad after the step, like the
+            // parameters', so a leaf's buffer must not be shared with another same-shaped gradient.
+            foreach (var leaf in RequestedInputGradientLeaves(forwardSteps))
+                if (idOf.TryGetValue(leaf, out var leafId)) persistent[leafId] = true;
             if (forwardSteps.Count > 0 &&
                 idOf.TryGetValue(forwardSteps[forwardSteps.Count - 1].OutputBuffer, out var lossId))
                 persistent[lossId] = true;
@@ -1719,6 +1723,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool device = engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine;
         HashSet<CompiledStep<T>>? aliased = null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        // With AIDOTNET_COMPILED_INPUT_GRADS the external leaves publish .Grad from the backward that writes them. An
+        // aliased leaf's gradient is a view written by no backward (the add's is skipped), so its .Grad would never be
+        // set: keep the leaves out of the aliasing, like the parameters.
+        parameterSet.UnionWith(RequestedInputGradientLeaves(forwardSteps));
         var dropped = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
@@ -1940,6 +1948,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
 
+    // The graph's external leaves (inputs no step produces) when AIDOTNET_COMPILED_INPUT_GRADS asks for their gradients;
+    // empty otherwise.
+    private static IEnumerable<Tensor<T>> RequestedInputGradientLeaves(IReadOnlyList<CompiledStep<T>> forwardSteps)
+    {
+        if (!CompiledInputGradientsRequested) return Array.Empty<Tensor<T>>();
+        var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var fwdStep in forwardSteps) produced.Add(fwdStep.OutputBuffer);
+        var leaves = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var fwdStep in forwardSteps)
+            foreach (var leaf in fwdStep.Inputs.OfType<Tensor<T>>().Where(input => !produced.Contains(input)))
+                leaves.Add(leaf);
+        return leaves;
+    }
+
     private static int[][] BuildPooledGradMap(
         System.Collections.Generic.HashSet<Tensor<T>> allTensors,
         System.Collections.Generic.List<CompiledStep<T>> forwardSteps,
@@ -2029,6 +2051,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var persistent = new bool[tc];
         foreach (var p in parameters)
             if (idOf.TryGetValue(p, out var pid)) persistent[pid] = true;
+        // Requested input gradients (AIDOTNET_COMPILED_INPUT_GRADS) are read through .Grad after the step, like the
+        // parameters', so a leaf's buffer must not be shared with another same-shaped gradient.
+        foreach (var leaf in RequestedInputGradientLeaves(forwardSteps))
+            if (idOf.TryGetValue(leaf, out var leafId)) persistent[leafId] = true;
         if (forwardSteps.Count > 0 &&
             idOf.TryGetValue(forwardSteps[forwardSteps.Count - 1].OutputBuffer, out var lossId))
             persistent[lossId] = true;
@@ -10200,6 +10226,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             var excluded = new HashSet<Tensor<T>>(parameters.Select(p => gradMap.TryGetValue(p, out var pg) ? pg : null).OfType<Tensor<T>>());
             if (gradMap.TryGetValue(lossOutput, out var lossGrad)) excluded.Add(lossGrad);
+            // Requested input gradients are read through .Grad after the step: each keeps an array of its own.
+            foreach (var leaf in RequestedInputGradientLeaves(forwardSteps))
+                if (gradMap.TryGetValue(leaf, out var leafGrad)) excluded.Add(leafGrad);
 
             var tenants = new List<int>();
             for (int g = 0; g < count; g++)
