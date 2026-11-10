@@ -26,7 +26,7 @@ public class BackwardRecyclerTests
     }
 
     [Fact]
-    public void ReturnedRingTensor_IsReissuedWithinTheStep_AndNotTwiceAfterReset()
+    public void ReturnedRingTensor_ArrayIsReissuedUnderANewTensor_AndNotTwiceAfterReset()
     {
         using var arena = TensorArena.Create();
         var log = new List<TensorArena.IssuedBuffer>();
@@ -34,50 +34,101 @@ public class BackwardRecyclerTests
         var first = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         arena.CloseIssueLog(log);
         Assert.Single(log);
+        var array = first.GetBackingArrayForCacheLookupUnsafe();
 
+        // The array comes back within the step, but never the wrapper: state on the old object described its first
+        // owner, and handing the object on corrupted LayerNorm and BatchNorm gradients.
         arena.ReturnIssued(log[0]);
         var again = TensorAllocator.RentUninitialized<float>(new[] { 32, 128 });
-        Assert.Same(first, again);
+        Assert.NotSame(first, again);
+        Assert.Same(array, again.GetBackingArrayForCacheLookupUnsafe());
         Assert.Equal(new[] { 32, 128 }, again.Shape.ToArray());
 
-        // Returned, then the step ends: the cursor hands it out once, and the stale free entry must not a second time.
+        // Returned, then the step ends: the cursor hands the wrapper out once, and the stale free entry must not hand
+        // its array out a second time.
         arena.ReturnIssued(log[0]);
         arena.Reset();
         var afterReset1 = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         var afterReset2 = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         Assert.Same(first, afterReset1);
-        Assert.NotSame(afterReset1, afterReset2);
+        Assert.NotSame(afterReset1.GetBackingArrayForCacheLookupUnsafe(), afterReset2.GetBackingArrayForCacheLookupUnsafe());
     }
 
-    // Pinning a ring wrapper (a layer registering a persistent tensor) removes it from its bucket and moves every later
-    // wrapper down one position. A returned wrapper must still be found by identity: a stored position would name the
-    // next live wrapper (handing out a tensor still in use) or run past the bucket. A returned wrapper that has since
-    // been pinned belongs to the model and must not be reissued at all.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NormBackward_AfterARecycledGradient_MatchesTheUnrecycledGradient(bool batchNorm)
+    {
+        // The loss gradient a Multiply backward consumes is returned and taken by the norm's input gradient. Reissuing
+        // the same wrapper object there gave LayerNorm a kernel gradient of 2.0577 against -0.0271.
+        var rng = new Random(13);
+        var x = Random(new[] { 2, 1, 4, 4 }, rng, 1f);
+        var k = Random(new[] { 8, 1, 3, 3 }, rng, 1f);
+        var b = Random(new[] { 8 }, rng, 1f);
+        var scale = Random(batchNorm ? new[] { 8 } : new[] { 4 }, rng, 1f);
+        var shift = Random(batchNorm ? new[] { 8 } : new[] { 4 }, rng, 1f);
+        var w = Random(new[] { 2, 8, 4, 4 }, rng, 1f);
+        var one = new[] { 1, 1 };
+        float[] Gradient(bool recycle)
+        {
+            var prior = BackwardRecycler<float>.EnabledOverride;
+            BackwardRecycler<float>.EnabledOverride = recycle;
+            try
+            {
+                using var tape = new GradientTape<float>();
+                var h = _engine.ReLU(_engine.TensorChannelBiasAdd(_engine.Conv2D(x, k, one, one, one), b));
+                var y = batchNorm
+                    ? _engine.BatchNorm(h, scale, shift, 1e-5, out _, out _)
+                    : _engine.LayerNorm(h, scale, shift, 1e-5, out _, out _);
+                var loss = _engine.ReduceSum(_engine.TensorMultiply(y, w), null, false);
+                return tape.ComputeGradients(loss, new[] { k, b })[k].ToArray();
+            }
+            finally
+            {
+                BackwardRecycler<float>.EnabledOverride = prior;
+            }
+        }
+
+        BackwardRecycler<float>.LastPassReturned = 0;
+        var recycled = Gradient(true);
+        Assert.True(BackwardRecycler<float>.LastPassReturned > 0, "nothing was recycled");
+        Assert.Equal(Gradient(false), recycled);
+    }
+
+    // A layer can register a persistent tensor (PinExistingTensor) after the step rented it, and the recycler can then
+    // still return its buffer as dead. The pinned array belongs to the model: neither a return before the pin nor one
+    // after it may hand it to another rent, while the other returned buffers stay reusable.
     [Fact]
-    public void ReturnedRingTensor_IsFoundByIdentity_AfterAnEarlierOneIsPinned()
+    public void PinnedBuffer_IsNotReissued_WhetherReturnedBeforeOrAfterThePin()
     {
         using var arena = TensorArena.Create();
         var log = new List<TensorArena.IssuedBuffer>();
         arena.OpenIssueLog(log);
-        var pinned = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        var pinnedBefore = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        var pinnedAfter = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         var returned = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
-        var live = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
         arena.CloseIssueLog(log);
         Assert.Equal(3, log.Count);
-        pinned.Fill(7f);
+        pinnedBefore.Fill(7f);
+        pinnedAfter.Fill(8f);
 
         arena.ReturnIssued(log[0]);
         arena.ReturnIssued(log[2]);
+        arena.PinExistingTensor(pinnedBefore);
+        arena.PinExistingTensor(pinnedAfter);
         arena.ReturnIssued(log[1]);
-        arena.PinExistingTensor(pinned);
 
-        Assert.Same(returned, TensorAllocator.RentUninitialized<float>(new[] { 64, 64 }));
-        Assert.Same(live, TensorAllocator.RentUninitialized<float>(new[] { 64, 64 }));
-        var fresh = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
-        Assert.NotSame(pinned, fresh);
-        Assert.NotSame(returned, fresh);
-        Assert.NotSame(live, fresh);
-        Assert.All(pinned.ToArray(), value => Assert.Equal(7f, value));
+        var pinnedArrays = new[] { pinnedBefore.GetBackingArrayForCacheLookupUnsafe(), pinnedAfter.GetBackingArrayForCacheLookupUnsafe() };
+        var reused = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+        Assert.Same(returned.GetBackingArrayForCacheLookupUnsafe(), reused.GetBackingArrayForCacheLookupUnsafe());
+        for (int i = 0; i < 3; i++)
+        {
+            var next = TensorAllocator.RentUninitialized<float>(new[] { 64, 64 });
+            Assert.DoesNotContain(next.GetBackingArrayForCacheLookupUnsafe(), pinnedArrays);
+        }
+
+        Assert.All(pinnedBefore.ToArray(), value => Assert.Equal(7f, value));
+        Assert.All(pinnedAfter.ToArray(), value => Assert.Equal(8f, value));
     }
 
     // The arena has one issue log. A second owner (a recycler of another element type on the same thread) must not
@@ -103,9 +154,13 @@ public class BackwardRecyclerTests
     // ReduceSum's backward hands back a Fill-ed ones tensor, tagged as uniform so ReluBackward can read one scalar. The
     // recycler returned that wrapper, LayerNorm's backward was given it and wrote its gradient through a lease, and the
     // ReLU then read the stale tag: every gradient below it came out as if the upstream gradient were all ones (#1702).
-    [Fact]
-    public void ReissuedRingTensor_DropsThePreviousOwnersUniformFill()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReissuedRingTensor_DropsThePreviousOwnersUniformFill(bool acrossStepBoundary)
     {
+        // Within a step the returned array comes back under a new tensor; at the step boundary the ring reissues the
+        // wrapper itself. Either way the new owner must not inherit the first owner's uniform-fill tag.
         var engine = new CpuEngine();
         using var arena = TensorArena.Create();
         var log = new List<TensorArena.IssuedBuffer>();
@@ -115,9 +170,11 @@ public class BackwardRecyclerTests
         ones.Fill(1f);
         Assert.Single(log);
 
-        arena.ReturnIssued(log[0]);
+        if (acrossStepBoundary) arena.Reset();
+        else arena.ReturnIssued(log[0]);
         var gradient = TensorAllocator.RentUninitialized<float>(new[] { 4, 8 });
-        Assert.Same(ones, gradient);
+        if (acrossStepBoundary) Assert.Same(ones, gradient);
+        else Assert.Same(ones.GetBackingArrayForCacheLookupUnsafe(), gradient.GetBackingArrayForCacheLookupUnsafe());
         using (var lease = gradient.LeaseArray())
             for (int i = 0; i < gradient.Length; i++) lease.Array[i] = 0.25f * (i + 1);
 
