@@ -518,7 +518,7 @@ public sealed partial class CudaBackend
         {
             AbortDirectPtxCapturePinTracking(directPtxPins);
             t_lastCaptureFailure = "cuGraphExecUpdate could not update the graph in place (result " + rc
-                + ", update result " + info.result + "): the relaunched step's topology differs from the captured one";
+                + ", update result " + info.result + ")";
         }
         return updated;
     }

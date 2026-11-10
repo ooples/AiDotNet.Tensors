@@ -5,6 +5,10 @@
 #   run-sde-mix.sh <sde64> <AiDotNet.Tensors.dll built for net10.0> [dw|dx]
 set -euo pipefail
 SDE=$1; MODE=${3:-dw}
+case "$MODE" in
+  dw|dx) ;;
+  *) echo "mode must be dw or dx, not $MODE" >&2; exit 2 ;;
+esac
 # MSBuild resolves a relative $(TensorsDll) from the project directory and cp from the caller's; pin both to one file.
 LIB=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 HERE=$(cd "$(dirname "$0")" && pwd)
