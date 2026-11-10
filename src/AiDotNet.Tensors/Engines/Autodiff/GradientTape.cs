@@ -1994,7 +1994,7 @@ public sealed class GradientTape<T> : IDisposable
                         }
                     }
 
-                    var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine);
+                    var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine, _retainGrad);
                     if (cached is not null)
                     {
                         // Per-call cleanup parity with the fresh-walk path

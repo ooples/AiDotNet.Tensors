@@ -140,7 +140,8 @@ internal static class RebindablePlanCache<T>
         TapeEntryArena<T> currentEntries,
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources,
-        IEngine engine)
+        IEngine engine,
+        IReadOnlyCollection<Tensor<T>>? retainedTensors = null)
     {
         if (_cachedReverseTopoIndices is null) return null;
         if (_cachedPatternHash != patternHash) return null;
@@ -189,6 +190,11 @@ internal static class RebindablePlanCache<T>
         var inputsBuffer3 = s_inputsBuffer3 ??= new Tensor<T>[3];
         bool timing = BackwardTiming.Enabled;
         var indices = _cachedReverseTopoIndices;
+        // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
+        var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
+        if (recycler is not null)
+            foreach (int noted in indices)
+                if (noted >= 0 && noted < currentEntries.Count) recycler.NoteOutput(currentEntries[noted].Output);
         try
         {
             for (int i = 0; i < indices.Length; i++)
@@ -229,10 +235,12 @@ internal static class RebindablePlanCache<T>
                     long ticks = Stopwatch.GetTimestamp() - start;
                     BackwardTiming.Record(entry.Backward.Method.Name, ticks);
                 }
+                recycler?.AfterStep(grads, entry.Output);
             }
         }
         finally
         {
+            recycler?.End();
             // Clear every per-arity buffer's references so a forward
             // intermediate that just rode through here (as an Input
             // field of some entry) doesn't get pinned in the thread-

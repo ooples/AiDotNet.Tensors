@@ -751,6 +751,15 @@ public sealed class TensorArena : IDisposable
             _cursor[key] = 0;
         }
 
+        // An array returned earlier this step (ReturnIssued) is free again before the cursor's next one.
+        if (_poolFree is not null && _poolFree.TryGetValue(key, out var freeArrays) && freeArrays.Count > 0)
+        {
+            var returned = (T[])freeArrays.Pop();
+            if (clear) Array.Clear(returned, 0, elementCount);
+            _issueLog?.Add(new IssuedBuffer(returned, -1, 0));
+            return returned;
+        }
+
         int cursor = _cursor[key];
         // Skip arrays a finished step handed to its caller (see ResetKeeping); they are still in use.
         if (_heldOver is not null)
@@ -762,6 +771,7 @@ public sealed class TensorArena : IDisposable
             var existing = (T[])bucket[cursor];
             _cursor[key] = cursor + 1;
             if (clear) Array.Clear(existing, 0, elementCount);
+            _issueLog?.Add(new IssuedBuffer(existing, -1, 0));
             return existing;
         }
 
@@ -780,6 +790,7 @@ public sealed class TensorArena : IDisposable
         bucket.Add(arr);
         TrackBackingBytes<T>(elementCount);
         _cursor[key] = cursor + 1;
+        _issueLog?.Add(new IssuedBuffer(arr, -1, 0));
         return arr;
     }
 
@@ -805,6 +816,7 @@ public sealed class TensorArena : IDisposable
         // Keys stay (TryAllocate indexes the cursor table by the pool's keys); the cursors restart on empty lists.
         var keys = new List<(Type, int)>(_cursor.Keys);
         foreach (var key in keys) _cursor[key] = 0;
+        ClearReturned();
     }
 
     /// <summary>
@@ -812,6 +824,77 @@ public sealed class TensorArena : IDisposable
     /// to one a model base or Optimize() call site opened for a training step and resets per step.
     /// </summary>
     internal bool OwnedByTape { get; set; }
+
+    // ---------------------------------------------------------------------
+    // Within-step return
+    //
+    // The cursors rewind only at a step boundary, so a step's backing memory is the SUM of every buffer it rents: a
+    // backward pass keeps each gradient and backward temporary it has finished with until the step ends. PyTorch frees
+    // them as backward goes, so its peak is the most that is live at once. A caller that can prove a buffer dead before
+    // the boundary (Engines.Autodiff.BackwardRecycler) opens an issue log, and hands the dead ones back through
+    // ReturnIssued; the next rent of the same element type and count takes a returned buffer before the cursor's next.
+    // ---------------------------------------------------------------------
+
+    /// <summary>A buffer this arena issued while an issue log was open, and where it lives for <see cref="ReturnIssued"/>.</summary>
+    internal readonly struct IssuedBuffer
+    {
+        internal IssuedBuffer(Array array, int ringSlot, int position)
+        {
+            Array = array;
+            RingSlot = ringSlot;
+            Position = position;
+        }
+
+        /// <summary>The backing array.</summary>
+        internal readonly Array Array;
+
+        /// <summary>The tensor-ring slot of its wrapper, or -1 for an array from the scratch pool.</summary>
+        internal readonly int RingSlot;
+
+        /// <summary>The wrapper's position in its ring bucket.</summary>
+        internal readonly int Position;
+    }
+
+    private List<IssuedBuffer>? _issueLog;
+    private Stack<int>?[]? _ringFree;
+    private Dictionary<(Type, int), Stack<Array>>? _poolFree;
+
+    /// <summary>Records every buffer issued from now on into <paramref name="log"/>, until <see cref="CloseIssueLog"/>.</summary>
+    internal void OpenIssueLog(List<IssuedBuffer> log) => _issueLog = log;
+
+    /// <summary>Stops recording issued buffers.</summary>
+    internal void CloseIssueLog() => _issueLog = null;
+
+    /// <summary>
+    /// Makes a buffer issued this step available to the next rent of its size before the step ends. The caller must
+    /// have proven that nothing reads or writes it any more: the arena reissues the same array (and, for the tensor
+    /// ring, the same wrapper object).
+    /// </summary>
+    internal void ReturnIssued(in IssuedBuffer buffer)
+    {
+        if (_disposed) return;
+        if (buffer.RingSlot >= 0)
+        {
+            var free = _ringFree ??= new Stack<int>?[MaxTensorRingSlots];
+            (free[buffer.RingSlot] ??= new Stack<int>()).Push(buffer.Position);
+            return;
+        }
+        var key = (buffer.Array.GetType().GetElementType()!, buffer.Array.Length);
+        _poolFree ??= new Dictionary<(Type, int), Stack<Array>>();
+        if (!_poolFree.TryGetValue(key, out var arrays))
+            _poolFree[key] = arrays = new Stack<Array>();
+        arrays.Push(buffer.Array);
+    }
+
+    // At a step boundary every issued buffer is free again through the cursors, so the returned ones must not be
+    // handed out a second time from the free lists.
+    private void ClearReturned()
+    {
+        if (_ringFree is not null)
+            foreach (var positions in _ringFree) positions?.Clear();
+        if (_poolFree is not null)
+            foreach (var arrays in _poolFree.Values) arrays.Clear();
+    }
 
     // Flat tensor ring buffer — sequential scan is faster than dictionary hash for <10 sizes.
     // A slot is keyed by element TYPE as well as element count: one arena can serve float and double
@@ -851,6 +934,9 @@ public sealed class TensorArena : IDisposable
                 && ReferenceEquals(_tensorRingTypes![i], typeof(T))
                 && _tensorRing[i] is List<object> bucket)
             {
+                // A wrapper returned earlier this step (ReturnIssued) is free again before the cursor's next one.
+                if (_ringFree?[i] is { Count: > 0 } freePositions)
+                    return ReissueRingTensor<T>(bucket, freePositions.Pop(), i, totalSize, shape);
                 int cursor = _tensorRingCursors![i];
                 // Skip wrappers a finished step handed to its caller (see ResetKeeping); they are still in use, and
                 // reissuing one would reshape and overwrite a tensor the caller holds.
@@ -859,48 +945,7 @@ public sealed class TensorArena : IDisposable
                 if (cursor < bucket.Count)
                 {
                     _tensorRingCursors[i] = cursor + 1;
-                    var cached = (LinearAlgebra.Tensor<T>)bucket[cursor];
-
-                    // Tensor<T> is publicly IDisposable, so a caller may legitimately release a
-                    // short-lived engine result before the next step. The arena still retains the
-                    // wrapper in this ring; reissuing it after Reset used to hand the next operation
-                    // a wrapper whose TensorStorage reference count was already zero. Do not revive
-                    // the disposed object (which would make an externally retained disposed handle
-                    // usable again). Replace just this ring slot with a fresh wrapper and backing
-                    // buffer. The exceptional dispose-before-reset path pays one allocation while
-                    // the normal zero-allocation reuse path below remains unchanged.
-                    if (cached.IsDisposed)
-                    {
-                        var replacementArray = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
-                        MarkIssued(replacementArray);
-                        _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
-                        TrackBackingBytes<T>(totalSize);
-                        cached = LinearAlgebra.Tensor<T>.FromMemory(
-                            new Memory<T>(replacementArray, 0, totalSize), shape);
-                        bucket[cursor] = cached;
-                    }
-
-                    // The ring buckets by element COUNT, not shape. The cached wrapper
-                    // carries the shape it was FIRST created with, so a same-count /
-                    // different-shape request (e.g. an [B,L] vs [L,B] permute in N-BEATS)
-                    // must be re-issued under the REQUESTED shape — otherwise a stale-shaped
-                    // tensor flows downstream and crashes shape checks on this post-Reset
-                    // reuse path (AiDotNet #1804). The buffer is contiguous with matching
-                    // element count, so this is a zero-copy metadata swap that does NOT
-                    // record a Reshape node on the active tape.
-                    if (!cached._shape.AsSpan().SequenceEqual(shape))
-                        cached.ArenaReshapeInPlace(shape);
-                    // Re-issued to a new owner: drop any release mark the previous owner's data left behind.
-                    cached.ClearReleaseMarks();
-                    // A reissued tensor is a new tensor and must not carry its previous owner's autograd history. A
-                    // backward kernel that fills it without recording left that GradFn in place, and the next step's graph
-                    // walk followed it into a node of an earlier step whose tensors the ring had since reissued under
-                    // other shapes (AiDotNet's StyleGAN after its R1 penalty's createGraph backward: "Multiples length (1)
-                    // must match tensor dimensions (3)" in ReduceSumBackward). AutoTensorCache resets the same state.
-                    cached.GradFn = null;
-                    cached.Grad = null;
-                    cached.LazySource = null;
-                    return cached;
+                    return ReissueRingTensor<T>(bucket, cursor, i, totalSize, shape);
                 }
 
                 // Need one more tensor of this size — reuse a persistent-pool
@@ -913,6 +958,7 @@ public sealed class TensorArena : IDisposable
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
                 bucket.Add(newTensor);
                 _tensorRingCursors[i] = cursor + 1;
+                _issueLog?.Add(new IssuedBuffer(newArr, i, bucket.Count - 1));
                 return newTensor;
             }
         }
@@ -931,6 +977,7 @@ public sealed class TensorArena : IDisposable
             _tensorRingTypes![idx] = typeof(T);
             _tensorRingSizes![idx] = totalSize;
             _tensorRingCursors![idx] = 1;
+            _issueLog?.Add(new IssuedBuffer(arr, idx, 0));
             return tensor;
         }
 
@@ -948,6 +995,61 @@ public sealed class TensorArena : IDisposable
         var overflowArr = TryAllocateUninitialized<T>(totalSize);
         if (overflowArr is null) return null; // disposed
         return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(overflowArr, 0, totalSize), shape);
+    }
+
+    // Hands out the ring wrapper at a bucket position again, under the requested shape and with no previous owner's
+    // state. Shared by the cursor's reuse and the free list of wrappers returned earlier this step.
+    private LinearAlgebra.Tensor<T> ReissueRingTensor<T>(List<object> bucket, int position, int slot, int totalSize, int[] shape)
+    {
+        var cached = (LinearAlgebra.Tensor<T>)bucket[position];
+
+        // Tensor<T> is publicly IDisposable, so a caller may legitimately release a
+        // short-lived engine result before the next step. The arena still retains the
+        // wrapper in this ring; reissuing it after Reset used to hand the next operation
+        // a wrapper whose TensorStorage reference count was already zero. Do not revive
+        // the disposed object (which would make an externally retained disposed handle
+        // usable again). Replace just this ring slot with a fresh wrapper and backing
+        // buffer. The exceptional dispose-before-reset path pays one allocation while
+        // the normal zero-allocation reuse path below remains unchanged.
+        if (cached.IsDisposed)
+        {
+            var replacementArray = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
+            MarkIssued(replacementArray);
+            _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
+            TrackBackingBytes<T>(totalSize);
+            cached = LinearAlgebra.Tensor<T>.FromMemory(
+                new Memory<T>(replacementArray, 0, totalSize), shape);
+            bucket[position] = cached;
+        }
+
+        // The ring buckets by element COUNT, not shape. The cached wrapper
+        // carries the shape it was FIRST created with, so a same-count /
+        // different-shape request (e.g. an [B,L] vs [L,B] permute in N-BEATS)
+        // must be re-issued under the REQUESTED shape — otherwise a stale-shaped
+        // tensor flows downstream and crashes shape checks on this post-Reset
+        // reuse path (AiDotNet #1804). The buffer is contiguous with matching
+        // element count, so this is a zero-copy metadata swap that does NOT
+        // record a Reshape node on the active tape.
+        if (!cached._shape.AsSpan().SequenceEqual(shape))
+            cached.ArenaReshapeInPlace(shape);
+        // Re-issued to a new owner: drop any release mark the previous owner's data left behind.
+        cached.ClearReleaseMarks();
+        // A reissued tensor is a new tensor and must not carry its previous owner's autograd history. A
+        // backward kernel that fills it without recording left that GradFn in place, and the next step's graph
+        // walk followed it into a node of an earlier step whose tensors the ring had since reissued under
+        // other shapes (AiDotNet's StyleGAN after its R1 penalty's createGraph backward: "Multiples length (1)
+        // must match tensor dimensions (3)" in ReduceSumBackward). AutoTensorCache resets the same state.
+        cached.GradFn = null;
+        cached.Grad = null;
+        cached.LazySource = null;
+        _issueLog?.Add(new IssuedBuffer(BackingArrayOf(cached), slot, position));
+        return cached;
+    }
+
+    private static Array BackingArrayOf<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        tensor._storage.TryGetBackingArrayIdentity(out var array, out _);
+        return array!;
     }
 
     // Boundary-carry buffer produced by the PREVIOUS DetachBoundaryAndReset, pending return to
@@ -1098,6 +1200,7 @@ public sealed class TensorArena : IDisposable
             for (int i = 0; i < _tensorRingCount; i++)
                 _tensorRingCursors[i] = 0;
         }
+        ClearReturned();
     }
 
     /// <summary>
@@ -1174,6 +1277,9 @@ public sealed class TensorArena : IDisposable
         _cursor.Clear();
         _pinnedArrays.Clear();
         _ringBackingArrays.Clear();
+        _ringFree = null;
+        _poolFree = null;
+        _issueLog = null;
 
         // Clear tensor ring pools (the Tensor<T> wrappers; their backing arrays
         // were just handed to the persistent pool above).

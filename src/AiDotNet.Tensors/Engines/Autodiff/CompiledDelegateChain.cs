@@ -231,41 +231,53 @@ internal sealed class CompiledDelegateChain<T>
                 foreach (var retained in retainedTensors) protectedStorages.Add(retained.StorageIdentity);
         }
 
-        for (int i = 0; i < _count; i++)
+        // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
+        var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
+        if (recycler is not null)
+            for (int i = 0; i < _count; i++) recycler.NoteOutput(_steps[i].Output);
+        try
         {
-            ref var step = ref _steps[i];
-            if (!DifferentiableOps.IsGradientRequired(step.Output))
+            for (int i = 0; i < _count; i++)
             {
+                ref var step = ref _steps[i];
+                if (!DifferentiableOps.IsGradientRequired(step.Output))
+                {
+                    if (gpuEngine is not null)
+                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    continue;
+                }
+                if (!grads.TryGetValue(step.Output, out var gradOutput))
+                {
+                    if (gpuEngine is not null)
+                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    continue;
+                }
+
+                long start = timing ? Stopwatch.GetTimestamp() : 0;
+                var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
+                try
+                {
+                    step.Backward(gradOutput, step.Inputs, step.Output,
+                        step.SavedState ?? Array.Empty<object>(), engine, grads);
+                }
+                finally
+                {
+                    DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
+                }
+                if (timing)
+                {
+                    long ticks = Stopwatch.GetTimestamp() - start;
+                    BackwardTiming.Record(step.Backward.Method.Name, ticks);
+                }
+
+                recycler?.AfterStep(grads, step.Output);
                 if (gpuEngine is not null)
                     _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
-                continue;
             }
-            if (!grads.TryGetValue(step.Output, out var gradOutput))
-            {
-                if (gpuEngine is not null)
-                    _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
-                continue;
-            }
-
-            long start = timing ? Stopwatch.GetTimestamp() : 0;
-            var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
-            try
-            {
-                step.Backward(gradOutput, step.Inputs, step.Output,
-                    step.SavedState ?? Array.Empty<object>(), engine, grads);
-            }
-            finally
-            {
-                DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
-            }
-            if (timing)
-            {
-                long ticks = Stopwatch.GetTimestamp() - start;
-                BackwardTiming.Record(step.Backward.Method.Name, ticks);
-            }
-
-            if (gpuEngine is not null)
-                _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+        }
+        finally
+        {
+            recycler?.End();
         }
 
         if (sources is not null)
