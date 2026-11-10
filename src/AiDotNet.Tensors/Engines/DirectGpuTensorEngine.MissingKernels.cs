@@ -4681,10 +4681,21 @@ public partial class DirectGpuTensorEngine
     {
         if (!indices._gpuBufferContainsRawInt32 || !HasResidentIndexStorage(indices))
             return GetOrAllocateBuffer(backend, indices);
+        // The capability is resolved before anything is allocated, so a backend without it costs no buffer; a conversion
+        // that still fails releases the output before the caller falls back to the CPU.
+        var conversion = IndexConversion.Resolve(backend);
         using var raw = GetOrAllocateBuffer(backend, indices);
         var numeric = AllocateOutputBuffer(backend, Math.Max(1, indices.Length));
-        IndexConversion.Of(backend).Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
-        return numeric;
+        try
+        {
+            conversion.Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
+            return numeric;
+        }
+        catch
+        {
+            numeric.DisposeAfterQueuedUse(backend);
+            throw;
+        }
     }
 
     private static bool HasResidentIndexStorage(Tensor<int> indices)
@@ -9643,7 +9654,7 @@ public partial class DirectGpuTensorEngine
     {
         int n = outer * dstDim * inner, m = outer * srcDim * inner;
         // Each write's position j along the axis, generated on the device (no host upload, so graph capture holds).
-        IndexConversion.Of(backend).ScatterPositions(positions, srcDim, inner, m);
+        IndexConversion.Resolve(backend).ScatterPositions(positions, srcDim, inner, m);
         backend.Fill(claims, -1f, n);
         backend.ScatterReduce(claims, positions, int32Index, outer, srcDim, dstDim, inner, 2);
         backend.TakeAlongDim(claims, floatIndex, winners, outer, srcDim, inner, dstDim);

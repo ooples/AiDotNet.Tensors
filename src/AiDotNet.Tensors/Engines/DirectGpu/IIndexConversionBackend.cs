@@ -32,6 +32,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             => backend as IIndexConversionBackend
                ?? throw new GpuCapabilityUnavailableException(
                    $"{backend.GetType().Name} does not implement the device index conversions (Int32ToFloat, ScatterPositions).");
+
+        /// <summary>
+        /// <see cref="Of"/>, after checking that the backend at the end of a delegating chain has the conversions too.
+        /// A delegating wrapper (recording, profiling) implements them by forwarding to its inner backend, so its own
+        /// implementation proves nothing: without this check a recording wrapper over a backend without them recorded
+        /// the conversion and failed at replay, outside the engine's capability fallback, instead of failing here.
+        /// </summary>
+        public static IIndexConversionBackend Resolve(IDirectGpuBackend backend)
+        {
+            var terminal = backend;
+            while (terminal is AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend wrapper) terminal = wrapper.InnerBackend;
+            Of(terminal);
+            return Of(backend);
+        }
     }
 }
 
