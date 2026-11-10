@@ -143,6 +143,63 @@ extern ""C"" __global__ void gla_scan_backward_ckpt(
         }
     }
 }
+
+// Channels-last causal depthwise conv (ICausalDepthwiseConvBackend): x, y, dy, dx are [rows, seqLen, C]; w, dw are
+// [K, C]; tap j reads j steps back. Every output element is written; no atomics, so all three are deterministic.
+extern ""C"" __global__ void causal_dwconv1d_forward(
+    const float* x, const float* w, float* y, int rows, int seqLen, int channels, int taps)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * seqLen * channels;
+    if (idx >= total) return;
+    int c = (int)(idx % channels);
+    int t = (int)((idx / channels) % seqLen);
+    int maxJ = min(taps - 1, t);
+    float acc = 0.0f;
+    for (int j = 0; j <= maxJ; j++) acc += w[j * channels + c] * x[idx - (long)j * channels];
+    y[idx] = acc;
+}
+
+extern ""C"" __global__ void causal_dwconv1d_backward_input(
+    const float* dy, const float* w, float* dx, int rows, int seqLen, int channels, int taps)
+{
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * seqLen * channels;
+    if (idx >= total) return;
+    int c = (int)(idx % channels);
+    int t = (int)((idx / channels) % seqLen);
+    int maxJ = min(taps - 1, seqLen - 1 - t);
+    float acc = 0.0f;
+    for (int j = 0; j <= maxJ; j++) acc += w[j * channels + c] * dy[idx + (long)j * channels];
+    dx[idx] = acc;
+}
+
+// Block (32 channel lanes x 8 groups) per (32-channel tile, tap): group g sums steps g, g + 8, ... of the flattened
+// [rows * seqLen] grid (lanes read consecutive channels, so loads coalesce), then lane 0..31 of group 0 adds the 8
+// partials in a fixed order. Launch: grid (ceil(C / 32), K), block (32, 8).
+extern ""C"" __global__ void causal_dwconv1d_backward_kernel(
+    const float* dy, const float* x, float* dw, int rows, int seqLen, int channels, int taps)
+{
+    __shared__ float partial[8][32];
+    int lane = threadIdx.x, group = threadIdx.y;
+    int c = blockIdx.x * 32 + lane;
+    int j = blockIdx.y;
+    float acc = 0.0f;
+    if (c < channels) {
+        long steps = (long)rows * seqLen;
+        for (long rt = group; rt < steps; rt += 8) {
+            int t = (int)(rt % seqLen);
+            if (t >= j) acc += dy[rt * channels + c] * x[(rt - j) * channels + c];
+        }
+    }
+    partial[group][lane] = acc;
+    __syncthreads();
+    if (group == 0 && c < channels) {
+        float s = 0.0f;
+        for (int g = 0; g < 8; g++) s += partial[g][lane];
+        dw[j * channels + c] = s;
+    }
+}
 ";
     }
 
@@ -151,7 +208,10 @@ extern ""C"" __global__ void gla_scan_backward_ckpt(
         return new[]
         {
             "gla_scan_forward",
-            "gla_scan_backward_ckpt"
+            "gla_scan_backward_ckpt",
+            "causal_dwconv1d_forward",
+            "causal_dwconv1d_backward_input",
+            "causal_dwconv1d_backward_kernel"
         };
     }
 }

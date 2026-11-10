@@ -18220,15 +18220,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         Fill(dG, 0f, batch * seqLen * numHeads);
         // State checkpoints every `chunk` steps plus one chunk of recomputed states: memory
         // batch*heads*(nChunks + chunk)*headDim^2 instead of batch*heads*seqLen*headDim^2.
-        int chunk = GlaBackwardChunk(seqLen);
-        int nChunks = (seqLen + chunk - 1) / chunk;
-        long rowsL = (long)batch * numHeads * headDim * headDim;
-        long ckptLenL = checked(rowsL * nChunks);
-        long scratchLenL = checked(rowsL * chunk);
-        if (ckptLenL > int.MaxValue || scratchLenL > int.MaxValue)
-            throw new ArgumentException("GLA backward checkpoint buffer is too large for a single allocation.");
-        using var ckptBuf = AllocateBuffer((int)ckptLenL);
-        using var scratchBuf = AllocateBuffer((int)scratchLenL);
+        var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        using var ckptBuf = AllocateBuffer(ckptLen);
+        using var scratchBuf = AllocateBuffer(scratchLen);
         uint total = (uint)(batch * numHeads * headDim);
         uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
 
@@ -18241,14 +18235,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
         ba[16] = &chunk;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
-    }
-
-    /// <summary>Chunk length for the checkpointed GLA backward: ceil(sqrt(seqLen)) minimises
-    /// nChunks + chunk, the number of saved state slices per (batch, head).</summary>
-    internal static int GlaBackwardChunk(int seqLen)
-    {
-        int c = (int)Math.Ceiling(Math.Sqrt(seqLen));
-        return Math.Max(1, Math.Min(seqLen, c));
     }
 
     // ── Fused xLSTM (mLSTM) scan forward (#1464) ───────────────────────────────────────────
