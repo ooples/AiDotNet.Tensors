@@ -3003,6 +3003,84 @@ internal static class BackwardFunctions<T>
         }
     }
 
+    /// <summary>
+    /// TensorScatter backward (torch.scatter): the destination's gradient is gradOutput with the overwritten positions
+    /// zeroed, and the source's is gradOutput read back at those positions (take-along-dim). When an index repeats
+    /// within a fibre the forward keeps only the last write, so only that source element receives the gradient; the
+    /// earlier writes were overwritten and get zero.
+    /// </summary>
+    internal static void TensorScatterBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var indices = (Tensor<int>)savedState[0];
+        var axis = (int)savedState[1];
+        var gradDestination = engine.TensorScatter(gradOutput, indices, new Tensor<T>(indices._shape), axis);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
+        var gradSource = engine.TensorTakeAlongDim(gradOutput, indices, axis);
+        // A GPU engine finds the overwritten writes on the device; the host scan is for host engines.
+        var lastWrites = engine is DirectGpuTensorEngine gpu
+            ? gpu.TryScatterLastWriteMask<T>(indices, axis, output._shape) ?? ScatterLastWriteMask(indices, axis)
+            : ScatterLastWriteMask(indices, axis);
+        if (lastWrites is not null)
+            gradSource = engine.TensorWhere(lastWrites, gradSource, new Tensor<T>((int[])gradSource._shape.Clone()));
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradSource, engine);
+    }
+
+    /// <summary>
+    /// For a scatter along <paramref name="axis"/>: 1 where an index entry is the last write to its position within its
+    /// fibre and 0 where a later entry overwrites it; null when no fibre repeats an index (every write survives).
+    /// </summary>
+    private static Tensor<T>? ScatterLastWriteMask(Tensor<int> indices, int axis)
+    {
+        var shape = indices._shape;
+        int count = shape[axis], outer = 1, inner = 1;
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        var overwritten = FindOverwrittenWrites(indices.GetFlattenedData(), indices.Length, outer, count, inner);
+        if (overwritten is null) return null;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var mask = new T[overwritten.Length];
+        for (int p = 0; p < mask.Length; p++) mask[p] = overwritten[p] ? ops.Zero : ops.One;
+        return new Tensor<T>(mask, (int[])shape.Clone());
+    }
+
+    /// <summary>
+    /// Marks each index entry that a later entry of its fibre overwrites (walking each fibre from its last write back);
+    /// null when no fibre repeats an index.
+    /// </summary>
+    private static bool[]? FindOverwrittenWrites(int[] index, int length, int outer, int count, int inner)
+    {
+        bool[]? overwritten = null;
+        var seen = new HashSet<int>();
+        for (int fibre = 0; fibre < outer * inner; fibre++)
+        {
+            int o = fibre / inner, i = fibre % inner;
+            seen.Clear();
+            for (int j = count - 1; j >= 0; j--)
+            {
+                int flat = (o * count + j) * inner + i;
+                if (!seen.Add(index[flat]))
+                    (overwritten ??= new bool[length])[flat] = true;
+            }
+        }
+        return overwritten;
+    }
+
+    /// <summary>
+    /// TopK backward: each selected value's gradient flows back to its position along the axis, and the positions that
+    /// were not selected get zero. The indices are distinct within a fibre, so a scatter into zeros is exact.
+    /// </summary>
+    internal static void TopKBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var indices = (Tensor<int>)savedState[0];
+        var axis = (int)savedState[1];
+        var gradInput = engine.TensorScatter(new Tensor<T>((int[])inputs[0]._shape.Clone()), indices, gradOutput, axis);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+    }
+
     /// <summary>ExpandDims backward: squeeze the added dimension</summary>
     internal static void ExpandDimsBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -3685,49 +3763,16 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var indicesTensor = savedState[0] as Tensor<int>;
-        int[] indices = indicesTensor is not null ? indicesTensor.GetFlattenedData() : (int[])savedState[0];
+        var indicesTensor = savedState[0] as Tensor<int> ?? new Tensor<int>((int[])savedState[0], new[] { ((int[])savedState[0]).Length });
         int dim = (int)savedState[1];
         var inShape = inputs[0]._shape;
-
-        int outerSize = 1, innerSize = 1;
-        int dimSize = inShape[dim];
-        for (int i = 0; i < dim; i++) outerSize *= inShape[i];
-        for (int i = dim + 1; i < inShape.Length; i++) innerSize *= inShape[i];
-
-        for (int i = 0; i < indices.Length; i++)
-            if (indices[i] < 0 || indices[i] >= dimSize)
-                throw new InvalidOperationException($"IndexSelectBackward: index {indices[i]} at position {i} out of range [0, {dimSize}).");
-
-        // Selecting along a leading axis (every axis before `dim` has size 1 -- the axis-0 row gather of MoE dispatch,
-        // embedding-style lookups, beam reordering) is exactly the embedding scatter-add: d_input[idx[i], :] +=
-        // d_out[i, :]. Route it through the engine so a GPU engine runs its device IndexAdd kernel instead of this
-        // method's host loop, which downloaded the gradient and paid a per-element indexer + version bump.
-        if (outerSize == 1)
-        {
-            var idx = indicesTensor ?? new Tensor<int>(indices, new[] { indices.Length });
-            var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var dense = engine.TensorEmbeddingLookupBackward(engine.Reshape(g, new[] { indices.Length, innerSize }), idx, dimSize, innerSize);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(dense, inShape), engine);
-            return;
-        }
-
-        var inputGrad = TensorPool<T>.RentZeroed(inShape);
-        var src = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetReadOnlyDataArray();
-        using (var lease = inputGrad.LeaseArray())
-        {
-            var dst = lease.Array;
-            for (int outer = 0; outer < outerSize; outer++)
-            for (int idx = 0; idx < indices.Length; idx++)
-            {
-                int dstBase = (outer * dimSize + indices[idx]) * innerSize;
-                int srcBase = (outer * indices.Length + idx) * innerSize;
-                for (int inner = 0; inner < innerSize; inner++)
-                    dst[dstBase + inner] = numOps.Add(dst[dstBase + inner], src[srcBase + inner]);
-            }
-        }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+        // index_select's gradient is index_add of the output gradient into zeros: each selected slice adds back to the
+        // slice it came from (a repeated index accumulates). Through the engine, a GPU engine runs its IndexAdd kernel
+        // on device-resident operands; the forward validated the indices.
+        var index1D = indicesTensor.Rank == 1 ? indicesTensor : indicesTensor.Reshape(indicesTensor.Length);
+        var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        var gradInput = engine.ScatterAdd(new Tensor<T>((int[])inShape.Clone()), index1D, g, dim);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
     }
 
     /// <summary>L1 loss backward</summary>
@@ -4576,8 +4621,19 @@ internal static class BackwardFunctions<T>
     {
         if (dist == 0.0) return 0.0;          // kink: choose the 0 subgradient
         if (diff == 0.0) return 0.0;
-        if (p == 2.0) return diff / dist;     // |d|·sign(d)·dist^-1 == d/dist
-        if (p == 1.0) return diff > 0 ? 1.0 : -1.0;
+        var order = CpuEngine.ClassifyNormOrder(p);
+        if (order == CpuEngine.NormOrder.Count) return 0.0;   // a count of differing coordinates is piecewise constant
+        // The max-norm moves with the coordinates that attain the maximum (torch: sign(diff) where |diff| == dist).
+        // Only a float tensor's forward rounds |a - b| to float (exactly the float of this double difference), so
+        // only then is the comparison at float precision; any other T compares the differences exactly.
+        if (order == CpuEngine.NormOrder.Max)
+        {
+            double absDiff = Math.Abs(diff);
+            bool attains = absDiff == dist || (typeof(T) == typeof(float) && (float)absDiff == (float)dist);
+            return attains ? (diff > 0 ? 1.0 : -1.0) : 0.0;
+        }
+        if (order == CpuEngine.NormOrder.Euclidean) return diff / dist;     // |d|·sign(d)·dist^-1 == d/dist
+        if (order == CpuEngine.NormOrder.Manhattan) return diff > 0 ? 1.0 : -1.0;
         double mag = Math.Pow(Math.Abs(diff), p - 1.0) * Math.Pow(dist, 1.0 - p);
         return diff > 0 ? mag : -mag;
     }
@@ -4639,23 +4695,34 @@ internal static class BackwardFunctions<T>
 
         var x1 = inputs[0];
         var x2 = inputs[1];
-        int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
+        int m = x1._shape[x1.Rank - 2], n = x2._shape[x2.Rank - 2], d = x1._shape[x1.Rank - 1];
+        CpuEngine.CDistBatchLayout(x1._shape, x2._shape, out var base1, out var base2);
         var gradX1 = TensorPool<T>.RentZeroed(x1._shape);
         var gradX2 = TensorPool<T>.RentZeroed(x2._shape);
+        var a = x1.GetFlattenedData();
+        var b = x2.GetFlattenedData();
+        var dist = output.GetFlattenedData();
+        var go = gradOutput.GetFlattenedData();
 
-        for (int i = 0; i < m; i++)
-        for (int j = 0; j < n; j++)
+        // A broadcast batch maps several output matrices to one input matrix, whose gradient sums over them.
+        for (int bi = 0; bi < base1.Length; bi++)
         {
-            double dist = numOps.ToDouble(output[i * n + j]);
-            double g = numOps.ToDouble(gradOutput[i * n + j]);
-            if (g == 0.0) continue;
-            for (int k = 0; k < d; k++)
+            int o1 = base1[bi] * m * d, o2 = base2[bi] * n * d, oo = bi * m * n;
+            for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
             {
-                double diff = numOps.ToDouble(x1[i * d + k]) - numOps.ToDouble(x2[j * d + k]);
-                double s = g * PNormTermGrad(diff, dist, p);
-                if (s == 0.0) continue;
-                gradX1[i * d + k] = numOps.Add(gradX1[i * d + k], numOps.FromDouble(s));
-                gradX2[j * d + k] = numOps.Subtract(gradX2[j * d + k], numOps.FromDouble(s));
+                double g = numOps.ToDouble(go[oo + i * n + j]);
+                if (g == 0.0) continue;
+                double dd = numOps.ToDouble(dist[oo + i * n + j]);
+                for (int k = 0; k < d; k++)
+                {
+                    int ia = o1 + i * d + k, ib = o2 + j * d + k;
+                    double diff = numOps.ToDouble(a[ia]) - numOps.ToDouble(b[ib]);
+                    double s = g * PNormTermGrad(diff, dd, p);
+                    if (s == 0.0) continue;
+                    gradX1[ia] = numOps.Add(gradX1[ia], numOps.FromDouble(s));
+                    gradX2[ib] = numOps.Subtract(gradX2[ib], numOps.FromDouble(s));
+                }
             }
         }
 

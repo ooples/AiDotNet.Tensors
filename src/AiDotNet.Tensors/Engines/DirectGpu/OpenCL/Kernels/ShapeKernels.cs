@@ -182,9 +182,14 @@ __kernel void search_sorted(__global const float* seq, __global const float* val
     int idx = get_global_id(0); if (idx >= numValues) return;
     float v = values[idx];
     int lo = 0, hi = seqLen;
+    // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+    // moves right; the NaN test reads the bits so -cl-finite-math-only cannot fold it away.
+    int vNan = (as_uint(v) & 0x7FFFFFFFu) > 0x7F800000u;
     while (lo < hi) {
         int mid = (lo + hi) >> 1;
-        int cond = (right != 0) ? (seq[mid] <= v) : (seq[mid] < v);
+        float s = seq[mid];
+        int nan = vNan || ((as_uint(s) & 0x7FFFFFFFu) > 0x7F800000u);
+        int cond = nan || ((right != 0) ? (s <= v) : (s < v));
         if (cond) lo = mid + 1; else hi = mid;
     }
     output[idx] = (float)lo;
@@ -211,9 +216,11 @@ __kernel void cdist(__global const float* x1, __global const float* x2, __global
         float diff = fabs(x1[i * d + k] - x2[j * d + k]);
         if (p == 1.0f) sum += diff;
         else if (p == 2.0f) sum += diff * diff;
+        else if (p == 0.0f) sum += (diff != 0.0f) ? 1.0f : 0.0f;
+        else if (p < 0.0f) sum = (diff > sum || (as_uint(diff) & 0x7FFFFFFFu) > 0x7F800000u) ? diff : sum;
         else sum += pow(diff, p);
     }
-    output[idx] = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
+    output[idx] = (p == 1.0f || p == 0.0f || p < 0.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
 }
 // Hierarchical-softmax leaf probabilities from raw per-level node activations `acts` [rows, treeDepth].
 // gate = sigmoid(acts[level]); per class c, prob = product over levels of (bit ? gate : 1-gate), with the
@@ -532,6 +539,15 @@ __kernel void copy_2d_strided4(__global const float* src, __global float* dst, i
     vstore4(vload4(0, src + (long)row * srcCols + 4 * q), 0, dst + (long)row * destTotalCols + destColOffset + 4 * q);
 }
 // Initialize padded index rows (stored as float): idx[r*P + i] = (i < L) ? i : -1.
+__kernel void int32_to_float(__global const int* raw, __global float* output, int n) {
+    int gid = get_global_id(0); if (gid >= n) return;
+    output[gid] = (float)raw[gid];
+}
+// A scatter write's position along its axis for [outer, srcDim, inner] writes, as a float: (gid / inner) % srcDim.
+__kernel void scatter_positions(__global float* output, int srcDim, int inner, int n) {
+    int gid = get_global_id(0); if (gid >= n) return;
+    output[gid] = (float)((gid / inner) % srcDim);
+}
 __kernel void iota_pad(__global float* idx, int L, int P, int numRows) {
     int gid = get_global_id(0); if (gid >= numRows * P) return;
     int i = gid % P; idx[gid] = (i < L) ? (float)i : -1.0f;
@@ -697,9 +713,11 @@ __kernel void pdist(__global const float* input, __global float* output, int n, 
         float diff = fabs(input[i * d + k] - input[j * d + k]);
         if (p == 1.0f) sum += diff;
         else if (p == 2.0f) sum += diff * diff;
+        else if (p == 0.0f) sum += (diff != 0.0f) ? 1.0f : 0.0f;
+        else if (p < 0.0f) sum = (diff > sum || (as_uint(diff) & 0x7FFFFFFFu) > 0x7F800000u) ? diff : sum;
         else sum += pow(diff, p);
     }
-    float dist = (p == 1.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
+    float dist = (p == 1.0f || p == 0.0f || p < 0.0f) ? sum : (p == 2.0f) ? sqrt(sum) : pow(sum, 1.0f / p);
     int outIdx = i * n - (i * (i + 1)) / 2 + (j - i - 1);
     output[outIdx] = dist;
 }
@@ -732,7 +750,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
+            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "int32_to_float", "scatter_positions", "rwkv7_forward", "hsoftmax_paths",
             "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }

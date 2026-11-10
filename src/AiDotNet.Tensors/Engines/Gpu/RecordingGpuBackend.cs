@@ -944,6 +944,37 @@ public class RecordingGpuBackend : DelegatingGpuBackend
             () => Inner.Copy(source, sourceOffset, destination, destinationOffset, length));
     }
 
+    /// <inheritdoc/>
+    public override void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
+    {
+        // A batched cdist copies each batch's matrices into shared scratch (recorded copies) before this kernel,
+        // so it must replay between those copies, not run at record time on scratch they have not filled.
+        RecordOrExecute(KernelType.Reduction, new[] { x1, x2 }, new[] { output },
+            () => Inner.CDist(x1, x2, output, m, n, d, p));
+    }
+
+    /// <inheritdoc/>
+    public override void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
+    {
+        RecordOrExecute(KernelType.Reduction, new[] { input }, new[] { output },
+            () => Inner.PDist(input, output, n, d, p));
+    }
+
+    /// <inheritdoc/>
+    public override void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        RecordOrExecute(KernelType.ElementWise, new[] { raw }, new[] { output },
+            () => Inner.Int32ToFloat(raw, output, n));
+    }
+
+    /// <inheritdoc/>
+    public override void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
+    {
+        // Reads nothing; the output is the node's dependency, so a recorded writer of the same buffer keeps its order.
+        RecordOrExecute(KernelType.ElementWise, System.Array.Empty<IGpuBuffer>(), new[] { output },
+            () => Inner.ScatterPositions(output, srcDim, inner, n));
+    }
+
     #endregion
 }
 

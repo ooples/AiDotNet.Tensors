@@ -53,7 +53,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             "parity210_take_along_dim_f","parity210_cross3","parity210_ldexp","parity210_kron2d",
             "parity210_search_sorted","parity210_next_after","parity210_index_write","parity210_cdist",
             "parity210_pdist","parity210_histc","parity210_bitonic_step","parity210_copy_rows",
-            "parity210_iota_pad","parity210_hsoftmax_paths","parity210_isin","parity210_copy_block_2d",
+            "parity210_iota_pad","parity210_int32_to_float","parity210_scatter_positions","parity210_hsoftmax_paths","parity210_isin","parity210_copy_block_2d",
             "parity210_scatter_reduce","parity210_unfold","parity210_classify_float","parity210_zeta",
             "parity210_polygamma","parity210_rwkv7_forward",
         };
@@ -1128,7 +1128,10 @@ extern ""C"" __global__ void parity210_kron2d(const float* __restrict__ a, const
 }
 extern ""C"" __global__ void parity210_search_sorted(const float* __restrict__ seq, const float* __restrict__ values, float* __restrict__ output, int seqLen, int numValues, int right) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx >= numValues) return; float v = values[idx]; int lo=0, hi=seqLen;
-    while (lo < hi) { int mid=(lo+hi)>>1; int cond=(right!=0)?(seq[mid]<=v):(seq[mid]<v); if (cond) lo=mid+1; else hi=mid; }
+    int vNan=(__float_as_uint(v)&0x7FFFFFFFu)>0x7F800000u;
+    // torch.searchsorted moves right on !(seq[mid] >= v) (!(seq[mid] > v) for right), so every comparison with a NaN
+    // moves right; the NaN test reads the bits so fast-math cannot fold it away.
+    while (lo < hi) { int mid=(lo+hi)>>1; float s=seq[mid]; int nan=vNan||((__float_as_uint(s)&0x7FFFFFFFu)>0x7F800000u); int cond=nan||((right!=0)?(s<=v):(s<v)); if (cond) lo=mid+1; else hi=mid; }
     output[idx] = (float)lo;
 }
 extern ""C"" __global__ void parity210_next_after(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ output, int size) {
@@ -1151,13 +1154,13 @@ extern ""C"" __global__ void parity210_index_write(float* __restrict__ output, c
 }
 extern ""C"" __global__ void parity210_cdist(const float* __restrict__ x1, const float* __restrict__ x2, float* __restrict__ output, int m, int n, int d, float p) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
-    output[idx]=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p);
+    for (int k=0;k<d;k++){ float diff=fabsf(x1[i*d+k]-x2[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=(diff>sum||(__float_as_uint(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=powf(diff,p); }
+    output[idx]=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p);
 }
 extern ""C"" __global__ void parity210_pdist(const float* __restrict__ input, float* __restrict__ output, int n, int d, float p) {
     int flat = blockIdx.x*blockDim.x+threadIdx.x; if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0f;
-    for (int k=0;k<d;k++){ float diff=fabsf(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else sum+=powf(diff,p); }
-    float dist=(p==1.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
+    for (int k=0;k<d;k++){ float diff=fabsf(input[i*d+k]-input[j*d+k]); if (p==1.0f) sum+=diff; else if (p==2.0f) sum+=diff*diff; else if (p==0.0f) sum+=(diff!=0.0f)?1.0f:0.0f; else if (p<0.0f) sum=(diff>sum||(__float_as_uint(diff)&0x7FFFFFFFu)>0x7F800000u)?diff:sum; else sum+=powf(diff,p); }
+    float dist=(p==1.0f||p==0.0f||p<0.0f)?sum:(p==2.0f)?sqrtf(sum):powf(sum,1.0f/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
 }
 extern ""C"" __global__ void parity210_histc(const float* __restrict__ input, float* __restrict__ hist, int n, int bins, float mn, float mx) {
     int idx = blockIdx.x*blockDim.x+threadIdx.x; if (idx>=n) return; float x=input[idx]; if (!(x>=mn&&x<=mx)) return;
@@ -1185,6 +1188,12 @@ extern ""C"" __global__ void parity210_bitonic_step(float* __restrict__ values, 
 }
 extern ""C"" __global__ void parity210_copy_rows(const float* __restrict__ src, float* __restrict__ dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) {
     int gid = blockIdx.x*blockDim.x+threadIdx.x; if (gid>=numRows*copyLen) return; int i=gid%copyLen; int r=gid/copyLen; dst[r*dstRowLen+i]=src[r*srcRowLen+i];
+}
+extern ""C"" __global__ void parity210_int32_to_float(const int* __restrict__ raw, float* __restrict__ output, int n) {
+    int gid = blockIdx.x*blockDim.x+threadIdx.x; if (gid>=n) return; output[gid]=(float)raw[gid];
+}
+extern ""C"" __global__ void parity210_scatter_positions(float* __restrict__ output, int srcDim, int inner, int n) {
+    int gid = blockIdx.x*blockDim.x+threadIdx.x; if (gid>=n) return; output[gid]=(float)((gid/inner)%srcDim);
 }
 extern ""C"" __global__ void parity210_iota_pad(float* __restrict__ idx, int L, int P, int numRows) {
     int gid = blockIdx.x*blockDim.x+threadIdx.x; if (gid>=numRows*P) return; int i=gid%P; idx[gid]=(i<L)?(float)i:-1.0f;

@@ -121,12 +121,14 @@ public sealed partial class VulkanBackend
     }
     public void CDist(IGpuBuffer x1, IGpuBuffer x2, IGpuBuffer output, int m, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         GlslDispatchN(VulkanAuditKernels.Cdist, m*n,
             new IGpuBuffer[] { x1, x2, output },
             new uint[] { (uint)m, (uint)n, (uint)d, FloatBits(p) });
     }
     public void PDist(IGpuBuffer input, IGpuBuffer output, int n, int d, float p)
     {
+        p = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.KernelNormOrder(p);
         GlslDispatchN(VulkanAuditKernels.Pdist, n*n,
             new IGpuBuffer[] { input, output },
             new uint[] { (uint)n, (uint)d, FloatBits(p) });
@@ -148,6 +150,20 @@ public sealed partial class VulkanBackend
         GlslDispatchN(VulkanAuditKernels.CopyRows, numRows*copyLen,
             new IGpuBuffer[] { src, dst },
             new uint[] { (uint)srcRowLen, (uint)dstRowLen, (uint)numRows, (uint)copyLen });
+    }
+    public void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n)
+    {
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.Require(raw, n, nameof(raw)); GpuBufferCapacity.Require(output, n, nameof(output));
+        GlslDispatchN(VulkanAuditKernels.Int32ToFloat, n,
+            new IGpuBuffer[] { raw, output },
+            new uint[] { (uint)n });
+    }
+    public void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n)
+    {
+        if (GpuBufferCapacity.IsEmptyLaunch(n)) return; GpuBufferCapacity.RequirePositions(output, srcDim, inner, n);
+        GlslDispatchN(VulkanAuditKernels.ScatterPositions, n,
+            new IGpuBuffer[] { output },
+            new uint[] { (uint)srcDim, (uint)inner, (uint)n });
     }
     public void IotaPad(IGpuBuffer idx, int l, int p, int numRows)
     {
