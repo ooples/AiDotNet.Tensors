@@ -55,6 +55,11 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         Tensor<T> input = inputs[0], grid = inputs[1];
+        // Under create-graph: differentiate the trilinear (or nearest) sample as recorded ops.
+        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+                BackwardFunctions<T>.GridSampleRecorded(e, input, grid, (GridSampleMode)savedState[0],
+                    (GridSamplePadding)savedState[1], (bool)savedState[2])))
+            return;
         var x = ToDoubles(input, ops);
         var g = ToDoubles(grid, ops);
         var go = ToDoubles(gradOutput, ops);

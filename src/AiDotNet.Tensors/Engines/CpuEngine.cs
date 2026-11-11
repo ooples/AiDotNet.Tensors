@@ -9828,7 +9828,12 @@ public partial class CpuEngine : ITensorLevelEngine
             && ReferenceEquals(input, inputOrig) && input.Layout == LinearAlgebra.TensorLayout.Nchw;
         if (tape is not null && !recomputeBackward)
         {
-            var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
+            // MaxPool2DWithIndices records its own edge; recorded here as well, the output would have two producers,
+            // which a tape walk (create-graph backward) runs both of, doubling the gradient.
+            Tensor<T> resultWithIdx;
+            int[,,,,] maxIndices;
+            using (new NoGradScope<T>())
+                resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out maxIndices);
             DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, inputOrig, BackwardFunctions<T>.MaxPool2DBackward,
                 new object[] { maxIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
             AutoTracer.RecordOp("MaxPool2D", resultWithIdx, eng => resultWithIdx);
@@ -10408,14 +10413,20 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("DepthwiseConv1D", input._shape); if (ac is not null) return ac.Execute(); }
 
-        // Reshape to 4D: [B, C, 1, L] and [C, multiplier, 1, K]
-        var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
-        var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
+        // Reshape to 4D: [B, C, 1, L] and [C, multiplier, 1, K]. Unrecorded: the op records its own edge below, and the
+        // composite's edges would make a second producer of the result (a tape walk, as in a create-graph backward,
+        // ran both and doubled the gradient).
+        Tensor<T> result;
+        using (new NoGradScope<T>())
+        {
+            var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
+            var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
 
-        var result4D = DepthwiseConv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding });
+            var result4D = DepthwiseConv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding });
 
-        // Squeeze height dimension: [B, C*mult, 1, outL] -> [B, C*mult, outL]
-        var result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+            // Squeeze height dimension: [B, C*mult, 1, outL] -> [B, C*mult, outL]
+            result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+        }
 
         DifferentiableOps.RecordBinary("DepthwiseConv1D", result, input, kernel, BackwardFunctions<T>.DepthwiseConv1DBackward,
             new object[] { stride, padding });

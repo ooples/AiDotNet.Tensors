@@ -1617,6 +1617,10 @@ internal static partial class BackwardFunctions<T>
         var stride = (int)savedState[0];
         var padding = (int)savedState[1];
 
+        if (TryMultilinearBackward("DepthwiseConv1D", DepthwiseConv1DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.DepthwiseConv1D(x[0], x[1], stride, padding)))
+            return;
+
         var gradInput = engine.DepthwiseConv1DBackwardInput(
             gradOutput, inputs[1], inputs[0]._shape, stride, padding);
         var gradKernel = engine.DepthwiseConv1DBackwardKernel(
@@ -1634,6 +1638,10 @@ internal static partial class BackwardFunctions<T>
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
+
+        if (TryMultilinearBackward("Conv3D", Conv3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.Conv3D(x[0], x[1], stride, padding, dilation)))
+            return;
 
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
         {
@@ -1655,6 +1663,10 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // inputs[0] = input, inputs[1] = grid
+        // Under create-graph: differentiate the bilinear sample (zeros padding, align_corners=false) as recorded ops.
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+                GridSampleRecorded(e, inputs[0], inputs[1], GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: false)))
+            return;
         var gradInput = engine.GridSampleBackwardInput(gradOutput, inputs[1], inputs[0]._shape);
         var gradGrid = engine.GridSampleBackwardGrid(gradOutput, inputs[0], inputs[1]);
 
@@ -1688,6 +1700,16 @@ internal static partial class BackwardFunctions<T>
         var mode = (GridSampleMode)SavedInt(nameof(GridSampleModeBackward), savedState, 0, "mode");
         var padding = (GridSamplePadding)SavedInt(nameof(GridSampleModeBackward), savedState, 1, "padding");
         bool alignCorners = SavedBool(nameof(GridSampleModeBackward), savedState, 2, "alignCorners");
+
+        if (mode != GridSampleMode.Bicubic
+            && TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+                GridSampleRecorded(e, inputs[0], inputs[1], mode, padding, alignCorners)))
+            return;
+        if (mode == GridSampleMode.Bicubic
+            && TryMultilinearBackward("GridSample", GridSampleModeBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.GridSample(x[0], inputs[1], mode, padding, alignCorners), new[] { true, false },
+                "Double backward through the grid of a bicubic GridSample is not implemented (as in PyTorch)."))
+            return;
 
         var gradInput = engine.GridSampleBackwardInput(
             gradOutput, inputs[1], inputs[0]._shape, mode, padding, alignCorners);
@@ -1734,6 +1756,9 @@ internal static partial class BackwardFunctions<T>
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
 
+        if (CreatesGraph && TrySelectionBackward("MaxPool2DBackward", gradOutput, inputs[0],
+                MaxPool2DGlobalIndices(maxIndices, inputs[0]._shape), engine, grads))
+            return;
         var grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -1797,6 +1822,9 @@ internal static partial class BackwardFunctions<T>
         var maxIndices = (Tensor<int>)savedState[0];
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool2DBackward", gradOutput, inputs[0],
+                PlaneTensorIndicesToGlobal(maxIndices, gradOutput._shape, inputs[0]._shape, 2), engine, grads))
+            return;
         var grad = engine.MaxPool2DBackwardWithTensorIndices(
             gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -1813,6 +1841,12 @@ internal static partial class BackwardFunctions<T>
         // plans serialized before they were saved; those replay the old unpadded gradient.
         var padding = savedState.Length > 2 ? savedState[2] as int[] : null;
         bool countIncludePad = savedState.Length > 3 && savedState[3] is true;
+
+        if (TryLinearBackward("AvgPool2DBackward", AvgPool2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => padding is null
+                    ? e.AvgPool2D(w, poolSize, stride)
+                    : e.AvgPool2D(w, poolSize[0], stride[0], padding[0], countIncludePad)))
+            return;
 
         var grad = engine.AvgPool2DBackward(gradOutput, inputs[0]._shape, poolSize, stride, padding, countIncludePad);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -2575,6 +2609,10 @@ internal static partial class BackwardFunctions<T>
         const string op = nameof(ForwardSplatBackward);
         RequireSavedState(op, savedState, 1);
         bool normalize = SavedBool(op, savedState, 0, "normalize");
+
+        // Under create-graph: differentiate the splat built from recorded ops.
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e => ForwardSplatRecorded(e, inputs[0], inputs[1], normalize)))
+            return;
 
         Tensor<T> gradInput;
         Tensor<T> gradFlow;
@@ -3402,6 +3440,11 @@ internal static partial class BackwardFunctions<T>
         int[] stride = (int[])savedState[0];
         int[] padding = (int[])savedState[1];
 
+        var outputPadding2D = TransposedConvOutputPadding(gradOutput._shape, inputs[0]._shape, inputs[1]._shape, stride, padding);
+        if (TryMultilinearBackward("ConvTranspose2D", ConvTranspose2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.ConvTranspose2D(x[0], x[1], stride, padding, outputPadding2D)))
+            return;
+
         var inputGrad = engine.ConvTranspose2DBackwardInput(gradOutput, inputs[1],
             inputs[0]._shape, stride, padding);
         var kernelGrad = engine.ConvTranspose2DBackwardKernel(gradOutput, inputs[0],
@@ -3479,6 +3522,9 @@ internal static partial class BackwardFunctions<T>
     {
         int scaleH = (int)savedState[0];
         int scaleW = (int)savedState[1];
+        if (TryLinearBackward("UpsampleBackward", UpsampleBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.Upsample(v, scaleH, scaleW)))
+            return;
         var inputGrad = engine.UpsampleBackward(gradOutput, inputs[0]._shape, scaleH, scaleW);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
@@ -3492,6 +3538,10 @@ internal static partial class BackwardFunctions<T>
         var inShape = inputs[0]._shape;
         int batch = inShape[0], channels = inShape[1], inH = inShape[2], inW = inShape[3];
         int outH = (int)savedState[0], outW = (int)savedState[1];
+
+        if (TryLinearBackward("AdaptiveAvgPool2DBackward", AdaptiveAvgPool2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.AdaptiveAvgPool2D(v, outH, outW)))
+            return;
 
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryAdaptiveAvgPool2DBackwardOnDevice(gradOutput, inShape, outH, outW) is { } deviceGrad)
@@ -3972,6 +4022,9 @@ internal static partial class BackwardFunctions<T>
         int h = inShape[^2], w = inShape[^1];
         var goShape = gradOutput._shape;
         int outH = goShape[^2], outW = goShape[^1];
+        if (TryLinearBackward("UpsampleBilinearBackward", UpsampleBilinearBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.TensorUpsampleBilinear(v, new[] { outH, outW })))
+            return;
         int batchChannels = 1;
         for (int i = 0; i < inShape.Length - 2; i++) batchChannels *= inShape[i];
 
@@ -6408,6 +6461,9 @@ internal static partial class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool2DBackward", gradOutput, inputs[0],
+                MaxPool2DGlobalIndices(maxIndices, inputShape), engine, grads))
+            return;
         var grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputShape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6421,6 +6477,9 @@ internal static partial class BackwardFunctions<T>
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
         var padding = (int[])savedState[2];
+        if (TryLinearBackward("AvgPool3DBackward", AvgPool3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.AvgPool3D(w, poolSize, stride, padding)))
+            return;
         var grad = engine.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6434,6 +6493,9 @@ internal static partial class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool3DBackward", gradOutput, inputs[0],
+                MaxPool3DGlobalIndices(maxIndices, inputShape), engine, grads))
+            return;
         var grad = engine.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6447,6 +6509,9 @@ internal static partial class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool3DBackward", gradOutput, inputs[0],
+                PlaneTensorIndicesToGlobal(maxIndices, gradOutput._shape, inputShape, 3), engine, grads))
+            return;
         var grad = engine.MaxPool3DBackwardWithTensorIndices(
             gradOutput, maxIndices, inputShape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -6459,6 +6524,9 @@ internal static partial class BackwardFunctions<T>
     {
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
+        if (TryMultilinearBackward("DepthwiseConv2D", DepthwiseConv2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.DepthwiseConv2D(x[0], x[1], stride, padding)))
+            return;
         var inputGrad = engine.DepthwiseConv2DBackwardInput(gradOutput, inputs[1], inputs[0]._shape, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         var kernelGrad = engine.DepthwiseConv2DBackwardKernel(gradOutput, inputs[0], inputs[1]._shape, stride, padding);
@@ -6485,6 +6553,10 @@ internal static partial class BackwardFunctions<T>
     {
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
+        var outputPadding3D = TransposedConvOutputPadding(gradOutput._shape, inputs[0]._shape, inputs[1]._shape, stride, padding);
+        if (TryMultilinearBackward("ConvTranspose3D", ConvTranspose3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.ConvTranspose3D(x[0], x[1], stride, padding, outputPadding3D)))
+            return;
         var inputGrad = engine.ConvTranspose3DBackwardInput(gradOutput, inputs[1], inputs[0]._shape, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         var kernelGrad = engine.ConvTranspose3DBackwardKernel(gradOutput, inputs[0], inputs[1]._shape, stride, padding);
@@ -6500,6 +6572,9 @@ internal static partial class BackwardFunctions<T>
         var scaleD = (int)savedState[0];
         var scaleH = (int)savedState[1];
         var scaleW = (int)savedState[2];
+        if (TryLinearBackward("Upsample3DBackward", Upsample3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.Upsample3D(v, scaleD, scaleH, scaleW)))
+            return;
         var grad = engine.Upsample3DBackward(gradOutput, inputShape, scaleD, scaleH, scaleW);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6551,6 +6626,9 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var stride = (int[])savedState[0];
+        if (TryMultilinearBackward("LocallyConnectedConv2D", LocallyConnectedConv2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.LocallyConnectedConv2D(x[0], x[1], null, stride)))
+            return;
         var inputGrad = engine.LocallyConnectedConv2DBackwardInput(gradOutput, inputs[1], inputs[0]._shape, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         var weightsGrad = engine.LocallyConnectedConv2DBackwardWeights(gradOutput, inputs[0], inputs[1]._shape, stride);
@@ -6700,6 +6778,10 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var positions = (Tensor<T>)savedState[0];
+        // Linear in the grid values (the positions are not differentiated).
+        if (TryLinearBackward("TrilinearInterpolateBackward", TrilinearInterpolateBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.TensorTrilinearInterpolate(v, positions)))
+            return;
         var grad = engine.TensorTrilinearInterpolateBackward(gradOutput, inputs[0], positions);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -9656,6 +9738,11 @@ internal static partial class BackwardFunctions<T>
         var input = inputs[0];
         var mode = (InterpolateMode)savedState[0];
         bool alignCorners = (bool)savedState[1];
+        // Every mode is linear in the input; the adjoint of its backward is the same interpolation.
+        var sizes = gradOutput._shape.Skip(2).ToArray();
+        if (TryLinearBackward("InterpolateBackward", InterpolateBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.Interpolate(v, sizes, mode, alignCorners)))
+            return;
         var gradInput = InterpolateBackwardImpl(gradOutput, input, mode, alignCorners);
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
     }
@@ -9898,6 +9985,9 @@ internal static partial class BackwardFunctions<T>
         int outH = (int)savedState[1];
         int outW = (int)savedState[2];
         bool alignCorners = (bool)savedState[3];
+        if (TryLinearBackward("AffineGrid3DBackward", AffineGrid3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.AffineGrid3D(v, outD, outH, outW, alignCorners)))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         int N = theta._shape[0];
         var gradTheta = new Tensor<T>(theta._shape);
@@ -9948,6 +10038,10 @@ internal static partial class BackwardFunctions<T>
         var theta = inputs[0];
         int outH = (int)savedState[0];
         int outW = (int)savedState[1];
+        // The grid is linear in theta; the adjoint of its backward is the grid construction itself.
+        if (TryLinearBackward("AffineGridBackward", AffineGridBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.AffineGrid(v, outH, outW)))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         int N = theta._shape[0];
         var gradTheta = new Tensor<T>(theta._shape);
@@ -9995,6 +10089,10 @@ internal static partial class BackwardFunctions<T>
         float spatialScale = (float)savedState[2];
         int samplingRatio = (int)savedState[3];
         bool aligned = (bool)savedState[4];
+        // Linear in the feature map for fixed boxes; the boxes' gradient is the constant zero below.
+        if (TryMultilinearBackward("RoIAlign", RoIAlignBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.RoIAlign(x[0], boxes, outH, outW, spatialScale, samplingRatio, aligned), new[] { true, false }))
+            return;
         var gradInput = RoIAlignBackwardImpl(gradOutput, input, boxes,
             outH, outW, spatialScale, samplingRatio, aligned);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -10042,6 +10140,15 @@ internal static partial class BackwardFunctions<T>
         int outH = (int)savedState[0];
         int outW = (int)savedState[1];
         float spatialScale = (float)savedState[2];
+        if (CreatesGraph)
+        {
+            // Each bin's max is a selection of one feature-map element: record the scatter with the gather as its
+            // adjoint; the boxes' gradient stays the constant zero.
+            TrySelectionBackward("RoIPoolBackward", gradOutput, input, RoIPoolGlobalIndices(input, boxes, outH, outW, spatialScale),
+                engine, grads);
+            DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
@@ -10213,6 +10320,9 @@ internal static partial class BackwardFunctions<T>
         var input = inputs[0];
         int origRate = (int)savedState[0];
         int newRate = (int)savedState[1];
+        if (TryLinearBackward("ResampleBackward", ResampleBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, v) => e.Resample(v, origRate, newRate)))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input._shape);
         if (origRate == newRate)
@@ -10295,6 +10405,9 @@ internal static partial class BackwardFunctions<T>
         int outChans = (int)savedState[2];
         float spatialScale = (float)savedState[3];
         int samplingRatio = (int)savedState[4];
+        if (TryMultilinearBackward("PsRoIAlign", PsRoIAlignBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.PsRoIAlign(x[0], boxes, outH, outW, outChans, spatialScale, samplingRatio), new[] { true, false }))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
@@ -10361,6 +10474,10 @@ internal static partial class BackwardFunctions<T>
         int outW = (int)savedState[1];
         int outChans = (int)savedState[2];
         float spatialScale = (float)savedState[3];
+        // Bin averages: linear in the feature map for fixed boxes.
+        if (TryMultilinearBackward("PsRoIPool", PsRoIPoolBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.PsRoIPool(x[0], boxes, outH, outW, outChans, spatialScale), new[] { true, false }))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
