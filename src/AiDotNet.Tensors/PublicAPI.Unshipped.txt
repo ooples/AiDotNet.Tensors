@@ -410,3 +410,6 @@ virtual AiDotNet.Tensors.Engines.CpuEngine.TensorTopKSoftmax<T>(AiDotNet.Tensors
 *REMOVED*abstract AiDotNet.Tensors.Engines.Autodiff.AutogradFunction<T>.Backward(AiDotNet.Tensors.Engines.Autodiff.AutogradContext! ctx, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.Engines.IEngine! engine, System.Collections.Generic.Dictionary<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! grads) -> void
 virtual AiDotNet.Tensors.Engines.Autodiff.AutogradFunction<T>.Backward(AiDotNet.Tensors.Engines.Autodiff.AutogradContext! ctx, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>?[]!
 virtual AiDotNet.Tensors.Engines.Autodiff.AutogradFunction<T>.Backward(AiDotNet.Tensors.Engines.Autodiff.AutogradContext! ctx, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.Engines.IEngine! engine, System.Collections.Generic.Dictionary<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! grads) -> void
+AiDotNet.Tensors.Engines.Autodiff.GradientRecording
+static AiDotNet.Tensors.Engines.Autodiff.GradientRecording.IsRecording<T>() -> bool
+static AiDotNet.Tensors.Engines.Autodiff.GradientRecording.IsTrainingTrace.get -> bool
