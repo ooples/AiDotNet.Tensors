@@ -35576,7 +35576,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         using var outputDataKeep2 = new KeepAliveScope(output);
                         var outSpan = output.DataUnmarked.Span;
                         var idxArr = new int[outSize];
-                        T minVal = numOps.MinValue;
+                        T minVal = ReduceMaxSeed(numOps);
                         for (int i = 0; i < outSize; i++) { outSpan[i] = minVal; idxArr[i] = -1; }
                         int rank = inShape.Length;
                         var outStrideForDim = BuildReducedOutStrideForDim(inShape, outShapeLocal, normAxes);
@@ -35636,7 +35636,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 using var fDataLease = input.LeaseArray();
                 var fData = (float[])(object)fDataLease.Array;
-                float maxVal = float.MinValue;
+                float maxVal = float.NegativeInfinity;
                 int maxIdx = 0;
                 for (int i = 0; i < input.Length; i++)
                     if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
@@ -35656,7 +35656,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputShape = GetReductionOutputShape(inputShape, normalizedAxes, keepDims);
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
-        T minVal = numOps.MinValue;
+        T minVal = ReduceMaxSeed(numOps);
         // The dense single-axis path initializes every cell itself, in parallel: skip the zeroing and the serial init.
         bool denseMax = normalizedAxes.Length == 1 && input.IsContiguous && (typeof(T) == typeof(float) || typeof(T) == typeof(double));
         var outputData = denseMax ? UninitializedArray<T>(outputSize) : new T[outputSize];
@@ -35892,8 +35892,20 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     }
 
+    /// <summary>
+    /// The value a ReduceMax cell starts from: negative infinity for float and double, otherwise the type's MinValue.
+    /// The float seed used to be float.MinValue (-3.4e38), so a row of -infinity (or of NaN, which never replaces the
+    /// seed) reduced to -3.4e38 instead of -infinity.
+    /// </summary>
+    private static T ReduceMaxSeed<T>(INumericOperations<T> numOps)
+    {
+        if (typeof(T) == typeof(float)) return (T)(object)float.NegativeInfinity;
+        if (typeof(T) == typeof(double)) return (T)(object)double.NegativeInfinity;
+        return numOps.MinValue;
+    }
+
     // Single-axis max over a dense row-major input (#653), fanned out over (outer, inner column block) units. Matches
-    // the serial odometer exactly: each cell starts at the type's MinValue with index -1, the axis is scanned in
+    // the serial odometer exactly: each cell starts at ReduceMaxSeed with index -1, the axis is scanned in
     // increasing order and only a strictly greater value (never NaN) replaces it, recording the absolute flat index.
     private static bool TryReduceMaxSingleAxisDense<T>(T[] data, T[] outData, int[] maxIndices, int[] shape, int axis, T minValue)
     {

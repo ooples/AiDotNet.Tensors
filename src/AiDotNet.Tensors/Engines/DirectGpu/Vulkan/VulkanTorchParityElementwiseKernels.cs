@@ -101,10 +101,14 @@ bool f_positive(float f) { uint u = floatBitsToUint(f); return u != 0u && u <= 0
 
     // A kernel in float / integer arithmetic only: runs on devices without shaderFloat64.
     private static string FloatShader(string declarations, string body, bool int64 = false, int localSize = LocalSize)
-        => Head(int64, localSize) + declarations + FloatHelpers + body;
+        => Head(int64, localSize) + declarations + ExactFloatKernels.Glsl + FloatHelpers + body;
 
     private const string FloatHelpers = @"
 bool f_isnan(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) > 0x7F800000u; }
+// Math.Max / Math.Min (IEEE 754-2019: +0 above -0) decided on the bit patterns (ExactFloatKernels), so a subnormal is
+// not flushed into a tie: max(+0, -0) is +0 (the AND of the patterns), min is -0 (the OR).
+float f_max(float x, float y) { uint a = floatBitsToUint(x), b = floatBitsToUint(y); return uintBitsToFloat(xf_key(a) == xf_key(b) ? (a & b) : (xf_gt(a, b) ? a : b)); }
+float f_min(float x, float y) { uint a = floatBitsToUint(x), b = floatBitsToUint(y); return uintBitsToFloat(xf_key(a) == xf_key(b) ? (a | b) : (xf_lt(a, b) ? a : b)); }
 bool f_isinf(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) == 0x7F800000u; }
 float f_nan() { return uintBitsToFloat(0x7FC00000u); }
 ";
@@ -240,12 +244,12 @@ double parity_mvlgamma(double v, int p)
             string f = op switch
             {
                 // NaN-ignoring max / min.
-                TorchParityBinaryOp.Fmax => "f_isnan(x) ? y : (f_isnan(y) ? x : max(x, y))",
-                TorchParityBinaryOp.Fmin => "f_isnan(x) ? y : (f_isnan(y) ? x : min(x, y))",
+                TorchParityBinaryOp.Fmax => "f_isnan(x) ? y : (f_isnan(y) ? x : f_max(x, y))",
+                TorchParityBinaryOp.Fmin => "f_isnan(x) ? y : (f_isnan(y) ? x : f_min(x, y))",
                 TorchParityBinaryOp.Heaviside => "f_isnan(x) ? x : (x < 0.0 ? 0.0 : (x > 0.0 ? 1.0 : y))",
-                // A comparison with NaN is false, as in .NET.
-                TorchParityBinaryOp.GreaterEqual => "(!f_isnan(x) && !f_isnan(y) && x >= y) ? 1.0 : 0.0",
-                _ => "(!f_isnan(x) && !f_isnan(y) && x <= y) ? 1.0 : 0.0",
+                // A comparison with NaN is false, as in .NET; decided on the bit patterns, so a subnormal is not flushed.
+                TorchParityBinaryOp.GreaterEqual => "!xf_lt(floatBitsToUint(x), floatBitsToUint(y)) && !f_isnan(x) && !f_isnan(y) ? 1.0 : 0.0",
+                _ => "!xf_gt(floatBitsToUint(x), floatBitsToUint(y)) && !f_isnan(x) && !f_isnan(y) ? 1.0 : 0.0",
             };
             return FloatShader(BinaryBuffers, "void main()\n{\n" + Index + "    float x = a[i], y = b[i];\n    o[i] = " + f + ";\n}\n");
         }

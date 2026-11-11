@@ -40,6 +40,10 @@ internal static class SystemNumericsVectorBridge
 {
     public static int FloatLaneCount => Vector<float>.Count;
     public static int DoubleLaneCount => Vector<double>.Count;
+
+    // -0 in every lane: XOR with it flips only the sign bit, the IEEE negate.
+    private static readonly Vector<float> NegativeZeroVector = new Vector<float>(-0.0f);
+    private static readonly Vector<double> NegativeZeroVectorDouble = new Vector<double>(-0.0);
     public static bool IsHardwareAccelerated => Vector.IsHardwareAccelerated;
 
     // ====================================================================
@@ -314,7 +318,7 @@ internal static class SystemNumericsVectorBridge
         var rVecs = MemoryMarshal.Cast<float, Vector<float>>(result.Slice(0, simdElements));
 
         for (int v = 0; v < sVecs.Length; v++)
-            rVecs[v] = -sVecs[v];
+            rVecs[v] = Vector.Xor(sVecs[v], NegativeZeroVector); // IEEE negate: Zero - v gave +0 for +0
 
         for (int i = simdElements; i < length; i++)
             result[i] = -src[i];
@@ -790,7 +794,7 @@ internal static class SystemNumericsVectorBridge
         var rVecs = MemoryMarshal.Cast<double, Vector<double>>(result.Slice(0, simdElements));
 
         for (int v = 0; v < sVecs.Length; v++)
-            rVecs[v] = -sVecs[v];
+            rVecs[v] = Vector.Xor(sVecs[v], NegativeZeroVectorDouble); // IEEE negate: Zero - v gave +0 for +0
 
         for (int i = simdElements; i < length; i++)
             result[i] = -src[i];

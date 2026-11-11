@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         public static string GetSource()
         {
-            return @"
+            return ExactFloatKernels.OpenCl + @"
 // ===========================================================================
 // REDUCTION KERNELS
 // ===========================================================================
@@ -55,11 +55,12 @@ __kernel void reduce_sum(
     }
 }
 
-// Parallel max reduction
+// Parallel max reduction, exact on the bit patterns (ExactFloatKernels): a NaN is skipped (the CPU scan never takes one)
+// and loads as the -inf identity, so an all-NaN input reduces to -inf as on the CPU; ties keep the left operand.
 __kernel void reduce_max(
     __global const float* input,
     __global float* output,
-    __local float* scratch,
+    __local uint* scratch,
     const int size)
 {
     const int globalIdx = get_global_id(0);
@@ -68,7 +69,8 @@ __kernel void reduce_max(
     const int localSize = get_local_size(0);
 
     // Load into local memory
-    scratch[localIdx] = (globalIdx < size) ? input[globalIdx] : -INFINITY;
+    const uint loaded = (globalIdx < size) ? as_uint(input[globalIdx]) : 0xFF800000u;
+    scratch[localIdx] = xf_isnan(loaded) ? 0xFF800000u : loaded;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Tree reduction in local memory
@@ -77,22 +79,23 @@ __kernel void reduce_max(
         // stride = localSize / 2 tree silently drops the LAST element when it is odd.
         for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
         if (localIdx < stride && localIdx + stride < stride_active) {
-            scratch[localIdx] = fmax(scratch[localIdx], scratch[localIdx + stride]);
+            const uint right = scratch[localIdx + stride];
+            if (xf_gt(right, scratch[localIdx])) scratch[localIdx] = right;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     // Write partial max
     if (localIdx == 0) {
-        output[groupIdx] = scratch[0];
+        output[groupIdx] = as_float(scratch[0]);
     }
 }
 
-// Parallel min reduction
+// Parallel min reduction, exact as reduce_max (NaN skipped, +inf identity).
 __kernel void reduce_min(
     __global const float* input,
     __global float* output,
-    __local float* scratch,
+    __local uint* scratch,
     const int size)
 {
     const int globalIdx = get_global_id(0);
@@ -101,7 +104,8 @@ __kernel void reduce_min(
     const int localSize = get_local_size(0);
 
     // Load into local memory
-    scratch[localIdx] = (globalIdx < size) ? input[globalIdx] : INFINITY;
+    const uint loaded = (globalIdx < size) ? as_uint(input[globalIdx]) : 0x7F800000u;
+    scratch[localIdx] = xf_isnan(loaded) ? 0x7F800000u : loaded;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Tree reduction in local memory
@@ -110,14 +114,15 @@ __kernel void reduce_min(
         // stride = localSize / 2 tree silently drops the LAST element when it is odd.
         for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
         if (localIdx < stride && localIdx + stride < stride_active) {
-            scratch[localIdx] = fmin(scratch[localIdx], scratch[localIdx + stride]);
+            const uint right = scratch[localIdx + stride];
+            if (xf_lt(right, scratch[localIdx])) scratch[localIdx] = right;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
     // Write partial min
     if (localIdx == 0) {
-        output[groupIdx] = scratch[0];
+        output[groupIdx] = as_float(scratch[0]);
     }
 }
 
@@ -229,11 +234,14 @@ __kernel void max_axis(
     const int outerIdx = get_global_id(0);
     if (outerIdx >= outerSize) return;
 
-    float maxVal = -INFINITY;
+    // The CPU ReduceMax scan, exact on the bit patterns: from -inf, take a value only when it is strictly greater, so a
+    // NaN is skipped, an all-NaN row gives -inf, and the first of equal maxima (-0 before +0) is kept.
+    __global const uint* row = (__global const uint*)input + (size_t)outerIdx * reduceSize;
+    uint best = 0xFF800000u;
     for (int i = 0; i < reduceSize; i++) {
-        maxVal = fmax(maxVal, input[outerIdx * reduceSize + i]);
+        if (xf_gt(row[i], best)) best = row[i];
     }
-    output[outerIdx] = maxVal;
+    output[outerIdx] = as_float(best);
 }
 
 

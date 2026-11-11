@@ -8058,8 +8058,10 @@ public partial class DirectGpuTensorEngine
         try
         {
             var cur = tensor;
-            if (min is not null) cur = TensorMax(cur, min);   // lower bound: max(x, min)
-            if (max is not null) cur = TensorMin(cur, max);   // upper bound: min(x, max)
+            // The bound goes FIRST: Max(lo, x) is lo > x ? lo : x, which is the CPU clamp's x < lo ? lo : x exactly (a NaN x
+            // stays NaN, a zero x keeps its sign). Max(x, lo) returned the bound for a NaN x and for a zero tie.
+            if (min is not null) cur = TensorMax(min, cur);   // lower bound
+            if (max is not null) cur = TensorMin(max, cur);   // upper bound: max < c ? max : c, the CPU's c > max ? max : c
             return cur;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorClampTensor", capabilityGap); return base.TensorClampTensor(tensor, min, max); }
