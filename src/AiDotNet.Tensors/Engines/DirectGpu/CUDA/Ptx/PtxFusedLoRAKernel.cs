@@ -112,8 +112,7 @@ internal sealed class PtxFusedLoRAKernel : IDisposable
             PtxCompat.SingleToInt32Bits(scaling).ToString("X8", CultureInfo.InvariantCulture);
 
         var ptx = new StringBuilder(12_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// fused LoRA B={batch} I={inputFeatures} R={rank} O={outputFeatures} scale={scalingLiteral}");
         ptx.AppendLine($".visible .entry {EntryPoint}(");

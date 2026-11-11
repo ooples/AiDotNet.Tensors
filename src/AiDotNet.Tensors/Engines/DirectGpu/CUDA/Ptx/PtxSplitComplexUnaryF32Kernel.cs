@@ -126,8 +126,7 @@ internal sealed class PtxSplitComplexUnaryF32Kernel : IDisposable
         string entryPoint = EntryPointFor(op);
 
         var ptx = new StringBuilder(2_048);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape count={count} block={blockThreads} layout=split-complex-fp32 op={OpTag(op)}");

@@ -168,8 +168,7 @@ internal sealed class PtxFusedRgLruScan128x256Kernel : IDisposable
             throw new NotSupportedException($"RG-LRU PTX emission is not implemented for SM {ccMajor}.{ccMinor}.");
 
         var ptx = new StringBuilder(96 * 1024);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

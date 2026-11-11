@@ -212,8 +212,7 @@ internal sealed class PtxFlashAttentionBackwardD64Kernel : IDisposable
     {
         ValidateShape(batch, heads, querySequence, keyValueSequence, scale, biasBatchStride);
         var ptx = new StringBuilder(20_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         EmitGradQuery(

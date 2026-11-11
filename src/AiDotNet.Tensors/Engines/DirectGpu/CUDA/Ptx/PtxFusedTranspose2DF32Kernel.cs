@@ -102,8 +102,7 @@ internal sealed class PtxFusedTranspose2DF32Kernel : IDisposable
     {
         Validate(rows, columns);
         var ptx = new StringBuilder(4_096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape rows={rows} columns={columns} tile={TileDim}x{TileDim} block={TileDim}x{BlockRows} strategy=shared-tile-cp-async op=transpose2d-f32");

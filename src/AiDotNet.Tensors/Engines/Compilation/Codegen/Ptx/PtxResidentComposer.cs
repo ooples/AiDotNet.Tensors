@@ -164,8 +164,7 @@ public static class PtxResidentComposer
 
         var ptx = new StringBuilder();
         ptx.Append(".version ").Append(PtxAffineEmitter.PtxIsaVersionFor(computeMajor, computeMinor)).Append('\n')
-           .Append(".target sm_").Append(computeMajor.ToString(CultureInfo.InvariantCulture))
-           .Append(computeMinor.ToString(CultureInfo.InvariantCulture)).Append('\n')
+           .Append(".target ").Append(PtxAffineEmitter.PtxTargetFor(computeMajor, computeMinor)).Append('\n')
            .Append(".address_size 64\n\n")
            .Append("// composed by PtxResidentComposer: ").Append(steps.Count.ToString(CultureInfo.InvariantCulture))
            .Append(" stage(s), one cooperative launch\n");

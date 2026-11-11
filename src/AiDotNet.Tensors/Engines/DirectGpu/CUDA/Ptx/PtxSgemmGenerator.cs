@@ -616,8 +616,7 @@ internal static class PtxSgemmGenerator
             L("ret;");
 
             var ptx = new StringBuilder(_body.Length + 2_048);
-            ptx.AppendLine(".version 7.1");
-            ptx.Append(".target sm_").Append(I(ccMajor)).AppendLine(I(ccMinor));
+            PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
             ptx.AppendLine(".address_size 64");
             ptx.Append("// sgemm ").Append(_c.Name).Append(' ').Append(_layout.Name).Append(' ').AppendLine(_p.ToString());
             if (_c.IsAsync) ptx.AppendLine(".extern .shared .align 16 .b8 smem[];");

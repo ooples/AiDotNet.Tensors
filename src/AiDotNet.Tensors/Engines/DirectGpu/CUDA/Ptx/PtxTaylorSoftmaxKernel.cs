@@ -84,8 +84,7 @@ internal sealed class PtxTaylorSoftmaxKernel : IDisposable
         const string One = "0f3F800000";  // 1.0
 
         var ptx = new StringBuilder(9_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// taylor-softmax-row M={m} N={n}");
         ptx.AppendLine();

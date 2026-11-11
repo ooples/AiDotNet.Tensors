@@ -16,8 +16,7 @@ internal static class DirectPtxPtxText
         if (computeCapabilityMajor <= 0) throw new ArgumentOutOfRangeException(nameof(computeCapabilityMajor));
         if (computeCapabilityMinor < 0) throw new ArgumentOutOfRangeException(nameof(computeCapabilityMinor));
 
-        text.AppendLine(".version 7.1");
-        text.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(text, computeCapabilityMajor, computeCapabilityMinor);
         text.AppendLine(".address_size 64");
         if (disableLoopUnrolling)
             text.AppendLine(".pragma \"nounroll\";");

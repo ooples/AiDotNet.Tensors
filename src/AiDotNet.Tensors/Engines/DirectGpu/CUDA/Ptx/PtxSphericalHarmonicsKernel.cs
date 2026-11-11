@@ -109,8 +109,7 @@ internal sealed class PtxSphericalHarmonicsKernel : IDisposable
         string f3 = DirectPtxPtxText.Hex(3.0f), f5 = DirectPtxPtxText.Hex(5.0f), f1 = DirectPtxPtxText.Hex(1.0f), zero = "0f00000000";
 
         var ptx = new StringBuilder(8_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// spherical-harmonics points={numPoints} basis={basisCount} channels={numChannels} x{channelsPerThread} degree={degree} broadcast={broadcastDir}");
         ptx.AppendLine();

@@ -91,8 +91,7 @@ internal sealed class PtxDropoutBackwardF32Kernel : IDisposable
         int groups = elementCount / valuesPerThread;
         int blocks = groups / ThreadsPerBlock;
         var ptx = new StringBuilder(2_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

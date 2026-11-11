@@ -91,8 +91,7 @@ internal sealed class PtxBitReversePermutationF32Kernel : IDisposable
         int shift = 32 - Log2(n);
 
         var ptx = new StringBuilder(2_560);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape n={n} log2n={Log2(n)} block={blockThreads} op=fft-bit-reverse");
         ptx.AppendLine();

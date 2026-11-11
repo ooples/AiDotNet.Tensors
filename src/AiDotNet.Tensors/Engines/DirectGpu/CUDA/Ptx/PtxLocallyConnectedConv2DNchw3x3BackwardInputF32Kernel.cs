@@ -163,8 +163,7 @@ internal sealed class PtxLocallyConnectedConv2DNchw3x3BackwardInputF32Kernel : I
         // then advance +288 bytes (72 elems) per co inside the tap.
 
         var ptx = new StringBuilder(24576);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

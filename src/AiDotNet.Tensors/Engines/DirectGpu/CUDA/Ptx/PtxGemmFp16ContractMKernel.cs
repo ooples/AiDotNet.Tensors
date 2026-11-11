@@ -85,8 +85,7 @@ internal sealed class PtxGemmFp16ContractMKernel : IDisposable
         int qHalfBytes = checked(q * sizeof(ushort)); // B row stride (over M) and C row stride (over P)
 
         var ptx = new StringBuilder(24_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// gemm-fp16-contract-m M={m} P={p} Q={q} tile(P,Q,M)={BlockP}x{BlockQ}x{BlockM}");
         ptx.AppendLine();
