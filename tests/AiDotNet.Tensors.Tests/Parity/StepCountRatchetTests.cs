@@ -3,6 +3,7 @@ using System;
 using System.IO;
 using System.Text.Json;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -15,7 +16,8 @@ namespace AiDotNet.Tensors.Tests.Parity;
 /// <item>CPU: managed bytes allocated per steady-state step on one thread (exact, so the slack only absorbs runtime
 /// noise such as a lazily grown pool).</item>
 /// <item>CUDA: memcpy and memset nodes of the captured step graph, which must not rise at all; kernel nodes, which may
-/// rise by 5% (at least 1) because the conv and GEMM routes are chosen by timing; plus the allocated bytes.</item>
+/// rise by 5% (at least 1) because the GEMM route depends on which vendor libraries load (the tuned-kernel routes are
+/// pinned to their references); plus the allocated bytes.</item>
 /// </list>
 /// Runs from random weights: no PyTorch needed, so the CPU cases run in hosted CI.
 /// </summary>
@@ -68,8 +70,9 @@ public abstract class StepCountRatchetBase
             if (!baseline.TryGetProperty(name, out var recordedCount)) continue;
             Assert.True(value is not null,
                 $"{key}: the baseline records {name} but no step graph was captured ({counts.GraphCaptureFailure}).");
-            // Kernel nodes follow the conv and GEMM routes the first calls choose by timing, so they move by a few between
-            // processes (ResNet-18 on an RTX 1000 Ada: 137, 148, 158); memcpy and memset nodes are exact.
+            // The CUDA ratchet pins the tuned-kernel routes, but the GEMM route still depends on the vendor libraries
+            // that load (the CNN step is one kernel longer with cuBLASLt than without it), so kernel nodes keep a small
+            // slack; memcpy and memset nodes are exact.
             int limit = name == "kernelNodes" ? recordedCount.GetInt32() + Math.Max(1, recordedCount.GetInt32() / 20) : recordedCount.GetInt32();
             Assert.True(value <= limit,
                 $"{key}: the captured step graph has {value} {name}, above the recorded {recordedCount.GetInt32()} (limit {limit}).");
@@ -127,7 +130,29 @@ public sealed class StepCountRatchetGpuTests : StepCountRatchetBase
             Skip.IfNot(gpu.IsGpuAvailable, "no GPU available to AiDotNet.Tensors.");
             // The keys and the graph-node counts are CUDA's; another backend (HIP, OpenCL) would defer under a "cuda:" key.
             Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "the CUDA ratchet needs the CUDA backend.");
-            Ratchet(network, gpu);
+            // Kernel nodes follow the tuned-kernel route of every conv shape (a Winograd conv is several kernels where
+            // the reference is one), and a slot decides by timing in this process, by the tuning budget left, and by
+            // decisions persisted under ~/.aidotnet/autotune by any earlier process on the machine. Unpinned, one
+            // commit measured ResNet-18 at 147, 148, 149, 157 and 166 kernel nodes on one RTX 1000 Ada. The ratchet
+            // tracks the step's structure, not the machine's tuning history, so every slot serves its reference route
+            // here and no persisted decision is read or written. The engine's backend is new, so no slot holds an
+            // earlier decision.
+            TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
+            bool previousIgnoreProfiles = TunedKernelPolicy.IgnoreProfiles;
+            bool previousPersist = TunedKernelPolicy.PersistDecisions;
+            TunedKernelPolicy.ModeOverride = TunedKernelMode.Off;
+            TunedKernelPolicy.IgnoreProfiles = true;
+            TunedKernelPolicy.PersistDecisions = false;
+            try
+            {
+                Ratchet(network, gpu);
+            }
+            finally
+            {
+                TunedKernelPolicy.ModeOverride = previousMode;
+                TunedKernelPolicy.IgnoreProfiles = previousIgnoreProfiles;
+                TunedKernelPolicy.PersistDecisions = previousPersist;
+            }
         }
     }
 }
