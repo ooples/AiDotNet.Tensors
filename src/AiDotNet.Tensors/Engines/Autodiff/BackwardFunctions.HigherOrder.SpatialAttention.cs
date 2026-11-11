@@ -183,9 +183,9 @@ internal static partial class BackwardFunctions<T>
         var laplacian = e.Reshape(e.TensorAdd(offDiagonal!, SparseMap(rowSums, new[] { v * v }, diagTo, diagFrom, minusOne)), new[] { v, v });
         if (!normalized) return laplacian;
 
-        // D^(-1/2)·L·D^(-1/2) with D the diagonal of −L, 0 where that is not above 1e-10 (the forward's rule).
+        // D^(-1/2)·L·D^(-1/2) with D the diagonal of L, 0 where that is not above 1e-10 (the forward's rule).
         var flat = e.Reshape(laplacian, new[] { v * v });
-        var d = e.TensorNegate(SparseMap(flat, new[] { v }, diagFrom, diagTo, null));
+        var d = SparseMap(flat, new[] { v }, diagFrom, diagTo, null);
         var dValues = RoIAlignPlan.ToDoubles(d);
         var keepD = new double[v];
         var fillD = new double[v];
