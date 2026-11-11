@@ -368,6 +368,7 @@ public partial class CpuEngine
         var bias = inputs[2];
         var ids = (int[])savedState[0];
         int vocab = (int)savedState[1];
+        if (BackwardFunctions<T>.TrySecondOrderFusedLinearCrossEntropy(gradOutput, inputs, engine, grads, ids)) return;
 
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
                 gradOutput, hidden, weight, bias, ids, null, out var deviceHidden, out var deviceWeight, out var deviceBias))
@@ -875,6 +876,7 @@ public partial class CpuEngine
         var weight = inputs[1];
         var bias = inputs[2];
         var target = inputs[3];
+        if (BackwardFunctions<T>.TrySecondOrderFusedLinearCrossEntropy(gradOutput, inputs, engine, grads, null)) return;
 
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
                 gradOutput, hidden, weight, bias, null, target, out var deviceHidden, out var deviceWeight, out var deviceBias))
