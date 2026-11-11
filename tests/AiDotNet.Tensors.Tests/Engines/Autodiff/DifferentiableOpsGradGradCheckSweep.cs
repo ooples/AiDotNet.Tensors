@@ -29,7 +29,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// mismatches are asserted. The stochastic ops are the exception: their forward differs between evaluations.
 /// </para>
 /// </remarks>
-public class DifferentiableOpsGradGradCheckSweep
+public partial class DifferentiableOpsGradGradCheckSweep
 {
     private readonly ITestOutputHelper _out;
     private readonly CpuEngine _engine = new();
@@ -65,6 +65,99 @@ public class DifferentiableOpsGradGradCheckSweep
         ["RoIPool"] = (new[] { 1 }, "boxes: torchvision's roi_pool gives rois no gradient (and the bins are discontinuous in them)"),
     };
 
+    /// <summary>
+    /// Parameter variants (see <see cref="ParameterVariants"/>) whose numerical second-order check is invalid, with the
+    /// reason, keyed <c>Op|parameter=Value</c>.
+    /// </summary>
+    internal static readonly Dictionary<string, string> NotSecondOrderCheckableVariants = new(StringComparer.Ordinal)
+    {
+    };
+
+    /// <summary>
+    /// Variants whose FIRST-order finite differences are invalid (a kink or a designed gradient the probe can hit),
+    /// so only their second-order mismatches are asserted, as for the base ops in the first-order sweep's Exempt table.
+    /// </summary>
+    internal static readonly Dictionary<string, string> FirstOrderExemptVariants = new(StringComparer.Ordinal)
+    {
+    };
+
+    /// <summary>
+    /// The base arguments plus, one parameter at a time, every other value of each mode-like parameter: each value of
+    /// an enum (an activation kind, a reduction kind, a padding or sampling mode), the other value of a bool (keepDims,
+    /// includeSelf, alignCorners...), each axis of an <c>axis</c>/<c>dim</c> int, and each single axis plus all axes of
+    /// an <c>axes</c>/<c>dims</c> array. A backward that is correct for the one value the table happens to pass and
+    /// wrong for another (FusedLinear's Tanh epilogue was swept only as None) cannot hide this way. A variant the op
+    /// rejects as an invalid argument is not one it supports, so it is dropped.
+    /// </summary>
+    // The per-area partial files (DifferentiableOpsGradGradCheckSweep.Exemptions*.cs) add their documented exclusions
+    // here, after the initializers above, so areas never edit one shared table.
+    static DifferentiableOpsGradGradCheckSweep()
+    {
+        AddExemptionsFusedActivations();
+        AddExemptionsReductionsAndIndexing();
+        AddExemptionsSpatialAndAttention();
+        AddExemptionsLinearAlgebraAndLosses();
+    }
+
+    static partial void AddExemptionsFusedActivations();
+    static partial void AddExemptionsReductionsAndIndexing();
+    static partial void AddExemptionsSpatialAndAttention();
+    static partial void AddExemptionsLinearAlgebraAndLosses();
+
+    private readonly List<string> _rejectedVariants = new();
+
+    private IEnumerable<(string Variant, object[] Args)> ParameterVariants(System.Reflection.MethodInfo m, object[] baseArgs)
+    {
+        yield return (string.Empty, baseArgs);
+        var ps = m.GetParameters();
+        int rank = baseArgs.OfType<Tensor<double>>().FirstOrDefault()?.Rank ?? 1;
+        for (int i = 0; i < ps.Length; i++)
+        {
+            var type = ps[i].ParameterType;
+            var pname = ps[i].Name ?? $"arg{i}";
+            var lower = pname.ToLowerInvariant();
+            var values = new List<(string, object?)>();
+            if (type.IsEnum && !type.IsDefined(typeof(FlagsAttribute), false))
+            {
+                foreach (var v in Enum.GetValues(type))
+                    if (!Equals(v, baseArgs[i])) values.Add(($"{pname}={v}", v));
+            }
+            else if (type == typeof(bool) && baseArgs[i] is bool b)
+            {
+                values.Add(($"{pname}={!b}", !b));
+            }
+            else if (type == typeof(int) && lower is "axis" or "dim" or "dimension" && baseArgs[i] is int axis)
+            {
+                for (int a = -rank; a < rank; a++)
+                    if (a != axis && a != axis - rank && a != axis + rank) values.Add(($"{pname}={a}", a));
+            }
+            else if (type == typeof(int[]) && lower is "axes" or "dims" or "dimensions" && baseArgs[i] is int[] axes)
+            {
+                for (int a = 0; a < rank; a++)
+                    if (!(axes.Length == 1 && axes[0] == a)) values.Add(($"{pname}=[{a}]", new[] { a }));
+                if (axes.Length != rank) values.Add(($"{pname}=all", Enumerable.Range(0, rank).ToArray()));
+            }
+
+            foreach (var (label, value) in values)
+            {
+                var args = DifferentiableOpsGradCheckSweep.CopyArgs(baseArgs);
+                args[i] = value!;
+                bool rejected = false;
+                try
+                {
+                    using (new NoGradScope<double>()) _ = m.Invoke(_engine, DifferentiableOpsGradCheckSweep.CopyArgs(args));
+                }
+                catch (Exception ex) when (DifferentiableOpsGradCheckSweep.Inner(ex) is ArgumentException or NotSupportedException
+                                           or IndexOutOfRangeException or InvalidOperationException)
+                {
+                    rejected = true;
+                    _rejectedVariants.Add($"{m.Name}|{label}: {DifferentiableOpsGradCheckSweep.Inner(ex).Message.Split('\n')[0]}");
+                }
+                if (!rejected) yield return (label, args);
+            }
+        }
+    }
+
     [Fact]
     public void EveryDifferentiableOp_SecondDerivativeMatchesFiniteDifferences()
     {
@@ -86,12 +179,19 @@ public class DifferentiableOpsGradGradCheckSweep
             var only = Environment.GetEnvironmentVariable("GRADGRAD_OPS") is { Length: > 0 } filter
                 ? new HashSet<string>(filter.Split(',').Select(s => s.Trim()), StringComparer.Ordinal)
                 : null;
-            foreach (var (name, m, args) in harness.DrivableOps(skipped))
+            foreach (var (name, m, baseArgs) in harness.DrivableOps(skipped, includeDelegators: true))
+            foreach (var (variant, args) in ParameterVariants(m, baseArgs))
             {
                 if (only is not null && !only.Contains(name)) continue;
                 if (NotSecondOrderCheckable.TryGetValue(name, out var why)) { exempted.Add($"{name} ({why})"); continue; }
-                bool firstOrderExempt = DifferentiableOpsGradCheckSweep.Exempt.ContainsKey(name);
-                string label = $"{name}|{DifferentiableOpsGradCheckSweep.ParamFingerprint(m)}";
+                if (variant.Length > 0 && NotSecondOrderCheckableVariants.TryGetValue($"{name}|{variant}", out var whyVariant))
+                {
+                    exempted.Add($"{name}|{variant} ({whyVariant})");
+                    continue;
+                }
+                bool firstOrderExempt = DifferentiableOpsGradCheckSweep.Exempt.ContainsKey(name)
+                    || (variant.Length > 0 && FirstOrderExemptVariants.ContainsKey($"{name}|{variant}"));
+                string label = $"{name}|{DifferentiableOpsGradCheckSweep.ParamFingerprint(m)}" + (variant.Length > 0 ? $" {{{variant}}}" : "");
 
                 var inputs = args.SelectMany(a => a switch
                 {
@@ -191,6 +291,8 @@ public class DifferentiableOpsGradGradCheckSweep
         foreach (var s in recordedTwice.OrderBy(x => x)) _out.WriteLine("TWICE     " + s);
         foreach (var s in exempted.OrderBy(x => x)) _out.WriteLine("exempt    " + s);
         foreach (var s in skipped.OrderBy(x => x)) _out.WriteLine("skip      " + s);
+        _out.WriteLine($"variants the ops reject as invalid arguments: {_rejectedVariants.Count}");
+        foreach (var s in _rejectedVariants.OrderBy(x => x)) _out.WriteLine("rejected  " + s);
 
         var all = secondOrderFailures.Concat(firstOrderFailures).Concat(threw).Concat(recordedTwice).Concat(skipped.Select(s => "SKIPPED " + s)).ToList();
         Assert.True(all.Count == 0,
@@ -219,7 +321,7 @@ public class DifferentiableOpsGradGradCheckSweep
             var only = Environment.GetEnvironmentVariable("GRADGRAD_OPS") is { Length: > 0 } filter
                 ? new HashSet<string>(filter.Split(',').Select(s => s.Trim()), StringComparer.Ordinal)
                 : null;
-            foreach (var (name, m, args) in harness.DrivableOps(skipped))
+            foreach (var (name, m, args) in harness.DrivableOps(skipped, includeDelegators: true))
             {
                 if (only is not null && !only.Contains(name)) continue;
                 // The first-order exemptions (kinks, stochastic forwards, designed gradients) cannot be finite-differenced

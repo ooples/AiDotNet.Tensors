@@ -7573,6 +7573,18 @@ internal static partial class BackwardFunctions<T>
         // to avoid re-running a full matmul here — re-computation was ~98% of backward
         // time on paper-scale transformers (e.g. 34s / 35s on ChronosBolt paper
         // defaults: 27 calls × 1.27s each).
+        // Under create-graph: differentiate act(x·W + b) as recorded ops. The activation derivative below is the
+        // fused handler's host math, which records nothing, so the second backward of a FusedLinear (a DenseLayer in
+        // eval mode) saw its gradient as a constant and every Hessian through it came out zero.
+        if (CreatesGraph)
+        {
+            var activationKind = savedState is { Length: >= 1 } ? (FusedActivationType)savedState[0] : FusedActivationType.None;
+            var activationSettings = savedState is { Length: >= 3 } ? savedState[2] as FusedActivationParams : null;
+            var linearInputs = inputs;
+            if (TryCompositeBackward(gradOutput, inputs, engine, grads,
+                    e => ApplyFusedActivationRecorded(e, FusedLinearPreActivationRecorded(e, linearInputs), activationKind, activationSettings)))
+                return;
+        }
         if (savedState is { Length: >= 1 })
         {
             var activation = (FusedActivationType)savedState[0];

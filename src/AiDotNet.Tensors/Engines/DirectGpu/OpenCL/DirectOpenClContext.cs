@@ -29,6 +29,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// </summary>
     internal sealed class DirectOpenClContext : IDisposable
     {
+        /// <summary>Contexts this process created and has not yet disposed.</summary>
+        private static int s_liveContexts;
+
+        /// <summary>
+        /// With <c>AIDOTNET_OPENCL_TRACE_CONTEXTS=1</c>, where each live context was created, so a failure to create one
+        /// (the driver's host budget exhausted by contexts nobody disposed: each holds its compiled programs, ~100 MB)
+        /// names the code that leaked them.
+        /// </summary>
+        private static readonly ConcurrentDictionary<DirectOpenClContext, string>? s_creationSites =
+            Environment.GetEnvironmentVariable("AIDOTNET_OPENCL_TRACE_CONTEXTS") == "1"
+                ? new ConcurrentDictionary<DirectOpenClContext, string>() : null;
+
+        /// <summary>Contexts this process created and has not yet disposed.</summary>
+        internal static int LiveContextCount => Volatile.Read(ref s_liveContexts);
+
+        private static string LiveContextReport()
+        {
+            var report = $" ({LiveContextCount} OpenCL context(s) of this process are still alive";
+            if (s_creationSites is null)
+                return report + "; set AIDOTNET_OPENCL_TRACE_CONTEXTS=1 to record where each was created)";
+            var sites = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var site in s_creationSites.Values) sites[site] = sites.TryGetValue(site, out int n) ? n + 1 : 1;
+            var lines = new List<string>();
+            foreach (var pair in sites) lines.Add($"{pair.Value} x {pair.Key}");
+            lines.Sort(StringComparer.Ordinal);
+            return report + "; created at:" + Environment.NewLine + string.Join(Environment.NewLine, lines) + ")";
+        }
+
         private IntPtr _context;
         private ThreadLocal<IntPtr>? _threadCommandQueue;
         private ThreadLocal<IntPtr>? _threadProfilingCommandQueue;
@@ -535,7 +563,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var deviceArray = new IntPtr[] { _device };
             _context = OpenClNativeBindings.CreateContext(IntPtr.Zero, 1, deviceArray, IntPtr.Zero, IntPtr.Zero, out err);
             if (err != OpenClNativeBindings.CL_SUCCESS || _context == IntPtr.Zero)
-                throw new InvalidOperationException($"Failed to create OpenCL context: {err}");
+                throw new InvalidOperationException($"Failed to create OpenCL context: {err}" + LiveContextReport());
+            Interlocked.Increment(ref s_liveContexts);
+            s_creationSites?.TryAdd(this, CreationSite());
 
             // Per-thread command queues (issue #414). The original design used a
             // single shared queue here, which made Parallel.ForEach(... IEngine
@@ -747,7 +777,28 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 OpenClNativeBindings.ReleaseContext(_context);
                 _context = IntPtr.Zero;
+                Interlocked.Decrement(ref s_liveContexts);
+                s_creationSites?.TryRemove(this, out _);
             }
+        }
+
+        // The first frames outside the OpenCL backend: the code that asked for this context.
+        private static string CreationSite()
+        {
+            var frames = new System.Diagnostics.StackTrace(1, false).GetFrames();
+            var parts = new List<string>();
+            foreach (var frame in frames)
+            {
+                var method = frame?.GetMethod();
+                var type = method?.DeclaringType;
+                if (type is null) continue;
+                string ns = type.Namespace ?? string.Empty;
+                if (ns.StartsWith("AiDotNet.Tensors.Engines", StringComparison.Ordinal) && !ns.Contains("Tests")) continue;
+                if (ns.StartsWith("System", StringComparison.Ordinal) || ns.StartsWith("Xunit", StringComparison.Ordinal)) continue;
+                parts.Add($"{type.FullName}.{method!.Name}");
+                if (parts.Count == 2) break;
+            }
+            return parts.Count == 0 ? "(inside the library)" : string.Join(" <- ", parts);
         }
     }
 }

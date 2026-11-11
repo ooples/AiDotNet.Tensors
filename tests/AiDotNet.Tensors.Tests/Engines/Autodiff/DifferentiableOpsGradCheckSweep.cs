@@ -31,7 +31,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// disagreements fail the test.
 /// </para>
 /// </remarks>
-public class DifferentiableOpsGradCheckSweep
+public partial class DifferentiableOpsGradCheckSweep
 {
     private readonly ITestOutputHelper _out;
     private readonly CpuEngine _engine = new();
@@ -98,7 +98,7 @@ public class DifferentiableOpsGradCheckSweep
     /// explicit, shrinkable list rather than a silent skip count.
     /// </para>
     /// </remarks>
-    private static readonly Dictionary<string, Func<Random, object[]>> OpCases = new(StringComparer.Ordinal)
+    private static readonly Dictionary<string, Func<Random, object[]>> BaseOpCases = new(StringComparer.Ordinal)
     {
         // --- matmul family: inner dimensions must agree ---
         ["TensorMatMul"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 2], r)],
@@ -152,6 +152,8 @@ public class DifferentiableOpsGradCheckSweep
         ["PsRoIPool"] = r => [SafeTensor([1, 8, 4, 4], r), RoiBoxes(2), 2, 2, 2, 1.0f],
 
         // --- fused linear: out = act(input @ weight + bias), so weight is [in, out] ---
+        // The generic fused linear: its activation is enumerated over every FusedActivationType by the gradgrad sweep.
+        ["FusedLinear"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r), FusedActivationType.Tanh, null!],
         ["FusedLinearGELU"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
         ["FusedLinearReLU"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
         ["FusedLinearSigmoid"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
@@ -411,6 +413,27 @@ public class DifferentiableOpsGradCheckSweep
         // MultiDot chains matmuls, so adjacent inner dimensions must agree: (2x3)(3x4)(4x2).
         ["TensorMultiDot"] = r => [new[] { SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4, 2], r) }],
     };
+
+    /// <summary>
+    /// <see cref="BaseOpCases"/> plus the entries the per-area partial files add (DifferentiableOpsGradCheckSweep.Cases*.cs),
+    /// so areas can grow the table without editing one shared initializer.
+    /// </summary>
+    private static readonly Dictionary<string, Func<Random, object[]>> OpCases = BuildOpCases();
+
+    private static Dictionary<string, Func<Random, object[]>> BuildOpCases()
+    {
+        var all = new Dictionary<string, Func<Random, object[]>>(BaseOpCases, StringComparer.Ordinal);
+        AddCasesFusedActivations(all);
+        AddCasesReductionsAndIndexing(all);
+        AddCasesSpatialAndAttention(all);
+        AddCasesLinearAlgebraAndLosses(all);
+        return all;
+    }
+
+    static partial void AddCasesFusedActivations(Dictionary<string, Func<Random, object[]>> cases);
+    static partial void AddCasesReductionsAndIndexing(Dictionary<string, Func<Random, object[]>> cases);
+    static partial void AddCasesSpatialAndAttention(Dictionary<string, Func<Random, object[]>> cases);
+    static partial void AddCasesLinearAlgebraAndLosses(Dictionary<string, Func<Random, object[]>> cases);
 
     /// <summary>
     /// Compact parameter-type fingerprint used to key table entries to a SPECIFIC overload,
@@ -915,7 +938,7 @@ public class DifferentiableOpsGradCheckSweep
     /// <summary>
     /// Every op the sweep above can drive, with arguments that run: (name, bound method, arguments).
     /// </summary>
-    internal IEnumerable<(string Name, MethodInfo Method, object[] Args)> DrivableOps(List<string> skipped)
+    internal IEnumerable<(string Name, MethodInfo Method, object[] Args)> DrivableOps(List<string> skipped, bool includeDelegators = false)
     {
         var candidates = typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Where(m => !m.IsSpecialName && m.IsGenericMethodDefinition)
@@ -927,7 +950,9 @@ public class DifferentiableOpsGradCheckSweep
         {
             var name = def.Name;
             if (name.Contains('`')) name = name.Substring(0, name.IndexOf('`'));
-            if (!OpRegistry.DifferentiableOps.Contains(name)) continue;
+            // Delegators (FusedLinear, fused convolutions, norms composed of recorded ops) are differentiable too; they
+            // record through other ops or their own entry, and their backward has to be just as correct.
+            if (!OpRegistry.DifferentiableOps.Contains(name) && !(includeDelegators && OpRegistry.DelegatorOps.Contains(name))) continue;
             MethodInfo m;
             try { m = def.MakeGenericMethod(typeof(double)); }
             catch { skipped.Add($"{name}: cannot bind <double>"); continue; }
