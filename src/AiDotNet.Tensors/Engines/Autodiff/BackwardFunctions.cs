@@ -5184,6 +5184,30 @@ internal static partial class BackwardFunctions<T>
         var min = hasMin ? inputs[1] : null;
         var max = hasMax ? inputs[hasMin ? 2 : 1] : null;
 
+        if (CreatesGraph)
+        {
+            // Each input's gradient is the upstream gradient routed by a fixed per-element selection (then summed over
+            // a broadcast bound): linear in it, with adjoint "broadcast the cotangent and mask it".
+            var selection = ClampSelection(tensor, min, max, minStrides, maxStrides, shape);
+            Tensor<T>?[] kernelGrads;
+            using (new NoGradScope<T>())   // the host routing below, not this branch again
+                kernelGrads = KernelGrads(ClampTensorBackward, gradOutput, inputs, output, savedState, engine);
+            var fullShape = (int[])tensor._shape.Clone();
+            void Route(Tensor<T>? input, int slot, int target)
+            {
+                if (input is null || kernelGrads[slot] is not { } value) return;
+                var mask = RoIAlignPlan.FromDoubles<T>(selection[target], (int[])fullShape.Clone());
+                var inputShape = (int[])input._shape.Clone();
+                var routed = LinearGrad("ClampTensorBackward", gradOutput, () => value,
+                    (e, w) => e.TensorMultiply(ShapesEqual(inputShape, fullShape) ? w : e.TensorBroadcastTo(w, fullShape), mask));
+                DifferentiableOps.AccumulateGrad(grads, input, routed, engine);
+            }
+            Route(tensor, 0, 0);
+            Route(min, 1, 1);
+            Route(max, hasMin ? 2 : 1, 2);
+            return;
+        }
+
         var gradTensor = TensorPool<T>.RentZeroed(tensor._shape);
         var gradMin = min is not null ? TensorPool<T>.RentZeroed(min._shape) : null;
         var gradMax = max is not null ? TensorPool<T>.RentZeroed(max._shape) : null;
@@ -8058,6 +8082,16 @@ internal static partial class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // a/y and b/y as recorded ops, 0 where y = 0 (as below).
+            var yZero = HostMask(output, v => v == 0);
+            var ys = SafeArgument(engine, output, yZero, 1);
+            var zeros = ConstantLike(output, 0);
+            AccumulateScaled(grads, a, gradOutput, Select(engine, yZero, zeros, engine.TensorDivide(a, ys)), engine);
+            AccumulateScaled(grads, b, gradOutput, Select(engine, yZero, zeros, engine.TensorDivide(b, ys)), engine);
+            return;
+        }
         using var yLease = output.Lease();
         var y = yLease.Span;
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
@@ -8084,6 +8118,12 @@ internal static partial class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0];
         var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // ±1 by whether the signs agree: a constant (piecewise) factor.
+            AccumulateScaled(grads, a, gradOutput, HostMap(a, b, (x, y) => (x >= 0) == (y >= 0) ? 1.0 : -1.0), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8109,6 +8149,13 @@ internal static partial class BackwardFunctions<T>
         // Use the identity fmod(a, b) = a - trunc(a/b)·b → d/da = 1, d/db = -trunc(a/b).
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // The quotient is piecewise constant: a constant factor (0 where b = 0, as below).
+            DifferentiableOps.AccumulateGrad(grads, a, gradOutput, engine);
+            AccumulateScaled(grads, b, gradOutput, HostMap(a, b, (x, y) => y == 0 ? 0.0 : -Math.Truncate(x / y)), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8135,6 +8182,12 @@ internal static partial class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, a, gradOutput, engine);
+            AccumulateScaled(grads, b, gradOutput, HostMap(a, b, (x, y) => y == 0 ? 0.0 : -Math.Floor(x / y)), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8160,6 +8213,18 @@ internal static partial class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // d/da = b·a^(b-1) = b·y/a (0 at a = 0); d/db = y·ln(a) (0 for a ≤ 0), as recorded ops.
+            var aZero = HostMask(a, v => v == 0);
+            var aNonPositive = HostMask(a, v => v <= 0);
+            var zeros = ConstantLike(a, 0);
+            var partialA = engine.TensorDivide(engine.TensorMultiply(b, output), SafeArgument(engine, a, aZero, 1));
+            var partialB = engine.TensorMultiply(output, engine.TensorLog(SafeArgument(engine, a, aNonPositive, 1)));
+            AccumulateScaled(grads, a, gradOutput, Select(engine, aZero, zeros, partialA), engine);
+            AccumulateScaled(grads, b, gradOutput, Select(engine, aNonPositive, zeros, partialB), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var ySrcLease = output.Lease();
         var ySrc = ySrcLease.Span;
@@ -8192,6 +8257,15 @@ internal static partial class BackwardFunctions<T>
         var x = inputs[0];
         // exp is stored in savedState as Tensor<int>; non-differentiable.
         var expT = (Tensor<int>)savedState[0];
+        if (CreatesGraph)
+        {
+            // 2^exp is a constant factor.
+            var scales = new double[expT.Length];
+            using (var expLease = expT.Lease())
+                for (int i = 0; i < scales.Length; i++) scales[i] = System.Math.Pow(2.0, expLease.Span[i]);
+            AccumulateScaled(grads, x, gradOutput, RoIAlignPlan.FromDoubles<T>(scales, (int[])x._shape.Clone()), engine);
+            return;
+        }
         using var eSrcLease = expT.Lease();
         var eSrc = eSrcLease.Span;
         using var dYLease = gradOutput.Lease();
@@ -8222,6 +8296,12 @@ internal static partial class BackwardFunctions<T>
         var gA = new Tensor<T>(a._shape);
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, a, gradOutput, engine.TensorExp(engine.TensorSubtract(a, output)), engine);
+            AccumulateScaled(grads, b, gradOutput, engine.TensorExp(engine.TensorSubtract(b, output)), engine);
+            return;
+        }
         for (int i = 0; i < dA.Length; i++)
         {
             // d/da log(e^a + e^b) = e^a / (e^a + e^b) = e^(a-y).
@@ -8250,6 +8330,12 @@ internal static partial class BackwardFunctions<T>
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
         var ln2 = ops.FromDouble(System.Math.Log(2.0));
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, a, gradOutput, engine.TensorExp(Scale(engine, engine.TensorSubtract(a, output), System.Math.Log(2.0))), engine);
+            AccumulateScaled(grads, b, gradOutput, engine.TensorExp(Scale(engine, engine.TensorSubtract(b, output), System.Math.Log(2.0))), engine);
+            return;
+        }
         for (int i = 0; i < dA.Length; i++)
         {
             // y = log2(2^a + 2^b); d/da = 2^a / (2^a + 2^b) = 2^(a-y) — unitless because
@@ -8283,6 +8369,12 @@ internal static partial class BackwardFunctions<T>
         var dX = dXLease.Span;
         // -2/√π
         var c = ops.FromDouble(-2.0 / System.Math.Sqrt(System.Math.PI));
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, x, gradOutput,
+                Scale(engine, engine.TensorExp(engine.TensorNegate(Squared(engine, x))), -2.0 / System.Math.Sqrt(System.Math.PI)), engine);
+            return;
+        }
         for (int i = 0; i < dX.Length; i++)
         {
             var expTerm = ops.Exp(ops.Negate(ops.Multiply(xSrc[i], xSrc[i])));
@@ -8306,6 +8398,13 @@ internal static partial class BackwardFunctions<T>
         using var dXLease = gX.LeaseWritable();
         var dX = dXLease.Span;
         var c = ops.FromDouble(System.Math.Sqrt(System.Math.PI) / 2.0);
+        if (CreatesGraph)
+        {
+            // √π/2 · exp(erfinv(x)²), through the recorded output.
+            AccumulateScaled(grads, x, gradOutput,
+                Scale(engine, engine.TensorExp(Squared(engine, output)), System.Math.Sqrt(System.Math.PI) / 2.0), engine);
+            return;
+        }
         for (int i = 0; i < dX.Length; i++)
         {
             // d/dy erfinv = (√π / 2) · exp(erfinv(y)²). y is input; output = erfinv(y).
@@ -8322,6 +8421,15 @@ internal static partial class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0]; var y = inputs[1];
+        if (CreatesGraph)
+        {
+            // (x ≠ 0)·log(y) and (x ≠ 0)·x/y, as torch's xlogy backward.
+            var xZero = HostMask(x, v => v == 0);
+            var zeros = ConstantLike(x, 0);
+            AccumulateScaled(grads, x, gradOutput, Select(engine, xZero, zeros, engine.TensorLog(y)), engine);
+            AccumulateScaled(grads, y, gradOutput, Select(engine, xZero, zeros, engine.TensorDivide(x, y)), engine);
+            return;
+        }
         var xSrc = x.AsSpan(); var ySrc = y.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8345,6 +8453,14 @@ internal static partial class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0]; var y = inputs[1];
+        if (CreatesGraph)
+        {
+            var xZero = HostMask(x, v => v == 0);
+            var zeros = ConstantLike(x, 0);
+            AccumulateScaled(grads, x, gradOutput, Select(engine, xZero, zeros, engine.TensorLog1p(y)), engine);
+            AccumulateScaled(grads, y, gradOutput, Select(engine, xZero, zeros, engine.TensorDivide(x, Shift(engine, y, 1))), engine);
+            return;
+        }
         var xSrc = x.AsSpan(); var ySrc = y.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8367,6 +8483,11 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorDigamma(inputs[0]), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -8395,6 +8516,12 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            // trigamma = polygamma(1, x), whose own backward is polygamma(2, x): every order stays recorded.
+            AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorPolygamma(1, inputs[0]), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -8425,6 +8552,11 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorI1(inputs[0]), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -8456,6 +8588,15 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            // I₀(x) − I₁(x)/x, with the limit ½ at x = 0.
+            var x0 = inputs[0];
+            var atZero = HostMask(x0, v => v == 0);
+            var d = engine.TensorSubtract(engine.TensorI0(x0), engine.TensorDivide(output, SafeArgument(engine, x0, atZero, 1)));
+            AccumulateScaled(grads, x0, gradOutput, Select(engine, atZero, ConstantLike(x0, 0.5), d), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -9066,6 +9207,14 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var input = inputs[0];
+        if (CreatesGraph)
+        {
+            // A constant mask of the finite elements (the replaced ones are constants of the output).
+            var finite = HostMask(input, v => !(double.IsNaN(v) || double.IsInfinity(v)));
+            DifferentiableOps.AccumulateGrad(grads, input,
+                DiagonalLinearGrad("NanToNumBackward", gradOutput, engine, (e, w) => e.TensorMultiply(w, finite)), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
         using var srcLease = input.Lease();
@@ -9374,6 +9523,16 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var x = inputs[0];
+        if (CreatesGraph)
+        {
+            // I0e(x) − I1e(x)·(sign(x) + 1/|x|), 0 at x = 0 like the host path (sign is a constant factor).
+            var atZero = HostMask(x, v => v == 0);
+            var safe = SafeArgument(engine, x, atZero, 1);
+            var factor = engine.TensorAdd(HostMap(x, v => System.Math.Sign(v)), engine.TensorReciprocal(engine.TensorAbs(safe)));
+            var d = engine.TensorSubtract(engine.TensorI0e(x), engine.TensorMultiply(output, factor));
+            AccumulateScaled(grads, x, gradOutput, Select(engine, atZero, ConstantLike(x, 0), d), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var deriv = new Tensor<T>(x._shape);
         using var xsLease = x.Lease();
