@@ -17,7 +17,10 @@ name: GPU (CUDA, self-hosted)
 # matches no job: add its architecture label (Settings > Actions > Runners > the runner > Labels, or re-run config.cmd with
 # --labels self-hosted,gpu,cuda,sm86). Until the variable is set every job is skipped, so nothing waits for a runner that does
 # not exist. Pull requests from forks never run here: a self-hosted runner must not execute untrusted code.
-# One runner serves every pull request and a run takes over an hour, so the lane skips draft pull requests and any
+# A pull request's GPU suites run on any runner that also carries the label `cuda-pr` (the RTX 3080s and the RTX 1000
+# Ada; not the GTX 1660 Ti, whose suites take about 3 hours), so a queue of pull requests is shared between them; its
+# AiDotNet model families still need an `sm86` runner. Add `cuda-pr` to a runner fast enough for the pull-request budget.
+# A run takes over an hour, so the lane skips draft pull requests and any
 # pull request labelled `skip-gpu-ci` (for a change that cannot affect the GPU, such as comment-only edits to the
 # paths below; a title rule would also skip a combined pull request that carries GPU work); the nightly schedule
 # still covers main.
@@ -42,6 +45,12 @@ on:
         description: Optional FullyQualifiedName substring that narrows the ratchet tests (empty runs them all)
         type: string
         default: ''
+      # Runs one architecture's job alone (for example to exercise a newly registered runner) instead of all of them.
+      arch:
+        description: Run only this architecture's job (all runs every architecture the nightly schedule runs)
+        type: choice
+        options: [all, sm86, sm75, sm89]
+        default: all
   # Pull requests run this workflow through ci.yml, as one job of the pull request's single CI run, when ci.yml's
   # changes job finds a file matching its path filter (cuda in .github/ci-path-filters.yml). Pushes to main do not
   # run it: the nightly schedule covers main.
@@ -85,27 +94,30 @@ jobs:
            (github.event.pull_request.head.repo.full_name == github.repository &&
             !github.event.pull_request.draft &&
             !contains(github.event.pull_request.labels.*.name, 'skip-gpu-ci'))) }}
-    # One job per runner architecture, chosen by the runner's sm label. The SM86 job is the lane's full gate (its check
-    # keeps the name "cuda"). The SM75 job (a GTX 1660 Ti) runs the same GPU suites, where the GA10x/SM86-only
-    # specializations skip by design, and leaves the AiDotNet model families to the SM86 job: they need its memory.
-    # Pull requests are gated by the SM86 job alone: the suites take about 3 hours on the GTX 1660 Ti (about 1 on the
-    # RTX 3080), so the SM75 job runs on the nightly schedule and on manual dispatch. The per-architecture settings
-    # (check name, timeout, allowed skips, model families, artifact) are derived from matrix.arch: matrix `include`
-    # entries cannot be used for them, because an entry left with no combination to extend is added as a new job,
-    # which would bring the SM75 job back on pull requests.
-    # The SM89 job (an RTX 1000 Ada laptop GPU) runs like the SM75 one -- nightly and on dispatch, GPU suites only, the
-    # SM86-only specializations allowed to skip -- and only while the repository variable CUDA_SM89_RUNNER_ENABLED is
-    # true: its runner is a laptop that is not always on, and a job waiting for an absent runner would hold the nightly
-    # run for a day and then fail it. Clear the variable while that runner is away.
+    # Nightly and on dispatch: one job per runner architecture, chosen by the runner's sm label. The SM86 job is the full
+    # lane (GPU suites, AiDotNet model families, step-time ratchets; its check keeps the name "cuda"). The SM75 job (a
+    # GTX 1660 Ti, about 3 hours) and the SM89 job (an RTX 1000 Ada laptop GPU) run the same GPU suites, where the
+    # GA10x/SM86-only specializations skip by design, and leave the model families to SM86: they need its memory. The
+    # SM89 job exists only while the repository variable CUDA_SM89_RUNNER_ENABLED is true: its runner is a laptop that is
+    # not always on, and a job waiting for an absent runner would hold the nightly run for a day and then fail it.
+    # Pull requests: two jobs. "pr" runs the GPU suites on whichever runner labelled cuda-pr is free (check name "cuda"),
+    # so the RTX 3080s and the Ada share the queue; "pr-models" runs the model families on an SM86 runner (check name
+    # "cuda-models"). The "pr" job reads its architecture from the GPU it landed on (steps.gpu.outputs.sm) for the
+    # SM86-only skip exemption and the watchdog. The per-architecture settings are derived from matrix.arch: matrix
+    # `include` entries cannot be used for them, because an entry left with no combination to extend is added as a new
+    # job, which would bring the SM75 job back on pull requests.
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJSON((github.event_name == 'pull_request' || inputs.ratchets_only) && '["sm86"]' || (vars.CUDA_SM89_RUNNER_ENABLED == 'true' && '["sm86","sm75","sm89"]' || '["sm86","sm75"]')) }}
-    name: ${{ matrix.arch == 'sm86' && 'cuda' || format('cuda-{0}', matrix.arch) }}
-    # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86, sm75 or sm89); a runner registered before
-    # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
-    runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
-    timeout-minutes: ${{ matrix.arch == 'sm86' && (github.event_name == 'pull_request' && 160 || 560) || 240 }}
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && '["pr","pr-models"]' || inputs.ratchets_only && '["sm86"]' || (inputs.arch && inputs.arch != 'all') && format('["{0}"]', inputs.arch) || (vars.CUDA_SM89_RUNNER_ENABLED == 'true' && '["sm86","sm75","sm89"]' || '["sm86","sm75"]')) }}
+    name: ${{ (matrix.arch == 'sm86' || matrix.arch == 'pr') && 'cuda' || matrix.arch == 'pr-models' && 'cuda-models' || format('cuda-{0}', matrix.arch) }}
+    # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86, sm75 or sm89), plus cuda-pr to take pull
+    # requests' GPU suites; a runner registered before the split carries no architecture label and picks up no job until
+    # relabelled (see the header for how).
+    runs-on: ${{ fromJSON(matrix.arch == 'pr' && '["self-hosted","gpu","cuda","cuda-pr"]' || matrix.arch == 'pr-models' && '["self-hosted","gpu","cuda","sm86"]' || format('["self-hosted","gpu","cuda","{0}"]', matrix.arch)) }}
+    # pr: the suites (78-101 minutes on an RTX 3080) on the slowest cuda-pr runner, plus setup and the interop host.
+    # pr-models: setup and the model families (about 18 minutes, bounded at 22).
+    timeout-minutes: ${{ matrix.arch == 'pr' && 200 || matrix.arch == 'pr-models' && 60 || matrix.arch == 'sm86' && 560 || 240 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -156,6 +168,18 @@ jobs:
         path: AiDotNet.Tensors
         persist-credentials: false
 
+    # First, so every step can read the architecture of the GPU the job landed on: a pull request's "pr" job runs on
+    # whichever cuda-pr runner is free (outputs.sm is sm86 on an RTX 3080, sm89 on the Ada).
+    - name: Record the GPU and driver
+      id: gpu
+      run: |
+        $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
+        if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
+        "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        $cap = "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1)".Trim()
+        if ($cap -notmatch '^\d+\.\d+$') { Write-Output "::error::nvidia-smi reported no compute capability ('$cap')."; exit 1 }
+        "sm=sm$($cap -replace '\.', '')" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_OUTPUT
+
     - name: Setup .NET
       uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
@@ -183,6 +207,7 @@ jobs:
     # the workspace, no admin needed) downloads a 3.13 into the workspace once. triton-windows is torch.compile's CUDA
     # backend on Windows; 3.5.x is the line built for torch 2.9.
     - name: Python packages
+      if: matrix.arch != 'pr-models'
       run: |
         $pins = 'numpy==2.3.4', 'torch==2.9.0', 'triton-windows<3.6'
         $index = 'https://download.pytorch.org/whl/cu128'
@@ -235,9 +260,10 @@ jobs:
         "Python packages (python, numpy, torch, cuda): $(& $py -I -c 'import sys, numpy, torch; print(sys.version.split()[0], numpy.__version__, torch.__version__, torch.version.cuda)')" |
           Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
-    # The harness steps below serve only the model-family step, which runs on SM86; the SM75 job skips them all.
+    # The harness steps below serve only the model-family step, which runs on SM86 (the nightly SM86 job and a pull
+    # request's pr-models job); every other job skips them.
     - name: Check out AiDotNet beside this checkout
-      if: matrix.arch == 'sm86' && !inputs.ratchets_only
+      if: (matrix.arch == 'sm86' || matrix.arch == 'pr-models') && !inputs.ratchets_only
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         repository: ooples/AiDotNet
@@ -250,7 +276,7 @@ jobs:
     # and MobileNetV2 training. Checked first, so a lane enabled without a harness that defines them fails in its first
     # minute with the fix in the message, not after the GPU suites.
     - name: Check the AiDotNet harness defines every model family
-      if: matrix.arch == 'sm86' && !inputs.ratchets_only
+      if: (matrix.arch == 'sm86' || matrix.arch == 'pr-models') && !inputs.ratchets_only
       run: |
         $program = Get-Content aidn/benchmarks/AiDotNet.PyTorchParity/Program.cs -Raw
         $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
@@ -261,12 +287,6 @@ jobs:
         }
         "MODEL_FAMILIES=$($families -join ',')" | Out-File -Append -FilePath $env:GITHUB_ENV
         "Model families: $($families -join ', ')" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
-
-    - name: Record the GPU and driver
-      run: |
-        $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
-        if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
-        "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     # The cuDNN paths (convolution candidates, batch norm) need cudnn64_9.dll on the loader path, and the toolkit's
     # cuBLASLt for the CUDA it was built against: the CUDA 13 build pairs with a CUDA 13 toolkit's cublasLt64_13.dll.
@@ -297,14 +317,15 @@ jobs:
         "cuDNN: $version (CUDA 13) at $($dll.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     - name: Check the lane selects every GPU test class
-      if: ${{ !inputs.ratchets_only }}
+      if: ${{ !inputs.ratchets_only && matrix.arch != 'pr-models' }}
       run: python AiDotNet.Tensors/scripts/ci/check-cuda-lane-coverage.py --filter ($env:CUDA_LANE_FILTER -replace "\s", "") AiDotNet.Tensors/tests
 
     - name: Build tests (net10.0)
+      if: matrix.arch != 'pr-models'
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
     - name: GPU suites (DirectGpu, Autodiff, Compilation, Parity)
-      if: ${{ !inputs.ratchets_only }}
+      if: ${{ !inputs.ratchets_only && matrix.arch != 'pr-models' }}
       env:
         # cuDNN's own error log, uploaded with the TRX. A cuDNN failure such as CUDNN_STATUS_EXECUTION_FAILED_CUDART
         # then names the CUDA runtime call that failed, which the exception does not.
@@ -319,8 +340,10 @@ jobs:
         # (about 18, bounded at 22) and the upload. The deadline counts from
         # the job's start (the runner worker's), not this step's, and stops DIAGNOSTICS_RESERVE_MINUTES short of the job
         # limit, so slow setup cannot let the job timeout cancel the step before the watchdog fires.
-        SUITE_WATCHDOG_MINUTES: ${{ matrix.arch == 'sm86' && '120' || '215' }}
-        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'sm86' && (github.event_name == 'pull_request' && 160 || 560) || 240 }}
+        # A pull request's suites ("pr") run where they land: 120 minutes on an RTX 3080, 165 on a slower cuda-pr runner
+        # (the job limit, 200 less the reserve, caps it anyway); the model families run in their own job there.
+        SUITE_WATCHDOG_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '120' || matrix.arch == 'pr' && '165' || '215' }}
+        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'pr' && 200 || matrix.arch == 'sm86' && 560 || 240 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
@@ -478,7 +501,7 @@ jobs:
     # ours first, torch's cudnn_cnn64_9.dll bound to our modules and failed with WinError 127, so every test of the
     # class failed. In a host of its own, torch is imported before the class creates an engine.
     - name: Embedded torch interop (own test host)
-      if: ${{ !cancelled() && !inputs.ratchets_only }}
+      if: ${{ !cancelled() && !inputs.ratchets_only && matrix.arch != 'pr-models' }}
       # Eight tests and one interpreter start: seconds. The bound leaves the model families' ~18 minutes and the upload
       # inside the job limit even when the suites end at the watchdog deadline (about 123 minutes into the job).
       timeout-minutes: 5
@@ -517,7 +540,7 @@ jobs:
         if ($searchErrors.Count -gt 0) { Write-Output "::error::The dump search was incomplete; unreachable dumps were not analysed."; exit 1 }
 
     - name: Fail on unexplained skips
-      if: ${{ always() && !inputs.ratchets_only }}
+      if: ${{ always() && !inputs.ratchets_only && matrix.arch != 'pr-models' }}
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
@@ -532,12 +555,12 @@ jobs:
       # The main suites and the torch interop host are checked apart, so each must have run tests of its own: a main
       # filter that selected nothing cannot pass on the interop tests alone.
       env:
-        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ matrix.arch != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]'' || '''' }}'
+        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]'' || '''' }}'
         ALLOWED_SKIP_TEST: '(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\.'
       run: |
         $failed = $false
-        foreach ($part in @(@{ Title = 'CUDA (${{ matrix.arch }})'; Trx = 'cuda.trx' },
-                            @{ Title = 'CUDA (${{ matrix.arch }}) torch interop'; Trx = 'cuda-torch-interop.trx' })) {
+        foreach ($part in @(@{ Title = 'CUDA (${{ steps.gpu.outputs.sm }})'; Trx = 'cuda.trx' },
+                            @{ Title = 'CUDA (${{ steps.gpu.outputs.sm }}) torch interop'; Trx = 'cuda-torch-interop.trx' })) {
           python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title $part.Title --fail-on-skip `
             --allowed-skip $env:ALLOWED_SKIP --allowed-skip-test $env:ALLOWED_SKIP_TEST `
             (Join-Path "${{ runner.temp }}/trx" $part.Trx)
@@ -547,7 +570,7 @@ jobs:
 
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
-      if: matrix.arch == 'sm86' && !inputs.ratchets_only
+      if: (matrix.arch == 'sm86' || matrix.arch == 'pr-models') && !inputs.ratchets_only
       # About 18 minutes in a passing run; bounded so the job budget above holds.
       timeout-minutes: 22
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
@@ -638,7 +661,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ${{ matrix.arch == 'sm86' && 'gpu-cuda-results' || format('gpu-cuda-results-{0}', matrix.arch) }}
+        name: ${{ (matrix.arch == 'sm86' || matrix.arch == 'pr') && 'gpu-cuda-results' || matrix.arch == 'pr-models' && 'gpu-cuda-results-models' || format('gpu-cuda-results-{0}', matrix.arch) }}
         path: |
           ${{ runner.temp }}/trx/**
           ${{ runner.temp }}/ratchets/**
