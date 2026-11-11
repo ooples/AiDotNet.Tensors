@@ -37,14 +37,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// (the driver's host budget exhausted by contexts nobody disposed: each holds its compiled programs, ~100 MB)
         /// names the code that leaked them.
         /// </summary>
-        private static readonly ConcurrentDictionary<DirectOpenClContext, string>? s_creationSites = CreateCreationSiteTrace();
+        private static readonly ConcurrentDictionary<IntPtr, string>? s_creationSites = CreateCreationSiteTrace();
 
         // With tracing on, the contexts still alive when the process exits (never disposed) are also written to
         // %TEMP%/aidotnet-opencl-live-contexts-<pid>.txt, so a leak is found even in a run where it caused no failure.
-        private static ConcurrentDictionary<DirectOpenClContext, string>? CreateCreationSiteTrace()
+        private static ConcurrentDictionary<IntPtr, string>? CreateCreationSiteTrace()
         {
             if (Environment.GetEnvironmentVariable("AIDOTNET_OPENCL_TRACE_CONTEXTS") != "1") return null;
-            var sites = new ConcurrentDictionary<DirectOpenClContext, string>();
+            var sites = new ConcurrentDictionary<IntPtr, string>();
             AppDomain.CurrentDomain.ProcessExit += (_, _) =>
             {
                 try
@@ -76,6 +76,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private IntPtr _context;
+        private OpenClNativeContextHandle? _native;
         private ThreadLocal<IntPtr>? _threadCommandQueue;
         private ThreadLocal<IntPtr>? _threadProfilingCommandQueue;
         private IntPtr _device;
@@ -182,6 +183,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             ReapCompletedResources();
             DirectOpenClSubmission.Register(memory);
+            _native?.Track(memory.NativeHandle, OpenClChildKind.MemObject);
         }
 
         /// <summary>
@@ -213,6 +215,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             long byteSize)
         {
             if (memoryObject == IntPtr.Zero) return;
+            // Claim it: a buffer resurrected by a finalizer can be disposed after its context was reclaimed, which
+            // already released it (see OpenClNativeContextHandle).
+            if (!ClaimNative(memoryObject))
+            {
+                lock (DirectOpenClSubmission.Gate) DirectOpenClSubmission.Unregister(memoryObject, memory);
+                return;
+            }
 
             bool releaseImmediately = false;
             lock (DirectOpenClSubmission.Gate)
@@ -305,8 +314,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
-        private static void ReleaseMemoryObject(IntPtr memoryObject, long byteSize)
+        private void ReleaseMemoryObject(IntPtr memoryObject, long byteSize)
         {
+            // The caller claimed it (RetireMemoryObject), so it is ours to release.
             OpenClNativeBindings.ReleaseMemObject(memoryObject);
             GpuKernelDiagnostics.RecordBufferReleased(byteSize);
         }
@@ -579,11 +589,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             // Create context
             var deviceArray = new IntPtr[] { _device };
+            // Contexts reclaimed without Dispose wait in the deferred-free queue; free them before asking the driver
+            // for another, whose host budget they would otherwise still hold.
+            DirectOpenClGpuBuffer.PendingFrees.Drain();
             _context = OpenClNativeBindings.CreateContext(IntPtr.Zero, 1, deviceArray, IntPtr.Zero, IntPtr.Zero, out err);
             if (err != OpenClNativeBindings.CL_SUCCESS || _context == IntPtr.Zero)
                 throw new InvalidOperationException($"Failed to create OpenCL context: {err}" + LiveContextReport());
             Interlocked.Increment(ref s_liveContexts);
-            s_creationSites?.TryAdd(this, CreationSite());
+            s_creationSites?.TryAdd(_context, CreationSite());
+            // Owns the context and everything created in it, so a context that is collected without being disposed
+            // still gives its native objects back (see OpenClNativeContextHandle). The callback is static: capturing
+            // this context would root it from its own handle.
+            _native = new OpenClNativeContextHandle(_context, OnNativeContextReleased);
 
             // Per-thread command queues (issue #414). The original design used a
             // single shared queue here, which made Parallel.ForEach(... IEngine
@@ -637,7 +654,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // call that uses the freed context handle.
                 if (_disposed) return IntPtr.Zero;
                 q = OpenClNativeBindings.CreateCommandQueue(_context, _device, properties, out err);
-                if (err == OpenClNativeBindings.CL_SUCCESS && q != IntPtr.Zero) LiveQueues.TryAdd(q, 0);
+                if (err == OpenClNativeBindings.CL_SUCCESS && q != IntPtr.Zero)
+                {
+                    LiveQueues.TryAdd(q, 0);
+                    _native?.Track(q, OpenClChildKind.CommandQueue);
+                }
             }
             if (err != OpenClNativeBindings.CL_SUCCESS || q == IntPtr.Zero)
             {
@@ -678,7 +699,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_disposed) return;
             var tl = _threadCommandQueue;
             if (tl is null) return;
-            foreach (IntPtr q in tl.Values)
+            foreach (IntPtr q in QueuesOf(tl))
             {
                 if (q != IntPtr.Zero) OpenClNativeBindings.Finish(q);
             }
@@ -702,6 +723,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Dispose()
         {
             if (_disposed) return;
+            GC.SuppressFinalize(this);
 
             // Stop new submissions and finish every implicit queue under the same gate used to enqueue
             // kernels. This closes the check/enqueue/dispose race and makes context teardown a real lifetime
@@ -714,7 +736,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 var regularToFinish = _threadCommandQueue;
                 if (regularToFinish is not null)
                 {
-                    foreach (IntPtr q in regularToFinish.Values)
+                    foreach (IntPtr q in QueuesOf(regularToFinish))
                     {
                         if (q == IntPtr.Zero) continue;
                         OpenClNativeBindings.Finish(q);
@@ -726,7 +748,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 var profilingToFinish = _threadProfilingCommandQueue;
                 if (profilingToFinish is not null)
                 {
-                    foreach (IntPtr q in profilingToFinish.Values)
+                    foreach (IntPtr q in QueuesOf(profilingToFinish))
                     {
                         if (q == IntPtr.Zero) continue;
                         OpenClNativeBindings.Finish(q);
@@ -773,9 +795,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _threadProfilingCommandQueue = null;
             if (profiling is not null)
             {
-                foreach (IntPtr q in profiling.Values)
+                foreach (IntPtr q in QueuesOf(profiling))
                 {
-                    if (q != IntPtr.Zero) OpenClNativeBindings.ReleaseCommandQueue(q);
+                    if (q == IntPtr.Zero || !ClaimNative(q)) continue;
+                    OpenClNativeBindings.ReleaseCommandQueue(q);
                 }
                 profiling.Dispose();
             }
@@ -784,21 +807,56 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _threadCommandQueue = null;
             if (regular is not null)
             {
-                foreach (IntPtr q in regular.Values)
+                foreach (IntPtr q in QueuesOf(regular))
                 {
-                    if (q != IntPtr.Zero) OpenClNativeBindings.ReleaseCommandQueue(q);
+                    if (q == IntPtr.Zero || !ClaimNative(q)) continue;
+                    OpenClNativeBindings.ReleaseCommandQueue(q);
                 }
                 regular.Dispose();
             }
 
-            if (_context != IntPtr.Zero)
+            // Releases the context (and anything a wrapper never released); the count drops in its callback.
+            _native?.ReleaseAll();
+            _context = IntPtr.Zero;
+        }
+
+        // A context collected without Dispose (its engine or backend was dropped) still holds ~110 MB of driver host
+        // memory. Its release is handed to the deferred-free queue the buffer finalizers use, so it runs on an ordinary
+        // thread (the next allocation, or the next context creation, drains it) and never concurrently with one of its
+        // own buffers being freed there; claiming (ClaimNative) keeps either order safe.
+        ~DirectOpenClContext()
+        {
+            if (_disposed || _native is null) return;
+            DirectOpenClGpuBuffer.PendingFrees.Enqueue(Dispose);
+        }
+
+        // The queues a per-thread ThreadLocal holds. A context reclaimed without Dispose is disposed from the deferred-free
+        // queue after the GC has already finalized its ThreadLocals (Values then throws); its queues are still released,
+        // as tracked children of the native handle, so none is lost.
+        private static IList<IntPtr> QueuesOf(ThreadLocal<IntPtr> queues)
+        {
+            try
             {
-                OpenClNativeBindings.ReleaseContext(_context);
-                _context = IntPtr.Zero;
-                Interlocked.Decrement(ref s_liveContexts);
-                s_creationSites?.TryRemove(this, out _);
+                return queues.Values;
+            }
+            catch (ObjectDisposedException)
+            {
+                return Array.Empty<IntPtr>();
             }
         }
+
+        // Runs when the native context is released, by Dispose (also when the finalizer queued it). Static on purpose.
+        private static void OnNativeContextReleased(IntPtr context)
+        {
+            Interlocked.Decrement(ref s_liveContexts);
+            s_creationSites?.TryRemove(context, out _);
+        }
+
+        /// <summary>Records a native object created in this context, released with it if its wrapper never is.</summary>
+        internal void TrackNative(IntPtr child, OpenClChildKind kind) => _native?.Track(child, kind);
+
+        /// <summary>Claims a native object for release by its wrapper: false when the context already released it.</summary>
+        internal bool ClaimNative(IntPtr child) => _native is null || _native.TryClaim(child);
 
         // The first frames outside the OpenCL backend: the code that asked for this context.
         private static string CreationSite()

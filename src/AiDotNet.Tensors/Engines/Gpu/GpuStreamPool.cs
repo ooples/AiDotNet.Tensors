@@ -27,7 +27,9 @@ public sealed class GpuStreamPool : IDisposable
 {
     private readonly IAsyncGpuBackend _backend;
     private readonly GpuExecutionOptions _options;
-    private readonly ConcurrentDictionary<GpuStreamType, ConcurrentBag<IGpuStream>> _availableStreams;
+    // Stacks, not ConcurrentBags: a bag keeps items in thread-static storage, which rooted every pooled stream - and
+    // through it the backend and its device context - so a backend dropped without Dispose was never collected.
+    private readonly ConcurrentDictionary<GpuStreamType, ConcurrentStack<IGpuStream>> _availableStreams;
     private readonly ConcurrentDictionary<IGpuStream, GpuStreamType> _streamTypes;
     private readonly object _creationLock = new();
     private int _totalComputeStreams;
@@ -65,8 +67,7 @@ public sealed class GpuStreamPool : IDisposable
     /// throwing. Consumers like <see cref="GpuStreamScheduler"/> use this to
     /// pre-size their leased working set so a single dispatch call can hold
     /// every pool stream concurrently rather than acquire-and-release on each
-    /// launch (which collapses onto one stream under <c>ConcurrentBag</c>'s
-    /// thread-local cache).
+    /// launch (which collapses onto the most recently returned stream).
     /// </summary>
     public int GetMaxStreams(GpuStreamType streamType) => GetMaxStreamsForType(streamType);
 
@@ -80,13 +81,13 @@ public sealed class GpuStreamPool : IDisposable
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         _options = options ?? new GpuExecutionOptions();
 
-        _availableStreams = new ConcurrentDictionary<GpuStreamType, ConcurrentBag<IGpuStream>>();
+        _availableStreams = new ConcurrentDictionary<GpuStreamType, ConcurrentStack<IGpuStream>>();
         _streamTypes = new ConcurrentDictionary<IGpuStream, GpuStreamType>();
 
         // Initialize stream bags for each type
         foreach (GpuStreamType streamType in Enum.GetValues(typeof(GpuStreamType)))
         {
-            _availableStreams[streamType] = new ConcurrentBag<IGpuStream>();
+            _availableStreams[streamType] = new ConcurrentStack<IGpuStream>();
         }
 
         // Create default streams
@@ -107,7 +108,7 @@ public sealed class GpuStreamPool : IDisposable
         ThrowIfDisposed();
 
         // Try to get an existing stream from the pool
-        if (_availableStreams.TryGetValue(streamType, out var bag) && bag.TryTake(out var stream))
+        if (_availableStreams.TryGetValue(streamType, out var bag) && bag.TryPop(out var stream))
         {
             return stream;
         }
@@ -121,7 +122,7 @@ public sealed class GpuStreamPool : IDisposable
             if (currentCount >= maxStreams)
             {
                 // Try one more time - someone might have released a stream
-                if (bag != null && bag.TryTake(out stream))
+                if (bag != null && bag.TryPop(out stream))
                 {
                     return stream;
                 }
@@ -157,7 +158,7 @@ public sealed class GpuStreamPool : IDisposable
         {
             if (_availableStreams.TryGetValue(streamType, out var bag))
             {
-                bag.Add(stream);
+                bag.Push(stream);
             }
         }
     }
@@ -296,7 +297,7 @@ public sealed class GpuStreamPool : IDisposable
         // Dispose all streams
         foreach (var bag in _availableStreams.Values)
         {
-            while (bag.TryTake(out var stream))
+            while (bag.TryPop(out var stream))
             {
                 stream.Dispose();
             }

@@ -43,9 +43,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
                 if (_cached is not null && _cached.IsAvailable)
                     return _cached;
 
+                // The process-wide GPU engine's backend when it is Metal: a second one is a second device context.
+                if (Engine.DirectGpuIfCreated is { IsAvailable: true, Backend: MetalBackend { IsAvailable: true } shared })
+                {
+                    _cached = shared;
+                    return shared;
+                }
+
                 var backend = new MetalBackend();
                 if (!backend.IsAvailable)
+                {
+                    backend.Dispose();
                     throw new InvalidOperationException("Metal SpMM backend failed to initialise.");
+                }
                 _cached = backend;
                 return backend;
             }

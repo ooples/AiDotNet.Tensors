@@ -1,4 +1,4 @@
-﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Automatic engine selection based on hardware capabilities
 
 using System;
@@ -127,6 +127,13 @@ namespace AiDotNet.Tensors.Engines
         /// }
         /// </code>
         /// </example>
+        /// <summary>
+        /// The process-wide <see cref="DirectGpu"/> engine if something has already created it, else null - without
+        /// creating one. Lets a component reuse the existing device context instead of opening a second, without forcing a
+        /// GPU backend into existence (a probe of its own would then hold two contexts instead of one).
+        /// </summary>
+        internal static DirectGpuEngine? DirectGpuIfCreated => System.Threading.Volatile.Read(ref _directGpuEngine);
+
         public static DirectGpuEngine? DirectGpu
         {
             get

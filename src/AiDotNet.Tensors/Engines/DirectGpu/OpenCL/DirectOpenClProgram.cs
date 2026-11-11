@@ -157,6 +157,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (err != OpenClNativeBindings.CL_SUCCESS || _program == IntPtr.Zero)
                 throw new InvalidOperationException($"Failed to create OpenCL program: {err}");
+            context.TrackNative(_program, OpenClChildKind.Program);
         }
 
         private DirectOpenClProgram(DirectOpenClContext context, IntPtr program, string sourceHash)
@@ -165,6 +166,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _program = program;
             _sourceHash = sourceHash;
             BuildOrigin = OpenClProgramBuildOrigin.NativeBinaryCache;
+            context.TrackNative(program, OpenClChildKind.Program);
         }
 
         /// <summary>
@@ -435,7 +437,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (_program != IntPtr.Zero)
             {
-                OpenClNativeBindings.ReleaseProgram(_program);
+                if (_context.ClaimNative(_program)) OpenClNativeBindings.ReleaseProgram(_program);
                 _program = IntPtr.Zero;
             }
 
