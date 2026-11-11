@@ -25,7 +25,11 @@ public class CompiledAutocastGraphStepTests : IDisposable
 
     public CompiledAutocastGraphStepTests(ITestOutputHelper output) => _output = output;
 
-    public void Dispose() => AiDotNetEngine.Current = _prior;
+    public void Dispose()
+    {
+        AiDotNetEngine.Current = _prior;
+        DirectGpuTensorEngine.AutocastConvOverride = null;
+    }
 
     private static Tensor<float> Rand(int[] shape, int seed, float scale)
     {
@@ -48,25 +52,34 @@ public class CompiledAutocastGraphStepTests : IDisposable
         var parameters = new[] { w1, b1, w2, b2 };
         if (onDevice) foreach (var p in parameters) p.Gpu();
 
-        using var scope16 = autocast ? new AutocastScope(PrecisionMode.Float16) : null;
-        ICompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.EnableTraining(parameters))
+        string? priorAutocast = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
+        try
         {
-            var h = engine.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
-            var o = engine.TensorAdd(engine.FusedLinear(h, w2, b2, FusedActivationType.None), h);
-            engine.TensorMSELoss(o, y);
-            plan = scope.CompileTraining(parameters);
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", autocast ? "fp16" : null);
+            using var scope16 = autocast ? new AutocastScope(PrecisionMode.Float16) : null;
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                var h = engine.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
+                var o = engine.TensorAdd(engine.FusedLinear(h, w2, b2, FusedActivationType.None), h);
+                engine.TensorMSELoss(o, y);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.05f);
+                var losses = new double[Steps];
+                for (int s = 0; s < Steps; s++) losses[s] = plan.Step().ToArray()[0];
+                var concrete = plan as CompiledTrainingPlan<float>;
+                bool replayed = concrete is not null
+                    && (IntPtr)typeof(CompiledTrainingPlan<float>)
+                        .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)! != IntPtr.Zero;
+                return (losses, replayed, concrete?.GraphCaptureFailureReason);
+            }
         }
-        using (plan)
+        finally
         {
-            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.05f);
-            var losses = new double[Steps];
-            for (int s = 0; s < Steps; s++) losses[s] = plan.Step().ToArray()[0];
-            var concrete = plan as CompiledTrainingPlan<float>;
-            bool replayed = concrete is not null
-                && (IntPtr)typeof(CompiledTrainingPlan<float>)
-                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)! != IntPtr.Zero;
-            return (losses, replayed, concrete?.GraphCaptureFailureReason);
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", priorAutocast);
         }
     }
 
@@ -87,27 +100,36 @@ public class CompiledAutocastGraphStepTests : IDisposable
         var parameters = new[] { w1, b1, w2, b2, w3, b3 };
         if (onDevice) foreach (var p in parameters) p.Gpu();
 
-        using var scope16 = autocast ? new AutocastScope(PrecisionMode.Float16) : null;
-        ICompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.EnableTraining(parameters))
+        string? priorAutocast = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
+        try
         {
-            var h = engine.FusedConv2D(x, w1, b1, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
-            h = engine.MaxPool2D(h, 2);
-            h = engine.FusedConv2D(h, w2, b2, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
-            h = engine.Reshape(h, new[] { batch, 16 * (size / 2) * (size / 2) });
-            engine.TensorMSELoss(engine.FusedLinear(h, w3, b3, FusedActivationType.None), y);
-            plan = scope.CompileTraining(parameters);
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", autocast ? "fp16" : null);
+            using var scope16 = autocast ? new AutocastScope(PrecisionMode.Float16) : null;
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                var h = engine.FusedConv2D(x, w1, b1, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
+                h = engine.MaxPool2D(h, 2);
+                h = engine.FusedConv2D(h, w2, b2, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
+                h = engine.Reshape(h, new[] { batch, 16 * (size / 2) * (size / 2) });
+                engine.TensorMSELoss(engine.FusedLinear(h, w3, b3, FusedActivationType.None), y);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.05f);
+                var losses = new double[Steps];
+                for (int s = 0; s < Steps; s++) losses[s] = plan.Step().ToArray()[0];
+                var concrete = plan as CompiledTrainingPlan<float>;
+                bool replayed = concrete is not null
+                    && (IntPtr)typeof(CompiledTrainingPlan<float>)
+                        .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)! != IntPtr.Zero;
+                return (losses, replayed, concrete?.GraphCaptureFailureReason);
+            }
         }
-        using (plan)
+        finally
         {
-            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.05f);
-            var losses = new double[Steps];
-            for (int s = 0; s < Steps; s++) losses[s] = plan.Step().ToArray()[0];
-            var concrete = plan as CompiledTrainingPlan<float>;
-            bool replayed = concrete is not null
-                && (IntPtr)typeof(CompiledTrainingPlan<float>)
-                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)! != IntPtr.Zero;
-            return (losses, replayed, concrete?.GraphCaptureFailureReason);
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", priorAutocast);
         }
     }
 
@@ -130,6 +152,7 @@ public class CompiledAutocastGraphStepTests : IDisposable
                 "Needs cuDNN tensor-core convolution.");
             Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
                 "Graph capture is disabled for this process.");
+            DirectGpuTensorEngine.AutocastConvOverride = true;
 
             var reference = TrainCnn(new CpuEngine(), onDevice: false, autocast: false);
             var before = gpu.AutocastConvDispatchCounts;
@@ -180,6 +203,53 @@ public class CompiledAutocastGraphStepTests : IDisposable
                 Assert.True(Math.Abs(reference.Losses[s] - captured.Losses[s]) <= 2e-2 * Math.Max(1, Math.Abs(reference.Losses[s])),
                     $"step {s}: FP16 captured loss {captured.Losses[s]:G6} != FP32 cpu {reference.Losses[s]:G6}");
             Assert.True(captured.Losses[Steps - 1] < captured.Losses[0], "the FP16 step did not train");
+        }
+    }
+
+    [SkippableFact]
+    public void ResidentCaptureScope_PreservesSetSliceAxisAndNonCanonicalTransposeView()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try
+        {
+            var candidate = new DirectGpuTensorEngine();
+            if (candidate.IsGpuAvailable) gpu = candidate; else candidate.Dispose();
+        }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            using var resident = gpu!.EnterResidentCaptureScope();
+            Skip.If(resident is null, "Backend does not support resident graph capture.");
+
+            AiDotNetEngine.Current = gpu;
+            IEngine eng = gpu;
+            IEngine cpu = new CpuEngine();
+
+            // 1. Sequential SetSliceAxis writes into a fresh zero destination preserve earlier slices.
+            var dstZero = new Tensor<float>([3, 4]);
+            var s0 = new Tensor<float>([1f, 2f, 3f, 4f], [4]);
+            var s2 = new Tensor<float>([9f, 10f, 11f, 12f], [4]);
+            s0.Gpu();
+            s2.Gpu();
+            eng.TensorSetSliceAxis(dstZero, s0, axis: 0, index: 0);
+            eng.TensorSetSliceAxis(dstZero, s2, axis: 0, index: 2);
+            Assert.Equal(new float[] { 1f, 2f, 3f, 4f, 0f, 0f, 0f, 0f, 9f, 10f, 11f, 12f }, dstZero.ToArray());
+
+            // 2. SetSliceAxis into a pre-populated host tensor preserves untouched slices.
+            var dstInit = new Tensor<float>([10f, 20f, 30f, 40f, 50f, 60f, 70f, 80f], [2, 4]);
+            var s1 = new Tensor<float>([-1f, -2f, -3f, -4f], [4]);
+            s1.Gpu();
+            eng.TensorSetSliceAxis(dstInit, s1, axis: 0, index: 1);
+            Assert.Equal(new float[] { 10f, 20f, 30f, 40f, -1f, -2f, -3f, -4f }, dstInit.ToArray());
+
+            // 3. TensorTranspose on a non-canonical transposed view honors logical strides instead of raw backing storage.
+            var m = new Tensor<float>([1f, 2f, 3f, 4f, 5f, 6f], [2, 3]);
+            m.Gpu();
+            var view = m.Transpose([1, 0]);
+            var gpuOut = eng.TensorTranspose(view).ToArray();
+            var cpuOut = cpu.TensorTranspose(new Tensor<float>([1f, 2f, 3f, 4f, 5f, 6f], [2, 3]).Transpose([1, 0])).ToArray();
+            Assert.Equal(cpuOut, gpuOut);
         }
     }
 }

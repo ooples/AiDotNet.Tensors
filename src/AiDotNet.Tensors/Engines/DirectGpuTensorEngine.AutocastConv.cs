@@ -48,7 +48,7 @@ public partial class DirectGpuTensorEngine
             Interlocked.Read(ref _autocastConvBackwardFilterCount));
 
     /// <summary>The resolved 16-bit route for one autocast convolution.</summary>
-    private readonly struct AutocastConvRoute
+    internal readonly struct AutocastConvRoute
     {
         internal AutocastConvRoute(IGpuMixedPrecisionConvBackend conv, IGenericFftBackend convert,
             GpuMixedPrecisionDataType dataType, FftElementType storage)
@@ -63,6 +63,98 @@ public partial class DirectGpuTensorEngine
         internal IGenericFftBackend Convert { get; }
         internal GpuMixedPrecisionDataType DataType { get; }
         internal FftElementType Storage { get; }
+    }
+
+    /// <summary>
+    /// Records the exact convolution precision executed by an eager taped forward pass so
+    /// <see cref="Autodiff.BackwardFunctions{T}.Conv2DBackward"/> reuses the forward pass's route even if
+    /// <see cref="AutocastScope"/> has exited before backward, and stays in FP32 if the forward pass ran in or
+    /// declined to FP32.
+    /// </summary>
+    internal sealed class RecordedConvPrecision
+    {
+        internal static readonly RecordedConvPrecision Fp32 = new(hasRoute: false, route: default);
+
+        private RecordedConvPrecision(bool hasRoute, AutocastConvRoute route)
+        {
+            HasRoute = hasRoute;
+            Route = route;
+        }
+
+        internal RecordedConvPrecision(AutocastConvRoute route)
+            : this(hasRoute: true, route)
+        {
+        }
+
+        internal bool HasRoute { get; }
+        internal AutocastConvRoute Route { get; }
+    }
+
+    [ThreadStatic] private static RecordedConvPrecision? t_lastForwardConvPrecision;
+    [ThreadStatic] private static RecordedConvPrecision? t_backwardConvPrecisionOverride;
+
+    internal readonly struct BackwardConvPrecisionScope : IDisposable
+    {
+        private readonly RecordedConvPrecision? _prior;
+        private readonly bool _active;
+
+        internal BackwardConvPrecisionScope(RecordedConvPrecision? precision)
+        {
+            _prior = t_backwardConvPrecisionOverride;
+            t_backwardConvPrecisionOverride = precision;
+            _active = precision is not null;
+        }
+
+        public void Dispose()
+        {
+            if (_active) t_backwardConvPrecisionOverride = _prior;
+        }
+    }
+
+    private static RecordedConvPrecision ConsumeLastForwardConvPrecision()
+    {
+        var recorded = t_lastForwardConvPrecision ?? RecordedConvPrecision.Fp32;
+        t_lastForwardConvPrecision = null;
+        return recorded;
+    }
+
+    internal static BackwardConvPrecisionScope PushBackwardConvPrecision(object[]? savedState, IEngine engine)
+    {
+        if (savedState is not null)
+        {
+            for (int i = savedState.Length - 1; i >= 0; i--)
+            {
+                if (savedState[i] is RecordedConvPrecision recorded)
+                    return new BackwardConvPrecisionScope(recorded);
+            }
+        }
+        // Eager CpuEngine / fallback forward nodes record [stride, padding, dilation] without RecordedConvPrecision;
+        // keep FP32 if an autocast scope is opened later around backward. Symbolic GraphMode / CompiledTrainingPlan
+        // nodes run inside ResidentStepActive and resolve the compiled step's active AutocastScope.
+        if (engine is not DirectGpuTensorEngine { ResidentStepActive: true })
+            return new BackwardConvPrecisionScope(RecordedConvPrecision.Fp32);
+        return default;
+    }
+
+    /// <summary>
+    /// True when this engine would route a convolution under an active <paramref name="precision"/> autocast scope onto
+    /// native 16-bit convolution math (used by parity harness baseline selection).
+    /// </summary>
+    internal bool SupportsEffectiveAutocastConv(PrecisionMode precision)
+    {
+        if (!(AutocastConvOverride ?? s_autocastConvEnabled)) return false;
+        if (GpuExecutionPolicyScope.EffectivePolicyFor(typeof(float)).AccuracyMode == GpuAccuracyMode.PreserveInputType)
+            return false;
+        if (!TryGetBackend(out var backend) || backend is DelegatingGpuBackend) return false;
+        if (backend is not INativeReducedPrecisionConv { NativeReducedPrecisionMath: true }
+            || backend.MixedPrecisionConv is not { } conv) return false;
+        if (backend is not IGenericFftBackend convert) return false;
+        return precision switch
+        {
+            PrecisionMode.Float16 => conv.SupportsHalfConv && convert.SupportsFftElementType(FftElementType.Float16),
+            PrecisionMode.BFloat16 => conv.SupportsBFloat16Conv && convert.SupportsFftElementType(FftElementType.BFloat16),
+            _ => false,
+        };
     }
 
     /// <summary>
@@ -95,6 +187,23 @@ public partial class DirectGpuTensorEngine
             default:
                 return false;
         }
+    }
+
+    private static bool TryResolveBackwardAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route)
+    {
+        if (t_backwardConvPrecisionOverride is { } recorded)
+        {
+            if (!recorded.HasRoute
+                || backend is DelegatingGpuBackend
+                || !ReferenceEquals(recorded.Route.Conv, backend.MixedPrecisionConv))
+            {
+                route = default;
+                return false;
+            }
+            route = recorded.Route;
+            return true;
+        }
+        return TryResolveAutocastConvRoute(backend, out route);
     }
 
     // Floats of scratch that hold `elements` 16-bit values.
@@ -132,16 +241,25 @@ public partial class DirectGpuTensorEngine
         IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight,
         int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH,
         int dilationW)
+        => TryAutocastConv2DForward(backend, input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels,
+            outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, out _);
+
+    private bool TryAutocastConv2DForward(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer kernel,
+        IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight,
+        int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH,
+        int dilationW, out AutocastConvRoute executedRoute)
     {
+        executedRoute = default;
         if (!TryResolveAutocastConvRoute(backend, out var route)) return false;
         int inputCount = checked(batch * inChannels * inHeight * inWidth);
         int kernelCount = checked(outChannels * inChannels * kernelH * kernelW);
         int outputCount = checked(batch * outChannels * outHeight * outWidth);
+        OwnedBuffer input16 = default, kernel16 = default, output16 = default;
         try
         {
-            using var input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
-            using var kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
-            using var output16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
+            input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
+            kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
+            output16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
             route.Convert.ConvertFloatToFftStorage(input, input16.Buffer, inputCount, route.Storage);
             route.Convert.ConvertFloatToFftStorage(kernel, kernel16.Buffer, kernelCount, route.Storage);
             ThrowIfAutocastConvFaultInjected();
@@ -154,6 +272,13 @@ public partial class DirectGpuTensorEngine
         {
             return false;
         }
+        finally
+        {
+            output16.DisposeAfterQueuedUse(backend);
+            kernel16.DisposeAfterQueuedUse(backend);
+            input16.DisposeAfterQueuedUse(backend);
+        }
+        executedRoute = route;
         Interlocked.Increment(ref _autocastConvForwardCount);
         return true;
     }
@@ -170,11 +295,12 @@ public partial class DirectGpuTensorEngine
         int inputCount = checked(batch * inChannels * inHeight * inWidth);
         int kernelCount = checked(outChannels * inChannels * kernelH * kernelW);
         int outputCount = checked(batch * outChannels * outHeight * outWidth);
+        OwnedBuffer kernel16 = default, gradOutput16 = default, gradInput16 = default;
         try
         {
-            using var kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
-            using var gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
-            using var gradInput16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
+            kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
+            gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
+            gradInput16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
             route.Convert.ConvertFloatToFftStorage(kernel, kernel16.Buffer, kernelCount, route.Storage);
             route.Convert.ConvertFloatToFftStorage(gradOutput, gradOutput16.Buffer, outputCount, route.Storage);
             ThrowIfAutocastConvFaultInjected();
@@ -186,6 +312,12 @@ public partial class DirectGpuTensorEngine
         catch (Exception ex) when (IsAutocastConvDecline(ex) && DeclineAutocastConv("AutocastConv2DBackwardData", ex))
         {
             return false;
+        }
+        finally
+        {
+            gradInput16.DisposeAfterQueuedUse(backend);
+            gradOutput16.DisposeAfterQueuedUse(backend);
+            kernel16.DisposeAfterQueuedUse(backend);
         }
         Interlocked.Increment(ref _autocastConvBackwardDataCount);
         return true;
@@ -203,11 +335,12 @@ public partial class DirectGpuTensorEngine
         int inputCount = checked(batch * inChannels * inHeight * inWidth);
         int kernelCount = checked(outChannels * inChannels * kernelH * kernelW);
         int outputCount = checked(batch * outChannels * outHeight * outWidth);
+        OwnedBuffer input16 = default, gradOutput16 = default, gradKernel16 = default;
         try
         {
-            using var input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
-            using var gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
-            using var gradKernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
+            input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
+            gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
+            gradKernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
             route.Convert.ConvertFloatToFftStorage(input, input16.Buffer, inputCount, route.Storage);
             route.Convert.ConvertFloatToFftStorage(gradOutput, gradOutput16.Buffer, outputCount, route.Storage);
             ThrowIfAutocastConvFaultInjected();
@@ -219,6 +352,12 @@ public partial class DirectGpuTensorEngine
         catch (Exception ex) when (IsAutocastConvDecline(ex) && DeclineAutocastConv("AutocastConv2DBackwardFilter", ex))
         {
             return false;
+        }
+        finally
+        {
+            gradKernel16.DisposeAfterQueuedUse(backend);
+            gradOutput16.DisposeAfterQueuedUse(backend);
+            input16.DisposeAfterQueuedUse(backend);
         }
         Interlocked.Increment(ref _autocastConvBackwardFilterCount);
         return true;

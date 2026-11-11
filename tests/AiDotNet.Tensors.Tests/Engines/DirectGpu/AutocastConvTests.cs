@@ -54,6 +54,7 @@ public sealed class AutocastConvTests : IDisposable
             engine.Dispose();
             Skip.If(true, $"Needs CUDA with cuDNN tensor-core {precision} convolution.");
         }
+        DirectGpuTensorEngine.AutocastConvOverride = true;
         return engine;
     }
 
@@ -221,8 +222,79 @@ public sealed class AutocastConvTests : IDisposable
         AssertCloseLoose(refDb, db, "tape db");
     }
 
+    [SkippableFact]
+    public void TapeGradients_AfterExitingFp16AutocastScope_StillUseForwardPrecision_AndFallbackPreservesFp32()
+    {
+        using var engine = RequireCudnnEngine();
+        var x = Random([2, 8, 10, 10], 170);
+        var w = Random([16, 8, 3, 3], 171, 0.3f);
+        var b = Random([16], 172, 0.2f);
+
+        Tensor<float> Loss(IEngine e, Tensor<float> xi, Tensor<float> wi, Tensor<float> bi)
+        {
+            var y = e.FusedConv2D(xi, wi, bi, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
+            return e.ReduceSum(e.TensorMultiply(y, y), null);
+        }
+
+        var cpu = new CpuEngine();
+        var rx = Rounded(x, PrecisionMode.Float16);
+        var rw = Rounded(w, PrecisionMode.Float16);
+        float[] refDx, refDw, refDb;
+        AiDotNetEngine.Current = cpu;
+        using (var tape = new GradientTape<float>())
+        {
+            var g = tape.ComputeGradients(Loss(cpu, rx, rw, b), sources: new[] { rx, rw, b });
+            refDx = g[rx].ToArray(); refDw = g[rw].ToArray(); refDb = g[b].ToArray();
+        }
+
+        // Case 1: forward runs inside AutocastScope(Float16), then scope exits BEFORE ComputeGradients (the standard
+        // PyTorch `with autocast(): loss = model(x); loss.backward()` pattern). Backward must still use FP16.
+        AiDotNetEngine.Current = engine;
+        var before = engine.AutocastConvDispatchCounts;
+        float[] dx, dw, db;
+        using (var tape = new GradientTape<float>())
+        {
+            Tensor<float> loss;
+            using (new AutocastScope(PrecisionMode.Float16))
+                loss = Loss(engine, x, w, b);
+            var g = tape.ComputeGradients(loss, sources: new[] { x, w, b });
+            dx = g[x].ToArray(); dw = g[w].ToArray(); db = g[b].ToArray();
+        }
+        var after = engine.AutocastConvDispatchCounts;
+        Assert.Equal(before.Forward + 1, after.Forward);
+        Assert.Equal(before.BackwardData + 1, after.BackwardData);
+        Assert.Equal(before.BackwardFilter + 1, after.BackwardFilter);
+        AssertCloseLoose(refDx, dx, "post-scope tape dX");
+        AssertCloseLoose(refDw, dw, "post-scope tape dW");
+        AssertCloseLoose(refDb, db, "post-scope tape db");
+
+        // Case 2: forward declines to FP32 under AutocastScope(Float16), then fault is cleared before ComputeGradients
+        // while still inside AutocastScope(Float16). Backward must preserve the FP32 route used by forward.
+        var beforeFallback = engine.AutocastConvDispatchCounts;
+        using (new AutocastScope(PrecisionMode.Float16))
+        using (var tape = new GradientTape<float>())
+        {
+            DirectGpuTensorEngine.AutocastConvInjectedFault = "forward";
+            Tensor<float> loss;
+            try
+            {
+                loss = Loss(engine, x, w, b);
+            }
+            finally
+            {
+                DirectGpuTensorEngine.AutocastConvInjectedFault = null;
+            }
+            _ = tape.ComputeGradients(loss, sources: new[] { x, w, b });
+        }
+        var afterFallback = engine.AutocastConvDispatchCounts;
+        Assert.Equal(beforeFallback.Forward, afterFallback.Forward);
+        Assert.Equal(beforeFallback.BackwardData, afterFallback.BackwardData);
+        Assert.Equal(beforeFallback.BackwardFilter, afterFallback.BackwardFilter);
+    }
+
     private static void AssertCloseLoose(float[] reference, float[] actual, string what)
     {
+        Assert.Equal(reference.Length, actual.Length);
         double scale = Math.Max(1e-6, reference.Max(v => Math.Abs((double)v)));
         double worst = reference.Zip(actual, (r, a) => Math.Abs((double)r - a)).Max();
         Assert.True(worst <= 1e-2 * scale, $"{what}: max |gpu - ref| {worst:E3} exceeds {1e-2 * scale:E3}");
@@ -394,7 +466,7 @@ public sealed class AutocastConvTests : IDisposable
             var previousPool = DirectGpuTensorEngine.EnterScratchPool(engine.CreateScratchPool());
             engine.SuspendActivationEviction();
             long start = engine.AutocastConvDispatchCounts.Forward;
-            DirectGpuTensorEngine.AutocastConvOverride = routeOn ? null : false;
+            DirectGpuTensorEngine.AutocastConvOverride = routeOn;
             try
             {
                 using (engine.EnterCompiledCapturePath())
@@ -408,7 +480,7 @@ public sealed class AutocastConvTests : IDisposable
             }
             finally
             {
-                DirectGpuTensorEngine.AutocastConvOverride = null;
+                DirectGpuTensorEngine.AutocastConvOverride = true;
                 engine.SetCurrentScratchAction(-1);
                 DirectGpuTensorEngine.RestoreScratchPool(previousPool);
                 engine.ResumeActivationEviction();

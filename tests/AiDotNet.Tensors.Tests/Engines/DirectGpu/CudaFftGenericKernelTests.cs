@@ -302,9 +302,10 @@ public class CudaFftGenericKernelTests
     }
 
     [Theory]
-    [InlineData(FftElementType.Float16, "cvt.rn.f16.f32")]
-    [InlineData(FftElementType.BFloat16, "cvt.rn.bf16.f32")]
-    public async Task NarrowTypesConvertWithPtxAndNeedNoToolkitHeaders(FftElementType type, string roundingCvt)
+    [InlineData(FftElementType.Float16, "cvt.rn.f16.f32", "return aidn_h2f(v);", "return aidn_f2h(v);")]
+    [InlineData(FftElementType.BFloat16, "cvt.rn.bf16.f32", "return __uint_as_float(((unsigned int)(v)) << 16);", "return aidn_f2bf(v);")]
+    public async Task NarrowTypesConvertWithPtxAndNeedNoToolkitHeaders(
+        FftElementType type, string roundingCvt, string expectedLoad, string expectedStore)
     {
         // NVRTC on a driver-only host has no cuda_fp16.h / cuda_bf16.h; including either failed the module's compile
         // and silently removed 16-bit storage (and the autocast convolution built on it, #1549).
@@ -312,6 +313,52 @@ public class CudaFftGenericKernelTests
         string src = CudaFFTGenericKernels.GetSource(type);
         Assert.DoesNotContain("#include <cuda_", src);
         Assert.Contains(roundingCvt, src);
+        Assert.Contains($"__device__ __forceinline__ float aidn_ld(STORE_T v) {{ {expectedLoad} }}", src);
+        Assert.Contains($"__device__ __forceinline__ STORE_T aidn_st(float v) {{ {expectedStore} }}", src);
+    }
+
+    [SkippableTheory]
+    [InlineData(FftElementType.Float16)]
+    [InlineData(FftElementType.BFloat16)]
+    public async Task NarrowStorageConversionMatchesIndependentHalfAndBFloat16Rounding(FftElementType type)
+    {
+        await Task.Yield();
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
+        Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} storage conversion is unavailable.");
+
+        // Values chosen where FP16 (10-bit mantissa) and BF16 (7-bit mantissa) round to distinct floats, plus ties.
+        float[] input =
+        {
+            0f, -0f, 1.0009765625f, -1.0009765625f, 1.00390625f, -1.00390625f,
+            3.14159265f, -2.71828183f, 0.33333334f, 123.45679f, -64.0625f, 1e-4f,
+        };
+        float[] actual = new float[input.Length];
+        using (IGpuBuffer src = backend.AllocateBuffer(input))
+        using (IGpuBuffer narrow = backend.AllocateByteBuffer(checked(input.Length * type.ByteSize())))
+        using (IGpuBuffer dst = backend.AllocateBuffer(input.Length))
+        {
+            backend.ConvertFloatToFftStorage(src, narrow, input.Length, type);
+            backend.ConvertFftStorageToFloat(narrow, dst, input.Length, type);
+            backend.DownloadBuffer(dst, actual);
+        }
+
+        for (int i = 0; i < input.Length; i++)
+        {
+            float expected = type == FftElementType.Float16
+                ? (float)(Half)input[i]
+                : RoundBFloat16NearestEven(input[i]);
+            Assert.Equal(expected, actual[i]);
+        }
+    }
+
+    private static float RoundBFloat16NearestEven(float value)
+    {
+        if (float.IsNaN(value)) return value;
+        uint bits = (uint)BitConverter.SingleToInt32Bits(value);
+        bits += 0x7FFFu + ((bits >> 16) & 1u);
+        return BitConverter.Int32BitsToSingle(unchecked((int)(bits & 0xFFFF0000u)));
     }
 
     [Fact]

@@ -26,16 +26,27 @@ public sealed class DirectPtxIsaVersionTests
 
     [Theory]
     [InlineData("sm_87", "7.4")]
+    [InlineData("sm_88", "9.0")]
     [InlineData("sm_89", "7.8")]
     [InlineData("sm_90", "7.8")]
     [InlineData("sm_90a", "7.8")]
     [InlineData("sm_100", "8.6")]
+    [InlineData("sm_101", "8.6")]
+    [InlineData("sm_103", "8.8")]
+    [InlineData("sm_110", "9.0")]
     [InlineData("sm_120", "8.7")]
     [InlineData("sm_121", "8.8")]
     public void A_newer_target_raises_the_version_to_its_minimum_isa(string target, string expected)
     {
         string raised = DirectPtxPtxText.EnsureIsaCoversTarget(Module("7.1", target));
         Assert.Equal(Module(expected, target), raised);
+    }
+
+    [Fact]
+    public void An_unknown_future_target_throws_instead_of_emitting_an_unverified_isa()
+    {
+        Assert.Throws<System.NotSupportedException>(() =>
+            DirectPtxPtxText.EnsureIsaCoversTarget(Module("7.1", "sm_199")));
     }
 
     [Fact]

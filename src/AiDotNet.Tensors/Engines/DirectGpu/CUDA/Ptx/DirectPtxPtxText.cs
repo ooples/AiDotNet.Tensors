@@ -32,10 +32,15 @@ internal static class DirectPtxPtxText
         {
             <= 86 => null,
             87 => (7, 4),
+            88 => (9, 0),
             89 or 90 => (7, 8),
             100 or 101 => (8, 6),
+            103 => (8, 8),
+            110 => (9, 0),
             120 => (8, 7),
-            _ => (8, 8),   // sm_103, sm_121 and anything newer the table does not name yet
+            121 => (8, 8),
+            _ => throw new NotSupportedException(
+                $"Direct PTX target sm_{target} has no mapped minimum PTX ISA version; add an explicit mapping before assembling for this architecture."),
         };
 
     /// <summary>
