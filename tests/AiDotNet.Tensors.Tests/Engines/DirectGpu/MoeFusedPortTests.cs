@@ -208,38 +208,81 @@ public class MoeFusedPortTests
         }
         Close("dscores large", Ref.D(rds), backend.DownloadBuffer(ds), 1e-3);
 
-        // Also cross 65,535 workgroups on Route and DScores directly (N = 65535 * 256 + 1 = 16,776,961) without running
-        // single-workgroup O(N) Sort/WGrad scans that exceed Windows WDDM's 2s TDR budget on Vulkan graphics queues.
+        // Multi-slice Sort + full Forward/Backward parity when NK > MaxSortSlotsPerSlice (66,000 > 65,536) and B > 1.
+        Check(backend, 33000, 2, 4, 2, 2, 3, 1);
+
+        // Full Forward at N = 65535 * 256 + 1 = 16,776,961 (crosses 65,535 X-workgroups on Route & Combine and 257 Sort slices).
         const int nRoute = 65535 * 256 + 1;
+        var largeShape = new MoeShape(nRoute, 1, 2, 1, 1, 1);
+        Assert.True(largeShape.Admitted);
+        var xLargeHost = new float[nRoute];
         var scoresHost = new float[nRoute * 2];
         for (int i = 0; i < nRoute; i++)
         {
-            scoresHost[i * 2] = 0.2f;
-            scoresHost[i * 2 + 1] = 0.8f;
+            if ((i & 1) == 0)
+            {
+                xLargeHost[i] = 2.0f;
+                scoresHost[i * 2] = 0.8f;
+                scoresHost[i * 2 + 1] = 0.2f;
+            }
+            else
+            {
+                xLargeHost[i] = -1.0f;
+                scoresHost[i * 2] = 0.2f;
+                scoresHost[i * 2 + 1] = 0.8f;
+            }
         }
+        using var rX = backend.AllocateBuffer(xLargeHost);
         using var rScores = backend.AllocateBuffer(scoresHost);
+        using var rW1 = backend.AllocateBuffer(new[] { 1.0f, 1.0f });
+        using var rW3 = backend.AllocateBuffer(new[] { 2.0f, 3.0f });
+        using var rW2 = backend.AllocateBuffer(new[] { 0.5f, 1.5f });
         using var rIds = backend.AllocateBuffer(nRoute);
         using var rGates = backend.AllocateBuffer(nRoute);
         using var rSsum = backend.AllocateBuffer(nRoute);
-        backend.Fill(rIds, float.NaN, nRoute);
-        backend.Fill(rGates, float.NaN, nRoute);
-        backend.Fill(rSsum, float.NaN, nRoute);
-
-        PortableMoe.LaunchRoute(capped, nRoute, 2, 1, rScores, null, rIds, rGates, rSsum);
-        backend.Synchronize();
-        var idsOut = backend.DownloadBuffer(rIds);
-        var gatesOut = backend.DownloadBuffer(rGates);
-        Assert.Equal(1.0f, idsOut[0]);
-        Assert.Equal(1.0f, idsOut[nRoute - 1]);
-        Assert.Equal(1.0f, gatesOut[nRoute - 1]);
-
-        // DScores: dg[0] = o[0] * dy[t] = 3 * 5 = 15, dot = 15 * 0.6 = 9 -> ds[t, 1] = (15 - 9) / 2 = 3.
-        using var rO = backend.AllocateBuffer(new[] { 3.0f });
-        using var rDy = backend.AllocateBuffer(nRoute);
+        using var rPerm = backend.AllocateBuffer(nRoute);
         using var rPos = backend.AllocateBuffer(nRoute);
+        using var rEnds = backend.AllocateBuffer(2);
+        using var rLoads = backend.AllocateBuffer(2);
+        using var rH13 = backend.AllocateBuffer(nRoute * 2);
+        using var rO = backend.AllocateBuffer(nRoute);
+        using var rY = backend.AllocateBuffer(nRoute);
+        backend.Fill(rY, float.NaN, nRoute);
+        backend.Fill(rEnds, float.NaN, 2);
+        backend.Fill(rLoads, float.NaN, 2);
+
+        PortableMoe.Forward(capped, largeShape, rX, rScores, null, rW1, rW3, rW2,
+            rIds, rGates, rSsum, rPerm, rPos, rEnds, rLoads, rH13, rO, rY);
+        backend.Synchronize();
+
+        const int expectedE0 = (nRoute + 1) / 2; // 8,388,481 even tokens
+        const int expectedE1 = nRoute / 2;       // 8,388,480 odd tokens
+        var endsOut = backend.DownloadBuffer(rEnds);
+        var loadsOut = backend.DownloadBuffer(rLoads);
+        Assert.Equal((float)expectedE0, endsOut[0]);
+        Assert.Equal((float)nRoute, endsOut[1]);
+        Assert.Equal((float)expectedE0, loadsOut[0]);
+        Assert.Equal((float)expectedE1, loadsOut[1]);
+
+        var permOut = backend.DownloadBuffer(rPerm);
+        Assert.Equal(0.0f, permOut[0]);
+        Assert.Equal((float)(nRoute - 1), permOut[expectedE0 - 1]);
+        Assert.Equal(1.0f, permOut[expectedE0]);
+        Assert.Equal((float)(nRoute - 2), permOut[nRoute - 1]);
+
+        float expectedEvenY = (float)((2.0 / (1.0 + Math.Exp(-2.0))) * 4.0 * 0.5);
+        float expectedOddY = (float)((-1.0 / (1.0 + Math.Exp(1.0))) * (-3.0) * 1.5);
+        var yLargeOut = backend.DownloadBuffer(rY);
+        Assert.InRange(Math.Abs(yLargeOut[0] - expectedEvenY), 0f, 1e-4f);
+        Assert.InRange(Math.Abs(yLargeOut[1] - expectedOddY), 0f, 1e-4f);
+        Assert.InRange(Math.Abs(yLargeOut[nRoute - 2] - expectedOddY), 0f, 1e-4f);
+        Assert.InRange(Math.Abs(yLargeOut[nRoute - 1] - expectedEvenY), 0f, 1e-4f);
+
+        // DScores across > 65,535 workgroups: dg[0] = o[0] * dy[t] = 3 * 5 = 15, dot = 15 * 0.6 = 9 -> ds[t, e] = (15 - 9) / 2 = 3.
+        using var rDy = backend.AllocateBuffer(nRoute);
         using var rDs = backend.AllocateBuffer(nRoute * 2);
+        backend.Fill(rO, 3.0f, nRoute);
         backend.Fill(rDy, 5.0f, nRoute);
-        backend.Fill(rPos, 0.0f, nRoute);
         backend.Fill(rGates, 0.6f, nRoute);
         backend.Fill(rSsum, 2.0f, nRoute);
         backend.Fill(rDs, float.NaN, nRoute * 2);
@@ -247,8 +290,8 @@ public class MoeFusedPortTests
         PortableMoe.LaunchDScores(capped, nRoute, 1, 2, 1, rO, rDy, rPos, rGates, rSsum, rIds, rDs);
         backend.Synchronize();
         var dsOut = backend.DownloadBuffer(rDs);
-        Assert.Equal(0.0f, dsOut[(nRoute - 1) * 2]);
-        Assert.Equal(3.0f, dsOut[(nRoute - 1) * 2 + 1]);
+        Assert.Equal(3.0f, dsOut[(nRoute - 1) * 2]);
+        Assert.Equal(0.0f, dsOut[(nRoute - 1) * 2 + 1]);
     }
 
     private static void Check(IDirectGpuBackend backend, int n, int d, int g, int k, int f, int b, int empty)

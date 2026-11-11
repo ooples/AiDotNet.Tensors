@@ -94,22 +94,33 @@ internal static class SparseRoutingResolver
     }
 }
 
+internal static class SparseRoutingLimits
+{
+    /// <summary>Grid-stride thread cap for integer count and min/max reductions (4,096 workgroups of 256 threads).</summary>
+    public const int MaxReductionThreads = 4096 * 256;
+}
+
 internal static class SparseRoutingCsrPlan
 {
     private const long MaxTileMatrixInts = 1L << 22; // 4M ints (16 MB) cap on tileCounts[numTiles, numEntries]
+    public const int MaxTileCount = 256;
+    private const long TargetSlotsPerTile = 256L;
+    private const long TileRoundingIncrement = TargetSlotsPerTile - 1L;
+    public const int ChunkScratchInts = 256;
+    private const int ScratchIndexingReserve = 512;
 
     public static void Compute(int rows, int k, int numEntries,
         out long totalSlots, out int numTiles, out int offSorted, out int offTile, out int offChunk, out int totalScratchInts)
     {
         totalSlots = checked((long)rows * k);
-        if (totalSlots > int.MaxValue - numEntries - 512)
+        if (totalSlots > int.MaxValue - numEntries - ScratchIndexingReserve)
             throw new ArgumentOutOfRangeException(nameof(rows), "Sparse routing slot count exceeds CSR scratch indexing limits.");
-        int maxTilesByMem = (int)System.Math.Max(1L, System.Math.Min(256L, MaxTileMatrixInts / System.Math.Max(1, numEntries)));
-        int desiredTiles = (int)System.Math.Min(256L, (totalSlots + 255L) / 256L);
+        int maxTilesByMem = (int)System.Math.Max(1L, System.Math.Min(MaxTileCount, MaxTileMatrixInts / System.Math.Max(1, numEntries)));
+        int desiredTiles = (int)System.Math.Min(MaxTileCount, (totalSlots + TileRoundingIncrement) / TargetSlotsPerTile);
         numTiles = System.Math.Max(1, System.Math.Min(desiredTiles, maxTilesByMem));
         offSorted = checked(numEntries + 1);
         offTile = checked(offSorted + (int)totalSlots);
         offChunk = checked(offTile + checked(numTiles * numEntries));
-        totalScratchInts = checked(offChunk + 256);
+        totalScratchInts = checked(offChunk + ChunkScratchInts);
     }
 }

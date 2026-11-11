@@ -92,9 +92,10 @@ public partial class CpuEngine
             var capturedWeight = weight;
             var capturedBias = bias;
             var capturedTargetIds = targetIds;
+            var readoutGuard = new ReadoutMutationGuard<T>(weight, bias);
             var compiledSavedState = new object[]
             {
-                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, weight.Version, bias.Version
+                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, readoutGuard
             };
             if (!computeReadoutGrads)
             {
@@ -108,8 +109,7 @@ public partial class CpuEngine
                     (eng, output) =>
                     {
                         compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray().Clone();
-                        compiledSavedState[5] = capturedWeight.Version;
-                        compiledSavedState[6] = capturedBias.Version;
+                        readoutGuard.Refresh(capturedWeight, capturedBias);
                         var result = eng.FusedLinearCrossEntropyWithLogits(
                             capturedHidden, capturedWeight, capturedBias, capturedTargetIds, computeReadoutGrads: false);
                         DirectGpuTensorEngine.CopyResultInto(eng, result, output);
@@ -135,8 +135,7 @@ public partial class CpuEngine
                     // Labels are not differentiable graph inputs, but they are live training data.
                     // Refresh the backward state on every replay instead of freezing the trace batch.
                     compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray().Clone();
-                    compiledSavedState[5] = capturedWeight.Version;
-                    compiledSavedState[6] = capturedBias.Version;
+                    readoutGuard.Refresh(capturedWeight, capturedBias);
                     var result = eng.FusedLinearCrossEntropyWithLogits(
                         capturedHidden, capturedWeight, capturedBias, capturedTargetIds, computeReadoutGrads: true);
                     DirectGpuTensorEngine.CopyResultInto(eng, result, output);
@@ -191,7 +190,11 @@ public partial class CpuEngine
             "FusedLinearCrossEntropy", output,
             tapeInputs,
             FusedLinearCrossEntropyIndexBackward<T>,
-            savedState: new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, weight.Version, bias.Version });
+            savedState: new object[]
+            {
+                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads,
+                new ReadoutMutationGuard<T>(weight, bias)
+            });
 
         return output;
     }
@@ -606,28 +609,80 @@ public partial class CpuEngine
             FusedLinearCrossEntropyPrecomputedBackward<T>,
             savedState: new object[]
             {
-                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, weight.Version, bias.Version, precomputed
+                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads,
+                new ReadoutMutationGuard<T>(weight, bias), precomputed
             });
         return output;
     }
 
+    internal sealed class ReadoutMutationGuard<T>
+    {
+        private Tensor<T> _weight;
+        private int _weightVersion;
+        private int _weightStorageVersion;
+        private Tensor<T> _bias;
+        private int _biasVersion;
+        private int _biasStorageVersion;
+
+        internal ReadoutMutationGuard(Tensor<T> weight, Tensor<T> bias)
+        {
+            _weight = weight;
+            _weightVersion = weight.Version;
+            _weightStorageVersion = weight.StorageMutationVersion;
+            _bias = bias;
+            _biasVersion = bias.Version;
+            _biasStorageVersion = bias.StorageMutationVersion;
+        }
+
+        internal void Refresh(Tensor<T> weight, Tensor<T> bias)
+        {
+            _weight = weight;
+            _weightVersion = weight.Version;
+            _weightStorageVersion = weight.StorageMutationVersion;
+            _bias = bias;
+            _biasVersion = bias.Version;
+            _biasStorageVersion = bias.StorageMutationVersion;
+        }
+
+        internal void Rebase(Tensor<T> from, Tensor<T> to)
+        {
+            if (ReferenceEquals(_weight, from))
+            {
+                _weight = to;
+                _weightVersion = to.Version;
+                _weightStorageVersion = to.StorageMutationVersion;
+            }
+            if (ReferenceEquals(_bias, from))
+            {
+                _bias = to;
+                _biasVersion = to.Version;
+                _biasStorageVersion = to.StorageMutationVersion;
+            }
+        }
+
+        internal void Validate(Tensor<T> weight, Tensor<T> bias)
+        {
+            if (InferenceModeFlag.IsActive) return;
+            if (weight.Version != _weightVersion || weight.StorageMutationVersion != _weightStorageVersion)
+            {
+                throw new InvalidOperationException(
+                    "Tensor input 1 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +
+                    "This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
+            }
+            if (bias.Version != _biasVersion || bias.StorageMutationVersion != _biasStorageVersion)
+            {
+                throw new InvalidOperationException(
+                    "Tensor input 2 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +
+                    "This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
+            }
+        }
+    }
+
     private static void ValidateDetachedReadoutVersions<T>(Tensor<T> weight, Tensor<T> bias, object[] savedState)
     {
-        if (InferenceModeFlag.IsActive || savedState.Length < 7) return;
-        int expectedWeightVersion = (int)savedState[5];
-        int expectedBiasVersion = (int)savedState[6];
-        if (weight.Version != expectedWeightVersion)
-        {
-            throw new InvalidOperationException(
-                "Tensor input 1 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +
-                "This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
-        }
-        if (bias.Version != expectedBiasVersion)
-        {
-            throw new InvalidOperationException(
-                "Tensor input 2 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +
-                "This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
-        }
+        if (InferenceModeFlag.IsActive || savedState.Length < 6) return;
+        if (savedState[5] is ReadoutMutationGuard<T> guard)
+            guard.Validate(weight, bias);
     }
 
     /// <summary>
@@ -642,7 +697,7 @@ public partial class CpuEngine
         var weight = computeReadout && inputs.Length > 1 ? inputs[1] : (Tensor<T>)savedState[2];
         var bias = computeReadout && inputs.Length > 2 ? inputs[2] : (Tensor<T>)savedState[3];
         ValidateDetachedReadoutVersions(weight, bias, savedState);
-        var pre = (FusedCePrecomputedGradients)savedState[7];
+        var pre = (FusedCePrecomputedGradients)savedState[6];
         var dHidden = System.Threading.Interlocked.Exchange(ref pre.Hidden, null);
         var dWeight = System.Threading.Interlocked.Exchange(ref pre.Weight, null);
         var dBias = System.Threading.Interlocked.Exchange(ref pre.Bias, null);

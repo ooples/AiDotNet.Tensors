@@ -13633,6 +13633,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
+        Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
         if (Compilation.GraphMode.IsActive)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
@@ -13643,7 +13644,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int n = hidden.Shape._dims[0];
         int d = hidden.Shape._dims[1];
         int vocab = weight.Shape._dims[1];
-        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab || targetIds.Length != n)
+        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d
+            || bias.Rank != 1 || bias.Length != vocab
+            || targetIds.Rank != 1 || targetIds.Length != n)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads);
 
         // A captured graph replays the device work it recorded, not this call: host-backed ids uploaded now would be
@@ -13722,7 +13725,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     savedState: new object[]
                     {
                         (int[])targetIds.GetDataArray().Clone(), vocab, weight, bias, computeReadoutGrads,
-                        weight.Version, bias.Version
+                        new CpuEngine.ReadoutMutationGuard<T>(weight, bias)
                     });
             }
             return result;
@@ -13747,6 +13750,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (target is null) throw new ArgumentNullException(nameof(target));
+        Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
         if (Compilation.GraphMode.IsActive)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
@@ -13757,7 +13761,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int n = hidden.Shape._dims[0];
         int d = hidden.Shape._dims[1];
         int vocab = weight.Shape._dims[1];
-        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Length != vocab
+        if (n <= 0 || vocab <= 0 || weight.Shape._dims[0] != d || bias.Rank != 1 || bias.Length != vocab
             || target.Rank != 2 || target.Shape._dims[0] != n || target.Shape._dims[1] != vocab)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
 

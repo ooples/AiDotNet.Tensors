@@ -16,6 +16,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal readonly VulkanBuffer Staging;
     private int _disposed;
     private readonly VulkanGpuBuffer? _viewParent;
+    private VulkanBackend? _batchUploadOwner;
     // What GpuMemoryStats counts for the device-local storage buffer (the staging buffer is host-visible memory).
     private DeviceMemoryHold _memory;
 
@@ -251,6 +252,15 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         return buffer;
     }
 
+    internal void HoldForBatchUpload(VulkanBackend owner) =>
+        System.Threading.Volatile.Write(ref _batchUploadOwner, owner);
+
+    internal void ClearBatchUploadHold() =>
+        System.Threading.Interlocked.Exchange(ref _batchUploadOwner, null);
+
+    internal static void CompleteDeferredBatchDispose(VulkanGpuBuffer buffer) =>
+        ReleaseWhenIdle(buffer);
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -260,6 +270,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // its buffers). Without the credit a TensorScope's frees still counted toward a forced collection.
         long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
         if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
+        var batchOwner = System.Threading.Interlocked.Exchange(ref _batchUploadOwner, null);
+        if (batchOwner is not null && batchOwner.TryDeferDisposedBatchUpload(this))
+            return;
         ReleaseWhenIdle(this);
     }
 

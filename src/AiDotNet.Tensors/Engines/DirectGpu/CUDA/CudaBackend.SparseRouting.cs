@@ -145,7 +145,7 @@ public sealed partial class CudaBackend : ISparseRoutingBackend
 
         if (length > 0)
         {
-            int totalThreads = System.Math.Min(length, 4096 * DefaultBlockSize);
+            int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
             void** aAcc = stackalloc void*[5];
             aAcc[0] = &pi; aAcc[1] = &pc; aAcc[2] = &length; aAcc[3] = &numBins; aAcc[4] = &totalThreads;
             LaunchKernel(fnAcc, SparseRoutingGrid(totalThreads), (uint)DefaultBlockSize, aAcc);
@@ -168,7 +168,7 @@ public sealed partial class CudaBackend : ISparseRoutingBackend
         aInit[0] = &po;
         LaunchKernel(fnInit, 1u, (uint)DefaultBlockSize, aInit);
 
-        int totalThreads = System.Math.Min(length, 4096 * DefaultBlockSize);
+        int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
         void** aRed = stackalloc void*[4];
         aRed[0] = &pd; aRed[1] = &po; aRed[2] = &length; aRed[3] = &totalThreads;
         LaunchKernel(fnRed, SparseRoutingGrid(totalThreads), (uint)DefaultBlockSize, aRed);

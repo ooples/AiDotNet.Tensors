@@ -4,6 +4,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 public sealed unsafe partial class VulkanBackend : ISparseRoutingBackend
 {
+    internal uint? MaxSparseRoutingWorkgroupsXForTests { get; set; }
+
     private void DispatchSparseRouting(string glsl, IGpuBuffer[] buffers, uint[] scalars, long workItems)
     {
         if (workItems == 0) return;
@@ -13,9 +15,28 @@ public sealed unsafe partial class VulkanBackend : ISparseRoutingBackend
         if (!IsGlslCompilerAvailable)
             throw new GpuCapabilityUnavailableException(
                 "Vulkan sparse-routing shaders require runtime GLSL compilation (shaderc), which is unavailable.");
+
+        uint deviceMaxGroups = _device.Limits.maxComputeWorkGroupCountX;
+        if (MaxSparseRoutingWorkgroupsXForTests is { } cap && cap > 0 && cap < deviceMaxGroups)
+            deviceMaxGroups = cap;
+        long maxItemsPerLaunch = System.Math.Min(
+            (long)(int.MaxValue / VulkanKernels.WorkgroupSize) * VulkanKernels.WorkgroupSize,
+            (long)deviceMaxGroups * VulkanKernels.WorkgroupSize);
+        if (maxItemsPerLaunch <= 0)
+            maxItemsPerLaunch = VulkanKernels.WorkgroupSize;
+
+        var push = new uint[scalars.Length + 1];
+        System.Array.Copy(scalars, push, scalars.Length);
+
         try
         {
-            GlslNaryOp(glsl, buffers, (int)workItems, scalars);
+            for (long offset = 0; offset < workItems; )
+            {
+                int chunk = (int)System.Math.Min(maxItemsPerLaunch, workItems - offset);
+                push[scalars.Length] = (uint)offset;
+                GlslNaryOp(glsl, buffers, chunk, push);
+                offset += chunk;
+            }
         }
         catch (InvalidOperationException ex)
         {
@@ -67,40 +88,46 @@ public sealed unsafe partial class VulkanBackend : ISparseRoutingBackend
         int totalSlots = (int)totalSlotsLong;
         int tileCountInts = checked(numTiles * numEntries);
 
-        using var csrBuf = AllocateBuffer(totalScratchInts);
-
-        DispatchSparseRouting(VulkanRecurrenceKernels.SparseZeroInt32,
-            new[] { csrBuf }, new[] { (uint)offTile, (uint)tileCountInts }, tileCountInts);
-
-        if (totalSlots > 0)
+        var csrBuf = AllocateBuffer(totalScratchInts);
+        try
         {
-            DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrTileCounts,
-                new[] { int32Indices, csrBuf },
-                new[] { (uint)totalSlots, (uint)numEntries, (uint)numTiles, (uint)offTile },
-                numTiles);
+            DispatchSparseRouting(VulkanRecurrenceKernels.SparseZeroInt32,
+                new[] { csrBuf }, new[] { (uint)offTile, (uint)tileCountInts }, tileCountInts);
+
+            if (totalSlots > 0)
+            {
+                DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrTileCounts,
+                    new[] { int32Indices, csrBuf },
+                    new[] { (uint)totalSlots, (uint)numEntries, (uint)numTiles, (uint)offTile },
+                    numTiles);
+            }
+
+            DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrEntryPrefix,
+                new[] { csrBuf }, new[] { (uint)numEntries, (uint)numTiles, (uint)offTile }, numEntries);
+
+            DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrChunkSums,
+                new[] { csrBuf }, new[] { (uint)numEntries, (uint)offChunk }, SparseRoutingCsrPlan.ChunkScratchInts);
+
+            DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrChunkFinalize,
+                new[] { csrBuf }, new[] { (uint)numEntries, (uint)offChunk }, (long)numEntries + 1);
+
+            if (totalSlots > 0)
+            {
+                DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrScatterSlots,
+                    new[] { int32Indices, csrBuf },
+                    new[] { (uint)totalSlots, (uint)numEntries, (uint)numTiles, (uint)offSorted, (uint)offTile },
+                    numTiles);
+            }
+
+            DispatchSparseRouting(VulkanRecurrenceKernels.TopKWeightedRowMixBackwardTable,
+                new[] { gradOutput, weights, csrBuf, gradTable },
+                new[] { (uint)numEntries, (uint)k, (uint)channels, (uint)offSorted },
+                totalOut);
         }
-
-        DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrEntryPrefix,
-            new[] { csrBuf }, new[] { (uint)numEntries, (uint)numTiles, (uint)offTile }, numEntries);
-
-        DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrChunkSums,
-            new[] { csrBuf }, new[] { (uint)numEntries, (uint)offChunk }, 256);
-
-        DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrChunkFinalize,
-            new[] { csrBuf }, new[] { (uint)numEntries, (uint)offChunk }, (long)numEntries + 1);
-
-        if (totalSlots > 0)
+        finally
         {
-            DispatchSparseRouting(VulkanRecurrenceKernels.TopKCsrScatterSlots,
-                new[] { int32Indices, csrBuf },
-                new[] { (uint)totalSlots, (uint)numEntries, (uint)numTiles, (uint)offSorted, (uint)offTile },
-                numTiles);
+            ((IQueuedBufferRelease)this).ReleaseAfterQueuedWork(csrBuf);
         }
-
-        DispatchSparseRouting(VulkanRecurrenceKernels.TopKWeightedRowMixBackwardTable,
-            new[] { gradOutput, weights, csrBuf, gradTable },
-            new[] { (uint)numEntries, (uint)k, (uint)channels, (uint)offSorted },
-            totalOut);
     }
 
     void ISparseRoutingBackend.CountIndicesInt32(IGpuBuffer int32Indices, IGpuBuffer counts, int length, int numBins)
@@ -110,7 +137,7 @@ public sealed unsafe partial class VulkanBackend : ISparseRoutingBackend
             new[] { counts }, new[] { 0u, (uint)numBins }, numBins);
         if (length > 0)
         {
-            int totalThreads = System.Math.Min(length, 4096 * 256);
+            int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
             DispatchSparseRouting(VulkanRecurrenceKernels.CountIndicesAccumulateInt32,
                 new[] { int32Indices, counts },
                 new[] { (uint)length, (uint)numBins, (uint)totalThreads },
@@ -125,7 +152,7 @@ public sealed unsafe partial class VulkanBackend : ISparseRoutingBackend
         if (length <= 0) return;
         DispatchSparseRouting(VulkanRecurrenceKernels.MinMaxInitInt32,
             new[] { outMinMaxInt32 }, new[] { 2u }, 2);
-        int totalThreads = System.Math.Min(length, 4096 * 256);
+        int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
         DispatchSparseRouting(VulkanRecurrenceKernels.MinMaxReduceInt32,
             new[] { int32Data, outMinMaxInt32 },
             new[] { (uint)length, (uint)totalThreads },

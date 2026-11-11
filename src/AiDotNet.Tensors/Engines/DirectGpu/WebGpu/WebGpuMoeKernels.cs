@@ -222,62 +222,120 @@ var<workgroup> wgEnd: i32;
 
     private const string SortBody = Entry + @"
     let e = grp + pm.groupBase;
-    var less = 0.0;
-    var mine = 0.0;
-    for (var b0 = 0; b0 < pm.NK; b0 = b0 + 256) {
-        let s = b0 + tid;
-        if (s < pm.NK) {
-            let v = i32(ids[s]);
-            if (v < e) { less = less + 1.0; }
-            if (v == e) { mine = mine + 1.0; }
+    if (pm.phase != 2) {
+        var less = 0.0;
+        var mine = 0.0;
+        for (var b0 = pm.slotStart; b0 < pm.slotEnd; b0 = b0 + 256) {
+            let s = b0 + tid;
+            if (s < pm.slotEnd) {
+                let v = i32(ids[s]);
+                if (v < e) { less = less + 1.0; }
+                if (v == e) { mine = mine + 1.0; }
+            }
         }
-    }
-    sm[tid] = less;
-    sm[256 + tid] = mine;
-    workgroupBarrier();
-    for (var o = 128; o > 0; o = o / 2) {
-        if (tid < o) { sm[tid] = sm[tid] + sm[tid + o]; sm[256 + tid] = sm[256 + tid] + sm[256 + tid + o]; }
-        workgroupBarrier();
-    }
-    let start = sm[0];
-    let count = sm[256];
-    workgroupBarrier();
-    if (tid == 0) { ends[e] = start + count; }
-    var running = start;
-    for (var b0 = 0; b0 < pm.NK; b0 = b0 + 256) {
-        let s = b0 + tid;
-        var flag = 0.0;
-        if (s < pm.NK) { if (i32(ids[s]) == e) { flag = 1.0; } }
-        sm[tid] = flag;
-        workgroupBarrier();
-        for (var off = 1; off < 256; off = off * 2) {
-            var add = 0.0;
-            if (tid >= off) { add = sm[tid - off]; }
-            workgroupBarrier();
-            sm[tid] = sm[tid] + add;
-            workgroupBarrier();
-        }
-        if (flag != 0.0) {
-            let p = running + sm[tid] - 1.0;
-            perm[i32(p)] = f32(s);
-            pos[s] = p;
-        }
-        running = running + sm[255];
-        workgroupBarrier();
-    }
-    for (var b = 0; b < pm.B; b = b + 1) {
-        var c = 0.0;
-        for (var s = b * pm.SPS + tid; s < (b + 1) * pm.SPS; s = s + 256) {
-            if (i32(ids[s]) == e) { c = c + 1.0; }
-        }
-        sm[tid] = c;
+        sm[tid] = less;
+        sm[256 + tid] = mine;
         workgroupBarrier();
         for (var o = 128; o > 0; o = o / 2) {
-            if (tid < o) { sm[tid] = sm[tid] + sm[tid + o]; }
+            if (tid < o) { sm[tid] = sm[tid] + sm[tid + o]; sm[256 + tid] = sm[256 + tid] + sm[256 + tid + o]; }
             workgroupBarrier();
         }
-        if (tid == 0) { loads[b * pm.G + e] = sm[0]; }
+        if (pm.phase == 3) {
+            let start = sm[0];
+            let count = sm[256];
+            workgroupBarrier();
+            if (tid == 0) { ends[e] = start + count; }
+            var running = start;
+            for (var b0 = pm.slotStart; b0 < pm.slotEnd; b0 = b0 + 256) {
+                let s = b0 + tid;
+                var flag = 0.0;
+                if (s < pm.slotEnd) { if (i32(ids[s]) == e) { flag = 1.0; } }
+                sm[tid] = flag;
+                workgroupBarrier();
+                for (var off = 1; off < 256; off = off * 2) {
+                    var add = 0.0;
+                    if (tid >= off) { add = sm[tid - off]; }
+                    workgroupBarrier();
+                    sm[tid] = sm[tid] + add;
+                    workgroupBarrier();
+                }
+                if (flag != 0.0) {
+                    let p = running + sm[tid] - 1.0;
+                    perm[i32(p)] = f32(s);
+                    pos[s] = p;
+                }
+                running = running + sm[255];
+                workgroupBarrier();
+            }
+        } else {
+            if (tid == 0) {
+                if (pm.phase == 0) { ends[e] = sm[0]; } else { ends[e] = ends[e] + sm[0]; }
+            }
+            workgroupBarrier();
+        }
+        if (pm.SPS <= 256) {
+            let bFirst = pm.slotStart / pm.SPS;
+            let bEnd = pm.slotEnd / pm.SPS;
+            for (var b = bFirst + tid; b < bEnd; b = b + 256) {
+                var c = 0.0;
+                let bs = b * pm.SPS;
+                let be = bs + pm.SPS;
+                for (var s = bs; s < be; s = s + 1) {
+                    if (i32(ids[s]) == e) { c = c + 1.0; }
+                }
+                loads[b * pm.G + e] = c;
+            }
+        } else {
+            let bFirst = pm.slotStart / pm.SPS;
+            let bLast = (pm.slotEnd - 1) / pm.SPS;
+            for (var b = bFirst; b <= bLast; b = b + 1) {
+                let bs = b * pm.SPS;
+                let be = (b + 1) * pm.SPS;
+                let segStart = max(bs, pm.slotStart);
+                let segEnd = min(be, pm.slotEnd);
+                var c = 0.0;
+                for (var s = segStart + tid; s < segEnd; s = s + 256) {
+                    if (i32(ids[s]) == e) { c = c + 1.0; }
+                }
+                sm[tid] = c;
+                workgroupBarrier();
+                for (var o = 128; o > 0; o = o / 2) {
+                    if (tid < o) { sm[tid] = sm[tid] + sm[tid + o]; }
+                    workgroupBarrier();
+                }
+                if (tid == 0) {
+                    if (segStart == bs) { loads[b * pm.G + e] = sm[0]; } else { loads[b * pm.G + e] = loads[b * pm.G + e] + sm[0]; }
+                }
+                workgroupBarrier();
+            }
+        }
+    } else {
+        if (tid == 0) { sm[0] = ends[e]; }
         workgroupBarrier();
+        var running = sm[0];
+        workgroupBarrier();
+        for (var b0 = pm.slotStart; b0 < pm.slotEnd; b0 = b0 + 256) {
+            let s = b0 + tid;
+            var flag = 0.0;
+            if (s < pm.slotEnd) { if (i32(ids[s]) == e) { flag = 1.0; } }
+            sm[tid] = flag;
+            workgroupBarrier();
+            for (var off = 1; off < 256; off = off * 2) {
+                var add = 0.0;
+                if (tid >= off) { add = sm[tid - off]; }
+                workgroupBarrier();
+                sm[tid] = sm[tid] + add;
+                workgroupBarrier();
+            }
+            if (flag != 0.0) {
+                let p = running + sm[tid] - 1.0;
+                perm[i32(p)] = f32(s);
+                pos[s] = p;
+            }
+            running = running + sm[255];
+            workgroupBarrier();
+        }
+        if (tid == 0) { ends[e] = running; }
     }
 }
 ";

@@ -139,7 +139,7 @@ public sealed partial class HipBackend : ISparseRoutingBackend
 
         if (length > 0)
         {
-            int totalThreads = System.Math.Min(length, 4096 * (int)DefaultBlockSize);
+            int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
             void** aAcc = stackalloc void*[5];
             aAcc[0] = &pi; aAcc[1] = &pc; aAcc[2] = &length; aAcc[3] = &numBins; aAcc[4] = &totalThreads;
             LaunchKernel(fnAcc, SparseRoutingGrid(totalThreads), DefaultBlockSize, aAcc);
@@ -161,7 +161,7 @@ public sealed partial class HipBackend : ISparseRoutingBackend
         aInit[0] = &po;
         LaunchKernel(fnInit, 1u, DefaultBlockSize, aInit);
 
-        int totalThreads = System.Math.Min(length, 4096 * (int)DefaultBlockSize);
+        int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
         void** aRed = stackalloc void*[4];
         aRed[0] = &pd; aRed[1] = &po; aRed[2] = &length; aRed[3] = &totalThreads;
         LaunchKernel(fnRed, SparseRoutingGrid(totalThreads), DefaultBlockSize, aRed);

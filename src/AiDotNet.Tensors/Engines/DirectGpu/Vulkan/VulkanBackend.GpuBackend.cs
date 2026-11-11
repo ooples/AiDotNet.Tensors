@@ -312,6 +312,7 @@ public sealed unsafe partial class VulkanBackend
                         VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         0, 0, IntPtr.Zero, 1, &barrier, 0, IntPtr.Zero);
+                    HoldBatchUploadBuffer(buffer);
                     return buffer;
                 }
             }
@@ -447,6 +448,8 @@ public sealed unsafe partial class VulkanBackend
             floatData[i] = Int32BitsToSingleCompat(data[i]);
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && floatData.Length > 0)
+            return AllocateAndRecordBatchUpload(floatData);
         return VulkanGpuBuffer.Create(floatData, _transfer);
     }
 

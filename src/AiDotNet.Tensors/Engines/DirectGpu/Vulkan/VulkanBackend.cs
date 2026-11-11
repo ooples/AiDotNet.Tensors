@@ -1047,6 +1047,48 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     private void RecordAndExecuteComputeWithScalarUnlocked(VulkanComputePipeline pipeline, int elementCount, float scalar, ThreadCommandResources threadRes)
     {
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
+        {
+            var batchCmd = _batchThreadRes.CommandBuffer;
+            if (_batchDispatchCount > 0)
+                RecordComputeMemoryBarrier(batchCmd);
+
+            VulkanNativeBindings.vkCmdBindPipeline(
+                batchCmd,
+                VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.Handle);
+
+            var batchDs = RetainBatchDescriptorSet(pipeline);
+            VulkanNativeBindings.vkCmdBindDescriptorSets(
+                batchCmd,
+                VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.Layout,
+                0, 1, &batchDs,
+                0, null);
+
+            Span<byte> batchPush = stackalloc byte[sizeof(uint) + sizeof(float)];
+            uint batchSize = (uint)elementCount;
+            Unsafe.WriteUnaligned(ref batchPush[0], batchSize);
+            Unsafe.WriteUnaligned(ref batchPush[sizeof(uint)], scalar);
+            fixed (byte* pBatchPush = batchPush)
+            {
+                VulkanNativeBindings.vkCmdPushConstants(
+                    batchCmd,
+                    pipeline.Layout,
+                    VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT,
+                    0,
+                    (uint)batchPush.Length,
+                    pBatchPush);
+            }
+
+            uint batchWgCount = VulkanKernels.CalculateWorkgroupCount(elementCount);
+            EnsureDispatchable(batchWgCount);
+            JournalDispatch(pipeline, batchWgCount, VulkanKernels.WorkgroupSize);
+            VulkanNativeBindings.vkCmdDispatch(batchCmd, batchWgCount, 1, 1);
+            _batchDispatchCount++;
+            return;
+        }
+
         var cmdBuffer = DispatchCommandBuffer(threadRes, out bool deferred);
 
         // Reset command buffer
@@ -1183,6 +1225,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         };
         VulkanNativeBindings.vkBeginCommandBuffer(cmdBuffer, &beginInfo);
 
+        BeginBatchBufferHold();
         _batchMode = true;
         _batchOwnerThreadId = Environment.CurrentManagedThreadId;
     }
@@ -1290,6 +1333,9 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         {
             // Wait for device to finish
             _device.WaitIdle();
+            _batchMode = false;
+            _batchDispatchCount = 0;
+            ReleaseBuffersHeldForBatch();
 
             // Parked buffers must be freed while the device still exists. The placeholder is pooled, so it is
             // released first and the drain frees it with the rest.

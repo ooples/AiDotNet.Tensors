@@ -91,7 +91,7 @@ public sealed partial class MetalBackend : ISparseRoutingBackend
         DispatchSparseRouting("sparse_zero_int32", new[] { mCounts }, new[] { 0, numBins }, numBins);
         if (length > 0)
         {
-            int totalThreads = System.Math.Min(length, 4096 * 256);
+            int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
             DispatchSparseRouting("count_indices_accumulate_int32",
                 new[] { M(int32Indices), mCounts },
                 new[] { length, numBins, totalThreads },
@@ -105,7 +105,7 @@ public sealed partial class MetalBackend : ISparseRoutingBackend
         if (length <= 0) return;
         var mOut = M(outMinMaxInt32);
         DispatchSparseRouting("minmax_init_int32", new[] { mOut }, new[] { 2 }, 2);
-        int totalThreads = System.Math.Min(length, 4096 * 256);
+        int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
         DispatchSparseRouting("minmax_reduce_int32",
             new[] { M(int32Data), mOut },
             new[] { length, totalThreads },

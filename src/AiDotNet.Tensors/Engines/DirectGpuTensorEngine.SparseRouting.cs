@@ -215,12 +215,18 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// Maximum input length for float-backed GPU histogram counts: IEEE-754 binary32 represents every non-negative
+    /// integer up to <c>2^24</c> (<c>16,777,216</c>) without rounding loss.
+    /// </summary>
+    private const int MaxExactFloatCount = 1 << 24;
+
     public override Tensor<T> TensorCountIndices<T>(Tensor<int> indices, int numBins)
     {
         using var __gpuOp = EnterGpuOp();
         if (Compilation.GraphMode.IsActive || (typeof(T) != typeof(float) && typeof(T) != typeof(int))
             || !TryGetBackend(out var backend) || SparseRoutingResolver.Resolve(backend) is not { } sr
-            || indices is null || numBins <= 0 || indices.Length > 16_777_216)
+            || indices is null || numBins <= 0 || indices.Length > MaxExactFloatCount)
             return base.TensorCountIndices<T>(indices!, numBins);
 
         if (indices.Length == 0)

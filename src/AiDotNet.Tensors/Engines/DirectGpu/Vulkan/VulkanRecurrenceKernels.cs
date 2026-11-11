@@ -580,30 +580,30 @@ void main() {
 layout(set=0,binding=0) readonly buffer Vb { float valBuf[]; };
 layout(set=0,binding=1) readonly buffer Ib { int idxBuf[]; };
 layout(set=0,binding=2) buffer Ob { float outBuf[]; };
-layout(push_constant) uniform PC { uint rows; uint cols; uint k; };
+layout(push_constant) uniform PC { uint rows; uint cols; uint k; uint baseOffset; };
 void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int R = int(rows), C = int(cols), K = int(k);
-    if (gid >= R * K) return;
-    int r = gid / K;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
+    uint total = rows * k;
+    if (gid >= total) return;
+    uint r = gid / k;
     int col = idxBuf[gid];
-    outBuf[gid] = (col >= 0 && col < C) ? valBuf[r * C + col] : 0.0;
+    outBuf[gid] = (col >= 0 && col < int(cols)) ? valBuf[r * cols + uint(col)] : 0.0;
 }";
 
     public static string GatherRowValuesBackward => Header + @"
 layout(set=0,binding=0) readonly buffer Gb { float gradBuf[]; };
 layout(set=0,binding=1) readonly buffer Ib { int idxBuf[]; };
 layout(set=0,binding=2) buffer DVb { float gradValBuf[]; };
-layout(push_constant) uniform PC { uint rows; uint cols; uint k; };
+layout(push_constant) uniform PC { uint rows; uint cols; uint k; uint baseOffset; };
 void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int R = int(rows), C = int(cols), K = int(k);
-    if (gid >= R * C) return;
-    int r = gid / C;
-    int c = gid % C;
-    int kBase = r * K;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
+    uint total = rows * cols;
+    if (gid >= total) return;
+    uint r = gid / cols;
+    int c = int(gid % cols);
+    uint kBase = r * k;
     float acc = 0.0;
-    for (int j = 0; j < K; j++) {
+    for (uint j = 0u; j < k; j++) {
         if (idxBuf[kBase + j] == c) acc += gradBuf[kBase + j];
     }
     gradValBuf[gid] = acc;
@@ -614,18 +614,19 @@ layout(set=0,binding=0) readonly buffer Tb { float tblBuf[]; };
 layout(set=0,binding=1) readonly buffer Ib { int idxBuf[]; };
 layout(set=0,binding=2) readonly buffer Wb { float wBuf[]; };
 layout(set=0,binding=3) buffer Ob { float outBuf[]; };
-layout(push_constant) uniform PC { uint rows; uint numEntries; uint k; uint channels; };
+layout(push_constant) uniform PC { uint rows; uint numEntries; uint k; uint channels; uint baseOffset; };
 void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int R = int(rows), G = int(numEntries), K = int(k), C = int(channels);
-    if (gid >= R * C) return;
-    int r = gid / C;
-    int c = gid % C;
-    int kBase = r * K;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
+    uint total = rows * channels;
+    if (gid >= total) return;
+    uint r = gid / channels;
+    uint c = gid % channels;
+    int G = int(numEntries);
+    uint kBase = r * k;
     float acc = 0.0;
-    for (int j = 0; j < K; j++) {
+    for (uint j = 0u; j < k; j++) {
         int entry = idxBuf[kBase + j];
-        if (entry >= 0 && entry < G) acc += wBuf[kBase + j] * tblBuf[entry * C + c];
+        if (entry >= 0 && entry < G) acc += wBuf[kBase + j] * tblBuf[uint(entry) * channels + c];
     }
     outBuf[gid] = acc;
 }";
@@ -635,36 +636,37 @@ layout(set=0,binding=0) readonly buffer Gb { float gradBuf[]; };
 layout(set=0,binding=1) readonly buffer Tb { float tblBuf[]; };
 layout(set=0,binding=2) readonly buffer Ib { int idxBuf[]; };
 layout(set=0,binding=3) buffer DWb { float gradWBuf[]; };
-layout(push_constant) uniform PC { uint rows; uint numEntries; uint k; uint channels; };
+layout(push_constant) uniform PC { uint rows; uint numEntries; uint k; uint channels; uint baseOffset; };
 void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int R = int(rows), G = int(numEntries), K = int(k), C = int(channels);
-    if (gid >= R * K) return;
-    int r = gid / K;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
+    uint total = rows * k;
+    if (gid >= total) return;
+    uint r = gid / k;
+    int G = int(numEntries);
     int entry = idxBuf[gid];
     float acc = 0.0;
     if (entry >= 0 && entry < G) {
-        int goBase = r * C;
-        int tbBase = entry * C;
-        for (int c = 0; c < C; c++) acc += gradBuf[goBase + c] * tblBuf[tbBase + c];
+        uint goBase = r * channels;
+        uint tbBase = uint(entry) * channels;
+        for (uint c = 0u; c < channels; c++) acc += gradBuf[goBase + c] * tblBuf[tbBase + c];
     }
     gradWBuf[gid] = acc;
 }";
 
     public static string SparseZeroInt32 => Header + @"
 layout(set=0,binding=0) buffer Bb { int buf[]; };
-layout(push_constant) uniform PC { uint offset; uint count; };
+layout(push_constant) uniform PC { uint offset; uint count; uint baseOffset; };
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
     if (gid < count) buf[offset + gid] = 0;
 }";
 
     public static string TopKCsrTileCounts => Header + @"
 layout(set=0,binding=0) readonly buffer Ib { int idxBuf[]; };
 layout(set=0,binding=1) buffer Cb { int csrBuf[]; };
-layout(push_constant) uniform PC { uint totalSlots; uint numEntries; uint numTiles; uint offTile; };
+layout(push_constant) uniform PC { uint totalSlots; uint numEntries; uint numTiles; uint offTile; uint baseOffset; };
 void main() {
-    int t = int(gl_GlobalInvocationID.x);
+    int t = int(baseOffset + gl_GlobalInvocationID.x);
     int TS = int(totalSlots), G = int(numEntries), NT = int(numTiles);
     if (t >= NT || TS <= 0) return;
     int tileSpan = ((TS - 1) / NT) + 1;
@@ -681,9 +683,9 @@ void main() {
 
     public static string TopKCsrEntryPrefix => Header + @"
 layout(set=0,binding=0) buffer Cb { int csrBuf[]; };
-layout(push_constant) uniform PC { uint numEntries; uint numTiles; uint offTile; };
+layout(push_constant) uniform PC { uint numEntries; uint numTiles; uint offTile; uint baseOffset; };
 void main() {
-    uint g = gl_GlobalInvocationID.x;
+    uint g = baseOffset + gl_GlobalInvocationID.x;
     if (g >= numEntries) return;
     int acc = 0;
     for (uint t = 0u; t < numTiles; t++) {
@@ -697,9 +699,9 @@ void main() {
 
     public static string TopKCsrChunkSums => Header + @"
 layout(set=0,binding=0) buffer Cb { int csrBuf[]; };
-layout(push_constant) uniform PC { uint numEntries; uint offChunk; };
+layout(push_constant) uniform PC { uint numEntries; uint offChunk; uint baseOffset; };
 void main() {
-    int cIdx = int(gl_GlobalInvocationID.x);
+    int cIdx = int(baseOffset + gl_GlobalInvocationID.x);
     if (cIdx >= 256) return;
     int G = int(numEntries);
     int acc = 0;
@@ -721,9 +723,9 @@ void main() {
 
     public static string TopKCsrChunkFinalize => Header + @"
 layout(set=0,binding=0) buffer Cb { int csrBuf[]; };
-layout(push_constant) uniform PC { uint numEntries; uint offChunk; };
+layout(push_constant) uniform PC { uint numEntries; uint offChunk; uint baseOffset; };
 void main() {
-    uint ug = gl_GlobalInvocationID.x;
+    uint ug = baseOffset + gl_GlobalInvocationID.x;
     if (ug > numEntries) return;
     if (ug == numEntries) {
         int total = 0;
@@ -743,9 +745,9 @@ void main() {
     public static string TopKCsrScatterSlots => Header + @"
 layout(set=0,binding=0) readonly buffer Ib { int idxBuf[]; };
 layout(set=0,binding=1) buffer Cb { int csrBuf[]; };
-layout(push_constant) uniform PC { uint totalSlots; uint numEntries; uint numTiles; uint offSorted; uint offTile; };
+layout(push_constant) uniform PC { uint totalSlots; uint numEntries; uint numTiles; uint offSorted; uint offTile; uint baseOffset; };
 void main() {
-    int t = int(gl_GlobalInvocationID.x);
+    int t = int(baseOffset + gl_GlobalInvocationID.x);
     int TS = int(totalSlots), G = int(numEntries), NT = int(numTiles);
     if (t >= NT || TS <= 0) return;
     int tileSpan = ((TS - 1) / NT) + 1;
@@ -771,9 +773,9 @@ layout(set=0,binding=0) readonly buffer Gb { float gradBuf[]; };
 layout(set=0,binding=1) readonly buffer Wb { float wBuf[]; };
 layout(set=0,binding=2) readonly buffer Cb { int csrBuf[]; };
 layout(set=0,binding=3) buffer DTb { float gradTblBuf[]; };
-layout(push_constant) uniform PC { uint numEntries; uint k; uint channels; uint offSorted; };
+layout(push_constant) uniform PC { uint numEntries; uint k; uint channels; uint offSorted; uint baseOffset; };
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
     uint total = numEntries * channels;
     if (gid >= total) return;
     uint g = gid / channels;
@@ -792,11 +794,11 @@ void main() {
     public static string CountIndicesAccumulateInt32 => Header + @"
 layout(set=0,binding=0) readonly buffer Ib { int idxBuf[]; };
 layout(set=0,binding=1) buffer Cb { int cntBuf[]; };
-layout(push_constant) uniform PC { uint length; uint numBins; uint totalThreads; };
+layout(push_constant) uniform PC { uint length; uint numBins; uint totalThreads; uint baseOffset; };
 shared int s_counts[256];
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
     int B = int(numBins);
     s_counts[tid] = 0;
     barrier();
@@ -824,9 +826,9 @@ void main() {
 
     public static string CountIndicesFinalizeFloat => Header + @"
 layout(set=0,binding=0) buffer Cb { int cntBuf[]; };
-layout(push_constant) uniform PC { uint numBins; };
+layout(push_constant) uniform PC { uint numBins; uint baseOffset; };
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
     if (gid < numBins) {
         int c = cntBuf[gid];
         cntBuf[gid] = floatBitsToInt(float(c));
@@ -835,9 +837,9 @@ void main() {
 
     public static string MinMaxInitInt32 => Header + @"
 layout(set=0,binding=0) buffer Ob { int outBuf[]; };
-layout(push_constant) uniform PC { uint count; };
+layout(push_constant) uniform PC { uint count; uint baseOffset; };
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
     if (gid >= count) return;
     if (gid == 0u) outBuf[0] = 2147483647;
     else if (gid == 1u) outBuf[1] = (-2147483647 - 1);
@@ -846,12 +848,12 @@ void main() {
     public static string MinMaxReduceInt32 => Header + @"
 layout(set=0,binding=0) readonly buffer Db { int dataBuf[]; };
 layout(set=0,binding=1) buffer Ob { int outBuf[]; };
-layout(push_constant) uniform PC { uint length; uint totalThreads; };
+layout(push_constant) uniform PC { uint length; uint totalThreads; uint baseOffset; };
 shared int s_min;
 shared int s_max;
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint gid = gl_GlobalInvocationID.x;
+    uint gid = baseOffset + gl_GlobalInvocationID.x;
     if (tid == 0u) {
         s_min = 2147483647;
         s_max = (-2147483647 - 1);

@@ -356,6 +356,66 @@ public sealed class SparseRoutingBackendParityTests
         Check(backend, rows, numEntries, k, channels);
     }
 
+    [SkippableFact]
+    public void Vulkan_ChunkedWorkgroupsAndBatchedUploads_PreserveDataAndDeferredDisposals()
+    {
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
+
+        // 1. Force 1-workgroup-per-launch chunking across all sparse-routing dispatches (> 256 workItems -> multiple chunks).
+        backend.MaxSparseRoutingWorkgroupsXForTests = 1;
+        try
+        {
+            Check(backend, rows: 35, numEntries: 20, k: 4, channels: 32);
+        }
+        finally
+        {
+            backend.MaxSparseRoutingWorkgroupsXForTests = null;
+        }
+
+        // 2. Inside BeginBatch..EndBatch, disposing a batch-uploaded buffer immediately must NOT allow a subsequent
+        // same-sized upload in the same batch to reuse/overwrite its staging or storage before submission completes,
+        // and TopKWeightedRowMixBackwardTable's internal CSR buffer must survive until EndBatch.
+        const int n = 64;
+        var data1 = Enumerable.Range(0, n).Select(i => (float)(i + 1)).ToArray();
+        var data2 = Enumerable.Range(0, n).Select(i => (float)(1000 + i)).ToArray();
+        using var out1 = backend.AllocateBuffer(n);
+        using var out2 = backend.AllocateBuffer(n);
+
+        const int rows = 8, numEntries = 6, k = 2, channels = 8;
+        var gradMix = SparseRoutingTapeGpuTests.Rand([rows, channels], 91);
+        var indices = SparseRoutingTapeGpuTests.RandIndices([rows, k], numEntries, 92);
+        var weights = SparseRoutingTapeGpuTests.Rand([rows, k], 93);
+        using var gmB = backend.AllocateBuffer(gradMix.ToArray());
+        using var idxB = backend.AllocateIntBuffer(indices.ToArray());
+        using var wB = backend.AllocateBuffer(weights.ToArray());
+        using var dtB = backend.AllocateBuffer(numEntries * channels);
+
+        backend.BeginBatch();
+        try
+        {
+            var up1 = backend.AllocateBuffer(data1);
+            backend.Scale(up1, out1, 1.0f, n);
+            up1.Dispose(); // Disposed mid-batch before up2 is allocated!
+
+            var up2 = backend.AllocateBuffer(data2);
+            backend.Scale(up2, out2, 1.0f, n);
+            up2.Dispose();
+
+            ((ISparseRoutingBackend)backend).TopKWeightedRowMixBackwardTable(
+                gmB, idxB, wB, dtB, rows, numEntries, k, channels);
+        }
+        finally
+        {
+            backend.EndBatch();
+        }
+
+        Assert.Equal(data1, backend.DownloadBuffer(out1));
+        Assert.Equal(data2, backend.DownloadBuffer(out2));
+        var expectedDt = new CpuEngine().TopKWeightedRowMixBackwardTable(gradMix, indices, weights, numEntries).ToArray();
+        SparseRoutingTapeGpuTests.AssertClose(expectedDt, backend.DownloadBuffer(dtB), "batched_csr_dtable");
+    }
+
     [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void Cuda_MatchesCpu_OnDevice(int rows, int numEntries, int k, int channels)

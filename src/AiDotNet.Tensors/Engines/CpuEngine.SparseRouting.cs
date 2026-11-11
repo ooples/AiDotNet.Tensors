@@ -23,15 +23,24 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorGatherRowValues<T>(Tensor<T> values, Tensor<int> indices)
     {
         var (rows, cols, k, outShape) = GatherRowValuesDims(values, indices);
+        if (typeof(T) != typeof(int))
+        {
+            GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+            if (indices.LazySource is not null)
+                GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
+        }
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             var capturedValues = values;
             var capturedIndices = indices;
-            var compiledSavedState = new object[] { CloneIndicesHost(indices), cols };
+            var compiledSavedState = new object[] { null!, cols, indices };
+            var graphInputs = typeof(T) == typeof(int)
+                ? new[] { values, (Tensor<T>)(object)indices }
+                : new[] { values };
             return scope.RecordVariadic(
                 LazyNodeType.Custom,
                 "TensorGatherRowValues",
-                new[] { values },
+                graphInputs,
                 outShape,
                 (eng, result) =>
                 {
@@ -102,16 +111,25 @@ public partial class CpuEngine
     public virtual Tensor<T> TopKWeightedRowMix<T>(Tensor<T> table, Tensor<int> indices, Tensor<T> weights)
     {
         var (rows, numEntries, k, channels, outShape) = TopKMixDims(table, indices, weights);
+        if (typeof(T) != typeof(int))
+        {
+            GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+            if (indices.LazySource is not null)
+                GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
+        }
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             var capturedTable = table;
             var capturedIndices = indices;
             var capturedWeights = weights;
-            var compiledSavedState = new object[] { CloneIndicesHost(indices) };
+            var compiledSavedState = new object[] { null!, indices };
+            var graphInputs = typeof(T) == typeof(int)
+                ? new[] { table, weights, (Tensor<T>)(object)indices }
+                : new[] { table, weights };
             return scope.RecordVariadic(
                 LazyNodeType.Custom,
                 "TopKWeightedRowMix",
-                new[] { table, weights },
+                graphInputs,
                 outShape,
                 (eng, result) =>
                 {
@@ -227,21 +245,31 @@ public partial class CpuEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (numBins < 0) throw new ArgumentOutOfRangeException(nameof(numBins), "numBins must be non-negative.");
 
+        if (typeof(T) != typeof(int))
+        {
+            GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+            if (indices.LazySource is not null)
+                GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
+        }
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             var capturedIndices = indices;
-            // Piecewise-constant integer histogram: non-differentiable, returns a [numBins] constant leaf per step.
-            var placeholder = new Tensor<T>(new[] { 1 });
+            // Piecewise-constant integer histogram: non-differentiable. When T == int, register indices directly;
+            // otherwise leaf indices are retained via savedState while graph-produced int indices were rejected above.
+            var graphInput = typeof(T) == typeof(int)
+                ? (Tensor<T>)(object)indices
+                : new Tensor<T>(new[] { 1 });
             return scope.RecordUnary(
                 LazyNodeType.Custom,
                 "TensorCountIndices",
-                placeholder,
+                graphInput,
                 new[] { numBins },
                 (eng, result) =>
                 {
                     var sr = eng as CpuEngine ?? new CpuEngine();
                     DirectGpuTensorEngine.CopyResultInto(eng, sr.TensorCountIndices<T>(capturedIndices, numBins), result);
-                });
+                },
+                savedState: new object[] { indices });
         }
 
         var counts = new Tensor<T>(new[] { numBins });
@@ -569,73 +597,94 @@ public partial class CpuEngine
         }, deterministicSafe: true);
     }
 
+    private static (int[] Offsets, int[] SortedSlots) BuildCpuEntryCsr(
+        int[] idx, int idxOff, int rows, int k, int numEntries)
+    {
+        int totalSlots = checked(rows * k);
+        var offsets = new int[checked(numEntries + 1)];
+        for (int rk = 0; rk < totalSlots; rk++)
+        {
+            int entry = idx[idxOff + rk];
+            if ((uint)entry < (uint)numEntries)
+                offsets[entry + 1]++;
+        }
+        for (int g = 1; g <= numEntries; g++)
+            offsets[g] += offsets[g - 1];
+
+        var cursor = (int[])offsets.Clone();
+        var sortedSlots = new int[offsets[numEntries]];
+        for (int rk = 0; rk < totalSlots; rk++)
+        {
+            int entry = idx[idxOff + rk];
+            if ((uint)entry < (uint)numEntries)
+                sortedSlots[cursor[entry]++] = rk;
+        }
+        return (offsets, sortedSlots);
+    }
+
     private static void TopKMixBackwardTableHost<T>(T[] go, int goOff, int[] idx, int idxOff, T[] w, int wOff, T[] dt,
         int rows, int numEntries, int k, int channels)
     {
+        var (offsets, sortedSlots) = BuildCpuEntryCsr(idx, idxOff, rows, k, numEntries);
+        long workEstimate = ((long)sortedSlots.Length + numEntries) * channels;
         int blocks = (channels + SparseRoutingChannelBlock - 1) / SparseRoutingChannelBlock;
         if (go is float[] goF && w is float[] wF && dt is float[] dtF)
         {
-            // One (entry g, channel block) per work item, scanning rows and K-slots in fixed ascending order.
-            CpuParallelSettings.ParallelForOrSerial(0, numEntries * blocks, (long)rows * k * channels, item =>
+            // One (entry g, channel block) per work item, iterating g's CSR slots in ascending (row, slot) order.
+            CpuParallelSettings.ParallelForOrSerial(0, numEntries * blocks, workEstimate, item =>
             {
                 int g = item / blocks, c0 = (item % blocks) * SparseRoutingChannelBlock;
                 int len = Math.Min(SparseRoutingChannelBlock, channels - c0), dst = g * channels + c0;
                 Array.Clear(dtF, dst, len);
-                for (int r = 0; r < rows; r++)
+                int start = offsets[g], end = offsets[g + 1];
+                for (int p = start; p < end; p++)
                 {
-                    int kBase = r * k;
-                    for (int j = 0; j < k; j++)
-                    {
-                        if (idx[idxOff + kBase + j] == g)
-                            ScaledAccumulate(dtF, dst, wF[wOff + kBase + j], goF, goOff + r * channels + c0, len);
-                    }
+                    int rk = sortedSlots[p];
+                    int r = rk / k;
+                    ScaledAccumulate(dtF, dst, wF[wOff + rk], goF, goOff + r * channels + c0, len);
                 }
             }, deterministicSafe: true);
         }
         else if (go is double[] goD && w is double[] wD && dt is double[] dtD)
         {
-            CpuParallelSettings.ParallelForOrSerial(0, numEntries * blocks, (long)rows * k * channels, item =>
+            CpuParallelSettings.ParallelForOrSerial(0, numEntries * blocks, workEstimate, item =>
             {
                 int g = item / blocks, c0 = (item % blocks) * SparseRoutingChannelBlock;
                 int len = Math.Min(SparseRoutingChannelBlock, channels - c0), dst = g * channels + c0;
                 Array.Clear(dtD, dst, len);
-                for (int r = 0; r < rows; r++)
+                int start = offsets[g], end = offsets[g + 1];
+                for (int p = start; p < end; p++)
                 {
-                    int kBase = r * k;
-                    for (int j = 0; j < k; j++)
-                    {
-                        if (idx[idxOff + kBase + j] == g)
-                            ScaledAccumulate(dtD, dst, wD[wOff + kBase + j], goD, goOff + r * channels + c0, len);
-                    }
+                    int rk = sortedSlots[p];
+                    int r = rk / k;
+                    ScaledAccumulate(dtD, dst, wD[wOff + rk], goD, goOff + r * channels + c0, len);
                 }
             }, deterministicSafe: true);
         }
         else
         {
-            TopKMixBackwardTableHostGeneric(go, goOff, idx, idxOff, w, wOff, dt, rows, numEntries, k, channels);
+            TopKMixBackwardTableHostGeneric(go, goOff, w, wOff, dt, offsets, sortedSlots, numEntries, k, channels, workEstimate);
         }
     }
 
     [ScalarKernel("Element types other than float and double have no typed arithmetic; float and double take the SIMD loops above.")]
-    private static void TopKMixBackwardTableHostGeneric<T>(T[] go, int goOff, int[] idx, int idxOff, T[] w, int wOff, T[] dt,
-        int rows, int numEntries, int k, int channels)
+    private static void TopKMixBackwardTableHostGeneric<T>(T[] go, int goOff, T[] w, int wOff, T[] dt,
+        int[] offsets, int[] sortedSlots, int numEntries, int k, int channels, long workEstimate)
     {
         var ops = MathHelper.GetNumericOperations<T>();
-        CpuParallelSettings.ParallelForOrSerial(0, numEntries, (long)rows * k * channels, g =>
+        CpuParallelSettings.ParallelForOrSerial(0, numEntries, workEstimate, g =>
         {
             int dst = g * channels;
             for (int c = 0; c < channels; c++) dt[dst + c] = ops.Zero;
-            for (int r = 0; r < rows; r++)
+            int start = offsets[g], end = offsets[g + 1];
+            for (int p = start; p < end; p++)
             {
-                int kBase = r * k;
-                for (int j = 0; j < k; j++)
-                {
-                    if (idx[idxOff + kBase + j] != g) continue;
-                    T wj = w[wOff + kBase + j];
-                    int goBase = goOff + r * channels;
-                    for (int c = 0; c < channels; c++)
-                        dt[dst + c] = ops.Add(dt[dst + c], ops.Multiply(wj, go[goBase + c]));
-                }
+                int rk = sortedSlots[p];
+                int r = rk / k;
+                T wj = w[wOff + rk];
+                int goBase = goOff + r * channels;
+                for (int c = 0; c < channels; c++)
+                    dt[dst + c] = ops.Add(dt[dst + c], ops.Multiply(wj, go[goBase + c]));
             }
         }, deterministicSafe: true);
     }

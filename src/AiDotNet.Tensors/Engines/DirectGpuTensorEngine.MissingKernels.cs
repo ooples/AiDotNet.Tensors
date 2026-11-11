@@ -7002,7 +7002,10 @@ public partial class DirectGpuTensorEngine
                 output => backend.Fill(output, 0f, minimumLength));
         }
 
-        if (input.Length > 16_777_216)
+        // IEEE-754 binary32 exact integer cutoff (2^24): counts and float-compared indices remain exact below/at this bound.
+        const int MaxExactFloatBinCount = 1 << 24;
+
+        if (input.Length > MaxExactFloatBinCount)
         {
             if (ThrowOnGpuKernelFallback)
                 throw new NotSupportedException(
@@ -7020,15 +7023,12 @@ public partial class DirectGpuTensorEngine
                 sr.MinMaxInt32(rawInput.Buffer, intBounds.Buffer, contiguousInput.Length);
                 backend.Synchronize();
                 float[] rawMinMax = backend.DownloadBuffer(intBounds.Buffer);
-                int minInt, maxInt;
-                unsafe
-                {
-                    fixed (float* p = rawMinMax)
-                    {
-                        minInt = ((int*)p)[0];
-                        maxInt = ((int*)p)[1];
-                    }
-                }
+                if (rawMinMax is null || rawMinMax.Length < 2)
+                    throw new InvalidOperationException("MinMaxInt32 returned fewer than 2 elements.");
+                var unpackedMinMax = new int[2];
+                Buffer.BlockCopy(rawMinMax, 0, unpackedMinMax, 0, 2 * sizeof(int));
+                int minInt = unpackedMinMax[0];
+                int maxInt = unpackedMinMax[1];
                 if (minInt < 0)
                     throw new ArgumentException(
                         $"BinCount requires non-negative ints; got {minInt}", nameof(input));
@@ -7063,7 +7063,7 @@ public partial class DirectGpuTensorEngine
             if (hostMin < 0)
                 throw new ArgumentException(
                     $"BinCount requires non-negative ints; got {hostMin}", nameof(input));
-            if (hostMax >= 16_777_216)
+            if (hostMax >= MaxExactFloatBinCount)
             {
                 if (ThrowOnGpuKernelFallback)
                     throw new NotSupportedException(
@@ -7090,7 +7090,7 @@ public partial class DirectGpuTensorEngine
         if (minValue < 0f)
             throw new ArgumentException(
                 $"BinCount requires non-negative ints; got {(int)minValue}", nameof(input));
-        if (maxValue >= 16_777_216f)
+        if (maxValue >= MaxExactFloatBinCount)
         {
             if (ThrowOnGpuKernelFallback)
                 throw new NotSupportedException(

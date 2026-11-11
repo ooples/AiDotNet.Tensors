@@ -185,6 +185,8 @@ public class MixtureOfExpertsTests
     {
         using var gpu = new DirectGpuTensorEngine();
         Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available.");
+        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IMoeKernelBackend moe && moe.MoeKernelsReady,
+            "Fused MoE kernels are not available on this DirectGpu backend.");
 
         const int n = 8, d = 6, g = 4, f = 5, k = 2;
         var cpu = new CpuEngine();
@@ -210,6 +212,8 @@ public class MixtureOfExpertsTests
         {
             cpuBoundTape.BindEngineIfUnset(cpu);
             var gpuY = MixtureOfExperts.SwiGluExperts(gpu, x, s, bias, w1, w3, w2, k, 2, out _);
+            Assert.True(gpuY.IsGpuResident || gpuY.HasPendingGpuData,
+                "SwiGluExperts fell back to the host instead of executing on the DirectGpu backend.");
             var gpuLoss = cpu.ReduceSum(cpu.TensorMultiply(gpuY, wy), null);
             gpuGrads = cpuBoundTape.ComputeGradients(gpuLoss, inputs);
         }

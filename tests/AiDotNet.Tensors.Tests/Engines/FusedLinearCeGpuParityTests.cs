@@ -110,25 +110,106 @@ public class FusedLinearCeGpuParityTests
             cpuGrads = tape.ComputeGradients(cpuLoss, new[] { cpuH, cpuW, cpuB });
         }
 
+        Assert.True(cpuGrads.ContainsKey(cpuH));
+        Assert.False(cpuGrads.ContainsKey(cpuW));
+        Assert.False(cpuGrads.ContainsKey(cpuB));
+        if (!gpu.IsGpuAvailable)
+            return;
+
         Tensor<float> gpuLoss;
         System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> gpuGrads;
         using (var tape = new GradientTape<float>())
         {
             gpuLoss = gpu.FusedLinearCrossEntropyWithLogits(gpuH, gpuW, gpuB, ids, computeReadoutGrads: false);
+            Assert.True(gpuLoss.IsGpuResident || gpuLoss.HasPendingGpuData,
+                "Detached FusedLinearCrossEntropyWithLogits loss fell back to the host instead of remaining on the GPU.");
             gpuGrads = tape.ComputeGradients(gpuLoss, new[] { gpuH, gpuW, gpuB });
         }
 
-        Assert.InRange(Math.Abs(gpuLoss[0] - cpuLoss[0]), 0f, 1e-4f);
-        Assert.True(cpuGrads.ContainsKey(cpuH) && gpuGrads.ContainsKey(gpuH));
-        Assert.False(cpuGrads.ContainsKey(cpuW));
-        Assert.False(cpuGrads.ContainsKey(cpuB));
+        Assert.True(gpuGrads.ContainsKey(gpuH));
+        Assert.True(gpuGrads[gpuH].IsGpuResident || gpuGrads[gpuH].HasPendingGpuData,
+            "Detached FusedLinearCrossEntropyWithLogits hidden gradient fell back to the host instead of remaining on the GPU.");
         Assert.False(gpuGrads.ContainsKey(gpuW));
         Assert.False(gpuGrads.ContainsKey(gpuB));
+        Assert.InRange(Math.Abs(gpuLoss[0] - cpuLoss[0]), 0f, 1e-4f);
 
         var expected = cpuGrads[cpuH].ToArray();
         var actual = gpuGrads[gpuH].ToArray();
         for (int i = 0; i < expected.Length; i++)
             Assert.InRange(Math.Abs(actual[i] - expected[i]), 0f, 2e-4f);
+    }
+
+    [Fact]
+    public void DirectGpuOverload_RejectsRank2BiasOrTargetIds_MatchingCpuEngine()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        var h = new Tensor<float>(Gen(8, 1), new[] { 2, 4 });
+        var w = new Tensor<float>(Gen(12, 2), new[] { 4, 3 });
+        var rank1Bias = new Tensor<float>(Gen(3, 3), new[] { 3 });
+        var rank2Bias = new Tensor<float>(Gen(3, 3), new[] { 1, 3 });
+        var rank1Ids = new Tensor<int>(new[] { 0, 2 }, new[] { 2 });
+        var rank2Ids = new Tensor<int>(new[] { 0, 2 }, new[] { 2, 1 });
+        var denseTarget = new Tensor<float>(new[] { 1f, 0f, 0f, 0f, 0f, 1f }, new[] { 2, 3 });
+
+        Assert.Equal("bias", Assert.Throws<ArgumentException>(() =>
+            gpu.FusedLinearCrossEntropyWithLogits(h, w, rank2Bias, rank1Ids, computeReadoutGrads: false)).ParamName);
+        Assert.Equal("targetIds", Assert.Throws<ArgumentException>(() =>
+            gpu.FusedLinearCrossEntropyWithLogits(h, w, rank1Bias, rank2Ids, computeReadoutGrads: false)).ParamName);
+        Assert.Equal("bias", Assert.Throws<ArgumentException>(() =>
+            gpu.FusedLinearCrossEntropyWithLogits(h, w, rank2Bias, denseTarget)).ParamName);
+    }
+
+    [Fact]
+    public void DetachedReadout_ViewMutationAndRecordInPlaceRebase_BehaveCorrectly()
+    {
+        var cpu = new CpuEngine();
+        var ids = new Tensor<int>(new[] { 1, 0 }, new[] { 2 });
+
+        // 1. Mutating a storage-aliasing view of detached weight without bumping weight.Version throws on backward.
+        using (var tape = new GradientTape<double>())
+        {
+            var h = new Tensor<double>(new double[] { 0.2, -0.3, 0.5, 0.1, -0.4, 0.6 }, new[] { 2, 3 });
+            var w = new Tensor<double>(new double[] { 0.1, -0.2, 0.3, 0.4, -0.1, 0.2 }, new[] { 3, 2 });
+            var b = new Tensor<double>(new double[] { 0.05, -0.05 }, new[] { 2 });
+            var loss = cpu.FusedLinearCrossEntropyWithLogits(h, w, b, ids, computeReadoutGrads: false);
+            var wView = w.Reshape(6);
+            wView[0] = 7.0;
+            wView.MarkModified();
+            Assert.Equal(0, w.Version);
+            Assert.Throws<InvalidOperationException>(() => tape.ComputeGradients(loss, new[] { h }));
+        }
+
+        // 2. RecordInPlace rebasing a nonzero-version detached readout updates the saved version guard to match the snapshot.
+        var hRef = new Tensor<double>(new double[] { 0.2, -0.3, 0.5, 0.1, -0.4, 0.6 }, new[] { 2, 3 });
+        var wInit = new double[] { 0.1, -0.2, 0.3, 0.4, -0.1, 0.2 };
+        var bInit = new double[] { 0.05, -0.05 };
+        double[] expectedDh;
+        using (var refTape = new GradientTape<double>())
+        {
+            var lRef = cpu.FusedLinearCrossEntropyWithLogits(
+                hRef, new Tensor<double>((double[])wInit.Clone(), new[] { 3, 2 }),
+                new Tensor<double>((double[])bInit.Clone(), new[] { 2 }), ids, computeReadoutGrads: false);
+            expectedDh = refTape.ComputeGradients(lRef, new[] { hRef })[hRef].ToArray();
+        }
+
+        using (var tape = new GradientTape<double>(new GradientTapeOptions { RecordInPlace = true }))
+        {
+            var h = new Tensor<double>(new double[] { 0.2, -0.3, 0.5, 0.1, -0.4, 0.6 }, new[] { 2, 3 });
+            var w = new Tensor<double>((double[])wInit.Clone(), new[] { 3, 2 });
+            var b = new Tensor<double>((double[])bInit.Clone(), new[] { 2 });
+            w.MarkModified();
+            b.MarkModified();
+            Assert.True(w.Version > 0 && b.Version > 0);
+
+            var loss = cpu.FusedLinearCrossEntropyWithLogits(h, w, b, ids, computeReadoutGrads: false);
+            cpu.TensorAddInPlace(w, new Tensor<double>(new double[] { 5, 5, 5, 5, 5, 5 }, new[] { 3, 2 }));
+            cpu.TensorAddInPlace(b, new Tensor<double>(new double[] { 2, -2 }, new[] { 2 }));
+
+            var grads = tape.ComputeGradients(loss, new[] { h });
+            var actualDh = grads[h].ToArray();
+            for (int i = 0; i < expectedDh.Length; i++)
+                Assert.InRange(Math.Abs(actualDh[i] - expectedDh[i]), 0.0, 1e-12);
+        }
     }
 
     [Fact]

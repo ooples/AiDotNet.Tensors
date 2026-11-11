@@ -45,6 +45,7 @@ internal static class PortableMoe
 {
     private const int MaxGroupsPerLaunch = 65535;
     private const int MaxElementsPerLaunch = MaxGroupsPerLaunch * MoeKernelTemplate.GroupSize;
+    internal const int MaxSortSlotsPerSlice = 65536;
     private const int T = MoeKernelTemplate.Tile;
 
     private static int Tiles(int extent) => (extent + T - 1) / T;
@@ -66,11 +67,11 @@ internal static class PortableMoe
     {
         // baseOffset is the last int of Route, Combine, and DScores.
         int baseSlot = ints.Length - 1;
-        for (int baseOffset = 0; baseOffset < total; baseOffset += MaxElementsPerLaunch)
+        for (long baseOffset = 0; baseOffset < total; baseOffset += MaxElementsPerLaunch)
         {
-            int chunk = Math.Min(MaxElementsPerLaunch, total - baseOffset);
+            int chunk = (int)Math.Min(MaxElementsPerLaunch, total - baseOffset);
             var slice = (int[])ints.Clone();
-            slice[baseSlot] = baseOffset;
+            slice[baseSlot] = (int)baseOffset;
             be.LaunchMoeKernel(kernel, Groups(chunk), buffers, slice);
         }
     }
@@ -78,12 +79,44 @@ internal static class PortableMoe
     private static void ChunkedGroups(IMoeKernelBackend be, string kernel, int totalGroups, IGpuBuffer[] buffers, int[] ints)
     {
         int baseSlot = ints.Length - 1;
-        for (int first = 0; first < totalGroups; first += MaxGroupsPerLaunch)
+        for (long first = 0; first < totalGroups; first += MaxGroupsPerLaunch)
         {
-            int count = Math.Min(MaxGroupsPerLaunch, totalGroups - first);
+            int count = (int)Math.Min(MaxGroupsPerLaunch, totalGroups - first);
             var slice = (int[])ints.Clone();
-            slice[baseSlot] = first;
+            slice[baseSlot] = (int)first;
             be.LaunchMoeKernel(kernel, count, buffers, slice);
+        }
+    }
+
+    internal static void LaunchSort(IMoeKernelBackend be, in MoeShape s, IGpuBuffer ids, IGpuBuffer perm,
+        IGpuBuffer pos, IGpuBuffer ends, IGpuBuffer loads)
+    {
+        int sps = s.NK / s.B;
+        var buffers = new[] { ids, perm, pos, ends, loads };
+        if (s.NK <= MaxSortSlotsPerSlice)
+        {
+            ChunkedGroups(be, MoeKernelTemplate.Sort, s.G, buffers,
+                new[] { s.NK, s.G, s.B, sps, 0, s.NK, 3, 0 });
+            return;
+        }
+
+        int sliceSlots = sps <= MaxSortSlotsPerSlice
+            ? (MaxSortSlotsPerSlice / sps) * sps
+            : MaxSortSlotsPerSlice;
+
+        for (long slotStart = 0; slotStart < s.NK; slotStart += sliceSlots)
+        {
+            int slotEnd = (int)Math.Min(s.NK, slotStart + sliceSlots);
+            int phase = slotStart == 0 ? 0 : 1;
+            ChunkedGroups(be, MoeKernelTemplate.Sort, s.G, buffers,
+                new[] { s.NK, s.G, s.B, sps, (int)slotStart, slotEnd, phase, 0 });
+        }
+
+        for (long slotStart = 0; slotStart < s.NK; slotStart += sliceSlots)
+        {
+            int slotEnd = (int)Math.Min(s.NK, slotStart + sliceSlots);
+            ChunkedGroups(be, MoeKernelTemplate.Sort, s.G, buffers,
+                new[] { s.NK, s.G, s.B, sps, (int)slotStart, slotEnd, 2, 0 });
         }
     }
 
@@ -112,8 +145,7 @@ internal static class PortableMoe
         IGpuBuffer pos, IGpuBuffer ends, IGpuBuffer loads, IGpuBuffer h13, IGpuBuffer o, IGpuBuffer y)
     {
         LaunchRoute(be, s.N, s.G, s.K, scores, bias, ids, gates, ssum);
-        ChunkedGroups(be, MoeKernelTemplate.Sort, s.G, new[] { ids, perm, pos, ends, loads },
-            new[] { s.NK, s.G, s.B, s.NK / s.B, 0 });
+        LaunchSort(be, s, ids, perm, pos, ends, loads);
         Tiled(be, MoeKernelTemplate.Up, (long)Tiles(s.NK) * Tiles(2 * s.F), new[] { x, perm, w1, w3, ends, h13 },
             Gemm(s.NK, 2 * s.F, s.D, s));
         Tiled(be, MoeKernelTemplate.Down, (long)Tiles(s.NK) * Tiles(s.D), new[] { h13, w2, ends, o },

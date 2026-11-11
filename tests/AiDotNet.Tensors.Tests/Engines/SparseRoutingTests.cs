@@ -306,4 +306,50 @@ public sealed class SparseRoutingTests
         AssertClose(refDw, g[sharedWeight].ToArray(), "dw_shared");
         AssertClose(refDb, g[sharedBias].ToArray(), "db_shared");
     }
+
+    [Fact]
+    public void GraphMode_IntIndexProducer_ExecutesBeforeSparseRoutingAndRejectsMixedTypeLazyIndices()
+    {
+        var engine = new CpuEngine();
+        var prior = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var valuesInt = new Tensor<int>(new[] { 10, 20, 30, 40, 50, 60 }, [2, 3]);
+            var baseIdx = new Tensor<int>(new[] { 0, 1, 1, 0 }, [2, 2]);
+            var shift = new Tensor<int>(new[] { 1, 1, 1, 1 }, [2, 2]);
+
+            AiDotNet.Tensors.Engines.Compilation.ICompiledPlan<int> plan;
+            using (var scope = AiDotNet.Tensors.Engines.Compilation.GraphMode.Enable())
+            {
+                var dynamicIdx = engine.TensorAdd(baseIdx, shift);
+                var gathered = engine.TensorGatherRowValues(valuesInt, dynamicIdx);
+                var counts = engine.TensorCountIndices<int>(dynamicIdx, 3);
+                var combined = engine.TensorAdd(engine.ReduceSum(gathered, null), engine.ReduceSum(counts, null));
+                plan = scope.CompileInference<int>();
+                _ = combined;
+            }
+
+            using (plan)
+            {
+                // baseIdx + shift = [[1, 2], [2, 1]] -> gathered = [[20, 30], [60, 50]] (sum 160), counts = [0, 2, 2] (sum 4) => 164.
+                Assert.Equal(164, plan.Execute()[0]);
+            }
+
+            // Mixed-dtype lazy index producer under training GraphMode must be rejected rather than reading stale indices.
+            var floatTable = RandFloat([4, 3], 71);
+            var floatWeights = RandFloat([2, 2], 72);
+            using (var scope = AiDotNet.Tensors.Engines.Compilation.GraphMode.EnableTraining(new[] { floatTable, floatWeights }))
+            {
+                var lazyIntIdx = engine.TensorAdd(baseIdx, shift);
+                Assert.NotNull(lazyIntIdx.LazySource);
+                Assert.ThrowsAny<NotSupportedException>(() =>
+                    engine.TopKWeightedRowMix(floatTable, lazyIntIdx, floatWeights));
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
 }

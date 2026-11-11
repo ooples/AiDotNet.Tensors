@@ -208,70 +208,138 @@ internal static class MoeKernelTemplate
     }
 ";
 
-    // One group per expert e: start = slots routed to experts below e; a stable scan places e's slots in slot order.
+    // One group per expert e: bounded slices over [slotStart, slotEnd) so no launch exceeds WDDM/GPU timeout budgets.
+    // phase == 3 runs single-slice count + scatter + sequence loads (NK <= 65,536).
+    // Multi-slice runs Pass 1 (phase == 0 initializes ends[e] = start_slice, phase == 1 accumulates start_slice, and
+    // both compute overlapping per-sequence loads) followed by Pass 2 (phase == 2 scatters e's slots starting at ends[e]
+    // and advances ends[e] to start + totalCount after the final slice).
     private const string SortBody = @"
     int e = grp + groupBase;
     int tid = lid;
-    float less = 0.0f, mine = 0.0f;
-    for (int b0 = 0; b0 < NK; b0 += 256)
+    if (phase != 2)
     {
-        int s = b0 + tid;
-        if (s < NK)
+        float less = 0.0f, mine = 0.0f;
+        for (int b0 = slotStart; b0 < slotEnd; b0 += 256)
         {
-            int v = TOINT(ids[s]);
-            if (v < e) less += 1.0f;
-            if (v == e) mine += 1.0f;
+            int s = b0 + tid;
+            if (s < slotEnd)
+            {
+                int v = TOINT(ids[s]);
+                if (v < e) less += 1.0f;
+                if (v == e) mine += 1.0f;
+            }
         }
-    }
-    sm[tid] = less;
-    sm[256 + tid] = mine;
-    BARRIER();
-    for (int o = 128; o > 0; o = o / 2)
-    {
-        if (tid < o) { sm[tid] += sm[tid + o]; sm[256 + tid] += sm[256 + tid + o]; }
-        BARRIER();
-    }
-    float start = sm[0];
-    float count = sm[256];
-    BARRIER();
-    if (tid == 0) ends[e] = start + count;
-    float running = start;
-    for (int b0 = 0; b0 < NK; b0 += 256)
-    {
-        int s = b0 + tid;
-        float flag = (s < NK && TOINT(ids[s]) == e) ? 1.0f : 0.0f;
-        sm[tid] = flag;
-        BARRIER();
-        for (int off = 1; off < 256; off = off * 2)
-        {
-            float add = tid >= off ? sm[tid - off] : 0.0f;
-            BARRIER();
-            sm[tid] += add;
-            BARRIER();
-        }
-        if (flag != 0.0f)
-        {
-            float p = running + sm[tid] - 1.0f;
-            perm[TOINT(p)] = TOFLOAT(s);
-            pos[s] = p;
-        }
-        running += sm[255];
-        BARRIER();
-    }
-    for (int b = 0; b < B; b++)
-    {
-        float c = 0.0f;
-        for (int s = b * SPS + tid; s < (b + 1) * SPS; s += 256)
-            if (TOINT(ids[s]) == e) c += 1.0f;
-        sm[tid] = c;
+        sm[tid] = less;
+        sm[256 + tid] = mine;
         BARRIER();
         for (int o = 128; o > 0; o = o / 2)
         {
-            if (tid < o) sm[tid] += sm[tid + o];
+            if (tid < o) { sm[tid] += sm[tid + o]; sm[256 + tid] += sm[256 + tid + o]; }
             BARRIER();
         }
-        if (tid == 0) loads[b * G + e] = sm[0];
+        if (phase == 3)
+        {
+            float start = sm[0];
+            float count = sm[256];
+            BARRIER();
+            if (tid == 0) ends[e] = start + count;
+            float running = start;
+            for (int b0 = slotStart; b0 < slotEnd; b0 += 256)
+            {
+                int s = b0 + tid;
+                float flag = (s < slotEnd && TOINT(ids[s]) == e) ? 1.0f : 0.0f;
+                sm[tid] = flag;
+                BARRIER();
+                for (int off = 1; off < 256; off = off * 2)
+                {
+                    float add = tid >= off ? sm[tid - off] : 0.0f;
+                    BARRIER();
+                    sm[tid] += add;
+                    BARRIER();
+                }
+                if (flag != 0.0f)
+                {
+                    float p = running + sm[tid] - 1.0f;
+                    perm[TOINT(p)] = TOFLOAT(s);
+                    pos[s] = p;
+                }
+                running += sm[255];
+                BARRIER();
+            }
+        }
+        else
+        {
+            if (tid == 0) ends[e] = (phase == 0) ? sm[0] : (ends[e] + sm[0]);
+            BARRIER();
+        }
+        if (SPS <= 256)
+        {
+            int bFirst = slotStart / SPS;
+            int bEnd = slotEnd / SPS;
+            for (int b = bFirst + tid; b < bEnd; b += 256)
+            {
+                float c = 0.0f;
+                int bs = b * SPS;
+                int be = bs + SPS;
+                for (int s = bs; s < be; s++)
+                    if (TOINT(ids[s]) == e) c += 1.0f;
+                loads[b * G + e] = c;
+            }
+        }
+        else
+        {
+            int bFirst = slotStart / SPS;
+            int bLast = (slotEnd - 1) / SPS;
+            for (int b = bFirst; b <= bLast; b++)
+            {
+                int bs = b * SPS;
+                int be = (b + 1) * SPS;
+                int segStart = bs > slotStart ? bs : slotStart;
+                int segEnd = be < slotEnd ? be : slotEnd;
+                float c = 0.0f;
+                for (int s = segStart + tid; s < segEnd; s += 256)
+                    if (TOINT(ids[s]) == e) c += 1.0f;
+                sm[tid] = c;
+                BARRIER();
+                for (int o = 128; o > 0; o = o / 2)
+                {
+                    if (tid < o) sm[tid] += sm[tid + o];
+                    BARRIER();
+                }
+                if (tid == 0) loads[b * G + e] = (segStart == bs) ? sm[0] : (loads[b * G + e] + sm[0]);
+                BARRIER();
+            }
+        }
+    }
+    else
+    {
+        if (tid == 0) sm[0] = ends[e];
         BARRIER();
+        float running = sm[0];
+        BARRIER();
+        for (int b0 = slotStart; b0 < slotEnd; b0 += 256)
+        {
+            int s = b0 + tid;
+            float flag = (s < slotEnd && TOINT(ids[s]) == e) ? 1.0f : 0.0f;
+            sm[tid] = flag;
+            BARRIER();
+            for (int off = 1; off < 256; off = off * 2)
+            {
+                float add = tid >= off ? sm[tid - off] : 0.0f;
+                BARRIER();
+                sm[tid] += add;
+                BARRIER();
+            }
+            if (flag != 0.0f)
+            {
+                float p = running + sm[tid] - 1.0f;
+                perm[TOINT(p)] = TOFLOAT(s);
+                pos[s] = p;
+            }
+            running += sm[255];
+            BARRIER();
+        }
+        if (tid == 0) ends[e] = running;
     }
 ";
 
@@ -325,7 +393,8 @@ internal static class MoeKernelTemplate
     {
         new(Route, new[] { "scores", "bias", "ids", "gates", "ssum" }, new[] { "N", "G", "TOPK", "biasMode", "baseOffset" },
             RouteBody, 0, new[] { 2, 3, 4 }),
-        new(Sort, new[] { "ids", "perm", "pos", "ends", "loads" }, new[] { "NK", "G", "B", "SPS", "groupBase" },
+        new(Sort, new[] { "ids", "perm", "pos", "ends", "loads" },
+            new[] { "NK", "G", "B", "SPS", "slotStart", "slotEnd", "phase", "groupBase" },
             SortBody, 512, new[] { 1, 2, 3, 4 }),
         new(Up, new[] { "xin", "perm", "w1", "w3", "ends", "h13" }, GemmInts, WithF2(GroupedRowsBody(
             "xin[(TOINT(perm[arow]) / TOPK) * Kd + acol]",

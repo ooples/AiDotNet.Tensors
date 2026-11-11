@@ -184,7 +184,7 @@ public sealed partial class OpenClBackend : ISparseRoutingBackend
 
         if (length > 0)
         {
-            int totalThreads = System.Math.Min(length, 4096 * 256);
+            int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
             kAcc.SetArg(0, ((DirectOpenClGpuBuffer)int32Indices).Buffer.Handle);
             kAcc.SetArg(1, hCounts);
             kAcc.SetArg(2, length);
@@ -208,7 +208,7 @@ public sealed partial class OpenClBackend : ISparseRoutingBackend
         kInit.SetArg(0, hOut);
         ExecuteSparseRouting1D(kInit, 2);
 
-        int totalThreads = System.Math.Min(length, 4096 * 256);
+        int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
         kRed.SetArg(0, ((DirectOpenClGpuBuffer)int32Data).Buffer.Handle);
         kRed.SetArg(1, hOut);
         kRed.SetArg(2, length);

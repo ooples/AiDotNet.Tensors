@@ -90,7 +90,7 @@ public sealed partial class WebGpuBackend : ISparseRoutingBackend
             new[] { counts }, new[] { 0, numBins }, numBins);
         if (length > 0)
         {
-            int totalThreads = System.Math.Min(length, 4096 * 256);
+            int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
             DispatchSparseRouting("sr_count_acc_i32", WebGpuRecurrenceKernels.CountIndicesAccumulateInt32,
                 new[] { int32Indices, counts }, new[] { length, numBins, totalThreads }, totalThreads);
         }
@@ -103,7 +103,7 @@ public sealed partial class WebGpuBackend : ISparseRoutingBackend
         if (length <= 0) return;
         DispatchSparseRouting("sr_minmax_init_i32", WebGpuRecurrenceKernels.MinMaxInitInt32,
             new[] { outMinMaxInt32 }, new[] { 2 }, 2);
-        int totalThreads = System.Math.Min(length, 4096 * 256);
+        int totalThreads = System.Math.Min(length, SparseRoutingLimits.MaxReductionThreads);
         DispatchSparseRouting("sr_minmax_red_i32", WebGpuRecurrenceKernels.MinMaxReduceInt32,
             new[] { int32Data, outMinMaxInt32 }, new[] { length, totalThreads }, totalThreads);
     }

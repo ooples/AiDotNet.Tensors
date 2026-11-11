@@ -44,8 +44,10 @@ public partial class DirectGpuTensorEngine
         }
         catch
         {
-            ids.Dispose(); gates.Dispose(); ssum.Dispose(); perm.Dispose(); pos.Dispose();
-            ends.Dispose(); load.Dispose(); h13.Dispose(); o.Dispose(); y.Dispose();
+            ids.DisposeAfterQueuedUse(backend); gates.DisposeAfterQueuedUse(backend); ssum.DisposeAfterQueuedUse(backend);
+            perm.DisposeAfterQueuedUse(backend); pos.DisposeAfterQueuedUse(backend); ends.DisposeAfterQueuedUse(backend);
+            load.DisposeAfterQueuedUse(backend); h13.DisposeAfterQueuedUse(backend); o.DisposeAfterQueuedUse(backend);
+            y.DisposeAfterQueuedUse(backend);
             throw;
         }
 
@@ -110,11 +112,11 @@ public partial class DirectGpuTensorEngine
         using var ends = GetOrAllocateBuffer(backend, saved.DEnds!);
         using var h13 = GetOrAllocateBuffer(backend, saved.DH13);
         using var o = GetOrAllocateBuffer(backend, saved.DO!);
-        using var dh13 = AllocateFullyWrittenOutputBuffer(backend, nk * 2 * f);
-        using var dxs = AllocateFullyWrittenOutputBuffer(backend, nk * d);
-        OwnedBuffer ds = default, dx = default, dw1 = default, dw3 = default, dw2 = default;
+        OwnedBuffer dh13 = default, dxs = default, ds = default, dx = default, dw1 = default, dw3 = default, dw2 = default;
         try
         {
+            dh13 = AllocateFullyWrittenOutputBuffer(backend, nk * 2 * f);
+            dxs = AllocateFullyWrittenOutputBuffer(backend, nk * d);
             ds = AllocateFullyWrittenOutputBuffer(backend, n * g);
             dx = AllocateFullyWrittenOutputBuffer(backend, n * d);
             dw1 = AllocateFullyWrittenOutputBuffer(backend, g * d * f);
@@ -126,8 +128,14 @@ public partial class DirectGpuTensorEngine
         }
         catch
         {
-            ds.Dispose(); dx.Dispose(); dw1.Dispose(); dw3.Dispose(); dw2.Dispose();
+            ds.DisposeAfterQueuedUse(backend); dx.DisposeAfterQueuedUse(backend); dw1.DisposeAfterQueuedUse(backend);
+            dw3.DisposeAfterQueuedUse(backend); dw2.DisposeAfterQueuedUse(backend);
             throw;
+        }
+        finally
+        {
+            dh13.DisposeAfterQueuedUse(backend);
+            dxs.DisposeAfterQueuedUse(backend);
         }
 
         Tensor<T> Out(OwnedBuffer b, int count, int[] shape)
