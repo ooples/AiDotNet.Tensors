@@ -131,6 +131,10 @@ public partial class CpuEngine
     {
         var input = inputs[0]; var mask = inputs[1]; var transition = inputs[2];
         var inputMap = inputs[3]; var outputMap = inputs[4]; var skip = inputs[5];
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+                e => RoutedDiagonalSsmComposite(e, input, mask, transition, inputMap, outputMap, skip)))
+            return;
         int batch = input.Shape[0], time = input.Shape[1], model = input.Shape[2];
         int experts = mask.Shape[2], state = transition.Shape[1];
         var dx = new Tensor<T>(input.Shape.ToArray()); var dm = new Tensor<T>(mask.Shape.ToArray());
@@ -151,6 +155,34 @@ public partial class CpuEngine
             batch, time, model, experts, state);
         Tensor<T>[] computed = { dx, dm, da, db, dc, dd };
         for (int i = 0; i < inputs.Length; i++) DifferentiableOps.AccumulateGrad(grads, inputs[i], computed[i], engine);
+    }
+
+    // The routed scan as recorded ops (the create-graph backward differentiates it):
+    // h_t = m_t ⊙ (A ⊙ h_{t-1} + B x_t),  y_t = m_t ⊙ (skip ⊙ x_t + C h_t), per expert.
+    private static Tensor<T> RoutedDiagonalSsmComposite<T>(IEngine e, Tensor<T> input, Tensor<T> mask,
+        Tensor<T> transition, Tensor<T> inputMap, Tensor<T> outputMap, Tensor<T> skip)
+    {
+        int batch = input.Shape[0], time = input.Shape[1], model = input.Shape[2];
+        int experts = mask.Shape[2], state = transition.Shape[1];
+        var a = RecordedOps<T>.R(e, transition, 1, experts, state);
+        var bMap = RecordedOps<T>.R(e, inputMap, 1, experts, state, model);
+        var cMap = RecordedOps<T>.R(e, outputMap, 1, experts, model, state);
+        var skip3 = RecordedOps<T>.R(e, skip, 1, experts, model);
+        Tensor<T> h = RecordedOps<T>.Zeros(batch, experts, state);
+        var ys = new List<Tensor<T>>(time);
+        for (int t = 0; t < time; t++)
+        {
+            var xt = RecordedOps<T>.At(e, input, 1, t);                                    // [B, D]
+            var mt = RecordedOps<T>.R(e, RecordedOps<T>.At(e, mask, 1, t), batch, experts, 1);
+            var bx = RecordedOps<T>.Sum(e,
+                RecordedOps<T>.Mul(e, bMap, RecordedOps<T>.R(e, xt, batch, 1, 1, model)), 3, keep: false);  // [B, E, S]
+            h = RecordedOps<T>.Mul(e, mt, RecordedOps<T>.Add(e, RecordedOps<T>.Mul(e, a, h), bx));
+            var ch = RecordedOps<T>.Sum(e,
+                RecordedOps<T>.Mul(e, cMap, RecordedOps<T>.R(e, h, batch, experts, 1, state)), 3, keep: false); // [B, E, D]
+            var direct = RecordedOps<T>.Mul(e, skip3, RecordedOps<T>.R(e, xt, batch, 1, model));
+            ys.Add(RecordedOps<T>.Mul(e, mt, RecordedOps<T>.Add(e, direct, ch)));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 
     private static void RoutedDiagonalSsmBackwardCore<T>(
