@@ -56170,100 +56170,25 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CTCLossBackward, savedState: new object[] { clp, ct, cil, ctl, cb }); } }
 
-        var ops = MathHelper.GetNumericOperations<T>();
-        int maxT = logProbs._shape[0];
-        int batchSize = logProbs._shape[1];
-        int numClasses = logProbs._shape[2];
-
-        if (inputLengths.Length != batchSize || targetLengths.Length != batchSize)
-            throw new ArgumentException("inputLengths and targetLengths must have length == batchSize.");
-
-        if (blank < 0 || blank >= numClasses)
-            throw new ArgumentOutOfRangeException(nameof(blank), $"Blank index {blank} must be in [0, {numClasses}).");
-
-        // Validate target bounds
-        int totalTargets = 0;
-        for (int n = 0; n < batchSize; n++)
-            totalTargets += targetLengths[n];
-        if (totalTargets > targets.Length)
-            throw new ArgumentException($"Sum of targetLengths ({totalTargets}) exceeds targets length ({targets.Length}).");
-
-        var losses = new Tensor<T>(new[] { batchSize });
-
-        // Forward-backward algorithm per batch element
-        int targetOffset = 0;
-        for (int n = 0; n < batchSize; n++)
+        // The lattice is CtcLattice's (CpuEngine.CtcLattice.cs), shared with the backward and with
+        // TensorCTCForwardBackward / TensorCTCLabelPosteriors, so the loss and its gradient use one recursion.
+        var problem = CtcLattice.Prepare(logProbs, targets, inputLengths, targetLengths, blank);
+        var lp = RoIAlignPlan.ToDoubles(logProbs);
+        var nll = new double[problem.Batch];
+        int stride = problem.MaxStates;
+        CpuParallelSettings.ParallelForOrSerial(0, problem.Batch, (long)problem.MaxTime * stride * problem.Batch * 2, n =>
         {
-            int T_n = inputLengths[n];
-            int U_n = targetLengths[n];
-
-            if (T_n < 0 || T_n > maxT)
-                throw new ArgumentOutOfRangeException(nameof(inputLengths), $"inputLengths[{n}]={T_n} must be in [0, {maxT}].");
-            if (U_n < 0)
-                throw new ArgumentOutOfRangeException(nameof(targetLengths), $"targetLengths[{n}]={U_n} must be non-negative.");
-
-            int S = 2 * U_n + 1; // expanded label length with blanks
-
-            // Build expanded label sequence: blank, l1, blank, l2, blank, ...
-            var expandedLabels = new int[S];
-            for (int s = 0; s < S; s++)
-            {
-                int label = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
-                if (label < 0 || label >= numClasses)
-                    throw new ArgumentOutOfRangeException(nameof(targets), $"Target label {label} must be in [0, {numClasses}).");
-                expandedLabels[s] = label;
-            }
-
-            // Alpha (forward) pass — log domain for numerical stability
-            var alpha = new double[T_n, S];
-            double negInf = double.NegativeInfinity;
-            for (int t = 0; t < T_n; t++)
-                for (int s = 0; s < S; s++)
-                    alpha[t, s] = negInf;
-
-            // Initialize
-            alpha[0, 0] = ops.ToDouble(logProbs[0, n, expandedLabels[0]]);
-            if (S > 1)
-                alpha[0, 1] = ops.ToDouble(logProbs[0, n, expandedLabels[1]]);
-
-            // Forward recursion
-            for (int t = 1; t < T_n; t++)
-            {
-                for (int s = 0; s < S; s++)
-                {
-                    double logProbTS = ops.ToDouble(logProbs[t, n, expandedLabels[s]]);
-                    double prevSum = alpha[t - 1, s];
-                    if (s >= 1)
-                        prevSum = LogSumExp(prevSum, alpha[t - 1, s - 1]);
-                    if (s >= 2 && expandedLabels[s] != blank && expandedLabels[s] != expandedLabels[s - 2])
-                        prevSum = LogSumExp(prevSum, alpha[t - 1, s - 2]);
-                    alpha[t, s] = prevSum + logProbTS;
-                }
-            }
-
-            // Total log-probability
-            double logProb = alpha[T_n - 1, S - 1];
-            if (S >= 2)
-                logProb = LogSumExp(logProb, alpha[T_n - 1, S - 2]);
-
+            var alpha = new double[Math.Max(1, problem.InputLengths[n] * stride)];
             // CTC loss = -log P(labels | input)
-            losses.SetFlat(n, ops.FromDouble(-logProb));
-            targetOffset += U_n;
-        }
+            nll[n] = -CtcLattice.Alpha(lp, problem, n, alpha, stride);
+        }, deterministicSafe: true);
+        var losses = RoIAlignPlan.FromDoubles<T>(nll, new[] { problem.Batch });
 
         Autodiff.DifferentiableOps.RecordIfActive("CTCLoss", losses,
             new[] { logProbs }, Autodiff.BackwardFunctions<T>.CTCLossBackward,
             new object[] { logProbs, targets, inputLengths, targetLengths, blank });
         { var clp2 = logProbs; var ct2 = targets; var cil2 = inputLengths; var ctl2 = targetLengths; var cb2 = blank; AutoTracer.RecordOp("CTCLoss", losses, eng => eng.TensorCTCLoss(clp2, ct2, cil2, ctl2, cb2)); }
         return losses;
-    }
-
-    private static double LogSumExp(double a, double b)
-    {
-        if (double.IsNegativeInfinity(a)) return b;
-        if (double.IsNegativeInfinity(b)) return a;
-        double max = Math.Max(a, b);
-        return max + Math.Log(Math.Exp(a - max) + Math.Exp(b - max));
     }
 
     #endregion

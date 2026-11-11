@@ -1,0 +1,126 @@
+using System;
+using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
+
+namespace AiDotNet.Tensors.Engines;
+
+/// <summary>
+/// The batched minimum-cost assignment behind <see cref="IEngine.TensorLinearSumAssignment{T}"/>: SciPy's
+/// shortest-augmenting-path solver (Crouse, "On implementing 2D rectangular assignment algorithms", IEEE TAES 2016;
+/// scipy/optimize/_lsap.c), batch items in parallel. The device kernels
+/// (<see cref="DirectGpu.NumericRecurrenceKernelTemplate"/>) run the same steps, one work-group per batch item.
+/// </summary>
+public partial class CpuEngine
+{
+    /// <inheritdoc />
+    public virtual Tensor<int> TensorLinearSumAssignment<T>(Tensor<T> cost)
+    {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+        var (batch, size) = LinearSumAssignmentShape(cost);
+        var result = LinearSumAssignmentHost(RoIAlignPlan.ToDoubles(cost), batch, size);
+        return new Tensor<int>(result, cost.Rank == 2 ? new[] { size } : new[] { batch, size });
+    }
+
+    /// <summary>Validates a [B, S, S] or [S, S] cost; returns (B, S).</summary>
+    internal static (int Batch, int Size) LinearSumAssignmentShape<T>(Tensor<T> cost)
+    {
+        if (cost is null) throw new ArgumentNullException(nameof(cost));
+        if (cost.Rank != 2 && cost.Rank != 3)
+            throw new ArgumentException($"cost must be [B, S, S] or [S, S]; got rank {cost.Rank}.", nameof(cost));
+        int rank = cost.Rank, size = cost._shape[rank - 1];
+        if (cost._shape[rank - 2] != size)
+            throw new ArgumentException($"cost must be square in its last two dimensions; got [{string.Join(", ", cost._shape)}].", nameof(cost));
+        return (rank == 3 ? cost._shape[0] : 1, size);
+    }
+
+    /// <summary>The assignment of every batch item: result[b * S + i] is the column of row i.</summary>
+    internal static int[] LinearSumAssignmentHost(double[] cost, int batch, int size)
+    {
+        var result = new int[batch * size];
+        if (size == 0) return result;
+        CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * size * size * size, b =>
+            SolveAssignment(cost, b * size * size, size, result, b * size), deterministicSafe: true);
+        return result;
+    }
+
+    /// <summary>
+    /// One S x S problem. A non-finite cost is replaced first: NaN and +inf by <c>big = (S + 1)(2 max|finite| + 1)</c>,
+    /// which exceeds the cost difference between any two assignments of the finite entries, so an assignment uses one
+    /// only where none can avoid it; -inf by <c>-big</c>. Then, per row, the shortest augmenting path over the reduced
+    /// costs <c>minVal + c[i, j] - u[i] - v[j]</c>: the next column scanned is the unscanned one with the smallest path
+    /// cost, ties to the lowest unassigned column, then the lowest column.
+    /// </summary>
+    private static void SolveAssignment(double[] cost, int offset, int size, int[] result, int resultOffset)
+    {
+        double maxAbs = 0;
+        for (int k = 0; k < size * size; k++)
+        {
+            double c = cost[offset + k];
+            if (!double.IsNaN(c) && !double.IsInfinity(c)) maxAbs = Math.Max(maxAbs, Math.Abs(c));
+        }
+        double big = (size + 1) * (2 * maxAbs + 1);
+        var c2 = new double[size * size];
+        for (int k = 0; k < c2.Length; k++)
+        {
+            double c = cost[offset + k];
+            c2[k] = double.IsNaN(c) || double.IsPositiveInfinity(c) ? big : double.IsNegativeInfinity(c) ? -big : c;
+        }
+
+        var u = new double[size];
+        var v = new double[size];
+        var spc = new double[size];
+        var path = new int[size];
+        var row4col = new int[size];
+        var col4row = new int[size];
+        var sr = new bool[size];
+        var sc = new bool[size];
+        row4col.AsSpan().Fill(-1);
+        col4row.AsSpan().Fill(-1);
+        path.AsSpan().Fill(-1);
+
+        for (int curRow = 0; curRow < size; curRow++)
+        {
+            spc.AsSpan().Fill(double.PositiveInfinity);
+            Array.Clear(sr, 0, size);
+            Array.Clear(sc, 0, size);
+            double minVal = 0;
+            int i = curRow, sink = -1;
+            while (sink == -1)
+            {
+                sr[i] = true;
+                double best = double.PositiveInfinity;
+                int bestKey = int.MaxValue, bestCol = -1;
+                for (int j = 0; j < size; j++)
+                {
+                    if (sc[j]) continue;
+                    double r = minVal + c2[i * size + j] - u[i] - v[j];
+                    if (r < spc[j]) { path[j] = i; spc[j] = r; }
+                    int key = (row4col[j] < 0 ? 0 : size) + j;
+                    if (spc[j] < best || (spc[j] == best && key < bestKey)) { best = spc[j]; bestKey = key; bestCol = j; }
+                }
+                minVal = best;
+                sc[bestCol] = true;
+                if (row4col[bestCol] == -1) sink = bestCol;
+                else i = row4col[bestCol];
+            }
+
+            u[curRow] += minVal;
+            for (int r = 0; r < size; r++)
+                if (sr[r] && r != curRow) u[r] += minVal - spc[col4row[r]];
+            for (int j = 0; j < size; j++)
+                if (sc[j]) v[j] -= minVal - spc[j];
+
+            for (int j = sink; ;)
+            {
+                int row = path[j];
+                row4col[j] = row;
+                int previous = col4row[row];
+                col4row[row] = j;
+                j = previous;
+                if (row == curRow) break;
+            }
+        }
+        Array.Copy(col4row, 0, result, resultOffset, size);
+    }
+}

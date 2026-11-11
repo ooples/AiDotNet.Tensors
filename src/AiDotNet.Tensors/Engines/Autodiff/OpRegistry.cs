@@ -21,6 +21,8 @@ internal static class OpRegistry
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
         "LstmCellFromGates",
+        // Batched tridiagonal solve: backward is the transposed solve plus the band of -g x^T (CpuEngine.TridiagonalSolve)
+        "TensorTridiagonalSolve",
         // Fused GRU sequence: one node, fused BPTT on the host and the device (#1568)
         "GruSequenceForward",
 
@@ -263,6 +265,9 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Numeric recurrences without a gradient: the branch-selected Fritsch-Carlson limiter, the CTC lattice variables
+        // and posteriors (the CTC loss's own backward consumes the posteriors), and the discrete assignment
+        "TensorFritschCarlsonLimit", "TensorCTCForwardBackward", "TensorCTCLabelPosteriors", "TensorLinearSumAssignment",
         // Scaled low-precision GEMMs: not differentiable, as torch's scaled_mm (CpuEngine.GroupedScaledMatMul)
         "TensorScaledMatMul", "TensorScaledGroupedMatMul",
         // Random draws, nonzero_static and unique(dim): constants (CpuEngine.TorchRandom)
