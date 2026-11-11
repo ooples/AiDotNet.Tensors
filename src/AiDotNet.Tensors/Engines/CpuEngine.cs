@@ -26380,87 +26380,54 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (output == null) throw new ArgumentNullException(nameof(output));
-        if (!output.IsContiguous) output = output.Contiguous();
-        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!input.IsContiguous) input = input.Contiguous();
-        var gradOutputOrig = gradOutput;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
-
-        var numOps = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
         if (axis < 0) axis = rank + axis;
-
-        var inputData = input.GetFlattenedData();
         var shape = input._shape;
+
+        // In double precision. y = softmax(u) with u = x/‖x‖ along the axis:
+        //   gu = y ⊙ (g - ⟨g, y⟩),   gx = gu/‖x‖ - x·⟨x, gu⟩/‖x‖³.
+        // The projection term used to be x·⟨x, gu⟩/‖x‖² (one 1/‖x‖ short), so every gradient was off by a term
+        // proportional to (1 - 1/‖x‖), right only for unit-norm rows.
+        var x = RoIAlignPlan.ToDoubles(input);
+        var g = RoIAlignPlan.ToDoubles(gradOutput);
+        var y = RoIAlignPlan.ToDoubles(output);
+        var gradIn = new double[x.Length];
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
 
-        // First compute the normalized input
-        var normalizedData = new T[input.Length];
-        var norms = new T[outerSize * innerSize];
-
         CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
-
-            // Compute L2 norm
-            T sumSquares = numOps.Zero;
+            int baseIdx = outer * axisSize * innerSize + inner;
+            double sumSquares = 0, gy = 0;
             for (int i = 0; i < axisSize; i++)
             {
-                int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                var val = inputData[flatIdx];
-                sumSquares = numOps.Add(sumSquares, numOps.Multiply(val, val));
+                int k = baseIdx + i * innerSize;
+                sumSquares += x[k] * x[k];
+                gy += g[k] * y[k];
             }
-            var norm = numOps.Sqrt(sumSquares);
-            if (numOps.Equals(norm, numOps.Zero))
-                norm = numOps.FromDouble(1e-10);
-            norms[idx] = norm;
-
-            // Normalize
+            double norm = Math.Sqrt(sumSquares);
+            if (norm == 0) norm = 1e-10;
+            double xDotGu = 0;
             for (int i = 0; i < axisSize; i++)
             {
-                int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                normalizedData[flatIdx] = numOps.Divide(inputData[flatIdx], norm);
+                int k = baseIdx + i * innerSize;
+                double gu = y[k] * (g[k] - gy);
+                gradIn[k] = gu;
+                xDotGu += x[k] * gu;
             }
-        });
-
-        // Get softmax gradient with respect to normalized input
-        var normalizedTensor = TensorAllocator.Rent<T>(shape, normalizedData);
-        var softmaxGrad = SoftmaxBackward(gradOutput, output, axis);
-        using var softmaxGradDataLease = softmaxGrad.LeaseArray();
-        var softmaxGradData = softmaxGradDataLease.Array;
-
-        // Chain rule through L2 normalization
-        var gradInputData = new T[input.Length];
-
-        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, (long)outerSize * innerSize * axisSize, idx =>
-        {
-            int outer = idx / innerSize;
-            int inner = idx % innerSize;
-            var norm = norms[idx];
-            var normCubed = numOps.Multiply(norm, numOps.Multiply(norm, norm));
-
-            // Compute dot product of x and grad_normalized
-            T dotProduct = numOps.Zero;
+            double cube = norm * norm * norm;
             for (int i = 0; i < axisSize; i++)
             {
-                int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                dotProduct = numOps.Add(dotProduct, numOps.Multiply(inputData[flatIdx], softmaxGradData[flatIdx]));
-            }
-
-            // grad_x = (grad_normalized - normalized * dot_product) / norm
-            for (int i = 0; i < axisSize; i++)
-            {
-                int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                var term = numOps.Multiply(normalizedData[flatIdx], dotProduct);
-                gradInputData[flatIdx] = numOps.Divide(numOps.Subtract(softmaxGradData[flatIdx], term), norm);
+                int k = baseIdx + i * innerSize;
+                gradIn[k] = gradIn[k] / norm - x[k] * xDotGu / cube;
             }
         });
 
-        return TensorAllocator.Rent<T>(shape, gradInputData);
+        return RoIAlignPlan.FromDoubles<T>(gradIn, (int[])shape.Clone());
     }
 
     /// <inheritdoc/>
@@ -34899,7 +34866,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             && capturedCounts.Length == freshCounts.Length)
                             DirectGpuTensorEngine.CopyResultInto(eng, freshCounts, capturedCounts);
                     },
-                    BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, capturedCounts! });
+                    BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, capturedCounts!, cd < 0 ? cd + source.Rank : cd });
                 using var eagerResultKeep5 = new KeepAliveScope(eagerResult);
                 using var lazyResultKeep6 = new KeepAliveScope(lazyResult);
                 eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
@@ -35049,7 +35016,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         counts = new Tensor<int>([outDimSize], new Vector<int>(countData));
         var scatterMeanResult = TensorAllocator.Rent<T>(outputShape, outputData);
-        DifferentiableOps.RecordUnary("ScatterMean", scatterMeanResult, source, BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, counts });
+        DifferentiableOps.RecordUnary("ScatterMean", scatterMeanResult, source, BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, counts, actualDim });
         { var cs = source; var ci = indices; var cd = dim; var co = outputSize; AutoTracer.RecordOp("ScatterMean", scatterMeanResult, eng => { eng.ScatterMean(cs, ci, out _, cd, co); return scatterMeanResult; }); }
         return scatterMeanResult;
     }
@@ -35190,7 +35157,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         argmax = new Tensor<int>(outputShape, new Vector<int>(argmaxData));
         var scatterMaxResult = TensorAllocator.Rent<T>(outputShape, outputData);
-        DifferentiableOps.RecordUnary("ScatterMax", scatterMaxResult, source, BackwardFunctions<T>.ScatterMaxBackward, new object[] { indices, argmax });
+        DifferentiableOps.RecordUnary("ScatterMax", scatterMaxResult, source, BackwardFunctions<T>.ScatterMaxBackward, new object[] { indices, argmax, actualDim });
         { var cs = source; var ci = indices; var cd = dim; var co = outputSize; AutoTracer.RecordOp("ScatterMax", scatterMaxResult, eng => { eng.ScatterMax(cs, ci, out _, cd, co); return scatterMaxResult; }); }
         return scatterMaxResult;
     }
@@ -35284,7 +35251,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterSoftmaxBackward, savedState: new object[] { ci }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterSoftmaxBackward, savedState: new object[] { ci, cd < 0 ? cd + cs.Rank : cd }); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterSoftmax", source._shape); if (ac is not null) return ac.Execute(); }
 
@@ -35363,7 +35330,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var scatterSmResult = TensorAllocator.Rent<T>(source._shape, outputData);
-        DifferentiableOps.RecordUnary("ScatterSoftmax", scatterSmResult, source, BackwardFunctions<T>.ScatterSoftmaxBackward, new object[] { indices });
+        DifferentiableOps.RecordUnary("ScatterSoftmax", scatterSmResult, source, BackwardFunctions<T>.ScatterSoftmaxBackward, new object[] { indices, actualDim });
         { var cs2 = source; var ci2 = indices; AutoTracer.RecordOp("ScatterSoftmax", scatterSmResult, eng => eng.ScatterSoftmax(cs2, ci2, dim, outputSize)); }
         return scatterSmResult;
     }
@@ -44074,6 +44041,10 @@ public partial class CpuEngine : ITensorLevelEngine
             });
         }
 
+        // The kernel records nothing, so neither point set used to receive a gradient (PairwiseDistance, which takes
+        // the square root of this, had none either). The backward is built from recorded engine ops, so it is also
+        // differentiable again.
+        DifferentiableOps.RecordBinary("PairwiseDistanceSquared", result, x, y, BackwardFunctions<T>.PairwiseDistanceSquaredTwoSetBackward);
         return result;
     }
 
@@ -49211,6 +49182,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.GlobalMaxPool2D(input));
         RequireRank(input, 4, "GlobalMaxPool2D", "[batch, channels, height, width]");
+        // Under a tape: the reshape + ReduceMax this op is classified as (OpRegistry.DelegatorOps), both recorded. The
+        // kernel below records nothing, so a GlobalMaxPool2D gave its input no gradient at all.
+        if (DifferentiableOps.IsRecording<T>())
+        {
+            int b = input._shape[0], ch = input._shape[1];
+            var flat = Reshape(input, new[] { b, ch, input._shape[2] * input._shape[3] });
+            return Reshape(ReduceMax(flat, new[] { 2 }, keepDims: false), new[] { b, ch, 1, 1 });
+        }
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();

@@ -2886,7 +2886,7 @@ public partial class DirectGpuTensorEngine
             using var twiceDotLease = AllocateTransientScratch(backend, outputLength);
             var twiceDot = twiceDotLease.Buffer;
 
-            return DispatchDeferredGpuOp<T>(backend, outputLength, new[] { rowsX, rowsY }, output =>
+            var distances = DispatchDeferredGpuOp<T>(backend, outputLength, new[] { rowsX, rowsY }, output =>
             {
                 backend.Multiply(inputX.Buffer, inputX.Buffer, squareX, x.Length);
                 backend.Multiply(inputY.Buffer, inputY.Buffer, squareY, y.Length);
@@ -2901,6 +2901,10 @@ public partial class DirectGpuTensorEngine
                 backend.Scale(dot, twiceDot, 2f, outputLength);
                 backend.Subtract(normSum, twiceDot, output, outputLength);
             });
+            // The same node CpuEngine records (its backward is built from engine ops, which run on this engine).
+            Autodiff.DifferentiableOps.RecordBinary("PairwiseDistanceSquared", distances, x, y,
+                Autodiff.BackwardFunctions<T>.PairwiseDistanceSquaredTwoSetBackward);
+            return distances;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.PairwiseDistanceSquared(x, y); }
     }
@@ -10377,10 +10381,13 @@ public partial class DirectGpuTensorEngine
             backend.Multiply(inputBuffer.Buffer, softmaxGradient, products, input.Length);
             backend.SumAxis(products, dot, outerSize, innerSize);
             backend.OuterProduct(dot, ones, expandedDot, outerSize, innerSize);
+            // grad_x = (grad_u - u·⟨x, grad_u⟩/‖x‖) / ‖x‖ with u = x/‖x‖: the projection term carries one more 1/‖x‖
+            // (dropping it was the CPU kernel's bug too).
             backend.Multiply(normalized, expandedDot, projection, input.Length);
-            backend.Subtract(softmaxGradient, projection, numerator, input.Length);
+            backend.Divide(projection, expandedNorm, numerator, input.Length);
+            backend.Subtract(softmaxGradient, numerator, projection, input.Length);
             return DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), result =>
-                backend.Divide(numerator, expandedNorm, result, input.Length));
+                backend.Divide(projection, expandedNorm, result, input.Length));
         }
         catch
         {
