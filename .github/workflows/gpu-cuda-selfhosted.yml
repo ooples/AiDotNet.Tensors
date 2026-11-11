@@ -11,7 +11,8 @@ name: GPU (CUDA, self-hosted)
 # To enable it, register a self-hosted runner on a machine with an NVIDIA GPU and the CUDA driver and a CUDA 13
 # toolkit (its bin on the machine PATH, for NVRTC and cuBLAS), PowerShell 7 and Python 3 on the machine PATH; the job
 # installs the .NET SDK and cuDNN into its workspace), with the labels `self-hosted, gpu, cuda` plus its architecture label,
-# `sm86` (RTX 30-series, the pull-request gate) or `sm75` (GTX 16-series / RTX 20-series), then set the repository variable
+# `sm86` (RTX 30-series, the pull-request gate), `sm75` (GTX 16-series / RTX 20-series) or `sm89` (RTX 40-series / Ada; its
+# job also needs the repository variable CUDA_SM89_RUNNER_ENABLED=true), then set the repository variable
 # CUDA_RUNNER_ENABLED=true. A runner registered before the lane was split by architecture has only the first three labels and
 # matches no job: add its architecture label (Settings > Actions > Runners > the runner > Labels, or re-run config.cmd with
 # --labels self-hosted,gpu,cuda,sm86). Until the variable is set every job is skipped, so nothing waits for a runner that does
@@ -92,12 +93,16 @@ jobs:
     # (check name, timeout, allowed skips, model families, artifact) are derived from matrix.arch: matrix `include`
     # entries cannot be used for them, because an entry left with no combination to extend is added as a new job,
     # which would bring the SM75 job back on pull requests.
+    # The SM89 job (an RTX 1000 Ada laptop GPU) runs like the SM75 one -- nightly and on dispatch, GPU suites only, the
+    # SM86-only specializations allowed to skip -- and only while the repository variable CUDA_SM89_RUNNER_ENABLED is
+    # true: its runner is a laptop that is not always on, and a job waiting for an absent runner would hold the nightly
+    # run for a day and then fail it. Clear the variable while that runner is away.
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJSON((github.event_name == 'pull_request' || inputs.ratchets_only) && '["sm86"]' || '["sm86","sm75"]') }}
+        arch: ${{ fromJSON((github.event_name == 'pull_request' || inputs.ratchets_only) && '["sm86"]' || (vars.CUDA_SM89_RUNNER_ENABLED == 'true' && '["sm86","sm75","sm89"]' || '["sm86","sm75"]')) }}
     name: ${{ matrix.arch == 'sm86' && 'cuda' || format('cuda-{0}', matrix.arch) }}
-    # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86 or sm75); a runner registered before
+    # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86, sm75 or sm89); a runner registered before
     # the split carries no architecture label and picks up neither job until relabelled (see the header for how).
     runs-on: [self-hosted, gpu, cuda, '${{ matrix.arch }}']
     timeout-minutes: ${{ matrix.arch == 'sm86' && (github.event_name == 'pull_request' && 160 || 560) || 240 }}
