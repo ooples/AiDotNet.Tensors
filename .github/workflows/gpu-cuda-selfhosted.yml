@@ -600,7 +600,7 @@ jobs:
     # and on dispatch on the RTX 3080 only (the SM86 job's limit rises to 560 minutes then: at most about 160 minutes
     # before this step, 360 in it, and the upload). They run only after every earlier step passed, so a red night does
     # not hold the shared runner for hours more. A deferral (no baseline for the machine class, a torch that cannot reach
-    # the device) fails the step, and so does a missing network: each of the six must report a pass or a failure.
+    # the device) fails the step, and so does a missing network: each of the nine must report a pass or a failure.
     - name: CUDA step-time ratchets (nightly)
       if: ${{ success() && matrix.arch == 'sm86' && github.event_name != 'pull_request' }}
       timeout-minutes: 360
@@ -609,7 +609,7 @@ jobs:
       run: |
         # torch.compile's inductor builds C++ with MSVC on Windows: load the x64 build environment (vcvars64.bat of the
         # newest Visual Studio with the VC tools) into this step. Without it every ratchet defers, so fail here, naming
-        # what the runner lacks, instead of reporting six deferrals.
+        # what the runner lacks, instead of reporting nine deferrals.
         $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
         $vs = if (Test-Path $vswhere) {
           & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -647,7 +647,7 @@ jobs:
           }
         }
         # A filtered dispatch selects only some networks on purpose; the full set must report only on an unfiltered run.
-        $networks = if ($env:RATCHET_FILTER) { @() } else { @('Mlp', 'Cnn', 'Lstm', 'Gru', 'Transformer', 'Resnet18') }
+        $networks = if ($env:RATCHET_FILTER) { @() } else { @('Mlp', 'Cnn', 'Lstm', 'Gru', 'Transformer', 'Resnet18', 'CnnFp16', 'TransformerFp16', 'Resnet18Fp16') }
         if ($env:RATCHET_FILTER -and $ran.Count -eq 0) {
           Write-Output "::error::ratchet_filter '$env:RATCHET_FILTER' ran no ratchet test."; exit 1
         }
