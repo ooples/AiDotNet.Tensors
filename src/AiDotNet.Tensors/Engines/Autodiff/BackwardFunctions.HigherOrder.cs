@@ -139,35 +139,73 @@ internal static partial class BackwardFunctions<T>
     /// <summary>
     /// Under <c>createGraph</c>: computes the input gradients by differentiating <paramref name="composite"/> — the
     /// op's forward written with recorded engine ops, reading the SAME input tensors the op recorded — with the
-    /// upstream gradient as its seed, under a nested tape that keeps the graph, and accumulates them on the outer
-    /// tape. Returns false (doing nothing) when no graph is being created, so the caller's fast kernel path runs.
+    /// upstream gradient as its seed, and accumulates them into the running backward. Returns false (doing nothing)
+    /// when no graph is being created, so the caller's fast kernel path runs.
     /// </summary>
     /// <remarks>
-    /// The nested backward's ops record on the nested tape and reach the outer graph through the gradient nodes
-    /// (<c>GradFn</c>), the same way <see cref="Transforms.TensorFunc{T}.Hessian"/> nests its backward passes, so the
-    /// gradients this produces are differentiable in both the op's inputs and the upstream gradient.
+    /// <para>
+    /// The composite is recorded on the SAME tape the create-graph backward records on, and its entries are walked
+    /// right here, in reverse, with a private gradient map, so the backward's ops land on that tape too. Both matter:
+    /// a later create-graph backward (a third derivative: a PINN differentiating a Laplacian residual) walks that
+    /// tape's entries, and the GradFn walk of a plain backward follows the nodes either way. Differentiating the
+    /// composite under a nested tape kept its entries off the outer tape, so the second create-graph backward found
+    /// no path from the gradient back to the inputs and returned nothing.
+    /// </para>
+    /// <para>
+    /// The private walk sets the running pass's indexed gradient slots aside (the inputs carry the outer pass's
+    /// indices, which would alias), and appends after the outer walk's position, so the outer pass does not visit the
+    /// composite's entries itself.
+    /// </para>
     /// </remarks>
     internal static bool TryCompositeBackward(Tensor<T> gradOutput, Tensor<T>[] inputs, IEngine engine,
         Dictionary<Tensor<T>, Tensor<T>> grads, Func<IEngine, Tensor<T>> composite)
     {
         if (!CreatesGraph) return false;
-        var outer = GradientTape<T>.Current;
+        var tape = GradientTape<T>.Current;
+        if (tape is null) return false;
         var sources = new List<Tensor<T>>(inputs.Length);
         foreach (var input in inputs)
             if (input is not null && !sources.Exists(s => ReferenceEquals(s, input))) sources.Add(input);
-        using (var tape = new GradientTape<T>())
+
+        var entries = tape.Entries;
+        int start = entries.Count;
+        var result = composite(engine);
+        int end = entries.Count;
+
+        var local = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance) { [result] = gradOutput };
+        var savedIndexed = DifferentiableOps._indexedGrads;
+        var savedSparse = DifferentiableOps._indexedSparseGrads;
+        DifferentiableOps._indexedGrads = null;
+        DifferentiableOps._indexedSparseGrads = null;
+        try
         {
-            var result = composite(engine);
-            var g = tape.ComputeGradients(result, sources, createGraph: true,
-                seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(result, gradOutput) });
-            using (GradientTape<T>.RecordOn(outer))
+            for (int i = end - 1; i >= start; i--)
             {
-                foreach (var input in sources)
+                // Copy what the backward needs: the walk's own backward ops append to (and may grow) the arena.
+                var entry = entries[i];
+                if (entry.Output is null || !local.TryGetValue(entry.Output, out var upstream)) continue;
+                var entryInputs = entry.GetInputsArray();
+                var previousOwners = DifferentiableOps.BeginBackwardStep<T>();
+                try
                 {
-                    if (g.TryGetValue(input, out var gi) && gi is not null)
-                        DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+                    entry.Backward(upstream, entryInputs, entry.Output, entry.SavedState ?? Array.Empty<object>(), engine, local);
+                }
+                finally
+                {
+                    DifferentiableOps.EndBackwardStep(previousOwners);
                 }
             }
+        }
+        finally
+        {
+            DifferentiableOps._indexedGrads = savedIndexed;
+            DifferentiableOps._indexedSparseGrads = savedSparse;
+        }
+
+        foreach (var input in sources)
+        {
+            if (local.TryGetValue(input, out var gi) && gi is not null)
+                DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
         }
         return true;
     }

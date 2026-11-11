@@ -5967,12 +5967,19 @@ internal static partial class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var predicted = inputs[0];
-        var target = (Tensor<T>)savedState[0];
+        // The target is the node's second input (it was saved state, which left its aspect ratio undifferentiated).
+        bool targetIsInput = inputs.Length > 1 && inputs[1] is not null;
+        var target = targetIsInput ? inputs[1] : (Tensor<T>)savedState[0];
+        // Under create-graph: differentiate v rebuilt from recorded ops (atan included), so its gradient is
+        // differentiable again; the loop below records nothing.
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e => CIoUAspectRecorded(e, predicted, target, targetIsInput)))
+            return;
         double eps = 1e-7;
         double fourOverPiSq = 4.0 / (Math.PI * Math.PI);
 
         int n = predicted.Shape[0];
         var gradPred = new T[n * 4];
+        var gradTarget = new double[n * 4];
 
         for (int i = 0; i < n; i++)
         {
@@ -6003,9 +6010,23 @@ internal static partial class BackwardFunctions<T>
             gradPred[o + 1] = numOps.FromDouble(go * dvdPh * -hOn);
             gradPred[o + 2] = numOps.FromDouble(go * dvdPw * wOn);
             gradPred[o + 3] = numOps.FromDouble(go * dvdPh * hOn);
+
+            // The target's side: dv/d(tw) = 2·(4/π²)·atanDiff·th/(tw² + th²), dv/d(th) = -2·(4/π²)·atanDiff·tw/(tw² + th²).
+            double rawTw = tx2 - tx1, rawTh = ty2 - ty1;
+            double trss = tw * tw + th * th;
+            double dvdTw = 2.0 * fourOverPiSq * atanDiff * (th / trss);
+            double dvdTh = 2.0 * fourOverPiSq * atanDiff * -(tw / trss);
+            double twOn = rawTw > 0 ? 1.0 : 0.0;
+            double thOn = rawTh > 0 ? 1.0 : 0.0;
+            gradTarget[o] = go * dvdTw * -twOn;
+            gradTarget[o + 1] = go * dvdTh * -thOn;
+            gradTarget[o + 2] = go * dvdTw * twOn;
+            gradTarget[o + 3] = go * dvdTh * thOn;
         }
 
         DifferentiableOps.AccumulateGrad(grads, predicted, new Tensor<T>(gradPred, new[] { n, 4 }), engine);
+        if (targetIsInput)
+            DifferentiableOps.AccumulateGrad(grads, target, RoIAlignPlan.FromDoubles<T>(gradTarget, new[] { n, 4 }), engine);
     }
 
     /// <summary>GIoU loss backward: IoU gradient + enclosing area penalty gradient.</summary>

@@ -52301,8 +52301,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // numerically identical to DIoU, so the one term CIoU adds over DIoU contributed nothing. The
         // engine has no differentiable atan to rebuild v from ops, so the node is recorded here with its
         // analytic derivative w.r.t. the predicted boxes.
-        DifferentiableOps.RecordUnary("CIoUAspect", v, predicted,
-            BackwardFunctions<T>.CIoUAspectBackward, savedState: new object[] { target });
+        // v depends on the target boxes' aspect ratio too (torchvision's complete_box_iou_loss differentiates both), so
+        // both are inputs: recording the target as saved state dropped its aspect-ratio gradient.
+        DifferentiableOps.RecordBinary("CIoUAspect", v, predicted, target, BackwardFunctions<T>.CIoUAspectBackward);
 
         // alpha is detached from gradient (constant w.r.t. backward), per the CIoU paper.
         var alpha = StopGradient(new Tensor<T>(alphaData, new[] { n, 1 }));
