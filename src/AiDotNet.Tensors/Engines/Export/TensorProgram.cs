@@ -225,7 +225,7 @@ public sealed partial class TensorProgram
     }
 
     private static bool SameValues<T>(Tensor<T> a, Tensor<T> b) =>
-        a.Contiguous().AsSpan().SequenceEqual(b.Contiguous().AsSpan(), EqualityComparer<T>.Default);
+        a.Contiguous().AsSpan().ToArray().SequenceEqual(b.Contiguous().AsSpan().ToArray(), EqualityComparer<T>.Default);
 
     private static (TensorProgram Program, Tensor<T>[] Outputs) TraceOnce<T>(Func<Tensor<T>[], Tensor<T>[]> function, Tensor<T>[] examples, TraceOptions options)
     {
