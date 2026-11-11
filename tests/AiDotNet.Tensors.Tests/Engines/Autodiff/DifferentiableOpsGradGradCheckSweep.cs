@@ -47,6 +47,22 @@ public class DifferentiableOpsGradGradCheckSweep
         ["TensorRandomLike"] = "stochastic forward",
         // An iterative reconstruction, exempted from the first-order sweep for the same reason.
         ["GriffinLim"] = "iterative phase reconstruction, not a single op",
+        // Straight-through estimator: the forward is piecewise constant, so finite differences of its (designed,
+        // mask-valued) gradient are zero while the recorded second backward is not. Its backward is still recorded
+        // (gradient ⊙ mask), so it stays connected under create-graph.
+        ["TensorFakeQuantize"] = "straight-through estimator: piecewise-constant forward, designed gradient",
+    };
+
+    /// <summary>
+    /// Inputs that are non-differentiable by design (torch gives them no gradient), per op, with the reason: their
+    /// first-order gradient is a constant zero, so the finite differences of the OTHER inputs' gradients with respect
+    /// to them have no analytical counterpart. The op's remaining inputs are still checked.
+    /// </summary>
+    internal static readonly Dictionary<string, (int[] Inputs, string Reason)> NonDifferentiableInputs = new(StringComparer.Ordinal)
+    {
+        ["RoIAlign"] = (new[] { 1 }, "boxes: torchvision's roi_align gives rois no gradient"),
+        ["PsRoIAlign"] = (new[] { 1 }, "boxes: torchvision's ps_roi_align gives rois no gradient"),
+        ["RoIPool"] = (new[] { 1 }, "boxes: torchvision's roi_pool gives rois no gradient (and the bins are discontinuous in them)"),
     };
 
     [Fact]
@@ -93,8 +109,9 @@ public class DifferentiableOpsGradGradCheckSweep
                     var outT = (Tensor<double>)m.Invoke(_engine, DifferentiableOpsGradCheckSweep.CopyArgs(args))!;
                     if (outT.GradFn?.Backward?.Method is { } bm) label += $" [{bm.DeclaringType?.Name}.{bm.Name}]";
                     var grads = tape.ComputeGradients(_engine.ReduceSum(outT, null), inputs);
+                    var excluded = NonDifferentiableInputs.TryGetValue(name, out var nd) ? nd.Inputs : Array.Empty<int>();
                     differentiated = Enumerable.Range(0, inputs.Length)
-                        .Where(i => grads.TryGetValue(inputs[i], out var g) && g is not null).ToArray();
+                        .Where(i => !excluded.Contains(i) && grads.TryGetValue(inputs[i], out var g) && g is not null).ToArray();
                 }
                 catch (Exception ex)
                 {
