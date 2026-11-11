@@ -427,12 +427,6 @@ internal static partial class BackwardFunctions<T>
         return result;
     }
 
-    private static int ShapeLength(int[] shape)
-    {
-        int n = 1;
-        foreach (int s in shape) n *= s;
-        return n;
-    }
 
     /// <summary>Global flat input indices from per-plane flat indices (one plane per leading (batch, channel) pair).</summary>
     internal static int[] PlaneIndicesToGlobal(int[] perPlane, int outPlane, int planeSize)
