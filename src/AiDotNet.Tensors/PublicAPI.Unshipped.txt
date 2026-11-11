@@ -258,3 +258,34 @@ static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotN
 static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! example, AiDotNet.Tensors.Engines.Export.TraceOptions? options) -> AiDotNet.Tensors.Engines.Export.TensorProgram!
 static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! examples) -> AiDotNet.Tensors.Engines.Export.TensorProgram!
 static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! examples, AiDotNet.Tensors.Engines.Export.TraceOptions? options) -> AiDotNet.Tensors.Engines.Export.TensorProgram!
+AiDotNet.Tensors.Engines.Export.CompiledTarget
+AiDotNet.Tensors.Engines.Export.CompiledTarget.CodecVersion.get -> int
+AiDotNet.Tensors.Engines.Export.CompiledTarget.Device.get -> string!
+AiDotNet.Tensors.Engines.Export.CompiledTarget.ElementType.get -> string!
+AiDotNet.Tensors.Engines.Export.CompiledTarget.HardwareFingerprint.get -> string!
+AiDotNet.Tensors.Engines.Export.CompiledTarget.InputShapes.get -> System.Collections.Generic.IReadOnlyList<int[]!>!
+AiDotNet.Tensors.Engines.Export.CompiledTarget.PlanFormatVersion.get -> int
+AiDotNet.Tensors.Engines.Export.CompiledTarget.SizeInBytes.get -> int
+AiDotNet.Tensors.Engines.Export.ProgramFormatException
+AiDotNet.Tensors.Engines.Export.ProgramFormatException.ProgramFormatException(string! message) -> void
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.KeepForeignTargets.get -> bool
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.KeepForeignTargets.set -> void
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.MaxBytes.get -> long
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.MaxBytes.set -> void
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.ProgramLoadOptions() -> void
+AiDotNet.Tensors.Engines.Export.ProgramPackage
+AiDotNet.Tensors.Engines.Export.ProgramPackage.ClearTargets() -> void
+AiDotNet.Tensors.Engines.Export.ProgramPackage.Execute<T>(AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! inputs) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!
+AiDotNet.Tensors.Engines.Export.ProgramPackage.GetOrCompile<T>(AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! inputs) -> AiDotNet.Tensors.Engines.Compilation.ICompiledPlan<T>?
+AiDotNet.Tensors.Engines.Export.ProgramPackage.IsDirty.get -> bool
+AiDotNet.Tensors.Engines.Export.ProgramPackage.Precompile<T>(AiDotNet.Tensors.Engines.IEngine! engine, System.Collections.Generic.IEnumerable<AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!>! inputSets) -> void
+AiDotNet.Tensors.Engines.Export.ProgramPackage.Program.get -> AiDotNet.Tensors.Engines.Export.TensorProgram!
+AiDotNet.Tensors.Engines.Export.ProgramPackage.ProgramPackage(AiDotNet.Tensors.Engines.Export.TensorProgram! program) -> void
+AiDotNet.Tensors.Engines.Export.ProgramPackage.Save(System.IO.Stream! stream) -> void
+AiDotNet.Tensors.Engines.Export.ProgramPackage.Save(string! path) -> void
+AiDotNet.Tensors.Engines.Export.ProgramPackage.Targets.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Export.CompiledTarget!>!
+static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(System.IO.Stream! stream) -> AiDotNet.Tensors.Engines.Export.ProgramPackage!
+static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(System.IO.Stream! stream, AiDotNet.Tensors.Engines.Export.ProgramLoadOptions? options) -> AiDotNet.Tensors.Engines.Export.ProgramPackage!
+static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(string! path) -> AiDotNet.Tensors.Engines.Export.ProgramPackage!
+static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(string! path, AiDotNet.Tensors.Engines.Export.ProgramLoadOptions? options) -> AiDotNet.Tensors.Engines.Export.ProgramPackage!
