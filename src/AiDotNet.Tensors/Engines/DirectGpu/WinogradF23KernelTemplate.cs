@@ -625,6 +625,8 @@ internal static class WinogradF23KernelTemplate
         })
         .Replace("PRECISE ", dialect == WinogradKernelDialect.Glsl ? "precise " : "")
         .Replace("TOINT(", dialect == WinogradKernelDialect.Glsl ? "int(" : "(int)(")
+        .Replace("TOFLOAT(", dialect == WinogradKernelDialect.Glsl ? "float(" : "(float)(")
+        .Replace("EXP(", dialect == WinogradKernelDialect.Hip ? "expf(" : "exp(")
         .Replace("IBITS(", dialect switch
         {
             WinogradKernelDialect.OpenCl => "as_float(",

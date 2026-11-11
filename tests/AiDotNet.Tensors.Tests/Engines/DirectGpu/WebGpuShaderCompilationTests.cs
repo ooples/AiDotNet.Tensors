@@ -30,6 +30,11 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuConvDgradS2Kernels.Entry",     // the stride-2 dgrad kernels' shared entry-point header, closed by each body
         "WebGpuGroupedGemmKernels.ForwardSource",     // templates: SourceFor fills in the entry-point name
         "WebGpuGroupedGemmKernels.WeightGradSource",
+        "WebGpuMoeKernels.Entry",             // the fused MoE kernels' bodies; SourceFor prefixes each with its header
+        "WebGpuMoeKernels.RouteBody",
+        "WebGpuMoeKernels.SortBody",
+        "WebGpuMoeKernels.CombineBody",
+        "WebGpuMoeKernels.DScoresBody",
     };
 
     private const string Validator = @"
@@ -128,6 +133,9 @@ process.exit(0);
             // The jagged-rows grouped GEMM, one module per kernel.
             foreach (var name in AiDotNet.Tensors.Engines.DirectGpu.GroupedGemmKernelTemplate.GetKernelNames())
                 Emit("GroupedGemm." + name, WebGpuGroupedGemmKernels.SourceFor(name));
+            // The fused MoE kernels, one module per kernel.
+            foreach (var name in AiDotNet.Tensors.Engines.DirectGpu.MoeKernelTemplate.GetKernelNames())
+                Emit("Moe." + name, WebGpuMoeKernels.SourceFor(name));
             // The FP32 PyTorch-parity kernels, one translated module per kernel (#1125, #1128).
             foreach (var module in CudaDialectToWgsl.Translate(AiDotNet.Tensors.Engines.DirectGpu.TorchParityF32Kernels.GetSource()))
             {
