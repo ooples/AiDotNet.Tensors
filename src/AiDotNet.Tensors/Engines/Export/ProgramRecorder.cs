@@ -144,14 +144,31 @@ internal sealed class ProgramRecorder : IEngineCallRecorder
             case EngineValueKind.Primitive or EngineValueKind.NullablePrimitive:
                 return new ProgramArg(p.Name, ProgramArgKind.Literal, literal: value);
             case EngineValueKind.PrimitiveArray:
-                var arr = (Array)value;
-                var copy = arr.GetType().GetElementType()!.IsEnum
-                    ? arr.Cast<object>().Select(e => (object)new EnumLiteral(e.ToString()!)).ToArray()
-                    : (Array)arr.Clone();
-                return new ProgramArg(p.Name, ProgramArgKind.Literal, literal: copy);
+                return new ProgramArg(p.Name, ProgramArgKind.Literal, literal: CopyLiteralArray((Array)value));
+            case EngineValueKind.ScalarArray:
+                return new ProgramArg(p.Name, ProgramArgKind.Literal,
+                    literal: ((Array)value).Cast<object>().Select(v => ToDouble(v, p.Name)).ToArray());
+            case EngineValueKind.ActivationParams:
+                var ap = (FusedActivationParams)value;
+                return new ProgramArg(p.Name, ProgramArgKind.Literal, literal: new object?[] { ap.Alpha, ap.Beta, ap.Theta });
             default:
                 throw new TraceException($"Parameter '{p.Name}' ({p.TypeKey}) has no portable form.");
         }
+    }
+
+    // Deep copy (jagged arrays included), with enum members kept by name.
+    private static Array CopyLiteralArray(Array arr)
+    {
+        var elem = arr.GetType().GetElementType()!;
+        if (elem.IsEnum) return arr.Cast<object>().Select(e => (object)new EnumLiteral(e.ToString()!)).ToArray();
+        if (elem.IsArray)
+        {
+            var outer = Array.CreateInstance(elem, arr.Length);
+            for (int i = 0; i < arr.Length; i++)
+                outer.SetValue(arr.GetValue(i) is Array inner ? CopyLiteralArray(inner) : null, i);
+            return outer;
+        }
+        return (Array)arr.Clone();
     }
 
     private static double ToDouble(object value, string name) => value switch

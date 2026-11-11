@@ -149,24 +149,6 @@ AiDotNet.Tensors.Engines.Export.EngineOpParameter.Kind.get -> AiDotNet.Tensors.E
 AiDotNet.Tensors.Engines.Export.EngineOpParameter.Name.get -> string!
 AiDotNet.Tensors.Engines.Export.EngineOpParameter.TypeKey.get -> string!
 AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Enum = 11 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Matrix = 7 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableEnum = 16 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.NullablePrimitive = 15 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableScalar = 14 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableTensor = 13 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.OutTensor = 12 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Primitive = 9 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.PrimitiveArray = 10 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Scalar = 8 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Tensor = 1 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorArray = 3 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorFixed = 2 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorList = 4 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorTuple = 5 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Unsupported = 17 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Vector = 6 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
-AiDotNet.Tensors.Engines.Export.EngineValueKind.Void = 0 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
 AiDotNet.Tensors.Engines.Export.EnumLiteral
 AiDotNet.Tensors.Engines.Export.EnumLiteral.Member.get -> string!
 AiDotNet.Tensors.Engines.Export.ProgramArg
@@ -289,3 +271,23 @@ static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(System.IO.Stream! str
 static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(System.IO.Stream! stream, AiDotNet.Tensors.Engines.Export.ProgramLoadOptions? options) -> AiDotNet.Tensors.Engines.Export.ProgramPackage!
 static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(string! path) -> AiDotNet.Tensors.Engines.Export.ProgramPackage!
 static AiDotNet.Tensors.Engines.Export.ProgramPackage.Load(string! path, AiDotNet.Tensors.Engines.Export.ProgramLoadOptions? options) -> AiDotNet.Tensors.Engines.Export.ProgramPackage!
+AiDotNet.Tensors.Engines.Export.EngineValueKind.ActivationParams = 13 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Enum = 11 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Matrix = 7 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableEnum = 18 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullablePrimitive = 17 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableScalar = 16 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableTensor = 15 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.OutTensor = 14 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Primitive = 9 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.PrimitiveArray = 10 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Scalar = 8 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.ScalarArray = 12 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Tensor = 1 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorArray = 3 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorFixed = 2 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorList = 4 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorTuple = 5 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Unsupported = 19 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Vector = 6 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Void = 0 -> AiDotNet.Tensors.Engines.Export.EngineValueKind

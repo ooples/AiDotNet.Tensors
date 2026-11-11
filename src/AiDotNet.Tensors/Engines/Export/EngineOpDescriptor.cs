@@ -30,6 +30,10 @@ public enum EngineValueKind
     PrimitiveArray,
     /// <summary>An enum value, stored by type name and member name.</summary>
     Enum,
+    /// <summary>An array of scalars of the op's element type; stored as doubles.</summary>
+    ScalarArray,
+    /// <summary>A <see cref="FusedActivationParams"/>, stored as its alpha, beta and theta.</summary>
+    ActivationParams,
     /// <summary>An <c>out</c> tensor parameter (an additional output).</summary>
     OutTensor,
     /// <summary>Nullable forms of the above.</summary>

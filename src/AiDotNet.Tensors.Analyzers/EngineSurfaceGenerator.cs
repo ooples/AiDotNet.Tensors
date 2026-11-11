@@ -174,6 +174,7 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
         }
         if (t is ITypeParameterSymbol tp && tp.TypeParameterKind == TypeParameterKind.Method) return "Scalar";
         if (t.IsRefLikeType) return "Unsupported";
+        if (t.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat).TrimEnd('?') == "AiDotNet.Tensors.Engines.FusedActivationParams") return "ActivationParams";
         if (t.TypeKind == TypeKind.Enum) return "Enum";
         switch (t.SpecialType)
         {
@@ -189,6 +190,8 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
             {
                 "Primitive" => "PrimitiveArray",
                 "Enum" => "PrimitiveArray",
+                "PrimitiveArray" => "PrimitiveArray",
+                "Scalar" => "ScalarArray",
                 "Tensor" or "TensorFixed" => "TensorArray",
                 _ => "Unsupported",
             };

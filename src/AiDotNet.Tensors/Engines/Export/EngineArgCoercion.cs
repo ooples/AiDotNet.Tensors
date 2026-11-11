@@ -25,9 +25,15 @@ public static class EngineArgCoercion
 
     private static object? Convert(object value, Type target)
     {
+        if (target.IsInstanceOfType(value)) return value;
         var underlying = Nullable.GetUnderlyingType(target);
         if (underlying is not null) return Convert(value, underlying);
 
+        if (target == typeof(FusedActivationParams) && value is object?[] { Length: 3 } ap)
+        {
+            float? F(object? o) => o is null ? null : System.Convert.ToSingle(o, System.Globalization.CultureInfo.InvariantCulture);
+            return new FusedActivationParams { Alpha = F(ap[0]), Beta = F(ap[1]), Theta = F(ap[2]) };
+        }
         if (value is EnumLiteral literal) value = literal.Member;
         if (target.IsEnum)
         {

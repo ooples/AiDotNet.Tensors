@@ -32,7 +32,7 @@ internal static class ProgramSerializer
     internal const byte SectionCompiled = 3;
 
     private const byte LitNull = 0, LitBool = 1, LitInt = 2, LitLong = 3, LitFloat = 4, LitDouble = 5, LitString = 6,
-        LitEnum = 7, LitArray = 8;
+        LitEnum = 7, LitArray = 8, LitObject = 9;
 
     // ── Program section ────────────────────────────────────────────────────────────────────────────────────
 
@@ -230,12 +230,12 @@ internal static class ProgramSerializer
 
     private static byte ElementTag(Type t) =>
         t == typeof(bool) ? LitBool : t == typeof(int) ? LitInt : t == typeof(long) ? LitLong : t == typeof(float) ? LitFloat
-        : t == typeof(double) ? LitDouble : t == typeof(string) ? LitString : LitEnum; // object[] of EnumLiteral
+        : t == typeof(double) ? LitDouble : t == typeof(string) ? LitString : t.IsArray ? LitArray : LitObject;
 
     private static Type TagType(byte tag) => tag switch
     {
         LitBool => typeof(bool), LitInt => typeof(int), LitLong => typeof(long), LitFloat => typeof(float),
-        LitDouble => typeof(double), LitString => typeof(string), LitEnum => typeof(object),
+        LitDouble => typeof(double), LitString => typeof(string), LitArray or LitObject => typeof(object),
         _ => throw new ProgramFormatException($"Unknown array element tag {tag}."),
     };
 
