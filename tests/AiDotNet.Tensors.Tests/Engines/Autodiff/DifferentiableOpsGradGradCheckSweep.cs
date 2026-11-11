@@ -64,8 +64,14 @@ public class DifferentiableOpsGradGradCheckSweep
         try
         {
             var harness = new DifferentiableOpsGradCheckSweep(_out);
+            // Local iteration aid: GRADGRAD_OPS=Tanh,Softmax restricts the sweep to those ops (the assertion still holds
+            // for whatever runs).
+            var only = Environment.GetEnvironmentVariable("GRADGRAD_OPS") is { Length: > 0 } filter
+                ? new HashSet<string>(filter.Split(',').Select(s => s.Trim()), StringComparer.Ordinal)
+                : null;
             foreach (var (name, m, args) in harness.DrivableOps(skipped))
             {
+                if (only is not null && !only.Contains(name)) continue;
                 if (NotSecondOrderCheckable.TryGetValue(name, out var why)) { exempted.Add($"{name} ({why})"); continue; }
                 bool firstOrderExempt = DifferentiableOpsGradCheckSweep.Exempt.ContainsKey(name);
                 string label = $"{name}|{DifferentiableOpsGradCheckSweep.ParamFingerprint(m)}";
