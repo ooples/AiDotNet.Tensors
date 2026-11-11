@@ -106,8 +106,7 @@ internal sealed class PtxDenseVectorKernel : IDisposable
     {
         Validate(operation, m, n);
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         if (operation == DirectPtxDenseVectorOperation.Dot)

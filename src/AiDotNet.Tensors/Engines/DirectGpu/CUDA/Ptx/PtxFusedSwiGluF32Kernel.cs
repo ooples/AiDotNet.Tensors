@@ -99,8 +99,7 @@ internal sealed class PtxFusedSwiGluF32Kernel : IDisposable
         int outputRowBytes = checked(halfDimension * sizeof(float));
         string negativeLog2E = FloatLiteral(-1.4426950408889634f);
         var ptx = new StringBuilder(6_144);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

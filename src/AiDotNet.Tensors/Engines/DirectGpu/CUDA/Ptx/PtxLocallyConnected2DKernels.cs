@@ -136,8 +136,7 @@ internal sealed class PtxLocallyConnected2DKernel : IDisposable
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(16384);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
@@ -318,8 +317,7 @@ internal sealed class PtxLocallyConnected2DBackwardBiasKernel : IDisposable
         string entry = EntryFor(Batch, OutputChannels, OutH, OutW);
 
         var s = new StringBuilder(6144);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

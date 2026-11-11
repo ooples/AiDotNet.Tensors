@@ -148,8 +148,7 @@ internal sealed class PtxConv2DNchw3x3BackwardWeightF32Kernel : IDisposable
         const int weightsPerOutBlock = KernelSize * KernelSize; // per (co,ci): 9
 
         var ptx = new StringBuilder(8192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

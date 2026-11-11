@@ -186,8 +186,7 @@ internal sealed class PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel :
         const int offsetGroupSpanElems = 2 * TapsPerChannel * SpatialElements;     // 1152 (g scale)
 
         var ptx = new StringBuilder(20480);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

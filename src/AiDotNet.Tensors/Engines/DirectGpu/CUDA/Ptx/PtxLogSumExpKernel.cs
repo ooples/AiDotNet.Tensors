@@ -82,8 +82,7 @@ internal sealed class PtxLogSumExpKernel : IDisposable
         const string NegInf = "0fFF800000";
 
         var ptx = new StringBuilder(9_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// logsumexp-row M={m} N={n}");
         ptx.AppendLine();

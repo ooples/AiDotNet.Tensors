@@ -92,8 +92,7 @@ internal sealed class PtxFusedComplexMultiplyF32Kernel : IDisposable
         int pairsPerThread = GetPairsPerThread(numPairs);
         int chunksPerThread = pairsPerThread / PairsPerChunk;
         var ptx = new StringBuilder(2_048);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape pairs={numPairs} block={BlockThreads} layout=interleaved-complex-fp32");
         ptx.AppendLine();

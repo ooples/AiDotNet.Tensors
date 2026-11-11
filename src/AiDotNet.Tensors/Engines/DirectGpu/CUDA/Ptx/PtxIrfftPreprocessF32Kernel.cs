@@ -98,8 +98,7 @@ internal sealed class PtxIrfftPreprocessF32Kernel : IDisposable
         int inLen = n / 2 + 1;
 
         var ptx = new StringBuilder(2_816);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape n={n} inlen={inLen} block={blockThreads} op=irfft-preprocess");
         ptx.AppendLine();

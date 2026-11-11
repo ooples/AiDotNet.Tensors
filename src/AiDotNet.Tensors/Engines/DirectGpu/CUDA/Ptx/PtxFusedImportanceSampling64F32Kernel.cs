@@ -91,8 +91,7 @@ internal sealed class PtxFusedImportanceSampling64F32Kernel : IDisposable
                 "The experimental importance-sampling emitter targets SM86 only.");
         ValidateNumRays(numRays);
         var ptx = new StringBuilder(55_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

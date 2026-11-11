@@ -100,8 +100,7 @@ internal sealed class PtxDepthwiseConv2D3x3BackwardInputKernel : IDisposable
         string entry = FormattableString.Invariant($"aidotnet_depthwise_bwd_input3x3_n{n}_c{c}_h{h}_w{w}");
 
         var s = new StringBuilder(12288);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
@@ -258,8 +257,7 @@ internal sealed class PtxDepthwiseConv2D3x3BackwardWeightKernel : IDisposable
         string entry = FormattableString.Invariant($"aidotnet_depthwise_bwd_weight3x3_n{n}_c{c}_h{h}_w{w}");
 
         var s = new StringBuilder(16384);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

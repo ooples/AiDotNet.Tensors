@@ -124,8 +124,7 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         const string one = "0f3F800000", zero = "0f00000000";
 
         var ptx = new StringBuilder(6_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// instant-ngp-hash-encode points={numPoints} res={resolution} table={tableSize} fpl={featuresPerLevel} loff={levelOffset} ostride={outputStride}");
         ptx.AppendLine();

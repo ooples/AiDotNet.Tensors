@@ -122,8 +122,7 @@ internal sealed class PtxWinogradF23InputTransformKernel : IDisposable
             $"aidotnet_winograd_f23_input_transform_n{n}_c{c}_h{h}_w{w}");
 
         var s = new StringBuilder(16384);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
