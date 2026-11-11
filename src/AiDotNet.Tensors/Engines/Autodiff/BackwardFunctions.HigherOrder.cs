@@ -160,6 +160,12 @@ internal static partial class BackwardFunctions<T>
             var result = composite(engine);
             var g = tape.ComputeGradients(result, sources, createGraph: true,
                 seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(result, gradOutput) });
+            // The composite's forward and backward were recorded on the nested tape; hand them to the outer one, so
+            // a later create-graph backward there (a third derivative) walks through them too. BEFORE the
+            // accumulation below: a tape walk runs entries in reverse recording order, so the producers of these
+            // gradients must precede the add that consumes them, or that walk reaches a producer before its
+            // gradient has arrived.
+            if (outer is not null) tape.TransferEntriesTo(outer);
             using (GradientTape<T>.RecordOn(outer))
             {
                 foreach (var input in sources)

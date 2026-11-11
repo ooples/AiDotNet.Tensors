@@ -480,6 +480,40 @@ public sealed class GradientTape<T> : IDisposable
     private TapeEntry<T> _discardSlot;
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    /// <summary>
+    /// Moves every entry this (nested) tape recorded onto <paramref name="target"/>, in order, handing it their
+    /// gradient nodes and saved-state pins, and leaves this tape empty.
+    /// </summary>
+    /// <remarks>
+    /// A create-graph backward that differentiates a composite under a nested tape
+    /// (<see cref="BackwardFunctions{T}.TryCompositeBackward"/>) records the composite's forward and its backward on
+    /// the nested tape. The gradient's graph reaches the outer tape's tensors through those nodes, but a later
+    /// create-graph backward on the outer tape walks only the OUTER tape's entries, so it lost every path through the
+    /// composite: a third derivative (or a second one taken with create-graph) through LayerNorm, GLU, a fused
+    /// convolution's batch norm, came out zero. Moved here, they are walked like any other recorded op.
+    /// </remarks>
+    internal void TransferEntriesTo(GradientTape<T> target)
+    {
+        if (target is null) throw new ArgumentNullException(nameof(target));
+        if (ReferenceEquals(target, this)) return;
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            ref var source = ref _entries[i];
+            if (source.Output is null) continue;
+            ref var slot = ref target.RecordSlot(out bool accepted);
+            if (!accepted)
+            {
+                // A bounded target drops it, as it would have dropped the op had it recorded there; its pins go.
+                DifferentiableOps.UnpinSavedStateTensors<T>(ref source);
+                continue;
+            }
+            slot = source;
+            if (source.Output.GradFn is { } node && ReferenceEquals(node.OwningTape, this)) node.OwningTape = target;
+        }
+        // The entries (and their pins) now belong to the target: clear without releasing anything.
+        _entries.Reset();
+    }
+
     internal ref TapeEntry<T> RecordSlot(out bool accepted)
     {
         // Same consumed-guard as Record(): RecordSlot is the alternate (direct arena-slot) recording

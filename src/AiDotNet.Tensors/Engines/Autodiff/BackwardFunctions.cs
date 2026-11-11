@@ -711,6 +711,17 @@ internal static partial class BackwardFunctions<T>
         // (GetFlat on a resident tensor) and re-uploads the derivative for the multiply. All engine kernels now use
         // this function's convention (the alpha branch at exactly x == 0, as PyTorch does). The device kernel
         // is float-only, so every other element type keeps the dtype-generic host path below.
+        if (CreatesGraph)
+        {
+            // Under create-graph: g ⊙ (y > 0 ? 1 : y + α), the branch mask constant and y the recorded output, whose own
+            // derivative (α·eˣ = y + α on the negative branch) carries the second order. (The mask reads the output, as
+            // the host path below does: y > 0 exactly when x > 0.)
+            var positive = ConstantMask(output, v => v > 0);
+            var alphaShifted = engine.TensorAddScalar(output, MathHelper.GetNumericOperations<T>().FromDouble((double)savedState[0]));
+            var slope = engine.TensorAdd(positive, engine.TensorMultiply(OneMinus(engine, positive), alphaShifted));
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.TensorMultiply(gradOutput, slope), engine);
+            return;
+        }
         if (typeof(T) == typeof(float) && engine.Is<DirectGpuTensorEngine>())
         {
             var deviceGrad = engine.EluBackward(gradOutput, inputs[0], output, (double)savedState[0]);
@@ -1570,6 +1581,21 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         bool relu = (bool)savedState[3];
+        // Under create-graph: differentiate act(conv2d(x, k) + b[c]) as recorded ops (the one-pass epilogue backward
+        // below runs on the host and records nothing).
+        var convIn = inputs[0];
+        var convKernel = inputs[1];
+        var convBias = inputs[2];
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                var z = e.Conv2D(convIn, convKernel, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]);
+                var biasShape = new int[z.Rank];
+                for (int i = 0; i < biasShape.Length; i++) biasShape[i] = 1;
+                biasShape[1] = convBias.Length;
+                z = e.TensorAdd(z, e.TensorBroadcastTo(e.Reshape(convBias, biasShape), z._shape));
+                return relu ? e.ReLU(z) : z;
+            }))
+            return;
         Tensor<T> gradPreActivation;
         if (typeof(T) == typeof(float) && engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu
             && gradOutput.IsContiguous && output.IsContiguous)
@@ -3372,7 +3398,10 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.SeluBackward(gradOutput, inputs[0]);
+        // Under create-graph: g ⊙ (x > 0 ? λ : λα·eˣ) with the branch mask constant and eˣ recorded.
+        var grad = CreatesGraph
+            ? engine.TensorMultiply(gradOutput, SeluDerivativeRecorded(engine, inputs[0]))
+            : engine.SeluBackward(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -3381,22 +3410,23 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.HardsigmoidBackward(gradOutput, inputs[0]);
+        // A fixed (x-dependent) mask of the upstream gradient: self-adjoint, recorded under create-graph.
+        var x = inputs[0];
+        var grad = DiagonalLinearGrad("HardsigmoidBackward", gradOutput, engine, (e, w) => e.HardsigmoidBackward(w, x));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
-    /// <summary>d(hardswish(x))/dx</summary>
+    /// <summary>
+    /// d(hardswish(x))/dx = 0 for x &lt; -3, x/3 + 1/2 for -3 ≤ x ≤ 3, 1 for x &gt; 3 (torch's hardswish_backward).
+    /// </summary>
     internal static void HardSwishBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        // derivative = clamp((2x+3)/6, 0, 1) — use engine ops for graph recording
-        var twoX = engine.TensorMultiplyScalar(inputs[0], numOps.FromDouble(2.0));
-        var twoXPlus3 = engine.TensorAddScalar(twoX, numOps.FromDouble(3.0));
-        var scaled = engine.TensorDivideScalar(twoXPlus3, numOps.FromDouble(6.0));
-        var clamped = engine.TensorClamp(scaled, numOps.Zero, numOps.One);
-        var grad = engine.TensorMultiply(gradOutput, clamped);
+        // The derivative used to be clamp((2x+3)/6, 0, 1), which is wrong on [-3, -1.5) (it gave 0 where the slope is
+        // negative) and on (1.5, 3] (1 where it is up to 1.5). Recorded ops with constant region masks, so the
+        // second derivative (1/3 inside the ramp) follows under create-graph.
+        var grad = engine.TensorMultiply(gradOutput, HardSwishDerivativeRecorded(engine, inputs[0]));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -3405,7 +3435,8 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.Relu6Backward(gradOutput, inputs[0]);
+        var x = inputs[0];
+        var grad = DiagonalLinearGrad("Relu6Backward", gradOutput, engine, (e, w) => e.Relu6Backward(w, x));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -3647,6 +3678,12 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Under create-graph: differentiate x·[x ≥ 0] + α̃·x·[x < 0] as recorded ops (α̃ the slope routed to each
+        // element's channel, a recorded gather), so both gradients stay connected to g, x and α.
+        var x = inputs[0];
+        var slope = inputs[1];
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e => PReluRecorded(e, x, slope)))
+            return;
         var (inputGrad, alphaGrad) = engine.PReLUBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], alphaGrad, engine);
@@ -3658,7 +3695,8 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         double threshold = (double)savedState[0];
-        var grad = engine.ThresholdBackward(gradOutput, inputs[0], threshold);
+        var x = inputs[0];
+        var grad = DiagonalLinearGrad("ThresholdBackward", gradOutput, engine, (e, w) => e.ThresholdBackward(w, x, threshold));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

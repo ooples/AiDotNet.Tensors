@@ -9980,7 +9980,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var biased = bias is null ? conv
                 : bias.Rank == 1 ? TensorChannelBiasAdd(conv, bias)
                 : TensorBroadcastAdd(conv, bias);
-            return ActivationRegistry.Get(activation) is { } handler ? handler.Apply(this, biased) : biased;
+            // The activation as recorded ops: most fused activations' handlers compute on the host and record nothing.
+            // Gumbel-Softmax keeps its sampling forward (which records its own relaxation backward).
+            return activation == FusedActivationType.GumbelSoftmax && ActivationRegistry.Get(activation) is { } gumbel
+                ? gumbel.Apply(this, biased)
+                : Autodiff.BackwardFunctions<T>.ApplyFusedActivationRecorded(this, biased, activation, null);
         }
 
         if (!TryGetBackend(out var backend))
@@ -10319,6 +10323,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         FusedActivationType activation)
     {
         using var __gpuOp = EnterGpuOp();
+        // A recording tape (or graph capture) takes the base composition of recorded ops: the device kernels below
+        // record nothing, so the inputs got no gradient at all under a tape.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
         if (!TryGetBackend(out var backend))
             return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
 
@@ -10506,6 +10514,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         FusedActivationType activation)
     {
         using var __gpuOp = EnterGpuOp();
+        // A recording tape (or graph capture) takes the base composition of recorded ops (see FusedConv3D).
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.FusedConvTranspose2D(input, kernel, bias, strideH, strideW, padH, padW, outputPadH, outputPadW, activation);
         if (!TryGetBackend(out var backend))
             return base.FusedConvTranspose2D(input, kernel, bias, strideH, strideW, padH, padW, outputPadH, outputPadW, activation);
 
@@ -12525,6 +12536,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> saveVar)
     {
         using var __gpuOp = EnterGpuOp();
+        // A recording tape (or graph capture) takes the base composition of recorded ops (see FusedConv3D).
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.FusedBatchNorm(input, gamma, beta, runningMean, runningVar, epsilon, momentum, training, activation, out saveMean, out saveVar);
         if (!TryGetBackend(out var backend))
             return base.FusedBatchNorm(input, gamma, beta, runningMean, runningVar, epsilon, momentum, training, activation, out saveMean, out saveVar);
 

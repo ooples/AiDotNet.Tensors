@@ -366,7 +366,11 @@ public partial class DifferentiableOpsGradGradCheckSweep
                         var g1 = tape.ComputeGradients(loss, sources, createGraph: true);
                         var h = Contract(g1, sources, v);
                         if (h is null) return 0;
-                        var g2 = tape.ComputeGradients(h, sources, createGraph: true);
+                        // The reference evaluations take the second backward without create-graph (the graph walk the
+                        // second-order sweep validates); only the differentiated evaluation runs every backward with
+                        // create-graph. Using create-graph for both made the check vacuous where that walk loses the
+                        // second-order gradient: K was then 0 on both sides (nested-tape composites did exactly this).
+                        var g2 = tape.ComputeGradients(h, sources, createGraph: differentiate);
                         var k = Contract(g2, sources, w);
                         if (k is null) return 0;
                         if (differentiate) third = tape.ComputeGradients(k, sources, createGraph: true);

@@ -48,6 +48,8 @@ internal static partial class BackwardFunctions<T>
                 result = engine.Reshape(result, (int[])gradOutput._shape.Clone());
             var g = tape.ComputeGradients(result, sources, createGraph: true,
                 seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(result, gradOutput) });
+            // Hand the nested tape's entries to the outer tape before accumulating (see TryCompositeBackward).
+            if (outer is not null) tape.TransferEntriesTo(outer);
             using (GradientTape<T>.RecordOn(outer))
             {
                 foreach (var input in sources)
