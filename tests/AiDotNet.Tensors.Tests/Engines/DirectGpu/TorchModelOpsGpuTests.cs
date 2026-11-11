@@ -189,6 +189,14 @@ public abstract class TorchModelOpsGpuTestsBase
         CheckForwardAndGradients(gpu, "TensorTopKSoftmax", (e, v) => e.TensorTopKSoftmax(v[0], 1), new[] { Rand(22, 4.0, 2, 3, 6) }, 2e-6, 1e-5);
         CheckForwardAndGradients(gpu, "TensorTopKSoftmax", (e, v) => e.TensorTopKSoftmax(v[0], 64), new[] { Rand(23, 4.0, 3, 64) }, 2e-6, 1e-5);
 
+        // Vocabulary-sized rows take the chunk-selection path: small k, a large k, and rows with heavy ties (values
+        // rounded to a few levels, so the lower-index rule decides most of the selection).
+        CheckForwardAndGradients(gpu, "TensorTopKSoftmax", (e, v) => e.TensorTopKSoftmax(v[0], 8), new[] { Rand(24, 6.0, 2, 50000) }, 2e-6, 1e-5);
+        CheckForwardAndGradients(gpu, "TensorTopKSoftmax", (e, v) => e.TensorTopKSoftmax(v[0], 300), new[] { Rand(25, 6.0, 2, 5000) }, 2e-6, 1e-5);
+        var ties = Rand(26, 3.0, 3, 4099);
+        for (int i = 0; i < ties.Length; i++) ties[i] = (float)Math.Round(ties[i]);
+        CheckForwardAndGradients(gpu, "TensorTopKSoftmax", (e, v) => e.TensorTopKSoftmax(v[0], 37), new[] { ties }, 2e-6, 1e-5);
+
         // Ties go to the lower index; NaN sorts below every number (and is selected only when k reaches it).
         var tied = new Tensor<float>(new[] { 1f, 3f, 3f, 2f, 3f, float.NaN, 0f, 5f, 2f, 2f, float.NaN, 1f }, new[] { 3, 4 });
         foreach (int k in new[] { 1, 2, 3, 4 })
@@ -220,6 +228,12 @@ public abstract class TorchModelOpsGpuTestsBase
             new[] { Rand(35, 2.0, 7, 4), Rand(36, 1.0, 4, 4) }, 2e-5, 2e-5);
         CheckForwardAndGradients(gpu, "TensorCrfForward", (e, v) => e.TensorCrfForward(v[0], v[1], v[2]),
             new[] { Rand(37, 2.0, 2, 1, 3), Rand(38, 1.0, 3, 3), Rand(39, 1.0, 3) }, 2e-5, 2e-5);
+
+        // More tags than a work group has lanes (each lane covers several tags), and a long sequence.
+        CheckForwardAndGradients(gpu, "TensorCrfForward", (e, v) => e.TensorCrfForward(v[0], v[1], v[2], v[3]),
+            new[] { Rand(42, 2.0, 2, 3, 300), Rand(43, 1.0, 300, 300), Rand(44, 1.0, 300), Rand(45, 1.0, 300) }, 2e-5, 2e-5);
+        CheckForwardAndGradients(gpu, "TensorCrfForward", (e, v) => e.TensorCrfForward(v[0], v[1]),
+            new[] { Rand(46, 2.0, 3, 400, 6), Rand(47, 1.0, 6, 6) }, 2e-5, 2e-5);   // log alpha reaches ~1e3: the offset form keeps full precision
 
         // Forbidden transitions (-inf, a constraint mask): log-sum-exp over -inf terms and a fully forbidden target.
         var masked = Rand(40, 1.0, 4, 4);
@@ -322,6 +336,48 @@ public sealed class OpenClTensorEngineTestFixture : IDirectGpuTensorEngineFixtur
         Engine?.Dispose();
         _backend?.Dispose();
     }
+}
+
+/// <summary>An engine over the CUDA backend, which a machine's default backend order need not pick.</summary>
+public sealed class CudaTensorEngineTestFixture : IDirectGpuTensorEngineFixture, IDisposable
+{
+    private readonly AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend? _backend;
+    public DirectGpuTensorEngine? Engine { get; }
+    public bool IsAvailable => Engine?.IsGpuAvailable == true;
+
+    public CudaTensorEngineTestFixture()
+    {
+        try
+        {
+            _backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+            if (!_backend.IsAvailable)
+            {
+                _backend.Dispose();
+                _backend = null;
+                return;
+            }
+            Engine = new DirectGpuTensorEngine(new DirectGpuEngine(_backend));
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or PlatformNotSupportedException or TypeInitializationException
+            or InvalidOperationException or EntryPointNotFoundException)
+        {
+            _backend?.Dispose();
+            _backend = null;
+            Engine = null;
+        }
+    }
+
+    public void Dispose()
+    {
+        Engine?.Dispose();
+        _backend?.Dispose();
+    }
+}
+
+[Collection("DirectGpuSerial")]
+public class TorchModelOpsCudaTests : TorchModelOpsGpuTestsBase, IClassFixture<CudaTensorEngineTestFixture>
+{
+    public TorchModelOpsCudaTests(CudaTensorEngineTestFixture fixture) : base(fixture) { }
 }
 
 /// <summary>The cases above on the machine's default DirectGpu backend.</summary>

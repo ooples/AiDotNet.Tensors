@@ -90,17 +90,17 @@ internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParit
     public void ModelFakeQuantize(IGpuBuffer input, IGpuBuffer partial, IGpuBuffer minMax, IGpuBuffer output, IGpuBuffer mask, int n,
         bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint)
         => PortableTorchModelOps.FakeQuantize(_launch, input, partial, minMax, output, mask, n, derive, symmetric, hasZeroPoint, qMin, qMax, fixedStep, zeroPoint);
-    public void ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratch, IGpuBuffer output, int rows, int width, int k)
-        => PortableTorchModelOps.TopKSoftmax(_launch, input, scratch, output, rows, width, k);
+    public void ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratchValues, IGpuBuffer scratchIndices, IGpuBuffer scratchWeights, IGpuBuffer output, int rows, int width, int k)
+        => PortableTorchModelOps.TopKSoftmax(_launch, input, scratchValues, scratchIndices, scratchWeights, output, rows, width, k);
     public void ModelTimeEmbedding(IGpuBuffer timesteps, IGpuBuffer frequencies, IGpuBuffer output, int batch, int halfDim, int dim)
         => PortableTorchModelOps.TimeEmbedding(_launch, timesteps, frequencies, output, batch, halfDim, dim);
     public void ModelTimeEmbeddingBackward(IGpuBuffer timesteps, IGpuBuffer frequencies, IGpuBuffer gradOutput, IGpuBuffer gradTimesteps, int batch, int halfDim, int dim)
         => PortableTorchModelOps.TimeEmbeddingBackward(_launch, timesteps, frequencies, gradOutput, gradTimesteps, batch, halfDim, dim);
     public void ModelCrfForward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer start, IGpuBuffer end, IGpuBuffer alpha, IGpuBuffer logZ, int batch, int seqLen, int tags)
         => PortableTorchModelOps.CrfForward(_launch, emissions, transitions, start, end, alpha, logZ, batch, seqLen, tags);
-    public void ModelCrfBackward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer end, IGpuBuffer alpha, IGpuBuffer logZ, IGpuBuffer gradLogZ,
+    public void ModelCrfBackward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer end, IGpuBuffer alpha, IGpuBuffer gradLogZ,
         IGpuBuffer beta, IGpuBuffer gradEmissions, IGpuBuffer gradTransitions, IGpuBuffer gradStart, IGpuBuffer gradEnd, int batch, int seqLen, int tags)
-        => PortableTorchModelOps.CrfBackward(_launch, emissions, transitions, end, alpha, logZ, gradLogZ, beta, gradEmissions, gradTransitions,
+        => PortableTorchModelOps.CrfBackward(_launch, emissions, transitions, end, alpha, gradLogZ, beta, gradEmissions, gradTransitions,
             gradStart, gradEnd, batch, seqLen, tags);
 }
 

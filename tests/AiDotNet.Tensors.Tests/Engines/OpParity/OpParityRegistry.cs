@@ -1683,6 +1683,14 @@ public static class OpParityRegistry
         var scores = OpInput.Rand(7002, new[] { 4, 16 }, -3.0, 3.0);
         yield return new OpCase("TensorTopKSoftmax[4,16;k3]", "activation", e => e.TensorTopKSoftmax(scores.F(), 3),
             e => e.TensorTopKSoftmax(scores.D(), 3), ParityTol.Ulp(16, 1e-6), opMethod: "TensorTopKSoftmax");
+        // A vocabulary-sized row: the device's chunk-selection path.
+        var vocab = OpInput.Rand(7019, new[] { 2, 50000 }, -6.0, 6.0);
+        yield return new OpCase("TensorTopKSoftmax[2,50000;k8]", "activation", e => e.TensorTopKSoftmax(vocab.F(), 8),
+            e => e.TensorTopKSoftmax(vocab.D(), 8), ParityTol.Ulp(16, 1e-6), opMethod: "TensorTopKSoftmax");
+        var longCrf = OpInput.Rand(7020, new[] { 2, 300, 5 }, -2.0, 2.0);
+        var longCrfTransitions = OpInput.Rand(7021, new[] { 5, 5 });
+        yield return new OpCase("TensorCrfForward[2,300,5]", "sequence", e => e.TensorCrfForward(longCrf.F(), longCrfTransitions.F()),
+            e => e.TensorCrfForward(longCrf.D(), longCrfTransitions.D()), ParityTol.Accum(1e-4), opMethod: "TensorCrfForward");
 
         var timesteps = OpInput.From(new[] { 0.0, 1.0, 7.0, 49.5, 250.0, 999.0 }, new[] { 6 });
         yield return new OpCase("TensorSinusoidalTimeEmbedding[6;d32]", "embedding", e => e.TensorSinusoidalTimeEmbedding(timesteps.F(), 32),

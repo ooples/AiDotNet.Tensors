@@ -18,8 +18,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// overflow-free forms of their CPU formulas. Index math is integer throughout.
 /// </para>
 /// <para>
-/// The CRF recursions launch once per time step (no work-group memory or barriers, which the portable dialect does
-/// not have); every other op is one or two launches.
+/// The CRF recursions run one work group per sequence that walks the time steps itself, separated by a group barrier
+/// (<c>__syncthreads()</c>, with <c>threadIdx.x</c> / <c>blockIdx.x</c> / <c>blockDim.x</c>, which every dialect
+/// translation maps); the forward is one launch, the backward three. Top-k softmax over a long row selects per chunk
+/// and then among the chunk candidates. Every other op is one to three launches.
 /// </para>
 /// </remarks>
 internal static class TorchModelOpsKernels
@@ -30,10 +32,10 @@ internal static class TorchModelOpsKernels
         "mo_lisht", "mo_bent_identity", "mo_gaussian", "mo_scaled_tanh", "mo_thresholded_relu", "mo_isru", "mo_sqrbf",
         "mo_surrogate_spike", "mo_activation_backward",
         "mo_minmax_partial", "mo_minmax_final", "mo_fake_quantize",
-        "mo_topk_select", "mo_topk_normalize",
+        "mo_topk_select", "mo_topk_normalize", "mo_topk_chunk", "mo_topk_rank", "mo_topk_zero", "mo_topk_scatter",
         "mo_time_embedding", "mo_time_embedding_backward",
-        "mo_crf_alpha_init", "mo_crf_alpha_step", "mo_crf_log_partition", "mo_crf_beta_init", "mo_crf_beta_step",
-        "mo_crf_emission_grad", "mo_crf_boundary_grad", "mo_crf_transition_grad",
+        "mo_crf_forward", "mo_crf_backward",
+        "mo_crf_boundary_grad", "mo_crf_transition_grad",
     };
 
     /// <summary>The grid-index helper for CUDA and HIP, which compile the dialect directly.</summary>
@@ -361,6 +363,108 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_topk_normalize(const floa
     y[g] = v / s;
 }
 
+// Long rows (a vocabulary): each (row, chunk) slot keeps its chunk's kk best entries, best first, by insertion (one
+// comparison per element once the list is full and the element loses to its last entry). The global top k of a row
+// are among these candidates: every entry ranking ahead of a top-k entry is itself top-k, so it is in its chunk's list.
+// Unfilled slots get (NaN, an index past the row), which rank after every real entry.
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_chunk(const float* x, float* candVal, int* candIdx, int rows, int width, int kk, int chunk, int chunks)
+{
+    int g = bx_gid();
+    if (g >= rows * chunks) { return; }
+    int r = g / chunks;
+    int c = g - r * chunks;
+    int base = r * width;
+    int dst = g * kk;
+    int begin = c * chunk;
+    int end = begin + chunk;
+    if (end > width) { end = width; }
+    int count = 0;
+    for (int j = begin; j < end; j++)
+    {
+        float v = x[base + j];
+        int slot = count;
+        if (count == kk)
+        {
+            if (!mo_before(v, j, candVal[dst + kk - 1], candIdx[dst + kk - 1])) { continue; }
+            slot = kk - 1;
+        }
+        int pos = slot;
+        for (int s = slot; s > 0; s--)
+        {
+            if (!mo_before(v, j, candVal[dst + s - 1], candIdx[dst + s - 1])) { break; }
+            candVal[dst + s] = candVal[dst + s - 1];
+            candIdx[dst + s] = candIdx[dst + s - 1];
+            pos = s - 1;
+        }
+        candVal[dst + pos] = v;
+        candIdx[dst + pos] = j;
+        if (count < kk) { count = count + 1; }
+    }
+    for (int s = count; s < kk; s++)
+    {
+        candVal[dst + s] = mo_nan();
+        candIdx[dst + s] = width + s;
+    }
+}
+
+// A candidate's rank among its row's candidates: per chunk list (sorted best first), a binary search for the entries
+// ahead of it. w = exp(v - top) for the k best, -1 for the rest.
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_rank(const float* candVal, const int* candIdx, float* w, int rows, int kk, int chunks, int k)
+{
+    int g = bx_gid();
+    int m = chunks * kk;
+    if (g >= rows * m) { return; }
+    int base = (g / m) * m;
+    float v = candVal[g];
+    int vi = candIdx[g];
+    int rank = 0;
+    float top = candVal[base];
+    int topIndex = candIdx[base];
+    for (int c = 0; c < chunks; c++)
+    {
+        int list = base + c * kk;
+        if (mo_before(candVal[list], candIdx[list], top, topIndex)) { top = candVal[list]; topIndex = candIdx[list]; }
+        int lo = 0;
+        int hi = kk;
+        for (int it = 0; it < 32; it++)
+        {
+            if (lo >= hi) { break; }
+            int mid = (lo + hi) / 2;
+            if (mo_before(candVal[list + mid], candIdx[list + mid], v, vi)) { lo = mid + 1; }
+            else { hi = mid; }
+        }
+        rank = rank + lo;
+    }
+    float r0 = -1.0f;
+    if (rank < k) { r0 = expf(v - top); }
+    w[g] = r0;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_zero(float* y, int n)
+{
+    int g = bx_gid();
+    if (g >= n) { return; }
+    y[g] = 0.0f;
+}
+
+// y[row, index] = w / (row sum of the selected w) for the k selected candidates (w -1 marks the rest; NaN is kept).
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_scatter(const int* candIdx, const float* w, float* y, int rows, int m, int width)
+{
+    int g = bx_gid();
+    if (g >= rows * m) { return; }
+    float v = w[g];
+    if (v < 0.0f) { return; }
+    int r = g / m;
+    int base = r * m;
+    float s = 0.0f;
+    for (int j = 0; j < m; j++)
+    {
+        float wj = w[base + j];
+        if (!(wj < 0.0f)) { s = s + wj; }
+    }
+    y[r * width + candIdx[g]] = v / s;
+}
+
 // ---- sinusoidal time embedding ----
 
 // y[b, c] = sin(t_b f_c) for c < half, cos(t_b f_(c - half)) for half <= c < 2 half, 0 past (an odd dim); freq holds
@@ -395,105 +499,250 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_time_embedding_backward(c
     dt[b] = s;
 }
 
-// ---- linear-chain CRF log-partition (alpha / beta in log space, [batch, seqLen, tags]; transitions [from, to]) ----
+// ---- linear-chain CRF log-partition (log space, [batch, seqLen, tags]; transitions [from, to]) ----
+// One work group per sequence (launched with batch * 256 threads) walks the time steps itself, its lanes covering the
+// tags, with a group barrier (device-memory scope) between steps: the forward recursion is one launch. The tag loops
+// step by the group size from 0, so every lane reaches every barrier (uniform control flow).
+//
+// Precision: log alpha grows with t (and log beta with seqLen - t), so plain float recursions lose an ulp of a value
+// near 1e3 per step, and the marginals exp(alpha + beta - logZ) cancel those large values. Each step is therefore kept
+// relative to an offset: the stored row is a_t = alpha_t - A_t with A_t = A_(t-1) + d_t, d_t the previous stored row's
+// maximum (an exact float), and A_t is summed exactly as an unevaluated hi + lo pair. The marginals' exponent
+// A_t + B_t - logZ is formed in that pair arithmetic, so it is a small number with float's full relative accuracy.
+//
+// Buffer layout: alpha holds the stored rows [batch, seqLen, tags], then per sequence (seqLen + 1) (hi, lo) pairs: A_t,
+// then logZ. beta holds the stored rows, then per sequence seqLen pairs (G_t, H_t) = (A_t + B_t - logZ,
+// A_(t-1) + B_t - logZ). A log-sum-exp subtracts the maximum; a -inf or NaN maximum is the result itself, as the CPU's.
 
-extern ""C"" __global__ __launch_bounds__(256) void mo_crf_alpha_init(const float* emit, const float* start, float* alpha, int batch, int seqLen, int tags)
+// exp and log to about an ulp on every backend: GLSL and WGSL bound their builtins only loosely (exp to 3 + 2|x| ulp, log
+// to an absolute 2^-21 near 1), an error a CRF recursion would add once per time step. exp: x = k ln2 + r with ln2 in
+// two parts (the first of 8 bits, so k ln2_hi is exact), Cephes' expf polynomial on |r| <= ln2 / 2, and 2^k applied as
+// two exact power-of-two factors. log: x = m 2^e with m in [sqrt(1/2), sqrt(2)), log m = 2 atanh((m - 1) / (m + 1)) by its
+// odd series. Arguments outside the normal range use the builtin.
+__device__ __forceinline__ float mo_exp(float x)
 {
-    int g = bx_gid();
-    if (g >= batch * tags) { return; }
-    int b = g / tags;
-    int j = g - b * tags;
-    int at = b * seqLen * tags + j;
-    alpha[at] = start[j] + emit[at];
+    if (!(x > -87.0f) || !(x < 88.0f)) { return expf(x); }
+    float k = rintf(x * 1.44269504088896341f);
+    float r = (x - k * 0.693359375f) - k * -2.12194440e-4f;
+    float q = ((((1.9875691500e-4f * r + 1.3981999507e-3f) * r + 8.3334519073e-3f) * r + 4.1665795894e-2f) * r + 1.6666665459e-1f) * r + 5.0000001201e-1f;
+    float er = 1.0f + r + r * r * q;
+    int ki = (int)k;
+    int k1 = ki / 2;
+    int k2 = ki - k1;
+    float s1 = __uint_as_float((unsigned int)(k1 + 127) << 23);
+    float s2 = __uint_as_float((unsigned int)(k2 + 127) << 23);
+    return er * s1 * s2;
 }
 
-// alpha[b, t, j] = emit[b, t, j] + logsumexp_i(alpha[b, t - 1, i] + trans[i, j]), the maximum subtracted; a -inf or
-// NaN maximum is the result itself, as the CPU's LogSumExp.
-extern ""C"" __global__ __launch_bounds__(256) void mo_crf_alpha_step(const float* emit, const float* trans, float* alpha, int batch, int seqLen, int tags, int stepIndex)
+__device__ __forceinline__ float mo_log(float x)
 {
-    int g = bx_gid();
-    if (g >= batch * tags) { return; }
-    int b = g / tags;
-    int j = g - b * tags;
-    int prev = b * seqLen * tags + (stepIndex - 1) * tags;
-    float m = -mo_inf();
-    for (int i = 0; i < tags; i++)
+    unsigned int bits = __float_as_uint(x);
+    if (bits < 0x00800000u || bits >= 0x7F800000u) { return logf(x); }
+    int e = (int)(bits >> 23) - 127;
+    float m = __uint_as_float((bits & 0x007FFFFFu) | 0x3F800000u);
+    if (m > 1.41421356237f)
     {
-        float v = alpha[prev + i] + trans[i * tags + j];
-        if (v > m) { m = v; }
+        m = 0.5f * m;
+        e = e + 1;
     }
-    float lse = m;
-    if (!mo_is_neg_inf(m) && !mo_isnan(m))
-    {
-        float s = 0.0f;
-        for (int i = 0; i < tags; i++) { s = s + expf(alpha[prev + i] + trans[i * tags + j] - m); }
-        lse = m + logf(s);
-    }
-    int at = prev + tags + j;
-    alpha[at] = emit[at] + lse;
+    float f = m - 1.0f;
+    float s = f / (2.0f + f);
+    float z = s * s;
+    float series = 2.0f * s + 2.0f * s * z * ((((z * 0.111111111f + 0.142857143f) * z + 0.2f) * z) + 0.333333333f);
+    float ef = (float)e;
+    return ef * 0.693145752f + (series + ef * 1.42860677e-6f);
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void mo_crf_log_partition(const float* alpha, const float* fin, float* logZ, int batch, int seqLen, int tags)
+// hi + lo + y as a renormalized pair (Knuth's two-sum: exact without fma); a non-finite sum carries through.
+__device__ __forceinline__ float2 mo_pair_add(float hi, float lo, float y)
 {
-    int b = bx_gid();
+    float s = hi + y;
+    if (!mo_isfinite(s)) { return make_float2(s, 0.0f); }
+    float bb = s - hi;
+    float e = (hi - (s - bb)) + (y - bb);
+    float t = lo + e;
+    float h = s + t;
+    float l = t - (h - s);
+    return make_float2(h, l);
+}
+
+// (aHi + aLo) + (bHi + bLo) - (zHi + zLo), rounded once to float.
+__device__ __forceinline__ float mo_pair_exponent(float aHi, float aLo, float bHi, float bLo, float zHi, float zLo)
+{
+    float2 x = mo_pair_add(aHi, aLo, bHi);
+    x = mo_pair_add(x.x, x.y, bLo);
+    x = mo_pair_add(x.x, x.y, -zHi);
+    x = mo_pair_add(x.x, x.y, -zLo);
+    float r = x.x + x.y;
+    return r;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void mo_crf_forward(const float* emit, const float* trans, const float* start, const float* fin, float* alpha, float* logZ, int batch, int seqLen, int tags)
+{
+    int b = blockIdx.x;
     if (b >= batch) { return; }
-    int last = b * seqLen * tags + (seqLen - 1) * tags;
-    float m = -mo_inf();
-    for (int j = 0; j < tags; j++)
+    int lane = threadIdx.x;
+    int lanes = blockDim.x;
+    int seq = b * seqLen * tags;
+    int offs = batch * seqLen * tags + b * (seqLen + 1) * 2;
+    for (int base = 0; base < tags; base = base + lanes)
     {
-        float v = alpha[last + j] + fin[j];
-        if (v > m) { m = v; }
+        int j = base + lane;
+        if (j < tags) { alpha[seq + j] = start[j] + emit[seq + j]; }
     }
-    float lse = m;
-    if (!mo_is_neg_inf(m) && !mo_isnan(m))
+    float accHi = 0.0f;
+    float accLo = 0.0f;
+    if (lane == 0)
     {
-        float s = 0.0f;
-        for (int j = 0; j < tags; j++) { s = s + expf(alpha[last + j] + fin[j] - m); }
-        lse = m + logf(s);
+        alpha[offs] = 0.0f;
+        alpha[offs + 1] = 0.0f;
     }
-    logZ[b] = lse;
+    __syncthreads();
+    for (int t = 1; t < seqLen; t++)
+    {
+        int prev = seq + (t - 1) * tags;
+        float d = -mo_inf();
+        for (int i = 0; i < tags; i++)
+        {
+            float a = alpha[prev + i];
+            if (a > d) { d = a; }
+        }
+        if (!mo_isfinite(d)) { d = 0.0f; }
+        for (int base = 0; base < tags; base = base + lanes)
+        {
+            int j = base + lane;
+            if (j < tags)
+            {
+                float m = -mo_inf();
+                for (int i = 0; i < tags; i++)
+                {
+                    float v = (alpha[prev + i] - d) + trans[i * tags + j];
+                    if (v > m) { m = v; }
+                }
+                float lse = m;
+                if (!mo_is_neg_inf(m) && !mo_isnan(m))
+                {
+                    float s = 0.0f;
+                    for (int i = 0; i < tags; i++) { s = s + mo_exp((alpha[prev + i] - d) + trans[i * tags + j] - m); }
+                    lse = m + mo_log(s);
+                }
+                alpha[prev + tags + j] = emit[prev + tags + j] + lse;
+            }
+        }
+        if (lane == 0)
+        {
+            float2 acc = mo_pair_add(accHi, accLo, d);
+            accHi = acc.x;
+            accLo = acc.y;
+            alpha[offs + 2 * t] = accHi;
+            alpha[offs + 2 * t + 1] = accLo;
+        }
+        __syncthreads();
+    }
+    if (lane == 0)
+    {
+        int last = seq + (seqLen - 1) * tags;
+        float m = -mo_inf();
+        for (int j = 0; j < tags; j++)
+        {
+            float v = alpha[last + j] + fin[j];
+            if (v > m) { m = v; }
+        }
+        float lse = m;
+        if (!mo_is_neg_inf(m) && !mo_isnan(m))
+        {
+            float s = 0.0f;
+            for (int j = 0; j < tags; j++) { s = s + mo_exp(alpha[last + j] + fin[j] - m); }
+            lse = m + mo_log(s);
+        }
+        float2 z = mo_pair_add(accHi, accLo, lse);
+        alpha[offs + 2 * seqLen] = z.x;
+        alpha[offs + 2 * seqLen + 1] = z.y;
+        logZ[b] = z.x + z.y;
+    }
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void mo_crf_beta_init(const float* fin, float* beta, int batch, int seqLen, int tags)
+// The backward recursion (stored rows b_t = beta_t - B_t, beta at the last step being end), the per-step exponents
+// G_t / H_t, and the emission gradient d logZ / d emit[b, t, j] = exp(alpha + beta - logZ) * dz[b], in the sequence's
+// work group.
+extern ""C"" __global__ __launch_bounds__(256) void mo_crf_backward(const float* emit, const float* trans, const float* fin, const float* alpha, const float* dz, float* beta, float* demit, int batch, int seqLen, int tags)
 {
-    int g = bx_gid();
-    if (g >= batch * tags) { return; }
-    int b = g / tags;
-    int j = g - b * tags;
-    beta[b * seqLen * tags + (seqLen - 1) * tags + j] = fin[j];
-}
-
-// beta[b, t, i] = logsumexp_j(trans[i, j] + emit[b, t + 1, j] + beta[b, t + 1, j])
-extern ""C"" __global__ __launch_bounds__(256) void mo_crf_beta_step(const float* emit, const float* trans, float* beta, int batch, int seqLen, int tags, int stepIndex)
-{
-    int g = bx_gid();
-    if (g >= batch * tags) { return; }
-    int b = g / tags;
-    int i = g - b * tags;
-    int nxt = b * seqLen * tags + (stepIndex + 1) * tags;
-    float m = -mo_inf();
-    for (int j = 0; j < tags; j++)
+    int b = blockIdx.x;
+    if (b >= batch) { return; }
+    int lane = threadIdx.x;
+    int lanes = blockDim.x;
+    int seq = b * seqLen * tags;
+    int volume = batch * seqLen * tags;
+    int aoffs = volume + b * (seqLen + 1) * 2;
+    int goffs = volume + b * seqLen * 2;
+    float zHi = alpha[aoffs + 2 * seqLen];
+    float zLo = alpha[aoffs + 2 * seqLen + 1];
+    for (int base = 0; base < tags; base = base + lanes)
     {
-        float v = trans[i * tags + j] + emit[nxt + j] + beta[nxt + j];
-        if (v > m) { m = v; }
+        int j = base + lane;
+        if (j < tags) { beta[seq + (seqLen - 1) * tags + j] = fin[j]; }
     }
-    float lse = m;
-    if (!mo_is_neg_inf(m) && !mo_isnan(m))
+    float accHi = 0.0f;
+    float accLo = 0.0f;
+    if (lane == 0)
     {
-        float s = 0.0f;
-        for (int j = 0; j < tags; j++) { s = s + expf(trans[i * tags + j] + emit[nxt + j] + beta[nxt + j] - m); }
-        lse = m + logf(s);
+        int t = seqLen - 1;
+        beta[goffs + 2 * t] = mo_pair_exponent(alpha[aoffs + 2 * t], alpha[aoffs + 2 * t + 1], 0.0f, 0.0f, zHi, zLo);
+        if (t >= 1) { beta[goffs + 2 * t + 1] = mo_pair_exponent(alpha[aoffs + 2 * t - 2], alpha[aoffs + 2 * t - 1], 0.0f, 0.0f, zHi, zLo); }
     }
-    beta[nxt - tags + i] = lse;
-}
-
-// d logZ / d emit[b, t, j] = p(y_t = j) = exp(alpha + beta - logZ), scaled by the row's upstream gradient.
-extern ""C"" __global__ __launch_bounds__(256) void mo_crf_emission_grad(const float* alpha, const float* beta, const float* logZ, const float* dz, float* demit, int batch, int seqLen, int tags)
-{
-    int g = bx_gid();
-    if (g >= batch * seqLen * tags) { return; }
-    int b = g / (seqLen * tags);
-    demit[g] = expf(alpha[g] + beta[g] - logZ[b]) * dz[b];
+    __syncthreads();
+    for (int t = seqLen - 2; t >= 0; t--)
+    {
+        int nxt = seq + (t + 1) * tags;
+        float e = -mo_inf();
+        for (int j = 0; j < tags; j++)
+        {
+            float v = beta[nxt + j];
+            if (v > e) { e = v; }
+        }
+        if (!mo_isfinite(e)) { e = 0.0f; }
+        for (int base = 0; base < tags; base = base + lanes)
+        {
+            int i = base + lane;
+            if (i < tags)
+            {
+                float m = -mo_inf();
+                for (int j = 0; j < tags; j++)
+                {
+                    float v = trans[i * tags + j] + emit[nxt + j] + (beta[nxt + j] - e);
+                    if (v > m) { m = v; }
+                }
+                float lse = m;
+                if (!mo_is_neg_inf(m) && !mo_isnan(m))
+                {
+                    float s = 0.0f;
+                    for (int j = 0; j < tags; j++) { s = s + mo_exp(trans[i * tags + j] + emit[nxt + j] + (beta[nxt + j] - e) - m); }
+                    lse = m + mo_log(s);
+                }
+                beta[nxt - tags + i] = lse;
+            }
+        }
+        if (lane == 0)
+        {
+            float2 acc = mo_pair_add(accHi, accLo, e);
+            accHi = acc.x;
+            accLo = acc.y;
+            beta[goffs + 2 * t] = mo_pair_exponent(alpha[aoffs + 2 * t], alpha[aoffs + 2 * t + 1], accHi, accLo, zHi, zLo);
+            if (t >= 1) { beta[goffs + 2 * t + 1] = mo_pair_exponent(alpha[aoffs + 2 * t - 2], alpha[aoffs + 2 * t - 1], accHi, accLo, zHi, zLo); }
+        }
+        __syncthreads();
+    }
+    float scale = dz[b];
+    int span = seqLen * tags;
+    for (int base = 0; base < span; base = base + lanes)
+    {
+        int at = base + lane;
+        if (at < span)
+        {
+            int t = at / tags;
+            demit[seq + at] = mo_exp(alpha[seq + at] + beta[seq + at] + beta[goffs + 2 * t]) * scale;
+        }
+    }
 }
 
 // d start[j] = sum_b p(y_0 = j), d end[j] = sum_b p(y_last = j): the emission gradients at the first and last step.
@@ -512,26 +761,28 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_crf_boundary_grad(const f
     dend[j] = s1;
 }
 
-// d trans[i, j] = sum_b sum_(t >= 1) p(y_(t-1) = i, y_t = j), scaled by each row's upstream gradient.
-extern ""C"" __global__ __launch_bounds__(256) void mo_crf_transition_grad(const float* emit, const float* trans, const float* alpha, const float* beta, const float* logZ, const float* dz, float* dtrans, int batch, int seqLen, int tags)
+// d trans[i, j] = sum_b sum_(t >= 1) p(y_(t-1) = i, y_t = j) dz[b] = exp(a_(t-1, i) + trans + emit_t,j + b_t,j + H_t) dz[b].
+extern ""C"" __global__ __launch_bounds__(256) void mo_crf_transition_grad(const float* emit, const float* trans, const float* alpha, const float* beta, const float* dz, float* dtrans, int batch, int seqLen, int tags)
 {
     int g = bx_gid();
     if (g >= tags * tags) { return; }
     int i = g / tags;
     int j = g - i * tags;
+    int volume = batch * seqLen * tags;
     float tr = trans[g];
     float s = 0.0f;
     for (int b = 0; b < batch; b++)
     {
-        float lz = logZ[b];
         float scale = dz[b];
+        int goffs = volume + b * seqLen * 2;
         for (int t = 1; t < seqLen; t++)
         {
             int at = b * seqLen * tags + t * tags;
-            s = s + expf(alpha[at - tags + i] + tr + emit[at + j] + beta[at + j] - lz) * scale;
+            s = s + mo_exp(alpha[at - tags + i] + tr + emit[at + j] + beta[at + j] + beta[goffs + 2 * t + 1]) * scale;
         }
     }
     dtrans[g] = s;
 }
+
 ";
 }

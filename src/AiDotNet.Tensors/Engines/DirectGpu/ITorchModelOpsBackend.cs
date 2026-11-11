@@ -1,4 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
+using System;
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
@@ -30,9 +31,9 @@ internal interface ITorchModelOpsBackend
     void ModelFakeQuantize(IGpuBuffer input, IGpuBuffer partial, IGpuBuffer minMax, IGpuBuffer output, IGpuBuffer mask, int n,
         bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint);
 
-    /// <summary>Softmax over each row's k largest entries (ties to the lower index), 0 elsewhere; <paramref name="scratch"/>
-    /// holds rows * width floats.</summary>
-    void ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratch, IGpuBuffer output, int rows, int width, int k);
+    /// <summary>Softmax over each row's k largest entries (ties to the lower index), 0 elsewhere. Each scratch buffer holds
+    /// <see cref="TorchModelOpsCodes.PlanTopK"/>'s ScratchLength floats (indices and weights only for a chunked plan).</summary>
+    void ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratchValues, IGpuBuffer scratchIndices, IGpuBuffer scratchWeights, IGpuBuffer output, int rows, int width, int k);
 
     /// <summary>[batch, dim] sinusoidal embedding of the timesteps; <paramref name="frequencies"/> holds 3 * halfDim
     /// floats, each frequency split by <see cref="TorchModelOpsCodes.SplitFrequency"/>.</summary>
@@ -43,9 +44,9 @@ internal interface ITorchModelOpsBackend
         int batch, int halfDim, int dim);
 
     /// <summary>
-    /// The CRF forward recursion: <paramref name="alpha"/> ([batch, seqLen, tags], log space) and
-    /// <paramref name="logZ"/> ([batch]). <paramref name="start"/> / <paramref name="end"/> hold tags scores (zeros when
-    /// the caller has none).
+    /// The CRF forward recursion: <paramref name="alpha"/> (<see cref="PortableTorchModelOps.CrfAlphaLength"/> floats: the
+    /// offset-relative log-space rows and their exact offsets, read by the backward) and <paramref name="logZ"/> ([batch]).
+    /// <paramref name="start"/> / <paramref name="end"/> hold tags scores (zeros when the caller has none).
     /// </summary>
     void ModelCrfForward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer start, IGpuBuffer end, IGpuBuffer alpha,
         IGpuBuffer logZ, int batch, int seqLen, int tags);
@@ -53,9 +54,10 @@ internal interface ITorchModelOpsBackend
     /// <summary>
     /// The CRF forward-backward gradients scaled by <paramref name="gradLogZ"/> ([batch]): emissions
     /// ([batch, seqLen, tags]), transitions ([tags, tags]) and the start / end scores ([tags] each).
-    /// <paramref name="beta"/> is [batch, seqLen, tags] scratch.
+    /// <paramref name="alpha"/> is the forward's; <paramref name="beta"/> is <see cref="PortableTorchModelOps.CrfBetaLength"/>
+    /// floats of scratch.
     /// </summary>
-    void ModelCrfBackward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer end, IGpuBuffer alpha, IGpuBuffer logZ,
+    void ModelCrfBackward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer end, IGpuBuffer alpha,
         IGpuBuffer gradLogZ, IGpuBuffer beta, IGpuBuffer gradEmissions, IGpuBuffer gradTransitions, IGpuBuffer gradStart,
         IGpuBuffer gradEnd, int batch, int seqLen, int tags);
 }
@@ -65,6 +67,50 @@ internal static class TorchModelOpsCodes
 {
     /// <summary>Slots of the first min / max pass of fake quantization.</summary>
     public const int MinMaxSlots = 1024;
+
+    /// <summary>How a top-k softmax runs, and the length of each of its scratch buffers.</summary>
+    internal readonly struct TopKPlan
+    {
+        public TopKPlan(bool chunked, int chunkLength, int chunks, int perChunk, int scratchLength)
+        {
+            Chunked = chunked;
+            ChunkLength = chunkLength;
+            Chunks = chunks;
+            PerChunk = perChunk;
+            ScratchLength = scratchLength;
+        }
+
+        /// <summary>False: every element ranks itself against its row (rows up to 1024 wide). True: chunk selection.</summary>
+        public bool Chunked { get; }
+        public int ChunkLength { get; }
+        public int Chunks { get; }
+        /// <summary>Candidates each chunk keeps (k).</summary>
+        public int PerChunk { get; }
+        public int ScratchLength { get; }
+    }
+
+    /// <summary>Rows wider than this use chunk selection; narrower rows rank every element against its row.</summary>
+    public const int TopKDirectWidth = 1024;
+
+    /// <summary>
+    /// The top-k plan for a [rows, width] input. Short rows rank each element against its row (O(width) per element, all
+    /// parallel). Long rows split into chunks that each keep their k best by insertion (O(chunk) per chunk once the list
+    /// fills, as an element that loses to the list's last entry costs one comparison), then rank the rows * chunks * k
+    /// candidates by a binary search per chunk list (O(chunks log k) each). For a small k the chunk length keeps a row's
+    /// candidates near 1024; for a large k it is a few hundred elements so a chunk's insertion stays short.
+    /// </summary>
+    public static TopKPlan PlanTopK(int rows, int width, int k)
+    {
+        if (width <= TopKDirectWidth)
+            return new TopKPlan(false, width, 1, k, checked(rows * width));
+        long chunk = k <= 32 ? Math.Max(256L, ((long)width * k + 1023) / 1024) : Math.Max(512L, k);
+        chunk = Math.Min(chunk, width);
+        int chunks = (int)((width + chunk - 1) / chunk);
+        long scratch = (long)rows * chunks * k;
+        if (scratch > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(rows), "rows * chunks * k must fit an int.");
+        return new TopKPlan(true, (int)chunk, chunks, k, (int)scratch);
+    }
 
     /// <summary>The activation code mo_activation_backward reads for a model activation, or -1.</summary>
     public static int ActivationCode(TorchParityUnaryOp op) => op switch

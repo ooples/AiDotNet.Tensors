@@ -39,6 +39,12 @@ internal static class TorchModelOpsTranslation
             .Replace("extern \"C\" __global__ __launch_bounds__(256) void", "__kernel void")
             .Replace("__device__ __forceinline__ ", "")
             .Replace("bx_gid()", "(int)get_global_id(0)")
+            // A group barrier that also orders the group's global-memory writes (the CRF steps read the previous
+            // step's values from device memory).
+            .Replace("__syncthreads()", "barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE)")
+            .Replace("threadIdx.x", "(int)get_local_id(0)")
+            .Replace("blockIdx.x", "(int)get_group_id(0)")
+            .Replace("blockDim.x", "(int)get_local_size(0)")
             .Replace("__float_as_uint(", "as_uint(")
             .Replace("__uint_as_float(", "as_float(")
             .Replace("make_float2(", "(float2)(");
@@ -85,8 +91,11 @@ internal static class TorchModelOpsTranslation
                 var pointer = Regex.Match(p, @"^(const )?(float|int)\* ?(\w+)$", RegexOptions.None, RegexTimeout);
                 if (pointer.Success)
                 {
+                    // A buffer a group-synchronized kernel writes is coherent, so a lane reads its group's writes after
+                    // the barrier rather than a cached value.
+                    string access = pointer.Groups[1].Success ? "readonly " : body.Contains("barrier()") ? "coherent " : "";
                     shader.Append("layout(set = 0, binding = ").Append(binding).Append(") ")
-                        .Append(pointer.Groups[1].Success ? "readonly " : "").Append("buffer MoBuf").Append(binding).Append(" { ")
+                        .Append(access).Append("buffer MoBuf").Append(binding).Append(" { ")
                         .Append(pointer.Groups[2].Value).Append(' ').Append(pointer.Groups[3].Value).Append("[]; };\n");
                     binding++;
                     continue;
@@ -105,6 +114,11 @@ internal static class TorchModelOpsTranslation
     private static string GlslExpressions(string s)
     {
         s = s.Replace("bx_gid()", "int(gl_GlobalInvocationID.x)")
+            // barrier() alone does not order buffer memory: make the group's buffer writes visible first.
+            .Replace("__syncthreads()", "memoryBarrierBuffer(); barrier()")
+            .Replace("threadIdx.x", "int(gl_LocalInvocationID.x)")
+            .Replace("blockIdx.x", "int(gl_WorkGroupID.x)")
+            .Replace("blockDim.x", "int(gl_WorkGroupSize.x)")
             .Replace("__float_as_uint(", "floatBitsToUint(")
             .Replace("__uint_as_float(", "uintBitsToFloat(")
             .Replace("make_float2(", "vec2(")
@@ -115,7 +129,12 @@ internal static class TorchModelOpsTranslation
         s = Regex.Replace(s, @"\bfmaxf\(", "max(", RegexOptions.None, RegexTimeout);
         s = Regex.Replace(s, @"\bfminf\(", "min(", RegexOptions.None, RegexTimeout);
         s = Regex.Replace(s, @"\brintf\(", "roundEven(", RegexOptions.None, RegexTimeout);
-        // A C cast of a name, (int)j, is int(j) in GLSL.
+        // Every float local is precise: a Vulkan driver may otherwise reassociate float arithmetic, which folds the
+        // error terms of the kernels' exact two-sums and bit splits ((hi - (s - bb)) to 0) and loses their precision.
+        s = Regex.Replace(s, @"(?m)(^|[;{}])(\s*)(float|vec2) (\w+)(\s*)(=|;)", "$1$2precise $3 $4$5$6", RegexOptions.None, RegexTimeout);
+        // A C cast of a parenthesized expression, (uint)(k + 127), is the constructor uint(k + 127) in GLSL; a cast of a
+        // name, (int)j, is int(j).
+        s = Regex.Replace(s, @"\((float|int|uint)\)\s*\(", "$1(", RegexOptions.None, RegexTimeout);
         return Regex.Replace(s, @"\((float|int|uint)\)\s*(\w+)", "$1($2)", RegexOptions.None, RegexTimeout);
     }
 

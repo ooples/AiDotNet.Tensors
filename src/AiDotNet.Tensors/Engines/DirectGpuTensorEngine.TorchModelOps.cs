@@ -158,9 +158,14 @@ public partial class DirectGpuTensorEngine
         {
             int n = scores.Length, rows = n / width;
             using var x = GetOrAllocateBuffer(backend, scores.IsContiguous ? scores : scores.Contiguous());
-            using var scratch = AllocateTransientScratch(backend, n, fullyWritten: true);
+            var plan = TorchModelOpsCodes.PlanTopK(rows, width, k);
+            using var values = AllocateTransientScratch(backend, plan.ScratchLength, fullyWritten: true);
+            // The chunked plan's candidate indices and weights; the direct plan reads only the first scratch.
+            using var indices = AllocateTransientScratch(backend, plan.Chunked ? plan.ScratchLength : 1, fullyWritten: true);
+            using var weights = AllocateTransientScratch(backend, plan.Chunked ? plan.ScratchLength : 1, fullyWritten: true);
             result = DispatchDeferredGpuOp<T>(backend, n, (int[])scores._shape.Clone(),
-                output => models.ModelTopKSoftmax(x.Buffer, scratch.Buffer, output, rows, width, k), fullyWritten: true);
+                output => models.ModelTopKSoftmax(x.Buffer, values.Buffer, indices.Buffer, weights.Buffer, output, rows, width, k),
+                fullyWritten: true);
         }
         catch (NotSupportedException ex)
         {
@@ -271,6 +276,7 @@ public partial class DirectGpuTensorEngine
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
         int volume = batch * seqLen * tags;
+        int alphaLength = PortableTorchModelOps.CrfAlphaLength(batch, seqLen, tags);
         bool record = DifferentiableOps.IsTapeActiveForThread<T>();
         OwnedBuffer alpha = default;
         bool ownsAlpha = false;
@@ -280,13 +286,13 @@ public partial class DirectGpuTensorEngine
             using var tr = GetOrAllocateBuffer(backend, transitions.IsContiguous ? transitions : transitions.Contiguous());
             using var start = CrfScoresBuffer(backend, startScores, tags);
             using var end = CrfScoresBuffer(backend, endScores, tags);
-            alpha = record ? AllocateFullyWrittenOutputBuffer(backend, volume) : AllocateTransientScratch(backend, volume, fullyWritten: true);
+            alpha = record ? AllocateFullyWrittenOutputBuffer(backend, alphaLength) : AllocateTransientScratch(backend, alphaLength, fullyWritten: true);
             ownsAlpha = true;
             var result = DispatchDeferredGpuOp<T>(backend, batch, new[] { batched ? batch : 1 },
                 logZ => models.ModelCrfForward(e.Buffer, tr.Buffer, start.Buffer, end.Buffer, alpha.Buffer, logZ, batch, seqLen, tags),
                 fullyWritten: true);
             if (!record) return result;
-            var alphaTensor = DeferTensorResult<T>(backend, alpha.Buffer, volume, new[] { batch, seqLen, tags });
+            var alphaTensor = DeferTensorResult<T>(backend, alpha.Buffer, alphaLength, new[] { alphaLength });
             alpha.RelinquishOwnership();
             ownsAlpha = false;
             var inputs = new List<Tensor<T>>(4) { emissions, transitions };
@@ -347,10 +353,26 @@ public partial class DirectGpuTensorEngine
             Transitions = RoIAlignPlan.ToDoubles(inputs[1]),
             Start = hasStart ? RoIAlignPlan.ToDoubles(inputs[2]) : new double[tags],
             End = hasEnd ? RoIAlignPlan.ToDoubles(inputs[hasStart ? 3 : 2]) : new double[tags],
-            Alpha = RoIAlignPlan.ToDoubles(alpha),
+            Alpha = CrfTrueAlpha(RoIAlignPlan.ToDoubles(alpha), batch, seqLen, tags),
             LogZ = RoIAlignPlan.ToDoubles(output),
         };
         BackwardFunctions<T>.CrfForwardBackward(gradOutput, inputs, output, new object[] { state }, engine, grads);
+    }
+
+    // log alpha from the device layout: each stored row plus its step's offset (a hi + lo pair after the rows).
+    private static double[] CrfTrueAlpha(double[] stored, int batch, int seqLen, int tags)
+    {
+        int volume = batch * seqLen * tags;
+        var alpha = new double[volume];
+        for (int b = 0; b < batch; b++)
+            for (int t = 0; t < seqLen; t++)
+            {
+                int pair = volume + (b * (seqLen + 1) + t) * 2;
+                double offset = stored[pair] + stored[pair + 1];
+                int row = (b * seqLen + t) * tags;
+                for (int j = 0; j < tags; j++) alpha[row + j] = stored[row + j] + offset;
+            }
+        return alpha;
     }
 
     private (Tensor<T> Emissions, Tensor<T> Transitions, Tensor<T> Start, Tensor<T> End)? TryCrfBackwardOnDevice<T>(
@@ -370,9 +392,8 @@ public partial class DirectGpuTensorEngine
             using var tr = GetOrAllocateBuffer(backend, transitions.IsContiguous ? transitions : transitions.Contiguous());
             using var end = CrfScoresBuffer(backend, endScores, tags);
             using var a = GetOrAllocateBuffer(backend, alpha);
-            using var z = GetOrAllocateBuffer(backend, logZ.IsContiguous ? logZ : logZ.Contiguous());
             using var dz = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
-            using var beta = AllocateTransientScratch(backend, volume, fullyWritten: true);
+            using var beta = AllocateTransientScratch(backend, PortableTorchModelOps.CrfBetaLength(batch, seqLen, tags), fullyWritten: true);
             dEmit = AllocateFullyWrittenOutputBuffer(backend, volume);
             ownsEmit = true;
             dTrans = AllocateFullyWrittenOutputBuffer(backend, tags * tags);
@@ -381,7 +402,7 @@ public partial class DirectGpuTensorEngine
             ownsStart = true;
             dEnd = AllocateFullyWrittenOutputBuffer(backend, tags);
             ownsEnd = true;
-            models.ModelCrfBackward(e.Buffer, tr.Buffer, end.Buffer, a.Buffer, z.Buffer, dz.Buffer, beta.Buffer, dEmit.Buffer,
+            models.ModelCrfBackward(e.Buffer, tr.Buffer, end.Buffer, a.Buffer, dz.Buffer, beta.Buffer, dEmit.Buffer,
                 dTrans.Buffer, dStart.Buffer, dEnd.Buffer, batch, seqLen, tags);
             var gEmit = DeferTensorResult<T>(backend, dEmit.Buffer, volume, (int[])emissions._shape.Clone());
             dEmit.RelinquishOwnership();

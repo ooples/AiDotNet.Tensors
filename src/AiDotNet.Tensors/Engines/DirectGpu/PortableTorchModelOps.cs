@@ -50,17 +50,31 @@ internal static class PortableTorchModelOps
             qMin, qMax, fixedStep, zeroPoint);
     }
 
-    public static void TopKSoftmax(PortableGenericFft.Launcher launch, IGpuBuffer input, IGpuBuffer scratch, IGpuBuffer output,
-        int rows, int width, int k)
+    public static void TopKSoftmax(PortableGenericFft.Launcher launch, IGpuBuffer input, IGpuBuffer scratchValues,
+        IGpuBuffer scratchIndices, IGpuBuffer scratchWeights, IGpuBuffer output, int rows, int width, int k)
     {
         long total = (long)rows * width;
         if (total <= 0) return;
         if (total > int.MaxValue) throw new System.ArgumentOutOfRangeException(nameof(rows), "rows * width must fit an int.");
+        if (k < 1 || k > width) throw new System.ArgumentOutOfRangeException(nameof(k));
         Require(input, total, nameof(input), "rows * width");
-        Require(scratch, total, nameof(scratch), "rows * width");
         Require(output, total, nameof(output), "rows * width");
-        launch("mo_topk_select", (int)total, input, scratch, rows, width, k);
-        launch("mo_topk_normalize", (int)total, scratch, output, rows, width);
+        var plan = TorchModelOpsCodes.PlanTopK(rows, width, k);
+        Require(scratchValues, plan.ScratchLength, nameof(scratchValues), "PlanTopK scratch");
+        if (!plan.Chunked)
+        {
+            // Short rows: every element ranks itself against its row (width threads per row, O(width) each).
+            launch("mo_topk_select", (int)total, input, scratchValues, rows, width, k);
+            launch("mo_topk_normalize", (int)total, scratchValues, output, rows, width);
+            return;
+        }
+        Require(scratchIndices, plan.ScratchLength, nameof(scratchIndices), "PlanTopK scratch");
+        Require(scratchWeights, plan.ScratchLength, nameof(scratchWeights), "PlanTopK scratch");
+        int candidates = plan.ScratchLength;   // rows * chunks * kk
+        launch("mo_topk_chunk", rows * plan.Chunks, input, scratchValues, scratchIndices, rows, width, plan.PerChunk, plan.ChunkLength, plan.Chunks);
+        launch("mo_topk_rank", candidates, scratchValues, scratchIndices, scratchWeights, rows, plan.PerChunk, plan.Chunks, k);
+        launch("mo_topk_zero", (int)total, output, (int)total);
+        launch("mo_topk_scatter", candidates, scratchIndices, scratchWeights, output, rows, plan.PerChunk * plan.Chunks, width);
     }
 
     public static void TimeEmbedding(PortableGenericFft.Launcher launch, IGpuBuffer timesteps, IGpuBuffer frequencies,
@@ -103,38 +117,50 @@ internal static class PortableTorchModelOps
         Require(transitions, (long)tags * tags, nameof(transitions), "tags * tags");
         Require(start, tags, nameof(start), "tags");
         Require(end, tags, nameof(end), "tags");
-        Require(alpha, volume, nameof(alpha), "batch * seqLen * tags");
+        Require(alpha, CrfAlphaLength(batch, seqLen, tags), nameof(alpha), "CrfAlphaLength");
         Require(logZ, batch, nameof(logZ), "batch");
-        int lanes = batch * tags;
-        launch("mo_crf_alpha_init", lanes, emissions, start, alpha, batch, seqLen, tags);
-        for (int t = 1; t < seqLen; t++)
-            launch("mo_crf_alpha_step", lanes, emissions, transitions, alpha, batch, seqLen, tags, t);
-        launch("mo_crf_log_partition", batch, alpha, end, logZ, batch, seqLen, tags);
+        // One work group of CrfGroupSize lanes per sequence; the kernel walks the time steps itself.
+        launch("mo_crf_forward", CrfThreads(batch), emissions, transitions, start, end, alpha, logZ, batch, seqLen, tags);
+    }
+
+    /// <summary>Lanes per CRF work group: the group size every backend launches these kernels with.</summary>
+    public const int CrfGroupSize = 256;
+
+    private static int CrfThreads(int batch)
+    {
+        if ((long)batch * CrfGroupSize > int.MaxValue)
+            throw new System.ArgumentOutOfRangeException(nameof(batch), "batch * 256 must fit an int.");
+        return batch * CrfGroupSize;
     }
 
     public static void CrfBackward(PortableGenericFft.Launcher launch, IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer end,
-        IGpuBuffer alpha, IGpuBuffer logZ, IGpuBuffer gradLogZ, IGpuBuffer beta, IGpuBuffer gradEmissions, IGpuBuffer gradTransitions,
+        IGpuBuffer alpha, IGpuBuffer gradLogZ, IGpuBuffer beta, IGpuBuffer gradEmissions, IGpuBuffer gradTransitions,
         IGpuBuffer gradStart, IGpuBuffer gradEnd, int batch, int seqLen, int tags)
     {
         int volume = CrfVolume(batch, seqLen, tags);
         Require(emissions, volume, nameof(emissions), "batch * seqLen * tags");
         Require(transitions, (long)tags * tags, nameof(transitions), "tags * tags");
         Require(end, tags, nameof(end), "tags");
-        Require(alpha, volume, nameof(alpha), "batch * seqLen * tags");
-        Require(logZ, batch, nameof(logZ), "batch");
+        Require(alpha, CrfAlphaLength(batch, seqLen, tags), nameof(alpha), "CrfAlphaLength");
         Require(gradLogZ, batch, nameof(gradLogZ), "batch");
-        Require(beta, volume, nameof(beta), "batch * seqLen * tags");
+        Require(beta, CrfBetaLength(batch, seqLen, tags), nameof(beta), "CrfBetaLength");
         Require(gradEmissions, volume, nameof(gradEmissions), "batch * seqLen * tags");
         Require(gradTransitions, (long)tags * tags, nameof(gradTransitions), "tags * tags");
         Require(gradStart, tags, nameof(gradStart), "tags");
         Require(gradEnd, tags, nameof(gradEnd), "tags");
-        int lanes = batch * tags;
-        launch("mo_crf_beta_init", lanes, end, beta, batch, seqLen, tags);
-        for (int t = seqLen - 2; t >= 0; t--)
-            launch("mo_crf_beta_step", lanes, emissions, transitions, beta, batch, seqLen, tags, t);
-        launch("mo_crf_emission_grad", volume, alpha, beta, logZ, gradLogZ, gradEmissions, batch, seqLen, tags);
+        // The backward recursion and the emission gradient, one work group per sequence; then the two sums over the batch.
+        launch("mo_crf_backward", CrfThreads(batch), emissions, transitions, end, alpha, gradLogZ, beta, gradEmissions,
+            batch, seqLen, tags);
         launch("mo_crf_boundary_grad", tags, gradEmissions, gradStart, gradEnd, batch, seqLen, tags);
-        launch("mo_crf_transition_grad", tags * tags, emissions, transitions, alpha, beta, logZ, gradLogZ, gradTransitions,
+        launch("mo_crf_transition_grad", tags * tags, emissions, transitions, alpha, beta, gradLogZ, gradTransitions,
             batch, seqLen, tags);
     }
+
+    /// <summary>The forward's alpha buffer: the stored rows, then per sequence (seqLen + 1) (hi, lo) offset pairs.</summary>
+    public static int CrfAlphaLength(int batch, int seqLen, int tags)
+        => checked(batch * seqLen * tags + batch * (seqLen + 1) * 2);
+
+    /// <summary>The backward's beta scratch: the stored rows, then per sequence seqLen (G, H) exponent pairs.</summary>
+    public static int CrfBetaLength(int batch, int seqLen, int tags)
+        => checked(batch * seqLen * tags + batch * seqLen * 2);
 }
