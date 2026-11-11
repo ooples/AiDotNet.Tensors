@@ -574,4 +574,117 @@ void main() {
         dB[gIdx] = sb;
     }
 }";
+
+    // Sparse routing & codebook primitives (ISparseRoutingBackend): <= 4 SSBOs per shader, zero atomics, deterministic.
+    public static string GatherRowValuesForward => Header + @"
+layout(set=0,binding=0) readonly buffer Vb { float valBuf[]; };
+layout(set=0,binding=1) readonly buffer Ib { int idxBuf[]; };
+layout(set=0,binding=2) buffer Ob { float outBuf[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; uint k; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int R = int(rows), C = int(cols), K = int(k);
+    if (gid >= R * K) return;
+    int r = gid / K;
+    int col = idxBuf[gid];
+    outBuf[gid] = (col >= 0 && col < C) ? valBuf[r * C + col] : 0.0;
+}";
+
+    public static string GatherRowValuesBackward => Header + @"
+layout(set=0,binding=0) readonly buffer Gb { float gradBuf[]; };
+layout(set=0,binding=1) readonly buffer Ib { int idxBuf[]; };
+layout(set=0,binding=2) buffer DVb { float gradValBuf[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; uint k; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int R = int(rows), C = int(cols), K = int(k);
+    if (gid >= R * C) return;
+    int r = gid / C;
+    int c = gid % C;
+    int kBase = r * K;
+    float acc = 0.0;
+    for (int j = 0; j < K; j++) {
+        if (idxBuf[kBase + j] == c) acc += gradBuf[kBase + j];
+    }
+    gradValBuf[gid] = acc;
+}";
+
+    public static string TopKWeightedRowMixForward => Header + @"
+layout(set=0,binding=0) readonly buffer Tb { float tblBuf[]; };
+layout(set=0,binding=1) readonly buffer Ib { int idxBuf[]; };
+layout(set=0,binding=2) readonly buffer Wb { float wBuf[]; };
+layout(set=0,binding=3) buffer Ob { float outBuf[]; };
+layout(push_constant) uniform PC { uint rows; uint numEntries; uint k; uint channels; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int R = int(rows), G = int(numEntries), K = int(k), C = int(channels);
+    if (gid >= R * C) return;
+    int r = gid / C;
+    int c = gid % C;
+    int kBase = r * K;
+    float acc = 0.0;
+    for (int j = 0; j < K; j++) {
+        int entry = idxBuf[kBase + j];
+        if (entry >= 0 && entry < G) acc += wBuf[kBase + j] * tblBuf[entry * C + c];
+    }
+    outBuf[gid] = acc;
+}";
+
+    public static string TopKWeightedRowMixBackwardWeights => Header + @"
+layout(set=0,binding=0) readonly buffer Gb { float gradBuf[]; };
+layout(set=0,binding=1) readonly buffer Tb { float tblBuf[]; };
+layout(set=0,binding=2) readonly buffer Ib { int idxBuf[]; };
+layout(set=0,binding=3) buffer DWb { float gradWBuf[]; };
+layout(push_constant) uniform PC { uint rows; uint numEntries; uint k; uint channels; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int R = int(rows), G = int(numEntries), K = int(k), C = int(channels);
+    if (gid >= R * K) return;
+    int r = gid / K;
+    int entry = idxBuf[gid];
+    float acc = 0.0;
+    if (entry >= 0 && entry < G) {
+        int goBase = r * C;
+        int tbBase = entry * C;
+        for (int c = 0; c < C; c++) acc += gradBuf[goBase + c] * tblBuf[tbBase + c];
+    }
+    gradWBuf[gid] = acc;
+}";
+
+    public static string TopKWeightedRowMixBackwardTable => Header + @"
+layout(set=0,binding=0) readonly buffer Gb { float gradBuf[]; };
+layout(set=0,binding=1) readonly buffer Ib { int idxBuf[]; };
+layout(set=0,binding=2) readonly buffer Wb { float wBuf[]; };
+layout(set=0,binding=3) buffer DTb { float gradTblBuf[]; };
+layout(push_constant) uniform PC { uint rows; uint numEntries; uint k; uint channels; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int R = int(rows), G = int(numEntries), K = int(k), C = int(channels);
+    if (gid >= G * C) return;
+    int g = gid / C;
+    int c = gid % C;
+    float acc = 0.0;
+    for (int r = 0; r < R; r++) {
+        int kBase = r * K;
+        for (int j = 0; j < K; j++) {
+            if (idxBuf[kBase + j] == g) acc += wBuf[kBase + j] * gradBuf[r * C + c];
+        }
+    }
+    gradTblBuf[gid] = acc;
+}";
+
+    public static string CountIndicesInt32 => Header + @"
+layout(set=0,binding=0) readonly buffer Ib { int idxBuf[]; };
+layout(set=0,binding=1) buffer Cb { float cntBuf[]; };
+layout(push_constant) uniform PC { uint length; uint numBins; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int L = int(length), B = int(numBins);
+    if (gid >= B) return;
+    int cnt = 0;
+    for (int i = 0; i < L; i++) {
+        if (idxBuf[i] == gid) cnt++;
+    }
+    cntBuf[gid] = float(cnt);
+}";
 }

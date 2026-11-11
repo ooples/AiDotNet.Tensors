@@ -200,6 +200,112 @@ extern ""C"" __global__ void causal_dwconv1d_backward_kernel(
         dw[j * channels + c] = s;
     }
 }
+
+// Sparse routing & codebook primitives (ISparseRoutingBackend): zero atomics, deterministic ascending reductions.
+extern ""C"" __global__ void gather_row_values_forward(
+    const float* values, const int* indices, float* output, int rows, int cols, int k)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * k;
+    if (gid >= total) return;
+    int r = (int)(gid / k);
+    int col = indices[gid];
+    output[gid] = (col >= 0 && col < cols) ? values[(long)r * cols + col] : 0.0f;
+}
+
+extern ""C"" __global__ void gather_row_values_backward(
+    const float* gradOut, const int* indices, float* gradValues, int rows, int cols, int k)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * cols;
+    if (gid >= total) return;
+    int r = (int)(gid / cols);
+    int c = (int)(gid % cols);
+    long kBase = (long)r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        if (indices[kBase + j] == c) acc += gradOut[kBase + j];
+    }
+    gradValues[gid] = acc;
+}
+
+extern ""C"" __global__ void topk_weighted_row_mix_forward(
+    const float* table, const int* indices, const float* weights, float* output,
+    int rows, int numEntries, int k, int channels)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * channels;
+    if (gid >= total) return;
+    int r = (int)(gid / channels);
+    int c = (int)(gid % channels);
+    long kBase = (long)r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        int entry = indices[kBase + j];
+        if (entry >= 0 && entry < numEntries)
+            acc += weights[kBase + j] * table[(long)entry * channels + c];
+    }
+    output[gid] = acc;
+}
+
+extern ""C"" __global__ void topk_weighted_row_mix_backward_weights(
+    const float* gradOut, const float* table, const int* indices, float* gradWeights,
+    int rows, int numEntries, int k, int channels)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * k;
+    if (gid >= total) return;
+    int r = (int)(gid / k);
+    int entry = indices[gid];
+    float acc = 0.0f;
+    if (entry >= 0 && entry < numEntries) {
+        long goBase = (long)r * channels;
+        long tbBase = (long)entry * channels;
+        for (int c = 0; c < channels; c++)
+            acc += gradOut[goBase + c] * table[tbBase + c];
+    }
+    gradWeights[gid] = acc;
+}
+
+// Launch: grid (ceil(channels / 32), numEntries), block (32, 8). Coalesced across channels, deterministic over 8 row groups.
+extern ""C"" __global__ void topk_weighted_row_mix_backward_table(
+    const float* gradOut, const int* indices, const float* weights, float* gradTable,
+    int rows, int numEntries, int k, int channels)
+{
+    __shared__ float partial[8][32];
+    int lane = threadIdx.x, group = threadIdx.y;
+    int c = blockIdx.x * 32 + lane;
+    int g = blockIdx.y;
+    float acc = 0.0f;
+    if (c < channels && g < numEntries) {
+        for (int r = group; r < rows; r += 8) {
+            long kBase = (long)r * k;
+            for (int j = 0; j < k; j++) {
+                if (indices[kBase + j] == g)
+                    acc += weights[kBase + j] * gradOut[(long)r * channels + c];
+            }
+        }
+    }
+    partial[group][lane] = acc;
+    __syncthreads();
+    if (group == 0 && c < channels && g < numEntries) {
+        float s = 0.0f;
+        for (int grp = 0; grp < 8; grp++) s += partial[grp][lane];
+        gradTable[(long)g * channels + c] = s;
+    }
+}
+
+extern ""C"" __global__ void count_indices_int32(
+    const int* indices, float* counts, int length, int numBins)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= numBins) return;
+    int cnt = 0;
+    for (int i = 0; i < length; i++) {
+        if (indices[i] == gid) cnt++;
+    }
+    counts[gid] = (float)cnt;
+}
 ";
     }
 
@@ -211,7 +317,13 @@ extern ""C"" __global__ void causal_dwconv1d_backward_kernel(
             "gla_scan_backward_ckpt",
             "causal_dwconv1d_forward",
             "causal_dwconv1d_backward_input",
-            "causal_dwconv1d_backward_kernel"
+            "causal_dwconv1d_backward_kernel",
+            "gather_row_values_forward",
+            "gather_row_values_backward",
+            "topk_weighted_row_mix_forward",
+            "topk_weighted_row_mix_backward_weights",
+            "topk_weighted_row_mix_backward_table",
+            "count_indices_int32"
         };
     }
 }

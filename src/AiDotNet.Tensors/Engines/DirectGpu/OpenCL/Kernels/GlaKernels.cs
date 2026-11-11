@@ -195,6 +195,106 @@ __kernel void causal_dwconv1d_backward_kernel(
     }
     dw[jc] = acc;
 }
+
+// Sparse routing & codebook primitives (ISparseRoutingBackend): zero atomics, deterministic ascending reductions.
+__kernel void gather_row_values_forward(
+    __global const float* values, __global const int* indices, __global float* output,
+    int rows, int cols, int k)
+{
+    long gid = get_global_id(0);
+    long total = (long)rows * k;
+    if (gid >= total) return;
+    int r = (int)(gid / k);
+    int col = indices[gid];
+    output[gid] = (col >= 0 && col < cols) ? values[(long)r * cols + col] : 0.0f;
+}
+
+__kernel void gather_row_values_backward(
+    __global const float* gradOut, __global const int* indices, __global float* gradValues,
+    int rows, int cols, int k)
+{
+    long gid = get_global_id(0);
+    long total = (long)rows * cols;
+    if (gid >= total) return;
+    int r = (int)(gid / cols);
+    int c = (int)(gid % cols);
+    long kBase = (long)r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        if (indices[kBase + j] == c) acc += gradOut[kBase + j];
+    }
+    gradValues[gid] = acc;
+}
+
+__kernel void topk_weighted_row_mix_forward(
+    __global const float* table, __global const int* indices, __global const float* weights, __global float* output,
+    int rows, int numEntries, int k, int channels)
+{
+    long gid = get_global_id(0);
+    long total = (long)rows * channels;
+    if (gid >= total) return;
+    int r = (int)(gid / channels);
+    int c = (int)(gid % channels);
+    long kBase = (long)r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        int entry = indices[kBase + j];
+        if (entry >= 0 && entry < numEntries)
+            acc += weights[kBase + j] * table[(long)entry * channels + c];
+    }
+    output[gid] = acc;
+}
+
+__kernel void topk_weighted_row_mix_backward_weights(
+    __global const float* gradOut, __global const float* table, __global const int* indices, __global float* gradWeights,
+    int rows, int numEntries, int k, int channels)
+{
+    long gid = get_global_id(0);
+    long total = (long)rows * k;
+    if (gid >= total) return;
+    int r = (int)(gid / k);
+    int entry = indices[gid];
+    float acc = 0.0f;
+    if (entry >= 0 && entry < numEntries) {
+        long goBase = (long)r * channels;
+        long tbBase = (long)entry * channels;
+        for (int c = 0; c < channels; c++)
+            acc += gradOut[goBase + c] * table[tbBase + c];
+    }
+    gradWeights[gid] = acc;
+}
+
+__kernel void topk_weighted_row_mix_backward_table(
+    __global const float* gradOut, __global const int* indices, __global const float* weights, __global float* gradTable,
+    int rows, int numEntries, int k, int channels)
+{
+    long gid = get_global_id(0);
+    long total = (long)numEntries * channels;
+    if (gid >= total) return;
+    int g = (int)(gid / channels);
+    int c = (int)(gid % channels);
+    float acc = 0.0f;
+    for (int r = 0; r < rows; r++) {
+        long kBase = (long)r * k;
+        for (int j = 0; j < k; j++) {
+            if (indices[kBase + j] == g)
+                acc += weights[kBase + j] * gradOut[(long)r * channels + c];
+        }
+    }
+    gradTable[gid] = acc;
+}
+
+__kernel void count_indices_int32(
+    __global const int* indices, __global float* counts, int length, int numBins)
+{
+    int gid = get_global_id(0);
+    if (gid >= numBins) return;
+    int cnt = 0;
+    for (int i = 0; i < length; i++) {
+        if (indices[i] == gid) cnt++;
+    }
+    counts[gid] = (float)cnt;
+}
 ";
     }
 
@@ -206,7 +306,13 @@ __kernel void causal_dwconv1d_backward_kernel(
             "gla_scan_backward_ckpt",
             "causal_dwconv1d_forward",
             "causal_dwconv1d_backward_input",
-            "causal_dwconv1d_backward_kernel"
+            "causal_dwconv1d_backward_kernel",
+            "gather_row_values_forward",
+            "gather_row_values_backward",
+            "topk_weighted_row_mix_forward",
+            "topk_weighted_row_mix_backward_weights",
+            "topk_weighted_row_mix_backward_table",
+            "count_indices_int32"
         };
     }
 }

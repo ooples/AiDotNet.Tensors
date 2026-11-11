@@ -704,5 +704,112 @@ kernel void gated_delta_scan_reduce(
         dB[gIdx] = sb;
     }
 }
+
+// ── Sparse routing & codebook primitives (ISparseRoutingBackend) ──────────────────────────────────
+kernel void gather_row_values_forward(
+    device const float* valBuf [[buffer(0)]], device const int* idxBuf [[buffer(1)]], device float* outBuf [[buffer(2)]],
+    constant int& rows [[buffer(3)]], constant int& cols [[buffer(4)]], constant int& k [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * k;
+    if ((int)gid >= total) return;
+    int r = (int)gid / k;
+    int col = idxBuf[gid];
+    outBuf[gid] = (col >= 0 && col < cols) ? valBuf[r * cols + col] : 0.0f;
+}
+
+kernel void gather_row_values_backward(
+    device const float* gradBuf [[buffer(0)]], device const int* idxBuf [[buffer(1)]], device float* gradValBuf [[buffer(2)]],
+    constant int& rows [[buffer(3)]], constant int& cols [[buffer(4)]], constant int& k [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * cols;
+    if ((int)gid >= total) return;
+    int r = (int)gid / cols;
+    int c = (int)gid % cols;
+    int kBase = r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        if (idxBuf[kBase + j] == c) acc += gradBuf[kBase + j];
+    }
+    gradValBuf[gid] = acc;
+}
+
+kernel void topk_weighted_row_mix_forward(
+    device const float* tblBuf [[buffer(0)]], device const int* idxBuf [[buffer(1)]],
+    device const float* wBuf [[buffer(2)]], device float* outBuf [[buffer(3)]],
+    constant int& rows [[buffer(4)]], constant int& numEntries [[buffer(5)]],
+    constant int& k [[buffer(6)]], constant int& channels [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * channels;
+    if ((int)gid >= total) return;
+    int r = (int)gid / channels;
+    int c = (int)gid % channels;
+    int kBase = r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        int entry = idxBuf[kBase + j];
+        if (entry >= 0 && entry < numEntries)
+            acc += wBuf[kBase + j] * tblBuf[entry * channels + c];
+    }
+    outBuf[gid] = acc;
+}
+
+kernel void topk_weighted_row_mix_backward_weights(
+    device const float* gradBuf [[buffer(0)]], device const float* tblBuf [[buffer(1)]],
+    device const int* idxBuf [[buffer(2)]], device float* gradWBuf [[buffer(3)]],
+    constant int& rows [[buffer(4)]], constant int& numEntries [[buffer(5)]],
+    constant int& k [[buffer(6)]], constant int& channels [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * k;
+    if ((int)gid >= total) return;
+    int r = (int)gid / k;
+    int entry = idxBuf[gid];
+    float acc = 0.0f;
+    if (entry >= 0 && entry < numEntries) {
+        int goBase = r * channels;
+        int tbBase = entry * channels;
+        for (int c = 0; c < channels; c++)
+            acc += gradBuf[goBase + c] * tblBuf[tbBase + c];
+    }
+    gradWBuf[gid] = acc;
+}
+
+kernel void topk_weighted_row_mix_backward_table(
+    device const float* gradBuf [[buffer(0)]], device const int* idxBuf [[buffer(1)]],
+    device const float* wBuf [[buffer(2)]], device float* gradTblBuf [[buffer(3)]],
+    constant int& rows [[buffer(4)]], constant int& numEntries [[buffer(5)]],
+    constant int& k [[buffer(6)]], constant int& channels [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = numEntries * channels;
+    if ((int)gid >= total) return;
+    int g = (int)gid / channels;
+    int c = (int)gid % channels;
+    float acc = 0.0f;
+    for (int r = 0; r < rows; r++) {
+        int kBase = r * k;
+        for (int j = 0; j < k; j++) {
+            if (idxBuf[kBase + j] == g)
+                acc += wBuf[kBase + j] * gradBuf[r * channels + c];
+        }
+    }
+    gradTblBuf[gid] = acc;
+}
+
+kernel void count_indices_int32(
+    device const int* idxBuf [[buffer(0)]], device float* cntBuf [[buffer(1)]],
+    constant int& length [[buffer(2)]], constant int& numBins [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= numBins) return;
+    int cnt = 0;
+    for (int i = 0; i < length; i++) {
+        if (idxBuf[i] == (int)gid) cnt++;
+    }
+    cntBuf[gid] = (float)cnt;
+}
 ";
 }

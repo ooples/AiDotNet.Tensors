@@ -40,6 +40,17 @@ public partial class CpuEngine
     /// <returns>Scalar (length-1, shape [1]) mean cross-entropy loss.</returns>
     public virtual Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
         Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds)
+        => FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads: true);
+
+    /// <summary>
+    /// Fused linear (LM head) + cross-entropy-with-logits loss with optional readout-parameter gradient detachment.
+    /// When <paramref name="computeReadoutGrads"/> is <see langword="false"/> (for example on intermediate layers in
+    /// zero-backprop local-credit assignment or frozen-head distillation), only <paramref name="hidden"/> is recorded
+    /// on the autodiff tape and neither <c>dWeight</c> (<c>[d, vocab]</c>) nor <c>dBias</c> (<c>[vocab]</c>) is
+    /// allocated or computed.
+    /// </summary>
+    public virtual Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds, bool computeReadoutGrads)
     {
         if (hidden is null) throw new ArgumentNullException(nameof(hidden));
         if (weight is null) throw new ArgumentNullException(nameof(weight));
@@ -81,11 +92,13 @@ public partial class CpuEngine
             var capturedWeight = weight;
             var capturedBias = bias;
             var capturedTargetIds = targetIds;
-            var compiledSavedState = new object[] { (int[])ids.Clone(), vocab };
+            var capturedComputeReadout = computeReadoutGrads;
+            var compiledSavedState = new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads };
+            var graphInputs = computeReadoutGrads ? new[] { hidden, weight, bias } : new[] { hidden };
             return scope.RecordVariadic(
                 LazyNodeType.Custom,
                 "FusedLinearCrossEntropy",
-                new[] { hidden, weight, bias },
+                graphInputs,
                 new[] { 1 },
                 (eng, output) =>
                 {
@@ -93,7 +106,7 @@ public partial class CpuEngine
                     // Refresh the backward state on every replay instead of freezing the trace batch.
                     compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray().Clone();
                     var result = eng.FusedLinearCrossEntropyWithLogits(
-                        capturedHidden, capturedWeight, capturedBias, capturedTargetIds);
+                        capturedHidden, capturedWeight, capturedBias, capturedTargetIds, capturedComputeReadout);
                     DirectGpuTensorEngine.CopyResultInto(eng, result, output);
                 },
                 FusedLinearCrossEntropyIndexBackward<T>,
@@ -104,7 +117,8 @@ public partial class CpuEngine
         // the step runs the three head GEMMs (logits, dHidden, dWeight) once instead of recomputing the logits in the
         // backward (four), and the [N, vocab] buffer is freed before the forward returns.
         if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine && DifferentiableOps.IsRecording<T>())
-            return FusedLinearCrossEntropyWithGradientsFloat(hidden, weight, bias, ids, n, d, vocab, FusedCeChunkElements);
+            return FusedLinearCrossEntropyWithGradientsFloat(
+                hidden, weight, bias, ids, n, d, vocab, FusedCeChunkElements, computeReadoutGrads);
 
         // logits = hidden·weight + bias, computed off-tape (this op records its own node).
         //
@@ -140,11 +154,12 @@ public partial class CpuEngine
         // differentiable tape input. Save a COPY so the backward is tied to the forward's labels —
         // targetIds is not a tape input, so mutating/recycling it after forward must not change the
         // gradient. Backward reconstructs dlogits = softmax - onehot(id).
+        var tapeInputs = computeReadoutGrads ? new[] { hidden, weight, bias } : new[] { hidden };
         DifferentiableOps.RecordIfActive<T>(
             "FusedLinearCrossEntropy", output,
-            new[] { hidden, weight, bias },
+            tapeInputs,
             FusedLinearCrossEntropyIndexBackward<T>,
-            savedState: new object[] { (int[])ids.Clone(), vocab });
+            savedState: new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads });
 
         return output;
     }
@@ -364,17 +379,25 @@ public partial class CpuEngine
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var hidden = inputs[0];
-        var weight = inputs[1];
-        var bias = inputs[2];
+        var weight = inputs.Length > 1 ? inputs[1] : (Tensor<T>)savedState[2];
+        var bias = inputs.Length > 2 ? inputs[2] : (Tensor<T>)savedState[3];
         var ids = (int[])savedState[0];
         int vocab = (int)savedState[1];
+        bool computeReadout = savedState.Length <= 4 || (bool)savedState[4];
+
+        bool needHidden = DifferentiableOps.IsGradientRequired(hidden);
+        bool needWeight = computeReadout && inputs.Length > 1 && DifferentiableOps.IsGradientRequired(weight);
+        bool needBias = computeReadout && inputs.Length > 2 && DifferentiableOps.IsGradientRequired(bias);
+        if (!needHidden && !needWeight && !needBias)
+            return;
 
         if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
-                gradOutput, hidden, weight, bias, ids, null, out var deviceHidden, out var deviceWeight, out var deviceBias))
+                gradOutput, hidden, weight, bias, ids, null, needHidden, needWeight, needBias,
+                out var deviceHidden, out var deviceWeight, out var deviceBias))
         {
-            DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
-            DifferentiableOps.AccumulateGrad(grads, weight, deviceWeight, engine);
-            DifferentiableOps.AccumulateGrad(grads, bias, deviceBias, engine);
+            if (needHidden) DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
+            if (needWeight) DifferentiableOps.AccumulateGrad(grads, weight, deviceWeight, engine);
+            if (needBias) DifferentiableOps.AccumulateGrad(grads, bias, deviceBias, engine);
             return;
         }
 
@@ -406,13 +429,21 @@ public partial class CpuEngine
                 SoftmaxMinusIndexGeneric<T>(logitData, ids, dLogits.GetDataArray(), n, vocab, g);
             }
 
-            var dHidden = engine.TensorMatMulTransposed(dLogits, weight);
-            var dWeight = engine.TensorMatMul(engine.TensorTranspose(hidden), dLogits);
-            var dBias = ColumnSums(dLogits, n, vocab);
-
-            DifferentiableOps.AccumulateGrad(grads, hidden, dHidden, engine);
-            DifferentiableOps.AccumulateGrad(grads, weight, dWeight, engine);
-            DifferentiableOps.AccumulateGrad(grads, bias, dBias, engine);
+            if (needHidden)
+            {
+                var dHidden = engine.TensorMatMulTransposed(dLogits, weight);
+                DifferentiableOps.AccumulateGrad(grads, hidden, dHidden, engine);
+            }
+            if (needWeight)
+            {
+                var dWeight = engine.TensorMatMul(engine.TensorTranspose(hidden), dLogits);
+                DifferentiableOps.AccumulateGrad(grads, weight, dWeight, engine);
+            }
+            if (needBias)
+            {
+                var dBias = ColumnSums(dLogits, n, vocab);
+                DifferentiableOps.AccumulateGrad(grads, bias, dBias, engine);
+            }
             // target ids are supervision — no gradient flows to them.
         }
     }
@@ -456,7 +487,8 @@ public partial class CpuEngine
     /// them handed out and recomputes through the ordinary backward.
     /// </remarks>
     internal Tensor<T> FusedLinearCrossEntropyWithGradientsFloat<T>(
-        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, int[] ids, int n, int d, int vocab, long chunkElements)
+        Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, int[] ids, int n, int d, int vocab, long chunkElements,
+        bool computeReadoutGrads = true)
     {
         var h = Reinterpret<Tensor<float>>(hidden);
         var w = Reinterpret<Tensor<float>>(weight);
@@ -464,7 +496,7 @@ public partial class CpuEngine
         float scale = 1f / n;
         int rowsPerChunk = (int)Math.Max(1, Math.Min(n, chunkElements / vocab));
         var rowLoss = new double[n];
-        var dBias = new float[vocab];
+        var dBias = computeReadoutGrads ? new float[vocab] : null;
         Tensor<float> dHidden;
         Tensor<float>? dWeight = null;
 
@@ -477,9 +509,12 @@ public partial class CpuEngine
                 MatMulInto(dLogits, h, w);
                 CrossEntropyGradRowsFloat(data, biasData, ids, 0, n, vocab, scale, rowLoss);
                 dHidden = DLogitsTimesWeightTransposed(data, w, n, d, vocab);
-                dWeight = PrefaultedTensor(d, vocab);
-                MatMulInto(dWeight, TensorTranspose(h), dLogits);
-                ColumnSumsFloat(data, dBias, n, vocab);
+                if (computeReadoutGrads)
+                {
+                    dWeight = PrefaultedTensor(d, vocab);
+                    MatMulInto(dWeight, TensorTranspose(h), dLogits);
+                    ColumnSumsFloat(data, dBias!, n, vocab);
+                }
                 ReturnFusedCeWorkspace(data);
             }
             else
@@ -499,18 +534,21 @@ public partial class CpuEngine
                     CrossEntropyGradRowsFloat(data, biasData, ids, start, rows, vocab, scale, rowLoss);
                     var dhc = DLogitsTimesWeightTransposed(data, w, rows, d, vocab);
                     Array.Copy(dhc.GetDataArray(), 0, dHiddenData, (long)start * d, (long)rows * d);
-                    if (dWeight is null)
+                    if (computeReadoutGrads)
                     {
-                        dWeight = PrefaultedTensor(d, vocab);
-                        MatMulInto(dWeight, TensorTranspose(hc), dLogits);
+                        if (dWeight is null)
+                        {
+                            dWeight = PrefaultedTensor(d, vocab);
+                            MatMulInto(dWeight, TensorTranspose(hc), dLogits);
+                        }
+                        else
+                        {
+                            dwcScratch ??= PrefaultedTensor(d, vocab);
+                            MatMulInto(dwcScratch, TensorTranspose(hc), dLogits);
+                            AddInPlaceFloat(dWeight.GetDataArray(), dwcScratch.GetDataArray());
+                        }
+                        ColumnSumsFloat(data, dBias!, rows, vocab);
                     }
-                    else
-                    {
-                        dwcScratch ??= PrefaultedTensor(d, vocab);
-                        MatMulInto(dwcScratch, TensorTranspose(hc), dLogits);
-                        AddInPlaceFloat(dWeight.GetDataArray(), dwcScratch.GetDataArray());
-                    }
-                    ColumnSumsFloat(data, dBias, rows, vocab);
                     ReturnFusedCeWorkspace(data);
                 }
                 dHidden = new Tensor<float>(dHiddenData, new[] { n, d });
@@ -526,13 +564,14 @@ public partial class CpuEngine
         {
             Hidden = dHidden,
             Weight = dWeight,
-            Bias = new Tensor<float>(dBias, new[] { vocab }),
+            Bias = dBias is not null ? new Tensor<float>(dBias, new[] { vocab }) : null,
         };
+        var tapeInputs = computeReadoutGrads ? new[] { hidden, weight, bias } : new[] { hidden };
         DifferentiableOps.RecordIfActive<T>(
             "FusedLinearCrossEntropy", output,
-            new[] { hidden, weight, bias },
+            tapeInputs,
             FusedLinearCrossEntropyPrecomputedBackward<T>,
-            savedState: new object[] { (int[])ids.Clone(), vocab, precomputed });
+            savedState: new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, precomputed });
         return output;
     }
 
@@ -544,11 +583,12 @@ public partial class CpuEngine
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var pre = (FusedCePrecomputedGradients)savedState[2];
+        bool computeReadout = (bool)savedState[4];
+        var pre = (FusedCePrecomputedGradients)savedState[5];
         var dHidden = System.Threading.Interlocked.Exchange(ref pre.Hidden, null);
         var dWeight = System.Threading.Interlocked.Exchange(ref pre.Weight, null);
         var dBias = System.Threading.Interlocked.Exchange(ref pre.Bias, null);
-        if (dHidden is null || dWeight is null || dBias is null)
+        if (dHidden is null || (computeReadout && (dWeight is null || dBias is null)))
         {
             FusedLinearCrossEntropyIndexBackward(gradOutput, inputs, output, savedState, engine, grads);
             return;
@@ -558,12 +598,18 @@ public partial class CpuEngine
         if (g != 1f)
         {
             ScaleInPlaceFloat(dHidden.GetDataArray(), g);
-            ScaleInPlaceFloat(dWeight.GetDataArray(), g);
-            ScaleInPlaceFloat(dBias.GetDataArray(), g);
+            if (computeReadout)
+            {
+                ScaleInPlaceFloat(dWeight!.GetDataArray(), g);
+                ScaleInPlaceFloat(dBias!.GetDataArray(), g);
+            }
         }
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], Reinterpret<Tensor<T>>(dHidden), engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], Reinterpret<Tensor<T>>(dWeight), engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[2], Reinterpret<Tensor<T>>(dBias), engine);
+        if (DifferentiableOps.IsGradientRequired(inputs[0]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], Reinterpret<Tensor<T>>(dHidden), engine);
+        if (computeReadout && inputs.Length > 1 && DifferentiableOps.IsGradientRequired(inputs[1]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], Reinterpret<Tensor<T>>(dWeight!), engine);
+        if (computeReadout && inputs.Length > 2 && DifferentiableOps.IsGradientRequired(inputs[2]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], Reinterpret<Tensor<T>>(dBias!), engine);
     }
 
     // Rows [start, start + rows) of a chunk: rowLoss[start + i] is row i's CE, and row i becomes its scaled gradient.
@@ -876,17 +922,23 @@ public partial class CpuEngine
         var bias = inputs[2];
         var target = inputs[3];
 
+        bool needHidden = DifferentiableOps.IsGradientRequired(hidden);
+        bool needWeight = DifferentiableOps.IsGradientRequired(weight);
+        bool needBias = DifferentiableOps.IsGradientRequired(bias);
+        if (!needHidden && !needWeight && !needBias)
+            return;
+
         if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
-                gradOutput, hidden, weight, bias, null, target, out var deviceHidden, out var deviceWeight, out var deviceBias))
+                gradOutput, hidden, weight, bias, null, target, needHidden, needWeight, needBias,
+                out var deviceHidden, out var deviceWeight, out var deviceBias))
         {
-            DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
-            DifferentiableOps.AccumulateGrad(grads, weight, deviceWeight, engine);
-            DifferentiableOps.AccumulateGrad(grads, bias, deviceBias, engine);
+            if (needHidden) DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
+            if (needWeight) DifferentiableOps.AccumulateGrad(grads, weight, deviceWeight, engine);
+            if (needBias) DifferentiableOps.AccumulateGrad(grads, bias, deviceBias, engine);
             return;
         }
 
         int n = hidden.Shape[0];
-        int d = hidden.Shape[1];
         int vocab = weight.Shape[1];
 
         // Upstream scalar grad (∂L_outer/∂loss). dlogits = g·(softmax(logits) - target)/N.
@@ -914,15 +966,23 @@ public partial class CpuEngine
                     logitData, target.GetDataArray(), dLogits.GetDataArray(), n, vocab, g);
             }
 
-            // dHidden = dLogits·weightᵀ  [N,d]  (weight is [d,vocab] → weightᵀ [vocab,d]).
-            var dHidden = engine.TensorMatMulTransposed(dLogits, weight);
-            // dWeight = hiddenᵀ·dLogits  [d,vocab]  (hiddenᵀ is [d,N], tiny — d,N small).
-            var dWeight = engine.TensorMatMul(engine.TensorTranspose(hidden), dLogits);
-            var dBias = ColumnSums(dLogits, n, vocab);
-
-            DifferentiableOps.AccumulateGrad(grads, hidden, dHidden, engine);
-            DifferentiableOps.AccumulateGrad(grads, weight, dWeight, engine);
-            DifferentiableOps.AccumulateGrad(grads, bias, dBias, engine);
+            if (needHidden)
+            {
+                // dHidden = dLogits·weightᵀ  [N,d]  (weight is [d,vocab] → weightᵀ [vocab,d]).
+                var dHidden = engine.TensorMatMulTransposed(dLogits, weight);
+                DifferentiableOps.AccumulateGrad(grads, hidden, dHidden, engine);
+            }
+            if (needWeight)
+            {
+                // dWeight = hiddenᵀ·dLogits  [d,vocab]  (hiddenᵀ is [d,N], tiny — d,N small).
+                var dWeight = engine.TensorMatMul(engine.TensorTranspose(hidden), dLogits);
+                DifferentiableOps.AccumulateGrad(grads, weight, dWeight, engine);
+            }
+            if (needBias)
+            {
+                var dBias = ColumnSums(dLogits, n, vocab);
+                DifferentiableOps.AccumulateGrad(grads, bias, dBias, engine);
+            }
             // target is supervision — no gradient flows to it.
         }
     }
@@ -997,5 +1057,25 @@ public partial class CpuEngine
             }
         }
         return result;
+    }
+}
+
+/// <summary>
+/// <see cref="IEngine"/> extension methods for the readout-detached <see cref="CpuEngine.FusedLinearCrossEntropyWithLogits{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{int}, bool)"/>
+/// overload, preserving source and binary compatibility for external <see cref="IEngine"/> implementations.
+/// </summary>
+public static class FusedLinearCrossEntropyEngineExtensions
+{
+    /// <inheritdoc cref="CpuEngine.FusedLinearCrossEntropyWithLogits{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{int}, bool)"/>
+    public static Tensor<T> FusedLinearCrossEntropyWithLogits<T>(
+        this IEngine engine, Tensor<T> hidden, Tensor<T> weight, Tensor<T> bias, Tensor<int> targetIds,
+        bool computeReadoutGrads)
+    {
+        if (engine is null) throw new ArgumentNullException(nameof(engine));
+        if (engine is CpuEngine cpuEngine)
+            return cpuEngine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads);
+        if (computeReadoutGrads)
+            return engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
+        return new CpuEngine().FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads: false);
     }
 }

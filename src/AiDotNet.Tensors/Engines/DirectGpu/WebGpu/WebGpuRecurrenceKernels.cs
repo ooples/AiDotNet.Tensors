@@ -623,4 +623,133 @@ struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 }
         dB[gIdx] = sb;
     }
 }";
+
+    // Sparse routing & codebook primitives (ISparseRoutingBackend): <= 4 storage bindings, zero atomics, deterministic.
+    public const string GatherRowValuesForward = @"
+@group(0) @binding(0) var<storage, read> valBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(2) var<storage, read_write> outBuf: array<f32>;
+struct P { rows: i32, cols: i32, k: i32 };
+@group(0) @binding(3) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let R = p.rows; let C = p.cols; let K = p.k;
+    if (gid >= R * K) { return; }
+    let r = gid / K;
+    let col = idxBuf[gid];
+    if (col >= 0 && col < C) {
+        outBuf[gid] = valBuf[r * C + col];
+    } else {
+        outBuf[gid] = 0.0;
+    }
+}";
+
+    public const string GatherRowValuesBackward = @"
+@group(0) @binding(0) var<storage, read> gradBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(2) var<storage, read_write> gradValBuf: array<f32>;
+struct P { rows: i32, cols: i32, k: i32 };
+@group(0) @binding(3) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let R = p.rows; let C = p.cols; let K = p.k;
+    if (gid >= R * C) { return; }
+    let r = gid / C;
+    let c = gid % C;
+    let kBase = r * K;
+    var acc: f32 = 0.0;
+    for (var j: i32 = 0; j < K; j = j + 1) {
+        if (idxBuf[kBase + j] == c) { acc = acc + gradBuf[kBase + j]; }
+    }
+    gradValBuf[gid] = acc;
+}";
+
+    public const string TopKWeightedRowMixForward = @"
+@group(0) @binding(0) var<storage, read> tblBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(2) var<storage, read> wBuf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outBuf: array<f32>;
+struct P { rows: i32, numEntries: i32, k: i32, channels: i32 };
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let R = p.rows; let G = p.numEntries; let K = p.k; let C = p.channels;
+    if (gid >= R * C) { return; }
+    let r = gid / C;
+    let c = gid % C;
+    let kBase = r * K;
+    var acc: f32 = 0.0;
+    for (var j: i32 = 0; j < K; j = j + 1) {
+        let entry = idxBuf[kBase + j];
+        if (entry >= 0 && entry < G) {
+            acc = acc + wBuf[kBase + j] * tblBuf[entry * C + c];
+        }
+    }
+    outBuf[gid] = acc;
+}";
+
+    public const string TopKWeightedRowMixBackwardWeights = @"
+@group(0) @binding(0) var<storage, read> gradBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> tblBuf: array<f32>;
+@group(0) @binding(2) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(3) var<storage, read_write> gradWBuf: array<f32>;
+struct P { rows: i32, numEntries: i32, k: i32, channels: i32 };
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let R = p.rows; let G = p.numEntries; let K = p.k; let C = p.channels;
+    if (gid >= R * K) { return; }
+    let r = gid / K;
+    let entry = idxBuf[gid];
+    var acc: f32 = 0.0;
+    if (entry >= 0 && entry < G) {
+        let goBase = r * C;
+        let tbBase = entry * C;
+        for (var c: i32 = 0; c < C; c = c + 1) {
+            acc = acc + gradBuf[goBase + c] * tblBuf[tbBase + c];
+        }
+    }
+    gradWBuf[gid] = acc;
+}";
+
+    public const string TopKWeightedRowMixBackwardTable = @"
+@group(0) @binding(0) var<storage, read> gradBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(2) var<storage, read> wBuf: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gradTblBuf: array<f32>;
+struct P { rows: i32, numEntries: i32, k: i32, channels: i32 };
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let R = p.rows; let G = p.numEntries; let K = p.k; let C = p.channels;
+    if (gid >= G * C) { return; }
+    let g = gid / C;
+    let c = gid % C;
+    var acc: f32 = 0.0;
+    for (var r: i32 = 0; r < R; r = r + 1) {
+        let kBase = r * K;
+        for (var j: i32 = 0; j < K; j = j + 1) {
+            if (idxBuf[kBase + j] == g) {
+                acc = acc + wBuf[kBase + j] * gradBuf[r * C + c];
+            }
+        }
+    }
+    gradTblBuf[gid] = acc;
+}";
+
+    public const string CountIndicesInt32 = @"
+@group(0) @binding(0) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(1) var<storage, read_write> cntBuf: array<f32>;
+struct P { length: i32, numBins: i32 };
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    let L = p.length; let B = p.numBins;
+    if (gid >= B) { return; }
+    var cnt: i32 = 0;
+    for (var i: i32 = 0; i < L; i = i + 1) {
+        if (idxBuf[i] == gid) { cnt = cnt + 1; }
+    }
+    cntBuf[gid] = f32(cnt);
+}";
 }

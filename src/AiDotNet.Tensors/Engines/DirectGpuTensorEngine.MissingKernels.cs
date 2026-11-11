@@ -6331,17 +6331,20 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal bool TryFusedLinearCrossEntropyBackwardOnDevice<T>(Tensor<T> gradOutput, Tensor<T> hidden,
         Tensor<T> weight, Tensor<T> bias, int[]? targetIds, Tensor<T>? denseTarget,
+        bool needHidden, bool needWeight, bool needBias,
         out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias)
     {
         using var __gpuOp = EnterGpuOp();
         gradHidden = gradWeight = gradBias = hidden;
+        if (!needHidden && !needWeight && !needBias)
+            return true;
         if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || hidden.Rank != 2 || weight.Rank != 2
             || (targetIds is null) == (denseTarget is null) || !TryGetBackend(out var backend))
             return false;
         try
         {
             if (targetIds is not null && TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias,
-                    targetIds, out gradHidden, out gradWeight, out gradBias))
+                    targetIds, needHidden, needWeight, needBias, out gradHidden, out gradWeight, out gradBias))
                 return true;
             int n = hidden._shape[0], vocab = weight._shape[1];
             int total = checked(n * vocab);
@@ -6377,9 +6380,9 @@ public partial class DirectGpuTensorEngine
 
                 if (TryScaleByDeviceScalar(difference, logitShape, gradOutput, 1f / n) is not { } dLogits)
                     return false;
-                gradHidden = TensorMatMulTransposed(dLogits, weight);
-                gradWeight = TensorMatMul(TensorTranspose(hidden), dLogits);
-                gradBias = ReduceSum(dLogits, new[] { 0 }, keepDims: false);
+                if (needHidden) gradHidden = TensorMatMulTransposed(dLogits, weight);
+                if (needWeight) gradWeight = TensorMatMul(TensorTranspose(hidden), dLogits);
+                if (needBias) gradBias = ReduceSum(dLogits, new[] { 0 }, keepDims: false);
             }
             return true;
         }
@@ -6474,11 +6477,14 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private bool TryFusedLinearCrossEntropyIndexBackwardChunked<T>(Tensor<T> gradOutput, Tensor<T> hidden,
         Tensor<T> weight, Tensor<T> bias, int[] targetIds,
+        bool needHidden, bool needWeight, bool needBias,
         out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias)
     {
         gradHidden = gradWeight = gradBias = hidden;
-        if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA
-            || gradOutput.Length != 1 || bias.Length != weight._shape[1])
+        if (!TryGetBackend(out var backend) || gradOutput.Length != 1 || bias.Length != weight._shape[1])
+            return false;
+        var transposedA = backend as DirectGpu.ITransposedAGemm;
+        if (needWeight && transposedA is null)
             return false;
         int n = hidden._shape[0], d = hidden._shape[1], vocab = weight._shape[1];
         if (n <= 0 || d <= 0 || vocab <= 0 || weight._shape[0] != d || targetIds.Length != n) return false;
@@ -6505,20 +6511,20 @@ public partial class DirectGpuTensorEngine
         using var bB = GetOrAllocateBuffer(backend, b);
         using var gB = GetOrAllocateBuffer(backend, g);
         using var positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
-        // using: an allocation that throws (an LM-sized head under memory pressure) still disposes the buffers before
-        // it; RelinquishOwnership hands each one to its result.
-        using var dHidden = AllocateOutputBuffer(backend, n * d);
-        using var dWeight = AllocateOutputBuffer(backend, d * vocab);
-        using var dBias = AllocateOutputBuffer(backend, vocab);
+        // Allocate only the gradient outputs actually requested on this tape pass: detached shared readouts skip both
+        // the [d, vocab] dWeight buffer and its h_c^T * dL_c GEMM across all intermediate layers.
+        using var dHidden = needHidden ? AllocateOutputBuffer(backend, n * d) : default;
+        using var dWeight = needWeight ? AllocateOutputBuffer(backend, d * vocab) : default;
+        using var dBias = needBias ? AllocateOutputBuffer(backend, vocab) : default;
         // Stream-ordered scratch: still read by queued kernels when this returns.
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
         using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
-        using var dhChunk = AllocateStreamOrderedScratch(backend, chunk * d);
-        using var ones = AllocateStreamOrderedScratch(backend, chunk);
+        using var dhChunk = needHidden ? AllocateStreamOrderedScratch(backend, chunk * d) : default;
+        using var ones = needBias ? AllocateStreamOrderedScratch(backend, chunk) : default;
         using var minusOnes = AllocateStreamOrderedScratch(backend, chunk);
         using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
-        backend.Fill(ones, 1f, chunk);
+        if (needBias) backend.Fill(ones!, 1f, chunk);
         backend.Fill(minusOnes, -1f, chunk);
         for (int r0 = 0; r0 < n; r0 += chunk)
         {
@@ -6532,18 +6538,32 @@ public partial class DirectGpuTensorEngine
             backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
             backend.Scale(logits, logits, 1f / n, cv);                           // / N
             backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
-            backend.MatMulTransposed(work, wB.Buffer, dhChunk, c, d, vocab);     // dHidden_c = dLogits_c·Wᵀ
-            backend.Copy(dhChunk, 0, dHidden.Buffer, r0 * d, c * d);
-            transposedA.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
-            backend.Gemm(ones, work, dBias.Buffer, 1, vocab, c, 1f, beta);       // dB += 1ᵀ·dL_c
+            if (needHidden)
+            {
+                backend.MatMulTransposed(work, wB.Buffer, dhChunk!, c, d, vocab); // dHidden_c = dLogits_c·Wᵀ
+                backend.Copy(dhChunk!, 0, dHidden.Buffer, r0 * d, c * d);
+            }
+            if (needWeight)
+                transposedA!.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
+            if (needBias)
+                backend.Gemm(ones!, work, dBias.Buffer, 1, vocab, c, 1f, beta);   // dB += 1ᵀ·dL_c
         }
         RecordFusedCeBackwardChunks((n + chunk - 1) / chunk);
-        gradHidden = DeferTensorResult<T>(backend, dHidden.Buffer, n * d, new[] { n, d });
-        dHidden.RelinquishOwnership();
-        gradWeight = DeferTensorResult<T>(backend, dWeight.Buffer, d * vocab, new[] { d, vocab });
-        dWeight.RelinquishOwnership();
-        gradBias = DeferTensorResult<T>(backend, dBias.Buffer, vocab, new[] { vocab });
-        dBias.RelinquishOwnership();
+        if (needHidden)
+        {
+            gradHidden = DeferTensorResult<T>(backend, dHidden.Buffer, n * d, new[] { n, d });
+            dHidden.RelinquishOwnership();
+        }
+        if (needWeight)
+        {
+            gradWeight = DeferTensorResult<T>(backend, dWeight.Buffer, d * vocab, new[] { d, vocab });
+            dWeight.RelinquishOwnership();
+        }
+        if (needBias)
+        {
+            gradBias = DeferTensorResult<T>(backend, dBias.Buffer, vocab, new[] { vocab });
+            dBias.RelinquishOwnership();
+        }
         return true;
     }
 
@@ -7011,6 +7031,24 @@ public partial class DirectGpuTensorEngine
                 throw new NotSupportedException(
                     "Resident BinCount requires at most 16,777,216 inputs because counts use the common exact float-integer GPU representation.");
             return base.TensorBinCount(input, minLength);
+        }
+
+        if (outputLength > 0 && AiDotNet.Tensors.Engines.DirectGpu.SparseRoutingResolver.Resolve(backend) is { } sr)
+        {
+            var contiguousInput = input.IsContiguous ? input : input.Contiguous();
+            try
+            {
+                using var rawInput = GetOrAllocateInt32IndexBuffer(backend, contiguousInput);
+                using var outBuf = AllocateFullyWrittenOutputBuffer(backend, outputLength);
+                sr.CountIndicesInt32(rawInput.Buffer, outBuf.Buffer, contiguousInput.Length, outputLength);
+                var counted = DeferTensorResult<int>(backend, outBuf.Buffer, outputLength, new[] { outputLength });
+                outBuf.RelinquishOwnership();
+                return counted;
+            }
+            catch (NotSupportedException capabilityGap)
+            {
+                GpuLaunchProbe.OnFallback("TensorBinCount", capabilityGap);
+            }
         }
 
         using var scalar = AllocateOutputBuffer(backend, input.Length);
