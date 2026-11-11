@@ -10,8 +10,9 @@ using Ref = AiDotNet.Tensors.Tests.Engines.GroupedRowsMatMulTests;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// The device jagged-rows grouped GEMM (per-group GEMMs on buffer views) and its backward against the double-precision
-/// reference: an unbalanced routed load with empty groups and rows past the last offset, plain and transposed b.
+/// The device jagged-rows grouped GEMM (IGroupedGemmBackend, implemented by every backend) and its backward against the
+/// double-precision reference: an unbalanced routed load with empty groups and rows past the last offset, plain and
+/// transposed b, with and without an [N] or [G, N] bias. No case may fall back to the host.
 /// </summary>
 [Collection("DirectGpuSerial")]
 public sealed class GroupedRowsMatMulGpuTests : IClassFixture<GpuCpuCorrectnessFixture>
@@ -20,12 +21,8 @@ public sealed class GroupedRowsMatMulGpuTests : IClassFixture<GpuCpuCorrectnessF
 
     public GroupedRowsMatMulGpuTests(GpuCpuCorrectnessFixture fixture) => _fixture = fixture;
 
-    // Where views are free at any offset (CUDA, HIP) the device path must run without a host fallback.
-    private void AssertNoHostFallback()
-    {
-        if (!_fixture.Gpu.UsesNativeGroupedRows) return;
+    private static void AssertNoHostFallback() =>
         Assert.DoesNotContain(GpuLaunchProbe.Fallbacks, f => f.Contains("x GroupedRows"));
-    }
 
     [SkippableTheory]
     [InlineData(false)]
@@ -42,37 +39,50 @@ public sealed class GroupedRowsMatMulGpuTests : IClassFixture<GpuCpuCorrectnessF
     }
 
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Gradients_MatchReference(bool transposeB)
+    [InlineData(0, false)]
+    [InlineData(0, true)]
+    [InlineData(1, false)]
+    [InlineData(2, true)]
+    public void Gradients_MatchReference(int biasRank, bool transposeB)
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
         var e = _fixture.Gpu;
         int k = 10, n = 9, g = Ref.UnbalancedEnds.Length;
         var a = Ref.Random(5, Ref.UnbalancedRows, k);
         var b = transposeB ? Ref.Random(6, g, n, k) : Ref.Random(6, g, k, n);
+        var bias = biasRank == 0 ? null : biasRank == 1 ? Ref.Random(13, n) : Ref.Random(13, g, n);
         var w = Ref.Random(7, Ref.UnbalancedRows, n);
-        Tensor<float> ga, gb;
+        Tensor<float> y, ga, gb;
+        Tensor<float>? gbias = null;
         using (var tape = new GradientTape<float>())
         {
-            var loss = e.ReduceSum(e.TensorMultiply(e.GroupedRowsMatMul(a, b, Ref.UnbalancedEnds, transposeB), w), null);
-            var grads = tape.ComputeGradients(loss, new[] { a, b });
+            y = e.GroupedRowsMatMul(a, b, Ref.UnbalancedEnds, transposeB, bias);
+            var loss = e.ReduceSum(e.TensorMultiply(y, w), null);
+            var grads = tape.ComputeGradients(loss, bias is null ? new[] { a, b } : new[] { a, b, bias });
             ga = grads[a]; gb = grads[b];
+            if (bias is not null) gbias = grads[bias];
         }
+        Ref.AssertClose(Ref.Reference(a, b, Ref.UnbalancedEnds, transposeB, bias), y, 1e-4, "y");
         var (da, db) = Ref.ReferenceGrads(a, b, w, Ref.UnbalancedEnds, transposeB);
         Ref.AssertClose(da, ga, 1e-4, "da");
         Ref.AssertClose(db, gb, 1e-4, "db");
+        if (bias is not null) Ref.AssertClose(Ref.ReferenceBiasGrad(w, Ref.UnbalancedEnds, biasRank == 2), gbias!, 1e-4, "dbias");
         AssertNoHostFallback();
     }
 
-    [SkippableFact]
-    public void PublicGroupedMatMul_MatchesReference()
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void PublicGroupedMatMul_MatchesReference(int biasRank)
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
         int k = 16, n = 12, g = Ref.UnbalancedEnds.Length;
         var a = Ref.Random(3, Ref.UnbalancedRows, k); var b = Ref.Random(4, g, k, n);
-        var y = _fixture.Gpu.TensorGroupedMatMul(a, b, new Tensor<int>(Ref.UnbalancedEnds, new[] { g }));
-        Ref.AssertClose(Ref.Reference(a, b, Ref.UnbalancedEnds, false), y, 1e-4, "y");
+        var bias = biasRank == 0 ? null : biasRank == 1 ? Ref.Random(12, n) : Ref.Random(12, g, n);
+        var y = _fixture.Gpu.TensorGroupedMatMul(a, b, new Tensor<int>(Ref.UnbalancedEnds, new[] { g }), bias);
+        Ref.AssertClose(Ref.Reference(a, b, Ref.UnbalancedEnds, false, bias), y, 1e-4, "y");
+        AssertNoHostFallback();
     }
 }
 #endif

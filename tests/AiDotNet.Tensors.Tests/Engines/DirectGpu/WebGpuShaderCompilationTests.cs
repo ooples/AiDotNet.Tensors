@@ -28,6 +28,8 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuBatchNormRegisterKernels.Forward",    // templates: SourceFor fills in the name and the values per thread
         "WebGpuBatchNormRegisterKernels.Backward",
         "WebGpuConvDgradS2Kernels.Entry",     // the stride-2 dgrad kernels' shared entry-point header, closed by each body
+        "WebGpuGroupedGemmKernels.ForwardSource",     // templates: SourceFor fills in the entry-point name
+        "WebGpuGroupedGemmKernels.WeightGradSource",
     };
 
     private const string Validator = @"
@@ -123,6 +125,9 @@ process.exit(0);
             // The register-resident BatchNorm, one module per kernel and per-thread variant (generated, not fields).
             foreach (var name in AiDotNet.Tensors.Engines.DirectGpu.BatchNormRegisterKernelTemplate.GetKernelNames())
                 Emit("BatchNormRegister." + name, WebGpuBatchNormRegisterKernels.SourceFor(name));
+            // The jagged-rows grouped GEMM, one module per kernel.
+            foreach (var name in AiDotNet.Tensors.Engines.DirectGpu.GroupedGemmKernelTemplate.GetKernelNames())
+                Emit("GroupedGemm." + name, WebGpuGroupedGemmKernels.SourceFor(name));
             // The FP32 PyTorch-parity kernels, one translated module per kernel (#1125, #1128).
             foreach (var module in CudaDialectToWgsl.Translate(AiDotNet.Tensors.Engines.DirectGpu.TorchParityF32Kernels.GetSource()))
             {

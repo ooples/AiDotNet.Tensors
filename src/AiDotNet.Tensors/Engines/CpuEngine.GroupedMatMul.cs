@@ -9,48 +9,76 @@ namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
 /// The native jagged-rows grouped GEMM behind <see cref="CpuEngine.TensorGroupedMatMul{T}"/> (torch grouped_mm with a
-/// 2-D <c>a</c> and a 3-D <c>b</c>, no bias): one tape node instead of a narrow, a matmul and a concatenation per group.
+/// 2-D <c>a</c> and a 3-D <c>b</c>, with or without a bias): one tape node instead of a narrow, a matmul, a bias add and a
+/// concatenation per group.
 /// </summary>
 /// <remarks>
 /// <para>
 /// Rows <c>[ends[g-1], ends[g])</c> of <c>a</c> <c>[M, K]</c> are multiplied by <c>b[g]</c> (<c>[G, K, N]</c>, or
 /// <c>[G, N, K]</c> read transposed), each group at its own row count, so an unbalanced mixture-of-experts router costs
-/// exactly its routed rows. Rows past the last offset are zero, as torch defines them. The backward is the same op on
-/// the gradient (<c>da_g = dout_g · op(b_g)^T</c>) plus the per-group outer product <c>db_g = a_g^T · dout_g</c>
-/// (zero for an empty group), so a training step's expert GEMMs and their gradients stay native on every engine:
-/// <see cref="DirectGpuTensorEngine"/> overrides both with device GEMMs on buffer views.
+/// exactly its routed rows. A bias (<c>[N]</c>, or <c>[G, N]</c> per group) is added to every routed row. Rows past the
+/// last offset are zero, as torch defines them. The backward is the same op on the gradient
+/// (<c>da_g = dout_g · op(b_g)^T</c>), the per-group outer product <c>db_g = a_g^T · dout_g</c> (zero for an empty
+/// group) and the per-group column sum of <c>dout</c> for the bias.
+/// </para>
+/// <para>
+/// Every engine runs it natively: <see cref="DirectGpuTensorEngine"/> overrides <see cref="GroupedRowsMatMul{T}"/> and
+/// <see cref="GroupedRowsWeightGrad{T}"/> with the backend's <see cref="DirectGpu.IGroupedGemmBackend"/>, which all six
+/// GPU backends implement (CUDA and HIP with vendor BLAS on buffer views, OpenCL, Vulkan, Metal and WebGPU with
+/// <see cref="DirectGpu.GroupedGemmKernelTemplate"/>'s kernels).
 /// </para>
 /// </remarks>
 public partial class CpuEngine
 {
-    /// <summary>Whether <see cref="TensorGroupedMatMul{T}"/> runs its jagged-rows form as the native op.</summary>
-    internal virtual bool UsesNativeGroupedRows => true;
-
-    /// <summary>Jagged-rows grouped matmul: [M, K] x [G, K, N] (or [G, N, K] with <paramref name="transposeB"/>) -> [M, N].</summary>
-    internal virtual Tensor<T> GroupedRowsMatMul<T>(Tensor<T> a, Tensor<T> b, int[] ends, bool transposeB)
+    /// <summary>
+    /// Jagged-rows grouped matmul: [M, K] x [G, K, N] (or [G, N, K] with <paramref name="transposeB"/>) -> [M, N], plus
+    /// <paramref name="bias"/> ([N] or [G, N]) on every routed row.
+    /// </summary>
+    internal virtual Tensor<T> GroupedRowsMatMul<T>(Tensor<T> a, Tensor<T> b, int[] ends, bool transposeB, Tensor<T>? bias = null)
     {
-        var (_, m, k, n) = GroupedRowsShape(a, b, ends, transposeB);
+        var (g, m, k, n) = GroupedRowsShape(a, b, ends, transposeB);
+        if (bias is not null) ValidateGroupBias(bias, g, n);
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            var ca = a; var cb = b;
-            return scope.RecordBinary(LazyNodeType.Custom, "GroupedMatMul", a, b, new[] { m, n },
-                (eng, result) =>
-                {
-                    var host = eng as CpuEngine ?? new CpuEngine();
-                    DirectGpuTensorEngine.CopyResultInto(eng, host.GroupedRowsMatMul(ca, cb, ends, transposeB), result);
-                },
-                GroupedRowsMatMulBackward<T>, new object[] { ends, transposeB });
+            var ca = a; var cb = b; var cbias = bias;
+            Action<IEngine, Tensor<T>> execute = (eng, result) =>
+            {
+                var host = eng as CpuEngine ?? new CpuEngine();
+                DirectGpuTensorEngine.CopyResultInto(eng, host.GroupedRowsMatMul(ca, cb, ends, transposeB, cbias), result);
+            };
+            var state = new object[] { ends, transposeB };
+            return bias is null
+                ? scope.RecordBinary(LazyNodeType.Custom, "GroupedMatMul", a, b, new[] { m, n }, execute, GroupedRowsMatMulBackward<T>, state)
+                : scope.RecordVariadic(LazyNodeType.Custom, "GroupedMatMul", new[] { a, b, bias }, new[] { m, n }, execute,
+                    GroupedRowsMatMulBackward<T>, state);
         }
 
         var output = new Tensor<T>(new[] { m, n });   // zero-initialized: rows past the last offset stay zero
-        if (output.Length > 0 && k > 0)
+        if (output.Length > 0)
         {
-            var x = HostArray(a, out int aOff);
-            var w = HostArray(b, out int bOff);
-            GroupedRowsHost(x, aOff, w, bOff, output.GetDataArray(), ends, k, n, transposeB);
+            var y = output.GetDataArray();
+            if (k > 0)
+            {
+                var x = HostArray(a, out int aOff);
+                var w = HostArray(b, out int bOff);
+                GroupedRowsHost(x, aOff, w, bOff, y, ends, k, n, transposeB);
+            }
+            if (bias is not null)
+            {
+                var bv = HostArray(bias, out int biasOff);
+                GroupedBiasHost(bv, biasOff, bias.Rank == 2, y, ends, n);
+            }
         }
-        DifferentiableOps.RecordBinary("GroupedMatMul", output, a, b, GroupedRowsMatMulBackward<T>, new object[] { ends, transposeB });
+        RecordGroupedRows(output, a, b, bias, ends, transposeB);
         return output;
+    }
+
+    /// <summary>Records the native op's tape node (two inputs, or three with a bias).</summary>
+    private protected static void RecordGroupedRows<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b, Tensor<T>? bias, int[] ends, bool transposeB)
+    {
+        var state = new object[] { ends, transposeB };
+        if (bias is null) DifferentiableOps.RecordBinary("GroupedMatMul", output, a, b, GroupedRowsMatMulBackward<T>, state);
+        else DifferentiableOps.RecordIfActive("GroupedMatMul", output, new[] { a, b, bias }, GroupedRowsMatMulBackward<T>, state);
     }
 
     /// <summary>Per-group outer product <c>w[g] = a_g^T · c_g</c>: a [M, K], c [M, N] -> [G, K, N]; not recorded.</summary>
@@ -88,7 +116,8 @@ public partial class CpuEngine
     /// <summary>
     /// Backward of <see cref="GroupedRowsMatMul{T}"/>. Without transposeB (<c>out_g = a_g b_g</c>): <c>da = grouped(dout, b, T)</c>,
     /// <c>db_g = a_g^T dout_g</c>. With it (<c>out_g = a_g b_g^T</c>): <c>da = grouped(dout, b)</c>, <c>db_g = dout_g^T a_g</c>.
-    /// Rows past the last offset get a zero gradient.
+    /// The bias gets the per-group column sums of <c>dout</c> (summed over the groups for a shared [N] bias). Rows past the
+    /// last offset get a zero gradient.
     /// </summary>
     internal static void GroupedRowsMatMulBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -105,6 +134,17 @@ public partial class CpuEngine
                     ? grouped.GroupedRowsWeightGrad(gradOutput, inputs[0], ends)
                     : grouped.GroupedRowsWeightGrad(inputs[0], gradOutput, ends),
                 engine);
+        if (inputs.Length > 2 && DifferentiableOps.IsGradientRequired(inputs[2]))
+        {
+            // Column sums per group: the weight gradient of a ones column, [G, 1, N].
+            var ops = MathHelper.GetNumericOperations<T>();
+            int m = gradOutput._shape[0], n = gradOutput._shape[1];
+            var ones = new Tensor<T>(new[] { m, 1 });
+            ones.Fill(ops.One);
+            var perGroup = engine.Reshape(grouped.GroupedRowsWeightGrad(ones, gradOutput, ends), new[] { ends.Length, n });
+            var biasGrad = inputs[2].Rank == 2 ? perGroup : engine.ReduceSum(perGroup, new[] { 0 }, false);
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], biasGrad, engine);
+        }
     }
 
     // out rows of group i = a rows · b[i] (or b[i]^T), each through the managed GEMM at its exact size.
@@ -125,6 +165,34 @@ public partial class CpuEngine
                         yD.AsSpan(yo, rows * n), n, rows, n, k);
                 else
                     GroupedBlockGeneric(a, ao, b, bo, y, yo, rows, k, n, transposeB);
+            }
+            start = ends[i];
+        }
+    }
+
+    // bias ([N], or [G, N] with perGroup) added to every routed row; rows past the last offset stay zero.
+    private static void GroupedBiasHost<T>(T[] bias, int biasOff, bool perGroup, T[] y, int[] ends, int n)
+    {
+        int start = 0;
+        for (int i = 0; i < ends.Length; i++)
+        {
+            int rows = ends[i] - start, bo = biasOff + (perGroup ? i * n : 0);
+            if (rows > 0)
+            {
+                if (y is float[] yF && bias is float[] bF)
+                {
+                    var row = bF.AsSpan(bo, n);
+                    for (int r = start; r < ends[i]; r++)
+                        Simd.SimdKernels.VectorAdd(yF.AsSpan(r * n, n), row, yF.AsSpan(r * n, n));
+                }
+                else if (y is double[] yD && bias is double[] bD)
+                {
+                    var row = bD.AsSpan(bo, n);
+                    for (int r = start; r < ends[i]; r++)
+                        Simd.SimdKernels.VectorAdd(yD.AsSpan(r * n, n), row, yD.AsSpan(r * n, n));
+                }
+                else
+                    GroupedBiasGeneric(bias, bo, y, start, ends[i], n);
             }
             start = ends[i];
         }
@@ -165,6 +233,15 @@ public partial class CpuEngine
                     sum = ops.Add(sum, ops.Multiply(a[ao + r * k + q], b[bo + (transposeB ? j * k + q : q * n + j)]));
                 y[yo + r * n + j] = sum;
             }
+    }
+
+    [ScalarKernel("Element types other than float and double have no typed add; float and double take SimdKernels above.")]
+    private static void GroupedBiasGeneric<T>(T[] bias, int bo, T[] y, int rowStart, int rowEnd, int n)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int r = rowStart; r < rowEnd; r++)
+            for (int j = 0; j < n; j++)
+                y[r * n + j] = ops.Add(y[r * n + j], bias[bo + j]);
     }
 
     [ScalarKernel("Element types other than float and double have no typed GEMM; float and double take BlasManaged above.")]

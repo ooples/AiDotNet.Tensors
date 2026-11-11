@@ -30,7 +30,7 @@ public class GroupedRowsMatMulTests
         return -1;   // past the last offset
     }
 
-    internal static double[] Reference(Tensor<float> a, Tensor<float> b, int[] ends, bool transposeB)
+    internal static double[] Reference(Tensor<float> a, Tensor<float> b, int[] ends, bool transposeB, Tensor<float>? bias = null)
     {
         int m = a.Shape[0], k = a.Shape[1], n = transposeB ? b.Shape[1] : b.Shape[2];
         var y = new double[m * n];
@@ -42,6 +42,7 @@ public class GroupedRowsMatMulTests
             {
                 double s = 0;
                 for (int q = 0; q < k; q++) s += (double)a[r, q] * (transposeB ? b[g, j, q] : b[g, q, j]);
+                if (bias is not null) s += bias.Rank == 2 ? bias[g, j] : bias[j];
                 y[r * n + j] = s;
             }
         }
@@ -66,6 +67,20 @@ public class GroupedRowsMatMulTests
                 }
         }
         return (da, db);
+    }
+
+    // d/dbias of sum(out * w): the per-group column sums of w over the group's rows ([G, N]), or their total ([N]).
+    internal static double[] ReferenceBiasGrad(Tensor<float> w, int[] ends, bool perGroup)
+    {
+        int n = w.Shape[1];
+        var d = new double[(perGroup ? ends.Length : 1) * n];
+        for (int r = 0; r < w.Shape[0]; r++)
+        {
+            int g = GroupOf(ends, r);
+            if (g < 0) continue;
+            for (int j = 0; j < n; j++) d[(perGroup ? g * n : 0) + j] += w[r, j];
+        }
+        return d;
     }
 
     internal static void AssertClose(double[] expected, Tensor<float> actual, double tolerance, string what)
@@ -94,13 +109,82 @@ public class GroupedRowsMatMulTests
         AssertClose(Reference(a, b, UnbalancedEnds, transposeB), y, 1e-5, "y");
     }
 
-    [Fact]
-    public void PublicGroupedMatMul_TakesTheNativePath_AndMatchesReference()
+    // Counts the native op's calls: the public grouped_mm must reach it exactly once (no per-group composition).
+    private sealed class CountingEngine : CpuEngine
     {
+        internal int Calls;
+
+        internal override Tensor<T> GroupedRowsMatMul<T>(Tensor<T> a, Tensor<T> b, int[] ends, bool transposeB, Tensor<T>? bias = null)
+        {
+            Calls++;
+            return base.GroupedRowsMatMul(a, b, ends, transposeB, bias);
+        }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void PublicGroupedMatMul_DispatchesToTheNativeOpOnce_AsOneTapeNode(int biasRank)
+    {
+        var engine = new CountingEngine();
         int k = 16, n = 12, g = UnbalancedEnds.Length;
         var a = Random(3, UnbalancedRows, k); var b = Random(4, g, k, n);
-        var y = _engine.TensorGroupedMatMul(a, b, new Tensor<int>(UnbalancedEnds, new[] { g }));
-        AssertClose(Reference(a, b, UnbalancedEnds, false), y, 1e-5, "y");
+        var bias = biasRank == 0 ? null : biasRank == 1 ? Random(12, n) : Random(12, g, n);
+        using var tape = new GradientTape<float>();
+        var y = engine.TensorGroupedMatMul(a, b, new Tensor<int>(UnbalancedEnds, new[] { g }), bias);
+        Assert.Equal(1, engine.Calls);
+        Assert.Equal(1, tape.EntryCount);   // one native node, not a narrow + matmul (+ bias add) per group and a concat
+        AssertClose(Reference(a, b, UnbalancedEnds, false, bias), y, 1e-5, "y");
+    }
+
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(1, true)]
+    [InlineData(2, true)]
+    public void Bias_ForwardAndAllGradients_MatchReference(int biasRank, bool transposeB)
+    {
+        int k = 10, n = 9, g = UnbalancedEnds.Length;
+        var a = Random(5, UnbalancedRows, k);
+        var b = transposeB ? Random(6, g, n, k) : Random(6, g, k, n);
+        var bias = biasRank == 1 ? Random(13, n) : Random(13, g, n);
+        var w = Random(7, UnbalancedRows, n);
+        Tensor<float> y, ga, gb, gbias;
+        using (var tape = new GradientTape<float>())
+        {
+            y = _engine.GroupedRowsMatMul(a, b, UnbalancedEnds, transposeB, bias);
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(y, w), null);
+            var grads = tape.ComputeGradients(loss, new[] { a, b, bias });
+            ga = grads[a]; gb = grads[b]; gbias = grads[bias];
+        }
+        AssertClose(Reference(a, b, UnbalancedEnds, transposeB, bias), y, 1e-5, "y");   // tail rows: zero, no bias
+        var (da, db) = ReferenceGrads(a, b, w, UnbalancedEnds, transposeB);
+        AssertClose(da, ga, 1e-4, "da");
+        AssertClose(db, gb, 1e-4, "db");
+        AssertClose(ReferenceBiasGrad(w, UnbalancedEnds, biasRank == 2), gbias, 1e-4, "dbias");
+    }
+
+    [Fact]
+    public void OffsetAndStridedViews_MatchReference()
+    {
+        int k = 8, n = 6, g = UnbalancedEnds.Length;
+        // a as rows 3.. of a larger tensor (a storage offset), then as a column slice of that (not contiguous).
+        var big = Random(14, UnbalancedRows + 5, k + 4);
+        var rowsView = _engine.TensorNarrow(big, 0, 3, UnbalancedRows);
+        var colsView = _engine.TensorNarrow(rowsView, 1, 2, k);
+        Assert.False(colsView.IsContiguous);
+        var b = Random(15, g, k, n);
+        var dense = new Tensor<float>(colsView.ToArray(), new[] { UnbalancedRows, k });
+        AssertClose(Reference(dense, b, UnbalancedEnds, false), _engine.GroupedRowsMatMul(colsView, b, UnbalancedEnds, false), 1e-5, "strided a");
+        var rowsDense = new Tensor<float>(rowsView.ToArray(), new[] { UnbalancedRows, k + 4 });
+        var b2 = Random(17, g, k + 4, n);
+        AssertClose(Reference(rowsDense, b2, UnbalancedEnds, false), _engine.GroupedRowsMatMul(rowsView, b2, UnbalancedEnds, false), 1e-5, "offset a");
+        // b as groups 1.. of a larger tensor (a storage offset).
+        var bigB = Random(16, g + 1, k, n);
+        var bView = _engine.TensorNarrow(bigB, 0, 1, g);
+        var bDense = new Tensor<float>(bView.ToArray(), new[] { g, k, n });
+        AssertClose(Reference(dense, bDense, UnbalancedEnds, false), _engine.GroupedRowsMatMul(dense, bView, UnbalancedEnds, false), 1e-5, "offset b");
     }
 
     [Theory]
@@ -142,6 +226,20 @@ public class GroupedRowsMatMulTests
         var a = Random(10, 6, 4); var b = Random(11, 2, 4, 3);
         Assert.Throws<ArgumentException>(() => _engine.GroupedRowsMatMul(a, b, new[] { 4, 2 }, false));
         Assert.Throws<ArgumentException>(() => _engine.GroupedRowsMatMul(a, b, new[] { 2, 7 }, false));
+    }
+
+    [Fact]
+    public void Rejects_AnOffsetCountThatIsNotTheGroupCount()
+    {
+        var a = Random(10, 6, 4); var b = Random(11, 2, 4, 3);
         Assert.Throws<ArgumentException>(() => _engine.GroupedRowsMatMul(a, b, new[] { 6 }, false));
+    }
+
+    [Fact]
+    public void Accepts_ALastOffsetEqualToTheRowCount()
+    {
+        var a = Random(10, 6, 4); var b = Random(11, 2, 4, 3);
+        var ends = new[] { 2, 6 };
+        AssertClose(Reference(a, b, ends, false), _engine.GroupedRowsMatMul(a, b, ends, false), 1e-5, "y");
     }
 }
