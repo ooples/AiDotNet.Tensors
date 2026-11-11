@@ -59,10 +59,17 @@ __kernel void gla_scan_forward(
     }
 }
 
-__kernel void gla_scan_recompute(
-    __global const float* K, __global const float* V, __global const float* G,
-    __global float* Straj,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+// Checkpointed backward (#gla-ckpt): pass 1 re-runs the forward scan saving the state entering each chunk of
+// `chunk` steps (Ckpt, B*H*nChunks*d^2 floats); pass 2 walks chunks in reverse, recomputes the chunk's states into
+// Scratch (B*H*chunk*d^2 floats) and runs BPTT over it. chunk = ceil(sqrt(S)) makes both O(sqrt(S)) instead of the
+// O(S) state trajectory, at the cost of one extra forward scan.
+__kernel void gla_scan_backward_ckpt(
+    __global const float* dOut, __global const float* Q, __global const float* K,
+    __global const float* V, __global const float* G,
+    __global float* Ckpt, __global float* Scratch,
+    __global volatile float* dQ, __global volatile float* dK,
+    __global volatile float* dV, __global volatile float* dG,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, int chunk)
 {
     int gid = get_global_id(0);
     int total = batch * numHeads * headDim;
@@ -72,73 +79,121 @@ __kernel void gla_scan_recompute(
     int h  = (gid / headDim) % numHeads;
     int b  = gid / (headDim * numHeads);
     int hOff = h * headDim;
-    int hh = headDim * headDim;
+    long hh = (long)headDim * headDim;
+    long bh = (long)b * numHeads + h;
+    long rowOff = (long)di * headDim;
+    int nChunks = (seqLen + chunk - 1) / chunk;
 
     float Srow[GLA_MAX_HEADDIM];
+    float dSrow[GLA_MAX_HEADDIM];
     for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
 
     for (int t = 0; t < seqLen; t++) {
+        if (t % chunk == 0) {
+            long ck = (bh * nChunks + t / chunk) * hh + rowOff;
+            for (int ki = 0; ki < headDim; ki++) Ckpt[ck + ki] = Srow[ki];
+        }
         int baseOff = (b * seqLen + t) * modelDim + hOff;
         float g  = G[(b * seqLen + t) * numHeads + h];
         float vd = V[baseOff + di];
-        long trajBase = ((long)(b * numHeads + h) * seqLen + t) * hh + (long)di * headDim;
-        for (int ki = 0; ki < headDim; ki++) {
-            float s = g * Srow[ki] + vd * K[baseOff + ki];
-            Srow[ki] = s;
-            Straj[trajBase + ki] = s;
+        for (int ki = 0; ki < headDim; ki++) Srow[ki] = g * Srow[ki] + vd * K[baseOff + ki];
+    }
+
+    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
+    for (int c = nChunks - 1; c >= 0; c--) {
+        int t0 = c * chunk;
+        int t1 = min(seqLen, t0 + chunk);
+        long ck = (bh * nChunks + c) * hh + rowOff;
+        for (int ki = 0; ki < headDim; ki++) Srow[ki] = Ckpt[ck + ki];
+        for (int t = t0; t < t1; t++) {
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            float g  = G[(b * seqLen + t) * numHeads + h];
+            float vd = V[baseOff + di];
+            long sc = (bh * chunk + (t - t0)) * hh + rowOff;
+            for (int ki = 0; ki < headDim; ki++) {
+                float s = g * Srow[ki] + vd * K[baseOff + ki];
+                Srow[ki] = s;
+                Scratch[sc + ki] = s;
+            }
+        }
+        for (int t = t1 - 1; t >= t0; t--) {
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gOff = (b * seqLen + t) * numHeads + h;
+            float g = G[gOff];
+            long sc = (bh * chunk + (t - t0)) * hh + rowOff;
+            long sp = (t > t0) ? (bh * chunk + (t - 1 - t0)) * hh + rowOff : -1;
+
+            float dOutVal = dOut[baseOff + di];
+            for (int ki = 0; ki < headDim; ki++) {
+                atomic_add_float(&dQ[baseOff + ki], dOutVal * Scratch[sc + ki]);
+                dSrow[ki] += dOutVal * Q[baseOff + ki];
+            }
+
+            float vd = V[baseOff + di];
+            float dg = 0.0f;
+            float dVacc = 0.0f;
+            for (int ki = 0; ki < headDim; ki++) {
+                float dStv = dSrow[ki];
+                float sprev = (sp >= 0) ? Scratch[sp + ki] : Ckpt[ck + ki];
+                dg += dStv * sprev;
+                atomic_add_float(&dK[baseOff + ki], dStv * vd);
+                dVacc += dStv * K[baseOff + ki];
+            }
+            atomic_add_float(&dV[baseOff + di], dVacc);
+            atomic_add_float(&dG[gOff], dg);
+
+            for (int ki = 0; ki < headDim; ki++) dSrow[ki] *= g;
         }
     }
 }
 
-__kernel void gla_scan_backward(
-    __global const float* dOut, __global const float* Q, __global const float* K,
-    __global const float* V, __global const float* G, __global const float* Straj,
-    __global volatile float* dQ, __global volatile float* dK,
-    __global volatile float* dV, __global volatile float* dG,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+// Channels-last causal depthwise conv (ICausalDepthwiseConvBackend): x, y, dy, dx are [rows, seqLen, C]; w, dw are
+// [K, C]; tap j reads j steps back. Every output element is written; no atomics, so all three are deterministic.
+__kernel void causal_dwconv1d_forward(
+    __global const float* x, __global const float* w, __global float* y,
+    int rows, int seqLen, int channels, int taps)
 {
-    int gid = get_global_id(0);
-    int total = batch * numHeads * headDim;
-    if (gid >= total) return;
+    long idx = get_global_id(0);
+    long total = (long)rows * seqLen * channels;
+    if (idx >= total) return;
+    int c = (int)(idx % channels);
+    int t = (int)((idx / channels) % seqLen);
+    int maxJ = min(taps - 1, t);
+    float acc = 0.0f;
+    for (int j = 0; j <= maxJ; j++) acc += w[j * channels + c] * x[idx - (long)j * channels];
+    y[idx] = acc;
+}
 
-    int di = gid % headDim;
-    int h  = (gid / headDim) % numHeads;
-    int b  = gid / (headDim * numHeads);
-    int hOff = h * headDim;
-    int hh = headDim * headDim;
+__kernel void causal_dwconv1d_backward_input(
+    __global const float* dy, __global const float* w, __global float* dx,
+    int rows, int seqLen, int channels, int taps)
+{
+    long idx = get_global_id(0);
+    long total = (long)rows * seqLen * channels;
+    if (idx >= total) return;
+    int c = (int)(idx % channels);
+    int t = (int)((idx / channels) % seqLen);
+    int maxJ = min(taps - 1, seqLen - 1 - t);
+    float acc = 0.0f;
+    for (int j = 0; j <= maxJ; j++) acc += w[j * channels + c] * dy[idx + (long)j * channels];
+    dx[idx] = acc;
+}
 
-    float dSrow[GLA_MAX_HEADDIM];
-    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
-
-    for (int t = seqLen - 1; t >= 0; t--) {
-        int baseOff = (b * seqLen + t) * modelDim + hOff;
-        int gOff = (b * seqLen + t) * numHeads + h;
-        float g = G[gOff];
-        long trajBase = ((long)(b * numHeads + h) * seqLen + t) * hh + (long)di * headDim;
-        long sprevBase = ((long)(b * numHeads + h) * seqLen + (t - 1)) * hh + (long)di * headDim;
-
-        float dOutVal = dOut[baseOff + di];
-        for (int ki = 0; ki < headDim; ki++) {
-            float sval = Straj[trajBase + ki];
-            atomic_add_float(&dQ[baseOff + ki], dOutVal * sval);
-            dSrow[ki] += dOutVal * Q[baseOff + ki];
-        }
-
-        float vd = V[baseOff + di];
-        float dg = 0.0f;
-        float dVacc = 0.0f;
-        for (int ki = 0; ki < headDim; ki++) {
-            float dStv = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
-            dg += dStv * sprev;
-            atomic_add_float(&dK[baseOff + ki], dStv * vd);
-            dVacc += dStv * K[baseOff + ki];
-        }
-        atomic_add_float(&dV[baseOff + di], dVacc);
-        atomic_add_float(&dG[gOff], dg);
-
-        for (int ki = 0; ki < headDim; ki++) dSrow[ki] *= g;
+// One work item per (tap j, channel c), summing every row and step in ascending order.
+__kernel void causal_dwconv1d_backward_kernel(
+    __global const float* dy, __global const float* x, __global float* dw,
+    int rows, int seqLen, int channels, int taps)
+{
+    int jc = get_global_id(0);
+    if (jc >= taps * channels) return;
+    int j = jc / channels, c = jc % channels;
+    float acc = 0.0f;
+    for (int r = 0; r < rows; r++) {
+        long rowBase = (long)r * seqLen * channels;
+        for (int t = j; t < seqLen; t++)
+            acc += dy[rowBase + (long)t * channels + c] * x[rowBase + (long)(t - j) * channels + c];
     }
+    dw[jc] = acc;
 }
 ";
     }
@@ -148,8 +203,10 @@ __kernel void gla_scan_backward(
         return new[]
         {
             "gla_scan_forward",
-            "gla_scan_recompute",
-            "gla_scan_backward"
+            "gla_scan_backward_ckpt",
+            "causal_dwconv1d_forward",
+            "causal_dwconv1d_backward_input",
+            "causal_dwconv1d_backward_kernel"
         };
     }
 }

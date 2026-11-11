@@ -65,6 +65,13 @@ public sealed class GlaScanTapeGpuTests : IClassFixture<DirectGpuTensorEngineTes
     [SkippableTheory]
     [InlineData(2, 16, 64, 4)]    // headDim 16
     [InlineData(2, 16, 800, 8)]   // the Born-linear LM shape: 8 heads x 100 features
+    // Checkpointed backward (chunk = ceil(sqrt(seqLen))): a single step; seqLen 37 (chunk 7, last
+    // chunk 2 tokens); an exact square (64 = 8 x 8); headDim 128 with seqLen 50 (chunk 8, last chunk 2),
+    // the head width whose full state trajectory reached 2.1 GB at batch 16, seqLen 256.
+    [InlineData(1, 1, 32, 2)]
+    [InlineData(2, 37, 64, 4)]
+    [InlineData(1, 64, 256, 2)]
+    [InlineData(1, 50, 512, 4)]
     public void TapeForwardAndGradients_MatchCpu(int batch, int seqLen, int modelDim, int numHeads)
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");

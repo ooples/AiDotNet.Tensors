@@ -79,6 +79,17 @@ public abstract class StepCountRatchetBase
     }
 }
 
+/// <summary>
+/// The head-to-heads and the step-count ratchets set process-wide state (CpuParallelSettings.MaxDegreeOfParallelism,
+/// AIDOTNET_AUTOCAST, AiDotNetEngine.Current) for a whole run, so they run with no other collection in parallel: a test
+/// elsewhere that set the thread count itself could otherwise run serially and still pass, and overlapping
+/// save-and-restore pairs could leave the setting changed after both finished.
+/// </summary>
+[CollectionDefinition("PyTorchHeadToHead", DisableParallelization = true)]
+public sealed class PyTorchHeadToHeadCollection
+{
+}
+
 /// <summary>The CPU cases (hosted CI).</summary>
 [Collection("PyTorchHeadToHead")]
 public sealed class StepCountRatchetTests : StepCountRatchetBase

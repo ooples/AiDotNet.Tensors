@@ -24,7 +24,6 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using SVec = System.Numerics.Vector<float>;
-using System.Threading.Tasks;
 
 namespace AiDotNet.Tensors.LinearAlgebra.Fft;
 
@@ -159,7 +158,7 @@ internal static class FftBatchFloat
         int numChunks = Math.Min(procs, batch);
         int chunk = (batch + numChunks - 1) / numChunks;
 
-        Parallel.For(0, numChunks, c =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.LightweightParallel(numChunks, c =>
         {
             int b0 = c * chunk;
             int b1 = Math.Min(batch, b0 + chunk);

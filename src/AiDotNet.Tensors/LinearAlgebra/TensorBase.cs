@@ -84,7 +84,7 @@ internal enum StreamingReleaseOutcome
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource
+public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource, IBackingArraySource
 {
     private bool _disposed;
 
@@ -180,6 +180,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal T[]? GetBackingArrayForCacheLookupUnsafe()
         => _data.GetBackingArrayIdentity();   // identity for cache lookups; does not escape the array
+
+    bool IBackingArraySource.TryGetBackingArray(out Array? array)
+    {
+        array = null;
+        if (LazySource is ILazyNode node && !node.IsRealized) return false;
+        // Any offset: a slice of an arena slab is a use of the whole slab, and GetBackingArrayIdentity names only
+        // arrays that start at the tensor's first element, so the recycler would hand back a slab a slice still reads.
+        array = _data.TryGetBackingArrayIdentity(out var backing, out _) ? backing : null;
+        return true;
+    }
 
     /// <summary>
     /// Per-tensor state almost no tensor sets: the streaming and GPU-offload bookkeeping, a partial view's own device

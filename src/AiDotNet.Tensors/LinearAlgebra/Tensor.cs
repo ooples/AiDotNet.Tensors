@@ -4662,61 +4662,60 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
-    /// Copies a slice from a source tensor to a destination tensor along a specified axis.
+    /// Copies a source tensor into a row-major destination at an offset along the concatenation axis.
     /// </summary>
     /// <param name="source">The tensor to copy data from.</param>
-    /// <param name="sourceShape">An entry-snapshot of <paramref name="source"/>'s
-    /// shape. The recursive walk reads ranks and per-axis extents from this
-    /// frozen array rather than <c>source._shape</c>, so a same-assembly
-    /// shape mutation during the copy cannot make us read past the
-    /// destination buffer or skip elements.</param>
-    /// <param name="destination">The tensor to copy data to.</param>
+    /// <param name="sourceShape">An entry-snapshot of <paramref name="source"/>'s shape. Every extent below is read
+    /// from this frozen array rather than <c>source._shape</c>, so a same-assembly shape mutation during the copy cannot
+    /// make it read past the destination or skip elements (issue #291).</param>
+    /// <param name="destination">The freshly allocated, contiguous concatenation result.</param>
     /// <param name="axis">The axis along which to copy the slice.</param>
-    /// <param name="destinationOffset">The offset in the destination tensor where the slice should be placed.</param>
+    /// <param name="destinationOffset">The source's offset along <paramref name="axis"/> in the destination.</param>
     /// <remarks>
-    /// <para><b>For Beginners:</b> This helper method is used when joining tensors together. It takes data from one tensor
-    /// and places it at the correct position in another tensor.</para>
-    ///
-    /// <para>The method uses recursion (a function calling itself) to navigate through all dimensions of the tensors
-    /// and copy values one by one to the right locations.</para>
-    ///
-    /// <para>This is a helper method used by the Concatenate method to combine multiple tensors.</para>
+    /// <para>
+    /// In row-major order the source occupies one contiguous run of <c>sourceShape[axis] * inner</c> elements for each
+    /// combination of the axes before <paramref name="axis"/>, so the copy is one block copy per such combination. It
+    /// used to walk every index tuple recursively and write each element through the indexer, which PerfView put at 7%
+    /// of an AiDotNet FasterRCNN Detect (TENS0010).
+    /// </para>
+    /// <para><b>For Beginners:</b> joining tensors is copying whole rows of numbers at once, not one number at a time.</para>
     /// </remarks>
     [MethodImpl(Hot)]
     private static void CopyTensorSlice(Tensor<T> source, int[] sourceShape, Tensor<T> destination, int axis, int destinationOffset)
     {
         int rank = sourceShape.Length;
-        int[] sourceIndices = new int[rank];
-        int[] destIndices = new int[destination.Rank];
-        // Snapshot strides and storage offset alongside the shape so the
-        // computed flat index is also a function of the entry-time view
-        // metadata, not of the live tensor.
-        int[] sourceStrides = source._strides;
-        int sourceStorageOffset = source._storageOffset;
-        var sourceData = source._data;
+        long outer = 1, inner = 1;
+        for (int d = 0; d < axis; d++) outer *= sourceShape[d];
+        for (int d = axis + 1; d < rank; d++) inner *= sourceShape[d];
+        long block = sourceShape[axis] * inner;
+        if (outer * block == 0) return;
 
-        [MethodImpl(Hot)]
-        void CopyRecursive(int depth)
+        // A strided view is materialized once, without recording a view op: the concatenation is the recorded op. A
+        // sparse tensor has no dense storage to copy (Contiguous rejects it), so it is densified first.
+        Tensor<T> contiguous = source;
+        if (source is SparseTensor<T> sparse)
         {
-            if (depth == rank)
-            {
-                int srcFlat = sourceStorageOffset;
-                for (int d = 0; d < rank; d++)
-                    srcFlat += sourceIndices[d] * sourceStrides[d];
-                destination[destIndices] = sourceData[srcFlat];
-                return;
-            }
-
-            int limit = sourceShape[depth];
-            for (int i = 0; i < limit; i++)
-            {
-                sourceIndices[depth] = i;
-                destIndices[depth] = depth == axis ? i + destinationOffset : i;
-                CopyRecursive(depth + 1);
-            }
+            contiguous = sparse.ToDense();
+        }
+        else if (!source.IsContiguous)
+        {
+            using (Engines.Autodiff.DifferentiableOps.SuppressTensorViewRecording())
+                contiguous = source.Contiguous();
         }
 
-        CopyRecursive(0);
+        var from = contiguous.AsSpan();
+        if (from.Length != outer * block)
+            throw new InvalidOperationException(
+                $"Concatenate input changed shape during the copy: expected {outer * block} elements, found {from.Length}.");
+
+        var to = destination.AsWritableSpan();
+        long destinationAxisExtent = destination._shape[axis];
+        long destinationRow = destinationAxisExtent * inner;
+        long destinationStart = destinationOffset * inner;
+        for (long o = 0; o < outer; o++)
+        {
+            from.Slice((int)(o * block), (int)block).CopyTo(to.Slice((int)(o * destinationRow + destinationStart), (int)block));
+        }
     }
 
     /// <summary>

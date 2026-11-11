@@ -19,7 +19,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IIndexConversionBackend
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -16331,12 +16331,39 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
     }
 
+    /// <summary>Longest power-of-two row <see cref="BatchedFFT"/> transforms in one shared-memory launch.</summary>
+    internal const int SharedMemoryFftMaxLength = 4096;
+
     /// <inheritdoc/>
     public unsafe void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
     {
         if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend not available");
 
         using var _ = PushContext();
+
+        // One launch per call when a row fits in shared memory (2*n floats, 32 KB at n = 4096, inside the
+        // 48 KB every CUDA device grants without opt-in): batched_fft_smem bit-reverses on load, runs all
+        // stages on chip and writes once. The multi-launch path below is kept for longer rows.
+        if (batch > 0 && n >= 2 && n <= SharedMemoryFftMaxLength && (n & (n - 1)) == 0
+            && _kernelCache.TryGetValue("batched_fft_smem", out var smemFftKernel))
+        {
+            IntPtr inRe = inputReal.Handle, inIm = inputImag.Handle, outRe = outputReal.Handle, outIm = outputImag.Handle;
+            int lg = (int)MathHelper.Log2(n);
+            int invFlag = inverse ? 1 : 0;
+            float scale = inverse ? 1.0f / n : 1.0f;
+            void** smemArgs = stackalloc void*[8];
+            smemArgs[0] = &inRe;
+            smemArgs[1] = &inIm;
+            smemArgs[2] = &outRe;
+            smemArgs[3] = &outIm;
+            smemArgs[4] = &n;
+            smemArgs[5] = &lg;
+            smemArgs[6] = &invFlag;
+            smemArgs[7] = &scale;
+            LaunchKernelWithSharedMem(smemFftKernel, (uint)batch, (uint)Math.Min(n / 2, 512),
+                (uint)(2 * n * sizeof(float)), smemArgs);
+            return;
+        }
 
         // Copy input to output for in-place FFT
         CudaCopyBuffer(inputReal, outputReal, batch * n);
@@ -18218,9 +18245,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (headDim > Kernels.CudaGlaKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.CudaGlaKernels.MaxHeadDim}).");
-        if (!_kernelCache.TryGetValue("gla_scan_recompute", out var recompute) ||
-            !_kernelCache.TryGetValue("gla_scan_backward", out var backward))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_recompute / gla_scan_backward");
+        if (!_kernelCache.TryGetValue("gla_scan_backward_ckpt", out var backward))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_backward_ckpt");
 
         using var _ = PushContext();
         // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
@@ -18228,26 +18254,22 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         Fill(dQ, 0f, batch * seqLen * modelDim);
         Fill(dK, 0f, batch * seqLen * modelDim);
         Fill(dG, 0f, batch * seqLen * numHeads);
-        long trajLenL = checked((long)batch * numHeads * seqLen * headDim * headDim);
-        if (trajLenL > int.MaxValue)
-            throw new ArgumentException("GLA trajectory buffer is too large for a single allocation.");
-        int trajLen = (int)trajLenL;
-        using var trajBuf = AllocateBuffer(trajLen);
+        // State checkpoints every `chunk` steps plus one chunk of recomputed states: memory
+        // batch*heads*(nChunks + chunk)*headDim^2 instead of batch*heads*seqLen*headDim^2.
+        var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        using var ckptBuf = AllocateBuffer(ckptLen);
+        using var scratchBuf = AllocateBuffer(scratchLen);
         uint total = (uint)(batch * numHeads * headDim);
         uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
 
-        IntPtr pk = k.Handle, pv = v.Handle, pg = gate.Handle, ptr = trajBuf.Handle;
-        void** ra = stackalloc void*[9];
-        ra[0] = &pk; ra[1] = &pv; ra[2] = &pg; ra[3] = &ptr;
-        ra[4] = &batch; ra[5] = &seqLen; ra[6] = &modelDim; ra[7] = &numHeads; ra[8] = &headDim;
-        LaunchKernel(recompute, grid, (uint)DefaultBlockSize, ra);
-
-        IntPtr pdo = dOut.Handle, pq = q.Handle;
+        IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle;
+        IntPtr pck = ckptBuf.Handle, psc = scratchBuf.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pdg = dG.Handle;
-        void** ba = stackalloc void*[15];
-        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg; ba[5] = &ptr;
-        ba[6] = &pdq; ba[7] = &pdk; ba[8] = &pdv; ba[9] = &pdg;
-        ba[10] = &batch; ba[11] = &seqLen; ba[12] = &modelDim; ba[13] = &numHeads; ba[14] = &headDim;
+        void** ba = stackalloc void*[17];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg; ba[5] = &pck; ba[6] = &psc;
+        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pdg;
+        ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
+        ba[16] = &chunk;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
     }
 

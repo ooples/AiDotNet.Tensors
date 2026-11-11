@@ -56,8 +56,7 @@ void main() {
     float binW = roiW / outW;
     int ry = samplingRatio > 0 ? samplingRatio : int(ceil(roiH / outH));
     int rx = samplingRatio > 0 ? samplingRatio : int(ceil(roiW / outW));
-    if (ry < 1) ry = 1;
-    if (rx < 1) rx = 1;
+    // torchvision: an aligned RoI of zero or negative size has an empty sampling grid and averages to 0.
     uint planeBase = uint((n * C + c) * H * W);
     float acc = 0.0;
     for (int iy = 0; iy < ry; iy++) {
@@ -67,7 +66,7 @@ void main() {
             acc += bilinear_sample(planeBase, sy, sx, H, W);
         }
     }
-    output_[gid] = acc / float(ry * rx);
+    output_[gid] = acc / float(max(ry * rx, 1));
 }
 ";
 

@@ -6,7 +6,7 @@ using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed partial class VulkanBackend : IIndexConversionBackend
+public sealed partial class VulkanBackend
 {
     /// <summary>Reinterpret float bits as uint (net471-safe alternative to BitConverter.SingleToUInt32Bits).</summary>
     private static unsafe uint FloatBits(float value) { return *(uint*)&value; }

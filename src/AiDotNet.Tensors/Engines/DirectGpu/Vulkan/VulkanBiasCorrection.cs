@@ -19,11 +19,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// -0.35, exp(x) &lt; 0.71, so 1 - exp(x) cancels by at most 3.4x and is used directly.</item>
 /// </list>
 /// <para><c>precise</c> keeps the compiler from contracting or reassociating the sums.</para>
+/// <para>beta = 0 (a valid Adam setting) returns 1, which is 1 - 0^t for every step t &gt;= 1: GLSL leaves log(0)
+/// undefined, where the earlier <c>1.0 - pow(0.0, t)</c> was defined.</para>
 /// </remarks>
 internal static class VulkanBiasCorrection
 {
     internal const string Glsl = @"
 float vk_bias_correction(float beta, float t){
+    if (beta <= 0.0) return 1.0;
     precise float l;
     if (beta >= 0.5) {
         precise float d = 1.0 - beta;

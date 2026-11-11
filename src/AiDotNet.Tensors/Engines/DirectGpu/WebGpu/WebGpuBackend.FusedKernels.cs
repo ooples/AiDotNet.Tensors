@@ -1,7 +1,7 @@
 #if NET8_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend : IIndexConversionBackend
+public sealed partial class WebGpuBackend
 {
     // WebGPU fused kernel dispatch via WGSL compute pipelines.
     // Dispatch2BufferAsync(module, source, kernel, inputBuf, outputBuf, uniforms, workSize)

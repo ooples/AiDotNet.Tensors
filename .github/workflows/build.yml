@@ -428,12 +428,14 @@ jobs:
           echo "::warning::Intel SDE download/extract failed for all mirrors (Intel rotated the URL). Skipping the SDE-emulated AVX-512 verification — the native --verify-microkernels above still ran. Update SDE_URLS in .github/workflows/build.yml with a current mirror link to re-enable it."
         fi
 
-    # #685: without AVX-512 hardware the machine-kernel GEMM tests above SKIP their AVX-512 cases, so
-    # the hand-emitted 6x32 kernel and the AVX-512 GEMM paths went unverified on almost every run
-    # (AVX512_RUNNER is unset; 57 of 60 recent jobs landed on non-AVX-512 runners). Run those same
-    # tests under the SDE fetched above, which emulates Sapphire Rapids, so they execute instead of
-    # skipping. Measured locally: ~17 min per pass, 25/25 run with 0 skipped.
-    - name: Run AVX-512 GEMM tests under Intel SDE (non-AVX-512 runners)
+    # #685, #1445: without AVX-512 hardware the machine-kernel GEMM tests and the AVX-512 direct-conv
+    # tile tests SKIP their AVX-512 cases, so the hand-emitted 6x32 kernel, the AVX-512 GEMM paths and
+    # the join-free conv tiles went unverified on almost every run (AVX512_RUNNER is unset; 57 of 60
+    # recent jobs landed on non-AVX-512 runners). Run those tests under the SDE fetched above, which
+    # emulates Sapphire Rapids, so they execute instead of skipping. The GEMM tests alone took 8-9 min
+    # on CI (runs 42627388920, 42642975482); the timeout bounds the step if the conv shapes add more.
+    - name: Run AVX-512 GEMM and direct-conv tests under Intel SDE (non-AVX-512 runners)
+      timeout-minutes: 45
       run: |
         set -uo pipefail
         if lscpu | grep -qiw avx512f; then

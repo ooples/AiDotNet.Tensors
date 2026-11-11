@@ -1504,12 +1504,9 @@ public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend
     public virtual void CopyRows(IGpuBuffer src, IGpuBuffer dst, int srcRowLen, int dstRowLen, int numRows, int copyLen) => Inner.CopyRows(src, dst, srcRowLen, dstRowLen, numRows, copyLen);
     /// <inheritdoc/>
     public virtual void IotaPad(IGpuBuffer idx, int l, int p, int numRows) => Inner.IotaPad(idx, l, p, numRows);
-    /// <summary>Raw int32 index values to float, on the inner backend: output[i] = (float)raw[i].</summary>
-    public virtual void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n) => InnerIndexConversion.Int32ToFloat(raw, output, n);
-    /// <summary>Each scatter write's position along its axis, as a float, on the inner backend.</summary>
-    public virtual void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n) => InnerIndexConversion.ScatterPositions(output, srcDim, inner, n);
-    private protected IIndexConversionBackend InnerIndexConversion => Inner as IIndexConversionBackend
-        ?? throw new System.NotSupportedException(Inner.GetType().Name + " has no index conversion kernels.");
+    /// <inheritdoc/>
+    public virtual void Int32ToFloat(IGpuBuffer raw, IGpuBuffer output, int n) => IndexConversion.Of(Inner).Int32ToFloat(raw, output, n);
+    public virtual void ScatterPositions(IGpuBuffer output, int srcDim, int inner, int n) => IndexConversion.Of(Inner).ScatterPositions(output, srcDim, inner, n);
     /// <inheritdoc/>
     public virtual void Rwkv7Forward(IGpuBuffer r, IGpuBuffer kappa, IGpuBuffer kTilde, IGpuBuffer v, IGpuBuffer decayLogit, IGpuBuffer iclRate, IGpuBuffer output, IGpuBuffer sbuf, int batch, int seqLen, int modelDim, int numHeads, int headDim) => Inner.Rwkv7Forward(r, kappa, kTilde, v, decayLogit, iclRate, output, sbuf, batch, seqLen, modelDim, numHeads, headDim);
     /// <inheritdoc/>

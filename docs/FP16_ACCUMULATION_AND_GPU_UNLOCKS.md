@@ -105,7 +105,7 @@ Console.WriteLine($"FP32 accumulate {fp32Acc:F0} TFLOP/s, FP16 accumulate {fp16A
 | `AIDOTNET_FP16_ACCUMULATE=0` | Turns the FP16-accumulate route off: every FP16 GEMM uses cuBLAS's FP32 accumulation. |
 | `AIDOTNET_FP16_ACCUMULATE=1` | Tunes shapes even on a device whose FP32 accumulation is already full rate. |
 | `AIDOTNET_MMA_RATE_SOURCE=auto` | Default: ask the driver, measure when it cannot answer. |
-| `AIDOTNET_MMA_RATE_SOURCE=driver` | Only ask the driver; with no answer the rate is unknown and the routes behave as on a reduced-rate card. |
+| `AIDOTNET_MMA_RATE_SOURCE=driver` | Only ask the driver. With no answer the rate is unknown: shapes are still tuned, but no FP16 or TF32 verdict is recorded or reused, so under the default `GpuDeterminism` FP16-accumulate GEMM and convolution keep cuBLAS even where tuning picked a faster kernel. |
 | `AIDOTNET_MMA_RATE_SOURCE=probe` | Never ask the driver; always measure. |
 
 ## End-to-end head-to-heads in FP16

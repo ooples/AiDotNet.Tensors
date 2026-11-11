@@ -409,64 +409,124 @@ inline void gla_atomic_add_f(device atomic_uint* buf, int idx, float val) {
     }
 }
 
-kernel void gla_scan_recompute(
-    device const float* K [[buffer(0)]], device const float* V [[buffer(1)]], device const float* G [[buffer(2)]],
-    device float* Straj [[buffer(3)]],
-    constant int& batch [[buffer(4)]], constant int& seqLen [[buffer(5)]], constant int& modelDim [[buffer(6)]],
-    constant int& numHeads [[buffer(7)]], constant int& headDim [[buffer(8)]], uint gid [[thread_position_in_grid]])
+// Checkpointed: pass 1 re-runs the forward scan saving the state entering each chunk of `chunk` steps (Ckpt,
+// B*H*nChunks*d^2); pass 2 walks chunks in reverse, recomputes the chunk's states into Scratch (B*H*chunk*d^2) and
+// runs BPTT over it: O(sqrt(S)) state memory instead of the O(S) trajectory (GlaScanCheckpoint).
+kernel void gla_scan_backward_ckpt(
+    device const float* dOut [[buffer(0)]], device const float* Q [[buffer(1)]], device const float* K [[buffer(2)]],
+    device const float* V [[buffer(3)]], device const float* G [[buffer(4)]],
+    device float* Ckpt [[buffer(5)]], device float* Scratch [[buffer(6)]],
+    device atomic_uint* dQ [[buffer(7)]], device atomic_uint* dK [[buffer(8)]], device float* dV [[buffer(9)]], device atomic_uint* dG [[buffer(10)]],
+    constant int& batch [[buffer(11)]], constant int& seqLen [[buffer(12)]], constant int& modelDim [[buffer(13)]],
+    constant int& numHeads [[buffer(14)]], constant int& headDim [[buffer(15)]], constant int& chunk [[buffer(16)]],
+    uint gid [[thread_position_in_grid]])
 {
     int total = batch * numHeads * headDim;
     if ((int)gid >= total) return;
     int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
     int hOff = h * headDim; int hh = headDim * headDim;
+    int bh = b * numHeads + h; int rowOff = di * headDim;
+    int nChunks = (seqLen + chunk - 1) / chunk;
     float Srow[REC_MAX_HEADDIM];
+    float dSrow[REC_MAX_HEADDIM];
     for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
     for (int t = 0; t < seqLen; t++) {
+        if (t % chunk == 0) {
+            int ck = (bh * nChunks + t / chunk) * hh + rowOff;
+            for (int ki = 0; ki < headDim; ki++) Ckpt[ck + ki] = Srow[ki];
+        }
         int baseOff = (b * seqLen + t) * modelDim + hOff;
         float g = G[(b * seqLen + t) * numHeads + h];
         float vd = V[baseOff + di];
-        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
-        for (int ki = 0; ki < headDim; ki++) { float s = g * Srow[ki] + vd * K[baseOff + ki]; Srow[ki] = s; Straj[trajBase + ki] = s; }
+        for (int ki = 0; ki < headDim; ki++) Srow[ki] = g * Srow[ki] + vd * K[baseOff + ki];
+    }
+    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
+    for (int c = nChunks - 1; c >= 0; c--) {
+        int t0 = c * chunk;
+        int t1 = min(seqLen, t0 + chunk);
+        int ck = (bh * nChunks + c) * hh + rowOff;
+        for (int ki = 0; ki < headDim; ki++) Srow[ki] = Ckpt[ck + ki];
+        for (int t = t0; t < t1; t++) {
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            float g = G[(b * seqLen + t) * numHeads + h];
+            float vd = V[baseOff + di];
+            int sc = (bh * chunk + (t - t0)) * hh + rowOff;
+            for (int ki = 0; ki < headDim; ki++) { float s = g * Srow[ki] + vd * K[baseOff + ki]; Srow[ki] = s; Scratch[sc + ki] = s; }
+        }
+        for (int t = t1 - 1; t >= t0; t--) {
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gOff = (b * seqLen + t) * numHeads + h;
+            float g = G[gOff];
+            int sc = (bh * chunk + (t - t0)) * hh + rowOff;
+            int sp = (t > t0) ? (bh * chunk + (t - 1 - t0)) * hh + rowOff : -1;
+            float dOutVal = dOut[baseOff + di];
+            for (int ki = 0; ki < headDim; ki++) {
+                gla_atomic_add_f(dQ, baseOff + ki, dOutVal * Scratch[sc + ki]);
+                dSrow[ki] += dOutVal * Q[baseOff + ki];
+            }
+            float vd = V[baseOff + di]; float dg = 0.0f; float dVacc = 0.0f;
+            for (int ki = 0; ki < headDim; ki++) {
+                float dStv = dSrow[ki];
+                float sprev = (sp >= 0) ? Scratch[sp + ki] : Ckpt[ck + ki];
+                dg += dStv * sprev;
+                gla_atomic_add_f(dK, baseOff + ki, dStv * vd);
+                dVacc += dStv * K[baseOff + ki];
+            }
+            dV[baseOff + di] = dVacc;
+            gla_atomic_add_f(dG, gOff, dg);
+            for (int ki = 0; ki < headDim; ki++) dSrow[ki] *= g;
+        }
     }
 }
 
-kernel void gla_scan_backward(
-    device const float* dOut [[buffer(0)]], device const float* Q [[buffer(1)]], device const float* K [[buffer(2)]],
-    device const float* V [[buffer(3)]], device const float* G [[buffer(4)]], device const float* Straj [[buffer(5)]],
-    device atomic_uint* dQ [[buffer(6)]], device atomic_uint* dK [[buffer(7)]], device float* dV [[buffer(8)]], device atomic_uint* dG [[buffer(9)]],
-    constant int& batch [[buffer(10)]], constant int& seqLen [[buffer(11)]], constant int& modelDim [[buffer(12)]],
-    constant int& numHeads [[buffer(13)]], constant int& headDim [[buffer(14)]], uint gid [[thread_position_in_grid]])
+// ── Channels-last causal depthwise conv (ICausalDepthwiseConvBackend) ─────────────────────────────
+// x, y, dy, dx are [rows, seqLen, C]; w, dw are [K, C]; tap j reads j steps back. Every output element is written and
+// nothing is atomic, so all three are deterministic.
+kernel void causal_dwconv1d_forward(
+    device const float* x [[buffer(0)]], device const float* w [[buffer(1)]], device float* y [[buffer(2)]],
+    constant int& rows [[buffer(3)]], constant int& seqLen [[buffer(4)]], constant int& channels [[buffer(5)]],
+    constant int& taps [[buffer(6)]], uint gid [[thread_position_in_grid]])
 {
-    int total = batch * numHeads * headDim;
+    int total = rows * seqLen * channels;
     if ((int)gid >= total) return;
-    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
-    int hOff = h * headDim; int hh = headDim * headDim;
-    float dSrow[REC_MAX_HEADDIM];
-    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
-    for (int t = seqLen - 1; t >= 0; t--) {
-        int baseOff = (b * seqLen + t) * modelDim + hOff;
-        int gOff = (b * seqLen + t) * numHeads + h;
-        float g = G[gOff];
-        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
-        int sprevBase = ((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim;
-        float dOutVal = dOut[baseOff + di];
-        for (int ki = 0; ki < headDim; ki++) {
-            float sval = Straj[trajBase + ki];
-            gla_atomic_add_f(dQ, baseOff + ki, dOutVal * sval);
-            dSrow[ki] += dOutVal * Q[baseOff + ki];
-        }
-        float vd = V[baseOff + di]; float dg = 0.0f; float dVacc = 0.0f;
-        for (int ki = 0; ki < headDim; ki++) {
-            float dStv = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
-            dg += dStv * sprev;
-            gla_atomic_add_f(dK, baseOff + ki, dStv * vd);
-            dVacc += dStv * K[baseOff + ki];
-        }
-        dV[baseOff + di] = dVacc;
-        gla_atomic_add_f(dG, gOff, dg);
-        for (int ki = 0; ki < headDim; ki++) dSrow[ki] *= g;
+    int idx = (int)gid;
+    int c = idx % channels; int t = (idx / channels) % seqLen;
+    int maxJ = min(taps - 1, t);
+    float acc = 0.0f;
+    for (int j = 0; j <= maxJ; j++) acc += w[j * channels + c] * x[idx - j * channels];
+    y[idx] = acc;
+}
+
+kernel void causal_dwconv1d_backward_input(
+    device const float* dy [[buffer(0)]], device const float* w [[buffer(1)]], device float* dx [[buffer(2)]],
+    constant int& rows [[buffer(3)]], constant int& seqLen [[buffer(4)]], constant int& channels [[buffer(5)]],
+    constant int& taps [[buffer(6)]], uint gid [[thread_position_in_grid]])
+{
+    int total = rows * seqLen * channels;
+    if ((int)gid >= total) return;
+    int idx = (int)gid;
+    int c = idx % channels; int t = (idx / channels) % seqLen;
+    int maxJ = min(taps - 1, seqLen - 1 - t);
+    float acc = 0.0f;
+    for (int j = 0; j <= maxJ; j++) acc += w[j * channels + c] * dy[idx + j * channels];
+    dx[idx] = acc;
+}
+
+// One thread per (tap j, channel c), summing every row and step in ascending order.
+kernel void causal_dwconv1d_backward_kernel(
+    device const float* dy [[buffer(0)]], device const float* x [[buffer(1)]], device float* dw [[buffer(2)]],
+    constant int& rows [[buffer(3)]], constant int& seqLen [[buffer(4)]], constant int& channels [[buffer(5)]],
+    constant int& taps [[buffer(6)]], uint gid [[thread_position_in_grid]])
+{
+    int jc = (int)gid;
+    if (jc >= taps * channels) return;
+    int j = jc / channels; int c = jc % channels;
+    float acc = 0.0f;
+    for (int r = 0; r < rows; r++) {
+        int rowBase = r * seqLen * channels;
+        for (int t = j; t < seqLen; t++) acc += dy[rowBase + t * channels + c] * x[rowBase + (t - j) * channels + c];
     }
+    dw[jc] = acc;
 }
 
 kernel void gated_delta_scan_recompute(

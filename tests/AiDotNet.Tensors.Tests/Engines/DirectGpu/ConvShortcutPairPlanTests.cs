@@ -203,8 +203,8 @@ public sealed class ConvShortcutPairPlanTests : IClassFixture<DirectGpuTensorEng
     public void ExternalInputPair_WritesTheRequestedInputGradient()
     {
         Skip.IfNot(_fixture.IsAvailable, "No DirectGpu backend available.");
-        var gpu = _fixture.Engine;
-        Skip.If(gpu is null, "No DirectGpu engine.");
+        Skip.If(_fixture.Engine is null, "No DirectGpu engine.");
+        if (_fixture.Engine is not { } gpu) return;
         const int batch = 2, c = 16, k = 24, size = 16;
         Skip.IfNot(gpu.SupportsConv2DBackwardInputShortcutPair(new[] { batch, c, size, size }, new[] { k, c, 3, 3 },
             new[] { k, c, 1, 1 }, size / 2, size / 2), "The backend does not compute the shortcut pair.");

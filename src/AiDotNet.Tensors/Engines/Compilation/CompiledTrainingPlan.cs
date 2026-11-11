@@ -605,10 +605,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Every other pre-allocated gradient is an intermediate the next backward recomputes; landing all of them
         // downloaded ~800 MB of activation gradients per plan when N-BEATS finished training on the GPU (966 tensors,
         // ~0.35 s a plan, two plans a Train call: the largest fixed cost of a GPU Train, AiDotNet#1804).
-        var parameterGradients = new HashSet<Tensor<T>>(_gradients, ReferenceEqualityComparer<Tensor<T>>.Instance);
-        if (_liveGradientMap is { } liveGradients)
-            foreach (var parameter in _parameters)
-                if (liveGradients.TryGetValue(parameter, out var current)) parameterGradients.Add(current);
+        // Requested input-leaf gradients (AIDOTNET_COMPILED_INPUT_GRADS) are read through .Grad like the parameters'.
+        var parameterGradients = ResultGradients();
         // Parameter and intermediate gradients share pooled backing arrays, and unbinding drops the array's pending
         // download. In _preAllocatedGrads order an intermediate could drop it before a later parameter gradient landed,
         // leaving that gradient's stale host values. So: take the intermediates out of their arrays' groups, land the
@@ -731,6 +729,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>Keeps THIS plan's captured SGD update in place (one step graph): the oracle for the ping-pong update.</summary>
     internal void DisablePingPongForTesting() => _pingPongRejected = true;
+
+    /// <summary>
+    /// The node counts of this plan's captured step graph, read when it was captured; null while the plan has none (no
+    /// capture ran, it failed, or the backend has no device graphs).
+    /// </summary>
+    internal Engines.DirectGpu.GraphNodeCounts? StepGraphNodeCounts { get; private set; }
 
     /// <summary>True while the plan replays a graph per replay parity.</summary>
     internal bool ReplaysParityGraphs => _stepGraphExecOdd != IntPtr.Zero;
@@ -1275,18 +1279,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_engine is not Engines.DirectGpuTensorEngine gte
             || gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true })
             return;
-        var gradients = Gradients;
+        // Parameter gradients and requested input-leaf gradients: both are read after the plan retires.
+        var landed = ResultGradients();
         // The intermediate gradients share pooled backing arrays with these, and a host read of an array downloads
         // every resident member on it: landing N-BEATS's parameter gradients downloaded all 966 of the plan's gradient
         // buffers (~800 MB) at the end of every GPU Train. The intermediates' device values are discarded with the
         // plan, so take them out of their groups first (AiDotNet#1804).
-        var landed = new HashSet<Tensor<T>>(gradients.Where(g => g is not null)!, ReferenceEqualityComparer<Tensor<T>>.Instance);
         foreach (var buffer in _preAllocatedGrads)
             if (buffer is not null && !landed.Contains(buffer))
                 Helpers.ResidentHostMirror.Detach(buffer);
-        foreach (var gradient in gradients)
+        foreach (var gradient in landed)
         {
-            if (gradient is null || TryHandGradientToTensorLifetime(gradient)) continue;
+            if (TryHandGradientToTensorLifetime(gradient)) continue;
             if (gradient.GetBackingArrayForCacheLookupUnsafe() is not { } backing) continue;
             try { Helpers.HostSync.TryMaterialize(backing); }
             catch (InvalidOperationException) { /* released without a host copy: nothing left to preserve */ }
@@ -1363,6 +1367,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
+        StepGraphNodeCounts = null;
         _stepGraphExecOdd = IntPtr.Zero;
         _graphStepCalls = 0;
         DisposeStepIo();   // before the rollback below, which may read the loss
@@ -1514,6 +1519,33 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     private Dictionary<Tensor<T>, Tensor<T>>? _liveGradientMap;
+
+    // The external leaves whose gradients AIDOTNET_COMPILED_INPUT_GRADS asked for. Their .Grad is read after the
+    // step like a parameter's, so retiring the plan must keep it. The compile-time set is thread-static and cleared
+    // when Compile returns, so the plan keeps its own copy.
+    private Tensor<T>[] _requestedInputGradientLeaves = Array.Empty<Tensor<T>>();
+
+    /// <summary>
+    /// The gradients a reader can still ask for once the plan retires: every parameter's (<see cref="Gradients"/>)
+    /// and every requested input leaf's, as the live gradient map and the leaf's <c>.Grad</c> hold them. Everything
+    /// else the plan pre-allocated is an intermediate the next backward recomputes.
+    /// </summary>
+    private HashSet<Tensor<T>> ResultGradients()
+    {
+        var results = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var gradient in _gradients)
+            if (gradient is not null) results.Add(gradient);
+        var live = _liveGradientMap;
+        if (live is not null)
+            foreach (var parameter in _parameters)
+                if (live.TryGetValue(parameter, out var current)) results.Add(current);
+        foreach (var leaf in _requestedInputGradientLeaves)
+        {
+            if (live is not null && live.TryGetValue(leaf, out var mapped)) results.Add(mapped);
+            if (leaf.Grad is { } published) results.Add(published);
+        }
+        return results;
+    }
 
     // Reshape-view gradients (AliasReshapeViewGradients) and the gradient buffer each views. They share host storage
     // but not a device binding, so the GPU step binds each view to its target's device buffer.
@@ -3902,6 +3934,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 0));
+                        StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;
                     }
                     catch (Exception captureFailure)
                     {
@@ -10002,6 +10035,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 storageLeases);
             storageLeases = null;
             plan._liveGradientMap = gradMap;
+            plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan._pooledGradients = pooledGradients;

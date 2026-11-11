@@ -525,9 +525,13 @@ internal static class HeadToHeadNetworkHarness
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-residency", network);
         WriteRandomWeightsAndData(spec, work);
         var previous = AiDotNetEngine.Current;
+        // The spec decides autocast, as in MeasureCompiledStepCounts: an FP16 spec's casts are crossings to count, and an
+        // inherited AIDOTNET_AUTOCAST=fp16 must not count an FP32 spec under autocast.
+        string? previousAutocast = Environment.GetEnvironmentVariable("AIDOTNET_AUTOCAST");
         AiDotNetEngine.Current = gpu;
         try
         {
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", AutocastOf(spec));
             var capture = new StepCrossingCapture(warmupSteps);
             TrainTensors(spec, work, gpu, TensorsMode.PhaseSynchronized, capture);
             return capture.Crossings ?? throw new InvalidOperationException("the measured step never ran.");
@@ -535,6 +539,7 @@ internal static class HeadToHeadNetworkHarness
         finally
         {
             AiDotNetEngine.Current = previous;
+            Environment.SetEnvironmentVariable("AIDOTNET_AUTOCAST", previousAutocast);
         }
     }
 
@@ -638,14 +643,16 @@ internal static class HeadToHeadNetworkHarness
             long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < counts.MeasuredSteps; i++) { plan.Step(); Sync(); }
             counts.AllocatedBytesPerStep = (GC.GetAllocatedBytesForCurrentThread() - before) / counts.MeasuredSteps;
-            if (gpu?.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda)
+            if (gpu is not null)
             {
                 counts.GraphCaptureFailure = plan.GraphCaptureFailureReason;
-                if (counts.GraphCaptureFailure is null)
+                // This plan's own graph, counted when it was captured: no failure reason does not mean a capture ran
+                // (AIDOTNET_CUDA_GRAPH_STEP=0 skips it), and a backend's last counts can be another capture's.
+                if (plan.StepGraphNodeCounts is { } nodes)
                 {
-                    counts.KernelNodes = cuda.LastCaptureKernelNodeCount;
-                    counts.MemcpyNodes = cuda.LastCaptureMemcpyNodeCount;
-                    counts.MemsetNodes = cuda.LastCaptureMemsetNodeCount;
+                    counts.KernelNodes = nodes.Kernel;
+                    counts.MemcpyNodes = nodes.Memcpy;
+                    counts.MemsetNodes = nodes.Memset;
                 }
             }
             return new TrainRun(new Dictionary<string, PhaseStats>(), Array.Empty<double>());

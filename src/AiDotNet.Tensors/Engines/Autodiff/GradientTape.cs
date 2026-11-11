@@ -134,6 +134,10 @@ public sealed class GradientTape<T> : IDisposable
     private bool _ownsArena;
     private Helpers.TensorArena? _ownedArena;
 
+    // The forward's rentals, recorded for GradientTapeOptions.ReleaseActivationsDuringBackward; the backward takes it.
+    private Helpers.TensorArena.ForwardActivationLog? _activationLog;
+    private Helpers.TensorArena? _activationLogArena;
+
     // Default ON (AIDOTNET_TAPE_OWNED_ARENA=0 turns it off). A TOP-LEVEL tape with no arena already active creates and
     // owns one for its lifetime, so a hand-rolled training loop - one that goes through no model base or Optimize()
     // call site, which open their own arena - recycles its step's buffers too. Without it every activation between
@@ -335,6 +339,18 @@ public sealed class GradientTape<T> : IDisposable
             _ownedArena = Helpers.TensorArena.Create();
             _ownedArena.OwnedByTape = true;
             _ownsArena = true;
+        }
+
+        // Record what the forward rents, so the backward can hand each activation back after its last use. Not gated on
+        // this tape's engine: that is the process default until the first op binds the engine the ops really run on
+        // (BindEngineIfUnset), so a CPU model on a machine whose default is a GPU engine never recorded its forward.
+        // The recycler declines a GPU backward itself, and the backward and Dispose take the log back either way.
+        if (_options.ReleaseActivationsDuringBackward && _parent is null && !_options.SuppressArenaScope
+            && Helpers.TensorArena.Current is { } activationArena)
+        {
+            _activationLog = new Helpers.TensorArena.ForwardActivationLog();
+            _activationLogArena = activationArena;
+            activationArena.OpenForwardActivationLog(_activationLog);
         }
 
         _savedReplayMode = Compilation.AutoTrainingCompiler.ReplayMode;
@@ -1049,7 +1065,20 @@ public sealed class GradientTape<T> : IDisposable
         bool createGraph,
         IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
     {
-        var grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
+        if (_activationLog is { Released: true })
+            throw new InvalidOperationException(
+                "This tape's first backward handed its forward activations back to the arena "
+                + "(GradientTapeOptions.ReleaseActivationsDuringBackward), so it cannot run another backward.");
+        Dictionary<Tensor<T>, Tensor<T>> grads;
+        try
+        {
+            grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
+        }
+        finally
+        {
+            // Whether or not this backward used it, the forward is over: stop recording rentals into it.
+            _activationLogArena?.TakeForwardActivationLog();
+        }
         if (_postAccumulateHooks is { Count: > 0 })
             foreach (var pair in grads)
                 if (pair.Value is not null) FirePostAccumulateHooks(pair.Key, pair.Value);
@@ -1994,7 +2023,7 @@ public sealed class GradientTape<T> : IDisposable
                         }
                     }
 
-                    var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine);
+                    var cached = RebindablePlanCache<T>.TryExecute(lookupHash, _entries, loss, sources, _engine, _retainGrad);
                     if (cached is not null)
                     {
                         // Per-call cleanup parity with the fresh-walk path
@@ -3207,8 +3236,10 @@ public sealed class GradientTape<T> : IDisposable
         // long-lived arena, Reset() it per step (the pre-existing #1804 behaviour).
         // The gradients and loss handed to the caller are arena memory; the step boundary must not hand them out
         // again while the caller still uses them (an optimizer step or weight clip after this scope, issue #1031).
-        var handedToCaller = _handedToCaller;
+        var handedToCaller = _options.ReleaseResultsAtDispose ? null : _handedToCaller;
         _handedToCaller = null;
+        _activationLogArena?.TakeForwardActivationLog();
+        _activationLogArena = null;
         if (_ownsArena)
         {
             _ownedArena?.DisposeKeeping(handedToCaller);

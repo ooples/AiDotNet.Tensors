@@ -260,7 +260,13 @@ public sealed partial class CudaBackend
 
     public IntPtr CaptureGraph(Action launch)
     {
-        if (!IsAvailable || launch is null) return IntPtr.Zero;
+        // Every zero return reports no graph: the diagnostics must not still describe a previous capture's.
+        t_lastCaptureNodeCounts = null;
+        if (!IsAvailable || launch is null)
+        {
+            t_lastCaptureFailure = !IsAvailable ? "the CUDA backend is not available" : "no capture body was given";
+            return IntPtr.Zero;
+        }
         using var _ = PushContext();
 
         // Capture on this backend's side stream, entered only by this thread: other threads keep submitting to the
@@ -276,6 +282,11 @@ public sealed partial class CudaBackend
     /// <inheritdoc cref="IGpuGraphCapture.LastCaptureFailure"/>
     string? IGpuGraphCapture.LastCaptureFailure => t_lastCaptureFailure;
 
+    [ThreadStatic] private static GraphNodeCounts? t_lastCaptureNodeCounts;
+
+    /// <inheritdoc cref="IGpuGraphCapture.LastCaptureNodeCounts"/>
+    GraphNodeCounts? IGpuGraphCapture.LastCaptureNodeCounts => t_lastCaptureNodeCounts;
+
     private static string DescribeCaptureException(Exception ex)
     {
         var inner = ex;
@@ -287,6 +298,7 @@ public sealed partial class CudaBackend
     private IntPtr CaptureGraphOnCurrentStream(Action launch)
     {
         t_lastCaptureFailure = null;
+        t_lastCaptureNodeCounts = null;
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
         try { EnterCapture(); }
         catch
@@ -381,6 +393,8 @@ public sealed partial class CudaBackend
 
         CompleteDirectPtxCapturePinTracking(directPtxPins, graphExec);
         GcDiag("capture+instantiate SUCCEEDED");
+        t_lastCaptureNodeCounts = new GraphNodeCounts(LastCaptureKernelNodeCount, LastCaptureMemcpyNodeCount,
+            LastCaptureMemsetNodeCount);
         return graphExec;
     }
 

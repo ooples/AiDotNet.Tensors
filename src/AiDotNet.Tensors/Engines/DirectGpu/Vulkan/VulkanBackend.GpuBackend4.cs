@@ -696,8 +696,32 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int batch, int n, bool inverse)
     {
         EnsureInitialized();
+        if (batch > 0 && n >= 2 && (n & (n - 1)) == 0 && n <= SharedFftMaxLength
+            && !ReferenceEquals(inputReal, outputReal) && !ReferenceEquals(inputReal, outputImag)
+            && !ReferenceEquals(inputImag, outputReal) && !ReferenceEquals(inputImag, outputImag))
+        {
+            // One workgroup per row; slices keep each dispatch within maxComputeWorkGroupCountX (65535 at minimum).
+            string shader = VulkanResidentKernels.SharedFft(SharedFftMaxLength);
+            int log2n = 0;
+            while ((1 << log2n) < n) log2n++;
+            int sliceRows = (int)Math.Min(_device.Limits.maxComputeWorkGroupCountX, 65535u);
+            for (int row = 0; row < batch; row += sliceRows)
+            {
+                int rows = Math.Min(sliceRows, batch - row);
+                GlslNaryOp(shader, new[] { inputReal, inputImag, outputReal, outputImag },
+                    checked(rows * VulkanKernels.WorkgroupSize),
+                    new[] { (uint)row, (uint)n, (uint)log2n, inverse ? 1u : 0u });
+            }
+            return;
+        }
         DispatchSplitDft(inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
     }
+
+    /// <summary>
+    /// Longest row <see cref="BatchedFFT"/> runs in one on-chip workgroup: 4096 when the device grants 32 KB of
+    /// workgroup shared memory, else 2048 (16 KB, the Vulkan minimum).
+    /// </summary>
+    private int SharedFftMaxLength => _device.MaxSharedMemorySize >= 2 * 4096 * sizeof(float) ? 4096 : 2048;
 
     public void FFT2D(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int height, int width, bool inverse)
     {
@@ -769,22 +793,23 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
     {
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions must be positive.");
-        int hh = headDim * headDim;
         long totalLong = checked((long)batch * numHeads * headDim);
-        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
-        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
+        if (totalLong > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(batch), "GLA dimensions exceed Vulkan launch/buffer limits.");
         int total = (int)totalLong;
-        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
+        // dQ/dK/dG are atomic accumulators in the backward kernel; zero them here so the
         // method is self-contained and correct even if the caller reuses dirty buffers.
         Fill(dQ, 0f, batch * seqLen * modelDim);
         Fill(dK, 0f, batch * seqLen * modelDim);
         Fill(dG, 0f, batch * seqLen * numHeads);
-        using var traj = AllocateBuffer((int)trajLenLong);
-        var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
-        GlslNaryOp(VulkanRecurrenceKernels.GlaRecompute, new[] { k, v, gate, traj }, total, pc);
-        GlslNaryOp(VulkanRecurrenceKernels.GlaBackward,
-            new[] { dOut, q, k, v, gate, traj, dQ, dK, dV, dG }, total, pc);
+        // State checkpoints every `chunk` steps plus one chunk of recomputed states instead of the full
+        // batch*heads*seqLen*headDim^2 trajectory (GlaScanCheckpoint).
+        var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        using var ckpt = AllocateBuffer(ckptLen);
+        using var scratch = AllocateBuffer(scratchLen);
+        var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim, (uint)chunk };
+        GlslNaryOp(VulkanRecurrenceKernels.GlaBackwardCheckpointed,
+            new[] { dOut, q, k, v, gate, ckpt, scratch, dQ, dK, dV, dG }, total, pc);
     }
 
     public void XLstmScanForward(

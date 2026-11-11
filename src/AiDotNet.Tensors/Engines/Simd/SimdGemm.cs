@@ -1899,6 +1899,15 @@ internal static partial class SimdGemm
                 c.Length, m, k, n);
         }
 
+        // A few rows of A against a B stored [n, k]: one dot product per output (see SgemmSkinnyTransB). The paths
+        // below transposed all of B per call for this shape: 51 ms for one row against a [51865, 384] table.
+        if (QualifiesForSkinnyTransB(transA, transB, m, k, n))
+        {
+            c.Slice(0, (int)((long)m * n)).Clear();
+            SgemmSkinnyTransB(a, lda, b, ldb, c, m, k, n, allowParallel: UseParallelGemm);
+            return;
+        }
+
 #if NETCOREAPP
 #if NET5_0_OR_GREATER
         // A tall product with a large A: row blocks that read A once, ahead of the column-panel route (see
@@ -2186,6 +2195,14 @@ internal static partial class SimdGemm
                 a.Length, lda, transA,
                 b.Length, ldb, transB,
                 c.Length, m, k, n);
+        }
+
+        // A few rows of A against a B stored [n, k]: one dot product per output, B streamed once (see
+        // SgemmSkinnyTransB). Every path below materialized a transposed copy of B per call for this shape.
+        if (QualifiesForSkinnyTransB(transA, transB, m, k, n))
+        {
+            SgemmSkinnyTransB(a, lda, b, ldb, c, m, k, n, allowParallel);
+            return;
         }
 
         // batch=1 / small-M, large-N, no-transpose: parallelize over N (output features). The

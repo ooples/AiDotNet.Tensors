@@ -754,6 +754,15 @@ internal static class BackwardFunctions<T>
     /// <summary>Test observable: input gradients this thread formed through the transposed-W NN product.</summary>
     [ThreadStatic] internal static long t_transposedWInputGradientRuns;
 
+    // The transposed copy of W is rented per call. Above this size the shared pool does not reliably keep it between
+    // training steps (a Gen2 collection trims large arrays), so every backward allocated it afresh: FasterRCNN's fc6
+    // weight [12544, 1024] cost 51 MB per step in an allocation trace. There the transposed-B kernel is as fast
+    // (66 rows: 41.9 vs 44.4 ms; fc7 [1024, 1024]: 1.9 vs 2.5 ms) and needs no buffer.
+    private const long BackwardInputGradientTransposeMaxElements = 1L << 20;
+
+    internal static bool BackwardInputGradientPrefersTransposedW(int m, int n, int k)
+        => (long)k * n <= BackwardInputGradientTransposeMaxElements && BackwardInputGradientPrefersTransposedW(m, n);
+
     internal static bool BackwardInputGradientPrefersTransposedW(int m, int n)
     {
 #if NET9_0_OR_GREATER
@@ -777,7 +786,7 @@ internal static class BackwardFunctions<T>
                 return;
 #endif
 #if NET5_0_OR_GREATER
-            if (BackwardInputGradientPrefersTransposedW(m, n))
+            if (BackwardInputGradientPrefersTransposedW(m, n, k))
             {
                 t_transposedWInputGradientRuns++;
                 float[] wT = System.Buffers.ArrayPool<float>.Shared.Rent(n * k);
@@ -1180,6 +1189,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        bool needsInputGradient = DifferentiableOps.IsGradientRequired(inputs[0]);
+        bool needsWeightGradient = DifferentiableOps.IsGradientRequired(inputs[1]);
+        if (!needsInputGradient && !needsWeightGradient) return;
+
         // Float32 + 2D fast paths: A: [M,K], B: [N,K] (stored row-major), gradC: [M,N].
         // CPU-only (!engine.SupportsGpu), like MatMulBackward: on a GPU engine this path called GetDataArray() on
         // device tensors -- a download per operand -- and ran the GEMMs with host SimdGemm, so every eager GPU
@@ -1196,46 +1209,60 @@ internal static class BackwardFunctions<T>
             && !engine.SupportsGpu)
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
-            var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
-            var bArr = (inputs[1] as Tensor<float>)?.GetDataArray();
-            if (dCArr is not null && aArr is not null && bArr is not null)
+            var aArr = needsWeightGradient ? (inputs[0] as Tensor<float>)?.GetDataArray() : null;
+            var bArr = needsInputGradient ? (inputs[1] as Tensor<float>)?.GetDataArray() : null;
+            if (dCArr is not null && (!needsWeightGradient || aArr is not null) && (!needsInputGradient || bArr is not null))
             {
                 int M = inputs[0]._shape[0];
                 int K = inputs[0]._shape[1];
                 int N = inputs[1]._shape[0];
 
-                var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-                var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                using var gradADataLease = gradATensor.LeaseArray();
-                var gradAData = (float[])(object)gradADataLease.Array;
-                using var gradBDataLease = gradBTensor.LeaseArray();
-                var gradBData = (float[])(object)gradBDataLease.Array;
-
                 // Large: the parallel packed BLAS first. SimdGemm's transposed-A path ran the tied LM head's
                 // dTable = gradCᵀ[49152,1024] · A[1024,512] in 993 ms vs 87 ms through TryGemmEx (3990X).
-                // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
-                BlasProvider.GemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, K, false, gradAData, 0, K);
-                // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
-                BlasProvider.GemmEx(N, K, M, dCArr, 0, N, true, aArr, 0, K, false, gradBData, 0, K);
+                if (needsInputGradient)
+                {
+                    var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+                    using (var gradADataLease = gradATensor.LeaseArray())
+                    {
+                        var gradAData = (float[])(object)gradADataLease.Array;
+                        // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
+                        BlasProvider.GemmEx(M, K, N, dCArr, 0, N, false, bArr!, 0, K, false, gradAData, 0, K);
+                    }
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
+                }
 
-                DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
-                DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                if (needsWeightGradient)
+                {
+                    var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
+                    using (var gradBDataLease = gradBTensor.LeaseArray())
+                    {
+                        var gradBData = (float[])(object)gradBDataLease.Array;
+                        // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
+                        BlasProvider.GemmEx(N, K, M, dCArr, 0, N, true, aArr!, 0, K, false, gradBData, 0, K);
+                    }
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
+                }
                 return;
-
             }
         }
 
         // Generic fallback: gradA = gradOut · B, gradB = gradOutᵀ · A.
         // No transpose on B (it's already in [N,K] form), but we need
         // gradOutᵀ for gradB.
-        var gradAFallback = engine.TensorMatMul(gradOutput, inputs[1]);
-        var gradOutT = TransposeLastTwoDims(gradOutput, engine);
-        var gradBFallback = engine.TensorMatMul(gradOutT, inputs[0]);
-        // Phase B.2: gradOutT is a local transpose buffer, consumed by
-        // TensorMatMul. Mirror the MatMulBackward ND×2D path's pool-return.
-        TensorPool<T>.Return(gradOutT);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
+        if (needsInputGradient)
+        {
+            var gradAFallback = engine.TensorMatMul(gradOutput, inputs[1]);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
+        }
+        if (needsWeightGradient)
+        {
+            var gradOutT = TransposeLastTwoDims(gradOutput, engine);
+            var gradBFallback = engine.TensorMatMul(gradOutT, inputs[0]);
+            // Phase B.2: gradOutT is a local transpose buffer, consumed by
+            // TensorMatMul. Mirror the MatMulBackward ND×2D path's pool-return.
+            TensorPool<T>.Return(gradOutT);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
+        }
     }
 
     /// <summary>d(A^T)/dA = transpose(grad)</summary>
@@ -3763,6 +3790,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps.IsGradientRequired(inputs[0])) return;
         var indicesTensor = savedState[0] as Tensor<int> ?? new Tensor<int>((int[])savedState[0], new[] { ((int[])savedState[0]).Length });
         int dim = (int)savedState[1];
         var inShape = inputs[0]._shape;
@@ -9321,6 +9349,7 @@ internal static class BackwardFunctions<T>
     private static Tensor<T> InterpolateBackwardImpl(Tensor<T> gradOutput, Tensor<T> input,
         InterpolateMode mode, bool alignCorners)
     {
+        if (InterpolateKernels.Handles(mode) && InterpolateKernels.TryBackward(gradOutput, input, mode, alignCorners) is { } fast) return fast;
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int spatial = input.Rank - 2;
@@ -9659,56 +9688,10 @@ internal static class BackwardFunctions<T>
     private static Tensor<T> RoIAlignBackwardImpl(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> boxes,
         int outH, int outW, float spatialScale, int samplingRatio, bool aligned)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var gradInput = new Tensor<T>(input._shape);
-        int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
-        int K = boxes._shape[0];
-        using var goLease = gradOutput.Lease();
-        var go = goLease.Span;
-        using var bLease = boxes.Lease();
-        var b = bLease.Span;
-        using var giLease = gradInput.LeaseWritable();
-        var gi = giLease.Span;
-        double offset = aligned ? 0.5 : 0.0;
+        if (boxes._shape[0] == 0) return new Tensor<T>(input._shape);
 
-        for (int k = 0; k < K; k++)
-        {
-            int n = (int)numOps.ToDouble(b[k * 5]);
-            if (n < 0 || n >= N) continue;
-            double x1 = numOps.ToDouble(b[k * 5 + 1]) * spatialScale - offset;
-            double y1 = numOps.ToDouble(b[k * 5 + 2]) * spatialScale - offset;
-            double x2 = numOps.ToDouble(b[k * 5 + 3]) * spatialScale - offset;
-            double y2 = numOps.ToDouble(b[k * 5 + 4]) * spatialScale - offset;
-            double roiW = aligned ? (x2 - x1) : Math.Max(x2 - x1, 1.0);
-            double roiH = aligned ? (y2 - y1) : Math.Max(y2 - y1, 1.0);
-            double binH = roiH / outH;
-            double binW = roiW / outW;
-            int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outH);
-            int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outW);
-            if (ry < 1) ry = 1; if (rx < 1) rx = 1;
-            double gridArea = ry * rx;
-
-            for (int c = 0; c < C; c++)
-            {
-                int planeBase = (n * C + c) * H * W;
-                for (int ph = 0; ph < outH; ph++)
-                for (int pw = 0; pw < outW; pw++)
-                {
-                    double g = numOps.ToDouble(go[((k * C + c) * outH + ph) * outW + pw]) / gridArea;
-                    if (g == 0) continue;
-                    for (int iy = 0; iy < ry; iy++)
-                    {
-                        double sy = y1 + ph * binH + (iy + 0.5) * binH / ry;
-                        for (int ix = 0; ix < rx; ix++)
-                        {
-                            double sx = x1 + pw * binW + (ix + 0.5) * binW / rx;
-                            ScatterBilinear(gi, planeBase, sy, sx, H, W, g, numOps);
-                        }
-                    }
-                }
-            }
-        }
-        return gradInput;
+        // The forward's taps scattered back, parallel over channels so overlapping RoIs never race; see RoIAlignPlan.
+        return RoIAlignPlan.Backward(gradOutput, boxes, input._shape, outH, outW, spatialScale, samplingRatio, aligned);
     }
 
     private static void ScatterBilinear(Span<T> dst, int planeBase,

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.150.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.149.0...v0.150.0) (2026-11-10)
+
+
+### Features
+
+* **compiled-plan:** choose which side of the gradient clip the l2 term goes on ([#1697](https://github.com/ooples/AiDotNet.Tensors/issues/1697)) ([14e6dcb](https://github.com/ooples/AiDotNet.Tensors/commit/14e6dcb614654e71e3b6cc29e8f1bc7aa1eed02b))
+* element-wise gate and engine fixes from the AiDotNet parity profiles ([#1702](https://github.com/ooples/AiDotNet.Tensors/issues/1702)) ([5ffc6f8](https://github.com/ooples/AiDotNet.Tensors/commit/5ffc6f87f99c33e26a8d6ab4c3eea115fa9c4b4b))
+
+
+### Bug Fixes
+
+* **compilation:** realize lazy operands before a recorded op's trace-time run ([#1704](https://github.com/ooples/AiDotNet.Tensors/issues/1704)) ([42acf96](https://github.com/ooples/AiDotNet.Tensors/commit/42acf964ee14fe3d4fcca12cc53b121cfbb4faa1))
+* **compile:** a recorded custom node's output owns its storage ([#1705](https://github.com/ooples/AiDotNet.Tensors/issues/1705)) ([#1707](https://github.com/ooples/AiDotNet.Tensors/issues/1707)) ([3b4ed5b](https://github.com/ooples/AiDotNet.Tensors/commit/3b4ed5be95e253ea568d32eb15cc66c8f3949558))
+* **cpu:** any-rank axis ops, with a reflection-driven rank conformance gate ([#1700](https://github.com/ooples/AiDotNet.Tensors/issues/1700)) ([c140cd6](https://github.com/ooples/AiDotNet.Tensors/commit/c140cd6d4c7d5ebf3b3152a863ed10e8724cc413))
+* **topk:** TopK/TensorTopK on any rank and axis; heap selection; GPU rank-N last axis ([#1696](https://github.com/ooples/AiDotNet.Tensors/issues/1696)) ([22f815a](https://github.com/ooples/AiDotNet.Tensors/commit/22f815aebd53f70e5642c5d71ad90d1b8e4c6187))
+
+
+### Performance
+
+* **gpu:** checkpointed GLA backward on all backends, broadcast without full expansion, fused causal depthwise conv ([#1712](https://github.com/ooples/AiDotNet.Tensors/issues/1712)) ([22caa5a](https://github.com/ooples/AiDotNet.Tensors/commit/22caa5aaeee4e7280eda911cc56389a87d23b956))
+* **gpu:** one-launch on-chip batched FFT on CUDA/HIP/OpenCL/Vulkan; drop per-op host syncs in RFFT/IRFFT ([#1714](https://github.com/ooples/AiDotNet.Tensors/issues/1714)) ([dc1bb7e](https://github.com/ooples/AiDotNet.Tensors/commit/dc1bb7e557601fe905e36b9e22e2edfdf0873778))
+
 ## [0.149.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.148.1...v0.149.0) (2026-11-09)
 
 

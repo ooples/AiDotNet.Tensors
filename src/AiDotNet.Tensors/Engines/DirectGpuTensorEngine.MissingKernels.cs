@@ -1098,7 +1098,6 @@ public partial class DirectGpuTensorEngine
             int weightCount = batch * numFreqs * 2;
             using var weights = CachedSpectrumConstant(backend, SpectrumConstant.IrfftAdjointWeights, 1, numFreqs, nFft);
             backend.BroadcastMultiplyLastAxis(interleaved.Buffer, weights.Buffer, scaled.Buffer, batch, numFreqs * 2);
-            backend.Synchronize();
 
             var result = DeferTensorResult<T>(backend, scaled.Buffer, weightCount, (int[])inputShape.Clone());
             scaled.RelinquishOwnership();
@@ -1175,7 +1174,6 @@ public partial class DirectGpuTensorEngine
             try
             {
                 backend.CopyRows(outRe.Buffer, resultBuf.Buffer, nFft, signalLength, batch, signalLength);
-                backend.Synchronize();
 
                 // Clone: inputShape is the caller's LIVE shape array (inputs[0]._shape), and handing it
                 // to the result would alias it. IrfftAdjointGpu already clones.
@@ -1257,9 +1255,8 @@ public partial class DirectGpuTensorEngine
             backend.CopyRows(specReal, packReal, nFft, numFreqs, batchSize, numFreqs);
             backend.CopyRows(specImag, packImag, nFft, numFreqs, batchSize, numFreqs);
             backend.InterleaveComplex(packReal, packImag, output, batchSize * numFreqs);
-
-            // Transient scratch returns to backend pools on dispose; the result stays resident.
-            backend.Synchronize();
+            // No host sync: scratch is released in stream order like every other op's, and the result stays
+            // resident. A Synchronize here stalled the host once per transform (forward and adjoint alike).
         });
 
         // Same backward as CpuEngine.RFFT: the ADJOINT, not the inverse. This previously routed the
@@ -1362,7 +1359,6 @@ public partial class DirectGpuTensorEngine
             backend.BroadcastMultiplyLastAxis(fullImagRaw, signBuffer.Buffer, fullImag, batchSize, nFft);
             backend.BatchedFFT(fullReal, fullImag, timeReal, timeImag, batchSize, nFft, inverse: true);
             backend.CopyRows(timeReal, output, nFft, outputLength, batchSize, outputLength);
-            backend.Synchronize();
         }, fullyWritten: true);
 
         // Mirrors CpuEngine.IRFFT: the backward of IRFFT is its ADJOINT, not RFFT. Routing the
@@ -4681,10 +4677,21 @@ public partial class DirectGpuTensorEngine
     {
         if (!indices._gpuBufferContainsRawInt32 || !HasResidentIndexStorage(indices))
             return GetOrAllocateBuffer(backend, indices);
+        // The capability is resolved before anything is allocated, so a backend without it costs no buffer; a conversion
+        // that still fails releases the output before the caller falls back to the CPU.
+        var conversion = IndexConversion.Resolve(backend);
         using var raw = GetOrAllocateBuffer(backend, indices);
         var numeric = AllocateOutputBuffer(backend, Math.Max(1, indices.Length));
-        IndexConversion(backend).Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
-        return numeric;
+        try
+        {
+            conversion.Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
+            return numeric;
+        }
+        catch
+        {
+            numeric.DisposeAfterQueuedUse(backend);
+            throw;
+        }
     }
 
     private static bool HasResidentIndexStorage(Tensor<int> indices)
@@ -9632,11 +9639,6 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private const int MaxExactScatterPositions = (1 << 24) + 1;
 
-    // The index helpers live on an internal interface (IDirectGpuBackend has shipped); every backend implements it.
-    private static IIndexConversionBackend IndexConversion(IDirectGpuBackend backend)
-        => backend as IIndexConversionBackend
-           ?? throw new NotSupportedException(backend.BackendName + " has no index conversion kernels.");
-
     /// <summary>
     /// For a scatter of [outer, srcDim, inner] writes into [outer, dstDim, inner]: <paramref name="claims"/> gets, per
     /// destination slot, the position j of the last write to it (-1 where nothing writes), and <paramref name="winners"/>
@@ -9648,7 +9650,7 @@ public partial class DirectGpuTensorEngine
     {
         int n = outer * dstDim * inner, m = outer * srcDim * inner;
         // Each write's position j along the axis, generated on the device (no host upload, so graph capture holds).
-        IndexConversion(backend).ScatterPositions(positions, srcDim, inner, m);
+        IndexConversion.Resolve(backend).ScatterPositions(positions, srcDim, inner, m);
         backend.Fill(claims, -1f, n);
         backend.ScatterReduce(claims, positions, int32Index, outer, srcDim, dstDim, inner, 2);
         backend.TakeAlongDim(claims, floatIndex, winners, outer, srcDim, inner, dstDim);
