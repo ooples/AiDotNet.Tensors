@@ -113,8 +113,7 @@ internal sealed class PtxWinogradF23FilterTransformKernel : IDisposable
         int total = k * c;
 
         var p = new StringBuilder(8192);
-        p.AppendLine(".version 7.1");
-        p.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(p, major, minor);
         p.AppendLine(".address_size 64");
         p.AppendLine();
         p.AppendLine($".visible .entry {entry}(");

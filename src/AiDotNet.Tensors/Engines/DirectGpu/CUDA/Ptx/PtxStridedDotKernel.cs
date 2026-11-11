@@ -87,8 +87,7 @@ internal sealed class PtxStridedDotKernel : IDisposable
         if (IsExactReverseCell(aSize, bSize, bOffset, bStep))
             return EmitExactReversePtx(ccMajor, ccMinor);
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($"// exact strided dot a={aSize} b={bSize} offset={bOffset} step={bStep}; valid-i=[{first},{last}]");
@@ -155,8 +154,7 @@ internal sealed class PtxStridedDotKernel : IDisposable
     private static string EmitExactReversePtx(int ccMajor, int ccMinor)
     {
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine("// exact strided dot a=512 b=512 offset=511 step=-1; valid-i=[0,511]; aligned float4 reverse pairs");

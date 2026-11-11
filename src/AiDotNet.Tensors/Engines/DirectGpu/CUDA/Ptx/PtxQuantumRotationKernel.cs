@@ -105,8 +105,7 @@ internal sealed class PtxQuantumRotationKernel : IDisposable
         const string oneHalf = "0f3F000000";   // 0.5
 
         var ptx = new StringBuilder(8_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// quantum-rotation qubits={numQubits} dim={dim} batch={batchSize}");
         ptx.AppendLine();

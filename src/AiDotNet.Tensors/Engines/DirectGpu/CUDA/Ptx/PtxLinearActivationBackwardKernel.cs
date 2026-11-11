@@ -81,8 +81,7 @@ internal sealed class PtxLinearActivationBackwardKernel : IDisposable
     {
         ValidateShape(m, n);
         var ptx = new StringBuilder(8_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// linear-activation-backward M={m} N={n} act={activation} " +

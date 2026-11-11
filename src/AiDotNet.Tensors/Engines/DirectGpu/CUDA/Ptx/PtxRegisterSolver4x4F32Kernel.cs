@@ -184,8 +184,7 @@ internal sealed class PtxRegisterSolver4x4F32Kernel : IDisposable
         DirectPtxSolver4x4Autotuner.ValidateBlockThreads(blockThreads);
         var ptx = new StringBuilder(operation is DirectPtxSolver4x4Operation.SvdReduced or
             DirectPtxSolver4x4Operation.CholeskyBackwardLower ? 48_000 : 32_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         string[] parameters = ParameterNames(operation);

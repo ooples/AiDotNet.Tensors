@@ -162,8 +162,7 @@ internal sealed class PtxFusedSgdMomentumF32Kernel : IDisposable
         Validate(size);
         ValidateBlockThreads(size, blockThreads);
         var ptx = new StringBuilder(3_072);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4 op=sgd-momentum wd={(hasWeightDecay ? 1 : 0)}");

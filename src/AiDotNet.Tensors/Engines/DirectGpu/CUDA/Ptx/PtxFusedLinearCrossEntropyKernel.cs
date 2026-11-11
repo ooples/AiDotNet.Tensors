@@ -122,8 +122,7 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
         int blockThreads = ThreadsForVocabulary(vocabulary);
         int staticSharedBytes = 2 * blockThreads * sizeof(float);
         var ptx = new StringBuilder(16_384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($"// exact fused projection/CE rows={rows} d={hiddenDimension} vocab={vocabulary}");
@@ -263,8 +262,7 @@ internal sealed class PtxFusedLinearCrossEntropyKernel : IDisposable
     {
         const int blockThreads = 128;
         var ptx = new StringBuilder(16_384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine("// exact fused projection/index-CE B4 K16 V32; one warp per row; logits retained in registers");

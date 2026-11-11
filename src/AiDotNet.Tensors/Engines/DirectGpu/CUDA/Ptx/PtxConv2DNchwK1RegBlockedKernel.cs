@@ -218,8 +218,7 @@ internal sealed class PtxConv2DNchwK1RegBlockedKernel : IDisposable
         string I(int v) => v.ToString(CultureInfo.InvariantCulture);
 
         var ptx = new StringBuilder(32768);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {entry}(");

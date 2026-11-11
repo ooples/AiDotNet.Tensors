@@ -95,8 +95,7 @@ internal sealed class PtxApplyMelFilterbankF32Kernel : IDisposable
         ValidateBlockThreads(numFrames, nMels, blockThreads);
 
         var ptx = new StringBuilder(3_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape frames={numFrames} freqs={numFreqs} mels={nMels} block={blockThreads} op=apply-mel-filterbank");
         ptx.AppendLine();

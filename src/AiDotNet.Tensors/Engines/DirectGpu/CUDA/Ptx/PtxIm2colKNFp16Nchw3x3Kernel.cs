@@ -134,8 +134,7 @@ internal sealed class PtxIm2colKNFp16Nchw3x3Kernel : IDisposable
                 "Only the experimental SM86 Im2col-KN-FP16 emitter exists.");
 
         var ptx = new StringBuilder(8192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

@@ -192,8 +192,7 @@ internal sealed class PtxFusedAdamUpdateF32Kernel : IDisposable
         ValidateBlockThreads(size, blockThreads);
 
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape size={size} block={blockThreads} elems-per-thread={ElementsPerThread} strategy=linear-vec4 op=adam-update");

@@ -105,8 +105,7 @@ internal sealed class PtxTrispectrumGatherF32Kernel : IDisposable
         int f23 = checked(maxF2 * maxF3);
 
         var ptx = new StringBuilder(3_840);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape maxF1={maxF1} maxF2={maxF2} maxF3={maxF3} block={blockThreads} op=trispectrum-gather");
         ptx.AppendLine();

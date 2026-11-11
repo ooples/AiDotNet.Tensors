@@ -170,8 +170,7 @@ internal sealed class PtxDeformableConv2DNchw3x3BackwardWeightF32Kernel : IDispo
         const int offsetTapStrideBytes = 2 * planeStrideBytes;            // 512 per tap (offY then offX plane)
 
         var ptx = new StringBuilder(16384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

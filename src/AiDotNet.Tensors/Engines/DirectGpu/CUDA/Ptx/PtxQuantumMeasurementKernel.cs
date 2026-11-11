@@ -79,8 +79,7 @@ internal sealed class PtxQuantumMeasurementKernel : IDisposable
         ValidateShape(count);
 
         var ptx = new StringBuilder(2_500);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// quantum-measurement count={count}");
         ptx.AppendLine();

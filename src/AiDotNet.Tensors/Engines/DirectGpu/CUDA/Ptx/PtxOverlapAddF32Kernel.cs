@@ -105,8 +105,7 @@ internal sealed class PtxOverlapAddF32Kernel : IDisposable
         ValidateBlockThreads(blockThreads);
 
         var ptx = new StringBuilder(3_072);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape numFrames={numFrames} nFft={nFft} hop={hopLength} outLen={outputLength} block={blockThreads} op=overlap-add");
         ptx.AppendLine();
