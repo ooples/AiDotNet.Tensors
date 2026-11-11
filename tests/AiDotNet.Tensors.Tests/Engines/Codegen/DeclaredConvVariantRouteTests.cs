@@ -252,6 +252,10 @@ public class DeclaredConvVariantRouteTests
     public void ConvolutionStagesRunAsOneResidentLaunchBitIdenticalToSeparateLaunches()
     {
         using var backend = OpenBackendOrSkip();
+        // The separate-launch baseline runs each stage through its declared program, which exists only where the
+        // declared route is released (sm_75/sm_86 by default; AIDOTNET_DECLARED_KERNELS_ARCH widens it).
+        Skip.IfNot(backend.DeclaredKernelsEnabled,
+            "The declared route is not released on this architecture (see AIDOTNET_DECLARED_KERNELS_ARCH).");
         Skip.IfNot(backend.SupportsResidentProgram, "A declared resident program needs a cooperative launch.");
         const int N = 2, C = 4, K = 6, H = 8, W = 8, Co = 3;
         var dense = new DeclaredConvKey(DeclaredConvPass.Forward, N, C, K, H, W, 3, 1, 1, 1, false,
