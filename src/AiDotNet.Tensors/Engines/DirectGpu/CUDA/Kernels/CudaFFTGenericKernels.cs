@@ -117,16 +117,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
                     storeExpr = "(v)";
                     break;
                 case FftElementType.Float16:
-                    includes = "#include <cuda_fp16.h>\n";
-                    storeType = "__half";
-                    loadExpr = "__half2float(v)";
-                    storeExpr = "__float2half_rn(v)";
+                    // PTX conversions, not cuda_fp16.h: NVRTC finds no toolkit headers on a driver-only host, and a
+                    // failed compile here took FP16 storage (and the autocast convolution that converts through it)
+                    // away. cvt.rn.f16.f32 rounds to nearest even, as __float2half_rn does.
+                    includes = string.Empty;
+                    storeType = "unsigned short";
+                    loadExpr = "aidn_h2f(v)";
+                    storeExpr = "aidn_f2h(v)";
                     break;
                 case FftElementType.BFloat16:
-                    includes = "#include <cuda_bf16.h>\n";
-                    storeType = "__nv_bfloat16";
-                    loadExpr = "__bfloat162float(v)";
-                    storeExpr = "__float2bfloat16(v)";
+                    // As for FP16: PTX (cvt.rn.bf16.f32, SM 8.0+, round to nearest even) instead of cuda_bf16.h.
+                    // Widening is exact: a bf16 is the top half of the float.
+                    includes = string.Empty;
+                    storeType = "unsigned short";
+                    loadExpr = "__uint_as_float(((unsigned int)(v)) << 16)";
+                    storeExpr = "aidn_f2bf(v)";
                     break;
                 default:
                     throw new System.ArgumentOutOfRangeException(nameof(type), type, "Unknown FFT element type.");
@@ -141,6 +146,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
 #define AIDN_PI 3.14159265358979323846f
 #define AIDN_FFTG_THREADS_PER_BLOCK 256
 #define STORE_T " + storeType + @"
+#if __CUDA_ARCH__ >= 530
+__device__ __forceinline__ float aidn_h2f(unsigned short h) { float f; asm(""cvt.f32.f16 %0, %1;"" : ""=f""(f) : ""h""(h)); return f; }
+__device__ __forceinline__ unsigned short aidn_f2h(float f) { unsigned short h; asm(""cvt.rn.f16.f32 %0, %1;"" : ""=h""(h) : ""f""(f)); return h; }
+#endif
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ unsigned short aidn_f2bf(float f) { unsigned short h; asm(""cvt.rn.bf16.f32 %0, %1;"" : ""=h""(h) : ""f""(f)); return h; }
+#endif
 __device__ __forceinline__ float aidn_ld(STORE_T v) { return " + loadExpr + @"; }
 __device__ __forceinline__ STORE_T aidn_st(float v) { return " + storeExpr + @"; }
 

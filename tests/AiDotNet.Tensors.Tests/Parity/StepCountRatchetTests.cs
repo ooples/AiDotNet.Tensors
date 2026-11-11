@@ -33,10 +33,14 @@ public abstract class StepCountRatchetBase
         var counts = HeadToHeadNetworkHarness.MeasureCompiledStepCounts(root, network, gpu);
         // CPU allocations can differ between the AVX2 and AVX-512 code paths, and CUDA graphs between devices (routes are
         // tuned per device), so each count is keyed by what it depends on. An unseeded combination defers with its value.
+        // CUDA graphs also depend on whether cuDNN serves the convolutions: its kernels replace the engine's own, so the
+        // same device captures a different number of nodes with and without it (the CNN on an RTX 1000 Ada: 37 without,
+        // 43 with). The CUDA lane always installs cuDNN, a developer machine may not, so the two keep separate baselines.
         string device = gpu is null
             ? "cpu:" + (System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated ? "avx512"
                 : System.Runtime.Intrinsics.X86.Avx2.IsSupported ? "avx2" : "scalar")
-            : "cuda:" + (gpu.GetBackend() is { } backend ? backend.DeviceName : "unknown");
+            : "cuda:" + (gpu.GetBackend() is { } backend ? backend.DeviceName : "unknown")
+              + (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.UseCudnnForConv ? ":cudnn" : "");
         string key = $"{network}:{device}";
         _output.WriteLine($"{key}: {counts.AllocatedBytesPerStep} bytes/step" +
             (counts.KernelNodes is { } k ? $", graph kernels {k}, memcpy {counts.MemcpyNodes}, memset {counts.MemsetNodes}" : "") +
@@ -69,7 +73,8 @@ public abstract class StepCountRatchetBase
             Assert.True(value is not null,
                 $"{key}: the baseline records {name} but no step graph was captured ({counts.GraphCaptureFailure}).");
             // Kernel nodes follow the conv and GEMM routes the first calls choose by timing, so they move by a few between
-            // processes (ResNet-18 on an RTX 1000 Ada: 137, 148, 158); memcpy and memset nodes are exact.
+            // processes (ResNet-18 on an RTX 1000 Ada: 137 to 168, with the most candidates timed under load), so each baseline
+            // is the highest count seen over several processes; memcpy and memset nodes are exact.
             int limit = name == "kernelNodes" ? recordedCount.GetInt32() + Math.Max(1, recordedCount.GetInt32() / 20) : recordedCount.GetInt32();
             Assert.True(value <= limit,
                 $"{key}: the captured step graph has {value} {name}, above the recorded {recordedCount.GetInt32()} (limit {limit}).");

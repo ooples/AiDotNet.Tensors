@@ -28,7 +28,7 @@ internal static class GpuBufferCapacity
                 $"{name} holds {buffer.SizeInBytes / sizeof(float)} 4-byte elements; the launch needs {count}.", name);
     }
 
-    /// <summary>The <see cref="IDirectGpuBackend.ScatterPositions"/> arguments a launch can trust.</summary>
+    /// <summary>The <see cref="IIndexConversionBackend.ScatterPositions"/> arguments a launch can trust.</summary>
     internal static void RequirePositions(IGpuBuffer output, int srcDim, int inner, int count)
     {
         if (srcDim <= 0) throw new ArgumentOutOfRangeException(nameof(srcDim), $"The scatter axis length {srcDim} must be positive.");

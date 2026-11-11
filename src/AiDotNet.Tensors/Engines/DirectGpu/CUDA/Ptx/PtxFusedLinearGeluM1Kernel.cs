@@ -90,8 +90,7 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         int outputsPerWarp = OutputsPerWarp;
         var ptx = new StringBuilder(8_192);
         int weightRowBytes = checked(inputFeatures * sizeof(float));
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

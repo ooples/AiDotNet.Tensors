@@ -626,6 +626,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
+            // Record WHY, so a host with a GPU driver but no NVRTC (the CUDA runtime compiler every CUDA-C module of
+            // this backend is built with) is diagnosable instead of reporting "no error".
+            InitializationError = !CudaNativeBindings.IsAvailable
+                ? "The CUDA driver library could not be loaded."
+                : "The CUDA driver is present, but NVRTC (the CUDA runtime compiler this backend compiles its kernels " +
+                  "with) could not be loaded. Install the CUDA toolkit or the nvidia-cuda-nvrtc package, or set " +
+                  "AIDOTNET_CUDA_DIR to the directory containing the NVRTC library.";
             IsAvailable = false;
             DeviceName = "None";
             return;
@@ -4134,6 +4141,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (TryDeclaredAddActivation("relu", A, B, C, size)) return;
+        // Where the declared route is not released (it is on sm_75/sm_86; not on sm_80, sm_89, sm_90 and newer) the add and
+        // the ReLU still run as one pass: bias_add_out over one row whose "bias" is B is C[i] = relu_nan_safe(A[i] + B[i]),
+        // the add_vectors sum and the relu kernel's operation, so bit-identical to the two launches it replaces.
+        if (size > 0 && _kernelCache.ContainsKey("bias_add_out"))
+        {
+            LaunchBiasAdd(A, B, C, 1, size, relu: true);
+            return;
+        }
         Add(A, B, C, size); Relu(C, C, size);
     }
     public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)

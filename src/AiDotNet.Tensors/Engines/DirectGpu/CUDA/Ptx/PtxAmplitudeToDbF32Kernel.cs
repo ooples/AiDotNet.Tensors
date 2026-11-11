@@ -96,8 +96,7 @@ internal sealed class PtxAmplitudeToDbF32Kernel : IDisposable
         string twentyLog10Of2 = DirectPtxPtxText.Hex((float)(20.0 * Math.Log10(2.0)));
 
         var ptx = new StringBuilder(2_048);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape length={length} block={blockThreads} clipTopDb={(clipTopDb ? 1 : 0)} op=amplitude-to-db");
         ptx.AppendLine();

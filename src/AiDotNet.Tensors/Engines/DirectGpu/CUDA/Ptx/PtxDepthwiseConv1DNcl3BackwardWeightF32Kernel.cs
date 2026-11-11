@@ -143,8 +143,7 @@ internal sealed class PtxDepthwiseConv1DNcl3BackwardWeightF32Kernel : IDisposabl
         const int channelStrideBytes = Length * sizeof(float);
 
         var ptx = new StringBuilder(4096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

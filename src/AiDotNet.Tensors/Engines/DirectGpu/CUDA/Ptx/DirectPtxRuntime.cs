@@ -334,6 +334,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     }
     private unsafe DirectPtxModule LoadJitModule(string ptx)
     {
+        ptx = DirectPtxPtxText.EnsureIsaCoversTarget(ptx);
         IntPtr text = Marshal.StringToHGlobalAnsi(ptx);
         const int logBytes = 16 * 1024;
         IntPtr errorLog = Marshal.AllocHGlobal(logBytes);

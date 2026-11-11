@@ -147,8 +147,7 @@ internal sealed class PtxWinogradWmmaBatchedGemmKernel : IDisposable
         int chunksPerOperand = blockTile * 2;
 
         var ptx = new StringBuilder(8192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(ptx, major, minor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

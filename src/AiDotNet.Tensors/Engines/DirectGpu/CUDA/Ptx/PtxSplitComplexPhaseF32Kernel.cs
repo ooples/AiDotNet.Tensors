@@ -96,8 +96,7 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
         const string negOne = "0fBF800000";
 
         var ptx = new StringBuilder(4_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape count={count} block={blockThreads} layout=split-complex-fp32 op=split-complex-phase");
         ptx.AppendLine();

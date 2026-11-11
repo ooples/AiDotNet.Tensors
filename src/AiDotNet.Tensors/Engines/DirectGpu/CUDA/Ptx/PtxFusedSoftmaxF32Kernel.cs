@@ -116,8 +116,7 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
             valueRegisterNames[i] = $"%f{i}";
         string valueRegisters = string.Join(", ", valueRegisterNames);
         var ptx = new StringBuilder(12_288);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape rows={rows} columns={columns} block={blockThreads} strategy=warp-row cache=ca");
@@ -177,8 +176,7 @@ internal sealed class PtxFusedSoftmaxF32Kernel : IDisposable
         int blockThreads)
     {
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape rows={rows} columns={columns} block={blockThreads} strategy=cta-row cache=ca");

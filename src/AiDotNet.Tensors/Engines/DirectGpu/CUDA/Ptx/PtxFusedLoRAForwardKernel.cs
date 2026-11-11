@@ -103,8 +103,7 @@ internal sealed class PtxFusedLoRAForwardKernel : IDisposable
         int nBytes = checked(n * sizeof(float));   // base/output row stride
 
         var ptx = new StringBuilder(32_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// fused-lora M={m} K={k} N={n} r={Rank} tile={BlockM}x{BlockN}x{BlockK}");
         ptx.AppendLine();

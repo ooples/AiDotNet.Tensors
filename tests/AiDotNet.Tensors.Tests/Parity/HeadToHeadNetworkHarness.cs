@@ -119,11 +119,25 @@ internal static class HeadToHeadNetworkHarness
     /// change. A GPU case adds the device model too. An unseen machine class defers; it never compares against
     /// another's baseline.
     /// </summary>
-    internal static string MachineKey(string device, string? gpuName = null)
+    internal static string MachineKey(string device, string? gpuName = null, bool? cudnnAutocastConv = null)
     {
         string key = $"{OsName()}-{RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}-" +
                      $"{Environment.ProcessorCount}cpu-{Slug(CpuModel())}-{device}";
-        return string.IsNullOrWhiteSpace(gpuName) ? key : key + "-" + Slug(gpuName);
+        if (!string.IsNullOrWhiteSpace(gpuName)) key += "-" + Slug(gpuName);
+        if (cudnnAutocastConv is bool cudnn) key += cudnn ? "-cudnn" : "-nocudnn";
+        return key;
+    }
+
+    private static bool SpecHasAutocastConv(JsonElement spec)
+    {
+        if (AutocastOf(spec) is null || !spec.TryGetProperty("layers", out var layers) || layers.ValueKind != JsonValueKind.Array)
+            return false;
+        foreach (var layer in layers.EnumerateArray())
+        {
+            if (layer.TryGetProperty("type", out var typeProp) && typeProp.GetString() is "conv2d" or "basicblock")
+                return true;
+        }
+        return false;
     }
 
     private static string Slug(string text)
@@ -312,8 +326,12 @@ internal static class HeadToHeadNetworkHarness
                           && gpuElement.ValueKind == JsonValueKind.String
             ? gpuElement.GetString()
             : null;
-        var tensors = RunTensors(ReadJson(spec), work, gpu, torch.Losses);
-        return (new CaseResult(network, device, MachineKey(device, gpuName), torch, tensors), null);
+        var specJson = ReadJson(spec);
+        bool? cudnnAutocastConv = device == "cuda" && SpecHasAutocastConv(specJson)
+            ? gpu is not null && gpu.SupportsEffectiveAutocastConv(AiDotNet.Tensors.Engines.Gpu.PrecisionMode.Float16)
+            : null;
+        var tensors = RunTensors(specJson, work, gpu, torch.Losses);
+        return (new CaseResult(network, device, MachineKey(device, gpuName, cudnnAutocastConv), torch, tensors), null);
     }
 
     /// <summary>Latest result per case, for tooling and for the stamped evidence the GPU lane commits.</summary>

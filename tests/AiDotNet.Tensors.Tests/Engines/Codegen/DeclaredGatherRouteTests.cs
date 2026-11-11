@@ -17,12 +17,16 @@ public class DeclaredGatherRouteTests
 {
     private static CudaBackend OpenBackendOrSkip()
     {
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+        // IsCudaAvailable (driver AND NVRTC) is exactly what CudaBackend requires; gating on the driver alone turned a
+        // host that merely lacks NVRTC into a failure instead of a skip. Driver+NVRTC with a failed init still throws.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         var backend = new CudaBackend();
         if (!backend.IsAvailable)
         {
+            string reason = backend.InitializationError ?? "no error was recorded";
             backend.Dispose();
-            throw new InvalidOperationException("CUDA driver was detected, but the CUDA backend failed to initialize.");
+            throw new InvalidOperationException("CUDA and NVRTC were detected, but the CUDA backend failed to initialize: " +
+                reason);
         }
         // Disposed before the skip: Skip throws, and the caller's `using` only takes ownership once this returns, so
         // skipping here would leak the retained primary context and the main stream for the rest of the run.

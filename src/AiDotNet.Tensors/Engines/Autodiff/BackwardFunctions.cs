@@ -1418,6 +1418,8 @@ internal static class BackwardFunctions<T>
 
         if (!needsInputGradient && !needsKernelGradient) return;
 
+        using var _ = DirectGpuTensorEngine.PushBackwardConvPrecision(savedState, engine);
+
         // Under create-graph the gradients are themselves differentiated, so they have to come from recorded ops.
         // The kernels below record nothing, so a WGAN-GP gradient penalty through a convolution reached none of the
         // critic's weights: the penalty's coefficient changed nothing about training.
@@ -1508,6 +1510,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        using var _ = DirectGpuTensorEngine.PushBackwardConvPrecision(savedState, engine);
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
             DifferentiableOps.AccumulateGrad(grads, inputs[0],
                 engine.Conv2D(gradOutput, inputs[1], (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]), engine);
@@ -1524,6 +1527,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        using var _ = DirectGpuTensorEngine.PushBackwardConvPrecision(savedState, engine);
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
             DifferentiableOps.AccumulateGrad(grads, inputs[0],
                 engine.Conv2D(inputs[1], gradOutput, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]), engine);

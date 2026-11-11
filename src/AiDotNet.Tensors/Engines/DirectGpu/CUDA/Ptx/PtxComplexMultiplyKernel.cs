@@ -78,8 +78,7 @@ internal sealed class PtxComplexMultiplyKernel : IDisposable
     {
         ValidateShape(pairs);
         var ptx = new StringBuilder(4_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// complex-multiply pairs={pairs}");
         ptx.AppendLine();
