@@ -81,6 +81,9 @@ public partial class CpuEngine
             int k = a._shape[1], n = b._shape[2];
             if (b._shape[0] != groups || b._shape[1] != k) throw new ArgumentException($"Expected b of shape [{groups}, {k}, N]; got [{string.Join(", ", b._shape)}].", nameof(b));
             if (ends[groups - 1] > a._shape[0]) throw new ArgumentException("The last offset passes the rows of a.", nameof(offsets));
+            // One native tape node (CpuEngine.GroupedMatMul.cs) where the engine runs it natively; the composition below
+            // otherwise (and for a bias, which it adds per group).
+            if (bias is null && UsesNativeGroupedRows) return GroupedRowsMatMul(a, b, ends, false);
             var parts = new List<Tensor<T>>();
             int start = 0;
             for (int g = 0; g < groups; g++)
