@@ -108,8 +108,7 @@ internal sealed class PtxFftFreqF32Kernel : IDisposable
         int split = (n + 1) / 2;
 
         var ptx = new StringBuilder(2_048);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape n={n} outlen={outLen} block={blockThreads} op=fft-freq-{(full ? "full" : "real")}");
         ptx.AppendLine();

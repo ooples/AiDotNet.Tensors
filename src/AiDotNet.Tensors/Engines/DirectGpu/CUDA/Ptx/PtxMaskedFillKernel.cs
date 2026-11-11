@@ -99,8 +99,7 @@ internal sealed class PtxMaskedFillKernel : IDisposable
         int packCount = variant.VectorWidth / 4;
         int packStrideBytes = checked(count * sizeof(float) / packCount);
         var ptx = new StringBuilder(4_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// masked-fill count={count}");
         ptx.AppendLine();

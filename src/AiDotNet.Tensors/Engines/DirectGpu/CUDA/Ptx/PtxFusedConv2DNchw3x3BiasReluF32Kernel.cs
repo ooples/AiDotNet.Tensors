@@ -156,8 +156,7 @@ internal sealed class PtxFusedConv2DNchw3x3BiasReluF32Kernel : IDisposable
         const int weightOutStrideBytes = InputChannels * KernelSize * KernelSize * sizeof(float); // per co
 
         var ptx = new StringBuilder(16384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

@@ -71,8 +71,7 @@ internal sealed class PtxDotProductKernel : IDisposable
     {
         ValidateShape(k);
         var ptx = new StringBuilder(4_096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// dot product K={k}");
         ptx.AppendLine();

@@ -94,8 +94,7 @@ internal sealed class PtxBatchedGemmExFanoutKernel : IDisposable
         int nHalfBytes = checked(n * sizeof(ushort));
 
         var ptx = new StringBuilder(24_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// batched-gemm-ex-fanout M={m} K={k} N={n} tile={BlockM}x{BlockN}x{BlockK}");
         ptx.AppendLine();

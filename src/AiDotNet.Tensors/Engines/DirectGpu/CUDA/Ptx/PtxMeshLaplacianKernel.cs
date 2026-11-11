@@ -82,8 +82,7 @@ internal sealed class PtxMeshLaplacianKernel : IDisposable
         const string one = "0f3F800000", negOne = "0fBF800000";
 
         var ptx = new StringBuilder(5_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// resident-uniform-mesh-laplacian faces={numFaces} vertices={numVertices}");
         ptx.AppendLine();

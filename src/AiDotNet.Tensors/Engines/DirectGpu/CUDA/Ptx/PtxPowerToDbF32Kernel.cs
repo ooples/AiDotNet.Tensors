@@ -93,8 +93,7 @@ internal sealed class PtxPowerToDbF32Kernel : IDisposable
         string tenLog10Of2 = DirectPtxPtxText.Hex((float)(10.0 * Math.Log10(2.0)));   // 10*log10(x) = lg2(x) * (10*log10 2)
 
         var ptx = new StringBuilder(2_048);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape count={count} block={blockThreads} op=power-to-db");
         ptx.AppendLine();

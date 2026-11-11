@@ -146,8 +146,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
         int bElements = checked(k * n);
         int outputElementBytes = outputType == DirectPtxGemmOutputType.Float32 ? 4 : 2;
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($"// exact {(inputType == DirectPtx16BitInputType.Float16 ? "fp16" : "bf16")} GEMM B={batch} M={m} N={n} K={k} ta={transposeA} tb={transposeB}");
@@ -226,8 +225,7 @@ internal sealed class PtxFp16GemmKernel : IDisposable
     private static string EmitTensorCoreM16N16K32(int ccMajor, int ccMinor)
     {
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine("// exact FP16 M16 N16 K32: one-warp async Tensor-Core specialization");

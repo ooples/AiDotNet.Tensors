@@ -103,8 +103,7 @@ internal sealed class PtxBatchedFftColsButterflyF32Kernel : IDisposable
         int imageStride = checked(height * width);
 
         var ptx = new StringBuilder(4_864);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape height={height} width={width} block={blockThreads} op=batched-fft-cols-butterfly (image=gridDimY; stride,inverse are .param)");
         ptx.AppendLine();

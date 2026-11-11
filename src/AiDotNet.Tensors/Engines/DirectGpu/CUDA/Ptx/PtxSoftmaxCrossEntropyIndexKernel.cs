@@ -87,8 +87,7 @@ internal sealed class PtxSoftmaxCrossEntropyIndexKernel : IDisposable
         const string One = "0f3F800000";
 
         var ptx = new StringBuilder(12_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// softmax-cross-entropy-index M={m} N={n}");
         ptx.AppendLine();
