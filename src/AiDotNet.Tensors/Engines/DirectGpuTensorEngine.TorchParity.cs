@@ -1152,6 +1152,10 @@ public partial class DirectGpuTensorEngine
         if (TryRecordCompiledOp("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores },
                 e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var compiledNode))
             return compiledNode;
+        // An inference trace records one opaque node whose replay re-enters this override (the device kernels).
+        if (TryCaptureModelOpInference("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores },
+                e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var captured))
+            return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryCrfForwardOnDevice(emissions, transitions, startScores, endScores) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorCrfForward: no device kernel", null);
@@ -1164,6 +1168,9 @@ public partial class DirectGpuTensorEngine
         if (TryRecordCompiledOp("TensorFakeQuantize", new Tensor<T>?[] { tensor },
                 e => e.TensorFakeQuantize(tensor, numBits, scale, zeroPoint, symmetric), out var compiledNode))
             return compiledNode;
+        if (TryCaptureModelOpInference("TensorFakeQuantize", new Tensor<T>?[] { tensor },
+                e => e.TensorFakeQuantize(tensor, numBits, scale, zeroPoint, symmetric), out var captured))
+            return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryFakeQuantizeOnDevice(tensor, numBits, scale, zeroPoint, symmetric) is { } onDevice) return onDevice;
         if (tensor is not null && tensor.Length > 0) GpuLaunchProbe.OnFallback("TensorFakeQuantize: no device kernel", null);
@@ -1175,6 +1182,8 @@ public partial class DirectGpuTensorEngine
     {
         if (TryRecordCompiledOp("TensorTopKSoftmax", new Tensor<T>?[] { scores }, e => e.TensorTopKSoftmax(scores, k), out var compiledNode))
             return compiledNode;
+        if (TryCaptureModelOpInference("TensorTopKSoftmax", new Tensor<T>?[] { scores }, e => e.TensorTopKSoftmax(scores, k), out var captured))
+            return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TryTopKSoftmaxOnDevice(scores, k) is { } onDevice) return onDevice;
         if (scores is not null && scores.Length > 0) GpuLaunchProbe.OnFallback("TensorTopKSoftmax: no device kernel", null);
@@ -1187,6 +1196,9 @@ public partial class DirectGpuTensorEngine
         if (TryRecordCompiledOp("TensorSinusoidalTimeEmbedding", new Tensor<T>?[] { timesteps },
                 e => e.TensorSinusoidalTimeEmbedding(timesteps, embeddingDim), out var compiledNode))
             return compiledNode;
+        if (TryCaptureModelOpInference("TensorSinusoidalTimeEmbedding", new Tensor<T>?[] { timesteps },
+                e => e.TensorSinusoidalTimeEmbedding(timesteps, embeddingDim), out var captured))
+            return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (TrySinusoidalTimeEmbeddingOnDevice(timesteps, embeddingDim) is { } onDevice) return onDevice;
         if (timesteps is not null && timesteps.Length > 0) GpuLaunchProbe.OnFallback("TensorSinusoidalTimeEmbedding: no device kernel", null);

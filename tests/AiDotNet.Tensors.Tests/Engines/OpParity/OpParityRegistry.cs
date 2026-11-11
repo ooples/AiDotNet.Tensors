@@ -1674,24 +1674,19 @@ public static class OpParityRegistry
 
         var q = OpInput.Rand(7001, new[] { 4, 33 }, -3.0, 3.0);
         yield return new OpCase("TensorFakeQuantize[4,33;8b]", "quantization", e => e.TensorFakeQuantize(q.F()), e => e.TensorFakeQuantize(q.D()),
-            ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize",
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize");
         yield return new OpCase("TensorFakeQuantize[4,33;4b,asym]", "quantization", e => e.TensorFakeQuantize(q.F(), 4, null, null, symmetric: false),
-            e => e.TensorFakeQuantize(q.D(), 4, null, null, symmetric: false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize",
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            e => e.TensorFakeQuantize(q.D(), 4, null, null, symmetric: false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize");
         yield return new OpCase("TensorFakeQuantize[4,33;3b,s0.25,z1]", "quantization", e => e.TensorFakeQuantize(q.F(), 3, 0.25, 1, symmetric: false),
-            e => e.TensorFakeQuantize(q.D(), 3, 0.25, 1, symmetric: false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize",
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            e => e.TensorFakeQuantize(q.D(), 3, 0.25, 1, symmetric: false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize");
 
         var scores = OpInput.Rand(7002, new[] { 4, 16 }, -3.0, 3.0);
         yield return new OpCase("TensorTopKSoftmax[4,16;k3]", "activation", e => e.TensorTopKSoftmax(scores.F(), 3),
-            e => e.TensorTopKSoftmax(scores.D(), 3), ParityTol.Ulp(16, 1e-6), opMethod: "TensorTopKSoftmax",
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            e => e.TensorTopKSoftmax(scores.D(), 3), ParityTol.Ulp(16, 1e-6), opMethod: "TensorTopKSoftmax");
 
         var timesteps = OpInput.From(new[] { 0.0, 1.0, 7.0, 49.5, 250.0, 999.0 }, new[] { 6 });
         yield return new OpCase("TensorSinusoidalTimeEmbedding[6;d32]", "embedding", e => e.TensorSinusoidalTimeEmbedding(timesteps.F(), 32),
-            e => e.TensorSinusoidalTimeEmbedding(timesteps.D(), 32), ParityTol.Ulp(16, 2e-6), opMethod: "TensorSinusoidalTimeEmbedding",
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            e => e.TensorSinusoidalTimeEmbedding(timesteps.D(), 32), ParityTol.Ulp(16, 2e-6), opMethod: "TensorSinusoidalTimeEmbedding");
 
         var emissions = OpInput.Rand(7003, new[] { 2, 5, 4 }, -2.0, 2.0);
         var transitions = OpInput.Rand(7004, new[] { 4, 4 });
@@ -1700,12 +1695,11 @@ public static class OpParityRegistry
         yield return new OpCase("TensorCrfForward[2,5,4;start,end]", "sequence",
             e => e.TensorCrfForward(emissions.F(), transitions.F(), startScores.F(), endScores.F()),
             e => e.TensorCrfForward(emissions.D(), transitions.D(), startScores.D(), endScores.D()), ParityTol.Accum(1e-5),
-            opMethod: "TensorCrfForward", graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            opMethod: "TensorCrfForward");
         var emissions2 = OpInput.Rand(7007, new[] { 6, 3 }, -2.0, 2.0);
         var transitions2 = OpInput.Rand(7008, new[] { 3, 3 });
         yield return new OpCase("TensorCrfForward[6,3]", "sequence", e => e.TensorCrfForward(emissions2.F(), transitions2.F()),
-            e => e.TensorCrfForward(emissions2.D(), transitions2.D()), ParityTol.Accum(1e-5), opMethod: "TensorCrfForward",
-            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+            e => e.TensorCrfForward(emissions2.D(), transitions2.D()), ParityTol.Accum(1e-5), opMethod: "TensorCrfForward");
 
         var hx = OpInput.Rand(7009, new[] { 5, 6 }, -0.3, 0.3);
         var hw = OpInput.Rand(7010, new[] { 4, 6 }, -0.5, 0.5);

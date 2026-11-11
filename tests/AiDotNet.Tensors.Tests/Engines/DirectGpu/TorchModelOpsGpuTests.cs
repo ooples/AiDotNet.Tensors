@@ -230,6 +230,45 @@ public abstract class TorchModelOpsGpuTestsBase
             new[] { Rand(41, 2.0, 2, 5, 4), masked }, 2e-5, 2e-5);
     }
 
+    /// <summary>
+    /// The four host-computed ops compile into a GPU inference plan (no host-boundary refusal) and each replay runs the
+    /// device kernels on the plan's live input.
+    /// </summary>
+    [SkippableFact]
+    public void HostKernelOps_CompileIntoInferencePlans_AndReplayOnLiveInputs()
+    {
+        var gpu = GpuOrSkip();
+        var cases = new (string Name, int[] Shape, Func<IEngine, Tensor<float>, Tensor<float>> Op)[]
+        {
+            ("TensorFakeQuantize", new[] { 3, 20 }, (e, v) => e.TensorFakeQuantize(v, 6, null, null, symmetric: false)),
+            ("TensorTopKSoftmax", new[] { 3, 20 }, (e, v) => e.TensorTopKSoftmax(v, 4)),
+            ("TensorSinusoidalTimeEmbedding", new[] { 5 }, (e, v) => e.TensorSinusoidalTimeEmbedding(e.TensorMultiplyScalar(v, 100f), 16)),
+            ("TensorCrfForward", new[] { 2, 4, 3 }, (e, v) => e.TensorCrfForward(v, new Tensor<float>(Enumerable.Range(0, 9).Select(i => 0.1f * i).ToArray(), new[] { 3, 3 }))),
+        };
+        foreach (var (name, shape, op) in cases)
+        {
+            var x = Rand(70, 2.0, shape);
+            AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float> plan;
+            using (var scope = AiDotNet.Tensors.Engines.Compilation.GraphMode.EnableInference())
+            {
+                var y = op(gpu, x);
+                plan = scope.CompileInference(y, new[] { x });
+            }
+            using (plan)
+            {
+                for (int round = 0; round < 2; round++)
+                {
+                    Rand(71 + round, 2.0, shape).ToArray().AsSpan().CopyTo(x.AsWritableSpan());
+                    var expected = op(new CpuEngine(), Copy(x)).ToArray();
+                    long launches = GpuLaunchProbe.Count;
+                    var replayed = plan.Execute().ToArray();
+                    Assert.True(GpuLaunchProbe.Count > launches, $"{name}: the compiled replay launched no kernel");
+                    AssertClose($"{name} compiled replay {round}", expected, replayed, 2e-5);
+                }
+            }
+        }
+    }
+
     [SkippableFact]
     public void ComposedOps_MatchCpu_AndStayOnDevice()
     {
