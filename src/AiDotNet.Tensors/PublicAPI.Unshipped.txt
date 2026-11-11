@@ -413,3 +413,5 @@ virtual AiDotNet.Tensors.Engines.Autodiff.AutogradFunction<T>.Backward(AiDotNet.
 AiDotNet.Tensors.Engines.Autodiff.GradientRecording
 static AiDotNet.Tensors.Engines.Autodiff.GradientRecording.IsRecording<T>() -> bool
 static AiDotNet.Tensors.Engines.Autodiff.GradientRecording.IsTrainingTrace.get -> bool
+AiDotNet.Tensors.Engines.Export.TraceOptions.VerificationInputs.get -> System.Collections.Generic.IEnumerable<object!>?
+AiDotNet.Tensors.Engines.Export.TraceOptions.VerificationInputs.set -> void

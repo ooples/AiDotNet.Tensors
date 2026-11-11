@@ -38,6 +38,13 @@ public sealed class TraceOptions
     /// </summary>
     public bool Verify { get; set; } = true;
 
+    /// <summary>
+    /// Further inputs to verify the program on (each run through the function and the replay). The example with its
+    /// values reversed is always added, which catches values the function reads out of its input on the host.
+    /// Each item is a <c>Tensor&lt;T&gt;[]</c> at the traced element type; items of another type are ignored.
+    /// </summary>
+    public IEnumerable<object>? VerificationInputs { get; set; }
+
     /// <summary>Relative/absolute tolerance used by <see cref="Verify"/>. Default 1e-5.</summary>
     public double Tolerance { get; set; } = 1e-5;
 }
@@ -178,9 +185,47 @@ public sealed partial class TensorProgram
                                              "The function computes part of its result outside the engine (element access, " +
                                              "LINQ over tensor data, or an engine held in a field), which a program cannot record.");
             }
+
+            // Replaying on the traced input cannot catch a value the function READ from that input on the host (token
+            // ids turned into gather indices, a threshold taken from the data): it became a constant, which is right
+            // for that input only. Each further input is run through the function itself and through the program.
+            // The default one is the example with its values in reverse order: every value stays one the input holds
+            // (so ids stay valid ids) while any value-derived constant changes.
+            var extra = new List<Tensor<T>[]>();
+            if (options.VerificationInputs is not null) extra.AddRange(options.VerificationInputs.OfType<Tensor<T>[]>());
+            var reversed = examples.Select(Reverse).ToArray();
+            if (reversed.Where((r, i) => !SameValues(r, examples[i])).Any()) extra.Add(reversed);
+            foreach (var inputs in extra)
+            {
+                Tensor<T>[] expected, actual;
+                using (new NoGradScope<T>())
+                {
+                    expected = function(inputs);
+                    actual = program.Run(AiDotNetEngine.Current, inputs);
+                }
+                for (int i = 0; i < expected.Length; i++)
+                {
+                    var why = Compare(expected[i], actual[i], options.Tolerance);
+                    if (why is not null)
+                        throw new TraceException($"Output {i} of the replayed program differs from the function on a different input " +
+                                                 $"({why}). The function reads values of its input on the host (for example token ids " +
+                                                 "used as indices), so the trace captured them as constants and would replay the first " +
+                                                 "input's result for every input.");
+                }
+            }
         }
         return program;
     }
+
+    private static Tensor<T> Reverse<T>(Tensor<T> t)
+    {
+        var data = t.Contiguous().AsSpan().ToArray();
+        Array.Reverse(data);
+        return new Tensor<T>(data, t._shape.ToArray());
+    }
+
+    private static bool SameValues<T>(Tensor<T> a, Tensor<T> b) =>
+        a.Contiguous().AsSpan().SequenceEqual(b.Contiguous().AsSpan(), EqualityComparer<T>.Default);
 
     private static (TensorProgram Program, Tensor<T>[] Outputs) TraceOnce<T>(Func<Tensor<T>[], Tensor<T>[]> function, Tensor<T>[] examples, TraceOptions options)
     {

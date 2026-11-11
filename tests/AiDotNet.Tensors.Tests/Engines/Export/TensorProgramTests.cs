@@ -117,12 +117,29 @@ public class TensorProgramTests : IDisposable
     }
 
     [Fact]
+    public void Trace_RejectsInputValuesReadOnTheHost_LikeTokenIdsUsedAsGatherIndices()
+    {
+        // The embedding lookup a Transformer does: ids read out of the input on the host become a Tensor<int> the
+        // trace can only capture as a constant, so the program would answer every input with the first one's rows.
+        var table = Random(15, 10, 4);
+        Tensor<float> Embed(Tensor<float> ids)
+        {
+            var idx = new Tensor<int>(ids.GetDataArray().Select(v => (int)v).ToArray(), new[] { ids.Length });
+            return AiDotNetEngine.Current.TensorIndexSelect(table, idx, 0);
+        }
+
+        var tokens = new Tensor<float>(new float[] { 1, 7, 3, 3, 9 }, new[] { 5 });
+        var ex = Assert.Throws<TraceException>(() => TensorProgram.Trace(Embed, tokens));
+        Assert.Contains("reads values of its input", ex.Message);
+    }
+
+    [Fact]
     public void EngineTypeChecks_SeeThroughTheTracer()
     {
         bool sawCpu = false;
         TensorProgram.Trace(x =>
         {
-            sawCpu = AiDotNetEngine.Current.Is<CpuEngine>() && AiDotNetEngine.Current is TracingEngine;
+            if (AiDotNetEngine.Current is TracingEngine) sawCpu = AiDotNetEngine.Current.Is<CpuEngine>(); // verification reruns it untraced
             return AiDotNetEngine.Current.TensorNegate(x);
         }, Random(14, 3));
         Assert.True(sawCpu);
