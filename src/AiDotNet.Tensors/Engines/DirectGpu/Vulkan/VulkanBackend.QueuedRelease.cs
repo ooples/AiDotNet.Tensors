@@ -30,6 +30,17 @@ public sealed unsafe partial class VulkanBackend : IQueuedBufferRelease
         }
     }
 
+    /// <summary>
+    /// A buffer uploaded inside the open batch holds its data only once <see cref="EndBatch"/> submits the recorded
+    /// copy; a readback or transfer copy issued before then runs on the transfer queue first and sees the old contents.
+    /// </summary>
+    private static void ThrowIfPendingBatchUpload(VulkanGpuBuffer buffer, string operation)
+    {
+        if (buffer.HasPendingBatchUpload)
+            throw new InvalidOperationException(
+                $"Vulkan {operation} of a buffer uploaded inside the open batch: its upload runs at EndBatch, so end the batch first.");
+    }
+
     internal bool TryDeferDisposedBatchUpload(VulkanGpuBuffer buffer)
     {
         lock (_releaseAfterBatch)

@@ -4146,6 +4146,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // the add_vectors sum and the relu kernel's operation, so bit-identical to the two launches it replaces.
         if (size > 0 && _kernelCache.ContainsKey("bias_add_out"))
         {
+            // The same operand checks as the two-launch path: bias_add_out reads A and B and writes C over size.
+            ValidateElementwiseOperands("add_relu", A, B, C, size);
             LaunchBiasAdd(A, B, C, 1, size, relu: true);
             return;
         }
@@ -6141,6 +6143,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    private static void ValidateElementwiseOperands(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (A.Handle == IntPtr.Zero || B.Handle == IntPtr.Zero || C.Handle == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand was DISPOSED (Handle=0): A={(long)A.Handle:X} B={(long)B.Handle:X} C={(long)C.Handle:X} — use-after-free guard.");
+        if (A.Size < size || B.Size < size || C.Size < size)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
+    }
+
     private unsafe void LaunchElementwiseKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         // PR #638 (CUDA-700 root fix): never launch an elementwise kernel over a buffer SMALLER than `size`. A
@@ -6149,12 +6161,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // the context with a sticky CUDA-700 (localized to add_vectors / op=TensorAdd via the post-launch check;
         // the GPU never exceeds ~2.6/12GB, so it was never a real OOM). Throw BEFORE the launch so the caller's
         // try/catch falls back to the correct (reallocating) host path instead of corrupting the context.
-        if (A.Handle == IntPtr.Zero || B.Handle == IntPtr.Zero || C.Handle == IntPtr.Zero)
-            throw new InvalidOperationException(
-                $"Elementwise '{kernelName}' operand was DISPOSED (Handle=0): A={(long)A.Handle:X} B={(long)B.Handle:X} C={(long)C.Handle:X} — use-after-free guard.");
-        if (A.Size < size || B.Size < size || C.Size < size)
-            throw new InvalidOperationException(
-                $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
+        ValidateElementwiseOperands(kernelName, A, B, C, size);
         // A declared kernel first (#890 phase 4a), computing this kernel's own expression.
         if (TryDeclaredElementwise(kernelName, C, size, A, B)) return;
         // Try vec4 variant for 4x throughput on bandwidth-limited ops

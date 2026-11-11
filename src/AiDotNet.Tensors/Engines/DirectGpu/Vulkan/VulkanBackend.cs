@@ -618,6 +618,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             return;
         }
 
+        ThrowIfHostSpanOpInsideOpenBatch();
+
         // Create buffers
         using var bufferA = VulkanBuffer.CreateStorageBuffer(size);
         using var bufferB = VulkanBuffer.CreateStorageBuffer(size);
@@ -687,6 +689,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             return;
         }
 
+        ThrowIfHostSpanOpInsideOpenBatch();
+
         // Create buffers
         using var bufferA = VulkanBuffer.CreateStorageBuffer(size);
         using var bufferB = VulkanBuffer.CreateStorageBuffer(size);
@@ -727,6 +731,18 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     }
 
     /// <summary>
+    /// The host-span ops read their result back as soon as they dispatch. Inside an open batch on the owner thread the
+    /// dispatch is only recorded, so the readback would return the staging buffer before the kernel ran; fail instead,
+    /// leaving the batch untouched.
+    /// </summary>
+    private void ThrowIfHostSpanOpInsideOpenBatch()
+    {
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
+            throw new NotSupportedException(
+                "Host-span Vulkan operations read their result synchronously and cannot run inside an open batch; call EndBatch first or use the device-buffer overload.");
+    }
+
+    /// <summary>
     /// Executes scalar multiplication: B = A * scalar
     /// </summary>
     /// <param name="input">Input array.</param>
@@ -750,6 +766,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         {
             return;
         }
+
+        ThrowIfHostSpanOpInsideOpenBatch();
 
         // Create buffers
         using var bufferA = VulkanBuffer.CreateStorageBuffer(size);

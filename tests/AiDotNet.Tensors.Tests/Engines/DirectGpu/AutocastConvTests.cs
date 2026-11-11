@@ -36,16 +36,19 @@ public sealed class AutocastConvTests : IDisposable
 
     private static DirectGpuTensorEngine RequireCudnnEngine(PrecisionMode precision = PrecisionMode.Float16)
     {
-        DirectGpuTensorEngine? engine = null;
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        // With CUDA present, only a missing native library is a prerequisite gap; any other construction failure
+        // (InvalidOperationException included) is an engine defect and must fail the test.
+        DirectGpuTensorEngine engine;
         try
         {
             engine = new DirectGpuTensorEngine();
         }
-        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException or InvalidOperationException)
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException)
         {
-            Skip.If(true, "GPU backend did not resolve: " + ex.Message);
+            throw new SkipException("GPU backend did not resolve: " + ex.Message);
         }
-        if (!engine!.IsGpuAvailable
+        if (!engine.IsGpuAvailable
             || engine.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend
             || engine.GetBackend() is not AiDotNet.Tensors.Engines.Gpu.INativeReducedPrecisionConv { NativeReducedPrecisionMath: true }
             || engine.GetBackend()!.MixedPrecisionConv is not { } conv

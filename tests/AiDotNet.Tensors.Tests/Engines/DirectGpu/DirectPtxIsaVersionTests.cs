@@ -29,7 +29,13 @@ public sealed class DirectPtxIsaVersionTests
     [InlineData("sm_88", "9.0")]
     [InlineData("sm_89", "7.8")]
     [InlineData("sm_90", "7.8")]
-    [InlineData("sm_90a", "7.8")]
+    // PTX ISA release notes: sm_90a arrived in 8.0 (sm_90 in 7.8), so 7.8 makes ptxas reject sm_90a; the later "a"
+    // targets arrived with their base, and the family-specific "f" targets in 8.8.
+    [InlineData("sm_90a", "8.0")]
+    [InlineData("sm_100a", "8.6")]
+    [InlineData("sm_100f", "8.8")]
+    [InlineData("sm_110f", "9.0")]
+    [InlineData("sm_120f", "8.8")]
     [InlineData("sm_100", "8.6")]
     [InlineData("sm_101", "8.6")]
     [InlineData("sm_103", "8.8")]

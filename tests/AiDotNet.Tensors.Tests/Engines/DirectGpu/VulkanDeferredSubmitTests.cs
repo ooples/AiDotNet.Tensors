@@ -235,4 +235,31 @@ void main() {
         finally { backend.EndBatch(); }
         Assert.All(backend.DownloadBuffer(c), v => Assert.Equal(2f, v));
     }
+
+    [SkippableFact]
+    public void ABatchRecordedUpload_DisposedBeforeTheBatchEnds_KeepsItsAllocationUntilItsCopyRuns()
+    {
+        // Inside a batch an upload is a recorded staging-to-storage copy that runs at EndBatch. Disposing the buffer
+        // before then used to park its allocation at once, so the next upload of that size took it, overwrote the
+        // staging data, and the first recorded copy delivered the second upload's values to the dispatch reading it.
+        var backend = BackendOrSkip();
+        const int size = 4093;   // a size no other test allocates, so a parked allocation would be the one rented
+        using var output = backend.AllocateBuffer(size);
+        backend.Synchronize();
+        IGpuBuffer? later = null;
+        backend.BeginBatch();
+        try
+        {
+            var first = backend.AllocateBuffer(Enumerable.Repeat(1f, size).ToArray());
+            RunAddOne(backend, first, output, size);   // recorded: output = 1 + 1
+            first.Dispose();
+            later = backend.AllocateBuffer(Enumerable.Repeat(9f, size).ToArray());
+        }
+        finally
+        {
+            backend.EndBatch();
+            later?.Dispose();
+        }
+        Assert.All(backend.DownloadBuffer(output), v => Assert.Equal(2f, v));
+    }
 }

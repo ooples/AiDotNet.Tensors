@@ -326,7 +326,10 @@ public class CudaFftGenericKernelTests
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
-        Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} storage conversion is unavailable.");
+        Skip.IfNot(backend.FftElementTypeHardwareSupported(type), $"This device's compute capability has no {type} storage.");
+        // Supported hardware with an unbuilt module is a compile defect (#1549 hid one behind a skip), not a skip.
+        Assert.True(backend.SupportsFftElementType(type),
+            $"CUDA {type} generic FFT module failed to compile: {backend.FftElementTypeCompileError(type)}");
 
         // Values chosen where FP16 (10-bit mantissa) and BF16 (7-bit mantissa) round to distinct floats, plus ties.
         float[] input =

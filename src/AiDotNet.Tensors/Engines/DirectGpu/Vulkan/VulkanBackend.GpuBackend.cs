@@ -341,6 +341,7 @@ public sealed unsafe partial class VulkanBackend
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        ThrowIfPendingBatchUpload(vb, "readback");
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         var result = new float[vb.Size];
@@ -356,6 +357,7 @@ public sealed unsafe partial class VulkanBackend
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        ThrowIfPendingBatchUpload(vb, "readback");
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         vb.Staging.ReadData(destination);
@@ -371,6 +373,7 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({vb.SizeInBytes}).", nameof(byteCount));
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        ThrowIfPendingBatchUpload(vb, "readback");
         GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.Vulkan);
 
         var result = new byte[byteCount];
@@ -419,6 +422,8 @@ public sealed unsafe partial class VulkanBackend
             throw new GpuCapabilityUnavailableException("Vulkan transfer manager not initialized.");
         if (source is not VulkanGpuBuffer src || destination is not VulkanGpuBuffer dst)
             throw new ArgumentException("Buffers must be VulkanGpuBuffer instances.");
+        ThrowIfPendingBatchUpload(src, "copy");
+        ThrowIfPendingBatchUpload(dst, "copy");
 
         GpuLaunchProbe.OnLaunch();
         _transfer.CopyDeviceToDevice(

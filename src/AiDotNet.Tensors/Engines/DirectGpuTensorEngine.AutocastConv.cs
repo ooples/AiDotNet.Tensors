@@ -145,7 +145,7 @@ public partial class DirectGpuTensorEngine
         if (!(AutocastConvOverride ?? s_autocastConvEnabled)) return false;
         if (GpuExecutionPolicyScope.EffectivePolicyFor(typeof(float)).AccuracyMode == GpuAccuracyMode.PreserveInputType)
             return false;
-        if (!TryGetBackend(out var backend) || backend is DelegatingGpuBackend) return false;
+        if (!TryGetBackendForQuery(out var backend) || backend is DelegatingGpuBackend) return false;
         if (backend is not INativeReducedPrecisionConv { NativeReducedPrecisionMath: true }
             || backend.MixedPrecisionConv is not { } conv) return false;
         if (backend is not IGenericFftBackend convert) return false;
@@ -162,6 +162,13 @@ public partial class DirectGpuTensorEngine
     /// issued (not inside a deferred launch), so a launch that runs later still uses the precision of its scope.
     /// </summary>
     private static bool TryResolveAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route)
+        // Inside a backward that replays a recorded precision, a forward convolution it issues (the input gradient,
+        // or any convolution of a create-graph backward) runs in that precision too, not the scope open now.
+        => t_backwardConvPrecisionOverride is not null
+            ? TryResolveBackwardAutocastConvRoute(backend, out route)
+            : TryResolveAmbientAutocastConvRoute(backend, out route);
+
+    private static bool TryResolveAmbientAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route)
     {
         route = default;
         if (!(AutocastConvOverride ?? s_autocastConvEnabled)) return false;
@@ -203,7 +210,7 @@ public partial class DirectGpuTensorEngine
             route = recorded.Route;
             return true;
         }
-        return TryResolveAutocastConvRoute(backend, out route);
+        return TryResolveAmbientAutocastConvRoute(backend, out route);
     }
 
     // Floats of scratch that hold `elements` 16-bit values.

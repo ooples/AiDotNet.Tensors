@@ -255,6 +255,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal void HoldForBatchUpload(VulkanBackend owner) =>
         System.Threading.Volatile.Write(ref _batchUploadOwner, owner);
 
+    /// <summary>True while this buffer's upload is recorded in an open batch and has not run yet.</summary>
+    internal bool HasPendingBatchUpload => System.Threading.Volatile.Read(ref _batchUploadOwner) is not null;
+
     internal void ClearBatchUploadHold() =>
         System.Threading.Interlocked.Exchange(ref _batchUploadOwner, null);
 

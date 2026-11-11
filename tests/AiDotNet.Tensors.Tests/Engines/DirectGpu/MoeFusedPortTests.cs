@@ -140,6 +140,89 @@ public class MoeFusedPortTests
         CheckLargeDispatchLimit(backend);
     }
 
+    [SkippableFact]
+    public void Vulkan_full_forward_sorts_16776961_slots_in_bounded_groups()
+    {
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
+        CheckLargeSort(backend);
+    }
+
+    [SkippableFact]
+    public void Cuda_full_forward_sorts_16776961_slots_in_bounded_groups()
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
+        CheckLargeSort(backend);
+    }
+
+    [SkippableFact]
+    public void OpenCl_full_forward_sorts_16776961_slots_in_bounded_groups()
+    {
+        Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
+        using var backend = new OpenClBackend(deviceIndex: 0);
+        Skip.IfNot(backend.IsAvailable, "OpenCL backend did not initialize.");
+        CheckLargeSort(backend);
+    }
+
+    /// <summary>
+    /// The largest admitted slot count with one expert (N = 16,776,961, D = G = K = F = B = 1): every slot lands on expert
+    /// 0, so the sort is the identity, ends [NK] and the load NK. One sort group per expert used to scan all NK slots
+    /// here (over a million barriers in a single group); each sort dispatch now covers one bounded slice.
+    /// </summary>
+    private static void CheckLargeSort(IDirectGpuBackend backend)
+    {
+        var moe = Assert.IsAssignableFrom<IMoeKernelBackend>(backend);
+        Assert.True(moe.MoeKernelsReady, "the fused MoE kernels did not build");
+        var capped = new MaxWorkgroupAssertingMoeBackend(moe);
+        const int n = 16_776_961;
+        var s = new MoeShape(n, 1, 1, 1, 1, 1);
+        Assert.True(s.Admitted);
+
+        var xHost = new float[n];
+        for (int i = 0; i < n; i++) xHost[i] = (i % 1999) / 1999f - 0.5f;
+        var scoresHost = new float[n];
+        for (int i = 0; i < n; i++) scoresHost[i] = 0.5f;
+        const float w1 = 0.75f, w3 = -1.25f, w2 = 0.5f;
+        using var bx = backend.AllocateBuffer(xHost);
+        using var bs = backend.AllocateBuffer(scoresHost);
+        using var bw1 = backend.AllocateBuffer(new[] { w1 });
+        using var bw3 = backend.AllocateBuffer(new[] { w3 });
+        using var bw2 = backend.AllocateBuffer(new[] { w2 });
+        IGpuBuffer Out(int count)
+        {
+            var buf = backend.AllocateBuffer(count);
+            backend.Fill(buf, float.NaN, count);
+            return buf;
+        }
+        using var ids = Out(n); using var gates = Out(n); using var ssum = Out(n); using var perm = Out(n);
+        using var pos = Out(n); using var ends = Out(1); using var loads = Out(1);
+        using var h13 = Out(2 * n); using var o = Out(n); using var y = Out(n);
+
+        PortableMoe.Forward(capped, s, bx, bs, null, bw1, bw3, bw2, ids, gates, ssum, perm, pos, ends, loads, h13, o,
+            y);
+        backend.Synchronize();
+
+        Assert.Equal((float)n, backend.DownloadBuffer(ends)[0]);
+        Assert.Equal((float)n, backend.DownloadBuffer(loads)[0]);
+        var permOut = backend.DownloadBuffer(perm);
+        var posOut = backend.DownloadBuffer(pos);
+        for (int i = 0; i < n; i++)
+        {
+            Assert.True(permOut[i] == i, $"perm[{i}] = {permOut[i]}, expected {i}");
+            Assert.True(posOut[i] == i, $"pos[{i}] = {posOut[i]}, expected {i}");
+        }
+        var yOut = backend.DownloadBuffer(y);
+        foreach (int t in new[] { 0, 4095, 4096, 8_388_607, 16_773_119, 16_773_120, n - 1 })
+        {
+            double h1 = xHost[t] * (double)w1, h3 = xHost[t] * (double)w3;
+            double expected = h1 / (1 + Math.Exp(-h1)) * h3 * w2;
+            Assert.True(Math.Abs(expected - yOut[t]) <= 1e-5 * Math.Max(1.0, Math.Abs(expected)),
+                $"y[{t}]: expected {expected:R}, got {yOut[t]:R}");
+        }
+    }
+
     private static void CheckLargeDispatchLimit(IDirectGpuBackend backend)
     {
         var innerMoe = Assert.IsAssignableFrom<IMoeKernelBackend>(backend);

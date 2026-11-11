@@ -1008,7 +1008,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 $"WriteOutputToStableCapture: stable capture-output buffer (size {_stableCaptureOutputSize}) is smaller than the forward output ({need}).");
             return output;
         }
-        var src = ResolveResidentBufferNoUpload(cb, output, need);
+        // ResolveResidentBufferNoUpload never returns an FP16 buffer (its FP32 callers would misread one), so an
+        // FP16-tagged output resolves through the FP16 accessor and reaches the down-convert below.
+        bool fp16Output = IsFp16Resident(output);
+        var src = fp16Output
+            ? (TryFp16ResidentInput(output, out int fp16Count) is { } fp16Buf && fp16Count >= need ? fp16Buf : null)
+            : ResolveResidentBufferNoUpload(cb, output, need);
         if (src is null)
         {
             if (capturing) throw new System.InvalidOperationException(
@@ -1019,7 +1024,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (FP32-sized) output buffer — the FP16-region EXIT. A raw Copy would memcpy need*4 bytes from a need*2-byte
         // FP16 buffer (garbage). The convert is captured into the graph, so replay re-runs it; the stable output is
         // then plain FP32 for DownloadOutput + the host read.
-        if (IsFp16Resident(output))
+        if (fp16Output)
             cb.ConvertToFp32(src, _stableCaptureOutput, need); // FP16 → FP32, captured
         else
             cb.Copy(src, _stableCaptureOutput, need); // async on the compute stream — captured into the graph
@@ -27899,7 +27904,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int d = 0; d < axis; d++) outerCount *= destination.Shape._dims[d];
                     int axisSize = destination.Shape._dims[axis];
                     var existingDst = ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false);
-                    if (existingDst is not null && existingDst.Handle != System.IntPtr.Zero && existingDst.Size >= destination.Length)
+                    // The resident step trusts the device buffer, but a host write since it was bound (version moved,
+                    // nothing pending on the device) makes it stale: a partial write into it would then make the stale
+                    // rows authoritative. Such a destination takes the host-initialized path below instead.
+                    bool hostWroteSinceBind = destination._gpuBuffer is not null
+                        && destination._gpuBufferVersion != destination.GpuCacheVersion
+                        && !destination.HasPendingGpuData && !IsDeviceAuthoritative(destination);
+                    if (!hostWroteSinceBind && existingDst is not null && existingDst.Handle != System.IntPtr.Zero && existingDst.Size >= destination.Length)
                     {
                         cudaBe.SetSliceAxis(existingDst, srcR, outerCount, axisSize, stride, index);
                         ResidentSyncCheck("SetSliceAxisResident");
@@ -29396,6 +29407,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (rOutBuf.Handle != System.IntPtr.Zero && rOutBuf.Size >= total)
                 {
                     backend.TileAxis(input.Buffer, rOutBuf, outer, 1, block, repeats);
+                    // An owned upload must outlive the queued tile; the using's Dispose is then a no-op.
+                    input.DisposeAfterQueuedUse(backend);
                     ResidentSyncCheck("TileSingleAxisResident");
                     BindResidentBuffer(rOut, rOutBuf, backend);
                     return rOut;
@@ -29409,24 +29422,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        OwnedBuffer output = default;
-        bool handedOff = false;
         try
         {
             // Preserve an authoritative resident input. UploadTensorRaw materializes the tensor's
             // host array first, which turns a tile inside a composed GPU recurrence into a hidden
             // device-to-host-to-device round trip.
             using var input = GetOrAllocateBuffer(backend, tensor);
-            output = AllocateFullyWrittenOutputBuffer(backend, total);
+            using var output = AllocateFullyWrittenOutputBuffer(backend, total);
             // ONE launch. Viewing the tiled axis and everything after it as a single `block` on a size-1
             // axis turns the kernel's per-element repeat into this op's block repeat:
             // output[o, r, :] = input[o, :] for r < repeats. The previous loop issued outer*repeats device
             // copies -- 50.3M one-element copies to tile a [1024, 1] ReduceSum gradient to [1024, 49152].
             backend.TileAxis(input.Buffer, output.Buffer, outer, 1, block, repeats);
+            input.DisposeAfterQueuedUse(backend);
 
             var result = DeferTensorResult<T>(backend, output.Buffer, total, outShape);
             output.RelinquishOwnership();
-            handedOff = true;
             return result;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -29434,10 +29445,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             System.Diagnostics.Trace.TraceWarning($"GPU tile fallback: {ex.GetType().Name}: {ex.Message}");
             if (ThrowOnGpuKernelFallback) throw;
             return null;
-        }
-        finally
-        {
-            if (!handedOff) output.Dispose();
         }
     }
 

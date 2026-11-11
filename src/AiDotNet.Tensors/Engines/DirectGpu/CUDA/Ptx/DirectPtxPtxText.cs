@@ -43,6 +43,32 @@ internal static class DirectPtxPtxText
         };
 
     /// <summary>
+    /// <see cref="MinimumIsaForTarget(int)"/> for a suffixed target. An architecture-specific target (<c>a</c>) can need
+    /// a newer ISA than its base: <c>sm_90a</c> arrived in PTX 8.0, after <c>sm_90</c> in 7.8; the later <c>a</c> targets
+    /// arrived with their base. Family-specific targets (<c>f</c>) arrived in PTX 8.8.
+    /// </summary>
+    internal static (int Major, int Minor)? MinimumIsaForTarget(int target, string suffix)
+    {
+        var baseIsa = MinimumIsaForTarget(target);
+        (int Major, int Minor)? suffixIsa = suffix switch
+        {
+            "" => null,
+            "a" when target == 90 => (8, 0),
+            "a" => null,
+            "f" => (8, 8),
+            _ => throw new NotSupportedException(
+                $"Direct PTX target sm_{target}{suffix} has an unknown suffix; add an explicit mapping before assembling for it."),
+        };
+        if (suffixIsa is not { } fromSuffix) return baseIsa;
+        if (baseIsa is not { } fromBase) return fromSuffix;
+        return fromBase.Major > fromSuffix.Major || (fromBase.Major == fromSuffix.Major && fromBase.Minor >= fromSuffix.Minor)
+            ? fromBase
+            : fromSuffix;
+    }
+
+    private static readonly TimeSpan HeaderRegexTimeout = TimeSpan.FromSeconds(1);
+
+    /// <summary>
     /// Raises the module's <c>.version</c> to the lowest PTX ISA that knows its <c>.target</c>. The emitters write
     /// <c>.version 7.1</c> with the device's own target, and ptxas rejects a target newer than the ISA (PTX 7.1 stops at
     /// sm_86: "PTX .version 7.1 does not support .target sm_89" on Ada). PTX is backward compatible, so the raised
@@ -51,12 +77,13 @@ internal static class DirectPtxPtxText
     internal static string EnsureIsaCoversTarget(string ptx)
     {
         if (ptx is null) throw new ArgumentNullException(nameof(ptx));
-        var target = System.Text.RegularExpressions.Regex.Match(ptx, @"^\s*\.target\s+sm_(\d+)[a-z]?\b",
-            System.Text.RegularExpressions.RegexOptions.Multiline);
+        var target = System.Text.RegularExpressions.Regex.Match(ptx, @"^\s*\.target\s+sm_(\d+)([a-z]?)\b",
+            System.Text.RegularExpressions.RegexOptions.Multiline, HeaderRegexTimeout);
         var version = System.Text.RegularExpressions.Regex.Match(ptx, @"^\s*\.version\s+(\d+)\.(\d+)",
-            System.Text.RegularExpressions.RegexOptions.Multiline);
+            System.Text.RegularExpressions.RegexOptions.Multiline, HeaderRegexTimeout);
         if (!target.Success || !version.Success) return ptx;
-        if (MinimumIsaForTarget(int.Parse(target.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture))
+        if (MinimumIsaForTarget(int.Parse(target.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture),
+                target.Groups[2].Value)
             is not { } needed)
             return ptx;
         int major = int.Parse(version.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);

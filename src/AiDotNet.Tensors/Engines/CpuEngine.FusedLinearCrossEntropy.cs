@@ -644,15 +644,22 @@ public partial class CpuEngine
             _biasStorageVersion = bias.StorageMutationVersion;
         }
 
+        /// <summary>
+        /// Repoints the guard at <paramref name="to"/>, the tape's snapshot of <paramref name="from"/> before an in-place
+        /// write, only while <paramref name="from"/> still holds the recorded value. One already mutated since recording
+        /// stays guarded as it is, so the backward still reports that mutation instead of the snapshot hiding it.
+        /// </summary>
         internal void Rebase(Tensor<T> from, Tensor<T> to)
         {
-            if (ReferenceEquals(_weight, from))
+            if (ReferenceEquals(_weight, from)
+                && from.Version == _weightVersion && from.StorageMutationVersion == _weightStorageVersion)
             {
                 _weight = to;
                 _weightVersion = to.Version;
                 _weightStorageVersion = to.StorageMutationVersion;
             }
-            if (ReferenceEquals(_bias, from))
+            if (ReferenceEquals(_bias, from)
+                && from.Version == _biasVersion && from.StorageMutationVersion == _biasStorageVersion)
             {
                 _bias = to;
                 _biasVersion = to.Version;
