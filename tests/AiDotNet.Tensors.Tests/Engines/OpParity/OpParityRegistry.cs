@@ -2714,6 +2714,18 @@ public static class OpParityRegistry
             e => e.TaylorSoftmaxBackward(go.F(), sin.F(), e.TaylorSoftmax(sin.F(), 2, -1), 2, -1),
             e => e.TaylorSoftmaxBackward(go.D(), sin.D(), e.TaylorSoftmax(sin.D(), 2, -1), 2, -1),
             ParityTol.Accum(1e-3), opMethod: "TaylorSoftmaxBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
+        // A non-last axis with tied maxima: the max-shift gradient belongs to the FIRST maximum along the axis only.
+        var tiedIn = OpInput.From(new[]
+        {
+            0.5, -0.2, 0.3, 0.9,
+            0.5, 0.7, 0.3, -0.4,
+            0.1, 0.7, -0.6, 0.9,
+        }, new[] { 3, 4 });
+        var tiedGrad = OpInput.Rand(3922, new[] { 3, 4 });
+        yield return new OpCase("TaylorSoftmaxBackward[3,4;axis0;tied]", "activation",
+            e => e.TaylorSoftmaxBackward(tiedGrad.F(), tiedIn.F(), e.TaylorSoftmax(tiedIn.F(), 2, 0), 2, 0),
+            e => e.TaylorSoftmaxBackward(tiedGrad.D(), tiedIn.D(), e.TaylorSoftmax(tiedIn.D(), 2, 0), 2, 0),
+            ParityTol.Accum(1e-3), opMethod: "TaylorSoftmaxBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
         yield return new OpCase("SphericalSoftmaxBackward[4,8]", "activation",
             e => e.SphericalSoftmaxBackward(go.F(), sin.F(), e.SphericalSoftmax(sin.F(), -1), -1),
             e => e.SphericalSoftmaxBackward(go.D(), sin.D(), e.SphericalSoftmax(sin.D(), -1), -1),

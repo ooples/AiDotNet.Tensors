@@ -10254,23 +10254,53 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TaylorSoftmaxBackward<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, int order, int axis)
     {
+        using var __gpuOp = EnterGpuOp();
         int ax = axis < 0 ? input.Rank + axis : axis;
-        // The device formula below evaluates g at x and drops the max-shift term; the forward evaluates g at
-        // x - max(x), so that is the gradient of a different function. The CPU backward has the exact formula; use it
-        // until this path applies the shift and the argmax correction too.
-        if (order >= 0 || IsTapeActive<T>() || Compilation.GraphMode.IsActive
-            || ax < 0 || ax >= input.Rank)
+        // Order 2 only, as the forward: g(z) = 1 + z + z^2/2 >= 1/2 never vanishes, so g'/g is finite everywhere.
+        if (order != 2 || IsTapeActive<T>() || Compilation.GraphMode.IsActive || ax < 0 || ax >= input.Rank
+            || typeof(T) != typeof(float) || input.Shape._dims[ax] == 0 || !TryGetBackend(out _))
             return base.TaylorSoftmaxBackward(gradOutput, input, output, order, axis);
 
-        var axes = new[] { ax };
+        // The CPU backward's exact formula, on the device. The forward evaluates g at z = x - max(x) (the FIRST maximum
+        // along the axis) and normalises, y = g(z) / sum g(z), so
+        //   dL/dz_i = y_i (dL/dy_i - sum_j dL/dy_j y_j) g'(z_i) / g(z_i),   dL/dx_k = dL/dz_k - [k = argmax] sum_i dL/dz_i.
+        // g is not shift-invariant the way exp is: evaluating it at x and dropping the argmax term (as this path did)
+        // is the gradient of a different function. The row ops work on the last axis; another axis is moved there and
+        // back, on the device.
+        int last = input.Rank - 1;
+        if (ax != last)
+        {
+            var perm = AxisLastPermutation(input.Rank, ax);
+            var moved = TaylorSoftmaxBackwardLastAxis(
+                PermutedContiguous(gradOutput, perm), PermutedContiguous(input, perm), PermutedContiguous(output, perm));
+            return PermutedContiguous(moved, InversePermutation(perm));
+        }
+        return TaylorSoftmaxBackwardLastAxis(gradOutput, input, output);
+    }
+
+    /// <summary>The order-2 Taylor-softmax backward along the last axis, every step a GPU-resident primitive.</summary>
+    private Tensor<T> TaylorSoftmaxBackwardLastAxis<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output)
+    {
+        var engine = (IEngine)this;
         var numOps = MathHelper.GetNumericOperations<T>();
+        int last = input.Rank - 1;
+        int axisSize = input.Shape._dims[last];
+        var axes = new[] { last };
+
+        var max = ReduceMax(input, axes, keepDims: true);
+        var z = TensorBroadcastSubtract(input, max);
+        var g = TensorAddScalar(TensorAdd(z, TensorMultiplyScalar(TensorMultiply(z, z), numOps.FromDouble(0.5))), numOps.One);
+        var gPrime = TensorAddScalar(z, numOps.One);
+
         var dot = ReduceSum(TensorMultiply(gradOutput, output), axes, keepDims: true);
-        var softmaxGrad = TensorMultiply(output, TensorBroadcastSubtract(gradOutput, dot));
-        var inputSquared = TensorMultiply(input, input);
-        var g = TensorAddScalar(
-            TensorAdd(input, TensorMultiplyScalar(inputSquared, numOps.FromDouble(0.5))), numOps.One);
-        var gPrime = TensorAddScalar(input, numOps.One);
-        return TensorMultiply(softmaxGrad, TensorDivide(gPrime, g));
+        var dz = TensorMultiply(TensorMultiply(output, TensorBroadcastSubtract(gradOutput, dot)), TensorDivide(gPrime, g));
+
+        // The shift's gradient goes to the first argmax, the element the forward subtracted (TensorArgMax keeps the
+        // first of equal maxima, as the CPU scan does).
+        var shiftGrad = ReduceSum(dz, axes, keepDims: true);
+        var firstMax = engine.TensorOneHot<T>(engine.TensorArgMax(input, last), axisSize);
+        var correction = TensorBroadcastMultiply(Reshape(firstMax, input.Shape.ToArray()), shiftGrad);
+        return TensorSubtract(dz, correction);
     }
 
     // #775: spherical softmax = Softmax(x / ||x||_2) along `axis`. L2-normalize on-device (square ->
