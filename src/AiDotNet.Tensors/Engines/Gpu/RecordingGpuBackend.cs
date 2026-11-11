@@ -38,7 +38,7 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// automatic lifetime management when possible.
 /// </para>
 /// </remarks>
-public class RecordingGpuBackend : DelegatingGpuBackend
+public class RecordingGpuBackend : DelegatingGpuBackend, ISparseRoutingBackend
 {
     private ExecutionGraphBuilder? _graphBuilder;
     private bool _isRecording;
@@ -977,6 +977,60 @@ public class RecordingGpuBackend : DelegatingGpuBackend
         var conversion = IndexConversion.Resolve(Inner);
         RecordOrExecute(KernelType.ElementWise, System.Array.Empty<IGpuBuffer>(), new[] { output },
             () => conversion.ScatterPositions(output, srcDim, inner, n));
+    }
+
+    void ISparseRoutingBackend.GatherRowValuesForward(IGpuBuffer values, IGpuBuffer int32Indices, IGpuBuffer output,
+        int rows, int cols, int k)
+    {
+        var sr = SparseRoutingResolver.RequireInner(Inner);
+        RecordOrExecute(KernelType.ElementWise, new[] { values, int32Indices }, new[] { output },
+            () => sr.GatherRowValuesForward(values, int32Indices, output, rows, cols, k));
+    }
+
+    void ISparseRoutingBackend.GatherRowValuesBackward(IGpuBuffer gradOutput, IGpuBuffer int32Indices, IGpuBuffer gradValues,
+        int rows, int cols, int k)
+    {
+        var sr = SparseRoutingResolver.RequireInner(Inner);
+        RecordOrExecute(KernelType.ElementWise, new[] { gradOutput, int32Indices }, new[] { gradValues },
+            () => sr.GatherRowValuesBackward(gradOutput, int32Indices, gradValues, rows, cols, k));
+    }
+
+    void ISparseRoutingBackend.TopKWeightedRowMixForward(IGpuBuffer table, IGpuBuffer int32Indices, IGpuBuffer weights,
+        IGpuBuffer output, int rows, int numEntries, int k, int channels)
+    {
+        var sr = SparseRoutingResolver.RequireInner(Inner);
+        RecordOrExecute(KernelType.ElementWise, new[] { table, int32Indices, weights }, new[] { output },
+            () => sr.TopKWeightedRowMixForward(table, int32Indices, weights, output, rows, numEntries, k, channels));
+    }
+
+    void ISparseRoutingBackend.TopKWeightedRowMixBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer table,
+        IGpuBuffer int32Indices, IGpuBuffer gradWeights, int rows, int numEntries, int k, int channels)
+    {
+        var sr = SparseRoutingResolver.RequireInner(Inner);
+        RecordOrExecute(KernelType.Reduction, new[] { gradOutput, table, int32Indices }, new[] { gradWeights },
+            () => sr.TopKWeightedRowMixBackwardWeights(gradOutput, table, int32Indices, gradWeights, rows, numEntries, k, channels));
+    }
+
+    void ISparseRoutingBackend.TopKWeightedRowMixBackwardTable(IGpuBuffer gradOutput, IGpuBuffer int32Indices,
+        IGpuBuffer weights, IGpuBuffer gradTable, int rows, int numEntries, int k, int channels)
+    {
+        var sr = SparseRoutingResolver.RequireInner(Inner);
+        RecordOrExecute(KernelType.Reduction, new[] { gradOutput, int32Indices, weights }, new[] { gradTable },
+            () => sr.TopKWeightedRowMixBackwardTable(gradOutput, int32Indices, weights, gradTable, rows, numEntries, k, channels));
+    }
+
+    void ISparseRoutingBackend.CountIndicesInt32(IGpuBuffer int32Indices, IGpuBuffer counts, int length, int numBins)
+    {
+        var sr = SparseRoutingResolver.RequireInner(Inner);
+        RecordOrExecute(KernelType.Reduction, new[] { int32Indices }, new[] { counts },
+            () => sr.CountIndicesInt32(int32Indices, counts, length, numBins));
+    }
+
+    void ISparseRoutingBackend.MinMaxInt32(IGpuBuffer int32Data, IGpuBuffer outMinMaxInt32, int length)
+    {
+        var sr = SparseRoutingResolver.RequireInner(Inner);
+        RecordOrExecute(KernelType.Reduction, new[] { int32Data }, new[] { outMinMaxInt32 },
+            () => sr.MinMaxInt32(int32Data, outMinMaxInt32, length));
     }
 
     #endregion
