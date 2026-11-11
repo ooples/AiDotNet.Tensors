@@ -4353,6 +4353,13 @@ internal static partial class BackwardFunctions<T>
         bool includeSelf = SavedBool(nameof(ScatterReduceBackward), savedState, 3, "includeSelf");
         var mode = (ScatterReduceMode)modeRaw;
 
+        // Sum and mean are jointly linear in (tensor, source) for fixed indices: the adjoint is the reduce itself.
+        if ((mode == ScatterReduceMode.Sum || mode == ScatterReduceMode.Mean)
+            && TryJointlyLinearBackward("ScatterReduceBackward", ScatterReduceBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorScatterReduce(xs[0], dim, new Tensor<int>((int[])idxData.Clone(), (int[])inputs[1]._shape.Clone()),
+                    xs[1], mode, includeSelf)))
+            return;
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var tensor = inputs[0];
         var source = inputs[1];
@@ -4442,6 +4449,53 @@ internal static partial class BackwardFunctions<T>
             }
         }
 
+        if (CreatesGraph && (isMinMax || mode == ScatterReduceMode.Prod))
+        {
+            // amin/amax: the upstream gradient routed to each slot's winner (fixed by the forward), as recorded sparse
+            // maps. prod: each factor's gradient is g·out/factor as recorded ops; with a zero factor that quotient is
+            // undefined, so a zero factor keeps the kernel below (not differentiable again).
+            bool anyZero = false;
+            for (int i = 0; i < dstLen && !anyZero; i++) anyZero = zeroCount[i] > 0;
+            if (isMinMax || !anyZero)
+            {
+                var keep = new List<int>();
+                for (int i = 0; i < dstLen; i++)
+                    if (selfParticipates[i] && (!isMinMax || winner[i] == -1)) keep.Add(i);
+                var srcTo = new List<int>();
+                var srcFrom = new List<int>();
+                for (int outer = 0; outer < outerSize; outer++)
+                {
+                    int outerBase = outer * dstAxis * innerSize;
+                    for (int i = 0; i < srcAxis; i++)
+                    {
+                        int srcBase = outer * srcAxis * innerSize + i * innerSize;
+                        for (int inner = 0; inner < innerSize; inner++)
+                        {
+                            int flatSrc = srcBase + inner;
+                            int target = idxData[flatSrc];
+                            if (target < 0 || target >= dstAxis) continue;
+                            int dstPos = outerBase + target * innerSize + inner;
+                            if (isMinMax && winner[dstPos] != flatSrc) continue;
+                            srcTo.Add(flatSrc);
+                            srcFrom.Add(dstPos);
+                        }
+                    }
+                }
+                var kept = keep.ToArray();
+                var routed = isMinMax ? gradOutput : engine.TensorMultiply(gradOutput, output);
+                var tensorGrad = SparseMap(routed, (int[])shape.Clone(), kept, kept, null);
+                var sourceGrad = SparseMap(routed, (int[])source._shape.Clone(), srcTo.ToArray(), srcFrom.ToArray(), null);
+                if (!isMinMax)
+                {
+                    tensorGrad = engine.TensorDivide(tensorGrad, tensor);
+                    sourceGrad = engine.TensorDivide(sourceGrad, source);
+                }
+                DifferentiableOps.AccumulateGrad(grads, tensor, tensorGrad, engine);
+                DifferentiableOps.AccumulateGrad(grads, source, sourceGrad, engine);
+                return;
+            }
+        }
+
         var gradTensor = TensorPool<T>.RentZeroed(shape);
         var gradSource = TensorPool<T>.RentZeroed(source._shape);
 
@@ -4519,6 +4573,9 @@ internal static partial class BackwardFunctions<T>
         RequireSavedState(nameof(SelectScatterBackward), savedState, 2);
         int dim = SavedInt(nameof(SelectScatterBackward), savedState, 0, "dim");
         int index = SavedInt(nameof(SelectScatterBackward), savedState, 1, "index");
+        if (TryJointlyLinearBackward("SelectScatterBackward", SelectScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorSelectScatter(xs[0], xs[1], dim, index)))
+            return;
 
         var tensor = inputs[0];
         var source = inputs[1];
@@ -4559,6 +4616,9 @@ internal static partial class BackwardFunctions<T>
         int dim = SavedInt(nameof(SliceScatterBackward), savedState, 0, "dim");
         int start = SavedInt(nameof(SliceScatterBackward), savedState, 1, "start");
         int length = SavedInt(nameof(SliceScatterBackward), savedState, 2, "length");
+        if (TryJointlyLinearBackward("SliceScatterBackward", SliceScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorSliceScatter(xs[0], xs[1], dim, start, length)))
+            return;
 
         var tensor = inputs[0];
         var source = inputs[1];
@@ -4611,6 +4671,26 @@ internal static partial class BackwardFunctions<T>
 
         var tensor = inputs[0];
         var source = inputs[1];
+        if (CreatesGraph)
+        {
+            // The same routing as recorded sparse maps: the destination keeps every position (accumulate) or the
+            // unwritten ones (overwrite); each source element reads its written position (the last writer only, on
+            // an overwrite).
+            var lastWriter = new Dictionary<int, int>(positions.Length);
+            for (int i = 0; i < positions.Length; i++) lastWriter[positions[i]] = i;
+            var keep = new List<int>(tensor.Length);
+            for (int i = 0; i < tensor.Length; i++)
+                if (accumulate || !lastWriter.ContainsKey(i)) keep.Add(i);
+            var srcTo = new List<int>(positions.Length);
+            var srcFrom = new List<int>(positions.Length);
+            for (int i = 0; i < positions.Length; i++)
+                if (accumulate || lastWriter[positions[i]] == i) { srcTo.Add(i); srcFrom.Add(positions[i]); }
+            var kept = keep.ToArray();
+            DifferentiableOps.AccumulateGrad(grads, tensor, SparseMap(gradOutput, (int[])tensor._shape.Clone(), kept, kept, null), engine);
+            DifferentiableOps.AccumulateGrad(grads, source,
+                SparseMap(gradOutput, (int[])source._shape.Clone(), srcTo.ToArray(), srcFrom.ToArray(), null), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
 
         var gradTensor = TensorPool<T>.RentZeroed(tensor._shape);
@@ -4656,6 +4736,9 @@ internal static partial class BackwardFunctions<T>
         var indices = savedState[0] as int[]
             ?? throw new ArgumentException(
                 $"{nameof(PutBackward)}: savedState[0] (indices) must be an int[].", nameof(savedState));
+        if (TryJointlyLinearBackward("PutBackward", PutBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorPut(xs[0], new Tensor<int>((int[])indices.Clone(), new[] { indices.Length }), xs[1])))
+            return;
 
         var tensor = inputs[0];
         var source = inputs[1];
@@ -4692,6 +4775,9 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryJointlyLinearBackward("BlockDiagBackward", BlockDiagBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorBlockDiag(xs)))
+            return;
         int totalCols = output._shape[1];
         int rowOffset = 0, colOffset = 0;
         foreach (var m in inputs)
@@ -4720,6 +4806,9 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryJointlyLinearBackward("CartesianProdBackward", CartesianProdBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorCartesianProd(xs)))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         int d = inputs.Length;
         var sizes = new int[d];
@@ -6199,6 +6288,9 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryMultilinearBackward("ComplexMultiplyBackward", ComplexMultiplyBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorComplexMultiply(xs[0], xs[1])))
+            return;
         var a = inputs[0];
         var b = inputs[1];
         var ops = MathHelper.GetNumericOperations<T>();
@@ -6251,6 +6343,19 @@ internal static partial class BackwardFunctions<T>
         var a = (Tensor<T>)savedState[0]; // original input
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
+        if (CreatesGraph)
+        {
+            // The kernel's g·z/(|z| + 1e-8) per (re, im) pair as recorded ops, differentiable in g and (through z and
+            // |z|) in the input.
+            var z = inputs[0];
+            var pairShape = new[] { pairs, 2 };
+            var columnShape = new[] { pairs, 1 };
+            var scale = engine.TensorDivide(engine.Reshape(gradOutput, columnShape),
+                engine.TensorAddScalar(engine.Reshape(output, columnShape), ops.FromDouble(1e-8)));
+            var recorded = engine.TensorMultiply(engine.Reshape(z, pairShape), engine.TensorBroadcastTo(scale, pairShape));
+            DifferentiableOps.AccumulateGrad(grads, z, engine.Reshape(recorded, z._shape), engine);
+            return;
+        }
 
         var gradA = new Tensor<T>(a._shape);
         for (int i = 0; i < pairs; i++)
@@ -6423,7 +6528,9 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axis = (int)savedState[0];
-        var grad = engine.SparsemaxBackward(gradOutput, output, axis);
+        // Projection onto the support with its mean removed: linear in g, symmetric, and fixed while the support is,
+        // so it is its own adjoint and has no second derivative in x (as torch's sparsemax).
+        var grad = DiagonalLinearGrad("SparsemaxBackward", gradOutput, engine, (e, w) => e.SparsemaxBackward(w, output, axis));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -6434,6 +6541,28 @@ internal static partial class BackwardFunctions<T>
     {
         var order = (int)savedState[0];
         var axis = (int)savedState[1];
+        // Under create-graph: differentiate the forward as recorded ops, f = Σ_{n≤order} (x - max)ⁿ/n!, y = f / Σ f.
+        var taylorInput = inputs[0];
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                int ax = axis < 0 ? axis + taylorInput.Rank : axis;
+                var shape = taylorInput._shape;
+                var shifted = e.TensorSubtract(taylorInput, e.TensorBroadcastTo(e.ReduceMax(taylorInput, new[] { ax }, keepDims: true), shape));
+                var f = e.TensorAddScalar(e.TensorMultiplyScalar(shifted, ops.Zero), ops.One);
+                var power = shifted;
+                var inverseFactorials = new double[order + 1];
+                inverseFactorials[0] = 1;
+                for (int n = 1; n <= order; n++) inverseFactorials[n] = inverseFactorials[n - 1] / n;
+                var coefficients = RoIAlignPlan.FromDoubles<T>(inverseFactorials, new[] { order + 1 });
+                for (int n = 1; n <= order; n++)
+                {
+                    if (n > 1) power = e.TensorMultiply(power, shifted);
+                    f = e.TensorAdd(f, e.TensorMultiplyScalar(power, coefficients.GetFlat(n)));
+                }
+                return e.TensorDivide(f, e.TensorBroadcastTo(e.ReduceSum(f, new[] { ax }, keepDims: true), shape));
+            }))
+            return;
         var grad = engine.TaylorSoftmaxBackward(gradOutput, inputs[0], output, order, axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6586,6 +6715,9 @@ internal static partial class BackwardFunctions<T>
     {
         var inputShape = inputs[0]._shape;
         var upscaleFactor = (int)savedState[0];
+        if (TryLinearBackward("PixelShuffleBackward", PixelShuffleBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.PixelShuffle(w, upscaleFactor)))
+            return;
         var grad = engine.PixelShuffleBackward(gradOutput, inputShape, upscaleFactor);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6660,6 +6792,9 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryMultilinearBackward("OctonionMatMulBackward", OctonionMatMulBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.OctonionMatMulTensor(xs[0], xs[1])))
+            return;
         var input = inputs[0];  // [batch, inputFeatures, 8]
         var weight = inputs[1]; // [outputFeatures, inputFeatures, 8]
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6872,8 +7007,47 @@ internal static partial class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var counts = (Tensor<int>)savedState[1];
         var sourceShape = inputs[0]._shape;
+        if (CreatesGraph)
+        {
+            // Each source row reads its group's gradient divided by the group size: a recorded sparse map.
+            var countData = counts.GetFlattenedData();
+            var (to, from, groups) = ScatterRows(indices, sourceShape, gradOutput._shape[0]);
+            var coef = new double[to.Length];
+            for (int k = 0; k < coef.Length; k++)
+            {
+                int count = countData[groups[k]];
+                coef[k] = count > 0 ? 1.0 / count : 1.0;
+            }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], SparseMap(gradOutput, (int[])sourceShape.Clone(), to, from, coef), engine);
+            return;
+        }
         var grad = engine.ScatterMeanBackward(gradOutput, indices, counts, sourceShape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    // The dim-0 group routing of a scatter: source element (d, inner) and its output element (indices[d], inner), as
+    // (source flat index, output flat index, group) triples for the in-range indices.
+    private static (int[] Source, int[] Output, int[] Group) ScatterRows(Tensor<int> indices, int[] sourceShape, int outputRows)
+    {
+        var idx = indices.GetFlattenedData();
+        int rows = sourceShape[0];
+        int inner = 1;
+        for (int d = 1; d < sourceShape.Length; d++) inner *= sourceShape[d];
+        var src = new List<int>(rows * inner);
+        var dst = new List<int>(rows * inner);
+        var group = new List<int>(rows * inner);
+        for (int d = 0; d < rows; d++)
+        {
+            int t = idx[d % idx.Length];
+            if (t < 0 || t >= outputRows) continue;
+            for (int k = 0; k < inner; k++)
+            {
+                src.Add(d * inner + k);
+                dst.Add(t * inner + k);
+                group.Add(t);
+            }
+        }
+        return (src.ToArray(), dst.ToArray(), group.ToArray());
     }
 
     /// <summary>ScatterMax backward via engine</summary>
@@ -6884,6 +7058,27 @@ internal static partial class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var argmax = (Tensor<int>)savedState[1];
         var sourceShape = inputs[0]._shape;
+        if (CreatesGraph)
+        {
+            // Each group's gradient goes to its winning source element (fixed by the forward): the kernel's routing of
+            // ones marks the winners, and the same routing of g is a recorded sparse map.
+            Tensor<T> winners;
+            using (new NoGradScope<T>())
+            {
+                var ones = new Tensor<T>((int[])gradOutput._shape.Clone());
+                ones.Fill(MathHelper.GetNumericOperations<T>().One);
+                winners = engine.ScatterMaxBackward(ones, argmax, sourceShape);
+            }
+            var won = RoIAlignPlan.ToDoubles(winners);
+            var (src, dst, _) = ScatterRows(indices, sourceShape, gradOutput._shape[0]);
+            var to = new List<int>(src.Length);
+            var from = new List<int>(src.Length);
+            for (int k = 0; k < src.Length; k++)
+                if (won[src[k]] != 0) { to.Add(src[k]); from.Add(dst[k]); }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                SparseMap(gradOutput, (int[])sourceShape.Clone(), to.ToArray(), from.ToArray(), null), engine);
+            return;
+        }
         var grad = engine.ScatterMaxBackward(gradOutput, argmax, sourceShape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6894,6 +7089,30 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var indices = (Tensor<int>)savedState[0];
+        var softmaxSource = inputs[0];
+        // Under create-graph: differentiate y = e / (group sum of e gathered back), e = exp(x - c), c each group's
+        // max as a constant shift (it cancels), with the group sum and gather as recorded sparse maps.
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                var shape = softmaxSource._shape;
+                var idx = indices.GetFlattenedData();
+                int groupCount = 0;
+                for (int i = 0; i < idx.Length; i++) groupCount = Math.Max(groupCount, idx[i] + 1);
+                var (src, dst, _) = ScatterRows(indices, shape, groupCount);
+                var x = RoIAlignPlan.ToDoubles(softmaxSource);
+                var groupShape = (int[])shape.Clone();
+                groupShape[0] = groupCount;
+                var max = new double[ShapeLength(groupShape)];
+                for (int i = 0; i < max.Length; i++) max[i] = double.NegativeInfinity;
+                for (int k = 0; k < src.Length; k++) max[dst[k]] = Math.Max(max[dst[k]], x[src[k]]);
+                var shiftValues = new double[x.Length];
+                for (int k = 0; k < src.Length; k++) shiftValues[src[k]] = max[dst[k]];
+                var shift = RoIAlignPlan.FromDoubles<T>(shiftValues, (int[])shape.Clone());
+                var exps = e.TensorExp(e.TensorSubtract(softmaxSource, shift));
+                var sums = SparseMap(exps, groupShape, dst, src, null);
+                return e.TensorDivide(exps, SparseMap(sums, (int[])shape.Clone(), src, dst, null));
+            }))
+            return;
         var grad = engine.ScatterSoftmaxBackward(gradOutput, output, indices);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6911,6 +7130,11 @@ internal static partial class BackwardFunctions<T>
             ? idxTensor.GetFlattenedData()
             : (int[])savedState[0];
         var axis = (int)savedState[1];
+        var scatterIndices = savedState[0] as Tensor<int> ?? new Tensor<int>((int[])indices.Clone(), new[] { indices.Length });
+        if (inputs.Length >= 2
+            && TryJointlyLinearBackward("ScatterBackward", ScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.Scatter(xs[0], scatterIndices, xs[1], axis)))
+            return;
 
         // Axis scatter with 1-D indices is index_copy, so the device helpers proven there apply unchanged.
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
@@ -7124,6 +7348,9 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryJointlyLinearBackward("AddManyBackward", AddManyBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorAddMany(xs)))
+            return;
         // Each input gets its own copy of gradOutput to prevent AccumulateGrad
         // from mutating a shared tensor via TensorAddInPlace
         // Every input gets its OWN fresh copy — including the first. Handing gradOutput itself to
@@ -7197,6 +7424,9 @@ internal static partial class BackwardFunctions<T>
         var repeats = (int)savedState[0];
         var axis = (int)savedState[1];
         var inputShape = inputs[0]._shape;
+        if (TryLinearBackward("RepeatElementsBackward", RepeatElementsBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorRepeatElements(w, repeats, axis)))
+            return;
         // Sum every `repeats` consecutive elements along axis
         var grad = new Tensor<T>(inputShape);
         var gradData = gradOutput.GetFlattenedData();
@@ -7262,6 +7492,9 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var inputShape = inputs[0]._shape;
+        if (TryLinearBackward("DiagonalBackward", DiagonalBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorDiagonal(w)))
+            return;
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryDiagonalBackwardOnDevice(gradOutput, inputShape) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -7945,6 +8178,9 @@ internal static partial class BackwardFunctions<T>
         int repeats = (int)savedState[0];
         int dim = (int)savedState[1];
         var input = inputs[0];
+        if (TryLinearBackward("RepeatInterleaveBackward", RepeatInterleaveBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorRepeatInterleave(w, repeats, dim)))
+            return;
         if (engine.Is<DirectGpuTensorEngine>())
         {
             // Output element [o, i * repeats + r, n] came from input [o, i, n]: viewed as [outer, axis, repeats, inner]
@@ -8000,6 +8236,14 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int axis = (int)savedState[0];
+        if (CreatesGraph)
+        {
+            // dx_k = Σ_{i≥k} g_i·y_i / x_k as recorded ops (the kernel below's formula), differentiable in g and x.
+            int cumAxis = axis < 0 ? axis + inputs[0].Rank : axis;
+            var recorded = engine.TensorDivide(ReverseCumSum(engine, engine.TensorMultiply(gradOutput, output), cumAxis), inputs[0]);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], recorded, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
@@ -8068,6 +8312,8 @@ internal static partial class BackwardFunctions<T>
         var dX = dXLease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < dX.Length; i++) dX[i] = zero;
+        var routeTo = CreatesGraph ? new List<int>() : null;
+        var routeFrom = CreatesGraph ? new List<int>() : null;
 
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -8092,9 +8338,15 @@ internal static partial class BackwardFunctions<T>
                     }
                     int argPos = outer * axisLen * innerSize + argExt * innerSize + inner;
                     dX[argPos] = ops.Add(dX[argPos], dY[pos]);
+                    routeTo?.Add(argPos);
+                    routeFrom?.Add(pos);
                 }
             }
 
+        // Under create-graph the same routing (each output's gradient to the position holding its running extreme)
+        // as a recorded sparse map, connected to the upstream gradient.
+        if (routeTo is not null)
+            grad = SparseMap(gradOutput, (int[])input._shape.Clone(), routeTo.ToArray(), routeFrom!.ToArray(), null);
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
@@ -8109,6 +8361,15 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int axis = (int)savedState[0];
+        if (CreatesGraph)
+        {
+            // dx_k = exp(x_k)·Σ_{i≥k} g_i·exp(-y_i) as recorded ops (the kernel below's Σ g_i·exp(x_k - y_i)).
+            int cumAxis = axis < 0 ? axis + inputs[0].Rank : axis;
+            var weighted = engine.TensorMultiply(gradOutput, engine.TensorExp(engine.TensorNegate(output)));
+            var recorded = engine.TensorMultiply(engine.TensorExp(inputs[0]), ReverseCumSum(engine, weighted, cumAxis));
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], recorded, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
@@ -8778,6 +9039,9 @@ internal static partial class BackwardFunctions<T>
         //
         //   dA[i0,..,iN] = Σ_{j0,..,jN} dY[i0*b0+j0, ..., iN*bN+jN] * B[j0,..,jN]
         //   dB[j0,..,jN] = Σ_{i0,..,iN} dY[i0*b0+j0, ..., iN*bN+jN] * A[i0,..,iN]
+        if (TryMultilinearBackward("KronBackward", KronBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorKron(xs[0], xs[1])))
+            return;
         var a = inputs[0];
         var b = inputs[1];
         var ops = MathHelper.GetNumericOperations<T>();
@@ -8871,6 +9135,14 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (inputs.Length >= 2)
+        {
+            int addAxis = (int)savedState[0];
+            var addIndices = (Tensor<int>)savedState[1];
+            if (TryJointlyLinearBackward("IndexAddBackward", IndexAddBackward, gradOutput, inputs, output, savedState, engine, grads,
+                    (e, xs) => e.TensorIndexAdd(xs[0], addAxis, addIndices, xs[1])))
+                return;
+        }
         // dL/d(input) = dL/d(output) — `input` is the zeroth input.
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
 
@@ -8926,6 +9198,11 @@ internal static partial class BackwardFunctions<T>
     {
         int axis = (int)savedState[0];
         var indices = (Tensor<int>)savedState[1];
+        if (inputs.Length >= 2
+                ? TryJointlyLinearBackward("IndexCopyBackward", IndexCopyBackward, gradOutput, inputs, output, savedState, engine, grads,
+                    (e, xs) => e.TensorIndexCopy(xs[0], axis, indices, xs[1]))
+                : TrySelfAdjointBackward("IndexCopyBackward", IndexCopyBackward, gradOutput, inputs, output, savedState, engine, grads))
+            return;
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
@@ -9074,6 +9351,9 @@ internal static partial class BackwardFunctions<T>
     {
         var indices = (Tensor<int>)savedState[0];
         int dim = (int)savedState[1];
+        if (TryLinearBackward("TakeAlongDimBackward", TakeAlongDimBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorTakeAlongDim(w, indices, dim)))
+            return;
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
@@ -9119,6 +9399,11 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var mask = (Tensor<Bit>)savedState[0];
+        if (inputs.Length >= 2
+                ? TryJointlyLinearBackward("MaskedScatterBackward", MaskedScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+                    (e, xs) => e.TensorMaskedScatter(xs[0], mask, xs[1]))
+                : TrySelfAdjointBackward("MaskedScatterBackward", MaskedScatterBackward, gradOutput, inputs, output, savedState, engine, grads))
+            return;
         if (inputs.Length >= 2 && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryMaskedScatterBackwardOnDevice(gradOutput, mask, inputs[1]._shape) is { } device)
         {
@@ -9188,6 +9473,10 @@ internal static partial class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var inputShape = (int[])savedState[1];
 
+        if (TryLinearBackward("TakeBackward", TakeBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorTake(w, indices)))
+            return;
+
         var grad = new Tensor<T>(inputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
         using var dstLease = grad.LeaseWritable();
@@ -9217,6 +9506,10 @@ internal static partial class BackwardFunctions<T>
     {
         var mask = (Tensor<Bit>)savedState[0];
         var inputShape = (int[])savedState[1];
+
+        if (TryLinearBackward("MaskedSelectBackward", MaskedSelectBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorMaskedSelect(w, mask)))
+            return;
 
         var grad = new Tensor<T>(inputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -9258,6 +9551,9 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var equationStr = (string)savedState[0];
+        if (TryMultilinearBackward("EinsumBackward", EinsumBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorEinsum(equationStr, xs)))
+            return;
         var eq = Engines.Einsum.EinsumEquation.Parse(equationStr);
 
         string outLabels = eq.Output.ToString();
@@ -9355,6 +9651,9 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int offset = (int)savedState[0];
+        if (TryLinearBackward("DiagEmbedBackward", DiagEmbedBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorDiagEmbed(w, offset)))
+            return;
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
@@ -9462,6 +9761,10 @@ internal static partial class BackwardFunctions<T>
         int size = (int)savedState[1];
         int step = (int)savedState[2];
         int[] inputShape = (int[])savedState[3];
+
+        if (TryLinearBackward("UnfoldBackward", UnfoldParity210Backward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorUnfold(w, dim, size, step)))
+            return;
 
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
@@ -10267,6 +10570,10 @@ internal static partial class BackwardFunctions<T>
     {
         var input = inputs[0];
         int winLength = (int)savedState[0];
+        // The delta filter is linear in the signal: the adjoint of its backward is the filter itself.
+        if (TryLinearBackward("ComputeDeltasBackward", ComputeDeltasBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.ComputeDeltas(w, winLength)))
+            return;
         int n = winLength / 2;
         double denom = 0.0;
         for (int i = 1; i <= n; i++) denom += 2.0 * i * i;
