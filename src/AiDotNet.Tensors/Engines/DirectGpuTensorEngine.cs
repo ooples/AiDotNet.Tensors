@@ -6081,7 +6081,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public bool TryConcatenateChannelsResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        // AUTOCAST AND THE RESIDENT PATHS. Autocast computes only the ops on AutocastScope's FP16 list in FP16 (matmul,
+        // conv, elementwise arithmetic, activations). Everything else -- data movement (concat, slice, narrow,
+        // transpose, permute, tile), norms, softmax, reductions and the gradient reductions -- computes in FP32 under
+        // autocast too, so its resident FP32 path is exactly what autocast asks for and stays on. Switching those off
+        // sent an autocast training step through the host and the generic paths: slower than the same step in FP32
+        // (#1549 head-to-heads). ResolveResidentBufferNoUpload never returns an FP16 buffer to these FP32 paths.
+        if (!ResidentStepActive || typeof(T) != typeof(float)) return false;
         if (a is null || b is null || output is null) return false;
         if (a.Rank != 4 || b.Rank != 4 || output.Rank != 4) return false;
         if (!a.IsContiguous || !b.IsContiguous || !output.IsContiguous) return false;
@@ -6253,7 +6259,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         mean = null; variance = null;
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || input.Rank < 2) return false;
         var arr = output.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return false;
@@ -6596,7 +6602,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TrySliceAxisResidentInto<T>(Tensor<T> output, Tensor<T> input, int axis, int index)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || !input.IsContiguous) return false;
         if (axis < 0 || axis >= input.Rank) return false;
         int outerSize = 1; for (int i = 0; i < axis; i++) outerSize *= input.Shape._dims[i];
@@ -7642,7 +7648,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TensorNarrowIntoResident<T>(Tensor<T> output, Tensor<T> input, int dim, int start, int length)
     {
         using var __gpuOp = EnterGpuOp();
-        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float) || !input.IsContiguous) return false;
+        if (typeof(T) != typeof(float) || !input.IsContiguous) return false;
         if (!TryGetBackend(out var backend) || backend is not IGpuBatchExecution layout) return false;
         int rank = input.Rank;
         if ((uint)dim >= (uint)rank || start < 0 || length < 0 || start > input._shape[dim] - length) return false; // start + length can overflow
@@ -7912,7 +7918,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TrySoftmaxResidentInto<T>(Tensor<T> output, Tensor<T> input, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length) return false;
         int rank = input.Rank;
         int eff = axis < 0 ? rank + axis : axis;
@@ -16522,7 +16528,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         gradInput = null;
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive || input.Rank != 4
+        if (typeof(T) != typeof(float) || !ResidentStepActive || input.Rank != 4
             || gradOutput.Rank != 4 || !input.IsContiguous || !gradOutput.IsContiguous
             || poolSize is not { Length: 2 } || stride is not { Length: 2 })
             return false;
@@ -16678,7 +16684,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         gradInput = null; gradGamma = null; gradBeta = null;
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || backend is not ILayerNormBackwardPartsBackend parts) return false;
         // An input gradient to ADD lands in its accumulator only where the backend adds in the same pass; otherwise it
         // is formed in a temporary and the caller accumulates it.
@@ -16826,7 +16832,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // PR #638 A1: resident-step LayerNorm backward — all 3 grads (gradInput/gradGamma/gradBeta) into
             // resident-bound outputs, invVar computed on-GPU (AddScalar + RsqrtKernel), no host download/upload.
             // Inputs resolved no-upload (capture-safe); mean/variance come from the forward's resident scratch.
-            if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+            if (ResidentStepActive && typeof(T) == typeof(float))
             {
                 var gR = ResolveResidentBufferNoUpload(backend, gradOutput, input.Length);
                 var iR = ResolveResidentBufferNoUpload(backend, input, input.Length);
@@ -19730,7 +19736,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T>? TryReduceLeadingAxesResident<T>(Tensor<T> input, int[] sortedAxes, bool keepDims,
         IDirectGpuBackend backend, ReduceOperation op)
     {
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !input.IsContiguous
+        if (typeof(T) != typeof(float) || !input.IsContiguous
             || input._storageOffset != 0 || input.Length == 0)
             return null;
         var dims = input.Shape._dims;
@@ -19948,7 +19954,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> into)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive || !gradOutput.IsContiguous
+        if (typeof(T) != typeof(float) || !ResidentStepActive || !gradOutput.IsContiguous
             || inputShape is not { Length: > 0 } || axes.Length == 0)
             return false;
         if (!TryGetBackend(out var backend) || backend is not IBroadcastReducedBackend broadcast) return false;
@@ -20065,7 +20071,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Permute the input tensor. PR #638 A1: in the resident step, materialize on-GPU into a contiguous
             // resident buffer (TensorPermuteInto — no recording, no download) so the resident reduce below can read
             // it; otherwise the strided VIEW from PermuteImpl forces a host download in the reduction path.
-            if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+            if (ResidentStepActive && typeof(T) == typeof(float))
             {
                 var permArr = permutation.ToArray();
                 var permDims = new int[permArr.Length];
@@ -20097,7 +20103,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // output buffer; no GetDataArray download, no temp AllocateOutputBuffer, no result download (each aborts
         // capture). Only Sum/Mean/Max over a contiguous [outerSize, reduceSize] layout (the last-axis form the
         // permute above produces). Falls through to the host path when the input isn't resident.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && input.IsContiguous)
+        if (ResidentStepActive && typeof(T) == typeof(float) && input.IsContiguous)
         {
             var inResid = ResolveResidentBufferNoUpload(backend, input, outerSize * reduceSize);
             if (inResid is not null)
@@ -22261,7 +22267,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal bool TryRectSliceInto<T>(Tensor<T> source, int[] start, int[] length, Tensor<T> into)
     {
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (typeof(T) != typeof(float) || !ResidentStepActive) return false;
         if (!source.IsContiguous || source.Rank == 0 || source.Rank > RectSliceLimits.MaxRank
             || start.Length != source.Rank || length.Length != source.Rank) return false;
         if (!TryGetBackend(out var backend) || backend is not IRectSliceKernels rect) return false;
@@ -22446,7 +22452,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TrySumRowsIntoGradient<T>(Tensor<T> gradOutput, int rows, int cols, Tensor<T> into, bool add)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (typeof(T) != typeof(float) || !ResidentStepActive) return false;
         if (rows <= 1 || cols <= 0 || gradOutput.Length != (long)rows * cols || !gradOutput.IsContiguous
             || gradOutput._storageOffset != 0) return false;
         if (!TryGetBackend(out var backend)) return false;
@@ -24638,7 +24644,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int cols = tensor.Shape._dims[1];
             // PR #638 A1: resident-step 2D transpose into a resident-bound output (no temp/download), keeping the
             // backward transpose's grad resident for capture (used by FusedLinear/LayerNorm fallback weight^T).
-            if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+            if (ResidentStepActive && typeof(T) == typeof(float))
             {
                 var inResid = ResolveResidentBufferNoUpload(backend, tensor, tensor.Length);
                 if (inResid is not null)
@@ -24686,7 +24692,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // fresh contiguous resident buffer (via the resident TensorPermuteInto path) so the backward permute grad
         // stays resident + contiguous. Records PermuteBackward exactly as the base view path. Only in the resident
         // step — outside it the view contract (IsContiguous == false) is preserved.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        if (ResidentStepActive && typeof(T) == typeof(float)
             && axes.Length == tensor.Shape._dims.Length)
         {
             try
@@ -27699,7 +27705,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // PR #638 A1: resident-step tile of the TRAILING size-1 axis (..,1) → (..,cols) — the ReduceSum-backward
         // broadcast for any rank — via the resident outer-product GEMM (src[outer,1]·ones[1,cols]). No Tile kernel,
         // no download. Engages only when every non-last multiple is 1 and the source's last dim is 1.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        if (ResidentStepActive && typeof(T) == typeof(float)
             && tensor.Rank >= 1 && multiples.Length == tensor.Rank
             && tensor.Shape._dims[tensor.Rank - 1] == 1 && multiples[tensor.Rank - 1] >= 1)
         {
@@ -27732,7 +27738,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (axis >= 0 && axis < destination.Rank)
             CpuEngine.ValidateSliceSourceShape(destination._shape, source._shape, axis);
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        if (ResidentStepActive && typeof(T) == typeof(float)
             && destination.IsContiguous && axis >= 0 && axis < destination.Rank
             && index >= 0 && index < destination.Shape._dims[axis] && TryGetBackend(out var backend))
         {
@@ -29270,7 +29276,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // PR #638 A1: resident-step trailing-axis tile (the ReduceSum-backward broadcast [..,1]→[..,cols]) via the
         // resident outer-product GEMM — no UploadTensorRaw/DeferTensorResult download. Must live HERE (the explicit
         // interface impl), not the public override: BroadcastGradToShape calls engine.TensorTile via IEngine.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        if (ResidentStepActive && typeof(T) == typeof(float)
             && tensor.Rank >= 1 && multiples.Length == tensor.Rank
             && tensor.Shape._dims[tensor.Rank - 1] == 1 && multiples[tensor.Rank - 1] >= 1)
         {
