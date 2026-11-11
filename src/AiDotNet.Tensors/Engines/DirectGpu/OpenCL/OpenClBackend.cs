@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IIndexConversionBackend
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —

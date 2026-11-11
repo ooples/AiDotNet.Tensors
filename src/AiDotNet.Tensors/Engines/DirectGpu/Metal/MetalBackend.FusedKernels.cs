@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend
+public sealed partial class MetalBackend : IIndexConversionBackend
 {
     // All methods use Metal GPU dispatch via GetPipeline + DispatchThreadgroups.
     // CPU fallback only for ops where MSL kernel source doesn't exist yet.

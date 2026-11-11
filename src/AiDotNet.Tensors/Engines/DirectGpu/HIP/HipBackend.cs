@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// <item>RX 6800 XT: 8,000+ GFLOPS (optimized scalar)</item>
 /// </list>
 /// </remarks>
-public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted
+public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IIndexConversionBackend
 {
     /// <summary>
     /// HIP has no cuDNN-equivalent half/bfloat16 conv path yet — returns

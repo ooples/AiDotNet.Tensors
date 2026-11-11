@@ -4683,7 +4683,7 @@ public partial class DirectGpuTensorEngine
             return GetOrAllocateBuffer(backend, indices);
         using var raw = GetOrAllocateBuffer(backend, indices);
         var numeric = AllocateOutputBuffer(backend, Math.Max(1, indices.Length));
-        backend.Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
+        IndexConversion(backend).Int32ToFloat(raw.Buffer, numeric.Buffer, indices.Length);
         return numeric;
     }
 
@@ -9632,6 +9632,11 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private const int MaxExactScatterPositions = (1 << 24) + 1;
 
+    // The index helpers live on an internal interface (IDirectGpuBackend has shipped); every backend implements it.
+    private static IIndexConversionBackend IndexConversion(IDirectGpuBackend backend)
+        => backend as IIndexConversionBackend
+           ?? throw new NotSupportedException(backend.BackendName + " has no index conversion kernels.");
+
     /// <summary>
     /// For a scatter of [outer, srcDim, inner] writes into [outer, dstDim, inner]: <paramref name="claims"/> gets, per
     /// destination slot, the position j of the last write to it (-1 where nothing writes), and <paramref name="winners"/>
@@ -9643,7 +9648,7 @@ public partial class DirectGpuTensorEngine
     {
         int n = outer * dstDim * inner, m = outer * srcDim * inner;
         // Each write's position j along the axis, generated on the device (no host upload, so graph capture holds).
-        backend.ScatterPositions(positions, srcDim, inner, m);
+        IndexConversion(backend).ScatterPositions(positions, srcDim, inner, m);
         backend.Fill(claims, -1f, n);
         backend.ScatterReduce(claims, positions, int32Index, outer, srcDim, dstDim, inner, 2);
         backend.TakeAlongDim(claims, floatIndex, winners, outer, srcDim, inner, dstDim);
