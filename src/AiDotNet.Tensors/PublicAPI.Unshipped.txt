@@ -133,3 +133,31 @@ virtual AiDotNet.Tensors.Engines.CpuEngine.CausalDepthwiseConv1DBackwardKernel<T
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1D<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardInput<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardKernel<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, int taps) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.Float16 = 0 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.Float32 = 1 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.Float64 = 2 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.Int8 = 3 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.UInt8 = 4 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.Int16 = 5 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.UInt16 = 6 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.Int32 = 7 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.UInt32 = 8 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageType.Int64 = 9 -> AiDotNet.Tensors.Engines.NumericStorageType
+AiDotNet.Tensors.Engines.NumericStorageTypeExtensions
+static AiDotNet.Tensors.Engines.NumericStorageTypeExtensions.GetByteWidth(this AiDotNet.Tensors.Engines.NumericStorageType type) -> int
+AiDotNet.Tensors.Engines.TensorDataEngineExtensions
+static AiDotNet.Tensors.Engines.TensorDataEngineExtensions.TensorFromBytes<T>(this AiDotNet.Tensors.Engines.IEngine! engine, System.ReadOnlySpan<byte> data, AiDotNet.Tensors.Engines.NumericStorageType sourceType, int[]! shape, bool littleEndian = true) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.TensorDataEngineExtensions.TensorParse<T>(this AiDotNet.Tensors.Engines.IEngine! engine, System.Collections.Generic.IReadOnlyList<string?>! tokens, int[]! shape, System.Globalization.NumberStyles styles, System.IFormatProvider! provider, T missingValue) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.TensorDataEngineExtensions.TensorParse<T>(this AiDotNet.Tensors.Engines.IEngine! engine, System.ReadOnlySpan<byte> utf8Text, byte delimiter, int[]! shape, System.Globalization.NumberStyles styles, System.IFormatProvider! provider, T missingValue) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.TensorDataEngineExtensions.TensorRandomUniformRange<T>(this AiDotNet.Tensors.Engines.IEngine! engine, System.Random! generator, int[]! shape, double min, double max) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.TensorDataEngineExtensions.TensorRandomUniformRangeInto<T>(this AiDotNet.Tensors.Engines.IEngine! engine, System.Random! generator, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! destination, double min, double max) -> void
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorFromBytes<T>(System.ReadOnlySpan<byte> data, AiDotNet.Tensors.Engines.NumericStorageType sourceType, int[]! shape, bool littleEndian = true) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorParse<T>(System.Collections.Generic.IReadOnlyList<string?>! tokens, int[]! shape, System.Globalization.NumberStyles styles, System.IFormatProvider! provider, T missingValue) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorParse<T>(System.ReadOnlySpan<byte> utf8Text, byte delimiter, int[]! shape, System.Globalization.NumberStyles styles, System.IFormatProvider! provider, T missingValue) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorRandomUniformFromGenerator<T>(System.Random! generator, int[]! shape, double min, double max) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorRandomUniformFromGeneratorInto<T>(System.Random! generator, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! destination, double min, double max) -> void
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorFromBytes<T>(System.ReadOnlySpan<byte> data, AiDotNet.Tensors.Engines.NumericStorageType sourceType, int[]! shape, bool littleEndian = true) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorParse<T>(System.Collections.Generic.IReadOnlyList<string?>! tokens, int[]! shape, System.Globalization.NumberStyles styles, System.IFormatProvider! provider, T missingValue) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorParse<T>(System.ReadOnlySpan<byte> utf8Text, byte delimiter, int[]! shape, System.Globalization.NumberStyles styles, System.IFormatProvider! provider, T missingValue) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorRandomUniformFromGenerator<T>(System.Random! generator, int[]! shape, double min, double max) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
