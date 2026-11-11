@@ -534,6 +534,10 @@ public partial class CpuEngine
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+                e => GlaScanComposite(e, inputs[0], inputs[1], inputs[2], inputs[3], numHeads)))
+            return;
         // Device backward on the GPU engine. A compiled plan records this function from the CPU base (GraphMode)
         // and replays it on the GPU engine, so it ran the managed BPTT recurrence with host copies around it on
         // every compiled GPU step.
@@ -593,5 +597,25 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, kProj, dK, engine);
         DifferentiableOps.AccumulateGrad(grads, vProj, dV, engine);
         DifferentiableOps.AccumulateGrad(grads, gate, dG, engine);
+    }
+
+    // The GLA recurrence as recorded ops, per head: S_t = g_t S_{t-1} + v_t k_tᵀ, o_t = S_t q_t.
+    private static Tensor<T> GlaScanComposite<T>(IEngine e, Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,
+        Tensor<T> gate, int numHeads)
+    {
+        int batch = qProj.Shape[0], seqLen = qProj.Shape[1], modelDim = qProj.Shape[2], headDim = modelDim / numHeads;
+        Tensor<T> state = RecordedOps<T>.Zeros(batch, numHeads, headDim, headDim);
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var q = RecordedOps<T>.R(e, RecordedOps<T>.At(e, qProj, 1, t), batch, numHeads, 1, headDim);
+            var k = RecordedOps<T>.R(e, RecordedOps<T>.At(e, kProj, 1, t), batch, numHeads, 1, headDim);
+            var v = RecordedOps<T>.R(e, RecordedOps<T>.At(e, vProj, 1, t), batch, numHeads, headDim, 1);
+            var g = RecordedOps<T>.R(e, RecordedOps<T>.At(e, gate, 1, t), batch, numHeads, 1, 1);
+            state = e.TensorAdd(RecordedOps<T>.Mul(e, g, state), RecordedOps<T>.Mul(e, v, k));
+            var o = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, state, q), 3, keep: false);   // [B, H, D]
+            ys.Add(RecordedOps<T>.R(e, o, batch, modelDim));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 }

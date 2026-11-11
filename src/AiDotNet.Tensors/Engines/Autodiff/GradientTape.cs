@@ -1249,6 +1249,35 @@ public sealed class GradientTape<T> : IDisposable
         var engine = _engine;
         var numOps = MathHelper.GetNumericOperations<T>();
 
+        // A walk nested inside another pass's backward (a backward differentiating a composite of recorded ops under a
+        // nested tape, as create-graph backwards do) shares tensors with the outer pass, which has already indexed them
+        // into ITS array. Those indices mean nothing here - read as this walk's slots they alias other tensors (a
+        // gradient was added to one of a different shape) - so they are set aside for this walk and restored after it,
+        // along with the outer pass's arrays.
+        var outerIndexedGrads = DifferentiableOps._indexedGrads;
+        var outerIndexedSparseGrads = DifferentiableOps._indexedSparseGrads;
+        List<KeyValuePair<Tensor<T>, int>>? displacedGradIndices = null;
+        if (outerIndexedGrads is not null)
+        {
+            displacedGradIndices = new List<KeyValuePair<Tensor<T>, int>>();
+            void Displace(Tensor<T>? t)
+            {
+                if (t is null || t._gradIndex < 0) return;
+                displacedGradIndices.Add(new KeyValuePair<Tensor<T>, int>(t, t._gradIndex));
+                t._gradIndex = -1;
+            }
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                ref var e = ref _entries[i];
+                Displace(e.Output);
+                Displace(e.Input0);
+                if (e.InputCount >= 2) Displace(e.Input1);
+                if (e.InputCount >= 3) Displace(e.Input2);
+                if (e.InputsOverflow != null)
+                    foreach (var inp in e.InputsOverflow) Displace(inp);
+            }
+        }
+
         // Assign gradient indices to all tensors that appear in the tape.
         // This enables O(1) array access in AccumulateGrad instead of dictionary hash lookup.
         int gradIndexCount = 0;
@@ -1525,6 +1554,13 @@ public sealed class GradientTape<T> : IDisposable
                 if (e.InputCount >= 3 && e.Input2 != null) e.Input2._gradIndex = -1;
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
+            }
+            // A nested walk hands the outer pass back its arrays and indices (see where they were set aside).
+            if (outerIndexedGrads is not null)
+            {
+                DifferentiableOps.SetIndexedGrads(outerIndexedGrads);
+                if (outerIndexedSparseGrads is not null) DifferentiableOps.SetIndexedSparseGrads(outerIndexedSparseGrads);
+                foreach (var displaced in displacedGradIndices!) displaced.Key._gradIndex = displaced.Value;
             }
             // The slow tape walk may skip pruned or gradient-dead entries, but all
             // entries acquired saved-state pins at record time. Release the original

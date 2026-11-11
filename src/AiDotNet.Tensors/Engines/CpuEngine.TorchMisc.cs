@@ -16,23 +16,24 @@ public partial class CpuEngine
     {
         if (alpha == 0) throw new ArgumentOutOfRangeException(nameof(alpha), "alpha must be non-zero.");
         return SpecialUnary("TensorCelu", tensor, x => x > 0 ? x : alpha * (Math.Exp(x / alpha) - 1),
-            (x, _) => x > 0 ? 1 : Math.Exp(x / alpha), e => e.TensorCelu(tensor, alpha));
+            (x, _) => x > 0 ? 1 : Math.Exp(x / alpha), e => e.TensorCelu(tensor, alpha), (e, x, _) => DCelu(e, x, alpha));
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorHardtanh<T>(Tensor<T> tensor, double minValue = -1.0, double maxValue = 1.0)
         => SpecialUnary("TensorHardtanh", tensor, x => Math.Min(Math.Max(x, minValue), maxValue),
-            (x, _) => x > minValue && x < maxValue ? 1 : 0, e => e.TensorHardtanh(tensor, minValue, maxValue));
+            (x, _) => x > minValue && x < maxValue ? 1 : 0, e => e.TensorHardtanh(tensor, minValue, maxValue),
+            (_, x, _) => BackwardFunctions<T>.HostMask(x, v => v > minValue && v < maxValue));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogSigmoid<T>(Tensor<T> tensor)
         => SpecialUnary("TensorLogSigmoid", tensor, x => Math.Min(x, 0) - Math.Log(1 + Math.Exp(-Math.Abs(x))),
-            (x, _) => 1 / (1 + Math.Exp(x)), e => e.TensorLogSigmoid(tensor));
+            (x, _) => 1 / (1 + Math.Exp(x)), e => e.TensorLogSigmoid(tensor), (e, x, _) => e.TensorSigmoid(e.TensorNegate(x)));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSoftsign<T>(Tensor<T> tensor)
         => SpecialUnary("TensorSoftsign", tensor, x => x / (1 + Math.Abs(x)),
-            (x, _) => 1 / ((1 + Math.Abs(x)) * (1 + Math.Abs(x))), e => e.TensorSoftsign(tensor));
+            (x, _) => 1 / ((1 + Math.Abs(x)) * (1 + Math.Abs(x))), e => e.TensorSoftsign(tensor), DSoftsign<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSoftmin<T>(Tensor<T> tensor, int axis = -1) => Softmax(TensorNegate(tensor), axis);
@@ -160,6 +161,17 @@ public partial class CpuEngine
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var source = (int[])savedState[0];
+        if (BackwardFunctions<T>.CreatesGraph)
+        {
+            // The same scatter-add as a recorded sparse map, so the gradient stays connected to the upstream gradient.
+            var to = new List<int>(source.Length);
+            var from = new List<int>(source.Length);
+            for (int o = 0; o < source.Length; o++)
+                if (source[o] >= 0) { to.Add(source[o]); from.Add(o); }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], BackwardFunctions<T>.SparseMap(gradOutput,
+                (int[])inputs[0]._shape.Clone(), to.ToArray(), from.ToArray(), null), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).AsSpan();
         var gx = new Tensor<T>((int[])inputs[0]._shape.Clone());
@@ -255,6 +267,25 @@ public partial class CpuEngine
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var fromSrc = (int[])savedState[0];
+        if (BackwardFunctions<T>.CreatesGraph)
+        {
+            // The same split of the upstream gradient (kept positions to the input, the diagonal to src) as recorded
+            // sparse maps.
+            var keepTo = new List<int>(fromSrc.Length);
+            var srcTo = new List<int>();
+            var srcFrom = new List<int>();
+            for (int i = 0; i < fromSrc.Length; i++)
+            {
+                if (fromSrc[i] < 0) keepTo.Add(i);
+                else { srcTo.Add(fromSrc[i]); srcFrom.Add(i); }
+            }
+            var kept = keepTo.ToArray();
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], BackwardFunctions<T>.SparseMap(gradOutput,
+                (int[])inputs[0]._shape.Clone(), kept, kept, null), engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], BackwardFunctions<T>.SparseMap(gradOutput,
+                (int[])inputs[1]._shape.Clone(), srcTo.ToArray(), srcFrom.ToArray(), null), engine);
+            return;
+        }
         var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).AsSpan();
         var gInput = new Tensor<T>((int[])inputs[0]._shape.Clone());
         var gSrc = new Tensor<T>((int[])inputs[1]._shape.Clone());

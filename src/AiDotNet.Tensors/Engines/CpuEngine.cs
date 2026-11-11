@@ -9828,7 +9828,12 @@ public partial class CpuEngine : ITensorLevelEngine
             && ReferenceEquals(input, inputOrig) && input.Layout == LinearAlgebra.TensorLayout.Nchw;
         if (tape is not null && !recomputeBackward)
         {
-            var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
+            // MaxPool2DWithIndices records its own edge; recorded here as well, the output would have two producers,
+            // which a tape walk (create-graph backward) runs both of, doubling the gradient.
+            Tensor<T> resultWithIdx;
+            int[,,,,] maxIndices;
+            using (new NoGradScope<T>())
+                resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out maxIndices);
             DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, inputOrig, BackwardFunctions<T>.MaxPool2DBackward,
                 new object[] { maxIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
             AutoTracer.RecordOp("MaxPool2D", resultWithIdx, eng => resultWithIdx);
@@ -10408,14 +10413,20 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("DepthwiseConv1D", input._shape); if (ac is not null) return ac.Execute(); }
 
-        // Reshape to 4D: [B, C, 1, L] and [C, multiplier, 1, K]
-        var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
-        var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
+        // Reshape to 4D: [B, C, 1, L] and [C, multiplier, 1, K]. Unrecorded: the op records its own edge below, and the
+        // composite's edges would make a second producer of the result (a tape walk, as in a create-graph backward,
+        // ran both and doubled the gradient).
+        Tensor<T> result;
+        using (new NoGradScope<T>())
+        {
+            var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
+            var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
 
-        var result4D = DepthwiseConv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding });
+            var result4D = DepthwiseConv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding });
 
-        // Squeeze height dimension: [B, C*mult, 1, outL] -> [B, C*mult, outL]
-        var result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+            // Squeeze height dimension: [B, C*mult, 1, outL] -> [B, C*mult, outL]
+            result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+        }
 
         DifferentiableOps.RecordBinary("DepthwiseConv1D", result, input, kernel, BackwardFunctions<T>.DepthwiseConv1DBackward,
             new object[] { stride, padding });
@@ -26105,25 +26116,24 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!input.IsContiguous) input = input.Contiguous();
-
-        var numOps = MathHelper.GetNumericOperations<T>();
         int rank = output.Rank;
         if (axis < 0) axis = rank + axis;
 
-        var gradOutputData = gradOutput.GetFlattenedData();
-        var inputData = input.GetFlattenedData();
-        using var outputDataLease = output.LeaseArray();
-        var outputData = outputDataLease.Array;
+        // In double precision. The forward evaluates g(x) = Σ_{n≤order} xⁿ/n! at z = x - max(x) (the first maximum
+        // along the axis) and normalises, y = g(z)/Σg(z), so
+        //   ∂L/∂z_i = y_i·(∂L/∂y_i - Σ_j ∂L/∂y_j·y_j)·g'(z_i)/g(z_i),   ∂L/∂x_k = ∂L/∂z_k - [k = argmax]·Σ_i ∂L/∂z_i.
+        // Evaluating g at x itself and dropping the max term gave the gradient of a different function: g is not
+        // shift-invariant the way exp is.
+        var gradOut = RoIAlignPlan.ToDoubles(gradOutput);
+        var xs = RoIAlignPlan.ToDoubles(input);
+        var ys = RoIAlignPlan.ToDoubles(output);
         var shape = output._shape;
-        var gradInputData = new T[output.Length];
+        var gradIn = new double[output.Length];
 
-        // Precompute factorials for derivative
-        var factorials = new double[order + 1];
-        factorials[0] = 1;
+        var inverseFactorials = new double[order + 1];
+        inverseFactorials[0] = 1;
         for (int i = 1; i <= order; i++)
-            factorials[i] = factorials[i - 1] * i;
+            inverseFactorials[i] = inverseFactorials[i - 1] / i;
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
@@ -26133,58 +26143,36 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int outer = idx / innerSize;
             int inner = idx % innerSize;
+            int baseIdx = outer * axisSize * innerSize + inner;
 
-            // Compute g(x) and g'(x) for each position
-            var gValues = new T[axisSize];
-            var gPrimeValues = new T[axisSize];
-            T sumG = numOps.Zero;
+            double maxVal = xs[baseIdx];
+            int argMax = 0;
+            for (int i = 1; i < axisSize; i++)
+                if (xs[baseIdx + i * innerSize] > maxVal) { maxVal = xs[baseIdx + i * innerSize]; argMax = i; }
 
+            double dot = 0;
+            for (int i = 0; i < axisSize; i++) dot += gradOut[baseIdx + i * innerSize] * ys[baseIdx + i * innerSize];
+
+            double shiftGrad = 0;
             for (int i = 0; i < axisSize; i++)
             {
-                int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                var x = inputData[flatIdx];
-
-                // g(x) = Taylor approximation
-                var g = numOps.One;
-                var xPower = numOps.One;
+                int flatIdx = baseIdx + i * innerSize;
+                double z = xs[flatIdx] - maxVal;
+                double g = 1, gPrime = 1, power = 1;
                 for (int n = 1; n <= order; n++)
                 {
-                    xPower = numOps.Multiply(xPower, x);
-                    g = numOps.Add(g, numOps.Divide(xPower, numOps.FromDouble(factorials[n])));
+                    power *= z;
+                    g += power * inverseFactorials[n];
+                    if (n < order) gPrime += power * inverseFactorials[n];
                 }
-
-                // g'(x) = derivative of Taylor = 1 + x + x^2/2! + ... (shifted)
-                var gPrime = numOps.One;
-                xPower = numOps.One;
-                for (int n = 1; n < order; n++)
-                {
-                    xPower = numOps.Multiply(xPower, x);
-                    gPrime = numOps.Add(gPrime, numOps.Divide(xPower, numOps.FromDouble(factorials[n])));
-                }
-
-                gValues[i] = g;
-                gPrimeValues[i] = gPrime;
-                sumG = numOps.Add(sumG, g);
+                double dz = ys[flatIdx] * (gradOut[flatIdx] - dot) * gPrime / g;
+                gradIn[flatIdx] = dz;
+                shiftGrad += dz;
             }
-
-            // Compute gradient using chain rule: grad = softmaxGrad * g'(x) / g(x)
-            T dotProduct = numOps.Zero;
-            for (int i = 0; i < axisSize; i++)
-            {
-                int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                dotProduct = numOps.Add(dotProduct, numOps.Multiply(gradOutputData[flatIdx], outputData[flatIdx]));
-            }
-
-            for (int i = 0; i < axisSize; i++)
-            {
-                int flatIdx = (outer * axisSize + i) * innerSize + inner;
-                var softmaxGrad = numOps.Multiply(outputData[flatIdx], numOps.Subtract(gradOutputData[flatIdx], dotProduct));
-                var gPrimeOverG = numOps.Divide(gPrimeValues[i], gValues[i]);
-                gradInputData[flatIdx] = numOps.Multiply(softmaxGrad, gPrimeOverG);
-            }
+            gradIn[baseIdx + argMax * innerSize] -= shiftGrad;
         });
 
-        return TensorAllocator.Rent<T>(shape, gradInputData);
+        return RoIAlignPlan.FromDoubles<T>(gradIn, (int[])shape.Clone());
     }
 
     /// <inheritdoc/>
@@ -51073,7 +51061,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Flatten", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        var result = tensor.Reshape([tensor.Length]);
+        // The engine records Flatten itself: Tensor.Reshape's own view edge would be a second producer of the same
+        // output, which a tape walk (create-graph backward) runs twice, doubling the gradient.
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Reshape([tensor.Length]);
         DifferentiableOps.RecordUnary("Flatten", result, tensor, BackwardFunctions<T>.FlattenBackward);
         AutoTracer.RecordOp("Flatten", result, eng => eng.TensorFlatten(tensor));
         return result;

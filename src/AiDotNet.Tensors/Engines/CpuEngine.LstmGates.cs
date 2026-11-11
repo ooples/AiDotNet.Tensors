@@ -70,6 +70,21 @@ public partial class CpuEngine
     private static void LstmGateBackward<T>(Tensor<T> gradient, Tensor<T>[] inputs, Tensor<T> output,
         object[]? saved, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Under create-graph: differentiate the packet [h, c] written with the recorded gate ops (the decomposed form
+        // the non-float element types run), so the gradient stays a node of the graph.
+        if (BackwardFunctions<T>.TryCompositeBackward(gradient, inputs, engine, grads, e =>
+            {
+                var gates = inputs[0];
+                var previousCell = inputs[1];
+                int hidden = previousCell.Shape[previousCell.Rank - 1];
+                Tensor<T> Gate(int i) => e.TensorNarrow(gates, gates.Rank - 1, i * hidden, hidden);
+                var c = e.TensorAdd(e.TensorMultiply(e.TensorSigmoid(Gate(1)), previousCell),
+                    e.TensorMultiply(e.TensorSigmoid(Gate(0)), e.Tanh(Gate(2))));
+                var h = e.TensorMultiply(e.TensorSigmoid(Gate(3)), e.Tanh(c));
+                int count = previousCell.Length;
+                return e.Concat(new[] { e.Reshape(h, new[] { count }), e.Reshape(c, new[] { count }) }, 0);
+            }))
+            return;
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryLstmGateBackward(gradient, inputs, output, grads)) return;
         if (typeof(T) == typeof(float))
         {

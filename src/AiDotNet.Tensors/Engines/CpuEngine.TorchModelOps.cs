@@ -23,7 +23,7 @@ public partial class CpuEngine
     {
         var f = CpuFusedOperations.GetDoubleActivation(type, parameters);
         var derivative = CpuFusedOperations.GetDoubleActivationDerivative(type, parameters);
-        return SpecialUnary(opName, tensor, f, (x, _) => derivative(x), replay);
+        return SpecialUnary(opName, tensor, f, (x, _) => derivative(x), replay, FusedKernelRecordedDerivative<T>(type, parameters));
     }
 
     /// <inheritdoc/>
@@ -104,7 +104,8 @@ public partial class CpuEngine
                 double sigmoid = 1.0 / (1.0 + Math.Exp(-surrogateBeta * (v - threshold)));
                 return surrogateBeta * sigmoid * (1.0 - sigmoid);
             },
-            e => e.TensorSurrogateSpike(membranePotential, threshold, surrogateBeta));
+            e => e.TensorSurrogateSpike(membranePotential, threshold, surrogateBeta),
+            (e, v, _) => DSurrogateSpike(e, v, threshold, surrogateBeta));
     }
 
     /// <inheritdoc/>
@@ -241,7 +242,7 @@ public partial class CpuEngine
 
         var result = RoIAlignPlan.FromDoubles<T>(y, new[] { batch, embeddingDim });
         DifferentiableOps.RecordUnary("TensorSinusoidalTimeEmbedding", result, timesteps,
-            BackwardFunctions<T>.SinusoidalTimeEmbeddingBackward, new object[] { freq, embeddingDim });
+            BackwardFunctions<T>.SinusoidalTimeEmbeddingBackwardWithSecondOrder, new object[] { freq, embeddingDim });
         return result;
     }
 
@@ -314,7 +315,7 @@ public partial class CpuEngine
         var inputs = new List<Tensor<T>>(4) { emissions, transitions };
         if (startScores is not null) inputs.Add(startScores);
         if (endScores is not null) inputs.Add(endScores);
-        DifferentiableOps.RecordIfActive("TensorCrfForward", result, inputs.ToArray(), BackwardFunctions<T>.CrfForwardBackward,
+        DifferentiableOps.RecordIfActive("TensorCrfForward", result, inputs.ToArray(), BackwardFunctions<T>.CrfForwardBackwardWithSecondOrder,
             new object[] { state });
         return result;
     }
