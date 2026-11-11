@@ -118,7 +118,7 @@ internal sealed class OptimizedBackwardPlan<T>
         // Reclaim graph-owned activation storages progressively after their final declared backward use.
         // Storage identity, not Tensor object identity, is the lifetime unit because metadata views alias their
         // source. Loss/source/retain-grad storages remain protected for the caller.
-        var gpuEngine = _engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        var gpuEngine = _engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
         HashSet<object>? protectedStorages = null;
         if (gpuEngine is not null)
         {

@@ -194,7 +194,7 @@ namespace AiDotNet.Tensors.Engines
         {
             lock (_lock)
             {
-                if (_default is IDisposable disposable)
+                if (_default.TryGet<IDisposable>(out var disposable))
                 {
                     disposable.Dispose();
                 }

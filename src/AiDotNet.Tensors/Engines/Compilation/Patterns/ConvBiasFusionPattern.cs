@@ -34,7 +34,7 @@ internal sealed class ConvBiasFusionPattern : IFusionPattern
     {
         fused = null;
         if (nodes[index] is not LazyNode<float> conv || conv.OpType != LazyNodeType.Conv2D || conv.OpName != "Conv2D"
-            || conv.RecordingEngine is not DirectGpuTensorEngine
+            || !conv.RecordingEngine.Is<DirectGpuTensorEngine>()
             || conv.SavedState is not { Length: 3 } saved || saved[0] is not int[] stride || saved[1] is not int[] padding
             || saved[2] is not int[] dilation || stride.Length != 2 || padding.Length != 2 || dilation.Length != 2
             || conv.Input1 is not { } kernel || !PatternHelpers.FanOutAtMostOne(conv, consumerCounts))

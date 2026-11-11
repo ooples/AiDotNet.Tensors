@@ -2571,7 +2571,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { xOrig, gamma, beta }, x._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                             cpuEng.BatchNormInferenceInto(output, capX, capG, capB, capM, capV, capE);
                         else
                         {
@@ -2664,7 +2664,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { x, gamma, beta, mean, variance }, x._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                         {
                             cpuEng.BatchNormInferenceInto(output, capX, capG, capB, capM, capV, capE);
                         }
@@ -2852,7 +2852,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // ~50 µs per call = ~1.2 ms aggregate per BERT inference.
                     (eng, output) =>
                     {
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                        if (typeof(T) == typeof(float) && eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                         {
                             cpuEng.BatchMatMulFloatInto(
                                 (Tensor<float>)(object)capturedA,
@@ -3568,7 +3568,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // A float add on the CPU writes the recorded output directly: the eager op's result was an
                     // activation-sized temporary per convolution, garbage the moment it was copied in.
                     // Only CPU-backed operands: a bias or input another engine left resident on a device has no array.
-                    if (typeof(T) == typeof(float) && engine is CpuEngine cpuEngine && !engine.SupportsGpu
+                    if (typeof(T) == typeof(float) && engine.TryGet<CpuEngine>(out var cpuEngine) && !engine.SupportsGpu
                         && capturedInput.IsContiguous && capturedBias.IsContiguous && output.IsContiguous
                         && capturedInput.GetCpuBackingForStridedRead(out _) is not null
                         && capturedBias.GetCpuBackingForStridedRead(out _) is not null
@@ -3672,7 +3672,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // GPU-resident trailing-broadcast add into output's stable buffer (no host fallback that
                         // breaks CUDA-graph capture); else the eager allocating path.
-                        if (eng is DirectGpuTensorEngine baGpu && baGpu.TryBroadcastAddResidentInto(output, capturedA, capturedB))
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var baGpu) && baGpu.TryBroadcastAddResidentInto(output, capturedA, capturedB))
                             return;
                         var eager = eng.TensorAdd(capturedA, capturedB);
                         DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
@@ -4528,7 +4528,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Under a gradient tape the write is differentiated through the out-of-place op: the tensor's history moves to
         // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
-        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorBroadcastAddInPlace", (e, x) => ((CpuEngine)e).TensorBroadcastAdd(x, ReferenceEquals(b, a) ? x : b)); return; }
+        if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorBroadcastAddInPlace", (e, x) => e.Cast<CpuEngine>().TensorBroadcastAdd(x, ReferenceEquals(b, a) ? x : b)); return; }
 
         // A non-contiguous target (a transpose, a strided slice) used to be swapped for a contiguous
         // COPY here, so every kernel below added into the copy and the caller's tensor came back
@@ -6344,7 +6344,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // GPU-resident elementwise multiply into output's stable buffer (no host materialize that
                         // breaks CUDA-graph capture); else the host write-through.
-                        if (eng is DirectGpuTensorEngine mGpu && mGpu.TryMultiplyResidentInto(output, capturedA, capturedB))
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var mGpu) && mGpu.TryMultiplyResidentInto(output, capturedA, capturedB))
                             return;
                         eng.TensorMultiplyInto(output, capturedA, capturedB);
                     },
@@ -6957,9 +6957,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // GPU-resident scalar multiply into output's stable buffer (no host materialize that breaks
                         // CUDA-graph capture — the attention QK^T·1/√d scaling); else the host path.
-                        if (eng is DirectGpuTensorEngine sclGpu && sclGpu.TryMultiplyScalarResidentInto(output, captured, capturedScalar))
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var sclGpu) && sclGpu.TryMultiplyScalarResidentInto(output, captured, capturedScalar))
                             return;
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
                         else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.MultiplyScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
@@ -7039,7 +7039,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // Device divide into output's stable buffer on the resident compiled step; else the host
                         // write, which bumps the version so a cached device copy of the output is not reused.
-                        if (eng is DirectGpuTensorEngine dGpu && dGpu.TryBinaryResidentInto(output, capturedA, capturedB,
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var dGpu) && dGpu.TryBinaryResidentInto(output, capturedA, capturedB,
                                 static (be, ia, ib, o, n) => be.Divide(ia, ib, o, n), "Divide"))
                             return;
                         using var capturedAKeep1 = new KeepAliveScope(capturedA);
@@ -7369,7 +7369,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorLog", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorLogInto(output, captured);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorLogInto(output, captured);
                         else { var r = eng.TensorLog(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.LogBackward);
@@ -7439,7 +7439,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorExp", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorExpInto(output, captured);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorExpInto(output, captured);
                         else { var r = eng.TensorExp(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ExpBackward);
@@ -7514,7 +7514,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSqrt", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorSqrtInto(output, captured);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorSqrtInto(output, captured);
                         else { var r = eng.TensorSqrt(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SqrtBackward);
@@ -7568,7 +7568,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorAbs", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorAbsInto(output, captured);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorAbsInto(output, captured);
                         else { var r = eng.TensorAbs(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AbsBackward);
@@ -7639,7 +7639,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         // During CUDA-graph capture the GPU engine keeps this resident (no AsSpan download → CUDA-900).
-                        if (eng is DirectGpuTensorEngine gpu && gpu.TensorNegateIntoResident(output, captured)) return;
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TensorNegateIntoResident(output, captured)) return;
                         using var capturedKeep1 = new KeepAliveScope(captured);
                         using var outputKeep3 = new KeepAliveScope(output);
                         MathHelper.GetNumericOperations<T>().Negate(captured.AsSpanUnmarked(), output.AsWritableSpanUnmarked());
@@ -8045,7 +8045,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Sin", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorSinInto(output, captured);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorSinInto(output, captured);
                         else { var r = eng.TensorSin(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SinBackward);
@@ -8074,7 +8074,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("Sin", result, tensorOrig,
             BackwardFunctions<T>.SinBackward);
-        { var c = tensor; AutoTracer.RecordOp("Sin", result, eng => ((CpuEngine)eng).TensorSin(c)); }
+        { var c = tensor; AutoTracer.RecordOp("Sin", result, eng => eng.Cast<CpuEngine>().TensorSin(c)); }
         return result;
     }
 
@@ -8094,7 +8094,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Cos", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorCosInto(output, captured);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorCosInto(output, captured);
                         else { var r = eng.TensorCos(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.CosBackward);
@@ -8123,7 +8123,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         DifferentiableOps.RecordUnary("Cos", result, tensorOrig,
             BackwardFunctions<T>.CosBackward);
-        { var c = tensor; AutoTracer.RecordOp("Cos", result, eng => ((CpuEngine)eng).TensorCos(c)); }
+        { var c = tensor; AutoTracer.RecordOp("Cos", result, eng => eng.Cast<CpuEngine>().TensorCos(c)); }
         return result;
     }
 
@@ -9772,7 +9772,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2D", input, outputShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
                         else { var eager = eng.MaxPool2D(captured, ps, st, pd); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
                     // The node saves no argmax, so its backward recovers the winners from the input: MaxPool2DBackward
@@ -10258,7 +10258,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool2D", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.AvgPool2DInto(output, captured, ps, s, p, cip);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.AvgPool2DInto(output, captured, ps, s, p, cip);
                         else { var r = eng.AvgPool2D(captured, ps, s, p, cip); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AvgPool2DBackward, AvgPool2DSavedState(poolSize, st, padding, countIncludePad));
@@ -10512,7 +10512,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.Conv2DInto(output, capturedInput, capturedKernel, s, p, d);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.Conv2DInto(output, capturedInput, capturedKernel, s, p, d);
                         else { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
@@ -13141,7 +13141,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Mish", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.MishInto(output, captured);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.MishInto(output, captured);
                         else { var r = eng.Mish(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.MishBackward);
@@ -13280,7 +13280,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.ELU, "ELU", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.ELUInto(output, captured, capturedAlpha);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.ELUInto(output, captured, capturedAlpha);
                         else { var r = eng.ELU(captured, capturedAlpha); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ELUBackward, new object[] { alpha });
@@ -14306,19 +14306,19 @@ public partial class CpuEngine : ITensorLevelEngine
                         // CUDA-graph capture): 2D / ND×2D first, then ND×ND BATCHED (attention QK^T / AV via
                         // cublasSgemmStridedBatched — without it the 4D attention matmuls host-fall-back = CUDA-900
                         // that aborts capture, #38). Single type check; else the host write-through path below.
-                        if (eng is DirectGpuTensorEngine mmGpu)
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var mmGpu))
                         {
                             if (mmGpu.TryMatMulResidentInto(output, capturedA, capturedB)) return;
                             if (mmGpu.TryBatchedMatMulResidentInto(output, capturedA, capturedB)) return;
                         }
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF && !eng.SupportsGpu)
+                        if (typeof(T) == typeof(float) && eng.TryGet<CpuEngine>(out var cpuEngF) && !eng.SupportsGpu)
                         {
                             cpuEngF.TensorMatMulFloatInto(
                                 (Tensor<float>)(object)capturedA,
                                 (Tensor<float>)(object)capturedB,
                                 (Tensor<float>)(object)output);
                         }
-                        else if (typeof(T) == typeof(double) && eng is CpuEngine cpuEngD && !eng.SupportsGpu)
+                        else if (typeof(T) == typeof(double) && eng.TryGet<CpuEngine>(out var cpuEngD) && !eng.SupportsGpu)
                         {
                             cpuEngD.TensorMatMulDoubleInto(
                                 (Tensor<double>)(object)capturedA,
@@ -15499,7 +15499,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // Routes through Conv2DInto(int[]) so the dispatch stays
                         // on the fast int[] NCHWc / im2col+Sgemm path without
                         // allocating an intermediate tensor.
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                             cpuEng.Conv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil);
                         else { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
@@ -18382,7 +18382,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { batch, channels, outputHeight, outputWidth },
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu && ph == pw && sh == sw)
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu && ph == pw && sh == sw)
                         {
                             cpuEng.MaxPool2DInto(output, captured, ph, sh, 0);
                         }
@@ -19301,7 +19301,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordBinary(LazyNodeType.DepthwiseConv2D, "DepthwiseConv2D", input, kernel, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.DepthwiseConv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPadding);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.DepthwiseConv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPadding);
                         else { var r = eng.DepthwiseConv2D(capturedInput, capturedKernel, capturedStride, capturedPadding); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
@@ -26585,7 +26585,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // Normalize straight into the plan's buffers: computing into fresh tensors and copying all three in
                         // was a third of a DenseNet training step's main-thread copy time.
-                        if (eng is CpuEngine && !eng.SupportsGpu
+                        if (eng.Is<CpuEngine>() && !eng.SupportsGpu
                             && TryBatchNormTrainingFloatInto(ci, cg, cb, ce, output, capturedMean, capturedVar))
                             return;
                         var r = eng.BatchNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
@@ -28298,7 +28298,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // GPU-resident compiled-step path: normalize into output's stable buffer + stable mean/var
                         // scratch (no fresh alloc that aborts CUDA-graph capture). Falls back to the eager path.
-                        if (eng is DirectGpuTensorEngine lnGpu
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var lnGpu)
                             && lnGpu.TryLayerNormResidentInto(output, ci, cg, cb, ce, out var rMean, out var rVar))
                         {
                             stateRef.Mean = rMean!;
@@ -35558,7 +35558,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // On the GPU the max and its argmax are computed on the device and the backward reads the
                         // device indices (ReduceMaxBackward dispatches on them). The host odometer below read the
                         // input back to the host on every replay, which aborts CUDA-graph capture (AiDotNet#1804).
-                        if (eng is DirectGpuTensorEngine gpuMax
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var gpuMax)
                             && gpuMax.TryReduceMaxWithIndicesIntoResident(output, capturedInput, capturedEffectiveAxes,
                                 capturedKeepDims, out var deviceIndices, out var deviceAxes))
                         {
@@ -36990,7 +36990,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Upsample", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.UpsampleInto(output, captured, capScaleH, capScaleW);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.UpsampleInto(output, captured, capScaleH, capScaleW);
                         else { var r = eng.Upsample(captured, capScaleH, capScaleW); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.UpsampleBackward, new object[] { capScaleH, capScaleW });
@@ -37267,7 +37267,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.PixelShuffleInto(output, c_input, c_upscaleFactor);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.PixelShuffleInto(output, c_input, c_upscaleFactor);
                         else { var r = eng.PixelShuffle(c_input, c_upscaleFactor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.PixelShuffleBackward, new object[] { c_upscaleFactor });
@@ -38027,7 +38027,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.CropInto(output, c_input, c_top, c_left, c_height, c_width);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.CropInto(output, c_input, c_top, c_left, c_height, c_width);
                         else { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.CropBackward, new object[] { c_top, c_left });
@@ -38225,7 +38225,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Pad", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
                         else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     // [top, left] feed the backward; bottom, right and the fill value describe the op to exporters
@@ -38311,7 +38311,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concat", captured, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.ConcatInto(output, captured, capturedAxis);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.ConcatInto(output, captured, capturedAxis);
                         else { var r = eng.Concat(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
@@ -38725,7 +38725,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // CUDA-graph-CAPTURABLE (the host Array.Copy gather below can't be recorded into a graph).
                         // Managed-index path (capture/replay) reads the externally-refreshed stable index buffer;
                         // eager path uploads inline. Falls through to the host gather when not GPU-resident.
-                        if (eng is DirectGpuTensorEngine gpuEng)
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var gpuEng))
                         {
                             gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(capturedIndices, n));
                             if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output)) return;
@@ -38949,7 +38949,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // GPU-resident embedding gather into output's stable buffer (the embedding_forward kernel
                         // casts float→int) — keeps the whole forward chain on-device for CUDA-graph capture. Else
                         // the host gather below.
-                        if (eng is DirectGpuTensorEngine embGpu
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var embGpu)
                             && embGpu.TryEmbeddingFromFloatIndicesResidentInto(output, capturedEmb, capturedFloatIdx, n, dim))
                             return;
                         // Read fresh float indices each replay; convert to int
@@ -41819,7 +41819,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         // Host engines write the concatenation straight into the plan's buffer.
-                        if (eng is not DirectGpuTensorEngine && TryConcatenateInto(captured, capturedAxis, output)) return;
+                        if (!eng.Is<DirectGpuTensorEngine>() && TryConcatenateInto(captured, capturedAxis, output)) return;
                         var r = eng.TensorConcatenate(captured, capturedAxis);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                     },
@@ -42540,7 +42540,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) =>
                     {
                         // GPU-resident slice into output's stable buffer (no host materialize that breaks capture).
-                        if (eng is DirectGpuTensorEngine slGpu && slGpu.TrySliceAxisResidentInto(output, captured, capAxis, capIndex))
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var slGpu) && slGpu.TrySliceAxisResidentInto(output, captured, capAxis, capIndex))
                             return;
                         var r = eng.TensorSliceAxis(captured, capAxis, capIndex);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
@@ -48814,7 +48814,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // On the GPU engine, gather on-device straight into the output buffer (graph-capturable);
                         // fall back to the host gather + copy when not GPU-resident (CPU engine / not-yet-resident).
-                        if (eng is DirectGpuTensorEngine gpuEng)
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var gpuEng))
                         {
                             gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(ci, ci.Length));
                             if (gpuEng.TryEmbeddingGatherGpu(ct, ci, ci.Length, output)) return;
@@ -49393,7 +49393,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "AdaptiveAvgPool2D", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.AdaptiveAvgPool2DInto(output, captured, capOutH, capOutW);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.AdaptiveAvgPool2DInto(output, captured, capOutH, capOutW);
                         else { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AdaptiveAvgPool2DBackward, new object[] { capOutH, capOutW });
@@ -50621,7 +50621,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
         DifferentiableOps.RecordUnary("SELU", result, tensorOrig, BackwardFunctions<T>.SELUBackward);
-        { var c = tensor; AutoTracer.RecordOp("SELU", result, eng => ((CpuEngine)eng).TensorSELU(c)); }
+        { var c = tensor; AutoTracer.RecordOp("SELU", result, eng => eng.Cast<CpuEngine>().TensorSELU(c)); }
         return result;
     }
 
@@ -50658,7 +50658,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 SimdKernels.HardSigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
             }
             DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
-            { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
+            { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => eng.Cast<CpuEngine>().TensorHardSigmoid(c)); }
             return result;
         }
         if (typeof(T) == typeof(double))
@@ -50670,7 +50670,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < tensor.Length; i++)
                 dDst[i] = Math.Max(0.0, Math.Min(1.0, dSrc[i] / 6.0 + 0.5));
             DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
-            { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
+            { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => eng.Cast<CpuEngine>().TensorHardSigmoid(c)); }
             return result;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -50681,7 +50681,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result[i] = numOps.FromDouble(val);
         }
         DifferentiableOps.RecordUnary("HardSigmoid", result, tensorOrig, BackwardFunctions<T>.HardSigmoidBackward);
-        { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => ((CpuEngine)eng).TensorHardSigmoid(c)); }
+        { var c = tensor; AutoTracer.RecordOp("HardSigmoid", result, eng => eng.Cast<CpuEngine>().TensorHardSigmoid(c)); }
         return result;
     }
 
@@ -50999,7 +50999,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dst[i] = numOps.Divide(numOps.One, src[i]);
         }
         DifferentiableOps.RecordUnary("Reciprocal", result, tensorOrig, BackwardFunctions<T>.ReciprocalBackward);
-        { var c = tensor; AutoTracer.RecordOp("Reciprocal", result, eng => ((CpuEngine)eng).TensorReciprocal(c)); }
+        { var c = tensor; AutoTracer.RecordOp("Reciprocal", result, eng => eng.Cast<CpuEngine>().TensorReciprocal(c)); }
         return result;
     }
 
@@ -51047,7 +51047,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 dst[i] = numOps.FromDouble(Math.Sign(numOps.ToDouble(src[i])));
         }
         DifferentiableOps.RecordUnary("Sign", result, tensorOrig, BackwardFunctions<T>.SignBackward);
-        { var c = tensor; AutoTracer.RecordOp("Sign", result, eng => ((CpuEngine)eng).TensorSign(c)); }
+        { var c = tensor; AutoTracer.RecordOp("Sign", result, eng => eng.Cast<CpuEngine>().TensorSign(c)); }
         return result;
     }
 
@@ -51098,7 +51098,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Narrow", tensor, outShape,
                     (eng, output) =>
                     {
-                        if (eng is DirectGpuTensorEngine gpu && gpu.TensorNarrowIntoResident(output, captured, capDim, capStart, capLen)) return;
+                        if (eng.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TensorNarrowIntoResident(output, captured, capDim, capStart, capLen)) return;
                         var r = eng.TensorNarrow(captured, capDim, capStart, capLen); DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                     },
                     BackwardFunctions<T>.NarrowBackward, new object[] { dim, start, length });
@@ -51391,7 +51391,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "UpsampleBilinear", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorUpsampleBilinearInto(output, captured, capOutputSize);
+                        if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu) cpuEng.TensorUpsampleBilinearInto(output, captured, capOutputSize);
                         else { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.UpsampleBilinearBackward, new object[] { new[] { capH, capW } });

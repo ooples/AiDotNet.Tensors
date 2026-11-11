@@ -797,7 +797,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     {
         // The plan drives the engine's backend directly (graph capture and replay): lease it so a concurrent Dispose
         // waits.
-        using var __gpuOp = (_engine as DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
+        using var __gpuOp = (_engine.As<DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
         using var recordingSuspension = GraphMode.SuspendRecording();
 
@@ -861,7 +861,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             }
 
             _graphWarmupCalls++;
-            if (_graphWarmupCalls >= InferenceGraphWarmup && _engine is DirectGpuTensorEngine gte)
+            if (_graphWarmupCalls >= InferenceGraphWarmup && _engine.TryGet<DirectGpuTensorEngine>(out var gte))
             {
                 // Enter the resident capture path. ResidentStepActive (capture-path depth + eviction
                 // suspended) flips the engine's GPU ops to stable resident buffers — no host round-trips —
@@ -964,7 +964,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // CUDA work would skip those steps on replay and serve stale downstream outputs. Refuse capture.
         if (_containsCrossEngineSteps) return false;
         if (typeof(T) != typeof(float)) return false;
-        if (_engine is not DirectGpuTensorEngine gte) return false;
+        if (!_engine.TryGet<DirectGpuTensorEngine>(out var gte)) return false;
         if (gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } backend) return false;
         cb = backend;
         return true;
@@ -1008,7 +1008,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// </summary>
     private bool RefreshFinalOutputFromResident()
     {
-        var eng = _graphEngine ?? _engine as DirectGpuTensorEngine;
+        var eng = _graphEngine ?? _engine.As<DirectGpuTensorEngine>();
         if (eng is null) return false;
         var data = eng.DownloadResidentBuffer(_finalOutput);
         if (data is null) return false;

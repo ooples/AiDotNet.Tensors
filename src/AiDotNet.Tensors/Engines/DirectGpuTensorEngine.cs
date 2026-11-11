@@ -4413,16 +4413,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var dArr = dest.GetBackingArrayForCacheLookupUnsafe();
             if (dArr is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[dArr] = s_currentForwardOp;
         }
-        if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
+        if (eng.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
-        AliasDiag(eng is DirectGpuTensorEngine ? "FELLBACK host-copy" : "not-gpu-engine");
+        AliasDiag(eng.Is<DirectGpuTensorEngine>() ? "FELLBACK host-copy" : "not-gpu-engine");
         // The host copy below makes dest's HOST data authoritative, so every device-side copy of dest is stale from
         // here on and must go: its bound buffer and pending download (the next read would run that download over the
         // fresh host values), and any activation- or persistent-cache entry keyed by its backing array (those lookups
         // have no version check and would keep serving the old device values to the next GPU consumer). Measured in
         // compiled training: the replayed GPU RMSNorm read a trace-time rms buffer (dW 4461 vs -0.134), and a GELU fed
         // by a replayed broadcast add kept reading the trace-time input, so the forward froze after the first step.
-        if (eng is DirectGpuTensorEngine destEngine)
+        if (eng.TryGet<DirectGpuTensorEngine>(out var destEngine))
         {
             if (dest.IsGpuResident) dest.Cpu();   // device-resident proper: return it to the host before overwriting
             destEngine.InvalidateResidentWeightBuffer(dest);
@@ -12716,7 +12716,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 static (gradOutput, inputs, output, savedState, engine, grads) =>
                 {
                     int heads = (int)savedState[0];
-                    if (engine is DirectGpuTensorEngine gpu
+                    if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
                         && gpu.GlaScanBackwardGpu(gradOutput, inputs, heads) is { } gpuGrads)
                     {
                         for (int i = 0; i < 4; i++)
@@ -12834,33 +12834,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // contiguous buffers. Materialize those permutations device-to-device for this composition;
         // otherwise GetOrAllocateBuffer must download the resident parent merely to pack the view.
         Tensor<T> PermuteForCompute(Tensor<T> input, int[] axes) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.PermuteContiguousGpu(input, axes)
                 : e.TensorPermute(input, axes);
         Tensor<T> SliceAxisForCompute(Tensor<T> input, int axis, int index) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.SliceAxisContiguousGpu(input, axis, index)
                 : e.TensorSliceAxis(input, axis, index);
         Tensor<T> TileForCompute(Tensor<T> input, int[] multiples) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.TileSingleAxisContiguousGpu(input, multiples)
                 : e.TensorTile(input, multiples);
         Tensor<T> ScaleForCompute(Tensor<T> input, T scalar) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.ScaleContiguousGpu(input, scalar)
                 : e.TensorMultiplyScalar(input, scalar);
         Tensor<T> MultiplyForCompute(Tensor<T> left, Tensor<T> right) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.BinaryContiguousGpu(left, right, static (backend, a, b, output, length) =>
                     backend.Multiply(a, b, output, length))
                 : e.TensorMultiply(left, right);
         Tensor<T> AddForCompute(Tensor<T> left, Tensor<T> right) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.BinaryContiguousGpu(left, right, static (backend, a, b, output, length) =>
                     backend.Add(a, b, output, length))
                 : e.TensorAdd(left, right);
         Tensor<T> ConcatenateForCompute(Tensor<T>[] tensors, int axis) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.ConcatenateContiguousGpu(tensors, axis)
                 : e.TensorConcatenate(tensors, axis);
 

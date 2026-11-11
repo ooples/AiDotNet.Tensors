@@ -58,7 +58,7 @@ public sealed class DpSgdFusedStep<T> : IDisposable
     /// thread's current engine.</summary>
     public static bool IsAvailable =>
         typeof(T) == typeof(float)
-        && AiDotNetEngine.Current is DirectGpuTensorEngine gpu && gpu.SupportsGpu
+        && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.SupportsGpu
         && Optimization.TensorCodecOptions.Current.EnableCompilation;
 
     /// <summary>

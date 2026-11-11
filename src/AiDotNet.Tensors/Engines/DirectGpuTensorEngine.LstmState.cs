@@ -42,7 +42,7 @@ public partial class DirectGpuTensorEngine
             packet = scope.RecordVariadic(LazyNodeType.Custom, "LstmSequenceTrainStates", parameters,
                 new[] { ((sequence ? b * t : b) + 2 * b) * h },
                 (eng, output) => CopyResultInto(eng,
-                    ((DirectGpuTensorEngine)eng).RunStatefulLstm(parameters, saved), output),
+                    eng.Cast<DirectGpuTensorEngine>().RunStatefulLstm(parameters, saved), output),
                 LstmSequenceBackwardGpuFloat, saved);
         }
         else

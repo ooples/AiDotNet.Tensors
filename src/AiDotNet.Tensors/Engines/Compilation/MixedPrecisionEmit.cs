@@ -324,7 +324,7 @@ internal static class MixedPrecisionEmit
             (e, o) => MixedPrecisionCast.CastToFp32(yH).AsSpan().CopyTo(o.AsWritableSpan()),
             // Down-cast the FP32 gradient into the Half grad space ON-DEVICE on the GPU (the host Tensor.Cast
             // would pull the gradient to CPU — CastResidentDtype keeps it resident); host cast otherwise.
-            (gradOut, input, output, state, e) => e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine g
+            (gradOut, input, output, state, e) => e.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var g)
                 ? g.CastResidentDtype<float, Half>(gradOut)
                 : MixedPrecisionCast.CastToFp32Backward(gradOut));
     }
@@ -343,14 +343,14 @@ internal static class MixedPrecisionEmit
             LazyNodeType.Custom, name, x, x._shape,
             (e, o) =>
             {
-                if (e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine fg && fg.TryCastResidentForwardHalf(x, o))
+                if (e.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var fg) && fg.TryCastResidentForwardHalf(x, o))
                     return;
                 using var oKeep1 = new KeepAliveScope(o);
                 MixedPrecisionCast.CastToFp16(x).AsSpan().CopyTo(o.AsWritableSpanUnmarked());
             },
             // Up-cast the Half gradient into the FP32 grad space ON-DEVICE on the GPU (the host Tensor.Cast
             // would pull the gradient to CPU — CastResidentDtype keeps it resident); host cast otherwise.
-            (gradOut, input, output, state, e) => e is AiDotNet.Tensors.Engines.DirectGpuTensorEngine g
+            (gradOut, input, output, state, e) => e.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var g)
                 ? g.CastResidentDtype<Half, float>(gradOut)
                 : MixedPrecisionCast.CastToFp16Backward(gradOut));
     }
@@ -363,7 +363,7 @@ internal static class MixedPrecisionEmit
     /// </summary>
     private static void LandHalf(IEngine e, Tensor<Half> r, Tensor<Half> o)
     {
-        if (e is DirectGpuTensorEngine gpu && gpu.TryLandResidentHalf(r, o)) return;
+        if (e.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryLandResidentHalf(r, o)) return;
         using var rKeep1 = new KeepAliveScope(r);
         using var oKeep2 = new KeepAliveScope(o);
         r.AsSpanUnmarked().CopyTo(o.AsWritableSpanUnmarked());

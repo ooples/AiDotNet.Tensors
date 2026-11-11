@@ -537,7 +537,7 @@ public partial class CpuEngine
         // Device backward on the GPU engine. A compiled plan records this function from the CPU base (GraphMode)
         // and replays it on the GPU engine, so it ran the managed BPTT recurrence with host copies around it on
         // every compiled GPU step.
-        if (engine is DirectGpuTensorEngine gpu && gpu.GlaScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.GlaScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
         {
             for (int i = 0; i < 4; i++)
                 DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);

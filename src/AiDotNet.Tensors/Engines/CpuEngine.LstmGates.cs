@@ -30,7 +30,7 @@ public partial class CpuEngine
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
             packet = scope.RecordVariadic(LazyNodeType.Custom, "LstmCellFromGates", inputs,
                 new[] { checked(2 * count) },
-                (e, output) => DirectGpuTensorEngine.CopyResultInto(e, ((CpuEngine)e).RunLstmGatePacket(gates, previousCell), output),
+                (e, output) => DirectGpuTensorEngine.CopyResultInto(e, e.Cast<CpuEngine>().RunLstmGatePacket(gates, previousCell), output),
                 LstmGateBackward<T>, null);
         else
         {
@@ -70,7 +70,7 @@ public partial class CpuEngine
     private static void LstmGateBackward<T>(Tensor<T> gradient, Tensor<T>[] inputs, Tensor<T> output,
         object[]? saved, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryLstmGateBackward(gradient, inputs, output, grads)) return;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryLstmGateBackward(gradient, inputs, output, grads)) return;
         if (typeof(T) == typeof(float))
         {
             var (dgFloat, dcFloat) = LstmGateBackwardFloat((Tensor<float>)(object)gradient,

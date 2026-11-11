@@ -55,7 +55,7 @@ public static class GpuOptimizer
     public static Tensor<float> CreateStateTensor(int[] shape)
     {
         if (shape is null) throw new ArgumentNullException(nameof(shape));
-        if (AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine
+        if (AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)
             && gpuEngine.TryCreateDeviceStateTensor(shape, out var state))
             return state;
         return new Tensor<float>(shape);
@@ -119,7 +119,7 @@ public static class GpuOptimizer
         if (m is null) throw new ArgumentNullException(nameof(m));
         if (v is null) throw new ArgumentNullException(nameof(v));
 
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
         var backend = gpuEngine.GetBackend();
         if (backend is null) return false;
 
@@ -151,7 +151,7 @@ public static class GpuOptimizer
         if (m is null) throw new ArgumentNullException(nameof(m));
         if (v is null) throw new ArgumentNullException(nameof(v));
 
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
         var backend = gpuEngine.GetBackend();
         if (backend is null) return false;
 
@@ -224,7 +224,7 @@ public static class GpuOptimizer
         if (param is null) throw new ArgumentNullException(nameof(param));
         if (grad is null) throw new ArgumentNullException(nameof(grad));
 
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
         var backend = gpuEngine.GetBackend();
         if (backend is null) return false;
 
@@ -248,7 +248,7 @@ public static class GpuOptimizer
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (parameters.Count != gradients.Count)
             throw new ArgumentException("Every parameter needs a gradient.", nameof(gradients));
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return false; using var __gpuOp = gpuEngine.EnterGpuOp();
         var backend = gpuEngine.GetBackend();
         if (backend is null) return false;
 
@@ -328,7 +328,7 @@ public static class GpuOptimizer
     private static DeviceGradientNorm? DeviceSumOfSquares(IReadOnlyList<Tensor<float>> gradients, float? clipTo,
         NonFiniteGradientPolicy nonFinite)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine)) return null;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return null;
         using var __gpuOp = gpuEngine.EnterGpuOp();
         var backend = gpuEngine.GetBackend();
         if (backend is not IMultiTensorKernels multi) return null;
@@ -410,7 +410,7 @@ public static class GpuOptimizer
             throw new ArgumentOutOfRangeException(nameof(lr), lr, "Learning rate must be finite and non-negative.");
         if (float.IsNaN(l1Strength) || float.IsInfinity(l1Strength) || l1Strength < 0f)
             throw new ArgumentOutOfRangeException(nameof(l1Strength), l1Strength, "L1 strength must be finite and non-negative.");
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp();
         var backend = e.GetBackend();
         if (backend is null) return false;
         var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
@@ -434,7 +434,7 @@ public static class GpuOptimizer
         out DirectGpu.IGpuBuffer? mScales, out DirectGpu.IGpuBuffer? vScales)
     {
         mQ = vQ = mScales = vScales = null;
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp();
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
         if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
@@ -493,7 +493,7 @@ public static class GpuOptimizer
         CompressedMomentBufferValidation.RequireCapacity(vQ, p.Length, nameof(vQ));
         CompressedMomentBufferValidation.RequireCapacity(mScales, (long)stateBlocks * sizeof(float), nameof(mScales));
         CompressedMomentBufferValidation.RequireCapacity(vScales, (long)stateBlocks * sizeof(float), nameof(vScales));
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp();
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
@@ -528,7 +528,7 @@ public static class GpuOptimizer
         CompressedMomentBufferValidation.RequireCapacity(vQ, p.Length, nameof(vQ));
         CompressedMomentBufferValidation.RequireCapacity(mScales, (long)stateBlocks * sizeof(float), nameof(mScales));
         CompressedMomentBufferValidation.RequireCapacity(vScales, (long)stateBlocks * sizeof(float), nameof(vScales));
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp();
         var backend = e.GetBackend();
         if (backend is not IAdam8BitWeightDecayBackend db)
             return weightDecay == 0f
@@ -551,7 +551,7 @@ public static class GpuOptimizer
     {
         m = v = null;
         if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp();
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         DirectGpu.IGpuBuffer? lm = null, lv = null;
         try
@@ -588,7 +588,7 @@ public static class GpuOptimizer
         CompressedMomentHyperparameters.Validate(lr, beta1, beta2, epsilon, weightDecay);
         CompressedMomentBufferValidation.RequireCapacity(m, (long)p.Length * sizeof(ushort), nameof(m));
         CompressedMomentBufferValidation.RequireCapacity(v, (long)p.Length * sizeof(ushort), nameof(v));
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp();
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp();
         if (e.GetBackend() is not ICompressedMomentGpuOptimizerBackend cb) return false;
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
@@ -608,7 +608,7 @@ public static class GpuOptimizer
     /// <summary>Plain SGD with L2-coupled weight decay (<c>grad + weightDecay·param</c>), in place on the GPU.</summary>
     internal static bool TrySgdStep(Tensor<float> p, Tensor<float> g, float lr, float weightDecay)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g.TryGetGpuBuffer();
         if (gb is null) return false;
         return TryUpdateParameter(e, b, p, pb => b.SgdUpdate(pb, gb, lr, weightDecay, p.Length), "TrySgdStep");
@@ -620,7 +620,7 @@ public static class GpuOptimizer
     /// </summary>
     internal static float[]? TryDownload(Tensor<float> tensor)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return null; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return null;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return null; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return null;
         var buffer = tensor.TryGetGpuBuffer();
         if (buffer is null) return null;
         var full = b.DownloadBuffer(buffer);
@@ -637,7 +637,7 @@ public static class GpuOptimizer
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (data.Length < tensor.Length)
             throw new ArgumentException($"data has {data.Length} elements but the tensor has {tensor.Length}.", nameof(data));
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var buffer = tensor.TryGetGpuBuffer();
         if (buffer is null) return false;
         using (var staged = b.AllocateBuffer(data))
@@ -648,7 +648,7 @@ public static class GpuOptimizer
 
     public static bool TrySgdMomentumStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (p is null || gb is null || vb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.SgdMomentumUpdate(pb, gb, vb, lr, momentum, weightDecay, p.Length), "TrySgdMomentumStep")) return false;
@@ -658,7 +658,7 @@ public static class GpuOptimizer
 
     public static bool TryRmspropStep(Tensor<float> p, Tensor<float> g, Tensor<float> squaredAvg, float lr, float rho, float epsilon, float weightDecay)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var sb = squaredAvg?.TryGetGpuBuffer();
         if (p is null || gb is null || sb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.RmspropUpdate(pb, gb, sb, lr, rho, epsilon, weightDecay, p.Length), "TryRmspropStep")) return false;
@@ -668,7 +668,7 @@ public static class GpuOptimizer
 
     public static bool TryAdagradStep(Tensor<float> p, Tensor<float> g, Tensor<float> accum, float lr, float epsilon, float weightDecay)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var ab = accum?.TryGetGpuBuffer();
         if (p is null || gb is null || ab is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.AdagradUpdate(pb, gb, ab, lr, epsilon, weightDecay, p.Length), "TryAdagradStep")) return false;
@@ -678,7 +678,7 @@ public static class GpuOptimizer
 
     public static bool TryNagStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (p is null || gb is null || vb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.NagUpdate(pb, gb, vb, lr, momentum, weightDecay, p.Length), "TryNagStep")) return false;
@@ -688,7 +688,7 @@ public static class GpuOptimizer
 
     public static bool TryLarsStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay, float trustCoeff)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var vb = velocity?.TryGetGpuBuffer();
         if (p is null || gb is null || vb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.LarsUpdate(pb, gb, vb, lr, momentum, weightDecay, trustCoeff, p.Length), "TryLarsStep")) return false;
@@ -699,7 +699,7 @@ public static class GpuOptimizer
     public static bool TryLambStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step,
         float maxTrustRatio = 0f, bool biasCorrection = true)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer();
         if (p is null || gb is null || mb is null || vb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.LambUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p.Length, maxTrustRatio, biasCorrection), "TryLambStep")) return false;
@@ -709,7 +709,7 @@ public static class GpuOptimizer
 
     public static bool TryAdadeltaStep(Tensor<float> p, Tensor<float> g, Tensor<float> accumGrad, Tensor<float> accumUpdate, float rho, float epsilon, float weightDecay)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var ag = accumGrad?.TryGetGpuBuffer(); var au = accumUpdate?.TryGetGpuBuffer();
         if (p is null || gb is null || ag is null || au is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.AdadeltaUpdate(pb, gb, ag, au, rho, epsilon, weightDecay, p.Length), "TryAdadeltaStep")) return false;
@@ -719,7 +719,7 @@ public static class GpuOptimizer
 
     public static bool TryAmsgradStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, Tensor<float> vMax, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer(); var xb = vMax?.TryGetGpuBuffer();
         if (p is null || gb is null || mb is null || vb is null || xb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.AmsgradUpdate(pb, gb, mb, vb, xb, lr, beta1, beta2, epsilon, weightDecay, step, p.Length), "TryAmsgradStep")) return false;
@@ -729,7 +729,7 @@ public static class GpuOptimizer
 
     public static bool TryAdamaxStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> u, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var ub = u?.TryGetGpuBuffer();
         if (p is null || gb is null || mb is null || ub is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.AdamaxUpdate(pb, gb, mb, ub, lr, beta1, beta2, epsilon, weightDecay, step, p.Length), "TryAdamaxStep")) return false;
@@ -739,7 +739,7 @@ public static class GpuOptimizer
 
     public static bool TryLionStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, float lr, float beta1, float beta2, float weightDecay)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer();
         if (p is null || gb is null || mb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.LionUpdate(pb, gb, mb, lr, beta1, beta2, weightDecay, p.Length), "TryLionStep")) return false;
@@ -749,7 +749,7 @@ public static class GpuOptimizer
 
     public static bool TryNadamStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer();
         if (p is null || gb is null || mb is null || vb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.NadamUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p.Length), "TryNadamStep")) return false;
@@ -759,7 +759,7 @@ public static class GpuOptimizer
 
     public static bool TryFtrlStep(Tensor<float> p, Tensor<float> g, Tensor<float> z, Tensor<float> n, float lr, float l1Reg, float l2Reg, float beta)
     {
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var e)) return false; using var __gpuOp = e.EnterGpuOp(); var b = e.GetBackend(); if (b is null) return false;
         var gb = g?.TryGetGpuBuffer(); var zb = z?.TryGetGpuBuffer(); var nb = n?.TryGetGpuBuffer();
         if (p is null || gb is null || zb is null || nb is null) return false;
         if (!TryUpdateParameter(e, b, p, pb => b.FtrlUpdate(pb, gb, zb, nb, lr, l1Reg, l2Reg, beta, p.Length), "TryFtrlStep")) return false;
@@ -805,7 +805,7 @@ public static class GpuOptimizer
         if (nnz > sparseIndices.Length || nnz > sparseValues.Length)
             throw new ArgumentException("nnz exceeds the supplied sparse buffers.", nameof(nnz));
 
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine engine)) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var engine)) return false;
         // The caller dispatches on the backend after this returns, so the lease goes to the caller (released here
         // only when preparation fails).
         lease = engine.EnterGpuOp();

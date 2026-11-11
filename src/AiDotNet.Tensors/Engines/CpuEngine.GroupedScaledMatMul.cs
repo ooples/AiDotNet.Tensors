@@ -89,7 +89,7 @@ public partial class CpuEngine
                 if (rows > 0)
                 {
                     var part = e.TensorMatMul(e.TensorNarrow(a, 0, start, rows), e.Reshape(e.TensorNarrow(b, 0, g, 1), new[] { k, n }));
-                    if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, GroupBias(e, bias, g, groups, n));
+                    if (bias is not null) part = e.Cast<CpuEngine>().TensorBroadcastAdd(part, GroupBias(e, bias, g, groups, n));
                     parts.Add(part);
                 }
                 start = ends[g];
@@ -112,7 +112,7 @@ public partial class CpuEngine
                 var part = len > 0
                     ? e.TensorMatMul(e.TensorNarrow(a, 1, start, len), e.TensorNarrow(b, 0, start, len))
                     : new Tensor<T>(new[] { m, n });
-                if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, GroupBias(e, bias, g, groups, n));
+                if (bias is not null) part = e.Cast<CpuEngine>().TensorBroadcastAdd(part, GroupBias(e, bias, g, groups, n));
                 parts[g] = e.Reshape(part, new[] { 1, m, n });
                 start = ends[g];
             }
@@ -132,7 +132,7 @@ public partial class CpuEngine
                 if (cols > 0)
                 {
                     var part = e.TensorMatMul(e.Reshape(e.TensorNarrow(a, 0, g, 1), new[] { m, k }), e.TensorNarrow(b, 1, start, cols));
-                    if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, e.TensorNarrow(GroupBias(e, bias, g, groups, -1), 0, 0, cols));
+                    if (bias is not null) part = e.Cast<CpuEngine>().TensorBroadcastAdd(part, e.TensorNarrow(GroupBias(e, bias, g, groups, -1), 0, 0, cols));
                     parts.Add(part);
                 }
                 start = ends[g];
@@ -182,7 +182,7 @@ public partial class CpuEngine
         // result [G, M, N]; bias [N] broadcasts directly, [G, N] becomes [G, 1, N].
         ValidateGroupBias(bias, result._shape[0], result._shape[2]);
         var b = bias.Rank == 2 ? e.Reshape(bias, new[] { bias._shape[0], 1, bias._shape[1] }) : bias;
-        return ((CpuEngine)e).TensorBroadcastAdd(result, b);
+        return e.Cast<CpuEngine>().TensorBroadcastAdd(result, b);
     }
 
     /// <inheritdoc/>
@@ -201,7 +201,7 @@ public partial class CpuEngine
             var left = Dequantize(e, a, scaleA, recipeA, swizzleA, rightOperand: false);
             var right = Dequantize(e, b, scaleB, recipeB, swizzleB, rightOperand: true);
             result = e.TensorMatMul(left, right);
-            if (bias is not null) result = ((CpuEngine)e).TensorBroadcastAdd(result, bias);
+            if (bias is not null) result = e.Cast<CpuEngine>().TensorBroadcastAdd(result, bias);
         }
         return result;
     }

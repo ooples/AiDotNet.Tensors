@@ -219,7 +219,7 @@ public static class AiDotNetEngine
         // re-adopting the GPU engine (the "GPU acceleration enabled" churn seen in CPU-only runs).
         if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU")))
         {
-            if (Current is DirectGpuTensorEngine)
+            if (Current.Is<DirectGpuTensorEngine>())
             {
                 SwitchToCpuEngine();
             }
@@ -243,7 +243,7 @@ public static class AiDotNetEngine
         // success path below overwrites Current without disposing it. A whole tournament of small models
         // therefore spent most of its time rebuilding (and leaking) GPU contexts. The circuit-breaker and
         // disable checks above already cover the cases where the current engine must NOT be reused.
-        if (Current is DirectGpuTensorEngine adopted && adopted.SupportsGpu)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var adopted) && adopted.SupportsGpu)
         {
             return true;
         }
@@ -443,9 +443,9 @@ public static class AiDotNetEngine
             var observed = Volatile.Read(ref _current);
             // A reset hands the choice back to the library either way, also when it keeps a plain CPU engine.
             Volatile.Write(ref _callerAssigned, false);
-            if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
+            if (observed is not null && observed.Unwrap().GetType() == typeof(CpuEngine)) return;
             Volatile.Write(ref _current, new CpuEngine());
-            if (observed is DirectGpuTensorEngine gpu && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
+            if (observed.TryGet<DirectGpuTensorEngine>(out var gpu) && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
         }
 
         // The parked engine keeps its context for the next adoption, but not memory nothing uses: free the device
@@ -578,7 +578,7 @@ public static class AiDotNetEngine
         {
             lock (_adoptionLock)
             {
-                if (Volatile.Read(ref _current) is DirectGpuTensorEngine)
+                if (Volatile.Read(ref _current).Is<DirectGpuTensorEngine>())
                 {
                     // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
                     // This runs from inside a CUDA fault handler on an already-corrupted context; calling
@@ -608,7 +608,7 @@ public static class AiDotNetEngine
     /// <returns>A GPU execution context, or null if GPU is not available.</returns>
     public static GpuExecutionContext? BeginGpuContext(GpuExecutionOptions? options = null)
     {
-        if (Current is DirectGpuTensorEngine gpuEngine)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
             return gpuEngine.BeginGpuContext(options);
         }
@@ -626,7 +626,7 @@ public static class AiDotNetEngine
     {
         if (action == null) throw new ArgumentNullException(nameof(action));
 
-        if (Current is DirectGpuTensorEngine gpuEngine)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
             return gpuEngine.WithGpuContext(action, options);
         }
@@ -649,7 +649,7 @@ public static class AiDotNetEngine
         if (fallback is null)
             throw new ArgumentNullException(nameof(fallback));
 
-        if (Current is DirectGpuTensorEngine gpuEngine)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
             return gpuEngine.WithGpuContext(func, fallback, options);
         }

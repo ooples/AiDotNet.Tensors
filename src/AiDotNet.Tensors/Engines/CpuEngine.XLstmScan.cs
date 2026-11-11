@@ -528,7 +528,7 @@ public partial class CpuEngine
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
-        if (engine is DirectGpuTensorEngine gpu)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             gpu.XLstmDeviceBackward(gradOutput, inputs, numHeads, grads);
             return;

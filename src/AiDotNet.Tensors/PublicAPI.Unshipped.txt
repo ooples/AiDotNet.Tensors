@@ -133,3 +133,11 @@ virtual AiDotNet.Tensors.Engines.CpuEngine.CausalDepthwiseConv1DBackwardKernel<T
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1D<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardInput<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardKernel<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, int taps) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.EngineWrapperExtensions
+AiDotNet.Tensors.Engines.IEngineWrapper
+AiDotNet.Tensors.Engines.IEngineWrapper.Inner.get -> AiDotNet.Tensors.Engines.IEngine!
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.As<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine) -> TEngine?
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Cast<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine) -> TEngine?
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Is<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine) -> bool
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.TryGet<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine, out TEngine? result) -> bool
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Unwrap(this AiDotNet.Tensors.Engines.IEngine? engine) -> AiDotNet.Tensors.Engines.IEngine?

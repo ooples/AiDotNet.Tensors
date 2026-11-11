@@ -103,7 +103,7 @@ public partial class DirectGpuTensorEngine
         return scope.RecordVariadic(LazyNodeType.Custom, opName, new[] { query, key, value }, outputShape,
             (eng, output) =>
             {
-                var gpu = (DirectGpuTensorEngine)eng;
+                var gpu = eng.Cast<DirectGpuTensorEngine>();
                 using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var attention = (IFusedAttentionBackend)backend;
@@ -123,7 +123,7 @@ public partial class DirectGpuTensorEngine
             (gradOutput, inputs, output, savedState, engine, grads) =>
             {
                 var lse = node.Lse ?? throw new InvalidOperationException("The fused attention node's backward ran before its forward.");
-                var gpu = (DirectGpuTensorEngine)engine;
+                var gpu = engine.Cast<DirectGpuTensorEngine>();
                 // In a resident step an accumulator receiving its first contribution here is the kernel's output itself.
                 Tensor<T>? FirstWriteTarget(Tensor<T> input) =>
                     Autodiff.DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add) is { } t && !add
@@ -168,7 +168,7 @@ public partial class DirectGpuTensorEngine
         int qStart, int kStart, int vStart)
     {
         if (attention.SavedState is not { Length: >= 1 } state || state[0] is not FusedAttentionRecordedNode recorded
-            || !recorded.Interleaved || attention.RecordingEngine is not DirectGpuTensorEngine engine || packed.Rank != 2
+            || !recorded.Interleaved || !attention.RecordingEngine.TryGet<DirectGpuTensorEngine>(out var engine) || packed.Rank != 2
             // The blocks are viewed per launch at offsets of W floats: only where views are free device-pointer offsets
             // (CUDA, HIP). Elsewhere a view can be refused for its offset's alignment or allocate; those keep the split.
             || !engine.SupportsPackedAttentionFusion)
@@ -207,7 +207,7 @@ public partial class DirectGpuTensorEngine
         return new LazyNode<float>(LazyNodeType.Custom, "MultiHeadAttentionPacked", new[] { packed }, attention.Output,
             (eng, output) =>
             {
-                var gpu = (DirectGpuTensorEngine)eng;
+                var gpu = eng.Cast<DirectGpuTensorEngine>();
                 using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var fused = (IFusedAttentionBackend)backend;
@@ -238,7 +238,7 @@ public partial class DirectGpuTensorEngine
             (gradOutput, inputs, output, savedState, engine, grads) =>
             {
                 var lse = node.Lse ?? throw new InvalidOperationException("The packed attention node's backward ran before its forward.");
-                var gpu = (DirectGpuTensorEngine)engine;
+                var gpu = engine.Cast<DirectGpuTensorEngine>();
                 var into = Autodiff.DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add) is { } t
                     && !add ? t : null;
                 var grad = gpu.PackedAttentionBackwardOnDevice(gradOutput, inputs[0], output, lse, p, headDim, Blocks, into);
@@ -515,7 +515,7 @@ public partial class DirectGpuTensorEngine
         return scope.RecordVariadic(LazyNodeType.Custom, "ShortAttentionForward", new[] { query, key, value }, outputShape,
             (eng, output) =>
             {
-                var gpu = (DirectGpuTensorEngine)eng;
+                var gpu = eng.Cast<DirectGpuTensorEngine>();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var kernel = backend as IShortAttentionForwardBackend
                     ?? throw new InvalidOperationException("The recorded short attention's backend lost the kernel.");
@@ -596,7 +596,7 @@ public partial class DirectGpuTensorEngine
     private static void FusedAttentionDeviceBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is not DirectGpuTensorEngine gpu)
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu))
             throw new InvalidOperationException("A fused device attention node must be differentiated by the GPU engine that recorded it.");
         var p = (FusedAttentionParams)savedState[0];
         int headDim = (int)savedState[1];
