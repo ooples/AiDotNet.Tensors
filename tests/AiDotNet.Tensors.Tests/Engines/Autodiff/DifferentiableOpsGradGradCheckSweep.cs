@@ -116,7 +116,22 @@ public partial class DifferentiableOpsGradGradCheckSweep
     static partial void AddExemptionsSpatialAndAttention();
     static partial void AddExemptionsLinearAlgebraAndLosses();
 
-    private readonly List<string> _rejectedVariants = new();
+    private readonly List<(string Variant, string Reason)> _rejectedVariants = new();
+
+    /// <summary>
+    /// Parameter values an op does not support at all (no argument shape makes them valid), with the reason. Any other
+    /// variant the op rejects fails the sweep: it needs a variant table entry ("Op|param=Value") with arguments valid
+    /// for that value, so a parameter value cannot silently drop out of the coverage.
+    /// </summary>
+    internal static readonly Dictionary<string, string> UnsupportedVariants = new(StringComparer.Ordinal)
+    {
+        ["TensorRot90|axes=[0]"] = "rot90 rotates in a plane: it takes exactly two axes",
+        ["TensorRot90|axes=[1]"] = "rot90 rotates in a plane: it takes exactly two axes",
+        ["TensorSqueeze|axis=1"] = "squeeze of an axis whose size is not 1 is invalid (the base shape's other axis)",
+        ["TensorRnnCell|cell=Gru"] = "TensorRnnCell is the Elman cell; GRU is TensorGruCell (swept separately)",
+        ["TensorRnnCell|cell=Lstm"] = "TensorRnnCell is the Elman cell; LSTM is TensorLstmCell (swept separately)",
+        ["TensorGridSample3D|mode=Bicubic"] = "bicubic sampling is 2-D only, as in PyTorch",
+    };
 
     private IEnumerable<(string Variant, object[] Args)> ParameterVariants(System.Reflection.MethodInfo m, object[] baseArgs)
     {
@@ -152,8 +167,18 @@ public partial class DifferentiableOpsGradGradCheckSweep
 
             foreach (var (label, value) in values)
             {
-                var args = DifferentiableOpsGradCheckSweep.CopyArgs(baseArgs);
-                args[i] = value!;
+                // A variant whose valid arguments differ in shape from the base ones (another axis needs another
+                // index tensor; a 1-D or 3-D mode needs another rank) brings its own factory, keyed by the label.
+                object[] args;
+                if (DifferentiableOpsGradCheckSweep.TryGetVariantCase(m, label, out var variantFactory))
+                {
+                    args = variantFactory(new Random(1234));
+                }
+                else
+                {
+                    args = DifferentiableOpsGradCheckSweep.CopyArgs(baseArgs);
+                    args[i] = value!;
+                }
                 bool rejected = false;
                 try
                 {
@@ -163,7 +188,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
                                            or IndexOutOfRangeException or InvalidOperationException)
                 {
                     rejected = true;
-                    _rejectedVariants.Add($"{m.Name}|{label}: {DifferentiableOpsGradCheckSweep.Inner(ex).Message.Split('\n')[0]}");
+                    _rejectedVariants.Add(($"{m.Name}|{label}", DifferentiableOpsGradCheckSweep.Inner(ex).Message.Split('\n')[0]));
                 }
                 if (!rejected) yield return (label, args);
             }
@@ -304,12 +329,18 @@ public partial class DifferentiableOpsGradGradCheckSweep
         foreach (var s in exempted.OrderBy(x => x)) _out.WriteLine("exempt    " + s);
         foreach (var s in skipped.OrderBy(x => x)) _out.WriteLine("skip      " + s);
         _out.WriteLine($"variants the ops reject as invalid arguments: {_rejectedVariants.Count}");
-        foreach (var s in _rejectedVariants.OrderBy(x => x)) _out.WriteLine("rejected  " + s);
+        foreach (var (variant, reason) in _rejectedVariants.OrderBy(x => x.Variant))
+            _out.WriteLine($"rejected  {variant}: {reason}" + (UnsupportedVariants.TryGetValue(variant, out var why) ? $" (unsupported: {why})" : " (NOT COVERED)"));
+        var uncovered = _rejectedVariants.Where(x => !UnsupportedVariants.ContainsKey(x.Variant))
+            .Select(x => $"UNCOVERED VARIANT {x.Variant}: the op rejected the base arguments with this value ({x.Reason}); " +
+                         "add a variant table entry with valid arguments, or list it in UnsupportedVariants with the reason")
+            .ToList();
 
-        var all = secondOrderFailures.Concat(firstOrderFailures).Concat(threw).Concat(recordedTwice).Concat(skipped.Select(s => "SKIPPED " + s)).ToList();
+        var all = secondOrderFailures.Concat(firstOrderFailures).Concat(threw).Concat(recordedTwice).Concat(uncovered)
+            .Concat(skipped.Select(s => "SKIPPED " + s)).ToList();
         Assert.True(all.Count == 0,
             $"{secondOrderFailures.Count} op(s) fail gradgradcheck, {firstOrderFailures.Count} fail the random-weight first-order " +
-            $"check, {threw.Count} threw, {skipped.Count} could not be driven:\n" + string.Join("\n", all.OrderBy(x => x).Take(80)));
+            $"check, {threw.Count} threw, {uncovered.Count} variant(s) uncovered, {skipped.Count} could not be driven:\n" + string.Join("\n", all.OrderBy(x => x).Take(80)));
     }
 
     /// <summary>
