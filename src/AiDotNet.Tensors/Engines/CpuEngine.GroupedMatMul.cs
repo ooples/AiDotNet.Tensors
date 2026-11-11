@@ -81,7 +81,10 @@ public partial class CpuEngine
         else DifferentiableOps.RecordIfActive("GroupedMatMul", output, new[] { a, b, bias }, GroupedRowsMatMulBackward<T>, state);
     }
 
-    /// <summary>Per-group outer product <c>w[g] = a_g^T · c_g</c>: a [M, K], c [M, N] -> [G, K, N]; not recorded.</summary>
+    /// <summary>
+    /// Per-group outer product <c>w[g] = a_g^T · c_g</c>: a [M, K], c [M, N] -> [G, K, N]. Recorded on an active tape
+    /// (the backward of the grouped matmul calls it, so a createGraph backward stays differentiable).
+    /// </summary>
     internal virtual Tensor<T> GroupedRowsWeightGrad<T>(Tensor<T> a, Tensor<T> c, int[] ends)
     {
         int g = ends.Length, k = a._shape[1], n = c._shape[1];
@@ -92,7 +95,28 @@ public partial class CpuEngine
             var y = HostArray(c, out int cOff);
             GroupedWeightGradHost(x, aOff, y, cOff, output.GetDataArray(), ends, k, n);
         }
+        RecordGroupedWeightGrad(output, a, c, ends);
         return output;
+    }
+
+    /// <summary>Records the per-group outer product's tape node.</summary>
+    private protected static void RecordGroupedWeightGrad<T>(Tensor<T> output, Tensor<T> a, Tensor<T> c, int[] ends) =>
+        DifferentiableOps.RecordBinary("GroupedRowsWeightGrad", output, a, c, GroupedRowsWeightGradBackward<T>, new object[] { ends });
+
+    /// <summary>
+    /// Backward of <see cref="GroupedRowsWeightGrad{T}"/> (<c>w_g = a_g^T c_g</c>): <c>da_g = c_g dw_g^T</c>,
+    /// <c>dc_g = a_g dw_g</c>; rows past the last offset get zero. Both are grouped matmuls, so they record in turn.
+    /// </summary>
+    internal static void GroupedRowsWeightGradBackward<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var ends = (int[])savedState[0];
+        var grouped = engine as CpuEngine ?? new CpuEngine();
+        if (DifferentiableOps.IsGradientRequired(inputs[0]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], grouped.GroupedRowsMatMul(inputs[1], gradOutput, ends, true), engine);
+        if (DifferentiableOps.IsGradientRequired(inputs[1]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], grouped.GroupedRowsMatMul(inputs[0], gradOutput, ends, false), engine);
     }
 
     /// <summary>Validates the jagged-rows form and returns (G, M, K, N).</summary>

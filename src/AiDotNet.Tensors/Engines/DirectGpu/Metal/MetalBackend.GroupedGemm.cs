@@ -36,7 +36,7 @@ public sealed partial class MetalBackend : IGroupedGemmBackend
                                 ok &= GetPipeline(GroupedGemmLibraryName, _groupedGemmLibrary, name).MaxTotalThreadsPerThreadgroup
                                       >= GroupedGemmKernelTemplate.GroupSize;
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (PortableGroupedGemm.IsBuildFailure(ex))
                     {
                         System.Diagnostics.Trace.TraceWarning($"Metal grouped GEMM kernels unavailable: {ex.Message}");
                         ok = false;

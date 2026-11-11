@@ -165,6 +165,63 @@ public class GroupedRowsMatMulTests
         AssertClose(ReferenceBiasGrad(w, UnbalancedEnds, biasRank == 2), gbias, 1e-4, "dbias");
     }
 
+    // Double backward through the bias: L = sum(y^2) / 2 gives dL/dbias = per-group column sums of y; differentiating
+    // s = sum(dL/dbias * v) again gives d s / d bias[g, j] = rows(g) * v[g, j] ([G, N]) or sum_g rows(g) * v[j] ([N]).
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void BiasGradient_IsDifferentiable_UnderCreateGraph(int biasRank)
+    {
+        int k = 5, n = 4, g = UnbalancedEnds.Length;
+        var a = Random(21, UnbalancedRows, k); var b = Random(22, g, k, n);
+        var bias = biasRank == 1 ? Random(23, n) : Random(23, g, n);
+        var v = biasRank == 1 ? Random(24, n) : Random(24, g, n);
+        using var tape = new GradientTape<float>();
+        var y = _engine.GroupedRowsMatMul(a, b, UnbalancedEnds, false, bias);
+        var loss = _engine.TensorMultiplyScalar(_engine.ReduceSum(_engine.TensorMultiply(y, y), null), 0.5f);
+        var gBias = tape.ComputeGradients(loss, new[] { bias }, createGraph: true)[bias];
+        var s = _engine.ReduceSum(_engine.TensorMultiply(gBias, v), null);
+        var second = tape.ComputeGradients(s, new[] { bias }, createGraph: false)[bias].Contiguous().ToArray();
+        var expected = new double[second.Length];
+        for (int grp = 0; grp < g; grp++)
+        {
+            int rows = UnbalancedEnds[grp] - (grp == 0 ? 0 : UnbalancedEnds[grp - 1]);
+            for (int j = 0; j < n; j++)
+                if (biasRank == 2) expected[grp * n + j] = rows * v[grp, j];
+                else expected[j] += rows * v[j];
+        }
+        for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], second[i], 3);
+    }
+
+    // Double backward through the weight gradient: L = sum(y * w) gives dL/db_g = a_g^T w_g; differentiating
+    // s = sum(dL/db * u) with respect to a gives da_r = u_g w_r^T for routed rows and zero for the tail.
+    [Fact]
+    public void WeightGradient_IsDifferentiable_UnderCreateGraph()
+    {
+        int k = 5, n = 4, g = UnbalancedEnds.Length;
+        var a = Random(25, UnbalancedRows, k); var b = Random(26, g, k, n);
+        var w = Random(27, UnbalancedRows, n); var u = Random(28, g, k, n);
+        using var tape = new GradientTape<float>();
+        var y = _engine.GroupedRowsMatMul(a, b, UnbalancedEnds, false);
+        var loss = _engine.ReduceSum(_engine.TensorMultiply(y, w), null);
+        var gB = tape.ComputeGradients(loss, new[] { b }, createGraph: true)[b];
+        var s = _engine.ReduceSum(_engine.TensorMultiply(gB, u), null);
+        var da = tape.ComputeGradients(s, new[] { a }, createGraph: false)[a];
+        var expected = new double[UnbalancedRows * k];
+        for (int r = 0; r < UnbalancedRows; r++)
+        {
+            int grp = GroupOf(UnbalancedEnds, r);
+            if (grp < 0) continue;
+            for (int q = 0; q < k; q++)
+            {
+                double acc = 0;
+                for (int j = 0; j < n; j++) acc += (double)u[grp, q, j] * w[r, j];
+                expected[r * k + q] = acc;
+            }
+        }
+        AssertClose(expected, da, 1e-4, "d2/da");
+    }
+
     [Fact]
     public void OffsetAndStridedViews_MatchReference()
     {

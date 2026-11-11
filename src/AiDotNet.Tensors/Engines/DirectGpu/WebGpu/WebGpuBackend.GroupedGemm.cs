@@ -30,7 +30,7 @@ public sealed partial class WebGpuBackend : IGroupedGemmBackend
                                 GetOrCreatePipelineAsync(GroupedGemmModulePrefix + name, WebGpuGroupedGemmKernels.SourceFor(name),
                                     name).GetAwaiter().GetResult();
                         }
-                        catch (Exception ex)
+                        catch (Exception ex) when (PortableGroupedGemm.IsBuildFailure(ex))
                         {
                             System.Diagnostics.Trace.TraceWarning($"WebGPU grouped GEMM kernels unavailable: {ex.Message}");
                             ok = false;

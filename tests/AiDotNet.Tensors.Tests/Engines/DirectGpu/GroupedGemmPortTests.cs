@@ -177,6 +177,22 @@ public class GroupedGemmPortTests
         Assert.True(gg.TryGroupedRowsWeightGrad(ba, bc, bw, ends, m, k, n), $"the weight gradient refused {label}");
         backend.Synchronize();
         Compare($"wgrad {label}", WeightGradReference(a, c, ends, m, k, n), backend.DownloadBuffer(bw), 1e-4);
+        CheckNaNStaysInItsGroup(backend, gg);
+    }
+
+    // A non-finite weight in one group must not reach another group's rows or the unrouted tail (rows share a tile).
+    private static void CheckNaNStaysInItsGroup(IDirectGpuBackend backend, IGroupedGemmBackend gg)
+    {
+        using var ba = backend.AllocateBuffer(new[] { 1f, 1f, 1f });
+        using var bb = backend.AllocateBuffer(new[] { float.NaN, 2f });
+        using var by = backend.AllocateBuffer(3);
+        backend.Fill(by, -7f, 3);
+        Assert.True(gg.TryGroupedRowsGemm(ba, bb, by, new[] { 1, 2 }, 3, 1, 1, false, null, false), "the forward refused M3 K1 N1");
+        backend.Synchronize();
+        var y = backend.DownloadBuffer(by);
+        Assert.True(float.IsNaN(y[0]), $"row 0 (group 0) should be NaN, got {y[0]}");
+        Assert.Equal(2f, y[1]);
+        Assert.Equal(0f, y[2]);
     }
 
     private static int GroupOf(int[] ends, int row)

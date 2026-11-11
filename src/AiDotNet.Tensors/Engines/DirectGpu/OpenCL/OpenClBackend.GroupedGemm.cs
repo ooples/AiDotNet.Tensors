@@ -61,7 +61,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 return true;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (PortableGroupedGemm.IsBuildFailure(ex))
             {
                 System.Diagnostics.Trace.TraceWarning($"OpenCL grouped GEMM kernels unavailable: {ex.Message}");
                 return false;

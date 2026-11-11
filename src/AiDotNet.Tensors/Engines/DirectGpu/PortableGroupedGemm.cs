@@ -10,6 +10,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal static class PortableGroupedGemm
 {
+    /// <summary>
+    /// Whether a failure while building the kernels leaves the backend usable, so the op reports itself unavailable and
+    /// the engine falls back (logged). Driver and compiler errors surface as many exception types across the four
+    /// backends; only runtime-fatal ones propagate.
+    /// </summary>
+    internal static bool IsBuildFailure(Exception ex) =>
+        ex is not (OutOfMemoryException or StackOverflowException or AccessViolationException
+            or System.Threading.ThreadAbortException);
+
     /// <summary>One launch: the kernel's buffers in binding order and its ints, over <paramref name="groups"/> groups of
     /// <see cref="GroupedGemmKernelTemplate.GroupSize"/>.</summary>
     internal delegate void Launcher(string kernelName, int groups, IGpuBuffer[] buffers, int[] ints);

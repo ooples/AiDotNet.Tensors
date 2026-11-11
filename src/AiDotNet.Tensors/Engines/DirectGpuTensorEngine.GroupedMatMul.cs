@@ -40,7 +40,7 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         int g = ends.Length, m = a._shape[0], k = a._shape[1], n = c._shape[1];
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IGroupedGemmBackend grouped
-            || g == 0 || k == 0 || n == 0)
+            || g == 0 || m == 0 || k == 0 || n == 0)
             return base.GroupedRowsWeightGrad(a, c, ends);
 
         using var aB = GetOrAllocateBuffer(backend, a);
@@ -53,6 +53,7 @@ public partial class DirectGpuTensorEngine
         }
         var result = DeferTensorResult<T>(backend, wB.Buffer, g * k * n, new[] { g, k, n });
         wB.RelinquishOwnership();
+        RecordGroupedWeightGrad(result, a, c, ends);
         return result;
     }
 }

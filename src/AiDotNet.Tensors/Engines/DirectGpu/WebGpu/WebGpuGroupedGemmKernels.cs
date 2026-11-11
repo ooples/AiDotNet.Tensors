@@ -88,9 +88,13 @@ fn NAME(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: 
                 workgroupBarrier();
                 for (var kk = 0; kk < 16; kk = kk + 1) {
                     for (var i = 0; i < 4; i = i + 1) {
-                        let a = sm[(tr * 4 + i) * 16 + kk];
-                        for (var j = 0; j < 4; j = j + 1) {
-                            acc[i * 4 + j] = fma(a, sm[1024 + kk * 64 + tc * 4 + j], acc[i * 4 + j]);
+                        // Only this group's rows accumulate: another group's weights (a NaN, say) never reach them.
+                        let orow = row0 + tr * 4 + i;
+                        if (orow >= r0 && orow < r1) {
+                            let a = sm[(tr * 4 + i) * 16 + kk];
+                            for (var j = 0; j < 4; j = j + 1) {
+                                acc[i * 4 + j] = fma(a, sm[1024 + kk * 64 + tc * 4 + j], acc[i * 4 + j]);
+                            }
                         }
                     }
                 }

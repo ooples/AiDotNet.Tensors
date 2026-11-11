@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -30,19 +31,15 @@ public sealed unsafe partial class VulkanBackend : IGroupedGemmBackend
             {
                 if (_groupedGemmReady is null)
                 {
-                    bool ok = true;
+                    bool ok;
                     try
                     {
-                        foreach (var spec in GroupedGemmKernelTemplate.Kernels)
-                            if (GetOrCreateGlslPipeline(s_groupedGemmShaders[spec.Name], spec.Buffers.Length,
-                                    (uint)(spec.Ints.Length * sizeof(uint))) is null)
-                            {
-                                System.Diagnostics.Trace.TraceWarning($"Vulkan grouped GEMM kernels unavailable: '{spec.Name}' did not build.");
-                                ok = false;
-                                break;
-                            }
+                        ok = GroupedGemmKernelTemplate.Kernels.All(spec =>
+                            GetOrCreateGlslPipeline(s_groupedGemmShaders[spec.Name], spec.Buffers.Length,
+                                (uint)(spec.Ints.Length * sizeof(uint))) is not null);
+                        if (!ok) System.Diagnostics.Trace.TraceWarning("Vulkan grouped GEMM kernels unavailable: a pipeline did not build.");
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (PortableGroupedGemm.IsBuildFailure(ex))
                     {
                         System.Diagnostics.Trace.TraceWarning($"Vulkan grouped GEMM kernels unavailable: {ex.Message}");
                         ok = false;

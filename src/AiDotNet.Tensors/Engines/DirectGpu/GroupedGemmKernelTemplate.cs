@@ -83,6 +83,9 @@ internal static class GroupedGemmKernelTemplate
                 {
                     for (int i = 0; i < 4; i++)
                     {
+                        // Only this group's rows accumulate: another group's weights (a NaN, say) never reach them.
+                        int orow = row0 + tr * 4 + i;
+                        if (orow < r0 || orow >= r1) continue;
                         float av = sm[(tr * 4 + i) * 16 + kk];
                         for (int j = 0; j < 4; j++)
                             acc[i * 4 + j] = FMA(av, sm[1024 + kk * 64 + tc * 4 + j], acc[i * 4 + j]);

@@ -70,6 +70,16 @@ public sealed class GroupedRowsMatMulGpuTests : IClassFixture<GpuCpuCorrectnessF
         AssertNoHostFallback();
     }
 
+    // No routed rows: the weight gradient is a zero [G, K, N] without uploading the empty inputs.
+    [SkippableFact]
+    public void WeightGrad_WithNoRows_IsZero()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        var w = _fixture.Gpu.GroupedRowsWeightGrad(new Tensor<float>(new[] { 0, 3 }), new Tensor<float>(new[] { 0, 2 }), new[] { 0 });
+        Assert.Equal(new[] { 1, 3, 2 }, w.Shape.ToArray());
+        Assert.All(w.ToArray(), x => Assert.Equal(0f, x));
+    }
+
     [SkippableTheory]
     [InlineData(0)]
     [InlineData(1)]
