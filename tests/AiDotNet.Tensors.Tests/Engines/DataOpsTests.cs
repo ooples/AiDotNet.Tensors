@@ -247,8 +247,8 @@ public sealed class DataOpsTests
         Assert.True(decided > corpus.Count * 8 / 10, $"the fast path decided only {decided} of {corpus.Count}");
 
         // The whole op equals float.TryParse per field, decided or not.
-        string text = string.Join(",", corpus);
-        var t = Cpu.TensorParse<float>(Encoding.UTF8.GetBytes(text), (byte)',', new[] { corpus.Count }, NumberStyles.Float,
+        string text = string.Join(";", corpus); // the corpus holds "1,5", one unparsable field
+        var t = Cpu.TensorParse<float>(Encoding.UTF8.GetBytes(text), (byte)';', new[] { corpus.Count }, NumberStyles.Float,
             CultureInfo.InvariantCulture, -1234.5f);
         var expectedAll = corpus.Select(s => float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out float v) ? v : -1234.5f).ToArray();
         AssertBits(expectedAll, t.ToArray());

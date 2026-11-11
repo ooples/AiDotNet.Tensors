@@ -255,8 +255,9 @@ internal static class DataDecodeChecks
     private static void CheckParse(IDirectGpuBackend backend, IDataDecodeBackend decode)
     {
         var corpus = AiDotNet.Tensors.Tests.Engines.DataOpsTests.NumericCorpus(20_000, seed: 21);
-        var bytes = Encoding.UTF8.GetBytes(string.Join(",", corpus));
-        var hostBounds = CpuEngine.SplitFieldBounds(bytes, (byte)',', out int fields);
+        // ";" because the corpus holds "1,5", one field that must fail to parse, not two fields.
+        var bytes = Encoding.UTF8.GetBytes(string.Join(";", corpus));
+        var hostBounds = CpuEngine.SplitFieldBounds(bytes, (byte)';', out int fields);
         Assert.Equal(corpus.Count, fields);
         const float missing = -1234.5f;
         uint missingBits = BitConverter.ToUInt32(BitConverter.GetBytes(missing), 0);
