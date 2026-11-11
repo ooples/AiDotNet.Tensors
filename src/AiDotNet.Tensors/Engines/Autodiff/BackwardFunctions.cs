@@ -1827,6 +1827,7 @@ internal static partial class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[0];
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderBatchNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         var gradInput = engine.BatchNormBackward(
             gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
@@ -1962,6 +1963,7 @@ internal static partial class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[0];
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderBatchNormAffine(gradOutput, inputs, engine, grads, mean, variance, epsilon)) return;
 
         Tensor<T> gradInput, gradGamma, gradBeta;
         // DirectGpuTensorEngine inherits CpuEngine, so a bare `is CpuEngine` would silently route
@@ -2019,6 +2021,7 @@ internal static partial class BackwardFunctions<T>
                 "never populated it before this replay (lazy/compiled-path wiring bug).")
             : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderLayerNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         // In a resident step the three gradients land in their accumulators directly (the input's added in the same
         // pass when it is not its first contribution, where the backend can).
@@ -2066,6 +2069,7 @@ internal static partial class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[1];
         var variance = (Tensor<T>)savedState[2];
         var epsilon = (double)savedState[3];
+        if (TrySecondOrderGroupNorm(gradOutput, inputs, engine, grads, numGroups, epsilon)) return;
 
         var gradInput = engine.GroupNormBackward(
             gradOutput, inputs[0], numGroups, inputs[1], mean, variance, epsilon,
@@ -2083,6 +2087,7 @@ internal static partial class BackwardFunctions<T>
     {
         var rms = (Tensor<T>)savedState[0];
         var epsilon = (double)savedState[1];
+        if (TrySecondOrderRMSNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         var gradInput = engine.RMSNormBackward(
             gradOutput, inputs[0], inputs[1], rms, epsilon, out var gradGamma);
@@ -2120,6 +2125,7 @@ internal static partial class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[0];
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderInstanceNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         var gradInput = engine.InstanceNormBackward(
             gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
@@ -2453,6 +2459,9 @@ internal static partial class BackwardFunctions<T>
             SoftcappedAttentionBackward(gradOutput, inputs, attentionWeights, scale, softcap, engine, grads);
             return;
         }
+        if (attentionWeights.Length == checked(gradOutput.Length / Math.Max(1, inputs[2]._shape[inputs[2].Rank - 1]) * inputs[1]._shape[inputs[1].Rank - 2])
+            && TrySecondOrderScaledDotProductAttention(gradOutput, inputs, engine, grads, attentionWeights, scale))
+            return;
         engine.ScaledDotProductAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], attentionWeights, scale,
             out var gradQ, out var gradK, out var gradV);
@@ -3662,6 +3671,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderMSELoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var predictions = inputs[0];
         var targets = inputs[1];
@@ -3770,6 +3780,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBCEWithLogitsLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var logits = inputs[0];
         var targets = inputs[1];
@@ -3786,6 +3797,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderCrossEntropyLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var logits = inputs[0];
         var targets = inputs[1];
@@ -3883,6 +3895,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderL1Loss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
         double scale = numOps.ToDouble(gradOutput[0]) / inputs[0].Length;
@@ -3901,6 +3914,7 @@ internal static partial class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
         double delta = (double)savedState[0];
+        if (TrySecondOrderHuberLoss(gradOutput, inputs, engine, grads, delta)) return;
         T scaleT = numOps.FromDouble(numOps.ToDouble(gradOutput[0]) / inputs[0].Length);
         // Huber gradient = clamp(diff, -delta, delta) * scale
         // clamp gives diff when |d|<=delta, delta*sign(d) when |d|>delta — exactly the Huber derivative
@@ -3915,6 +3929,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderKLDivLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
         // d(KL)/d(input) = -target / N * gradOutput[0]
@@ -3930,6 +3945,7 @@ internal static partial class BackwardFunctions<T>
     {
         // NLL backward is inherently index-based (scatter -scale at target class positions).
         // No element-wise engine op can express this — same as PyTorch's implementation.
+        if (TrySecondOrderNLLLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var targetTensor = inputs[1];
         int n = inputs[0].Shape[0];
@@ -4759,6 +4775,7 @@ internal static partial class BackwardFunctions<T>
             ? pv
             : throw new ArgumentException(
                 $"{nameof(PDistBackward)}: savedState[0] (p) must be a double.", nameof(savedState));
+        if (TrySecondOrderPDist(gradOutput, inputs, engine, grads, p)) return;
 
         var input = inputs[0];
         int n = input._shape[0], d = input._shape[1];
@@ -4799,6 +4816,7 @@ internal static partial class BackwardFunctions<T>
             ? pv
             : throw new ArgumentException(
                 $"{nameof(CDistBackward)}: savedState[0] (p) must be a double.", nameof(savedState));
+        if (TrySecondOrderCDist(gradOutput, inputs, output, engine, grads, p)) return;
 
         var x1 = inputs[0];
         var x2 = inputs[1];
@@ -4873,6 +4891,7 @@ internal static partial class BackwardFunctions<T>
             ? e
             : throw new ArgumentException(
                 $"{nameof(CosineSimilarityDimBackward)}: savedState[1] (eps) must be a double.", nameof(savedState));
+        if (TrySecondOrderCosineSimilarityDim(gradOutput, inputs, engine, grads, dim, eps)) return;
 
         var a = inputs[0];
         var b = inputs[1];
@@ -4936,6 +4955,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderCosineSimilarityLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var a = inputs[0];
         var b = inputs[1];
@@ -5426,6 +5446,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.ReLU)) return;
         var preActivation = (Tensor<T>)savedState[0];
 
         // Fused fast path: ReLU mask + transposed GEMM in minimal allocations.
@@ -5591,6 +5612,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.Sigmoid)) return;
         var maskedGrad = engine.SigmoidBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
@@ -5611,6 +5633,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.Tanh)) return;
         var maskedGrad = engine.TanhBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
@@ -5631,6 +5654,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.GELU)) return;
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.GeluBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
@@ -5652,6 +5676,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.Swish)) return;
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.SwishBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
@@ -6202,6 +6227,7 @@ internal static partial class BackwardFunctions<T>
         var inputLengths = (int[])savedState[2];
         var targetLengths = (int[])savedState[3];
         int blank = (int)savedState[4];
+        if (TrySecondOrderCtcLoss(gradOutput, inputs, engine, grads, targets, inputLengths, targetLengths, blank)) return;
 
         var ops = MathHelper.GetNumericOperations<T>();
         int maxT = logProbs._shape[0];
@@ -6538,6 +6564,7 @@ internal static partial class BackwardFunctions<T>
     {
         // inputs: [0]=input, [1]=centers, [2]=epsilons
         // RBFKernelBackward signature: (gradOutput, input, centers, epsilons, output)
+        if (TrySecondOrderRBFKernel(gradOutput, inputs, engine, grads)) return;
         var (gradX, gradCenters, gradEpsilons) = engine.RBFKernelBackward(gradOutput, inputs[0], inputs[1], inputs[2], output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradCenters, engine);
@@ -6660,6 +6687,7 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
+        if (TrySecondOrderBinaryCrossEntropy(gradOutput, inputs, engine, grads, (double)savedState[0])) return;
         var epsilon = numOps.FromDouble((double)savedState[0]);
         var grad = engine.TensorBinaryCrossEntropyBackward(inputs[0], inputs[1], epsilon);
         var scaledGrad = engine.TensorMultiply(gradOutput, grad);
@@ -6749,6 +6777,7 @@ internal static partial class BackwardFunctions<T>
         var axes = (int[])savedState[0];
         var mean = (Tensor<T>)savedState[1];
         var variance = (Tensor<T>)savedState[2];
+        if (TrySecondOrderReduceLogVariance(gradOutput, inputs, engine, grads, axes, variance)) return;
         var grad = engine.ReduceLogVarianceBackward(gradOutput, inputs[0], mean, variance, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -9568,6 +9597,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Iou)) return;
         var (gA, gB) = engine.BoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
@@ -9578,6 +9608,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Generalized)) return;
         var (gA, gB) = engine.GeneralizedBoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
@@ -9588,6 +9619,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Distance)) return;
         var (gA, gB) = engine.DistanceBoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
@@ -9598,6 +9630,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Complete)) return;
         var (gA, gB) = engine.CompleteBoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
