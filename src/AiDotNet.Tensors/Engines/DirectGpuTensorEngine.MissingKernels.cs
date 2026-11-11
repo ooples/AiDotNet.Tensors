@@ -10253,7 +10253,10 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, int order, int axis)
     {
         int ax = axis < 0 ? input.Rank + axis : axis;
-        if (order != 2 || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        // The device formula below evaluates g at x and drops the max-shift term; the forward evaluates g at
+        // x - max(x), so that is the gradient of a different function. The CPU backward has the exact formula; use it
+        // until this path applies the shift and the argmax correction too.
+        if (order >= 0 || IsTapeActive<T>() || Compilation.GraphMode.IsActive
             || ax < 0 || ax >= input.Rank)
             return base.TaylorSoftmaxBackward(gradOutput, input, output, order, axis);
 
