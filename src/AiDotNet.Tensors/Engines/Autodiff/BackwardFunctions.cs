@@ -9918,8 +9918,10 @@ internal static class BackwardFunctions<T>
             int sBase = r * tIn, dBase = r * tOut;
             for (int ot = 0; ot < tOut; ot++)
             {
-                double srcIdx = (double)ot * down / up;
-                int centre = (int)Math.Floor(srcIdx);
+                // Same exact placement as the forward (integer centre + fraction).
+                long num = (long)ot * down;
+                int centre = (int)(num / up);
+                double frac = (double)(num % up) / up;
                 // Forward per-output normalisation sums the weights; replay
                 // the same to get the denominator for this output element.
                 double wSum = 0.0;
@@ -9927,7 +9929,7 @@ internal static class BackwardFunctions<T>
                 {
                     int idx = centre + k;
                     if (idx < 0 || idx >= tIn) continue;
-                    double t = (idx - srcIdx) * cutoff;
+                    double t = (k - frac) * cutoff;
                     double sinc = Math.Abs(t) < 1e-12 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
                     double hann = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * (k + halfWidth) / (2.0 * halfWidth));
                     wSum += sinc * hann;
@@ -9939,7 +9941,7 @@ internal static class BackwardFunctions<T>
                 {
                     int idx = centre + k;
                     if (idx < 0 || idx >= tIn) continue;
-                    double t = (idx - srcIdx) * cutoff;
+                    double t = (k - frac) * cutoff;
                     double sinc = Math.Abs(t) < 1e-12 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
                     double hann = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * (k + halfWidth) / (2.0 * halfWidth));
                     double w = sinc * hann / wSum;

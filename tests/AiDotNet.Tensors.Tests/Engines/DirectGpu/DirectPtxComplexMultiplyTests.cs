@@ -2141,7 +2141,10 @@ public class DirectPtxComplexMultiplyTests
         Assert.Contains("op=audio-resample", ptx);
         Assert.Contains("$RS_LOOP:", ptx);
         Assert.Contains("rem.u32 %r3, %r2, 1500", ptx);         // ot = gid % outLen
-        Assert.Contains("cvt.rmi.s32.f32 %r5", ptx);            // centre = floor(srcIdx)
+        Assert.Contains("div.u64 %rd7, %rd6", ptx);             // centre = ot*down/up, exact integer division
+        Assert.Contains("rem.u64 %rd8, %rd6", ptx);             // fraction numerator
+        Assert.DoesNotContain("cvt.rmi.s32.f32", ptx, StringComparison.Ordinal); // no float floor of the position
+        Assert.Contains("fma.rn.f32 %f22, %f21", ptx);          // near-zero sinc by Taylor series
         Assert.Equal(2, Count(ptx, "cvt.rni.f32.f32"));         // range reduction for sin and cos
         Assert.Contains("sin.approx.f32", ptx);
         Assert.Contains("cos.approx.f32", ptx);

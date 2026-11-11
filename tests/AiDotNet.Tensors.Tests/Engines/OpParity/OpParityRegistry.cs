@@ -1671,6 +1671,20 @@ public static class OpParityRegistry
             e => e.TimeStretch(stretchWaveform.D(), 1.5, nFft, hopLength),
             ParityTol.Accum(3e-3), opMethod: "TimeStretch");
 
+        // The two stages of PitchShift(3 semitones) at its own parameters: a sub-1 stretch rate and a non-integer
+        // resample ratio. Rate 1.5 and a 2:1 resample (the cases above) do not exercise either.
+        var pitchStageWaveform = OpInput.Rand(6062, new[] { 256 });
+        double pitchRate = 1.0 / System.Math.Pow(2.0, 3.0 / 12.0);
+        yield return new OpCase("TimeStretch[256;r0.84;n16]", "audio",
+            e => e.TimeStretch(pitchStageWaveform.F(), pitchRate, nFft, hopLength),
+            e => e.TimeStretch(pitchStageWaveform.D(), pitchRate, nFft, hopLength),
+            ParityTol.Accum(3e-3), opMethod: "TimeStretch");
+        var resampleStageWaveform = OpInput.Rand(6063, new[] { 304 });
+        yield return new OpCase("Resample[304;19027->16000]", "audio",
+            e => e.Resample(resampleStageWaveform.F(), 19027, 16000),
+            e => e.Resample(resampleStageWaveform.D(), 19027, 16000),
+            ParityTol.Accum(1e-3), opMethod: "Resample");
+
         var pitchWaveform = OpInput.Rand(6061, new[] { 256 });
         yield return new OpCase("PitchShift[256;3st;n16]", "audio",
             e => e.PitchShift(pitchWaveform.F(), 16000, 3.0, nFft, hopLength),

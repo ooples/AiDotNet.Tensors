@@ -649,15 +649,18 @@ public partial class CpuEngine
             int sBase = row * tIn, dBase = row * tOut;
             for (int ot = 0; ot < tOut; ot++)
             {
-                double srcIdx = (double)ot * down / up;
-                int centre = (int)Math.Floor(srcIdx);
+                // Exact position: ot*down/up as an integer centre and a fraction (the GPU kernels do the same), so a
+                // position just below an integer can never round up and shift the window by a sample.
+                long num = (long)ot * down;
+                int centre = (int)(num / up);
+                double frac = (double)(num % up) / up;
                 double acc = 0;
                 double weightSum = 0;
                 for (int k = -halfWidth; k <= halfWidth; k++)
                 {
                     int idx = centre + k;
                     if (idx < 0 || idx >= tIn) continue;
-                    double t = (idx - srcIdx) * cutoff;
+                    double t = (k - frac) * cutoff;
                     double w = Sinc(t) * Hann(k, halfWidth);
                     acc += w * ops.ToDouble(src[sBase + idx]);
                     weightSum += w;
@@ -673,8 +676,10 @@ public partial class CpuEngine
 
     private static double Sinc(double x)
     {
-        if (Math.Abs(x) < 1e-12) return 1.0;
+        // Same near-zero form as the GPU kernels (Taylor series below |pi x| = 1e-3), so a tap almost exactly on the
+        // source position is weighted identically on every engine.
         double px = Math.PI * x;
+        if (Math.Abs(px) < 1e-3) return 1.0 - px * px / 6.0;
         return Math.Sin(px) / px;
     }
 

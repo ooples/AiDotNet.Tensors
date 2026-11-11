@@ -109,16 +109,22 @@ struct P { leading: i32, inLen: i32, outLen: i32, up: i32, down: i32, halfWidth:
     let sBase = row * p.inLen;
     var cutoff : f32;
     if (p.up > p.down) { cutoff = 1.0 / f32(p.up); } else { cutoff = 1.0 / f32(p.down); }
-    let srcIdx = f32(ot) * f32(p.down) / f32(p.up);
-    let centre = i32(floor(srcIdx));
+    // Exact source position in 32-bit integers (ot = q*up + r; the host guarantees up*down < 2^31).
+    let q = ot / p.up; let r = ot - q * p.up;
+    let rd = r * p.down;
+    let centre = q * p.down + rd / p.up;
+    let frac = f32(rd - (rd / p.up) * p.up) / f32(p.up);
     var acc : f32 = 0.0; var wSum : f32 = 0.0;
     let PI = 3.14159265358979323846;
     for (var k : i32 = -p.halfWidth; k <= p.halfWidth; k = k + 1) {
         let idx = centre + k;
         if (idx < 0 || idx >= p.inLen) { continue; }
-        let tt = (f32(idx) - srcIdx) * cutoff;
+        let tt = (f32(k) - frac) * cutoff;
         var sinc : f32;
-        if (abs(tt) < 1e-12) { sinc = 1.0; } else { sinc = sin(PI * tt) / (PI * tt); }
+        // Near zero, sin(x)/x by its Taylor series: a fast or relaxed sin has ~1e-7 absolute error, which turns
+        // sin(x)/x for x ~ 1e-8 (a tap almost exactly on the source position) into garbage. Error below 1e-14.
+        let px = PI * tt;
+        if (abs(px) < 1e-3) { sinc = 1.0 - px * px * (1.0 / 6.0); } else { sinc = sin(px) / px; }
         let hann = 0.5 - 0.5 * cos(2.0 * PI * f32(k + p.halfWidth) / f32(2 * p.halfWidth));
         let w = sinc * hann;
         acc = acc + w * input_[sBase + idx];

@@ -202,6 +202,9 @@ public partial class DirectGpuTensorEngine
                 int up = newRate / gcd;
                 int down = origRate / gcd;
                 int halfWidth = Math.Max(8, Math.Min(256, up * 8));
+                // The kernels place each output exactly with 32-bit integer math (ot = q*up + r), which needs
+                // up*down < 2^31. Coprime rates beyond that (e.g. 48000:47999) take the exact CPU path.
+                if ((long)up * down >= int.MaxValue) return base.Resample(waveform, origRate, newRate);
 
                 int outLen = (int)((long)inLen * up / down);
                 int leading = waveform.Length / inLen;
