@@ -105,6 +105,31 @@ public sealed partial class TensorProgram
     /// <summary>Live parameter tensors given at trace time (not persisted), by value id.</summary>
     internal Dictionary<int, object> LiveParameters { get; set; } = new();
 
+    /// <summary>Parameter ids loaded by shape only, which must be bound before a replay.</summary>
+    internal HashSet<int> Unbound { get; set; } = new();
+
+    /// <summary>Whether every parameter has a value (false after loading a package saved without parameter values).</summary>
+    public bool ParametersBound => Unbound.Count == 0;
+
+    /// <summary>
+    /// Makes replays at <typeparamref name="T"/> use <paramref name="parameters"/> (in <see cref="ParameterIds"/> order) as the
+    /// parameter tensors: the live weights of a model, so training them updates the program and the program needs no copy.
+    /// </summary>
+    public void BindParameters<T>(IReadOnlyList<Tensor<T>> parameters)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        var ids = ParameterIds.ToArray();
+        if (parameters.Count != ids.Length) throw new ArgumentException($"The program has {ids.Length} parameter(s); got {parameters.Count}.", nameof(parameters));
+        for (int i = 0; i < ids.Length; i++)
+        {
+            var expected = Values[ids[i]].Shape;
+            if (!parameters[i]._shape.SequenceEqual(expected))
+                throw new ArgumentException($"Parameter {i} (%{ids[i]}) must have shape [{string.Join(", ", expected)}]; got [{string.Join(", ", parameters[i]._shape)}].", nameof(parameters));
+        }
+        _parameterCache[typeof(T)] = parameters.Cast<object>().ToArray();
+        Unbound.Clear();
+    }
+
     /// <summary>The parameter value ids, in definition order.</summary>
     public IEnumerable<int> ParameterIds => Values.Where(v => v.Role == ProgramValueRole.Parameter).Select(v => v.Id);
 
@@ -371,6 +396,8 @@ public sealed partial class TensorProgram
         if (inputs is null) throw new ArgumentNullException(nameof(inputs));
         if (inputs.Length != Inputs.Count) throw new ArgumentException($"The program takes {Inputs.Count} input(s); got {inputs.Length}.", nameof(inputs));
 
+        if (Unbound.Count > 0 && !_parameterCache.ContainsKey(typeof(T)))
+            throw new InvalidOperationException("The program was saved without parameter values; call BindParameters before running it.");
         var symbols = BindSymbols(inputs);
         var env = new object?[Values.Count];
         for (int i = 0; i < inputs.Length; i++) env[Inputs[i]] = inputs[i];

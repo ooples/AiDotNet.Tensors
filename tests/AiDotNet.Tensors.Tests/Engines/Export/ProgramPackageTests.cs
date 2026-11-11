@@ -58,6 +58,26 @@ public class ProgramPackageTests : IDisposable
     }
 
     [Fact]
+    public void SaveWithoutParameterValues_RequiresBinding_AndRunsOnTheBoundWeights()
+    {
+        var program = Mlp(out var w);
+        var withValues = Bytes(new ProgramPackage(program));
+        using var ms = new MemoryStream();
+        new ProgramPackage(program).Save(ms, includeParameterValues: false);
+        Assert.True(ms.Length < withValues.Length);
+
+        var loaded = ProgramPackage.Load(new MemoryStream(ms.ToArray())).Program;
+        Assert.False(loaded.ParametersBound);
+        var x = Random(3, 9, 4);
+        Assert.Throws<InvalidOperationException>(() => loaded.Run(x));
+
+        loaded.BindParameters(new[] { w });
+        Assert.True(loaded.ParametersBound);
+        Assert.Equal(program.Run(x).GetDataArray(), loaded.Run(x).GetDataArray());
+        Assert.Throws<ArgumentException>(() => loaded.BindParameters(new[] { Random(1, 2, 2) }));
+    }
+
+    [Fact]
     public void Load_RejectsTamperedFiles()
     {
         var bytes = Bytes(new ProgramPackage(Mlp(out _)));

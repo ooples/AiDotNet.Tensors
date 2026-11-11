@@ -241,7 +241,7 @@ internal static class ProgramSerializer
 
     // ── Tensor section ─────────────────────────────────────────────────────────────────────────────────────
 
-    internal static byte[] WriteTensors(IReadOnlyDictionary<int, object> stored)
+    internal static byte[] WriteTensors(IReadOnlyDictionary<int, object> stored, ISet<int>? shapeOnly = null)
     {
         using var ms = new MemoryStream();
         using var w = new BinaryWriter(ms, Encoding.UTF8);
@@ -254,6 +254,9 @@ internal static class ProgramSerializer
             w.Write(key);
             var (bytes, shape) = ((byte[], int[]))Generic(nameof(TensorBytes), element).Invoke(null, new[] { kv.Value })!;
             WriteInts(w, shape);
+            bool withData = shapeOnly is null || !shapeOnly.Contains(kv.Key);
+            w.Write(withData);
+            if (!withData) continue;
             w.Write(bytes.Length);
             w.Write(bytes);
         }
@@ -261,10 +264,10 @@ internal static class ProgramSerializer
         return ms.ToArray();
     }
 
-    internal static Dictionary<int, object> ReadTensors(byte[] data)
+    internal static Dictionary<int, object> ReadTensors(byte[] data, HashSet<int> unbound)
     {
         var r = new Reader(data);
-        int count = r.Count(12);
+        int count = r.Count(11);
         var result = new Dictionary<int, object>(count);
         for (int i = 0; i < count; i++)
         {
@@ -277,6 +280,13 @@ internal static class ProgramSerializer
             {
                 if (d < 0) throw new ProgramFormatException($"Stored tensor %{id} has a negative dimension.");
                 elements = checked(elements * d);
+            }
+            if (!r.Bool())
+            {
+                // Saved without values: a zero tensor of the right shape until the caller binds the real one.
+                unbound.Add(id);
+                result[id] = Generic(nameof(TensorFromBytes), element).Invoke(null, new object[] { new byte[checked((int)(elements * StoredSize(element)))], shape })!;
+                continue;
             }
             int length = r.Count(1);
             var bytes = r.Bytes(length);

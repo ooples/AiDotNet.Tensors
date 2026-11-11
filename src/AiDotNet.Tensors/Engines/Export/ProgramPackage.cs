@@ -194,7 +194,14 @@ public sealed class ProgramPackage
     // ── Persistence ────────────────────────────────────────────────────────────────────────────────────────
 
     /// <summary>Writes the package: header, program section, tensor section, one section per compiled target, checksum.</summary>
-    public void Save(Stream stream)
+    public void Save(Stream stream) => Save(stream, includeParameterValues: true);
+
+    /// <summary>
+    /// Writes the package. With <paramref name="includeParameterValues"/> false, parameters are written by shape only: a
+    /// caller that persists the weights itself (a model file) binds them after loading with
+    /// <see cref="TensorProgram.BindParameters{T}"/>, so weights are not stored twice.
+    /// </summary>
+    public void Save(Stream stream, bool includeParameterValues)
     {
         if (stream is null) throw new ArgumentNullException(nameof(stream));
         byte[] body;
@@ -205,7 +212,7 @@ public sealed class ProgramPackage
             w.Write(ProgramSerializer.Version);
             w.Write(TensorProgram.FormatVersion);
             WriteSection(w, ProgramSerializer.SectionProgram, ProgramSerializer.WriteProgram(Program));
-            WriteSection(w, ProgramSerializer.SectionTensors, ProgramSerializer.WriteTensors(Program.Stored));
+            WriteSection(w, ProgramSerializer.SectionTensors, ProgramSerializer.WriteTensors(Program.Stored, includeParameterValues ? null : new HashSet<int>(Program.ParameterIds)));
             foreach (var t in Targets) WriteSection(w, ProgramSerializer.SectionCompiled, WriteTarget(t));
             w.Flush();
             body = ms.ToArray();
@@ -279,8 +286,10 @@ public sealed class ProgramPackage
         }
         if (programBytes is null || tensorBytes is null) throw new ProgramFormatException("The package has no program or tensor section.");
 
-        var stored = ProgramSerializer.ReadTensors(tensorBytes);
+        var unbound = new HashSet<int>();
+        var stored = ProgramSerializer.ReadTensors(tensorBytes, unbound);
         var program = ProgramSerializer.ReadProgram(programBytes, stored);
+        program.Unbound = unbound;
         var package = new ProgramPackage(program);
         package._targets.AddRange(options.KeepForeignTargets
             ? targets

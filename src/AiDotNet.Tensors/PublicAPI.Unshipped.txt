@@ -291,3 +291,6 @@ AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorTuple = 5 -> AiDotNet.Tens
 AiDotNet.Tensors.Engines.Export.EngineValueKind.Unsupported = 19 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
 AiDotNet.Tensors.Engines.Export.EngineValueKind.Vector = 6 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
 AiDotNet.Tensors.Engines.Export.EngineValueKind.Void = 0 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.ProgramPackage.Save(System.IO.Stream! stream, bool includeParameterValues) -> void
+AiDotNet.Tensors.Engines.Export.TensorProgram.BindParameters<T>(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! parameters) -> void
+AiDotNet.Tensors.Engines.Export.TensorProgram.ParametersBound.get -> bool
