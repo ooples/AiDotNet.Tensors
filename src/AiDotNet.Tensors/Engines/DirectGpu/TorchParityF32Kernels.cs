@@ -15,7 +15,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal static class TorchParityF32Kernels
 {
-    public static string GetSource() => Tables() + Helpers + SpecialFunctions + Elementwise + Sampling + Indexing;
+    // The model-op kernels (TorchModelOpsKernels) ride along: Metal and WebGPU build this one library.
+    public static string GetSource() => Tables() + Helpers + SpecialFunctions + Elementwise + Sampling + Indexing + TorchModelOpsKernels.Source;
 
     private static string Tables()
     {

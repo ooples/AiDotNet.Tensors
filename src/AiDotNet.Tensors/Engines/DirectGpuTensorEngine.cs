@@ -30429,6 +30429,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = tensor.Rank;
                 int normalizedAxis = axis < 0 ? rank + axis : axis;
+                if (normalizedAxis >= 0 && normalizedAxis < rank - 1 && tensor.Length > 0 && !Compilation.GraphMode.IsActive)
+                {
+                    // Any other axis: move it last on the device, run the row path below, move it back, and record one
+                    // node on the input (its backward reduces along the saved axis with device ops). This used to fall
+                    // to the CPU, a host round trip for e.g. log-softmin over the batch axis.
+                    Tensor<T> moved;
+                    using (new Autodiff.NoGradScope<T>())
+                        moved = AlongLastAxis(tensor, normalizedAxis, t => ((IEngine)this).TensorLogSoftmax(t, -1));
+                    Autodiff.DifferentiableOps.RecordUnary("LogSoftmax", moved, tensor,
+                        Autodiff.BackwardFunctions<T>.LogSoftmaxBackward, new object[] { normalizedAxis });
+                    return moved;
+                }
                 if (normalizedAxis == rank - 1 && tensor.Length > 0)
                 {
                     int features = tensor.Shape._dims[normalizedAxis];

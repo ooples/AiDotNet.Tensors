@@ -12,7 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// run (<see cref="TorchParityF32Kernels"/>), executed as their generated WGSL on Dawn. The parity device suites run on
 /// an engine over it, so the WebGPU / Metal kernels meet the same CPU references as every other backend.
 /// </summary>
-internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParityElementwiseBackend
+internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParityElementwiseBackend, ITorchModelOpsBackend
 {
     private readonly PortableGenericFft.Launcher _launch;
 
@@ -83,6 +83,25 @@ internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParit
         => PortableTorchParity.GridSample3D(_launch, input, grid, output, batches, channels, depth, height, width, points, mode, padding, alignCorners);
     public void TorchParityGridSample3DBackward(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer outputGrad, IGpuBuffer inputGrad, IGpuBuffer gridGrad, int batches, int channels, int depth, int height, int width, int points, int mode, int padding, bool alignCorners)
         => PortableTorchParity.GridSample3DBackward(_launch, input, grid, outputGrad, inputGrad, gridGrad, batches, channels, depth, height, width, points, mode, padding, alignCorners);
+
+    // The model-op kernels ride in the same FP32 source (TorchParityF32Kernels), so Dawn runs them too.
+    public void ModelActivationBackward(int op, IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int n, float p0, float p1)
+        => PortableTorchModelOps.ActivationBackward(_launch, op, gradOutput, input, gradInput, n, p0, p1);
+    public void ModelFakeQuantize(IGpuBuffer input, IGpuBuffer partial, IGpuBuffer minMax, IGpuBuffer output, IGpuBuffer mask, int n,
+        bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint)
+        => PortableTorchModelOps.FakeQuantize(_launch, input, partial, minMax, output, mask, n, derive, symmetric, hasZeroPoint, qMin, qMax, fixedStep, zeroPoint);
+    public void ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratch, IGpuBuffer output, int rows, int width, int k)
+        => PortableTorchModelOps.TopKSoftmax(_launch, input, scratch, output, rows, width, k);
+    public void ModelTimeEmbedding(IGpuBuffer timesteps, IGpuBuffer frequencies, IGpuBuffer output, int batch, int halfDim, int dim)
+        => PortableTorchModelOps.TimeEmbedding(_launch, timesteps, frequencies, output, batch, halfDim, dim);
+    public void ModelTimeEmbeddingBackward(IGpuBuffer timesteps, IGpuBuffer frequencies, IGpuBuffer gradOutput, IGpuBuffer gradTimesteps, int batch, int halfDim, int dim)
+        => PortableTorchModelOps.TimeEmbeddingBackward(_launch, timesteps, frequencies, gradOutput, gradTimesteps, batch, halfDim, dim);
+    public void ModelCrfForward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer start, IGpuBuffer end, IGpuBuffer alpha, IGpuBuffer logZ, int batch, int seqLen, int tags)
+        => PortableTorchModelOps.CrfForward(_launch, emissions, transitions, start, end, alpha, logZ, batch, seqLen, tags);
+    public void ModelCrfBackward(IGpuBuffer emissions, IGpuBuffer transitions, IGpuBuffer end, IGpuBuffer alpha, IGpuBuffer logZ, IGpuBuffer gradLogZ,
+        IGpuBuffer beta, IGpuBuffer gradEmissions, IGpuBuffer gradTransitions, IGpuBuffer gradStart, IGpuBuffer gradEnd, int batch, int seqLen, int tags)
+        => PortableTorchModelOps.CrfBackward(_launch, emissions, transitions, end, alpha, logZ, gradLogZ, beta, gradEmissions, gradTransitions,
+            gradStart, gradEnd, batch, seqLen, tags);
 }
 
 /// <summary>An engine over <see cref="DawnTorchParityBackend"/>; unavailable without OpenCL or Dawn.</summary>
