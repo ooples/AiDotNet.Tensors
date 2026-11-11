@@ -290,8 +290,8 @@ public class CudaFftGenericKernelTests
 
     [Theory]
     [InlineData(FftElementType.Float32, "float", "_f32")]
-    [InlineData(FftElementType.Float16, "__half", "_f16")]
-    [InlineData(FftElementType.BFloat16, "__nv_bfloat16", "_bf16")]
+    [InlineData(FftElementType.Float16, "unsigned short", "_f16")]
+    [InlineData(FftElementType.BFloat16, "unsigned short", "_bf16")]
     public async Task SourceUsesTheRequestedStorageType(FftElementType type, string storeType, string suffix)
     {
         await Task.Yield();
@@ -302,12 +302,16 @@ public class CudaFftGenericKernelTests
     }
 
     [Theory]
-    [InlineData(FftElementType.Float16, "cuda_fp16.h")]
-    [InlineData(FftElementType.BFloat16, "cuda_bf16.h")]
-    public async Task NarrowTypesIncludeTheirHeader(FftElementType type, string header)
+    [InlineData(FftElementType.Float16, "cvt.rn.f16.f32")]
+    [InlineData(FftElementType.BFloat16, "cvt.rn.bf16.f32")]
+    public async Task NarrowTypesConvertWithPtxAndNeedNoToolkitHeaders(FftElementType type, string roundingCvt)
     {
+        // NVRTC on a driver-only host has no cuda_fp16.h / cuda_bf16.h; including either failed the module's compile
+        // and silently removed 16-bit storage (and the autocast convolution built on it, #1549).
         await Task.Yield();
-        Assert.Contains(header, CudaFFTGenericKernels.GetSource(type));
+        string src = CudaFFTGenericKernels.GetSource(type);
+        Assert.DoesNotContain("#include <cuda_", src);
+        Assert.Contains(roundingCvt, src);
     }
 
     [Fact]

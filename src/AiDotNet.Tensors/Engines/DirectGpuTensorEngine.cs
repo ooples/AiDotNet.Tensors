@@ -7712,7 +7712,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // round-trip. The legacy GPU path below uploads input/kernel + DownloadIntoTensor (non-
         // capturable: 901/900). This is the ResBlock's inference fast-path conv (pre-allocated
         // output), so making it resident is what lets the residual add downstream stay on-device.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        // Under FP16/BF16 autocast too (#1549): the convolution then runs in that precision into the same resident output.
+        if (ResidentStepActive && typeof(T) == typeof(float)
             && input.Rank == 4 && kernel.Rank == 4
             && output.GetBackingArrayForCacheLookupUnsafe() is not null
             && TryGetBackend(out var rbk) && HasResidentReplayRoutes(rbk))
@@ -7730,6 +7731,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = inFp16 ? default : GetOrAllocateContiguousInputBuffer(rbk, input);
                 using var bufK = GetWeightBufferPreferResident(rbk, kernel, PersistentTensorRole.Weights);
                 var outBuf = GetOrCreateResidentBuffer(rbk, output, output.Length);
+
+                // #1549 autocast: an FP32 input convolves in the autocast precision into the resident FP32 output. An
+                // FP16-resident input (the FP16-activation mode) keeps the FP16 GEMM routes below, already 16-bit.
+                if (!inFp16 && TryAutocastConv2DForward(rbk, bufIn.Buffer, bufK.Buffer, outBuf,
+                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation))
+                {
+                    ResidentSyncCheck("Conv2DInto");
+                    BindResidentBuffer(output, outBuf, rbk);
+                    return;
+                }
+                if (Gpu.AutocastScope.IsEnabled && !inFp16)
+                {
+                    // Autocast without a 16-bit conv route on this backend: the plain FP32 convolution, as before, not
+                    // the FP16-conv lever below (which autocast never selected).
+                    rbk.Conv2D(bufIn.Buffer, bufK.Buffer, outBuf,
+                        b, ic, ih, iw, oc, oh, ow, kh, kw, stride, stride, padding, padding, dilation, dilation);
+                    ResidentSyncCheck("Conv2DInto");
+                    BindResidentBuffer(output, outBuf, rbk);
+                    return;
+                }
 
                 // #1650/#638 FP16-conv replay-floor lever (AIDOTNET_FP16_CONV=1): the INDUSTRY path (oneDNN/cuDNN/
                 // PyTorch) — conv as a GEMM on the matrix units. Fused FP16 im2col → col[K,N] (FP16), cached FP16
@@ -7758,7 +7779,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         hbConvR.Im2colKNFp16(bufIn.Buffer, colHalf, b, ic, ih, iw, kh, kw, stride, stride, padding, padding, dilation, dilation);
                     var wHalf = GetOrCacheFp16Weights(rbk, bufK.Buffer, M * K); // FP16 weights, converted once + cached
                     // FP16-act: keep the conv OUTPUT FP16 (GemmFp16HalfOut) + tag, so the next op reads FP16 (no convert).
-                    if (Fp16ActEnabled && rbk is IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cbOut)
+                    // Never under autocast (#1549): the FP32-only resident ops autocast now runs on the device read
+                    // their inputs as FP32, so autocast must not create FP16-tagged activations for them.
+                    if (Fp16ActEnabled && !Gpu.AutocastScope.IsEnabled
+                        && rbk is IFp16ActivationBackend { SupportsFp16ActivationStorage: true } cbOut)
                     {
                         if (batchedConvGemm is not null)
                             batchedConvGemm.GemmFp16ConvBatched(wHalf, colHalf, outBuf, M, oh * ow, K, b, halfOutput: true);
@@ -7803,7 +7827,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 BindResidentBuffer(output, outBuf, rbk);
                 return;
             }
-            catch (NotSupportedException cex) { GpuLaunchProbe.OnFallback("TensorLogInto", cex); AliasDiag($"Conv2DInto-resident FELLBACK in=[{string.Join(",", input._shape)}]: {cex.GetType().Name}: {cex.Message}"); }
+            catch (NotSupportedException cex) { GpuLaunchProbe.OnFallback("Conv2DInto", cex); AliasDiag($"Conv2DInto-resident FELLBACK in=[{string.Join(",", input._shape)}]: {cex.GetType().Name}: {cex.Message}"); }
         }
 
         if (TryGetBackend(out var gpuBackend))
@@ -7823,10 +7847,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuK = gpuBackend.AllocateBuffer(floatKernel.GetDataArray());
                 using var gpuOut = gpuBackend.AllocateBuffer(output.Length);
 
-                gpuBackend.Conv2D(gpuIn, gpuK, gpuOut,
-                    batch, inChannels, inH, inW,
-                    outChannels, outH, outW,
-                    kH, kW, stride, stride, padding, padding, dilation, dilation);
+                if (!TryAutocastConv2DForward(gpuBackend, gpuIn, gpuK, gpuOut,
+                        batch, inChannels, inH, inW, outChannels, outH, outW,
+                        kH, kW, stride, stride, padding, padding, dilation, dilation))
+                    gpuBackend.Conv2D(gpuIn, gpuK, gpuOut,
+                        batch, inChannels, inH, inW,
+                        outChannels, outH, outW,
+                        kH, kW, stride, stride, padding, padding, dilation, dilation);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
             }
@@ -10049,6 +10076,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
+            // #1549: under FP16/BF16 autocast the convolution runs in that precision (cuDNN tensor cores) and writes
+            // its FP32 output here; bias and activation below then run as for any FP32 convolution. Every FP32 route
+            // that follows is skipped for it.
+            bool autocastConv = typeof(T) == typeof(float) && TryAutocastConv2DForward(backend, inputBuffer.Buffer,
+                kernelBuffer.Buffer, outputBuffer.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+
             // Issue #841 golden slice: the direct PTX path owns the complete
             // convolution+bias+ReLU dataflow for one exact resident FP32 ABI.
             // Every other shape/semantic contract continues through the
@@ -10058,7 +10092,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // 1x1 contract it beats cuDNN's best ~1.60x on SM86. It fails closed on
             // any other contract, falling through to the v1 golden slice and then
             // the established path.
-            if (typeof(T) == typeof(float) && bias is { } rbBias &&
+            if (!autocastConv && typeof(T) == typeof(float) && bias is { } rbBias &&
                 activation == FusedActivationType.ReLU &&
                 kernelH == 1 && kernelW == 1 && strideH == 1 && strideW == 1 &&
                 padH == 0 && padW == 0 && dilationH == 1 && dilationW == 1 &&
@@ -10081,7 +10115,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return rbResult;
                 }
             }
-            if (typeof(T) == typeof(float) && bias is { } directBias &&
+            if (!autocastConv && typeof(T) == typeof(float) && bias is { } directBias &&
                 activation == FusedActivationType.ReLU &&
                 backend is IDirectPtxBackend directCuda &&
                 directCuda.IsDirectPtxConvolutionEnabled)
@@ -10117,7 +10151,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : null;
             // A backend that adds the bias and applies the activation in the convolution's own output kernel saves the
             // two passes below (conv2d_bias_add and the activation) over the whole output.
-            if ((bias is not null || activation == FusedActivationType.ReLU)
+            if (!autocastConv && (bias is not null || activation == FusedActivationType.ReLU)
                 && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU)
                 && backend is IConvBiasActivationBackend fusedConv)
             {
@@ -10146,14 +10180,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     return fusedResult;
                 }
             }
-            using (AiDotNet.Tensors.Engines.DirectGpu.ConvWeightIdentity.Enter(weightKey, kernel.GpuCacheVersion))
+            if (!autocastConv)
             {
-                backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
-                    batch, inChannels, inHeight, inWidth,
-                    outChannels, outHeight, outWidth,
-                    kernelH, kernelW,
-                    strideH, strideW, padH, padW,
-                    dilationH, dilationW);
+                using (AiDotNet.Tensors.Engines.DirectGpu.ConvWeightIdentity.Enter(weightKey, kernel.GpuCacheVersion))
+                {
+                    backend.Conv2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
+                        batch, inChannels, inHeight, inWidth,
+                        outChannels, outHeight, outWidth,
+                        kernelH, kernelW,
+                        strideH, strideW, padH, padW,
+                        dilationH, dilationW);
+                }
             }
 
             // Add bias if present
@@ -10291,13 +10328,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Execute GPU convolution
-            backend.Conv2D(input.Buffer, kernelBuffer.Buffer, outputBuffer,
-                batch, inChannels, inHeight, inWidth,
-                outChannels, outHeight, outWidth,
-                kernelH, kernelW,
-                strideH, strideW, padH, padW,
-                dilationH, dilationW);
+            // Execute GPU convolution (in the autocast precision under an FP16/BF16 scope, #1549)
+            if (typeof(T) != typeof(float) || !TryAutocastConv2DForward(backend, input.Buffer, kernelBuffer.Buffer,
+                    outputBuffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+                backend.Conv2D(input.Buffer, kernelBuffer.Buffer, outputBuffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW,
+                    strideH, strideW, padH, padW,
+                    dilationH, dilationW);
 
             // Add bias if present using GPU kernel for NCHW format
             if (bias != null)
@@ -19015,13 +19055,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
             using var kernelBuffer = GetOrAllocateBuffer(backend, kernel);
             int outputLength = batch * inChannels * inHeight * inWidth;
+            // #1549: under FP16/BF16 autocast the input gradient runs in that precision, as the forward did.
+            AutocastConvRoute autocastRoute = default;
+            bool autocastConv = typeof(T) == typeof(float) && TryResolveAutocastConvRoute(backend, out autocastRoute);
             return DispatchDeferredGpuOp<T>(backend, outputLength, inputShape, output =>
-                backend.Conv2DBackwardInput(gradOutBuffer.Buffer, kernelBuffer.Buffer, output,
-                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW),
+            {
+                if (!autocastConv || !TryAutocastConv2DBackwardData(backend, autocastRoute, kernelBuffer.Buffer, gradOutBuffer.Buffer, output,
+                        batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                        kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+                    backend.Conv2DBackwardInput(gradOutBuffer.Buffer, kernelBuffer.Buffer, output,
+                        batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                        kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            },
                 fullyWritten: true);   // every input-gradient route stores the whole gradient
         }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("EmbeddingBackwardGpu", capabilityGap);
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Conv2DBackwardInput", capabilityGap);
             return base.Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
         }
     }
@@ -19065,10 +19113,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
             int outputLength = outChannels * inChannels * kernelH * kernelW;
+            // #1549: under FP16/BF16 autocast the weight gradient runs in that precision (FP32 accumulation, as cuDNN
+            // computes it), and lands in the FP32 gradient the optimizer reads.
+            AutocastConvRoute autocastRoute = default;
+            bool autocastConv = typeof(T) == typeof(float) && TryResolveAutocastConvRoute(backend, out autocastRoute);
             return DispatchDeferredGpuOp<T>(backend, outputLength, kernelShape, output =>
-                backend.Conv2DBackwardKernel(inputBuffer.Buffer, gradOutBuffer.Buffer, output,
-                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW),
+            {
+                if (!autocastConv || !TryAutocastConv2DBackwardFilter(backend, autocastRoute, inputBuffer.Buffer, gradOutBuffer.Buffer, output,
+                        batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                        kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+                    backend.Conv2DBackwardKernel(inputBuffer.Buffer, gradOutBuffer.Buffer, output,
+                        batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                        kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            },
                 fullyWritten: true);   // every weight-gradient route stores the whole gradient (split-K sums in order)
         }
         catch (Exception ex)
@@ -21619,6 +21676,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Upload kernel
         using var kernelBuffer = GetWeightBufferPreferResident(backend, kernel, PersistentTensorRole.Weights);
 
+        // #1549: under FP16/BF16 autocast the input gradient runs in that precision, as IEngine.Conv2DBackwardInput does.
+        if (typeof(T) != typeof(float) || !TryResolveAutocastConvRoute(backend, out var autocastRoute)
+            || !TryAutocastConv2DBackwardData(backend, autocastRoute, kernelBuffer.Buffer, gradOutput.Buffer, gradInputBuffer,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW,
+                stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1]))
         backend.Conv2DBackwardInput(
             gradOutput.Buffer, kernelBuffer.Buffer, gradInputBuffer,
             batch, inChannels, inHeight, inWidth,
@@ -21678,6 +21740,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int kernelSize = kernelShape[0] * kernelShape[1] * kernelShape[2] * kernelShape[3];
         var gradKernelBuffer = backend.AllocateBuffer(kernelSize);
 
+        // #1549: under FP16/BF16 autocast the weight gradient runs in that precision, as IEngine.Conv2DBackwardKernel does.
+        if (typeof(T) != typeof(float) || !TryResolveAutocastConvRoute(backend, out var autocastRoute)
+            || !TryAutocastConv2DBackwardFilter(backend, autocastRoute, input.Buffer, gradOutput.Buffer, gradKernelBuffer,
+                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW,
+                stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1]))
         backend.Conv2DBackwardKernel(
             input.Buffer, gradOutput.Buffer, gradKernelBuffer,
             batch, inChannels, inHeight, inWidth,
