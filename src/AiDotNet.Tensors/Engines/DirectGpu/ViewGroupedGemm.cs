@@ -16,6 +16,7 @@ internal static class ViewGroupedGemm
         ?? throw new InvalidOperationException(
             $"{views.GetType().Name} refused a buffer view at offset {offset} ({count} elements) although it reports views free at any offset.");
 
+    /// <summary>Offsets non-decreasing and within [0, m].</summary>
     private static bool Valid(int[] ends, int m)
     {
         if (ends.Length == 0) return false;
@@ -28,6 +29,7 @@ internal static class ViewGroupedGemm
         return prev <= m;
     }
 
+    /// <summary>One vendor-BLAS GEMM per non-empty group on buffer views, the bias added per group, rows past the last offset zeroed.</summary>
     internal static bool TryForward(IDirectGpuBackend backend, IGpuBuffer a, IGpuBuffer b, IGpuBuffer y, int[] ends,
         int m, int n, int k, bool transposeB, IGpuBuffer? bias, bool biasPerGroup)
     {
@@ -65,6 +67,7 @@ internal static class ViewGroupedGemm
         return true;
     }
 
+    /// <summary>Per-group weight gradient a_g^T c_g through transposed scratch sized by the rows actually used; empty groups zeroed.</summary>
     internal static bool TryWeightGrad(IDirectGpuBackend backend, IGpuBuffer a, IGpuBuffer c, IGpuBuffer w, int[] ends,
         int m, int k, int n)
     {

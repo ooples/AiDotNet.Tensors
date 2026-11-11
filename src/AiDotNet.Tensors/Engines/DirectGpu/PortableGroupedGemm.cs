@@ -19,6 +19,7 @@ internal static class PortableGroupedGemm
     // The offsets are floats on the device (the template's buffers are float arrays): exact only below 2^24.
     private const int MaxExactRows = 1 << 24;
 
+    /// <summary>Offsets non-decreasing, within [0, m], and m below 2^24 so the float-encoded offsets stay exact.</summary>
     private static bool Valid(int[] ends, int m)
     {
         if (ends.Length == 0 || m >= MaxExactRows) return false;
@@ -40,6 +41,7 @@ internal static class PortableGroupedGemm
 
     private static int Tiles(int extent) => (extent + GroupedGemmKernelTemplate.Tile - 1) / GroupedGemmKernelTemplate.Tile;
 
+    /// <summary>Launches total workgroups in chunks of at most 65535, passing each chunk's first tile as tileBase.</summary>
     private static void LaunchTiled(Launcher launch, string kernel, long total, IGpuBuffer[] buffers, int[] ints)
     {
         int baseSlot = ints.Length - 1;   // tileBase is the last int of both kernels
@@ -52,6 +54,7 @@ internal static class PortableGroupedGemm
         }
     }
 
+    /// <summary>Runs the forward kernel over every group in one (chunked) launch; false if the shape is refused.</summary>
     internal static bool TryForward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer a, IGpuBuffer b, IGpuBuffer y,
         int[] ends, int m, int n, int k, bool transposeB, IGpuBuffer? bias, bool biasPerGroup)
     {
@@ -69,6 +72,7 @@ internal static class PortableGroupedGemm
         return true;
     }
 
+    /// <summary>Runs the per-group weight-gradient kernel (w_g = a_g^T c_g, zero for empty groups); false if refused.</summary>
     internal static bool TryWeightGrad(IDirectGpuBackend backend, Launcher launch, IGpuBuffer a, IGpuBuffer c, IGpuBuffer w,
         int[] ends, int m, int k, int n)
     {

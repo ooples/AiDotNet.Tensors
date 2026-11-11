@@ -194,5 +194,6 @@ fn NAME(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: 
         [GroupedGemmKernelTemplate.WeightGrad] = WeightGradSource.Replace("NAME", GroupedGemmKernelTemplate.WeightGrad),
     };
 
+    /// <summary>The WGSL module for one kernel name, its entry point named after the kernel.</summary>
     internal static string SourceFor(string name) => Sources[name];
 }

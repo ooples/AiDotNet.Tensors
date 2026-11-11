@@ -185,10 +185,12 @@ internal static class GroupedGemmKernelTemplate
         new(WeightGrad, new[] { "xa", "wout", "cg", "ends" }, WeightGradInts, WeightGradBody, 2048, new[] { 1 }),
     };
 
+    /// <summary>The kernel names: the forward and the weight gradient.</summary>
     internal static string[] GetKernelNames() => new[] { Forward, WeightGrad };
 
     internal static string GetModuleSource(WinogradKernelDialect dialect) => WinogradF23KernelTemplate.EmitModule(Kernels, dialect);
 
+    /// <summary>The standalone GLSL compute shader for one kernel (Vulkan compiles one pipeline per kernel).</summary>
     internal static string GetGlslSource(string name)
     {
         foreach (var spec in Kernels)

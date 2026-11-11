@@ -9,6 +9,7 @@ public partial class DirectGpuTensorEngine
     // implements: CUDA and HIP run one vendor-BLAS GEMM per group on buffer views, OpenCL, Vulkan, Metal and WebGPU one
     // launch of GroupedGemmKernelTemplate over every group. Nothing is gathered or padded to the largest group. Records
     // the same tape node as the CPU op, whose backward calls back into these overrides.
+    /// <summary>The jagged-rows grouped GEMM on the device; falls back to the CPU op (and logs it) only if the backend refuses the shape.</summary>
     internal override Tensor<T> GroupedRowsMatMul<T>(Tensor<T> a, Tensor<T> b, int[] ends, bool transposeB, Tensor<T>? bias = null)
     {
         using var __gpuOp = EnterGpuOp();
@@ -33,6 +34,7 @@ public partial class DirectGpuTensorEngine
         return result;
     }
 
+    /// <summary>The per-group weight gradient on the device; falls back to the CPU op (and logs it) only if the backend refuses the shape.</summary>
     internal override Tensor<T> GroupedRowsWeightGrad<T>(Tensor<T> a, Tensor<T> c, int[] ends)
     {
         using var __gpuOp = EnterGpuOp();
