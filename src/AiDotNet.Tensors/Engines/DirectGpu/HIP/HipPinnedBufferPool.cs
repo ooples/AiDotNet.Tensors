@@ -8,7 +8,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// </summary>
 internal sealed class HipPinnedBufferPool : IDisposable
 {
-    private readonly ConcurrentDictionary<int, ConcurrentBag<IntPtr>> _buckets = new();
+    // A stack, not a ConcurrentBag: see CudaPinnedBufferPool.
+    private readonly ConcurrentDictionary<int, ConcurrentStack<IntPtr>> _buckets = new();
     private bool _disposed;
 
     public IntPtr Rent(int sizeInBytes)
@@ -16,7 +17,7 @@ internal sealed class HipPinnedBufferPool : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(HipPinnedBufferPool));
         int bucketSize = NextPowerOfTwo(sizeInBytes);
 
-        if (_buckets.TryGetValue(bucketSize, out var bag) && bag.TryTake(out var ptr))
+        if (_buckets.TryGetValue(bucketSize, out var bag) && bag.TryPop(out var ptr))
             return ptr;
 
         ptr = IntPtr.Zero;
@@ -31,10 +32,10 @@ internal sealed class HipPinnedBufferPool : IDisposable
             return;
 
         int bucketSize = NextPowerOfTwo(sizeInBytes);
-        var bag = _buckets.GetOrAdd(bucketSize, _ => new ConcurrentBag<IntPtr>());
+        var bag = _buckets.GetOrAdd(bucketSize, _ => new ConcurrentStack<IntPtr>());
 
         if (bag.Count < 8)
-            bag.Add(ptr);
+            bag.Push(ptr);
         else
             HipNativeBindings.hipHostFree(ptr);
     }
@@ -58,7 +59,7 @@ internal sealed class HipPinnedBufferPool : IDisposable
 
         foreach (var kvp in _buckets)
         {
-            while (kvp.Value.TryTake(out var ptr))
+            while (kvp.Value.TryPop(out var ptr))
             {
                 HipNativeBindings.hipHostFree(ptr);
             }

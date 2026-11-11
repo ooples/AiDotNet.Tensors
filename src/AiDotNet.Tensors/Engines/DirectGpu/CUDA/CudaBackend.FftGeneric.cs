@@ -130,14 +130,14 @@ public sealed partial class CudaBackend : IGenericFftBackend
         UnloadGenericFftModule(ref _fftGenericBFloat16Module);
     }
 
-    private static void UnloadGenericFftModule(ref IntPtr module)
+    private void UnloadGenericFftModule(ref IntPtr module)
     {
         if (module == IntPtr.Zero)
         {
             return;
         }
 
-        CudaNativeBindings.cuModuleUnload(module);
+        UnloadModule(module);
         module = IntPtr.Zero;
     }
 
