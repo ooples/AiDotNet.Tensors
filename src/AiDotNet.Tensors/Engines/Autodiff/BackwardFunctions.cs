@@ -2614,7 +2614,9 @@ internal static partial class BackwardFunctions<T>
 
         Tensor<T>? gradFirst = null;
         Tensor<T>? gradSecond = null;
-        using (GradientTape<T>.NoGrad())
+        // Built from engine ops: under create-graph they record (the scope is skipped), so the gradient is itself
+        // differentiable; otherwise recording is suppressed as before.
+        using (CreatesGraph ? null : GradientTape<T>.NoGrad())
         {
             var paddedSecond = engine.Pad(
                 second, radius, radius, radius, radius, numOps.Zero);
@@ -2718,6 +2720,11 @@ internal static partial class BackwardFunctions<T>
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+                deformInputs[2], null, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], 1, 1)))
+            return;
 
         var gradInput = engine.DeformableConv2DBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], null, inputs[0]._shape, stride, padding, dilation);
@@ -2743,6 +2750,11 @@ internal static partial class BackwardFunctions<T>
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
         var mask = inputs[3];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+                deformInputs[2], deformInputs[3], (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], 1, 1)))
+            return;
 
         var gradInput = engine.DeformableConv2DBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], mask, inputs[0]._shape, stride, padding, dilation);
@@ -2774,6 +2786,11 @@ internal static partial class BackwardFunctions<T>
         var dilation = (int[])savedState[2];
         int groups = (int)savedState[3];
         int deformGroups = (int)savedState[4];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+                deformInputs[2], null, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], (int)savedState[3], (int)savedState[4])))
+            return;
 
         var gradInput = engine.DeformableConv2DGroupedBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], null, inputs[0]._shape, stride, padding, dilation, groups, deformGroups);
@@ -2801,6 +2818,11 @@ internal static partial class BackwardFunctions<T>
         int groups = (int)savedState[3];
         int deformGroups = (int)savedState[4];
         var mask = inputs[3];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+                deformInputs[2], deformInputs[3], (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], (int)savedState[3], (int)savedState[4])))
+            return;
 
         var gradInput = engine.DeformableConv2DGroupedBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], mask, inputs[0]._shape, stride, padding, dilation, groups, deformGroups);
@@ -2834,6 +2856,11 @@ internal static partial class BackwardFunctions<T>
         var tgtShape = (int[])savedState[3];
         var attentionCoeffs = (Tensor<T>)savedState[4];
         var leakyReluAlpha = (double)savedState[5];
+        // Under create-graph: differentiate the attention as recorded ops (the backward kernel records nothing).
+        var gatInputs = inputs;
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads,
+                e => GraphAttentionRecorded(e, gatInputs[0], srcData, tgtData, gatInputs[1], gatInputs[2], leakyReluAlpha)))
+            return;
         var edgeSrc = new Tensor<int>(srcData, srcShape);
         var edgeTgt = new Tensor<int>(tgtData, tgtShape);
         // inputs[0]=nodeFeatures, inputs[1]=attnWeightSource, inputs[2]=attnWeightTarget
@@ -2853,6 +2880,15 @@ internal static partial class BackwardFunctions<T>
         var attentionWeights = (Tensor<T>)savedState[0];
         var numQueriesPerKV = (int)savedState[1];
         var scale = (double)savedState[2];
+        // Under create-graph: differentiate the attention as recorded ops (the fused backward kernel records nothing).
+        // The forward saves no causal flag; its masked positions are exactly the zero attention weights, which become
+        // a constant additive mask.
+        var gqaInputs = inputs;
+        if (CreatesGraph
+            && TryCompositeBackward(gradOutput, inputs, engine, grads,
+                e => AttentionRecorded(e, gqaInputs[0], gqaInputs[1], gqaInputs[2], scale, false,
+                    MaskFromZeroWeights(attentionWeights), numQueriesPerKV)))
+            return;
         engine.GroupedQueryAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], attentionWeights, numQueriesPerKV, scale,
             out var gradQ, out var gradK, out var gradV);
@@ -2878,6 +2914,11 @@ internal static partial class BackwardFunctions<T>
         var scale = (double)savedState[1];
         var isCausal = (bool)savedState[2];
         Tensor<T>? attentionBias = savedState.Length > 3 && savedState[3] is Tensor<T> b ? b : null;
+        // Under create-graph: differentiate the attention as recorded ops (the fused backward kernel records nothing).
+        var flashInputs = inputs;
+        if (TryCompositeBackward(gradOutput, inputs, engine, grads,
+                e => AttentionRecorded(e, flashInputs[0], flashInputs[1], flashInputs[2], scale, isCausal, attentionBias, 1)))
+            return;
         engine.FlashAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], output, softmaxStats, scale, isCausal,
             out var gradQ, out var gradK, out var gradV, attentionBias);
@@ -4380,6 +4421,26 @@ internal static partial class BackwardFunctions<T>
         int outLength = (length - kernelSize) / stride + 1;
         T scale = numOps.FromDouble(1.0 / kernelSize);
 
+        if (CreatesGraph)
+        {
+            // The same window average as a recorded sparse map (its adjoint, the window gather, is recorded too).
+            var to = new List<int>();
+            var from = new List<int>();
+            var coef = new List<double>();
+            for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+            for (int o = 0; o < outLength; o++)
+            for (int k = 0; k < kernelSize; k++)
+            {
+                to.Add((b * channels + c) * length + o * stride + k);
+                from.Add((b * channels + c) * outLength + o);
+                coef.Add(1.0 / kernelSize);
+            }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                SparseMap(gradOutput, (int[])inShape.Clone(), to.ToArray(), from.ToArray(), coef.ToArray()), engine);
+            return;
+        }
+
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int b = 0; b < batch; b++)
         for (int c = 0; c < channels; c++)
@@ -4402,7 +4463,15 @@ internal static partial class BackwardFunctions<T>
         // Argmax indices are flat offsets — scatter gradient to those positions
         // Use engine ops: create zeros, then add gradient at argmax positions
         var numOps = MathHelper.GetNumericOperations<T>();
-        int[] argmax = (int[])savedState[0];
+        // A compiled graph's node saves only (kernelSize, stride): find the winners again from the input.
+        int[] argmax = savedState[0] is int[] saved
+            ? saved
+            : MaxPool1DArgmax(inputs[0], (int)savedState[0], (int)savedState[1]);
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], ArgmaxScatterRecorded(gradOutput, inputs[0]._shape, argmax), engine);
+            return;
+        }
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         using var gradDataLease = gradOutput.Lease();
@@ -5412,6 +5481,11 @@ internal static partial class BackwardFunctions<T>
         // Argmax indices are flat offsets — scatter gradient to those positions
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], ArgmaxScatterRecorded(gradOutput, inputs[0]._shape, argmax), engine);
+            return;
+        }
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
         using var gradDataLease = gradOutput.LeaseArray();
         var gradData = gradDataLease.Array;

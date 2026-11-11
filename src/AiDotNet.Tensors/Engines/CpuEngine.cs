@@ -34564,6 +34564,33 @@ public partial class CpuEngine : ITensorLevelEngine
                 nameof(edgeTargetIndices));
         }
 
+        // Under a tape: the same computation from recorded ops (a per-head projection, then the recorded single-head
+        // GraphAttention), so the node features, the head weights and both attention vectors get gradients (of any
+        // order). The host loops below record nothing.
+        if (DifferentiableOps.IsRecording<T>() && !GraphMode.IsActive)
+        {
+            var flatNodes = Reshape(nodeFeatures, new[] { batchSize * numNodes, inFeatures });
+            var flatSource = Reshape(attentionWeightsSource, new[] { attentionWeightsSource.Length });
+            var flatTarget = Reshape(attentionWeightsTarget, new[] { attentionWeightsTarget.Length });
+            var headOutputs = new Tensor<T>[numHeads];
+            var headCoefficients = new Tensor<T>[numHeads];
+            for (int h = 0; h < numHeads; h++)
+            {
+                var projection = Reshape(TensorNarrow(headWeights, 0, h, 1), new[] { inFeatures, headDim });
+                var transformed = Reshape(TensorMatMul(flatNodes, projection), new[] { batchSize, numNodes, headDim });
+                headOutputs[h] = GraphAttention(transformed, edgeSourceIndices, edgeTargetIndices,
+                    TensorNarrow(flatSource, 0, h * headDim, headDim), TensorNarrow(flatTarget, 0, h * headDim, headDim),
+                    leakyReluAlpha, out headCoefficients[h]);
+            }
+            using (new NoGradScope<T>())
+                attentionCoeffs = TensorStack(headCoefficients, 1);
+            if (concatenate)
+                return Reshape(TensorStack(headOutputs, 2), new[] { batchSize, numNodes, numHeads * headDim });
+            Tensor<T> sum = headOutputs[0];
+            for (int h = 1; h < numHeads; h++) sum = TensorAdd(sum, headOutputs[h]);
+            return TensorMultiplyScalar(sum, numOps.FromDouble(1.0 / numHeads));
+        }
+
         using var nodeDataLease = nodeFeatures.Lease();
         var nodeData = nodeDataLease.Span;
         using var weightDataLease = headWeights.Lease();
@@ -43868,7 +43895,29 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> biases)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-        return MeshConvolutionOperations.SpiralConv(vertexFeatures, spiralIndices, weights, biases);
+        var result = MeshConvolutionOperations.SpiralConv(vertexFeatures, spiralIndices, weights, biases);
+        if (DifferentiableOps.IsRecording<T>() && !GraphMode.IsActive)
+        {
+            // Differentiable in the features, weights and bias: the kernels give the first-order gradients; under
+            // create-graph the backward differentiates the gather + linear map as recorded ops.
+            var indices = spiralIndices.ToArray();
+            int spiralLength = spiralIndices._shape[1];
+            int inputChannels = vertexFeatures._shape[1];
+            DifferentiableOps.RecordIfActive("SpiralConv", result, new[] { vertexFeatures, weights, biases },
+                (gradOutput, ins, output, saved, eng, grads) =>
+                {
+                    if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, ins, eng, grads,
+                            e => BackwardFunctions<T>.SpiralConvRecorded(e, ins[0], indices, spiralLength, ins[1], ins[2])))
+                        return;
+                    var indexTensor = new Tensor<int>(indices, new[] { indices.Length / spiralLength, spiralLength });
+                    DifferentiableOps.AccumulateGrad(grads, ins[0],
+                        MeshConvolutionOperations.SpiralConvBackwardInput(gradOutput, indexTensor, ins[1], inputChannels), eng);
+                    DifferentiableOps.AccumulateGrad(grads, ins[1],
+                        MeshConvolutionOperations.SpiralConvBackwardWeights(gradOutput, ins[0], indexTensor), eng);
+                    DifferentiableOps.AccumulateGrad(grads, ins[2], MeshConvolutionOperations.SpiralConvBackwardBias(gradOutput), eng);
+                });
+        }
+        return result;
     }
 
     /// <inheritdoc/>
@@ -43932,7 +43981,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 new[] { vertexFeatures, laplacian, weights, biases },
                 engine => engine.DiffusionConv(
                     vertexFeatures, laplacian, weights, biases, diffusionTime));
-        return MeshConvolutionOperations.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime);
+        var result = MeshConvolutionOperations.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime);
+        if (DifferentiableOps.IsRecording<T>() && !GraphMode.IsActive)
+        {
+            // Differentiable in all four tensors. The kernel backward has no Laplacian gradient, so the backward
+            // differentiates the Taylor-series composite (MeshConvolutionOperations.DiffusionConv's exact formula).
+            double t = MathHelper.GetNumericOperations<T>().ToDouble(diffusionTime);
+            DifferentiableOps.RecordIfActive("DiffusionConv", result, new[] { vertexFeatures, laplacian, weights, biases },
+                BackwardFunctions<T>.CompositeBackward((e, ins) => BackwardFunctions<T>.DiffusionConvRecorded(e, ins[0], ins[1], ins[2], ins[3], t)));
+        }
+        return result;
     }
 
     /// <inheritdoc/>
@@ -43953,7 +44011,17 @@ public partial class CpuEngine : ITensorLevelEngine
         LaplacianType laplacianType = LaplacianType.Cotangent)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-        return MeshConvolutionOperations.ComputeMeshLaplacian(vertices, faces, laplacianType);
+        var result = MeshConvolutionOperations.ComputeMeshLaplacian(vertices, faces, laplacianType);
+        // The cotangent (and normalized) Laplacian depends on the vertex positions; the uniform one only on the faces,
+        // so it has no gradient (as a constant of the connectivity).
+        if (laplacianType != LaplacianType.Uniform && DifferentiableOps.IsRecording<T>() && !GraphMode.IsActive)
+        {
+            var faceData = faces.ToArray();
+            bool normalized = laplacianType == LaplacianType.Normalized;
+            DifferentiableOps.RecordUnary("ComputeMeshLaplacian", result, vertices,
+                BackwardFunctions<T>.CompositeBackward((e, ins) => BackwardFunctions<T>.MeshLaplacianRecorded(e, ins[0], faceData, normalized)));
+        }
+        return result;
     }
 
     /// <inheritdoc/>
@@ -51499,7 +51567,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                     int outIdx = (b * channels + c) * outW + ow;
                     outData[outIdx] = maxVal;
-                    indices[outIdx] = maxIdx;
+                    // Flat offset into the input, as the backward reads it: the position within the row alone
+                    // routed every row's gradient into the first (batch, channel) row.
+                    indices[outIdx] = (b * channels + c) * width + maxIdx;
                 }
         DifferentiableOps.RecordUnary("MaxPool1D", result, input, BackwardFunctions<T>.MaxPool1DBackward,
             savedState: new object[] { indices, kernelSize, stride });
@@ -55334,9 +55404,35 @@ public partial class CpuEngine : ITensorLevelEngine
         [ThreadStatic] public static Complex<T>[]? Col;  // exactly h
     }
 
+    /// <summary>
+    /// y = Re(IFFT2(FFT2(x) ⊙ H)) is linear in x, and its adjoint is the same filter with the conjugate response:
+    /// Re(F⁻¹ conj(H) F g). The backward applies it through the engine, so it records again under create-graph and the
+    /// gradient is differentiable to any order. (The filter is a constant parameter here; a complex tensor has no
+    /// gradient on a real tape.)
+    /// </summary>
+    [ScalarKernel("Conjugates the (small, constant) filter response once per recorded forward.")]
+    private protected void RecordSpectralFilter<T>(string opName, Tensor<T> result, Tensor<T> input, Tensor<Complex<T>> filter, bool batched)
+    {
+        // A lazy graph records the composed FFT ops instead (the fused path is skipped there).
+        if (!DifferentiableOps.IsRecording<T>() || GraphMode.IsActive) return;
+        var ops = MathHelper.GetNumericOperations<T>();
+        var source = filter.IsContiguous ? filter : filter.Contiguous();
+        var conjugate = new Complex<T>[source.Length];
+        for (int i = 0; i < conjugate.Length; i++)
+        {
+            var c = source.GetFlat(i);
+            conjugate[i] = new Complex<T>(c.Real, ops.Negate(c.Imaginary));
+        }
+        var adjointFilter = new Tensor<Complex<T>>(conjugate, (int[])source._shape.Clone());
+        DifferentiableOps.RecordUnary(opName, result, input,
+            (g, ins, _, _, eng, grads) => DifferentiableOps.AccumulateGrad(grads, ins[0],
+                batched ? eng.NativeSpectralFilterBatch(g, adjointFilter) : eng.NativeSpectralFilter(g, adjointFilter), eng));
+    }
+
     /// <inheritdoc />
     public virtual Tensor<T> NativeSpectralFilter<T>(Tensor<T> input, Tensor<Complex<T>> filter)
     {
+        var recordedInput = input;
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (filter is null) throw new ArgumentNullException(nameof(filter));
         // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
@@ -55373,7 +55469,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // same 1/H·1/W inverse scaling and real extraction). Skipped when a lazy
         // graph is being recorded so the composed public ops still register nodes.
         if (!GraphMode.IsActive)
-            return NativeSpectralFilterFused(input, filter, h, w, filterLen);
+        {
+            var fused = NativeSpectralFilterFused(input, filter, h, w, filterLen);
+            RecordSpectralFilter("NativeSpectralFilter", fused, recordedInput, filter, batched: false);
+            return fused;
+        }
 
         // Composed fallback (graph-recording mode): FFT2D → multiply → IFFT2D.
         // Kept byte-for-byte as the original so lazy-graph recording is unchanged.
@@ -55490,6 +55590,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public virtual Tensor<T> NativeSpectralFilterBatch<T>(Tensor<T> input, Tensor<Complex<T>> filter)
     {
+        var recordedInput = input;
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (filter is null) throw new ArgumentNullException(nameof(filter));
         // These kernels read the storage array directly, so a strided view (a transpose, a slice) would be read in
@@ -55519,7 +55620,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // Fast path: fused, buffer-reusing round trip (bit-identical to composed).
         // Preserves the original modular-broadcast semantics for any filterLen.
         if (!GraphMode.IsActive && filterLen > 0)
-            return NativeSpectralFilterFused(input, filter, h, w, filterLen);
+        {
+            var fused = NativeSpectralFilterFused(input, filter, h, w, filterLen);
+            RecordSpectralFilter("NativeSpectralFilterBatch", fused, recordedInput, filter, batched: true);
+            return fused;
+        }
 
         // Composed fallback (graph-recording mode): FFT2D → multiply → IFFT2D.
         // Kept byte-for-byte as the original so lazy-graph recording is unchanged.

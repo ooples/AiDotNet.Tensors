@@ -479,7 +479,6 @@ public sealed class GradientTape<T> : IDisposable
     // Sentinel slot used when MaxEntries is reached — writes are discarded
     private TapeEntry<T> _discardSlot;
 
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     /// <summary>
     /// Moves every entry this (nested) tape recorded onto <paramref name="target"/>, in order, handing it their
     /// gradient nodes and saved-state pins, and leaves this tape empty.
@@ -514,6 +513,7 @@ public sealed class GradientTape<T> : IDisposable
         _entries.Reset();
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal ref TapeEntry<T> RecordSlot(out bool accepted)
     {
         // Same consumed-guard as Record(): RecordSlot is the alternate (direct arena-slot) recording

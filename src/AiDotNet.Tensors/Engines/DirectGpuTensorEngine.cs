@@ -32136,6 +32136,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.SpectralFilter(inBuf.Buffer, filterReal, filterImaginary,
                         output, batchCount, h, w, filterSliceCount));
                 backend.Synchronize();
+                RecordSpectralFilter("NativeSpectralFilter", result, input, filter, batched: false);
                 return result;
             }
             finally
@@ -32212,6 +32213,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.SpectralFilter(inBuf.Buffer, filterReal, filterImaginary,
                         output, totalSlices, h, w, filterSliceCount));
                 backend.Synchronize();
+                RecordSpectralFilter("NativeSpectralFilterBatch", result, input, filter, batched: true);
                 return result;
             }
             finally
