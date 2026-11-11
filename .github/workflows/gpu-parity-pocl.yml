@@ -114,7 +114,10 @@ jobs:
       uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
         dotnet-version: '10.0.x'
-        dotnet-quality: 'preview'
+        # GA on a self-hosted runner: 'preview' on the 10.0 channel resolves to 10.0.100-rc.2, whose NuGet fails the restore
+        # with NU1510. Hosted runners mask that with the image's newer preinstalled SDK; a self-hosted runner has none
+        # (the CUDA lane pins GA for the same reason).
+        dotnet-quality: ${{ runner.environment == 'self-hosted' && 'ga' || 'preview' }}
 
     - name: Install POCL (CPU OpenCL device) + ICD loader
       run: |
