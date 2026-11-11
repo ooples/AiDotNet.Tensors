@@ -302,3 +302,4 @@ static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Cast<TEngine>(this AiDot
 static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Is<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine) -> bool
 static AiDotNet.Tensors.Engines.EngineWrapperExtensions.TryGet<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine, out TEngine? result) -> bool
 static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Unwrap(this AiDotNet.Tensors.Engines.IEngine? engine) -> AiDotNet.Tensors.Engines.IEngine?
+static AiDotNet.Tensors.Helpers.TensorPool.ForceFreshAllocationsScope(bool forceFresh) -> System.IDisposable!

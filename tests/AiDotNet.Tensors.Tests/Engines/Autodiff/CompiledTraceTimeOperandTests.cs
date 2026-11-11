@@ -137,7 +137,7 @@ public class CompiledTraceTimeOperandTests
     {
         var engine = new CpuEngine();
         var prior = AiDotNetEngine.Current;
-        bool priorFresh = TensorPool.ForceFreshAllocations;
+        IDisposable? freshScope = null;
         AiDotNetEngine.Current = engine;
         try
         {
@@ -153,7 +153,7 @@ public class CompiledTraceTimeOperandTests
             Assert.NotEqual(0f, expectedLoss);
 
             // A compiled training step traces and runs its first step on fresh, uninitialized allocations.
-            TensorPool.ForceFreshAllocations = true;
+            freshScope = TensorPool.ForceFreshAllocationsScope(true); // this thread only: parallel tests keep pooling
             ICompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.EnableTraining(parameters))
             {
@@ -180,7 +180,7 @@ public class CompiledTraceTimeOperandTests
         }
         finally
         {
-            TensorPool.ForceFreshAllocations = priorFresh;
+            freshScope?.Dispose();
             AiDotNetEngine.Current = prior;
         }
     }
