@@ -362,24 +362,34 @@ internal static class MoeKernelTemplate
 ";
 
     // d gates[t, j] = o[pos(t, j)] . dy[t]; gates = sel / sum(sel), so d sel_j = (d gate_j - sum_i d gate_i gate_i) / sum.
+    // One workgroup per token: each slot's <o, dy> is a coalesced strided sum and a tree reduction (sm[256 + j] keeps
+    // it), then the [G] row is written in parallel, zero where the token did not route.
     private const string DScoresBody = @"
-    if (gid < N - baseOffset)
+    int tid = lid;
+    int t = grp + baseOffset;
+    for (int j = 0; j < TOPK; j++)
     {
-        int t = baseOffset + gid;
-        float dg[16];
-        float dot = 0.0f;
-        for (int j = 0; j < TOPK; j++)
+        int p = TOINT(pos[t * TOPK + j]);
+        float a = 0.0f;
+        for (int c = tid; c < D; c += 256) a = FMA(o[p * D + c], dy[t * D + c], a);
+        sm[tid] = a;
+        BARRIER();
+        for (int h = 128; h > 0; h = h / 2)
         {
-            int sl = t * TOPK + j;
-            int p = TOINT(pos[sl]);
-            float a = 0.0f;
-            for (int c = 0; c < D; c++) a = FMA(o[p * D + c], dy[t * D + c], a);
-            dg[j] = a;
-            dot = FMA(a, gates[sl], dot);
+            if (tid < h) sm[tid] += sm[tid + h];
+            BARRIER();
         }
-        for (int e = 0; e < G; e++) ds[t * G + e] = 0.0f;
+        if (tid == 0) sm[256 + j] = sm[0];
+        BARRIER();
+    }
+    float dot = 0.0f;
+    for (int j = 0; j < TOPK; j++) dot = FMA(sm[256 + j], gates[t * TOPK + j], dot);
+    for (int e = tid; e < G; e += 256)
+    {
+        float v = 0.0f;
         for (int j = 0; j < TOPK; j++)
-            ds[t * G + TOINT(ids[t * TOPK + j])] = (dg[j] - dot) / ssum[t];
+            if (TOINT(ids[t * TOPK + j]) == e) v = (sm[256 + j] - dot) / ssum[t];
+        ds[t * G + e] = v;
     }
 ";
 
@@ -405,7 +415,7 @@ internal static class MoeKernelTemplate
         new(Combine, new[] { "src", "pos", "gates", "y" }, new[] { "N", "D", "TOPK", "useGates", "baseOffset" },
             CombineBody, 0, new[] { 3 }),
         new(DScores, new[] { "o", "dy", "pos", "gates", "ssum", "ids", "ds" }, new[] { "N", "D", "G", "TOPK", "baseOffset" },
-            DScoresBody, 0, new[] { 6 }),
+            DScoresBody, 256 + MaxTopK, new[] { 6 }),
         new(DAct, new[] { "dy", "perm", "gates", "w2", "ends", "h13", "dh13" }, GemmInts, WithF2(GroupedRowsBody(
             "gates[TOINT(perm[arow])] * dy[(TOINT(perm[arow]) / TOPK) * Kd + acol]",
             "w2[(g * N + bcol) * Kd + brow]",

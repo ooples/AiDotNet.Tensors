@@ -359,22 +359,28 @@ var<workgroup> wgEnd: i32;
 ";
 
     private const string DScoresBody = Entry + @"
-    if (gid < pm.N - pm.baseOffset) {
-        let t = pm.baseOffset + gid;
-        var dg: array<f32, 16>;
-        var dot = 0.0;
-        for (var j = 0; j < pm.TOPK; j = j + 1) {
-            let sl = t * pm.TOPK + j;
-            let p = i32(pos[sl]);
-            var a = 0.0;
-            for (var c = 0; c < pm.D; c = c + 1) { a = fma(o[p * pm.D + c], dy[t * pm.D + c], a); }
-            dg[j] = a;
-            dot = fma(a, gates[sl], dot);
+    let t = grp + pm.baseOffset;
+    for (var j = 0; j < pm.TOPK; j = j + 1) {
+        let p = i32(pos[t * pm.TOPK + j]);
+        var a = 0.0;
+        for (var c = tid; c < pm.D; c = c + 256) { a = fma(o[p * pm.D + c], dy[t * pm.D + c], a); }
+        sm[tid] = a;
+        workgroupBarrier();
+        for (var h = 128; h > 0; h = h / 2) {
+            if (tid < h) { sm[tid] = sm[tid] + sm[tid + h]; }
+            workgroupBarrier();
         }
-        for (var e = 0; e < pm.G; e = e + 1) { ds[t * pm.G + e] = 0.0; }
+        if (tid == 0) { sm[256 + j] = sm[0]; }
+        workgroupBarrier();
+    }
+    var dot = 0.0;
+    for (var j = 0; j < pm.TOPK; j = j + 1) { dot = fma(sm[256 + j], gates[t * pm.TOPK + j], dot); }
+    for (var e = tid; e < pm.G; e = e + 256) {
+        var v = 0.0;
         for (var j = 0; j < pm.TOPK; j = j + 1) {
-            ds[t * pm.G + i32(ids[t * pm.TOPK + j])] = (dg[j] - dot) / ssum[t];
+            if (i32(ids[t * pm.TOPK + j]) == e) { v = (sm[256 + j] - dot) / ssum[t]; }
         }
+        ds[t * pm.G + e] = v;
     }
 }
 ";
