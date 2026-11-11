@@ -124,6 +124,51 @@ public class GroupedGemmPortTests
         CheckManyGroups(backend);
     }
 
+    [SkippableFact]
+    public void Vulkan_grouped_gemm_inside_active_batch_preserves_prior_dispatches()
+    {
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
+        var gg = Assert.IsAssignableFrom<IGroupedGemmBackend>(backend);
+
+        const int m = 16, k = 8, n = 6;
+        var ends = new[] { 5, 12, 16 };
+        var a = Random(m * k, 41);
+        var b = Random(ends.Length * k * n, 42);
+        var c = Random(m * n, 43);
+        var preLeft = new float[] { 10f, 20f, 30f, 40f };
+        var preRight = new float[] { 1f, 2f, 3f, 4f };
+
+        using var ba = backend.AllocateBuffer(a);
+        using var bb = backend.AllocateBuffer(b);
+        using var bc = backend.AllocateBuffer(c);
+        using var by = backend.AllocateBuffer(m * n);
+        using var bw = backend.AllocateBuffer(ends.Length * k * n);
+        using var bPreL = backend.AllocateBuffer(preLeft);
+        using var bPreR = backend.AllocateBuffer(preRight);
+        using var bPreOut = backend.AllocateBuffer(preLeft.Length);
+        backend.Fill(bPreOut, -999f, preLeft.Length);
+        backend.Fill(by, float.NaN, m * n);
+        backend.Fill(bw, float.NaN, ends.Length * k * n);
+
+        backend.BeginBatch();
+        try
+        {
+            // Earlier command recorded into the active batch must NOT be discarded by grouped GEMM's offsets upload.
+            backend.Add(bPreL, bPreR, bPreOut, preLeft.Length);
+            Assert.True(gg.TryGroupedRowsGemm(ba, bb, by, ends, m, n, k, false, null, false));
+            Assert.True(gg.TryGroupedRowsWeightGrad(ba, bc, bw, ends, m, k, n));
+        }
+        finally
+        {
+            backend.EndBatch();
+        }
+
+        Assert.Equal(new float[] { 11f, 22f, 33f, 44f }, backend.DownloadBuffer(bPreOut));
+        Compare("vulkan batch fwd", ForwardReference(a, b, ends, m, k, n, false, null, false), backend.DownloadBuffer(by), 1e-4);
+        Compare("vulkan batch wgrad", WeightGradReference(a, c, ends, m, k, n), backend.DownloadBuffer(bw), 1e-4);
+    }
+
     private static void CheckManyGroups(IDirectGpuBackend backend)
     {
         var gg = Assert.IsAssignableFrom<IGroupedGemmBackend>(backend);

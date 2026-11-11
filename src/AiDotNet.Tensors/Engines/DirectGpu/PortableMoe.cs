@@ -44,6 +44,7 @@ internal readonly struct MoeShape
 internal static class PortableMoe
 {
     private const int MaxGroupsPerLaunch = 65535;
+    private const int MaxElementsPerLaunch = MaxGroupsPerLaunch * MoeKernelTemplate.GroupSize;
     private const int T = MoeKernelTemplate.Tile;
 
     private static int Tiles(int extent) => (extent + T - 1) / T;
@@ -55,8 +56,34 @@ internal static class PortableMoe
         // tileBase is ints[5] in both GEMM int lists.
         for (long first = 0; first < total; first += MaxGroupsPerLaunch)
         {
-            ints[5] = (int)first;
-            be.LaunchMoeKernel(kernel, (int)Math.Min(MaxGroupsPerLaunch, total - first), buffers, ints);
+            var slice = (int[])ints.Clone();
+            slice[5] = (int)first;
+            be.LaunchMoeKernel(kernel, (int)Math.Min(MaxGroupsPerLaunch, total - first), buffers, slice);
+        }
+    }
+
+    private static void Elementwise(IMoeKernelBackend be, string kernel, int total, IGpuBuffer[] buffers, int[] ints)
+    {
+        // baseOffset is the last int of Route, Combine, and DScores.
+        int baseSlot = ints.Length - 1;
+        for (int baseOffset = 0; baseOffset < total; baseOffset += MaxElementsPerLaunch)
+        {
+            int chunk = Math.Min(MaxElementsPerLaunch, total - baseOffset);
+            var slice = (int[])ints.Clone();
+            slice[baseSlot] = baseOffset;
+            be.LaunchMoeKernel(kernel, Groups(chunk), buffers, slice);
+        }
+    }
+
+    private static void ChunkedGroups(IMoeKernelBackend be, string kernel, int totalGroups, IGpuBuffer[] buffers, int[] ints)
+    {
+        int baseSlot = ints.Length - 1;
+        for (int first = 0; first < totalGroups; first += MaxGroupsPerLaunch)
+        {
+            int count = Math.Min(MaxGroupsPerLaunch, totalGroups - first);
+            var slice = (int[])ints.Clone();
+            slice[baseSlot] = first;
+            be.LaunchMoeKernel(kernel, count, buffers, slice);
         }
     }
 
@@ -74,16 +101,16 @@ internal static class PortableMoe
         IGpuBuffer w1, IGpuBuffer w3, IGpuBuffer w2, IGpuBuffer ids, IGpuBuffer gates, IGpuBuffer ssum, IGpuBuffer perm,
         IGpuBuffer pos, IGpuBuffer ends, IGpuBuffer loads, IGpuBuffer h13, IGpuBuffer o, IGpuBuffer y)
     {
-        be.LaunchMoeKernel(MoeKernelTemplate.Route, Groups(s.N), new[] { scores, bias ?? scores, ids, gates, ssum },
-            new[] { s.N, s.G, s.K, bias is null ? 0 : 1 });
-        be.LaunchMoeKernel(MoeKernelTemplate.Sort, s.G, new[] { ids, perm, pos, ends, loads },
-            new[] { s.NK, s.G, s.B, s.NK / s.B });
+        Elementwise(be, MoeKernelTemplate.Route, s.N, new[] { scores, bias ?? scores, ids, gates, ssum },
+            new[] { s.N, s.G, s.K, bias is null ? 0 : 1, 0 });
+        ChunkedGroups(be, MoeKernelTemplate.Sort, s.G, new[] { ids, perm, pos, ends, loads },
+            new[] { s.NK, s.G, s.B, s.NK / s.B, 0 });
         Tiled(be, MoeKernelTemplate.Up, (long)Tiles(s.NK) * Tiles(2 * s.F), new[] { x, perm, w1, w3, ends, h13 },
             Gemm(s.NK, 2 * s.F, s.D, s));
         Tiled(be, MoeKernelTemplate.Down, (long)Tiles(s.NK) * Tiles(s.D), new[] { h13, w2, ends, o },
             Gemm(s.NK, s.D, s.F, s));
-        be.LaunchMoeKernel(MoeKernelTemplate.Combine, Groups((long)s.N * s.D), new[] { o, pos, gates, y },
-            new[] { s.N, s.D, s.K, 1 });
+        Elementwise(be, MoeKernelTemplate.Combine, s.N * s.D, new[] { o, pos, gates, y },
+            new[] { s.N, s.D, s.K, 1, 0 });
     }
 
     /// <summary>
@@ -95,14 +122,14 @@ internal static class PortableMoe
         IGpuBuffer ends, IGpuBuffer h13, IGpuBuffer o, IGpuBuffer ds, IGpuBuffer dh13, IGpuBuffer dxs, IGpuBuffer dx,
         IGpuBuffer dw1, IGpuBuffer dw3, IGpuBuffer dw2)
     {
-        be.LaunchMoeKernel(MoeKernelTemplate.DScores, Groups(s.N), new[] { o, dy, pos, gates, ssum, ids, ds },
-            new[] { s.N, s.D, s.G, s.K });
+        Elementwise(be, MoeKernelTemplate.DScores, s.N, new[] { o, dy, pos, gates, ssum, ids, ds },
+            new[] { s.N, s.D, s.G, s.K, 0 });
         Tiled(be, MoeKernelTemplate.DAct, (long)Tiles(s.NK) * Tiles(s.F), new[] { dy, perm, gates, w2, ends, h13, dh13 },
             Gemm(s.NK, s.F, s.D, s));
         Tiled(be, MoeKernelTemplate.DX, (long)Tiles(s.NK) * Tiles(s.D), new[] { dh13, w1, w3, ends, dxs },
             Gemm(s.NK, s.D, 2 * s.F, s));
-        be.LaunchMoeKernel(MoeKernelTemplate.Combine, Groups((long)s.N * s.D), new[] { dxs, pos, gates, dx },
-            new[] { s.N, s.D, s.K, 0 });
+        Elementwise(be, MoeKernelTemplate.Combine, s.N * s.D, new[] { dxs, pos, gates, dx },
+            new[] { s.N, s.D, s.K, 0, 0 });
         Tiled(be, MoeKernelTemplate.WUp, (long)s.G * Tiles(s.D) * Tiles(2 * s.F), new[] { x, perm, dh13, ends, dw1, dw3 },
             Wgrad(s.D, 2 * s.F, s));
         Tiled(be, MoeKernelTemplate.WDown, (long)s.G * Tiles(s.F) * Tiles(s.D), new[] { h13, perm, gates, dy, ends, dw2 },

@@ -63,6 +63,14 @@ internal static class PortableGroupedGemm
         }
     }
 
+    private static void ReleaseAfterLaunch(IDirectGpuBackend backend, IGpuBuffer buffer)
+    {
+        if (backend is IQueuedBufferRelease queued)
+            queued.ReleaseAfterQueuedWork(buffer);
+        else
+            buffer.Dispose();
+    }
+
     /// <summary>Runs the forward kernel over every group in one (chunked) launch; false if the shape is refused.</summary>
     internal static bool TryForward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer a, IGpuBuffer b, IGpuBuffer y,
         int[] ends, int m, int n, int k, bool transposeB, IGpuBuffer? bias, bool biasPerGroup)
@@ -73,11 +81,18 @@ internal static class PortableGroupedGemm
             || (long)g * k * n > int.MaxValue)
             return false;
         long tiles = (long)Tiles(m) * Tiles(n);
-        using var endsBuffer = backend.AllocateBuffer(EndsAsFloats(ends));
-        int biasMode = bias is null ? 0 : biasPerGroup ? 2 : 1;
-        LaunchTiled(launch, GroupedGemmKernelTemplate.Forward, tiles,
-            new[] { a, y, b, endsBuffer, bias ?? endsBuffer },
-            new[] { m, n, k, g, Tiles(n), transposeB ? 1 : 0, biasMode, 0 });
+        var endsBuffer = backend.AllocateBuffer(EndsAsFloats(ends));
+        try
+        {
+            int biasMode = bias is null ? 0 : biasPerGroup ? 2 : 1;
+            LaunchTiled(launch, GroupedGemmKernelTemplate.Forward, tiles,
+                new[] { a, y, b, endsBuffer, bias ?? endsBuffer },
+                new[] { m, n, k, g, Tiles(n), transposeB ? 1 : 0, biasMode, 0 });
+        }
+        finally
+        {
+            ReleaseAfterLaunch(backend, endsBuffer);
+        }
         return true;
     }
 
@@ -90,10 +105,17 @@ internal static class PortableGroupedGemm
             || (long)m * k > int.MaxValue || (long)m * n > int.MaxValue)
             return false;
         long tiles = (long)g * Tiles(k) * Tiles(n);
-        using var endsBuffer = backend.AllocateBuffer(EndsAsFloats(ends));
-        LaunchTiled(launch, GroupedGemmKernelTemplate.WeightGrad, tiles,
-            new[] { a, w, c, endsBuffer },
-            new[] { m, k, n, g, Tiles(k), Tiles(n), 0 });
+        var endsBuffer = backend.AllocateBuffer(EndsAsFloats(ends));
+        try
+        {
+            LaunchTiled(launch, GroupedGemmKernelTemplate.WeightGrad, tiles,
+                new[] { a, w, c, endsBuffer },
+                new[] { m, k, n, g, Tiles(k), Tiles(n), 0 });
+        }
+        finally
+        {
+            ReleaseAfterLaunch(backend, endsBuffer);
+        }
         return true;
     }
 }

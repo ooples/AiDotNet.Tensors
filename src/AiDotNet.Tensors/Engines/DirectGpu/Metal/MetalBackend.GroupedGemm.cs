@@ -12,7 +12,8 @@ public sealed partial class MetalBackend : IGroupedGemmBackend
 {
     private const string GroupedGemmLibraryName = "GroupedGemm";
     private IntPtr _groupedGemmLibrary;
-    private bool? _groupedGemmReady;
+    // 0 not yet asked, 1 ready, 2 declined.
+    private int _groupedGemmReady;
 
     // The library, compiled once, and both kernels able to run their 256 threads in one threadgroup; otherwise the host op
     // runs, and the trace says why.
@@ -20,10 +21,11 @@ public sealed partial class MetalBackend : IGroupedGemmBackend
     {
         get
         {
-            if (_groupedGemmReady is { } ready) return ready;
+            int cached = System.Threading.Volatile.Read(ref _groupedGemmReady);
+            if (cached != 0) return cached == 1;
             lock (_tunedSlotsLock)
             {
-                if (_groupedGemmReady is null)
+                if (_groupedGemmReady == 0)
                 {
                     bool ok;
                     try
@@ -41,9 +43,9 @@ public sealed partial class MetalBackend : IGroupedGemmBackend
                         System.Diagnostics.Trace.TraceWarning($"Metal grouped GEMM kernels unavailable: {ex.Message}");
                         ok = false;
                     }
-                    _groupedGemmReady = ok;
+                    System.Threading.Volatile.Write(ref _groupedGemmReady, ok ? 1 : 2);
                 }
-                return _groupedGemmReady.Value;
+                return _groupedGemmReady == 1;
             }
         }
     }

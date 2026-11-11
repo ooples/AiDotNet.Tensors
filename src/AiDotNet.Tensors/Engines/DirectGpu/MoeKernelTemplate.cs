@@ -180,9 +180,9 @@ internal static class MoeKernelTemplate
     private const string Act = "(h13[arow * F2 + acol] / (1.0f + EXP(-h13[arow * F2 + acol]))) * h13[arow * F2 + F + acol]";
 
     private const string RouteBody = @"
-    int t = gid;
-    if (t < N)
+    if (gid < N - baseOffset)
     {
+        int t = baseOffset + gid;
         float bv[16];
         int bi[16];
         for (int j = 0; j < 16; j++) { bv[j] = -3.0e38f; bi[j] = 0; }
@@ -210,7 +210,7 @@ internal static class MoeKernelTemplate
 
     // One group per expert e: start = slots routed to experts below e; a stable scan places e's slots in slot order.
     private const string SortBody = @"
-    int e = grp;
+    int e = grp + groupBase;
     int tid = lid;
     float less = 0.0f, mine = 0.0f;
     for (int b0 = 0; b0 < NK; b0 += 256)
@@ -276,9 +276,10 @@ internal static class MoeKernelTemplate
 ";
 
     private const string CombineBody = @"
-    int i = gid;
-    if (i < N * D)
+    int total = N * D;
+    if (gid < total - baseOffset)
     {
+        int i = baseOffset + gid;
         int t = i / D;
         int c = i - t * D;
         float acc = 0.0f;
@@ -294,9 +295,9 @@ internal static class MoeKernelTemplate
 
     // d gates[t, j] = o[pos(t, j)] . dy[t]; gates = sel / sum(sel), so d sel_j = (d gate_j - sum_i d gate_i gate_i) / sum.
     private const string DScoresBody = @"
-    int t = gid;
-    if (t < N)
+    if (gid < N - baseOffset)
     {
+        int t = baseOffset + gid;
         float dg[16];
         float dot = 0.0f;
         for (int j = 0; j < TOPK; j++)
@@ -322,9 +323,9 @@ internal static class MoeKernelTemplate
 
     internal static readonly WinogradF23KernelTemplate.Spec[] Kernels =
     {
-        new(Route, new[] { "scores", "bias", "ids", "gates", "ssum" }, new[] { "N", "G", "TOPK", "biasMode" },
+        new(Route, new[] { "scores", "bias", "ids", "gates", "ssum" }, new[] { "N", "G", "TOPK", "biasMode", "baseOffset" },
             RouteBody, 0, new[] { 2, 3, 4 }),
-        new(Sort, new[] { "ids", "perm", "pos", "ends", "loads" }, new[] { "NK", "G", "B", "SPS" },
+        new(Sort, new[] { "ids", "perm", "pos", "ends", "loads" }, new[] { "NK", "G", "B", "SPS", "groupBase" },
             SortBody, 512, new[] { 1, 2, 3, 4 }),
         new(Up, new[] { "xin", "perm", "w1", "w3", "ends", "h13" }, GemmInts, WithF2(GroupedRowsBody(
             "xin[(TOINT(perm[arow]) / TOPK) * Kd + acol]",
@@ -332,9 +333,9 @@ internal static class MoeKernelTemplate
             "h13[row * F2 + col] = v;", transposedB: false)), 2048, new[] { 5 }),
         new(Down, new[] { "h13", "w2", "ends", "o" }, GemmInts, WithF2(GroupedRowsBody(
             Act, "w2[(g * Kd + brow) * N + bcol]", "o[row * N + col] = v;", transposedB: false)), 2048, new[] { 3 }),
-        new(Combine, new[] { "src", "pos", "gates", "y" }, new[] { "N", "D", "TOPK", "useGates" },
+        new(Combine, new[] { "src", "pos", "gates", "y" }, new[] { "N", "D", "TOPK", "useGates", "baseOffset" },
             CombineBody, 0, new[] { 3 }),
-        new(DScores, new[] { "o", "dy", "pos", "gates", "ssum", "ids", "ds" }, new[] { "N", "D", "G", "TOPK" },
+        new(DScores, new[] { "o", "dy", "pos", "gates", "ssum", "ids", "ds" }, new[] { "N", "D", "G", "TOPK", "baseOffset" },
             DScoresBody, 0, new[] { 6 }),
         new(DAct, new[] { "dy", "perm", "gates", "w2", "ends", "h13", "dh13" }, GemmInts, WithF2(GroupedRowsBody(
             "gates[TOINT(perm[arow])] * dy[(TOINT(perm[arow]) / TOPK) * Kd + acol]",

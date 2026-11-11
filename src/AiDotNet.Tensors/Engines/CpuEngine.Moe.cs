@@ -52,6 +52,7 @@ internal sealed class MoeSaved
     internal int[]? Ids, Perm, Pos, Ends;
 
     // Device forward: the same intermediates as resident float tensors (indices as floats).
+    internal DirectGpu.IDirectGpuBackend? DeviceBackend;
     internal Tensor<float>? DIds, DGates, DSsum, DPerm, DPos, DEnds, DH13, DO;
 }
 
@@ -60,6 +61,11 @@ public partial class CpuEngine
     internal static void ValidateMoe<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
         Tensor<T> w2, int topK, int sequences, out int n, out int d, out int g, out int f)
     {
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (scores is null) throw new ArgumentNullException(nameof(scores));
+        if (w1 is null) throw new ArgumentNullException(nameof(w1));
+        if (w3 is null) throw new ArgumentNullException(nameof(w3));
+        if (w2 is null) throw new ArgumentNullException(nameof(w2));
         if (x.Rank != 2 || scores.Rank != 2 || w1.Rank != 3 || w3.Rank != 3 || w2.Rank != 3)
             throw new ArgumentException("Expected x [N, D], scores [N, G], w1/w3 [G, D, F] and w2 [G, F, D].");
         n = x._shape[0]; d = x._shape[1]; g = w1._shape[0]; f = w1._shape[2];
@@ -87,79 +93,128 @@ public partial class CpuEngine
         ValidateMoe(x, scores, bias, w1, w3, w2, topK, sequences, out int n, out int d, out int g, out int f);
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         var ops = MathHelper.GetNumericOperations<T>();
-        saved = new MoeSaved(n, d, g, topK, f, sequences);
         double[] X = MoeHost(x), S = MoeHost(scores), W1 = MoeHost(w1), W3 = MoeHost(w3), W2 = MoeHost(w2);
         double[]? Bv = bias is null ? null : MoeHost(bias);
-        int nk = n * topK, f2 = 2 * f;
 
-        // Route: top-k of scores + bias (ties to the lower expert), gates over the picked scores.
-        var ids = new int[nk]; var gates = new double[nk]; var ssum = new double[n];
-        var bv = new double[topK]; var bi = new int[topK];
-        for (int t = 0; t < n; t++)
+        RouteTokensHost(S, Bv, n, g, topK, out var ids, out var gates, out var ssum);
+        SortSlotsByExpertHost(ids, n * topK, g, sequences, out var ends, out var perm, out var pos, out var load);
+        ComputeSwiGluExpertProjectionsHost(X, W1, W3, W2, perm, ids, pos, gates, n, d, topK, f, out var h13, out var o, out var y);
+
+        saved = new MoeSaved(n, d, g, topK, f, sequences)
         {
-            for (int j = 0; j < topK; j++) { bv[j] = double.NegativeInfinity; bi[j] = 0; }
-            for (int e = 0; e < g; e++)
+            Ids = ids, Gates = gates, Ssum = ssum, Perm = perm, Pos = pos, Ends = ends, H13 = h13, O = o,
+        };
+        loads = MoeTensor(load, new[] { sequences, g }, ops);
+        var output = MoeTensor(y, new[] { n, d }, ops);
+        RecordMoe(output, x, scores, w1, w3, w2, saved);
+        return output;
+    }
+
+    private static void RouteTokensHost(double[] S, double[]? Bv, int n, int g, int topK,
+        out int[] ids, out double[] gates, out double[] ssum)
+    {
+        ids = new int[n * topK];
+        gates = new double[n * topK];
+        ssum = new double[n];
+        var bv = new double[topK];
+        var bi = new int[topK];
+        for (int t = 0; t < n; t++)
+            RouteSingleTokenHost(S, Bv, t, g, topK, bv, bi, ids, gates, ssum);
+    }
+
+    private static void RouteSingleTokenHost(double[] S, double[]? Bv, int t, int g, int topK,
+        double[] bv, int[] bi, int[] ids, double[] gates, double[] ssum)
+    {
+        for (int j = 0; j < topK; j++) { bv[j] = double.NegativeInfinity; bi[j] = 0; }
+        for (int e = 0; e < g; e++)
+        {
+            double v = S[t * g + e] + (Bv is null ? 0 : Bv[e]);
+            if (v > bv[topK - 1])
             {
-                double v = S[t * g + e] + (Bv is null ? 0 : Bv[e]);
-                if (!(v > bv[topK - 1])) continue;
                 int p = topK - 1;
                 while (p > 0 && bv[p - 1] < v) { bv[p] = bv[p - 1]; bi[p] = bi[p - 1]; p--; }
-                bv[p] = v; bi[p] = e;
+                bv[p] = v;
+                bi[p] = e;
             }
-            double s = 0;
-            for (int j = 0; j < topK; j++) s += S[t * g + bi[j]];
-            for (int j = 0; j < topK; j++) { ids[t * topK + j] = bi[j]; gates[t * topK + j] = S[t * g + bi[j]] / s; }
-            ssum[t] = s;
         }
+        FinalizeTokenGatesHost(S, t, g, topK, bi, ids, gates, ssum);
+    }
 
-        // Stable counting sort of the slots by expert; per-sequence loads.
-        var ends = new int[g]; var perm = new int[nk]; var pos = new int[nk]; var load = new double[sequences * g];
+    private static void FinalizeTokenGatesHost(double[] S, int t, int g, int topK,
+        int[] bi, int[] ids, double[] gates, double[] ssum)
+    {
+        double s = 0;
+        for (int j = 0; j < topK; j++) s += S[t * g + bi[j]];
+        for (int j = 0; j < topK; j++)
+        {
+            ids[t * topK + j] = bi[j];
+            gates[t * topK + j] = S[t * g + bi[j]] / s;
+        }
+        ssum[t] = s;
+    }
+
+    private static void SortSlotsByExpertHost(int[] ids, int nk, int g, int sequences,
+        out int[] ends, out int[] perm, out int[] pos, out double[] load)
+    {
+        ends = new int[g];
+        perm = new int[nk];
+        pos = new int[nk];
+        load = new double[sequences * g];
         foreach (int e in ids) ends[e]++;
         int sps = nk / sequences;
         for (int sl = 0; sl < nk; sl++) load[(sl / sps) * g + ids[sl]]++;
-        for (int e = 1; e < g; e++) ends[e] += ends[e - 1];
         var next = new int[g];
-        for (int e = 1; e < g; e++) next[e] = ends[e - 1];
-        for (int sl = 0; sl < nk; sl++) { int p = next[ids[sl]]++; perm[p] = sl; pos[sl] = p; }
-
-        // Up (h13), down (o), combine.
-        var h13 = new double[nk * f2]; var o = new double[nk * d]; var act = new double[f];
-        for (int r = 0; r < nk; r++)
+        for (int e = 1; e < g; e++)
         {
-            int tok = perm[r] / topK, e = ids[perm[r]];
-            for (int c = 0; c < f; c++)
-            {
-                double a1 = 0, a3 = 0;
-                for (int q = 0; q < d; q++)
-                {
-                    double xv = X[tok * d + q];
-                    a1 += xv * W1[(e * d + q) * f + c];
-                    a3 += xv * W3[(e * d + q) * f + c];
-                }
-                h13[r * f2 + c] = a1; h13[r * f2 + f + c] = a3;
-                act[c] = Silu(a1) * a3;
-            }
-            for (int c = 0; c < d; c++)
-            {
-                double a = 0;
-                for (int q = 0; q < f; q++) a += act[q] * W2[(e * f + q) * d + c];
-                o[r * d + c] = a;
-            }
+            ends[e] += ends[e - 1];
+            next[e] = ends[e - 1];
         }
-        var y = new double[n * d];
+        for (int sl = 0; sl < nk; sl++) { int p = next[ids[sl]]++; perm[p] = sl; pos[sl] = p; }
+    }
+
+    private static void ComputeSwiGluExpertProjectionsHost(double[] X, double[] W1, double[] W3, double[] W2,
+        int[] perm, int[] ids, int[] pos, double[] gates, int n, int d, int topK, int f,
+        out double[] h13, out double[] o, out double[] y)
+    {
+        int nk = n * topK, f2 = 2 * f;
+        h13 = new double[nk * f2];
+        o = new double[nk * d];
+        var act = new double[f];
+        for (int r = 0; r < nk; r++)
+            EvaluateSortedSlotHost(X, W1, W3, W2, perm[r] / topK, ids[perm[r]], r, d, f, act, h13, o);
+
+        y = new double[n * d];
         for (int t = 0; t < n; t++)
             for (int j = 0; j < topK; j++)
             {
                 int sl = t * topK + j, p = pos[sl];
                 for (int c = 0; c < d; c++) y[t * d + c] += gates[sl] * o[p * d + c];
             }
+    }
 
-        saved.Ids = ids; saved.Gates = gates; saved.Ssum = ssum; saved.Perm = perm; saved.Pos = pos; saved.Ends = ends;
-        saved.H13 = h13; saved.O = o;
-        loads = MoeTensor(load, new[] { sequences, g }, ops);
-        var output = MoeTensor(y, new[] { n, d }, ops);
-        RecordMoe(output, x, scores, w1, w3, w2, saved);
-        return output;
+    private static void EvaluateSortedSlotHost(double[] X, double[] W1, double[] W3, double[] W2,
+        int tok, int e, int r, int d, int f, double[] act, double[] h13, double[] o)
+    {
+        int f2 = 2 * f;
+        for (int c = 0; c < f; c++)
+        {
+            double a1 = 0, a3 = 0;
+            for (int q = 0; q < d; q++)
+            {
+                double xv = X[tok * d + q];
+                a1 += xv * W1[(e * d + q) * f + c];
+                a3 += xv * W3[(e * d + q) * f + c];
+            }
+            h13[r * f2 + c] = a1;
+            h13[r * f2 + f + c] = a3;
+            act[c] = Silu(a1) * a3;
+        }
+        for (int c = 0; c < d; c++)
+        {
+            double a = 0;
+            for (int q = 0; q < f; q++) a += act[q] * W2[(e * f + q) * d + c];
+            o[r * d + c] = a;
+        }
     }
 
     private protected static void RecordMoe<T>(Tensor<T> output, Tensor<T> x, Tensor<T> scores, Tensor<T> w1, Tensor<T> w3,
@@ -171,11 +226,35 @@ public partial class CpuEngine
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var saved = (MoeSaved)savedState[0];
-        var cpu = engine as CpuEngine ?? new CpuEngine();
-        var (dx, ds, dw1, dw3, dw2) = cpu.MoeSwiGluGradients(gradOutput, inputs[0], inputs[2], inputs[3], inputs[4], saved);
+        var gradEngine = ResolveMoeGradEngine(engine, saved);
+        var (dx, ds, dw1, dw3, dw2) = gradEngine.MoeSwiGluGradients(gradOutput, inputs[0], inputs[2], inputs[3], inputs[4], saved);
         var outs = new[] { dx, ds, dw1, dw3, dw2 };
         for (int i = 0; i < 5; i++)
             if (DifferentiableOps.IsGradientRequired(inputs[i])) DifferentiableOps.AccumulateGrad(grads, inputs[i], outs[i], engine);
+    }
+
+    private static CpuEngine ResolveMoeGradEngine(IEngine tapeEngine, MoeSaved saved)
+    {
+        if (saved.DH13 is not null)
+        {
+            if (tapeEngine is DirectGpuTensorEngine tapeGpu && !tapeGpu.IsDisposed
+                && (saved.DeviceBackend is null
+                    || ReferenceEquals(tapeGpu.PlacementBackend, saved.DeviceBackend)
+                    || ReferenceEquals(tapeGpu.QueryBackend, saved.DeviceBackend)))
+                return tapeGpu;
+
+            var owner = DirectGpuTensorEngine.EngineOwning(saved.DeviceBackend ?? saved.DH13._gpuBackend);
+            if (owner is not null && !owner.IsDisposed)
+                return owner;
+
+            if (AiDotNetEngine.Current is DirectGpuTensorEngine currentGpu && !currentGpu.IsDisposed
+                && (saved.DeviceBackend is null || ReferenceEquals(currentGpu.PlacementBackend, saved.DeviceBackend)))
+                return currentGpu;
+
+            if (tapeEngine is DirectGpuTensorEngine fallbackGpu)
+                return fallbackGpu;
+        }
+        return tapeEngine as CpuEngine ?? new CpuEngine();
     }
 
     /// <summary>Gradients of the fused MoE (dx, dscores, dw1, dw3, dw2) from the saved forward; the host computes in double.</summary>

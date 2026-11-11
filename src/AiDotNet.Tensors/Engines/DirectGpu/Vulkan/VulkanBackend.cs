@@ -1169,6 +1169,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         _batchThreadRes = threadRes;
         _batchDispatchCount = 0;
         ReleaseBatchDescriptorSets();
+        ReleaseBuffersHeldForBatch();
 
         var cmdBuffer = threadRes.CommandBuffer;
         VulkanNativeBindings.vkResetCommandBuffer(cmdBuffer, 0);

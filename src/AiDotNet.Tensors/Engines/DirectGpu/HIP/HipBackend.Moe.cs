@@ -7,16 +7,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 public sealed partial class HipBackend : IMoeKernelBackend
 {
     private IntPtr _moeModule;
-    private bool? _moeReady;
+    // 0 not yet asked, 1 ready, 2 declined.
+    private int _moeReady;
 
     bool IMoeKernelBackend.MoeKernelsReady
     {
         get
         {
-            if (_moeReady is { } ready) return ready;
+            int cached = System.Threading.Volatile.Read(ref _moeReady);
+            if (cached != 0) return cached == 1;
             lock (_tunedSlotsLock)
             {
-                if (_moeReady is null)
+                if (_moeReady == 0)
                 {
                     var failure = CompileKernelModule(MoeKernelTemplate.GetModuleSource(WinogradKernelDialect.Hip),
                         "moe_kernels", ref _moeModule, MoeKernelTemplate.GetKernelNames(), useFastMath: false);
@@ -24,9 +26,9 @@ public sealed partial class HipBackend : IMoeKernelBackend
                         System.Diagnostics.Trace.TraceWarning($"HIP fused MoE kernels unavailable: {failure.Message}");
                     bool ok = failure is null;
                     foreach (var name in MoeKernelTemplate.GetKernelNames()) ok &= HasTunedKernel(name);
-                    _moeReady = ok;
+                    System.Threading.Volatile.Write(ref _moeReady, ok ? 1 : 2);
                 }
-                return _moeReady.Value;
+                return _moeReady == 1;
             }
         }
     }

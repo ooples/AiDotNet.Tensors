@@ -9,17 +9,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 public sealed partial class WebGpuBackend : IGroupedGemmBackend
 {
     private const string GroupedGemmModulePrefix = "GroupedGemm_";
-    private bool? _groupedGemmReady;
+    // 0 not yet asked, 1 ready, 2 declined.
+    private int _groupedGemmReady;
 
     // Every pipeline, built once; a module the implementation rejects leaves the host op, and says why.
     private bool GroupedGemmReady
     {
         get
         {
-            if (_groupedGemmReady is { } ready) return ready;
+            int cached = System.Threading.Volatile.Read(ref _groupedGemmReady);
+            if (cached != 0) return cached == 1;
             lock (_tunedSlotsLock)
             {
-                if (_groupedGemmReady is null)
+                if (_groupedGemmReady == 0)
                 {
                     bool ok = IsAvailable;
                     if (ok)
@@ -36,9 +38,9 @@ public sealed partial class WebGpuBackend : IGroupedGemmBackend
                             ok = false;
                         }
                     }
-                    _groupedGemmReady = ok;
+                    System.Threading.Volatile.Write(ref _groupedGemmReady, ok ? 1 : 2);
                 }
-                return _groupedGemmReady.Value;
+                return _groupedGemmReady == 1;
             }
         }
     }

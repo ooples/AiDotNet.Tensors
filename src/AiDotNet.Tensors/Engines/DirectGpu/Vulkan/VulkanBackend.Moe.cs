@@ -17,16 +17,18 @@ public sealed unsafe partial class VulkanBackend : IMoeKernelBackend
         return shaders;
     }
 
-    private bool? _moeReady;
+    // 0 not yet asked, 1 ready, 2 declined.
+    private int _moeReady;
 
     bool IMoeKernelBackend.MoeKernelsReady
     {
         get
         {
-            if (_moeReady is { } ready) return ready;
+            int cached = System.Threading.Volatile.Read(ref _moeReady);
+            if (cached != 0) return cached == 1;
             lock (_tunedSlotsLock)
             {
-                if (_moeReady is null)
+                if (_moeReady == 0)
                 {
                     bool ok;
                     try
@@ -41,9 +43,9 @@ public sealed unsafe partial class VulkanBackend : IMoeKernelBackend
                         System.Diagnostics.Trace.TraceWarning($"Vulkan fused MoE kernels unavailable: {ex.Message}");
                         ok = false;
                     }
-                    _moeReady = ok;
+                    System.Threading.Volatile.Write(ref _moeReady, ok ? 1 : 2);
                 }
-                return _moeReady.Value;
+                return _moeReady == 1;
             }
         }
     }

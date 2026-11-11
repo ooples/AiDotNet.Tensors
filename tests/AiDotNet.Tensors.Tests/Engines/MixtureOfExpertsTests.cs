@@ -165,6 +165,60 @@ public class MixtureOfExpertsTests
     }
 
     [Fact]
+    public void Rejects_NullTensors()
+    {
+        var e = new CpuEngine();
+        var x = new Tensor<float>(new[] { 4, 3 });
+        var s = new Tensor<float>(new[] { 4, 5 });
+        var w = new Tensor<float>(new[] { 5, 3, 2 });
+        var w2 = new Tensor<float>(new[] { 5, 2, 3 });
+        Assert.Equal("engine", Assert.Throws<ArgumentNullException>(() => MixtureOfExperts.SwiGluExperts(null!, x, s, null, w, w, w2, 2, 1, out _)).ParamName);
+        Assert.Equal("x", Assert.Throws<ArgumentNullException>(() => MixtureOfExperts.SwiGluExperts(e, null!, s, null, w, w, w2, 2, 1, out _)).ParamName);
+        Assert.Equal("scores", Assert.Throws<ArgumentNullException>(() => MixtureOfExperts.SwiGluExperts(e, x, null!, null, w, w, w2, 2, 1, out _)).ParamName);
+        Assert.Equal("w1", Assert.Throws<ArgumentNullException>(() => MixtureOfExperts.SwiGluExperts(e, x, s, null, null!, w, w2, 2, 1, out _)).ParamName);
+        Assert.Equal("w3", Assert.Throws<ArgumentNullException>(() => MixtureOfExperts.SwiGluExperts(e, x, s, null, w, null!, w2, 2, 1, out _)).ParamName);
+        Assert.Equal("w2", Assert.Throws<ArgumentNullException>(() => MixtureOfExperts.SwiGluExperts(e, x, s, null, w, w, null!, 2, 1, out _)).ParamName);
+    }
+
+    [SkippableFact]
+    public void CpuBoundTape_DeviceMoeForward_DispatchesGradientsToCompatibleGpuEngine()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available.");
+
+        const int n = 8, d = 6, g = 4, f = 5, k = 2;
+        var cpu = new CpuEngine();
+        var x = Random<float>(21, -1, 1, n, d);
+        var s = Random<float>(22, 0.05, 0.95, n, g);
+        var bias = Random<float>(23, -0.2, 0.2, g);
+        var w1 = Random<float>(24, -0.5, 0.5, g, d, f);
+        var w3 = Random<float>(25, -0.5, 0.5, g, d, f);
+        var w2 = Random<float>(26, -0.5, 0.5, g, f, d);
+        var wy = Random<float>(27, -1, 1, n, d);
+        var inputs = new[] { x, s, w1, w3, w2 };
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> refGrads;
+        using (var refTape = new GradientTape<float>())
+        {
+            var refY = MixtureOfExperts.SwiGluExperts(cpu, x, s, bias, w1, w3, w2, k, 2, out _);
+            var refLoss = cpu.ReduceSum(cpu.TensorMultiply(refY, wy), null);
+            refGrads = refTape.ComputeGradients(refLoss, inputs);
+        }
+
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> gpuGrads;
+        using (var cpuBoundTape = new GradientTape<float>())
+        {
+            cpuBoundTape.BindEngineIfUnset(cpu);
+            var gpuY = MixtureOfExperts.SwiGluExperts(gpu, x, s, bias, w1, w3, w2, k, 2, out _);
+            var gpuLoss = cpu.ReduceSum(cpu.TensorMultiply(gpuY, wy), null);
+            gpuGrads = cpuBoundTape.ComputeGradients(gpuLoss, inputs);
+        }
+
+        foreach (var t in inputs)
+            AssertClose(D(refGrads[t]), D(gpuGrads[t]), 1e-4, "grad");
+    }
+
+    [Fact]
     public void Rejects_InconsistentShapes()
     {
         var e = new CpuEngine();

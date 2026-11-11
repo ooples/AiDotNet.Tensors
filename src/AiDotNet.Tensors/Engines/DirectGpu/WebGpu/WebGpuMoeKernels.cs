@@ -189,8 +189,8 @@ var<workgroup> wgEnd: i32;
 ";
 
     private const string RouteBody = Entry + @"
-    let t = gid;
-    if (t < pm.N) {
+    if (gid < pm.N - pm.baseOffset) {
+        let t = pm.baseOffset + gid;
         var bv: array<f32, 16>;
         var bi: array<i32, 16>;
         for (var j = 0; j < 16; j = j + 1) { bv[j] = -3.0e38; bi[j] = 0; }
@@ -221,7 +221,7 @@ var<workgroup> wgEnd: i32;
 ";
 
     private const string SortBody = Entry + @"
-    let e = grp;
+    let e = grp + pm.groupBase;
     var less = 0.0;
     var mine = 0.0;
     for (var b0 = 0; b0 < pm.NK; b0 = b0 + 256) {
@@ -283,8 +283,9 @@ var<workgroup> wgEnd: i32;
 ";
 
     private const string CombineBody = Entry + @"
-    let i = gid;
-    if (i < pm.N * pm.D) {
+    let total = pm.N * pm.D;
+    if (gid < total - pm.baseOffset) {
+        let i = pm.baseOffset + gid;
         let t = i / pm.D;
         let c = i - t * pm.D;
         var acc = 0.0;
@@ -300,8 +301,8 @@ var<workgroup> wgEnd: i32;
 ";
 
     private const string DScoresBody = Entry + @"
-    let t = gid;
-    if (t < pm.N) {
+    if (gid < pm.N - pm.baseOffset) {
+        let t = pm.baseOffset + gid;
         var dg: array<f32, 16>;
         var dot = 0.0;
         for (var j = 0; j < pm.TOPK; j = j + 1) {

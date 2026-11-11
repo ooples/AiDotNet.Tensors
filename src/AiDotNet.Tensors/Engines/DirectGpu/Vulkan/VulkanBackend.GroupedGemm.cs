@@ -19,17 +19,19 @@ public sealed unsafe partial class VulkanBackend : IGroupedGemmBackend
         return shaders;
     }
 
-    private bool? _groupedGemmReady;
+    // 0 not yet asked, 1 ready, 2 declined.
+    private int _groupedGemmReady;
 
     // Every pipeline, built once; a shader the driver rejects leaves the host op, and says why.
     private bool GroupedGemmReady
     {
         get
         {
-            if (_groupedGemmReady is { } ready) return ready;
+            int cached = System.Threading.Volatile.Read(ref _groupedGemmReady);
+            if (cached != 0) return cached == 1;
             lock (_tunedSlotsLock)
             {
-                if (_groupedGemmReady is null)
+                if (_groupedGemmReady == 0)
                 {
                     bool ok;
                     try
@@ -44,9 +46,9 @@ public sealed unsafe partial class VulkanBackend : IGroupedGemmBackend
                         System.Diagnostics.Trace.TraceWarning($"Vulkan grouped GEMM kernels unavailable: {ex.Message}");
                         ok = false;
                     }
-                    _groupedGemmReady = ok;
+                    System.Threading.Volatile.Write(ref _groupedGemmReady, ok ? 1 : 2);
                 }
-                return _groupedGemmReady.Value;
+                return _groupedGemmReady == 1;
             }
         }
     }
