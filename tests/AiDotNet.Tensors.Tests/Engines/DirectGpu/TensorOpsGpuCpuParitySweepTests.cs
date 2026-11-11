@@ -52,6 +52,8 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         ["TensorBatchMatMul"] = "contracts operands of different shapes",
         ["TensorMatMul"] = "contracts operands of different shapes",
         ["TensorAddMM"] = "contracts operands of different shapes",
+        // Compared GPU vs CPU (forward, gradients, residency) in TorchModelOpsGpuTests.
+        ["TensorHyperbolicLinear"] = "contracts operands of different shapes",
         ["TensorAddmv"] = "contracts operands of different shapes",
         ["TensorAddbmm"] = "contracts operands of different shapes",
         ["TensorBaddbmm"] = "contracts operands of different shapes",

@@ -153,6 +153,8 @@ layout(push_constant) uniform P { uint n; };
     {
         TorchParityUnaryOp.Hardtanh or TorchParityUnaryOp.Softsign or TorchParityUnaryOp.Signbit or TorchParityUnaryOp.IsPosInf
             or TorchParityUnaryOp.IsNegInf or TorchParityUnaryOp.Angle or TorchParityUnaryOp.NonZero => false,
+        // The model activations compute in float (TorchModelOpsKernels, translated to GLSL).
+        _ when TorchModelOpsCodes.ActivationKernel(op) is not null => false,
         _ => true,
     };
 
@@ -162,6 +164,7 @@ layout(push_constant) uniform P { uint n; };
 
     public static string Unary(TorchParityUnaryOp op) => Cached("unary:" + op, () =>
     {
+        if (TorchModelOpsCodes.ActivationKernel(op) is { } modelKernel) return TorchModelOpsTranslation.Glsl[modelKernel];
         if (!NeedsDoubles(op))
         {
             string f = op switch

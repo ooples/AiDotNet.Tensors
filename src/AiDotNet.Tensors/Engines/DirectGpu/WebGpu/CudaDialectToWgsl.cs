@@ -127,7 +127,7 @@ internal static class CudaDialectToWgsl
             module.Append("struct P { ").Append(string.Join(", ", fields)).Append(" };\n");
             module.Append("@group(0) @binding(").Append(binding).Append(") var<uniform> p : P;\n");
             module.Append(helpers);
-            module.Append("@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {")
+            module.Append("@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {")
                 .Append(Statements(body, scalars)).Append("}\n");
             result[name] = module.ToString();
         }
@@ -177,7 +177,12 @@ internal static class CudaDialectToWgsl
              .Replace("__int_as_float(", "bitcast<f32>(")
              // A function call, so a NaN / infinity bit pattern is a runtime value (WebGpuShaderPrelude defines it).
              .Replace("__uint_as_float(", "wgsl_f32_bits(")
-             .Replace("bx_gid()", "i32(id.x)");
+             .Replace("bx_gid()", "i32(id.x)")
+             // Work-group form (one group per item): a barrier that also orders storage memory, and the group ids.
+             .Replace("__syncthreads()", "storageBarrier()")
+             .Replace("threadIdx.x", "i32(lid.x)")
+             .Replace("blockIdx.x", "i32(wid.x)")
+             .Replace("blockDim.x", "256");
         // atomicAddFloat(&buf[i], v): a compare-and-swap loop over the float's bits (buf binds as atomic<u32>).
         s = Regex.Replace(s, @"atomicAddFloat\(&(\w+)\[([^\]]+)\], ([^;]+)\);", m =>
             $"{{ var tp_old: u32 = atomicLoad(&{m.Groups[1].Value}[{m.Groups[2].Value}]); loop {{ let tp_res = atomicCompareExchangeWeak(&{m.Groups[1].Value}[{m.Groups[2].Value}], tp_old, bitcast<u32>(bitcast<f32>(tp_old) + ({m.Groups[3].Value}))); if (tp_res.exchanged) {{ break; }} tp_old = tp_res.old_value; }} }}",

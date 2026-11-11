@@ -78,6 +78,20 @@ public partial class CpuEngine
 
     #endregion
 
+    // Under an inference trace: one opaque node over the op's tensor operands, whose replay re-runs the op on the
+    // plan's engine (the device kernels on a GPU engine). Training traces record through TryRecordCompiledOp.
+    private protected bool TryCaptureModelOpInference<T>(string opName, Tensor<T>?[] inputs, Func<IEngine, Tensor<T>> forward,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Tensor<T>? captured)
+    {
+        captured = null;
+        if (!GraphMode.IsInferenceTrace) return false;
+        var operands = new List<Tensor<T>>(inputs.Length);
+        foreach (var input in inputs)
+            if (input is not null && !operands.Contains(input)) operands.Add(input);
+        captured = CaptureInferenceKernel(operands.ToArray(), forward, opName);
+        return true;
+    }
+
     #region Spiking, quantization, routing, embeddings
 
     /// <inheritdoc/>
@@ -103,6 +117,7 @@ public partial class CpuEngine
         if (TryRecordCompiledOp("TensorFakeQuantize", new Tensor<T>?[] { tensor },
                 e => e.TensorFakeQuantize(tensor, numBits, scale, zeroPoint, symmetric), out var compiledNode))
             return compiledNode;
+        if (TryCaptureModelOpInference("TensorFakeQuantize", new Tensor<T>?[] { tensor }, e => e.TensorFakeQuantize(tensor, numBits, scale, zeroPoint, symmetric), out var captured)) return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
 
         double qMin = symmetric ? -(1L << (numBits - 1)) : 0;
@@ -160,6 +175,7 @@ public partial class CpuEngine
             throw new ArgumentOutOfRangeException(nameof(k), $"k must be between 1 and the last axis' length {width}; got {k}.");
         if (TryRecordCompiledOp("TensorTopKSoftmax", new Tensor<T>?[] { scores }, e => e.TensorTopKSoftmax(scores, k), out var compiledNode))
             return compiledNode;
+        if (TryCaptureModelOpInference("TensorTopKSoftmax", new Tensor<T>?[] { scores }, e => e.TensorTopKSoftmax(scores, k), out var captured)) return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
 
         var x = RoIAlignPlan.ToDoubles(scores);
@@ -203,6 +219,7 @@ public partial class CpuEngine
         if (TryRecordCompiledOp("TensorSinusoidalTimeEmbedding", new Tensor<T>?[] { timesteps },
                 e => e.TensorSinusoidalTimeEmbedding(timesteps, embeddingDim), out var compiledNode))
             return compiledNode;
+        if (TryCaptureModelOpInference("TensorSinusoidalTimeEmbedding", new Tensor<T>?[] { timesteps }, e => e.TensorSinusoidalTimeEmbedding(timesteps, embeddingDim), out var captured)) return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
 
         int batch = timesteps._shape[0];
@@ -254,6 +271,7 @@ public partial class CpuEngine
         if (TryRecordCompiledOp("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores },
                 e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var compiledNode))
             return compiledNode;
+        if (TryCaptureModelOpInference("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores }, e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var captured)) return captured;
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
 
         var state = new BackwardFunctions<T>.CrfForwardState

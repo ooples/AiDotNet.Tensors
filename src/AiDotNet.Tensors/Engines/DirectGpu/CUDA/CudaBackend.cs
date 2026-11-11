@@ -1241,6 +1241,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _torchParityElementwiseModule = IntPtr.Zero;
             System.Diagnostics.Trace.TraceWarning($"CUDA torch-parity kernels unavailable; those ops use the CPU path: {ex.Message}");
         }
+        // Model-level ops (CpuEngine.TorchModelOps): precise math, same optional policy as the parity module.
+        try
+        {
+            _torchModelOpsModule = CompileKernelModule(device, TorchModelOpsKernels.CudaPrelude + TorchModelOpsKernels.Source,
+                "torch_model_ops_kernels", TorchModelOpsKernels.KernelNames, useFastMath: false);
+        }
+        catch (Exception ex)
+        {
+            _torchModelOpsModule = IntPtr.Zero;
+            System.Diagnostics.Trace.TraceWarning($"CUDA model-op kernels unavailable; those ops use the CPU path: {ex.Message}");
+        }
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
         _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
@@ -19270,6 +19281,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
             _torchParityElementwiseModule = IntPtr.Zero;
+        }
+        if (_torchModelOpsModule != IntPtr.Zero)
+        {
+            CudaNativeBindings.cuModuleUnload(_torchModelOpsModule);
+            _torchModelOpsModule = IntPtr.Zero;
         }
         if (_octonionModule != IntPtr.Zero)
         {

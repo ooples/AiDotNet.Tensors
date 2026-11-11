@@ -637,6 +637,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(hipMathMacros + CUDA.Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity", ref _torchParityModule,
                 CUDA.Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
 
+            // Model-level ops (CpuEngine.TorchModelOps): the shared dialect source, precise math.
+            CompileKernelModule(TorchModelOpsKernels.CudaPrelude + TorchModelOpsKernels.Source, "torch_model_ops", ref _torchModelOpsModule,
+                TorchModelOpsKernels.KernelNames, useFastMath: false);
+
             // Categorical sampling: its own module, and NOT fast-math. Sharing the neural-net
             // module would make every kernel in it hostage to this one compiling, and fast math
             // permits reassociating the ordered double accumulation this kernel needs to reproduce
@@ -11575,6 +11579,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             HipNativeBindings.hipModuleUnload(_torchParityModule);
             _torchParityModule = IntPtr.Zero;
+        }
+        if (_torchModelOpsModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_torchModelOpsModule);
+            _torchModelOpsModule = IntPtr.Zero;
         }
         if (_neuralNetModule != IntPtr.Zero)
         {
