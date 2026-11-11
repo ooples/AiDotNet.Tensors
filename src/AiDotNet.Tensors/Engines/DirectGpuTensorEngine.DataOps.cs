@@ -28,25 +28,24 @@ public partial class DirectGpuTensorEngine
         try
         {
             var output = AllocateFullyWrittenOutputBuffer(backend, count);
-            bool launched;
+            bool handedOff = false;
             try
             {
-                launched = decode.TryDecodeBytes(words.Buffer, output.Buffer, count, sourceType, littleEndian);
+                if (!decode.TryDecodeBytes(words.Buffer, output.Buffer, count, sourceType, littleEndian))
+                {
+                    GpuLaunchProbe.OnFallback("TensorFromBytes", null);
+                    return base.TensorFromBytes<T>(data, sourceType, shape, littleEndian);
+                }
+                var result = DeferTensorResult<T>(backend, output.Buffer, count, (int[])shape.Clone());
+                output.RelinquishOwnership();
+                handedOff = true;
+                return result;
             }
-            catch
+            finally
             {
-                output.Dispose();
-                throw;
+                // Every path that does not hand the buffer to the result tensor (fallback, any throw) releases it.
+                if (!handedOff) output.Dispose();
             }
-            if (!launched)
-            {
-                output.Dispose();
-                GpuLaunchProbe.OnFallback("TensorFromBytes", null);
-                return base.TensorFromBytes<T>(data, sourceType, shape, littleEndian);
-            }
-            var result = DeferTensorResult<T>(backend, output.Buffer, count, (int[])shape.Clone());
-            output.RelinquishOwnership();
-            return result;
         }
         finally
         {

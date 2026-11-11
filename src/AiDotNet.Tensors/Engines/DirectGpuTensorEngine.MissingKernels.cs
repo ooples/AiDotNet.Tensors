@@ -4741,7 +4741,7 @@ public partial class DirectGpuTensorEngine
             int numRows = L == 0 ? 0 : input.Length / L;
             // The bitonic network carries positions as floats: past MaxFloatExactSortIndexColumns a position (and so the
             // index tie-break that makes the sort stable) is no longer exact, so such rows sort on the host.
-            if (numRows == 0 || L == 0 || L > MaxFloatExactSortIndexColumns) return base.TensorSort(input, axis, descending);
+            if (numRows == 0 || L > MaxFloatExactSortIndexColumns) return base.TensorSort(input, axis, descending);
             // Resident: keep the sorted values AND the int indices on the GPU (FinishGpuOp). The index
             // tensor rides as a float buffer (int-as-float); downstream TakeAlongDim/gather reuse it in
             // place (no re-upload) — completing the argsort -> gather int-residency chain.
