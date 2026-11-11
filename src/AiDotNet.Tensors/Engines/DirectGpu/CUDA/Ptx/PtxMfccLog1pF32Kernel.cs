@@ -90,8 +90,7 @@ internal sealed class PtxMfccLog1pF32Kernel : IDisposable
         string ln2 = DirectPtxPtxText.Hex((float)Math.Log(2.0));
 
         var ptx = new StringBuilder(1_792);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape count={count} block={blockThreads} op=mfcc-log1p");
         ptx.AppendLine();

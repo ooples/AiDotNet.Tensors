@@ -154,8 +154,7 @@ internal sealed class PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel : 
                 "Only the experimental SM86 locally-connected Conv2D 3x3 backward-weight emitter exists.");
 
         var ptx = new StringBuilder(8192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

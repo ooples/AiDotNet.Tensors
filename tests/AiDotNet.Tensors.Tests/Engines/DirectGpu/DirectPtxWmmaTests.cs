@@ -658,6 +658,9 @@ public partial class DirectPtxWmmaTests
     public void TensorEngine_FlashAttentionRoutesCanonicalShapeThroughFeatureGate()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        // Without NVRTC the engine correctly selects another GPU backend (e.g. OpenCL), so the
+        // CudaBackend assertion below only holds when a CUDA backend can be constructed at all.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "Requires a CUDA backend (driver and NVRTC).");
         bool? previous = DirectPtxFeatureGate.TestOverride;
         DirectPtxFeatureGate.TestOverride = true;
         try

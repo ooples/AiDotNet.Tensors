@@ -111,8 +111,7 @@ internal sealed class PtxBuildSpectrumF32Kernel : IDisposable
         int total = checked(batch * numFrames);
 
         var ptx = new StringBuilder(3_584);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape batch={batch} numFreqs={numFreqs} numFrames={numFrames} nFft={nFft} block={blockThreads} op=build-spectrum");
         ptx.AppendLine();

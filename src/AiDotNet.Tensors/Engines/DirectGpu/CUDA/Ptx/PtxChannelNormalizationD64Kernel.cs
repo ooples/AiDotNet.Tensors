@@ -598,8 +598,7 @@ internal sealed class PtxChannelNormalizationD64Kernel : IDisposable
         params string[] parameters)
     {
         var ptx = new StringBuilder(16_384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact 64-value channel normalization op={OperationName(operation)}");
         ptx.AppendLine($".visible .entry {GetEntryPoint(operation)}(");

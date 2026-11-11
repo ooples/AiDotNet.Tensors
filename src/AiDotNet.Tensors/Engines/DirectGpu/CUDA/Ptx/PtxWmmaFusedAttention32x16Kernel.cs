@@ -88,7 +88,6 @@ internal sealed class PtxWmmaFusedAttention32x16Kernel : IDisposable
 
     internal static string EmitPtx(int ccMajor, int ccMinor, bool isCausal, float scale)
     {
-        string target = $"sm_{ccMajor}{ccMinor}";
         string scaleHex = FloatLiteral(scale);
         const string log2E = "0f3FB8AA3B";
         const int qShared = 0;
@@ -100,8 +99,7 @@ internal sealed class PtxWmmaFusedAttention32x16Kernel : IDisposable
         const int sharedBytes = 9216;
 
         var ptx = new StringBuilder(24 * 1024);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target {target}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

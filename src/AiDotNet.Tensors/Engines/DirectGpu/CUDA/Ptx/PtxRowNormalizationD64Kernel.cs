@@ -1219,8 +1219,7 @@ internal sealed class PtxRowNormalizationD64Kernel : IDisposable
         int ccMajor, int ccMinor, string entryPoint, params string[] parameters)
     {
         var ptx = new StringBuilder(12_288);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// direct-ptx normalization d64 entry={entryPoint}");
         ptx.AppendLine($".visible .entry {entryPoint}(");

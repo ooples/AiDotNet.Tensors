@@ -149,8 +149,7 @@ internal sealed class PtxFusedConv3DKernel : IDisposable
         string entry = shape.Entry;
 
         var s = new StringBuilder(26624);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
@@ -400,8 +399,7 @@ internal sealed class PtxFusedConvTranspose2DKernel : IDisposable
         string entry = shape.Entry;
 
         var s = new StringBuilder(18432);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

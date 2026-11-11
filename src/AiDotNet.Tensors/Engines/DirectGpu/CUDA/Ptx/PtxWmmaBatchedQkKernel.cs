@@ -93,10 +93,6 @@ internal sealed class PtxWmmaBatchedQkKernel : IDisposable
         if ((m & 31) != 0 || (n & 31) != 0 || (k & 15) != 0)
             throw new ArgumentException("M and N must be multiples of 32; K must be a multiple of 16.");
 
-        // PTX 7.1 includes the sm_86 target used by Ampere consumer GPUs.
-        // Target the actual device family so the Driver
-        // JIT produces architecture-specific SASS for this context.
-        string target = $"sm_{ccMajor}{ccMinor}";
         string scaleHex = "0f" + PtxCompat.SingleToInt32Bits(scale).ToString("X8", CultureInfo.InvariantCulture);
         int aBatchBytes = checked(m * k * sizeof(ushort));
         int bBatchBytes = checked(n * k * sizeof(ushort));
@@ -111,8 +107,7 @@ internal sealed class PtxWmmaBatchedQkKernel : IDisposable
         int chunksPerOperand = blockTile * 2;
 
         var ptx = new StringBuilder(8192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target {target}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

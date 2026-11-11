@@ -86,8 +86,7 @@ internal sealed class PtxSparsemaxKernel : IDisposable
         const string NegInf = "0fFF800000";
 
         var ptx = new StringBuilder(11_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// sparsemax-row M={m} N={n} bisect={BisectionSteps}");
         ptx.AppendLine();

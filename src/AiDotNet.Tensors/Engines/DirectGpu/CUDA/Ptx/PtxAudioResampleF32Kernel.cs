@@ -114,8 +114,7 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
         const string half = "0f3F000000", negHalf = "0fBF000000", one = "0f3F800000", zero = "0f00000000";
 
         var ptx = new StringBuilder(5_632);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape leading={leading} inLen={inLen} outLen={outLen} up={up} down={down} halfWidth={halfWidth} block={blockThreads} op=audio-resample");
         ptx.AppendLine();

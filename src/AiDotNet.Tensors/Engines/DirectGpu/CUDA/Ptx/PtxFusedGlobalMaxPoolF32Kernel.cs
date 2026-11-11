@@ -114,8 +114,7 @@ internal sealed class PtxFusedGlobalMaxPoolF32Kernel : IDisposable
         int scratchReg = valuesPerLane + 1;
 
         var ptx = new StringBuilder(4_096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape rows={rows} spatial={spatial} block={blockThreads} strategy=warp-plane op=global-maxpool cache=ca");

@@ -134,8 +134,7 @@ internal static partial class PtxVisionEmitter
         DirectPtxVisionSpec spec, int ccMajor, int ccMinor, params string[] parameters)
     {
         var ptx = new StringBuilder(8192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint(spec.Operation)}(");

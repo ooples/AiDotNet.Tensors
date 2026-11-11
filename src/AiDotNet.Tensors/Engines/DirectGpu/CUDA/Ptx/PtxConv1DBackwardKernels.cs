@@ -123,8 +123,7 @@ internal sealed class PtxConv1DBackwardInputKernel : IDisposable
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(12288);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
@@ -310,8 +309,7 @@ internal sealed class PtxConv1DBackwardWeightKernel : IDisposable
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(16384);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
