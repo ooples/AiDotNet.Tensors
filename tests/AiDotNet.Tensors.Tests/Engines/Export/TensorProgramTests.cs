@@ -117,6 +117,18 @@ public class TensorProgramTests : IDisposable
     }
 
     [Fact]
+    public void EngineTypeChecks_SeeThroughTheTracer()
+    {
+        bool sawCpu = false;
+        TensorProgram.Trace(x =>
+        {
+            sawCpu = AiDotNetEngine.Current.Is<CpuEngine>() && AiDotNetEngine.Current is TracingEngine;
+            return AiDotNetEngine.Current.TensorNegate(x);
+        }, Random(14, 3));
+        Assert.True(sawCpu);
+    }
+
+    [Fact]
     public void TracingIsThreadLocal()
     {
         var program = TensorProgram.Trace(x =>

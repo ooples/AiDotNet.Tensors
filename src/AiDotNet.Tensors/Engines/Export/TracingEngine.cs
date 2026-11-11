@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.Export;
 /// the wrapper, and one that calls back through <see cref="AiDotNetEngine.Current"/> is nested, which the recorder
 /// suppresses. The recorded graph is therefore the logical program the caller wrote, before any fusion.
 /// </remarks>
-public sealed partial class TracingEngine
+public sealed partial class TracingEngine : IEngineWrapper
 {
     private readonly IEngine _inner;
     private readonly IEngineCallRecorder _recorder;
