@@ -222,6 +222,100 @@ public class GroupedRowsMatMulTests
         AssertClose(expected, da, 1e-4, "d2/da");
     }
 
+    // The compiled (GraphMode) training plan records the same node and reaches the same gradients.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    public void CompiledTrainingPlan_Gradients_MatchReference(int biasRank)
+    {
+        int k = 6, n = 5, g = UnbalancedEnds.Length;
+        var a = Random(31, UnbalancedRows, k); var b = Random(32, g, k, n);
+        var bias = biasRank == 0 ? null : Random(33, g, n);
+        var w = Random(34, UnbalancedRows, n);
+        var parameters = bias is null ? new[] { a, b } : new[] { a, b, bias };
+        AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlan<float> plan;
+        using (var scope = AiDotNet.Tensors.Engines.Compilation.GraphMode.Enable())
+        {
+            var engine = new CpuEngine();
+            engine.ReduceSum(engine.TensorMultiply(engine.GroupedRowsMatMul(a, b, UnbalancedEnds, false, bias), w), null);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            plan.Step();
+            var (da, db) = ReferenceGrads(a, b, w, UnbalancedEnds, false);
+            AssertClose(da, plan.Gradients[0], 1e-4, "da");
+            AssertClose(db, plan.Gradients[1], 1e-4, "db");
+            if (bias is not null) AssertClose(ReferenceBiasGrad(w, UnbalancedEnds, true), plan.Gradients[2], 1e-4, "dbias");
+        }
+    }
+
+    // Element types without a typed GEMM take the generic kernels: forward with each bias form, and the weight gradient.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void IntegerElements_MatchReference(bool transposeB)
+    {
+        int k = 3, n = 2, g = UnbalancedEnds.Length;
+        var rng = new System.Random(35);
+        Tensor<int> Ints(params int[] shape)
+        {
+            var t = new Tensor<int>(shape);
+            var d = t.GetDataArray();
+            for (int i = 0; i < d.Length; i++) d[i] = rng.Next(-3, 4);
+            return t;
+        }
+        var a = Ints(UnbalancedRows, k);
+        var b = transposeB ? Ints(g, n, k) : Ints(g, k, n);
+        var biasN = Ints(n); var biasGn = Ints(g, n);
+        foreach (var bias in new Tensor<int>?[] { null, biasN, biasGn })
+        {
+            var y = _engine.GroupedRowsMatMul(a, b, UnbalancedEnds, transposeB, bias).ToArray();
+            for (int r = 0; r < UnbalancedRows; r++)
+            {
+                int grp = GroupOf(UnbalancedEnds, r);
+                for (int j = 0; j < n; j++)
+                {
+                    int s = 0;
+                    if (grp >= 0)
+                    {
+                        for (int q = 0; q < k; q++) s += a[r, q] * (transposeB ? b[grp, j, q] : b[grp, q, j]);
+                        if (bias is not null) s += bias.Rank == 2 ? bias[grp, j] : bias[j];
+                    }
+                    Assert.Equal(s, y[r * n + j]);
+                }
+            }
+        }
+        var c = Ints(UnbalancedRows, n);
+        var wg = _engine.GroupedRowsWeightGrad(a, c, UnbalancedEnds).ToArray();
+        var expected = new int[g * k * n];
+        for (int r = 0; r < UnbalancedRows; r++)
+        {
+            int grp = GroupOf(UnbalancedEnds, r);
+            if (grp < 0) continue;
+            for (int p = 0; p < k; p++)
+                for (int j = 0; j < n; j++) expected[(grp * k + p) * n + j] += a[r, p] * c[r, j];
+        }
+        Assert.Equal(expected, wg);
+    }
+
+    [Fact]
+    public void Double_BiasAndWeightGradient_MatchReference()
+    {
+        int k = 6, n = 5, g = UnbalancedEnds.Length;
+        static Tensor<double> D(Tensor<float> f) => new(Array.ConvertAll(f.ToArray(), v => (double)v), f.Shape.ToArray());
+        var af = Random(36, UnbalancedRows, k); var bf = Random(37, g, k, n); var biasF = Random(38, g, n); var cf = Random(39, UnbalancedRows, n);
+        var y = _engine.GroupedRowsMatMul(D(af), D(bf), UnbalancedEnds, false, D(biasF)).ToArray();
+        var expected = Reference(af, bf, UnbalancedEnds, false, biasF);
+        for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], y[i], 10);
+        var w = _engine.GroupedRowsWeightGrad(D(af), D(cf), UnbalancedEnds).ToArray();
+        for (int r = 0, grp; r < UnbalancedRows; r++)
+            if ((grp = GroupOf(UnbalancedEnds, r)) >= 0)
+                for (int p = 0; p < k; p++)
+                    for (int j = 0; j < n; j++) w[(grp * k + p) * n + j] -= (double)af[r, p] * cf[r, j];
+        Assert.All(w, v => Assert.True(Math.Abs(v) < 1e-9, $"residual {v}"));
+    }
+
     [Fact]
     public void OffsetAndStridedViews_MatchReference()
     {
