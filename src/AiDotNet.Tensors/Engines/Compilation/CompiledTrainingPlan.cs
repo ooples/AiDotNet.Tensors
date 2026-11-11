@@ -11476,9 +11476,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // LogSoftmax forward: pinned SIMD FusedLogSoftmaxRow per row
+        // LogSoftmax forward: pinned SIMD FusedLogSoftmaxRow per row -- a row is the LAST axis, so only a step recorded
+        // over that axis (the axis the node saves; old nodes without it were last-axis). Taking any rank-2 LogSoftmax
+        // here replayed a log-softmax over axis 0 as one over axis 1: wrong values, which looked like the compiled plan
+        // ignoring its live inputs. Other axes fall through to the generic replay of the recorded engine call.
         if (step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1 && typeof(T) == typeof(float)
-            && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
+            && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2
+            && (step.SavedState is not { Length: > 0 } || (step.SavedState[0] is int lsmForwardAxis && (lsmForwardAxis == 1 || lsmForwardAxis == -1))))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(

@@ -1666,8 +1666,11 @@ public static class OpParityRegistry
             e => e.TensorSurrogateSpike(x.D(), 0.3, 4.0), ParityTol.Exact, opMethod: "TensorSurrogateSpike");
         yield return new OpCase("TensorLogSoftmin[4,16;-1]", "activation", e => e.TensorLogSoftmin(x.F()), e => e.TensorLogSoftmin(x.D()),
             ParityTol.Accum(1e-5), opMethod: "TensorLogSoftmin");
-        // (A non-last axis is covered on the device by TorchModelOpsGpuTests: the CPU engine's compiled inference replay of
-        // TensorLogSoftmax over a non-last axis does not yet reflect live inputs, so it has no registry case here.)
+        // A non-last axis: the compiled plans' pinned row kernel once replayed it as the last axis.
+        yield return new OpCase("TensorLogSoftmin[4,16;0]", "activation", e => e.TensorLogSoftmin(x.F(), 0), e => e.TensorLogSoftmin(x.D(), 0),
+            ParityTol.Accum(1e-5), opMethod: "TensorLogSoftmin");
+        yield return new OpCase("TensorLogSoftmax[4,16;0]", "activation", e => e.TensorLogSoftmax(x.F(), 0), e => e.TensorLogSoftmax(x.D(), 0),
+            ParityTol.Accum(1e-5), opMethod: "TensorLogSoftmax");
 
         var q = OpInput.Rand(7001, new[] { 4, 33 }, -3.0, 3.0);
         yield return new OpCase("TensorFakeQuantize[4,33;8b]", "quantization", e => e.TensorFakeQuantize(q.F()), e => e.TensorFakeQuantize(q.D()),
