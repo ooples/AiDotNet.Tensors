@@ -2948,9 +2948,21 @@ public partial class CpuEngine
         int rank = input.Rank;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
-
-        var numOps = MathHelper.GetNumericOperations<T>();
         var valuesOut = AutoTensorCache.RentOrAllocate<T>(input._shape);
+        var indicesOut = StableSortAlongAxis(input, axis, descending, valuesOut);
+        return (valuesOut, indicesOut);
+    }
+
+    /// <summary>
+    /// The stable sort behind <see cref="TensorSort{T}"/>, <see cref="TensorArgsort{T}"/> and
+    /// <see cref="ArgSort{T}"/> along a validated, non-negative <paramref name="axis"/>: the permutation in PyTorch's
+    /// order, equal values in their original index order in both directions (LINQ OrderBy / OrderByDescending), and the
+    /// sorted values into <paramref name="valuesOut"/> when one is given.
+    /// </summary>
+    private static Tensor<int> StableSortAlongAxis<T>(Tensor<T> input, int axis, bool descending, Tensor<T>? valuesOut)
+    {
+        int rank = input.Rank;
+        var numOps = MathHelper.GetNumericOperations<T>();
         var indicesOut = new Tensor<int>(input._shape);
 
         if (!input.IsContiguous) input = input.Contiguous();
@@ -2968,8 +2980,11 @@ public partial class CpuEngine
         // is copied once.
         var srcArr = input.GetCpuBackingForStridedRead(out int srcOff);
         if (srcArr is null) { srcArr = input.ToArray(); srcOff = 0; }
-        var valArr = valuesOut.GetCpuBackingForContiguousWrite(out int valOff)
-            ?? throw new InvalidOperationException("TensorSort needs a host values buffer.");
+        int valOff = 0;
+        var valArr = valuesOut is null
+            ? null
+            : valuesOut.GetCpuBackingForContiguousWrite(out valOff)
+              ?? throw new InvalidOperationException("TensorSort needs a host values buffer.");
         var idxArr = indicesOut.GetCpuBackingForContiguousWrite(out int idxOff)
             ?? throw new InvalidOperationException("TensorSort needs a host indices buffer.");
         int dop = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -3002,12 +3017,12 @@ public partial class CpuEngine
                 for (int a = 0; a < axisSize; a++)
                 {
                     int pos = baseIdx + a * innerSize;
-                    valArr[valOff + pos] = srcArr[srcOff + baseIdx + order[a] * innerSize];
+                    if (valArr is not null) valArr[valOff + pos] = srcArr[srcOff + baseIdx + order[a] * innerSize];
                     idxArr[idxOff + pos] = order[a];
                 }
             }
         }, deterministicSafe: true);
-        return (valuesOut, indicesOut);
+        return indicesOut;
     }
 
     /// <summary>

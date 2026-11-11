@@ -44254,47 +44254,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<int>(input._shape);
-        var inputData = input.GetFlattenedData();
-        using var resultDataLease = result.LeaseArray();
-        var resultData = resultDataLease.Array;
-
-        int axisSize = input._shape[axis];
-        int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
-        int innerSize = 1;
-        for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
-
-        for (int outer = 0; outer < outerSize; outer++)
-        {
-            for (int inner = 0; inner < innerSize; inner++)
-            {
-                var axisValues = new (T value, int index)[axisSize];
-                for (int a = 0; a < axisSize; a++)
-                {
-                    int flatIndex = outer * axisSize * innerSize + a * innerSize + inner;
-                    axisValues[a] = (inputData[flatIndex], a);
-                }
-
-                if (descending)
-                {
-                    Array.Sort(axisValues, (x, y) => numOps.Compare(y.value, x.value));
-                }
-                else
-                {
-                    Array.Sort(axisValues, (x, y) => numOps.Compare(x.value, y.value));
-                }
-
-                for (int a = 0; a < axisSize; a++)
-                {
-                    int flatIndex = outer * axisSize * innerSize + a * innerSize + inner;
-                    resultData[flatIndex] = axisValues[a].index;
-                }
-            }
-        }
-
-        return result;
+        // Stable, in PyTorch's order: the same permutation TensorSort and TensorArgsort return (equal values keep their
+        // index order ascending and descending), so seeded consumers see no tie reordering.
+        return StableSortAlongAxis(input, axis, descending, valuesOut: null);
     }
 
     /// <inheritdoc/>

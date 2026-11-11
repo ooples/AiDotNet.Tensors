@@ -7891,6 +7891,12 @@ public partial interface IEngine
     /// indices (torch.sort). Ascending by default, descending when
     /// <paramref name="descending"/> is true.
     /// </summary>
+    /// <remarks>
+    /// The sort is stable in both directions: equal values keep their original index order, ascending and descending
+    /// alike (torch.sort / torch.argsort with <c>stable=True</c>, numpy <c>kind='stable'</c>, LINQ OrderBy /
+    /// OrderByDescending), on the host and on every DirectGpu backend. The order is PyTorch's: -0 equals +0, and NaN
+    /// sorts after +inf ascending and first descending (LINQ's comparer instead puts NaN first ascending).
+    /// </remarks>
     (Tensor<T> Values, Tensor<int> Indices) TensorSort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>
@@ -7898,6 +7904,12 @@ public partial interface IEngine
     /// (torch.argsort). Ascending by default, descending when
     /// <paramref name="descending"/> is true.
     /// </summary>
+    /// <remarks>
+    /// The sort is stable in both directions: equal values keep their original index order, ascending and descending
+    /// alike (torch.sort / torch.argsort with <c>stable=True</c>, numpy <c>kind='stable'</c>, LINQ OrderBy /
+    /// OrderByDescending), on the host and on every DirectGpu backend. The order is PyTorch's: -0 equals +0, and NaN
+    /// sorts after +inf ascending and first descending (LINQ's comparer instead puts NaN first ascending).
+    /// </remarks>
     Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>
@@ -8751,6 +8763,8 @@ public partial interface IEngine
     /// <param name="axis">Axis along which to sort. Default -1 means last axis.</param>
     /// <param name="descending">If true, sort in descending order.</param>
     /// <returns>Tensor of indices that would sort the input.</returns>
+    /// <remarks>The same stable permutation as <see cref="TensorArgsort{T}"/>: equal values keep their original index
+    /// order in both directions; NaN sorts last ascending and first descending.</remarks>
     Tensor<int> ArgSort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>

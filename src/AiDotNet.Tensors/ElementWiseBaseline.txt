@@ -393,7 +393,6 @@
 4	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.AnalyticSignalSpan<T>(T[], double, double, double, int, AiDotNet.Tensors.Interfaces.INumericOperations<T>)
 4	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.ApplyBroadcastChannelOp<T>(T[], int, T[], int, T[], int, int, int, int, AiDotNet.Tensors.Engines.CpuEngine.BroadcastOp)
 6	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.ApplyRoPEInterleaved<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, AiDotNet.Tensors.LinearAlgebra.Tensor<T>, AiDotNet.Tensors.LinearAlgebra.Tensor<T>, int)
-2	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.ArgSort<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, int, bool)
 1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.Asin<T>(AiDotNet.Tensors.LinearAlgebra.Vector<T>)
 1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.Asinh<T>(AiDotNet.Tensors.LinearAlgebra.Vector<T>)
 1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.Atan<T>(AiDotNet.Tensors.LinearAlgebra.Vector<T>)
