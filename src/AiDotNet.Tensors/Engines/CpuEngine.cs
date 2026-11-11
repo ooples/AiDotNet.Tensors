@@ -44996,6 +44996,23 @@ public partial class CpuEngine : ITensorLevelEngine
         if (weights == null) throw new ArgumentNullException(nameof(weights));
         if (!destination.IsContiguous) throw new InvalidOperationException("Destination tensor must be contiguous.");
 
+        // Under a gradient tape the in-place kernels below record nothing, so the destination would carry no gradient
+        // at all (and a Hessian through it would be silently zero). Compute the recorded FusedLinear instead, copy it
+        // into the destination, and record the destination as an identity of it: gradients of every order then flow
+        // exactly as through FusedLinear.
+        if (DifferentiableOps.IsRecording<T>())
+        {
+            var recorded = FusedLinear(input, weights, bias, activation, activationParams);
+            if (destination.Length != recorded.Length)
+                throw new ArgumentException(
+                    $"Destination length ({destination.Length}) must equal the result's ({recorded.Length}).", nameof(destination));
+            var source = recorded.IsContiguous ? recorded : recorded.Contiguous();
+            using (var dstLease = destination.LeaseWritable())
+                source.AsSpan().CopyTo(dstLease.Span);
+            DifferentiableOps.RecordUnary("FusedLinearInto", destination, recorded, BackwardFunctions<T>.CopyIntoBackward);
+            return;
+        }
+
         if (!input.IsContiguous) input = input.Contiguous();
         if (!weights.IsContiguous) weights = weights.Contiguous();
 
@@ -45660,7 +45677,12 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return tensor;
-        return handler.Apply(this, tensor);
+        // Gumbel-Softmax samples noise: its forward stays the handler's (which records its own relaxation backward).
+        if (activation == FusedActivationType.GumbelSoftmax) return handler.Apply(this, tensor);
+        // Every other activation as recorded engine ops. The handlers of the pointwise / row-wise fused activations
+        // (ELU, Mish, Softplus, CELU, LogSoftmax, Squash, ...) compute with host math and record nothing, so under a
+        // tape the fused convolutions and batch norm gave their inputs NO gradient at all for those activations.
+        return BackwardFunctions<T>.ApplyFusedActivationRecorded(this, tensor, activation, null);
     }
 
     /// <summary>

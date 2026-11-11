@@ -54,6 +54,18 @@ public partial class DifferentiableOpsGradGradCheckSweep
     };
 
     /// <summary>
+    /// Ops whose THIRD derivative cannot be checked against finite differences, with the reason (their first and
+    /// second orders are still checked).
+    /// </summary>
+    internal static readonly Dictionary<string, string> NotThirdOrderCheckable = new(StringComparer.Ordinal)
+    {
+        // torchvision's complete_box_iou_loss computes the aspect weight α under no_grad; the backward holds it
+        // constant, so beyond the orders where its own derivative happens to vanish at the probe the recorded
+        // derivatives are those of the frozen-α loss, not of the forward the differences see.
+        ["CompleteBoxIou"] = "aspect weight α is a stop-gradient constant (torchvision), so the third differences see a different function",
+    };
+
+    /// <summary>
     /// Inputs that are non-differentiable by design (torch gives them no gradient), per op, with the reason: their
     /// first-order gradient is a constant zero, so the finite differences of the OTHER inputs' gradients with respect
     /// to them have no analytical counterpart. The op's remaining inputs are still checked.
@@ -326,7 +338,8 @@ public partial class DifferentiableOpsGradGradCheckSweep
                 if (only is not null && !only.Contains(name)) continue;
                 // The first-order exemptions (kinks, stochastic forwards, designed gradients) cannot be finite-differenced
                 // at third order either; the second-order sweep already covers their graph connectivity.
-                if (NotSecondOrderCheckable.ContainsKey(name) || DifferentiableOpsGradCheckSweep.Exempt.ContainsKey(name)) { exempt++; continue; }
+                if (NotSecondOrderCheckable.ContainsKey(name) || DifferentiableOpsGradCheckSweep.Exempt.ContainsKey(name)
+                    || NotThirdOrderCheckable.ContainsKey(name)) { exempt++; continue; }
                 string label = $"{name}|{DifferentiableOpsGradCheckSweep.ParamFingerprint(m)}";
                 var inputs = args.SelectMany(a => a switch
                 {
@@ -366,11 +379,25 @@ public partial class DifferentiableOpsGradGradCheckSweep
                         var g1 = tape.ComputeGradients(loss, sources, createGraph: true);
                         var h = Contract(g1, sources, v);
                         if (h is null) return 0;
-                        var g2 = tape.ComputeGradients(h, sources, createGraph: true);
+                        // The reference evaluations take the second backward without create-graph (the graph walk the
+                        // second-order sweep validates); only the differentiated evaluation runs every backward with
+                        // create-graph. Using create-graph for both made the check vacuous where that walk loses the
+                        // second-order gradient: K was then 0 on both sides (nested-tape composites did exactly this).
+                        var g2 = tape.ComputeGradients(h, sources, createGraph: differentiate);
                         var k = Contract(g2, sources, w);
-                        if (k is null) return 0;
+                        if (k is null)
+                        {
+                            // No second level anywhere: right only when the first level is identically zero.
+                            if (differentiate && sources.All(s => g1.TryGetValue(s, out var z) && z.AsSpan().ToArray().All(v => v == 0)))
+                                third = new Dictionary<Tensor<double>, Tensor<double>>();
+                            return 0;
+                        }
                         // A source whose first- or second-level gradient is missing leaves third null (see below).
-                        if (differentiate && sources.Any(s => !g1.ContainsKey(s) || !g2.ContainsKey(s))) return k[0];
+                        // (A first-level gradient that is identically zero - a piecewise-constant op - legitimately has
+                        // no second level.)
+                        if (differentiate && sources.Any(s => !g1.ContainsKey(s)
+                                || (!g2.ContainsKey(s) && g1[s].AsSpan().ToArray().Any(v => v != 0))))
+                            return k[0];
                         if (differentiate) third = tape.ComputeGradients(k, sources, createGraph: true);
                         return k[0];
                     }

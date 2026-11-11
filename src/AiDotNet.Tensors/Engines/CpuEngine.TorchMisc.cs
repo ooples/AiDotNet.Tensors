@@ -91,6 +91,14 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var slopes = (double[])savedState[0];
+        if (BackwardFunctions<T>.CreatesGraph)
+        {
+            // g ⊙ (the forward's per-element slope) as a recorded multiply by a constant, so the gradient stays
+            // connected to g under create-graph (its derivative in x is zero, the slopes being fixed by the forward).
+            var slopeTensor = RoIAlignPlan.FromDoubles<T>(slopes, (int[])inputs[0]._shape.Clone());
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.TensorMultiply(gradOutput, slopeTensor), engine);
+            return;
+        }
         var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).AsSpan().ToArray();
         DifferentiableOps.AccumulateGrad(grads, inputs[0],
             FromDoubles<T>((int[])inputs[0]._shape.Clone(), i => ops.ToDouble(g[i]) * slopes[i]), engine);

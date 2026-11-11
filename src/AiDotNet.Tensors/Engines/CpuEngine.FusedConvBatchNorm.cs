@@ -41,7 +41,9 @@ public partial class CpuEngine
             var conv = FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, FusedActivationType.None);
             // BatchNormAffine is the differentiable form of inference batch norm (gradients for x, gamma and beta, as
             // PyTorch gives in eval mode); BatchNormInference records nothing.
-            return ApplyFusedActivation(BatchNormAffine(conv, gamma, beta, runningMean, runningVariance, epsilon), activation);
+            // The activation as recorded ops: the handlers of most fused activations compute on the host and record
+            // nothing, which left the inputs with no gradient for those activations.
+            return ApplyActivationRecorded(BatchNormAffine(conv, gamma, beta, runningMean, runningVariance, epsilon), activation);
         }
 
         var (foldedKernel, foldedBias) = ConvBatchNormFold<T>.Get(kernel, bias, gamma, beta, runningMean, runningVariance, epsilon,
