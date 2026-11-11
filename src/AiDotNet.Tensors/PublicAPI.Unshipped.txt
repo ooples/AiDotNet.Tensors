@@ -133,3 +133,128 @@ virtual AiDotNet.Tensors.Engines.CpuEngine.CausalDepthwiseConv1DBackwardKernel<T
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1D<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardInput<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! kernel) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CausalDepthwiseConv1DBackwardKernel<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, int taps) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Export.EngineArgCoercion
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.GenericArity.get -> int
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.Id.get -> string!
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.InPlaceParameter.get -> int
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.IsTraceable.get -> bool
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.Name.get -> string!
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.Parameters.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Export.EngineOpParameter!>!
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.ReturnKind.get -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.UntraceableReason.get -> string?
+AiDotNet.Tensors.Engines.Export.EngineOpParameter
+AiDotNet.Tensors.Engines.Export.EngineOpParameter.HasDefault.get -> bool
+AiDotNet.Tensors.Engines.Export.EngineOpParameter.Kind.get -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineOpParameter.Name.get -> string!
+AiDotNet.Tensors.Engines.Export.EngineOpParameter.TypeKey.get -> string!
+AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Enum = 11 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Matrix = 7 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableEnum = 16 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullablePrimitive = 15 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableScalar = 14 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.NullableTensor = 13 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.OutTensor = 12 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Primitive = 9 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.PrimitiveArray = 10 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Scalar = 8 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Tensor = 1 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorArray = 3 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorFixed = 2 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorList = 4 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.TensorTuple = 5 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Unsupported = 17 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Vector = 6 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EngineValueKind.Void = 0 -> AiDotNet.Tensors.Engines.Export.EngineValueKind
+AiDotNet.Tensors.Engines.Export.EnumLiteral
+AiDotNet.Tensors.Engines.Export.EnumLiteral.Member.get -> string!
+AiDotNet.Tensors.Engines.Export.ProgramArg
+AiDotNet.Tensors.Engines.Export.ProgramArg.Kind.get -> AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramArg.Literal.get -> object?
+AiDotNet.Tensors.Engines.Export.ProgramArg.Name.get -> string!
+AiDotNet.Tensors.Engines.Export.ProgramArg.Symbolic.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Export.SymbolicInt>?
+AiDotNet.Tensors.Engines.Export.ProgramArg.SymbolicIsArray.get -> bool
+AiDotNet.Tensors.Engines.Export.ProgramArg.Values.get -> System.Collections.Generic.IReadOnlyList<int>!
+AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramArgKind.Literal = 2 -> AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramArgKind.Null = 4 -> AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramArgKind.Out = 5 -> AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramArgKind.Symbolic = 3 -> AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramArgKind.Value = 0 -> AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramArgKind.ValueList = 1 -> AiDotNet.Tensors.Engines.Export.ProgramArgKind
+AiDotNet.Tensors.Engines.Export.ProgramNode
+AiDotNet.Tensors.Engines.Export.ProgramNode.Args.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Export.ProgramArg!>!
+AiDotNet.Tensors.Engines.Export.ProgramNode.InPlaceInput.get -> int
+AiDotNet.Tensors.Engines.Export.ProgramNode.Op.get -> AiDotNet.Tensors.Engines.Export.EngineOpDescriptor!
+AiDotNet.Tensors.Engines.Export.ProgramNode.Outputs.get -> System.Collections.Generic.IReadOnlyList<int>!
+AiDotNet.Tensors.Engines.Export.ProgramNode.TypeArguments.get -> System.Collections.Generic.IReadOnlyList<string!>!
+AiDotNet.Tensors.Engines.Export.ProgramValue
+AiDotNet.Tensors.Engines.Export.ProgramValue.Container.get -> string!
+AiDotNet.Tensors.Engines.Export.ProgramValue.ElementType.get -> string!
+AiDotNet.Tensors.Engines.Export.ProgramValue.Id.get -> int
+AiDotNet.Tensors.Engines.Export.ProgramValue.Name.get -> string?
+AiDotNet.Tensors.Engines.Export.ProgramValue.Role.get -> AiDotNet.Tensors.Engines.Export.ProgramValueRole
+AiDotNet.Tensors.Engines.Export.ProgramValue.Shape.get -> int[]!
+AiDotNet.Tensors.Engines.Export.ProgramValueRole
+AiDotNet.Tensors.Engines.Export.ProgramValueRole.Constant = 1 -> AiDotNet.Tensors.Engines.Export.ProgramValueRole
+AiDotNet.Tensors.Engines.Export.ProgramValueRole.Input = 0 -> AiDotNet.Tensors.Engines.Export.ProgramValueRole
+AiDotNet.Tensors.Engines.Export.ProgramValueRole.Intermediate = 3 -> AiDotNet.Tensors.Engines.Export.ProgramValueRole
+AiDotNet.Tensors.Engines.Export.ProgramValueRole.Parameter = 2 -> AiDotNet.Tensors.Engines.Export.ProgramValueRole
+AiDotNet.Tensors.Engines.Export.SymbolicInt
+AiDotNet.Tensors.Engines.Export.SymbolicInt.Equals(AiDotNet.Tensors.Engines.Export.SymbolicInt other) -> bool
+AiDotNet.Tensors.Engines.Export.SymbolicInt.Evaluate(System.Collections.Generic.IReadOnlyList<long>! symbols) -> long
+AiDotNet.Tensors.Engines.Export.SymbolicInt.Offset.get -> long
+AiDotNet.Tensors.Engines.Export.SymbolicInt.Scale.get -> long
+AiDotNet.Tensors.Engines.Export.SymbolicInt.Symbol.get -> int
+AiDotNet.Tensors.Engines.Export.SymbolicInt.SymbolicInt() -> void
+AiDotNet.Tensors.Engines.Export.SymbolicInt.SymbolicInt(int symbol, long scale, long offset) -> void
+AiDotNet.Tensors.Engines.Export.TensorProgram
+AiDotNet.Tensors.Engines.Export.TensorProgram.Diagnostics.get -> System.Collections.Generic.IReadOnlyList<string!>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.GetParameters<T>() -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.InputDimensions.get -> System.Collections.Generic.IReadOnlyList<System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Export.SymbolicInt>!>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Inputs.get -> System.Collections.Generic.IReadOnlyList<int>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Nodes.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Export.ProgramNode!>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.OpSetHash.get -> string!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Outputs.get -> System.Collections.Generic.IReadOnlyList<int>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.ParameterIds.get -> System.Collections.Generic.IEnumerable<int>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Run<T>(AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! inputs) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Run<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Run<T>(params AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! inputs) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Symbols.get -> System.Collections.Generic.IReadOnlyList<string!>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.ToFunc<T>() -> System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!
+AiDotNet.Tensors.Engines.Export.TensorProgram.TracedElementType.get -> string!
+AiDotNet.Tensors.Engines.Export.TensorProgram.Values.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Export.ProgramValue!>!
+AiDotNet.Tensors.Engines.Export.TraceException
+AiDotNet.Tensors.Engines.Export.TraceException.TraceException(string! message) -> void
+AiDotNet.Tensors.Engines.Export.TraceOptions
+AiDotNet.Tensors.Engines.Export.TraceOptions.DynamicDimensions.get -> System.Collections.Generic.IReadOnlyList<(int Input, int Axis)>?
+AiDotNet.Tensors.Engines.Export.TraceOptions.DynamicDimensions.set -> void
+AiDotNet.Tensors.Engines.Export.TraceOptions.InferDynamicDimensions.get -> bool
+AiDotNet.Tensors.Engines.Export.TraceOptions.InferDynamicDimensions.set -> void
+AiDotNet.Tensors.Engines.Export.TraceOptions.Names.get -> System.Collections.Generic.IReadOnlyDictionary<object!, string!>?
+AiDotNet.Tensors.Engines.Export.TraceOptions.Names.set -> void
+AiDotNet.Tensors.Engines.Export.TraceOptions.Parameters.get -> System.Collections.Generic.IEnumerable<object!>?
+AiDotNet.Tensors.Engines.Export.TraceOptions.Parameters.set -> void
+AiDotNet.Tensors.Engines.Export.TraceOptions.Tolerance.get -> double
+AiDotNet.Tensors.Engines.Export.TraceOptions.Tolerance.set -> void
+AiDotNet.Tensors.Engines.Export.TraceOptions.TraceOptions() -> void
+AiDotNet.Tensors.Engines.Export.TraceOptions.Verify.get -> bool
+AiDotNet.Tensors.Engines.Export.TraceOptions.Verify.set -> void
+AiDotNet.Tensors.Engines.Export.TracingEngine
+AiDotNet.Tensors.Engines.Export.TracingEngine.Inner.get -> AiDotNet.Tensors.Engines.IEngine!
+const AiDotNet.Tensors.Engines.Export.TensorProgram.FormatVersion = 1 -> int
+override AiDotNet.Tensors.Engines.Export.EngineOpDescriptor.ToString() -> string!
+override AiDotNet.Tensors.Engines.Export.EngineOpParameter.ToString() -> string!
+override AiDotNet.Tensors.Engines.Export.EnumLiteral.ToString() -> string!
+override AiDotNet.Tensors.Engines.Export.ProgramNode.ToString() -> string!
+override AiDotNet.Tensors.Engines.Export.ProgramValue.ToString() -> string!
+override AiDotNet.Tensors.Engines.Export.SymbolicInt.Equals(object? obj) -> bool
+override AiDotNet.Tensors.Engines.Export.SymbolicInt.GetHashCode() -> int
+override AiDotNet.Tensors.Engines.Export.SymbolicInt.ToString() -> string!
+override AiDotNet.Tensors.Engines.Export.TensorProgram.ToString() -> string!
+static AiDotNet.Tensors.Engines.Export.EngineArgCoercion.As<TParam>(object? value) -> TParam
+static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! example) -> AiDotNet.Tensors.Engines.Export.TensorProgram!
+static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! example, AiDotNet.Tensors.Engines.Export.TraceOptions? options) -> AiDotNet.Tensors.Engines.Export.TensorProgram!
+static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! examples) -> AiDotNet.Tensors.Engines.Export.TensorProgram!
+static AiDotNet.Tensors.Engines.Export.TensorProgram.Trace<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! examples, AiDotNet.Tensors.Engines.Export.TraceOptions? options) -> AiDotNet.Tensors.Engines.Export.TensorProgram!

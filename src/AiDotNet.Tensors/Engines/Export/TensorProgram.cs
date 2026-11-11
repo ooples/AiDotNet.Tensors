@@ -1,0 +1,532 @@
+using System;
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.LinearAlgebra;
+
+namespace AiDotNet.Tensors.Engines.Export;
+
+/// <summary>Options for <see cref="TensorProgram.Trace{T}(Func{Tensor{T}[], Tensor{T}[]}, Tensor{T}[], TraceOptions?)"/>.</summary>
+public sealed class TraceOptions
+{
+    /// <summary>
+    /// Captured tensors that are trainable. They become <see cref="ProgramValueRole.Parameter"/> values: a replay exposes
+    /// them through <see cref="TensorProgram.GetParameters{T}"/> as tape leaves. Every other captured tensor is a constant.
+    /// </summary>
+    public IEnumerable<object>? Parameters { get; set; }
+
+    /// <summary>Names for captured tensors and inputs (by reference), kept in the program for readability and mapping.</summary>
+    public IReadOnlyDictionary<object, string>? Names { get; set; }
+
+    /// <summary>
+    /// The input dimensions to treat as dynamic, as (input index, axis) pairs. Default: axis 0 of every input of rank
+    /// at least 1. Each is probed at two more sizes; integer arguments that follow it become symbolic. A dimension the
+    /// program's structure depends on is reported in <see cref="TensorProgram.Diagnostics"/> and kept static.
+    /// </summary>
+    public IReadOnlyList<(int Input, int Axis)>? DynamicDimensions { get; set; }
+
+    /// <summary>Whether to probe dynamic dimensions at all. Default true.</summary>
+    public bool InferDynamicDimensions { get; set; } = true;
+
+    /// <summary>
+    /// Whether to replay the program on the example inputs and compare with the traced function's result, which catches
+    /// work the function did outside the engine. Default true.
+    /// </summary>
+    public bool Verify { get; set; } = true;
+
+    /// <summary>Relative/absolute tolerance used by <see cref="Verify"/>. Default 1e-5.</summary>
+    public double Tolerance { get; set; } = 1e-5;
+}
+
+/// <summary>
+/// A portable, versioned record of what a function computes, as calls to public <see cref="IEngine"/> ops with named,
+/// typed arguments. Unlike a compiled plan it is hardware independent and holds the logical (pre-fusion) graph;
+/// it replays eagerly on any engine and element type (recording on the gradient tape, so a replayed program can be
+/// trained), compiles to a plan for the current device, and saves with its compiled plans for any number of devices
+/// (see <see cref="ProgramPackage"/>).
+/// </summary>
+public sealed partial class TensorProgram
+{
+    /// <summary>The current program format version.</summary>
+    public const int FormatVersion = 1;
+
+    private readonly ConcurrentDictionary<Type, object[]> _parameterCache = new();
+    private readonly ConcurrentDictionary<Type, object> _constantCache = new();
+
+    internal TensorProgram(string elementType, List<ProgramValue> values, List<ProgramNode> nodes, int[] inputs, int[] outputs,
+        Dictionary<int, object> stored, SymbolicInt[][] inputDimensions, string[] symbols, List<string> diagnostics)
+    {
+        TracedElementType = elementType;
+        Values = values;
+        Nodes = nodes;
+        Inputs = inputs;
+        Outputs = outputs;
+        Stored = stored;
+        InputDimensions = inputDimensions;
+        Symbols = symbols;
+        Diagnostics = diagnostics;
+        OpSetHash = EngineOpCatalog.OpSetHash;
+    }
+
+    /// <summary>The element type the program was traced at (a key such as <c>float</c>).</summary>
+    public string TracedElementType { get; }
+
+    /// <summary>All values, by id.</summary>
+    public IReadOnlyList<ProgramValue> Values { get; }
+
+    /// <summary>The recorded engine calls, in execution order.</summary>
+    public IReadOnlyList<ProgramNode> Nodes { get; }
+
+    /// <summary>The input value ids, in argument order.</summary>
+    public IReadOnlyList<int> Inputs { get; }
+
+    /// <summary>The output value ids, in result order.</summary>
+    public IReadOnlyList<int> Outputs { get; }
+
+    /// <summary>Per input, per axis: the dimension as a constant or a symbol.</summary>
+    public IReadOnlyList<IReadOnlyList<SymbolicInt>> InputDimensions { get; }
+
+    /// <summary>Symbol names (s0, s1, ...), one per dynamic dimension.</summary>
+    public IReadOnlyList<string> Symbols { get; }
+
+    /// <summary>Notes from tracing (dimensions kept static and why).</summary>
+    public IReadOnlyList<string> Diagnostics { get; }
+
+    /// <summary>The op-set hash of the engine surface the program was traced against.</summary>
+    public string OpSetHash { get; internal set; }
+
+    /// <summary>Stored tensors for constants and parameters, by value id (as traced; converted on replay).</summary>
+    internal Dictionary<int, object> Stored { get; }
+
+    /// <summary>Live parameter tensors given at trace time (not persisted), by value id.</summary>
+    internal Dictionary<int, object> LiveParameters { get; set; } = new();
+
+    /// <summary>The parameter value ids, in definition order.</summary>
+    public IEnumerable<int> ParameterIds => Values.Where(v => v.Role == ProgramValueRole.Parameter).Select(v => v.Id);
+
+    // ── Tracing ─────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>Traces a single-input, single-output function with default options.</summary>
+    public static TensorProgram Trace<T>(Func<Tensor<T>, Tensor<T>> function, Tensor<T> example) => Trace(function, example, null);
+
+    /// <summary>Traces a multi-input, multi-output function with default options.</summary>
+    public static TensorProgram Trace<T>(Func<Tensor<T>[], Tensor<T>[]> function, Tensor<T>[] examples) => Trace(function, examples, null);
+
+    /// <summary>Traces a single-input, single-output function.</summary>
+    public static TensorProgram Trace<T>(Func<Tensor<T>, Tensor<T>> function, Tensor<T> example, TraceOptions? options)
+    {
+        if (function is null) throw new ArgumentNullException(nameof(function));
+        return Trace(xs => new[] { function(xs[0]) }, new[] { example }, options);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="function"/> on <paramref name="examples"/> with a tracing engine installed for the calling
+    /// thread and records every outer IEngine call it makes. Throws <see cref="TraceException"/> when the function uses an
+    /// op with no portable form or (with <see cref="TraceOptions.Verify"/>) computes something outside the engine.
+    /// </summary>
+    public static TensorProgram Trace<T>(Func<Tensor<T>[], Tensor<T>[]> function, Tensor<T>[] examples, TraceOptions? options)
+    {
+        if (function is null) throw new ArgumentNullException(nameof(function));
+        if (examples is null || examples.Length == 0) throw new ArgumentException("At least one example input is required.", nameof(examples));
+        options ??= new TraceOptions();
+
+        var (program, eager) = TraceOnce(function, examples, options);
+        var diagnostics = (List<string>)program.Diagnostics;
+
+        if (options.InferDynamicDimensions)
+            program = InferSymbols(program, function, examples, options, diagnostics);
+
+        if (options.Verify)
+        {
+            Tensor<T>[] replayed;
+            using (new NoGradScope<T>())
+                replayed = program.Run(AiDotNetEngine.Current, examples);
+            for (int i = 0; i < eager.Length; i++)
+            {
+                var why = Compare(eager[i], replayed[i], options.Tolerance);
+                if (why is not null)
+                    throw new TraceException($"Output {i} of the replayed program differs from the traced function ({why}). " +
+                                             "The function computes part of its result outside the engine (element access, " +
+                                             "LINQ over tensor data, or an engine held in a field), which a program cannot record.");
+            }
+        }
+        return program;
+    }
+
+    private static (TensorProgram Program, Tensor<T>[] Outputs) TraceOnce<T>(Func<Tensor<T>[], Tensor<T>[]> function, Tensor<T>[] examples, TraceOptions options)
+    {
+        var recorder = new ProgramRecorder(typeof(T), options.Parameters, options.Names);
+        var inputs = new int[examples.Length];
+        for (int i = 0; i < examples.Length; i++)
+        {
+            string? name = options.Names is not null && options.Names.TryGetValue(examples[i], out var n) ? n : "x" + i;
+            inputs[i] = recorder.DefineInput(examples[i], name);
+        }
+
+        Tensor<T>[] result;
+        var tracer = new TracingEngine(AiDotNetEngine.Current, recorder);
+        using (AiDotNetEngine.PushThreadEngine(tracer))
+        using (new NoGradScope<T>())
+        {
+            result = function(examples) ?? throw new TraceException("The function returned null.");
+        }
+        recorder.Stop();
+        if (recorder.Failure is not null) throw new TraceException(recorder.Failure);
+
+        var outputs = new int[result.Length];
+        for (int i = 0; i < result.Length; i++)
+        {
+            if (result[i] is null) throw new TraceException($"Output {i} is null.");
+            outputs[i] = recorder.IdOf(result[i]);
+        }
+        var dims = examples.Select(e => e._shape.Select(d => new SymbolicInt(-1, 0, d)).ToArray()).ToArray();
+        var program = new TensorProgram(ElementTypes.KeyOf(typeof(T)) ?? typeof(T).Name, recorder.Values, recorder.Nodes,
+            inputs, outputs, recorder.Snapshots, dims, Array.Empty<string>(), new List<string>())
+        {
+            LiveParameters = recorder.Live,
+        };
+        return (program, result);
+    }
+
+    private static TensorProgram InferSymbols<T>(TensorProgram program, Func<Tensor<T>[], Tensor<T>[]> function, Tensor<T>[] examples,
+        TraceOptions options, List<string> diagnostics)
+    {
+        var requested = options.DynamicDimensions
+            ?? examples.Select((e, i) => (Input: i, Axis: 0)).Where(x => examples[x.Input].Rank >= 1).ToList();
+        if (requested.Count == 0) return program;
+
+        // Dimensions that share a size in the example (a batch axis on two inputs) must move together, so each
+        // distinct size is one symbol.
+        var groups = requested.GroupBy(r => examples[r.Input]._shape[r.Axis]).ToList();
+        var symbols = new List<string>();
+        var dims = program.InputDimensions.Select(d => d.ToArray()).ToArray();
+        var nodes = program.Nodes.ToList();
+
+        foreach (var group in groups)
+        {
+            int baseSize = group.Key;
+            var probes = new List<TensorProgram>();
+            bool ok = true;
+            foreach (int delta in new[] { 1, 2 })
+            {
+                var probeInputs = examples.Select((e, i) =>
+                {
+                    var axes = group.Where(g => g.Input == i).Select(g => g.Axis).ToArray();
+                    return axes.Length == 0 ? e : Resize(e, axes, baseSize + delta);
+                }).ToArray();
+                try
+                {
+                    probes.Add(TraceOnce(function, probeInputs, options).Program);
+                }
+                catch (Exception ex)
+                {
+                    diagnostics.Add($"Size {baseSize} kept static: tracing at {baseSize + delta} failed ({ex.Message}).");
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+
+            int symbol = symbols.Count;
+            var updated = Generalize(nodes, probes[0].Nodes, probes[1].Nodes, baseSize, symbol, out var why);
+            if (updated is null)
+            {
+                diagnostics.Add($"Size {baseSize} kept static: {why}");
+                continue;
+            }
+            nodes = updated;
+            symbols.Add("s" + symbol);
+            foreach (var (input, axis) in group) dims[input][axis] = new SymbolicInt(symbol, 1, 0);
+        }
+
+        return new TensorProgram(program.TracedElementType, (List<ProgramValue>)program.Values, nodes, program.Inputs.ToArray(),
+            program.Outputs.ToArray(), program.Stored, dims, symbols.ToArray(), diagnostics)
+        {
+            LiveParameters = program.LiveParameters,
+        };
+    }
+
+    // The three traces must be the same graph; integer literals that differ must be linear in the size.
+    private static List<ProgramNode>? Generalize(List<ProgramNode> a, IReadOnlyList<ProgramNode> b, IReadOnlyList<ProgramNode> c,
+        long size, int symbol, out string? why)
+    {
+        why = null;
+        if (a.Count != b.Count || a.Count != c.Count) { why = "the number of engine calls depends on it."; return null; }
+        var result = new List<ProgramNode>(a.Count);
+        for (int n = 0; n < a.Count; n++)
+        {
+            var (x, y, z) = (a[n], b[n], c[n]);
+            if (x.Op != y.Op || x.Op != z.Op || !x.Outputs.SequenceEqual(y.Outputs) || !x.Outputs.SequenceEqual(z.Outputs))
+            { why = $"call {n} ({x.Op.Name}) changes with it."; return null; }
+            var args = new ProgramArg[x.Args.Count];
+            for (int i = 0; i < args.Length; i++)
+            {
+                var (p, q, r) = (x.Args[i], y.Args[i], z.Args[i]);
+                if (p.Kind != q.Kind || p.Kind != r.Kind || !p.Values.SequenceEqual(q.Values) || !p.Values.SequenceEqual(r.Values))
+                { why = $"argument '{p.Name}' of call {n} ({x.Op.Name}) changes with it."; return null; }
+                if (p.Kind is not (ProgramArgKind.Literal or ProgramArgKind.Symbolic) || LiteralEquals(p, q) && LiteralEquals(p, r))
+                {
+                    args[i] = p;
+                    continue;
+                }
+                var fit = Fit(p, q, r, size, symbol);
+                if (fit is null) { why = $"argument '{p.Name}' of call {n} ({x.Op.Name}) is not a linear function of it."; return null; }
+                args[i] = fit;
+            }
+            result.Add(new ProgramNode(x.Op, x.TypeArguments.ToArray(), args, x.Outputs.ToArray(), x.InPlaceInput));
+        }
+        return result;
+    }
+
+    private static bool LiteralEquals(ProgramArg p, ProgramArg q)
+    {
+        if (p.Kind == ProgramArgKind.Symbolic || q.Kind == ProgramArgKind.Symbolic)
+            return p.Kind == q.Kind && p.Symbolic!.SequenceEqual(q.Symbolic!);
+        return ProgramNode.FormatLiteral(p.Literal) == ProgramNode.FormatLiteral(q.Literal);
+    }
+
+    private static long[]? Ints(object? literal) => literal switch
+    {
+        int i => new long[] { i },
+        long l => new[] { l },
+        int[] ia => ia.Select(v => (long)v).ToArray(),
+        long[] la => la,
+        _ => null,
+    };
+
+    private static ProgramArg? Fit(ProgramArg p, ProgramArg q, ProgramArg r, long size, int symbol)
+    {
+        if (p.Kind == ProgramArgKind.Symbolic) return null; // an earlier symbol already claimed it
+        var (u, v, w) = (Ints(p.Literal), Ints(q.Literal), Ints(r.Literal));
+        if (u is null || v is null || w is null || u.Length != v.Length || u.Length != w.Length) return null;
+        var exprs = new SymbolicInt[u.Length];
+        for (int k = 0; k < u.Length; k++)
+        {
+            long scale = v[k] - u[k];
+            if (w[k] - v[k] != scale) return null;             // not linear across the three sizes
+            exprs[k] = scale == 0 ? new SymbolicInt(-1, 0, u[k]) : new SymbolicInt(symbol, scale, u[k] - scale * size);
+        }
+        bool isArray = p.Literal is Array;
+        return p.WithSymbolic(exprs, isArray);
+    }
+
+    private static Tensor<T> Resize<T>(Tensor<T> example, int[] axes, int newSize)
+    {
+        // Rows are copied cyclically along each axis, so a probe holds only values the example holds (valid indices stay valid).
+        var shape = example._shape.ToArray();
+        foreach (var a in axes) shape[a] = newSize;
+        var src = example.Contiguous();
+        var dst = new Tensor<T>(shape);
+        var srcData = src.AsSpan();
+        var dstData = dst.AsWritableSpan();
+        var srcShape = example._shape;
+        var idx = new int[shape.Length];
+        for (int flat = 0; flat < dstData.Length; flat++)
+        {
+            int rem = flat, s = 0, stride = 1;
+            for (int d = shape.Length - 1; d >= 0; d--) { idx[d] = rem % shape[d]; rem /= shape[d]; }
+            for (int d = shape.Length - 1; d >= 0; d--) { s += (idx[d] % srcShape[d]) * stride; stride *= srcShape[d]; }
+            dstData[flat] = srcData[s];
+        }
+        return dst;
+    }
+
+    [Helpers.ScalarKernel("Trace-time verification compares two results once, with a per-element tolerance and NaN handling.")]
+    private static string? Compare<T>(Tensor<T> expected, Tensor<T> actual, double tol)
+    {
+        if (!expected._shape.SequenceEqual(actual._shape))
+            return $"shape [{string.Join(", ", actual._shape)}] vs [{string.Join(", ", expected._shape)}]";
+        var ops = Helpers.MathHelper.GetNumericOperations<T>();
+        var e = expected.Contiguous().AsSpan();
+        var a = actual.Contiguous().AsSpan();
+        for (int i = 0; i < e.Length; i++)
+        {
+            double x = ops.ToDouble(e[i]), y = ops.ToDouble(a[i]);
+            if (double.IsNaN(x) && double.IsNaN(y)) continue;
+            if (Math.Abs(x - y) > tol + tol * Math.Abs(x)) return $"element {i}: {y} vs {x}";
+        }
+        return null;
+    }
+
+    // ── Replay ──────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>Replays a single-input, single-output program on the current engine.</summary>
+    public Tensor<T> Run<T>(Tensor<T> input) => Run(AiDotNetEngine.Current, new[] { input })[0];
+
+    /// <summary>Replays the program on the current engine.</summary>
+    public Tensor<T>[] Run<T>(params Tensor<T>[] inputs) => Run(AiDotNetEngine.Current, inputs);
+
+    /// <summary>
+    /// Replays the program eagerly on <paramref name="engine"/> at element type <typeparamref name="T"/> (which need not
+    /// be the traced type). Every op goes through the engine, so an active gradient tape records the replay and
+    /// <see cref="GetParameters{T}"/> receive gradients.
+    /// </summary>
+    public Tensor<T>[] Run<T>(IEngine engine, Tensor<T>[] inputs)
+    {
+        if (engine is null) throw new ArgumentNullException(nameof(engine));
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (inputs.Length != Inputs.Count) throw new ArgumentException($"The program takes {Inputs.Count} input(s); got {inputs.Length}.", nameof(inputs));
+
+        var symbols = BindSymbols(inputs);
+        var env = new object?[Values.Count];
+        for (int i = 0; i < inputs.Length; i++) env[Inputs[i]] = inputs[i];
+        var parameters = GetParameterObjects<T>();
+        var constants = GetConstants<T>();
+        int pi = 0;
+        foreach (var v in Values)
+        {
+            if (v.Role == ProgramValueRole.Parameter) env[v.Id] = parameters[pi++];
+            else if (v.Role == ProgramValueRole.Constant) env[v.Id] = ((object?[])constants)[v.Id];
+        }
+
+        foreach (var node in Nodes) Execute(engine, node, env, symbols, typeof(T));
+
+        var outputs = new Tensor<T>[Outputs.Count];
+        for (int i = 0; i < outputs.Length; i++)
+            outputs[i] = env[Outputs[i]] as Tensor<T>
+                ?? throw new InvalidOperationException($"Output {i} is not a Tensor<{typeof(T).Name}>.");
+        return outputs;
+    }
+
+    /// <summary>The program as a function of one input.</summary>
+    public Func<Tensor<T>, Tensor<T>> ToFunc<T>() => x => Run(x);
+
+    /// <summary>
+    /// The trainable parameters at element type <typeparamref name="T"/>, in <see cref="ParameterIds"/> order. They are
+    /// created once per element type from the stored values and reused by every replay, so an optimizer can update them.
+    /// </summary>
+    public IReadOnlyList<Tensor<T>> GetParameters<T>() => GetParameterObjects<T>().Cast<Tensor<T>>().ToArray();
+
+    private object[] GetParameterObjects<T>() => _parameterCache.GetOrAdd(typeof(T), _ =>
+        Values.Where(v => v.Role == ProgramValueRole.Parameter)
+              .Select(v => LiveParameters.TryGetValue(v.Id, out var live) && ElementOf(v, typeof(T)) == TensorValues.Describe(live).Element
+                  ? live
+                  : TensorValues.Materialize(Stored[v.Id], v.Container, ElementOf(v, typeof(T))))
+              .ToArray());
+
+    private object GetConstants<T>() => _constantCache.GetOrAdd(typeof(T), _ =>
+    {
+        var arr = new object?[Values.Count];
+        foreach (var v in Values)
+            if (v.Role == ProgramValueRole.Constant)
+                arr[v.Id] = TensorValues.Materialize(Stored[v.Id], v.Container, ElementOf(v, typeof(T)));
+        return arr;
+    });
+
+    /// <summary>Replaces a stored parameter or constant value (used by loaders and by facades syncing trained weights).</summary>
+    internal void SetStored(int id, object tensor)
+    {
+        Stored[id] = TensorValues.Snapshot(tensor);
+        _parameterCache.Clear();
+        _constantCache.Clear();
+    }
+
+    private static Type ElementOf(ProgramValue v, Type replay) =>
+        v.ElementType == "$T" ? replay : ElementTypes.TypeOf(v.ElementType) ?? throw new InvalidOperationException($"Unknown element type {v.ElementType}.");
+
+    private long[] BindSymbols<T>(Tensor<T>[] inputs)
+    {
+        var symbols = new long[Symbols.Count];
+        var bound = new bool[Symbols.Count];
+        for (int i = 0; i < inputs.Length; i++)
+        {
+            var dims = InputDimensions[i];
+            var shape = inputs[i]._shape;
+            if (shape.Length != dims.Count)
+                throw new ArgumentException($"Input {i} must have rank {dims.Count}; got [{string.Join(", ", shape)}].");
+            for (int d = 0; d < dims.Count; d++)
+            {
+                var e = dims[d];
+                if (e.Symbol < 0)
+                {
+                    if (shape[d] != e.Offset)
+                        throw new ArgumentException($"Input {i} axis {d} must be {e.Offset} (static in this program); got {shape[d]}.");
+                }
+                else if (!bound[e.Symbol]) { symbols[e.Symbol] = shape[d]; bound[e.Symbol] = true; }
+                else if (symbols[e.Symbol] != shape[d])
+                    throw new ArgumentException($"Input {i} axis {d} is {Symbols[e.Symbol]}, already bound to {symbols[e.Symbol]}; got {shape[d]}.");
+            }
+        }
+        return symbols;
+    }
+
+    private static readonly ConcurrentDictionary<Type, Func<IEngine, int, object?[], (bool, object?)>> Invokers = new();
+
+    private static Func<IEngine, int, object?[], (bool, object?)> InvokerFor(Type element) => Invokers.GetOrAdd(element, t =>
+    {
+        var m = typeof(EngineOpInvoker<>).MakeGenericType(t).GetMethod("TryInvoke", BindingFlags.NonPublic | BindingFlags.Static)!;
+        return (e, op, a) =>
+        {
+            var args = new object?[] { e, op, a, null };
+            bool ok = (bool)m.Invoke(null, args)!;
+            return (ok, args[3]);
+        };
+    });
+
+    private static void Execute(IEngine engine, ProgramNode node, object?[] env, long[] symbols, Type replay)
+    {
+        var d = node.Op;
+        var args = new object?[node.Args.Count];
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = node.Args[i];
+            args[i] = a.Kind switch
+            {
+                ProgramArgKind.Value => env[a.Values[0]],
+                ProgramArgKind.ValueList => a.Values.Select(v => env[v]).ToArray(),
+                ProgramArgKind.Literal => a.Literal,
+                ProgramArgKind.Symbolic => a.SymbolicIsArray
+                    ? a.Symbolic!.Select(s => checked((int)s.Evaluate(symbols))).ToArray()
+                    : checked((int)a.Symbolic![0].Evaluate(symbols)),
+                _ => null,
+            };
+        }
+
+        Type element = node.TypeArguments.Count == 0 ? replay
+            : node.TypeArguments[0] == "$T" ? replay
+            : ElementTypes.TypeOf(node.TypeArguments[0]) ?? throw new InvalidOperationException($"Unknown element type {node.TypeArguments[0]}.");
+        bool ok;
+        object? result;
+        if (element == replay && replay == typeof(float)) ok = EngineOpInvoker<float>.TryInvoke(engine, d.Index, args, out result);
+        else if (element == replay && replay == typeof(double)) ok = EngineOpInvoker<double>.TryInvoke(engine, d.Index, args, out result);
+        else (ok, result) = InvokerFor(element)(engine, d.Index, args);
+        if (!ok) throw new NotSupportedException($"{d.Id} has no typed replay (it takes more than one type parameter).");
+
+        int o = 0;
+        switch (d.ReturnKind)
+        {
+            case EngineValueKind.Void: break;
+            case EngineValueKind.TensorArray or EngineValueKind.TensorList:
+                foreach (var item in (IEnumerable)result!) env[node.Outputs[o++]] = item;
+                break;
+            case EngineValueKind.TensorTuple:
+                foreach (var item in ProgramRecorder.TupleItems(result!)) env[node.Outputs[o++]] = item;
+                break;
+            default:
+                env[node.Outputs[o++]] = result;
+                break;
+        }
+        for (int i = 0; i < args.Length; i++)
+            if (d.Parameters[i].Kind == EngineValueKind.OutTensor) env[node.Outputs[o++]] = args[i];
+        if (node.InPlaceInput >= 0) env[node.Outputs[o]] = args[d.InPlaceParameter];
+    }
+
+    /// <summary>A readable listing of the program.</summary>
+    public override string ToString()
+    {
+        var sb = new StringBuilder();
+        sb.Append("program<").Append(TracedElementType).Append(">(");
+        sb.Append(string.Join(", ", Inputs.Select((id, i) =>
+            $"%{id}: [{string.Join(", ", InputDimensions[i])}]" + (Values[id].Name is { } n ? " " + n : ""))));
+        sb.AppendLine(")");
+        foreach (var v in Values.Where(v => v.Role is ProgramValueRole.Constant or ProgramValueRole.Parameter))
+            sb.AppendLine($"  %{v.Id} = {v.Role.ToString().ToLowerInvariant()} {v.Container}<{v.ElementType}>[{string.Join(", ", v.Shape)}]" + (v.Name is { } n ? " " + n : ""));
+        foreach (var node in Nodes) sb.Append("  ").AppendLine(node.ToString());
+        sb.Append("  return ").AppendLine(string.Join(", ", Outputs.Select(o => "%" + o)));
+        return sb.ToString();
+    }
+}

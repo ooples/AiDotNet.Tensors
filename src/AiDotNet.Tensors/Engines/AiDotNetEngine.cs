@@ -42,6 +42,35 @@ public static class AiDotNetEngine
     private static DirectGpuTensorEngine? _adoptedGpu;
     private static readonly object _adoptionLock = new object();
 
+    [ThreadStatic] private static IEngine? _threadEngine;
+    private static int _threadOverrides;
+
+    /// <summary>
+    /// Makes <see cref="Current"/> return <paramref name="engine"/> on the calling thread only, until the returned
+    /// scope is disposed. Other threads keep seeing the process-wide engine. Scopes nest.
+    /// </summary>
+    internal static System.IDisposable PushThreadEngine(IEngine engine)
+    {
+        if (engine is null) throw new System.ArgumentNullException(nameof(engine));
+        var previous = _threadEngine;
+        _threadEngine = engine;
+        Interlocked.Increment(ref _threadOverrides);
+        return new ThreadEngineScope(previous);
+    }
+
+    private sealed class ThreadEngineScope : System.IDisposable
+    {
+        private readonly IEngine? _previous;
+        private int _disposed;
+        public ThreadEngineScope(IEngine? previous) => _previous = previous;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _threadEngine = _previous;
+            Interlocked.Decrement(ref _threadOverrides);
+        }
+    }
+
     // True while Current holds an engine the caller assigned through the setter, as opposed to the startup CPU engine,
     // one auto-detection adopted, or one a reset/release installed. Written under _adoptionLock with every write of Current.
     private static bool _callerAssigned;
@@ -83,6 +112,9 @@ public static class AiDotNetEngine
     {
         get
         {
+            // A thread override (a program trace) is visible only to the thread that installed it. The counter keeps
+            // the thread-static read off the hot path while no override exists anywhere.
+            if (Volatile.Read(ref _threadOverrides) != 0 && _threadEngine is { } local) return local;
             return Volatile.Read(ref _current);
         }
         set
