@@ -208,46 +208,47 @@ public class MoeFusedPortTests
         }
         Close("dscores large", Ref.D(rds), backend.DownloadBuffer(ds), 1e-3);
 
-        // Also cross 65,535 workgroups on Route and DScores: N = 65535 * 256 + 1 = 16,776,961 (< 2^24).
+        // Also cross 65,535 workgroups on Route and DScores directly (N = 65535 * 256 + 1 = 16,776,961) without running
+        // single-workgroup O(N) Sort/WGrad scans that exceed Windows WDDM's 2s TDR budget on Vulkan graphics queues.
         const int nRoute = 65535 * 256 + 1;
-        var sRoute = new MoeShape(nRoute, 1, 1, 1, 1, 1);
-        Assert.True(sRoute.Admitted);
-        var ones = new float[nRoute];
-        for (int i = 0; i < nRoute; i++) ones[i] = 0.5f;
-        using var rX = backend.AllocateBuffer(ones);
-        using var rScores = backend.AllocateBuffer(ones);
+        var scoresHost = new float[nRoute * 2];
+        for (int i = 0; i < nRoute; i++)
+        {
+            scoresHost[i * 2] = 0.2f;
+            scoresHost[i * 2 + 1] = 0.8f;
+        }
+        using var rScores = backend.AllocateBuffer(scoresHost);
         using var rIds = backend.AllocateBuffer(nRoute);
         using var rGates = backend.AllocateBuffer(nRoute);
         using var rSsum = backend.AllocateBuffer(nRoute);
-        using var rO = backend.AllocateBuffer(nRoute);
-        using var rDy = backend.AllocateBuffer(ones);
-        using var rPos = backend.AllocateBuffer(nRoute);
-        using var rDs = backend.AllocateBuffer(nRoute);
+        backend.Fill(rIds, float.NaN, nRoute);
         backend.Fill(rGates, float.NaN, nRoute);
-        backend.Fill(rDs, float.NaN, nRoute);
-        using var rPerm = backend.AllocateBuffer(nRoute);
-        using var rEnds = backend.AllocateBuffer(1);
-        using var rLoads = backend.AllocateBuffer(1);
-        using var rW1 = backend.AllocateBuffer(new[] { 1f });
-        using var rW3 = backend.AllocateBuffer(new[] { 1f });
-        using var rW2 = backend.AllocateBuffer(new[] { 1f });
-        using var rH13 = backend.AllocateBuffer(2 * nRoute);
-        using var rY = backend.AllocateBuffer(nRoute);
-        using var rDh13 = backend.AllocateBuffer(2 * nRoute);
-        using var rDxs = backend.AllocateBuffer(nRoute);
-        using var rDx = backend.AllocateBuffer(nRoute);
-        using var rDw1 = backend.AllocateBuffer(1);
-        using var rDw3 = backend.AllocateBuffer(1);
-        using var rDw2 = backend.AllocateBuffer(1);
+        backend.Fill(rSsum, float.NaN, nRoute);
 
-        PortableMoe.Forward(capped, sRoute, rX, rScores, null, rW1, rW3, rW2, rIds, rGates, rSsum, rPerm, rPos, rEnds, rLoads, rH13, rO, rY);
-        PortableMoe.Backward(capped, sRoute, rDy, rX, rW1, rW3, rW2, rIds, rGates, rSsum, rPerm, rPos, rEnds, rH13, rO, rDs, rDh13, rDxs, rDx,
-            rDw1, rDw3, rDw2);
+        PortableMoe.LaunchRoute(capped, nRoute, 2, 1, rScores, null, rIds, rGates, rSsum);
         backend.Synchronize();
+        var idsOut = backend.DownloadBuffer(rIds);
         var gatesOut = backend.DownloadBuffer(rGates);
-        var dsOut = backend.DownloadBuffer(rDs);
+        Assert.Equal(1.0f, idsOut[0]);
+        Assert.Equal(1.0f, idsOut[nRoute - 1]);
         Assert.Equal(1.0f, gatesOut[nRoute - 1]);
-        Assert.Equal(0.0f, dsOut[nRoute - 1]);
+
+        // DScores: dg[0] = o[0] * dy[t] = 3 * 5 = 15, dot = 15 * 0.6 = 9 -> ds[t, 1] = (15 - 9) / 2 = 3.
+        using var rO = backend.AllocateBuffer(new[] { 3.0f });
+        using var rDy = backend.AllocateBuffer(nRoute);
+        using var rPos = backend.AllocateBuffer(nRoute);
+        using var rDs = backend.AllocateBuffer(nRoute * 2);
+        backend.Fill(rDy, 5.0f, nRoute);
+        backend.Fill(rPos, 0.0f, nRoute);
+        backend.Fill(rGates, 0.6f, nRoute);
+        backend.Fill(rSsum, 2.0f, nRoute);
+        backend.Fill(rDs, float.NaN, nRoute * 2);
+
+        PortableMoe.LaunchDScores(capped, nRoute, 1, 2, 1, rO, rDy, rPos, rGates, rSsum, rIds, rDs);
+        backend.Synchronize();
+        var dsOut = backend.DownloadBuffer(rDs);
+        Assert.Equal(0.0f, dsOut[(nRoute - 1) * 2]);
+        Assert.Equal(3.0f, dsOut[(nRoute - 1) * 2 + 1]);
     }
 
     private static void Check(IDirectGpuBackend backend, int n, int d, int g, int k, int f, int b, int empty)

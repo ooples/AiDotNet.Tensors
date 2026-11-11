@@ -93,6 +93,16 @@ internal static class PortableMoe
     private static int[] Wgrad(int p, int nn, in MoeShape s) =>
         new[] { p, nn, s.G, Tiles(p), Tiles(nn), 0, s.K, s.F };
 
+    internal static void LaunchRoute(IMoeKernelBackend be, int n, int g, int k, IGpuBuffer scores, IGpuBuffer? bias,
+        IGpuBuffer ids, IGpuBuffer gates, IGpuBuffer ssum) =>
+        Elementwise(be, MoeKernelTemplate.Route, n, new[] { scores, bias ?? scores, ids, gates, ssum },
+            new[] { n, g, k, bias is null ? 0 : 1, 0 });
+
+    internal static void LaunchDScores(IMoeKernelBackend be, int n, int d, int g, int k, IGpuBuffer o, IGpuBuffer dy,
+        IGpuBuffer pos, IGpuBuffer gates, IGpuBuffer ssum, IGpuBuffer ids, IGpuBuffer ds) =>
+        Elementwise(be, MoeKernelTemplate.DScores, n, new[] { o, dy, pos, gates, ssum, ids, ds },
+            new[] { n, d, g, k, 0 });
+
     /// <summary>
     /// The forward: route, sort, up-projection (h13 [NK, 2F], kept for the backward), down-projection (o [NK, D], kept),
     /// and the gated combine into y [N, D]. Writes ids/gates [NK], ssum [N], perm/pos [NK], ends [G], loads [B, G].
@@ -101,8 +111,7 @@ internal static class PortableMoe
         IGpuBuffer w1, IGpuBuffer w3, IGpuBuffer w2, IGpuBuffer ids, IGpuBuffer gates, IGpuBuffer ssum, IGpuBuffer perm,
         IGpuBuffer pos, IGpuBuffer ends, IGpuBuffer loads, IGpuBuffer h13, IGpuBuffer o, IGpuBuffer y)
     {
-        Elementwise(be, MoeKernelTemplate.Route, s.N, new[] { scores, bias ?? scores, ids, gates, ssum },
-            new[] { s.N, s.G, s.K, bias is null ? 0 : 1, 0 });
+        LaunchRoute(be, s.N, s.G, s.K, scores, bias, ids, gates, ssum);
         ChunkedGroups(be, MoeKernelTemplate.Sort, s.G, new[] { ids, perm, pos, ends, loads },
             new[] { s.NK, s.G, s.B, s.NK / s.B, 0 });
         Tiled(be, MoeKernelTemplate.Up, (long)Tiles(s.NK) * Tiles(2 * s.F), new[] { x, perm, w1, w3, ends, h13 },
@@ -122,8 +131,7 @@ internal static class PortableMoe
         IGpuBuffer ends, IGpuBuffer h13, IGpuBuffer o, IGpuBuffer ds, IGpuBuffer dh13, IGpuBuffer dxs, IGpuBuffer dx,
         IGpuBuffer dw1, IGpuBuffer dw3, IGpuBuffer dw2)
     {
-        Elementwise(be, MoeKernelTemplate.DScores, s.N, new[] { o, dy, pos, gates, ssum, ids, ds },
-            new[] { s.N, s.D, s.G, s.K, 0 });
+        LaunchDScores(be, s.N, s.D, s.G, s.K, o, dy, pos, gates, ssum, ids, ds);
         Tiled(be, MoeKernelTemplate.DAct, (long)Tiles(s.NK) * Tiles(s.F), new[] { dy, perm, gates, w2, ends, h13, dh13 },
             Gemm(s.NK, s.F, s.D, s));
         Tiled(be, MoeKernelTemplate.DX, (long)Tiles(s.NK) * Tiles(s.D), new[] { dh13, w1, w3, ends, dxs },
