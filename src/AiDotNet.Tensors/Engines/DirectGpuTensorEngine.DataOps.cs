@@ -27,25 +27,17 @@ public partial class DirectGpuTensorEngine
         var words = new OwnedBuffer(backend.AllocateIntBuffer(PackWords(data)), ownsBuffer: true);
         try
         {
-            var output = AllocateFullyWrittenOutputBuffer(backend, count);
-            bool handedOff = false;
-            try
+            // Dispose releases the buffer on the fallback and on any throw; once the result tensor takes it,
+            // RelinquishOwnership makes Dispose a no-op.
+            using var output = AllocateFullyWrittenOutputBuffer(backend, count);
+            if (!decode.TryDecodeBytes(words.Buffer, output.Buffer, count, sourceType, littleEndian))
             {
-                if (!decode.TryDecodeBytes(words.Buffer, output.Buffer, count, sourceType, littleEndian))
-                {
-                    GpuLaunchProbe.OnFallback("TensorFromBytes", null);
-                    return base.TensorFromBytes<T>(data, sourceType, shape, littleEndian);
-                }
-                var result = DeferTensorResult<T>(backend, output.Buffer, count, (int[])shape.Clone());
-                output.RelinquishOwnership();
-                handedOff = true;
-                return result;
+                GpuLaunchProbe.OnFallback("TensorFromBytes", null);
+                return base.TensorFromBytes<T>(data, sourceType, shape, littleEndian);
             }
-            finally
-            {
-                // Every path that does not hand the buffer to the result tensor (fallback, any throw) releases it.
-                if (!handedOff) output.Dispose();
-            }
+            var result = DeferTensorResult<T>(backend, output.Buffer, count, (int[])shape.Clone());
+            output.RelinquishOwnership();
+            return result;
         }
         finally
         {
