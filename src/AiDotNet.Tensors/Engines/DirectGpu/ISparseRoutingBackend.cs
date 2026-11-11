@@ -37,19 +37,79 @@ internal interface ISparseRoutingBackend
 
     /// <summary>counts[g] = (float) |{ i in [0, length) : int32Indices[i] == g }| for g in [0, numBins).</summary>
     void CountIndicesInt32(IGpuBuffer int32Indices, IGpuBuffer counts, int length, int numBins);
+
+    /// <summary>outMinMaxInt32[0] = min_i int32Data[i], outMinMaxInt32[1] = max_i int32Data[i] (raw int32 bits, length &gt; 0).</summary>
+    void MinMaxInt32(IGpuBuffer int32Data, IGpuBuffer outMinMaxInt32, int length);
 }
 
 internal static class SparseRoutingResolver
 {
-    /// <summary>The physical backend's sparse-routing kernels, or null when unavailable or deferred-recording.</summary>
+    /// <summary>
+    /// Resolves sparse-routing execution for <paramref name="backend"/>: returns an outer <see cref="Gpu.RecordingGpuBackend"/>
+    /// during eager recording so trace-by-execution graphs capture sparse-routing ops, returns <see langword="null"/>
+    /// during non-eager deferred recording or when the underlying physical backend lacks sparse-routing kernels, and
+    /// otherwise returns the physical <see cref="ISparseRoutingBackend"/>.
+    /// </summary>
     public static ISparseRoutingBackend? Resolve(IDirectGpuBackend backend)
     {
-        while (backend is Gpu.DelegatingGpuBackend wrapper)
+        var terminal = backend;
+        while (terminal is Gpu.DelegatingGpuBackend w)
         {
-            if (wrapper is Gpu.RecordingGpuBackend { IsRecording: true, ExecuteWhileRecording: false })
+            if (w is Gpu.RecordingGpuBackend { IsRecording: true, ExecuteWhileRecording: false })
                 return null;
-            backend = wrapper.InnerBackend;
+            terminal = w.InnerBackend;
         }
-        return backend as ISparseRoutingBackend;
+        if (terminal is not ISparseRoutingBackend)
+            return null;
+
+        var current = backend;
+        while (current is Gpu.DelegatingGpuBackend wrapper)
+        {
+            if (current is ISparseRoutingBackend capable)
+                return capable;
+            current = wrapper.InnerBackend;
+        }
+        return current as ISparseRoutingBackend;
+    }
+
+    public static ISparseRoutingBackend RequireInner(IDirectGpuBackend backend)
+    {
+        var terminal = backend;
+        while (terminal is Gpu.DelegatingGpuBackend w)
+            terminal = w.InnerBackend;
+        if (terminal is not ISparseRoutingBackend)
+        {
+            throw new GpuCapabilityUnavailableException(
+                $"{terminal.GetType().Name} does not implement sparse-routing kernels.");
+        }
+
+        var current = backend;
+        while (current is Gpu.DelegatingGpuBackend wrapper)
+        {
+            if (current is ISparseRoutingBackend capable)
+                return capable;
+            current = wrapper.InnerBackend;
+        }
+        return (ISparseRoutingBackend)current;
+    }
+}
+
+internal static class SparseRoutingCsrPlan
+{
+    private const long MaxTileMatrixInts = 1L << 22; // 4M ints (16 MB) cap on tileCounts[numTiles, numEntries]
+
+    public static void Compute(int rows, int k, int numEntries,
+        out long totalSlots, out int numTiles, out int offSorted, out int offTile, out int offChunk, out int totalScratchInts)
+    {
+        totalSlots = checked((long)rows * k);
+        if (totalSlots > int.MaxValue - numEntries - 512)
+            throw new ArgumentOutOfRangeException(nameof(rows), "Sparse routing slot count exceeds CSR scratch indexing limits.");
+        int maxTilesByMem = (int)System.Math.Max(1L, System.Math.Min(256L, MaxTileMatrixInts / System.Math.Max(1, numEntries)));
+        int desiredTiles = (int)System.Math.Min(256L, (totalSlots + 255L) / 256L);
+        numTiles = System.Math.Max(1, System.Math.Min(desiredTiles, maxTilesByMem));
+        offSorted = checked(numEntries + 1);
+        offTile = checked(offSorted + (int)totalSlots);
+        offChunk = checked(offTile + checked(numTiles * numEntries));
+        totalScratchInts = checked(offChunk + 256);
     }
 }

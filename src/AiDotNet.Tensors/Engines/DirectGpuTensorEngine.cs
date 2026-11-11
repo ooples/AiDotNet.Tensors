@@ -13719,7 +13719,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var tapeInputs = computeReadoutGrads ? new[] { hidden, weight, bias } : new[] { hidden };
                 Autodiff.DifferentiableOps.RecordIfActive("FusedLinearCrossEntropy", result, tapeInputs,
                     CpuEngine.FusedLinearCrossEntropyIndexBackward<T>,
-                    savedState: new object[] { (int[])targetIds.GetDataArray().Clone(), vocab, weight, bias, computeReadoutGrads });
+                    savedState: new object[]
+                    {
+                        (int[])targetIds.GetDataArray().Clone(), vocab, weight, bias, computeReadoutGrads,
+                        weight.Version, bias.Version
+                    });
             }
             return result;
         }

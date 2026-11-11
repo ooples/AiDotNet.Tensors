@@ -7002,9 +7002,77 @@ public partial class DirectGpuTensorEngine
                 output => backend.Fill(output, 0f, minimumLength));
         }
 
-        // The result shape depends on the data. Keep the full input resident and synchronize only
-        // the two scalar bounds; the public API has no device-side capacity/count representation
-        // from which a Tensor shape could otherwise be constructed.
+        if (input.Length > 16_777_216)
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException(
+                    "Resident BinCount requires at most 16,777,216 inputs because counts use the common exact float-integer GPU representation.");
+            return base.TensorBinCount(input, minLength);
+        }
+
+        var contiguousInput = input.IsContiguous ? input : input.Contiguous();
+        if (AiDotNet.Tensors.Engines.DirectGpu.SparseRoutingResolver.Resolve(backend) is { } sr)
+        {
+            try
+            {
+                using var rawInput = GetOrAllocateInt32IndexBuffer(backend, contiguousInput);
+                using var intBounds = AllocateFullyWrittenOutputBuffer(backend, 2);
+                sr.MinMaxInt32(rawInput.Buffer, intBounds.Buffer, contiguousInput.Length);
+                backend.Synchronize();
+                float[] rawMinMax = backend.DownloadBuffer(intBounds.Buffer);
+                int minInt, maxInt;
+                unsafe
+                {
+                    fixed (float* p = rawMinMax)
+                    {
+                        minInt = ((int*)p)[0];
+                        maxInt = ((int*)p)[1];
+                    }
+                }
+                if (minInt < 0)
+                    throw new ArgumentException(
+                        $"BinCount requires non-negative ints; got {minInt}", nameof(input));
+
+                int exactObservedLength = checked(maxInt + 1);
+                int exactOutputLength = Math.Max(minimumLength, exactObservedLength);
+                if (exactOutputLength == 0)
+                    return new Tensor<int>(new[] { 0 });
+
+                using var outBuf = AllocateFullyWrittenOutputBuffer(backend, exactOutputLength);
+                sr.CountIndicesInt32(rawInput.Buffer, outBuf.Buffer, contiguousInput.Length, exactOutputLength);
+                var counted = DeferTensorResult<int>(backend, outBuf.Buffer, exactOutputLength, new[] { exactOutputLength });
+                outBuf.RelinquishOwnership();
+                return counted;
+            }
+            catch (NotSupportedException capabilityGap)
+            {
+                GpuLaunchProbe.OnFallback("TensorBinCount", capabilityGap);
+            }
+        }
+
+        if (!HasResidentIndexStorage(contiguousInput))
+        {
+            var hostData = contiguousInput.GetDataArray();
+            int hostMin = hostData[0], hostMax = hostData[0];
+            for (int i = 1; i < hostData.Length; i++)
+            {
+                int v = hostData[i];
+                if (v < hostMin) hostMin = v;
+                if (v > hostMax) hostMax = v;
+            }
+            if (hostMin < 0)
+                throw new ArgumentException(
+                    $"BinCount requires non-negative ints; got {hostMin}", nameof(input));
+            if (hostMax >= 16_777_216)
+            {
+                if (ThrowOnGpuKernelFallback)
+                    throw new NotSupportedException(
+                        "Float-comparison BinCount fallback requires values below 16,777,216.");
+                return base.TensorBinCount(input, minLength);
+            }
+        }
+
+        // Fallback when ISparseRoutingBackend is unavailable (e.g. non-eager deferred recording or custom backend).
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var negated = AllocateOutputBuffer(backend, input.Length);
         using var maximum = AllocateOutputBuffer(backend, 1);
@@ -7022,34 +7090,16 @@ public partial class DirectGpuTensorEngine
         if (minValue < 0f)
             throw new ArgumentException(
                 $"BinCount requires non-negative ints; got {(int)minValue}", nameof(input));
-
-        int observedLength = checked((int)maxValue + 1);
-        int outputLength = Math.Max(minimumLength, observedLength);
-        if (input.Length > 16_777_216)
+        if (maxValue >= 16_777_216f)
         {
             if (ThrowOnGpuKernelFallback)
                 throw new NotSupportedException(
-                    "Resident BinCount requires at most 16,777,216 inputs because counts use the common exact float-integer GPU representation.");
+                    "Float-comparison BinCount fallback requires values below 16,777,216.");
             return base.TensorBinCount(input, minLength);
         }
 
-        if (outputLength > 0 && AiDotNet.Tensors.Engines.DirectGpu.SparseRoutingResolver.Resolve(backend) is { } sr)
-        {
-            var contiguousInput = input.IsContiguous ? input : input.Contiguous();
-            try
-            {
-                using var rawInput = GetOrAllocateInt32IndexBuffer(backend, contiguousInput);
-                using var outBuf = AllocateFullyWrittenOutputBuffer(backend, outputLength);
-                sr.CountIndicesInt32(rawInput.Buffer, outBuf.Buffer, contiguousInput.Length, outputLength);
-                var counted = DeferTensorResult<int>(backend, outBuf.Buffer, outputLength, new[] { outputLength });
-                outBuf.RelinquishOwnership();
-                return counted;
-            }
-            catch (NotSupportedException capabilityGap)
-            {
-                GpuLaunchProbe.OnFallback("TensorBinCount", capabilityGap);
-            }
-        }
+        int observedLength = checked((int)maxValue + 1);
+        int outputLength = Math.Max(minimumLength, observedLength);
 
         using var scalar = AllocateOutputBuffer(backend, input.Length);
         using var matches = AllocateOutputBuffer(backend, input.Length);

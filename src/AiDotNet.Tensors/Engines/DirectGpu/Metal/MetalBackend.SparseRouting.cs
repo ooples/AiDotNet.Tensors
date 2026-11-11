@@ -42,14 +42,73 @@ public sealed partial class MetalBackend : ISparseRoutingBackend
 
     void ISparseRoutingBackend.TopKWeightedRowMixBackwardTable(IGpuBuffer gradOutput, IGpuBuffer int32Indices,
         IGpuBuffer weights, IGpuBuffer gradTable, int rows, int numEntries, int k, int channels)
-        => DispatchSparseRouting("topk_weighted_row_mix_backward_table",
-            new[] { M(gradOutput), M(int32Indices), M(weights), M(gradTable) },
-            new[] { rows, numEntries, k, channels },
-            (long)numEntries * channels);
+    {
+        long totalOut = checked((long)numEntries * channels);
+        if (totalOut == 0) return;
+        SparseRoutingCsrPlan.Compute(rows, k, numEntries,
+            out long totalSlotsLong, out int numTiles, out int offSorted, out int offTile, out int offChunk, out int totalScratchInts);
+        int totalSlots = (int)totalSlotsLong;
+        int tileCountInts = checked(numTiles * numEntries);
+
+        using var csrBuf = AllocateBuffer(totalScratchInts);
+        var mCsr = M(csrBuf);
+        var mIdx = M(int32Indices);
+
+        DispatchSparseRouting("sparse_zero_int32",
+            new[] { mCsr }, new[] { offTile, tileCountInts }, tileCountInts);
+
+        if (totalSlots > 0)
+        {
+            DispatchSparseRouting("topk_csr_tile_counts",
+                new[] { mIdx, mCsr }, new[] { totalSlots, numEntries, numTiles, offTile }, numTiles);
+        }
+
+        DispatchSparseRouting("topk_csr_entry_prefix",
+            new[] { mCsr }, new[] { numEntries, numTiles, offTile }, numEntries);
+
+        DispatchSparseRouting("topk_csr_chunk_sums",
+            new[] { mCsr }, new[] { numEntries, offChunk }, 256);
+
+        DispatchSparseRouting("topk_csr_chunk_finalize",
+            new[] { mCsr }, new[] { numEntries, offChunk }, (long)numEntries + 1);
+
+        if (totalSlots > 0)
+        {
+            DispatchSparseRouting("topk_csr_scatter_slots",
+                new[] { mIdx, mCsr }, new[] { totalSlots, numEntries, numTiles, offSorted, offTile }, numTiles);
+        }
+
+        DispatchSparseRouting("topk_weighted_row_mix_backward_table",
+            new[] { M(gradOutput), M(weights), mCsr, M(gradTable) },
+            new[] { numEntries, k, channels, offSorted },
+            totalOut);
+    }
 
     void ISparseRoutingBackend.CountIndicesInt32(IGpuBuffer int32Indices, IGpuBuffer counts, int length, int numBins)
-        => DispatchSparseRouting("count_indices_int32",
-            new[] { M(int32Indices), M(counts) },
-            new[] { length, numBins },
-            numBins);
+    {
+        if (numBins <= 0) return;
+        var mCounts = M(counts);
+        DispatchSparseRouting("sparse_zero_int32", new[] { mCounts }, new[] { 0, numBins }, numBins);
+        if (length > 0)
+        {
+            int totalThreads = System.Math.Min(length, 4096 * 256);
+            DispatchSparseRouting("count_indices_accumulate_int32",
+                new[] { M(int32Indices), mCounts },
+                new[] { length, numBins, totalThreads },
+                totalThreads);
+        }
+        DispatchSparseRouting("count_indices_finalize_float", new[] { mCounts }, new[] { numBins }, numBins);
+    }
+
+    void ISparseRoutingBackend.MinMaxInt32(IGpuBuffer int32Data, IGpuBuffer outMinMaxInt32, int length)
+    {
+        if (length <= 0) return;
+        var mOut = M(outMinMaxInt32);
+        DispatchSparseRouting("minmax_init_int32", new[] { mOut }, new[] { 2 }, 2);
+        int totalThreads = System.Math.Min(length, 4096 * 256);
+        DispatchSparseRouting("minmax_reduce_int32",
+            new[] { M(int32Data), mOut },
+            new[] { length, totalThreads },
+            totalThreads);
+    }
 }

@@ -12,6 +12,8 @@ using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.Engines.Gpu.Graph;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -134,6 +136,115 @@ public sealed class SparseRoutingTapeGpuTests : IClassFixture<DirectGpuTensorEng
         AssertClose(c.Dw, g.Dw, "dw");
         AssertClose(c.Db, g.Db, "db");
     }
+
+    [SkippableFact]
+    public void TopKWeightedRowMixBackwardTable_EntriesAbove65535_MatchesCpu_OnDevice()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        var cpu = new CpuEngine();
+
+        const int rows = 48, numEntries = 65_600, k = 4, channels = 8;
+        var gradOut = Rand([rows, channels], 31);
+        var indices = RandIndices([rows, k], numEntries, 32);
+        var weights = Rand([rows, k], 33);
+
+        var expected = cpu.TopKWeightedRowMixBackwardTable(gradOut, indices, weights, numEntries);
+        var actual = gpu.TopKWeightedRowMixBackwardTable(gradOut, indices, weights, numEntries);
+        Assert.True(actual.IsGpuResident || actual.HasPendingGpuData, "TopKWeightedRowMixBackwardTable fell back to host");
+        AssertClose(expected.ToArray(), actual.ToArray(), "dTable_65600");
+    }
+
+    [SkippableFact]
+    public void TensorBinCount_ExactInt32AboveFloat24BitLimit_PreservesExactUpperBin_OnDevice()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        var cpu = new CpuEngine();
+
+        var hostInput = new Tensor<int>(new[] { 3, 16_777_217, 3 }, new[] { 3 });
+        var cpuBins = cpu.TensorBinCount(hostInput);
+        var gpuBins = gpu.TensorBinCount(hostInput);
+
+        Assert.Equal(16_777_218, gpuBins.Length);
+        Assert.Equal(cpuBins[0], gpuBins[0]);
+        Assert.Equal(2, gpuBins[3]);
+        Assert.Equal(0, gpuBins[16_777_216]);
+        Assert.Equal(1, gpuBins[16_777_217]);
+    }
+
+    [SkippableFact]
+    public void RecordingGpuBackend_EagerTrace_RecordsAndReplaysSparseRouting()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var physical = _fixture.Engine!.GetBackend();
+        Skip.If(physical is null || SparseRoutingResolver.Resolve(physical) is null,
+            "Physical GPU backend does not implement ISparseRoutingBackend.");
+
+        var recording = new RecordingGpuBackend(physical!) { ExecuteWhileRecording = true };
+        var sr = SparseRoutingResolver.Resolve(recording);
+        Assert.Same(recording, sr);
+
+        var cpu = new CpuEngine();
+        const int rows = 12, numEntries = 20, k = 3, channels = 16;
+        var values1 = Rand([rows, numEntries], 41);
+        var indices1 = RandIndices([rows, k], numEntries, 42);
+        var table1 = Rand([numEntries, channels], 43);
+        var weights1 = Rand([rows, k], 44);
+        var gradMix1 = Rand([rows, channels], 45);
+
+        using var valB = physical.AllocateBuffer(values1.ToArray());
+        using var idxB = physical.AllocateIntBuffer(indices1.ToArray());
+        using var tblB = physical.AllocateBuffer(table1.ToArray());
+        using var wB = physical.AllocateBuffer(weights1.ToArray());
+        using var gmB = physical.AllocateBuffer(gradMix1.ToArray());
+        using var ygB = physical.AllocateBuffer(rows * k);
+        using var ymB = physical.AllocateBuffer(rows * channels);
+        using var dtB = physical.AllocateBuffer(numEntries * channels);
+        using var cntB = physical.AllocateBuffer(numEntries);
+        using var mmB = physical.AllocateBuffer(2);
+
+        using var builder = new ExecutionGraphBuilder();
+        recording.BeginRecording(builder);
+        try
+        {
+            sr!.GatherRowValuesForward(valB, idxB, ygB, rows, numEntries, k);
+            sr.TopKWeightedRowMixForward(tblB, idxB, wB, ymB, rows, numEntries, k, channels);
+            sr.TopKWeightedRowMixBackwardTable(gmB, idxB, wB, dtB, rows, numEntries, k, channels);
+            sr.CountIndicesInt32(idxB, cntB, rows * k, numEntries);
+            sr.MinMaxInt32(idxB, mmB, rows * k);
+        }
+        finally
+        {
+            recording.EndRecording();
+        }
+
+        Assert.Equal(5, builder.NodeCount);
+        AssertClose(cpu.TensorGatherRowValues(values1, indices1).ToArray(), physical.DownloadBuffer(ygB), "eager_gather");
+        AssertClose(cpu.TopKWeightedRowMix(table1, indices1, weights1).ToArray(), physical.DownloadBuffer(ymB), "eager_mix");
+        AssertClose(cpu.TopKWeightedRowMixBackwardTable(gradMix1, indices1, weights1, numEntries).ToArray(), physical.DownloadBuffer(dtB), "eager_dtable");
+        AssertClose(cpu.TensorCountIndices<float>(indices1, numEntries).ToArray(), physical.DownloadBuffer(cntB), "eager_counts");
+
+        // Zero outputs in-place, then replay the compiled graph and verify sparse-routing nodes actually execute on replay.
+        physical.Fill(ygB, 0f, rows * k);
+        physical.Fill(ymB, 0f, rows * channels);
+        physical.Fill(dtB, 0f, numEntries * channels);
+        physical.Fill(cntB, 0f, numEntries);
+        physical.Fill(mmB, 0f, 2);
+
+        var compiled = builder.Build();
+        compiled.Execute(physical);
+
+        AssertClose(cpu.TensorGatherRowValues(values1, indices1).ToArray(), physical.DownloadBuffer(ygB), "replay_gather");
+        AssertClose(cpu.TopKWeightedRowMix(table1, indices1, weights1).ToArray(), physical.DownloadBuffer(ymB), "replay_mix");
+        AssertClose(cpu.TopKWeightedRowMixBackwardTable(gradMix1, indices1, weights1, numEntries).ToArray(), physical.DownloadBuffer(dtB), "replay_dtable");
+        AssertClose(cpu.TensorCountIndices<float>(indices1, numEntries).ToArray(), physical.DownloadBuffer(cntB), "replay_counts");
+        var mmFloats = physical.DownloadBuffer(mmB);
+        var mmInts = new int[2];
+        Buffer.BlockCopy(mmFloats, 0, mmInts, 0, 2 * sizeof(int));
+        Assert.Equal(indices1.ToArray().Min(), mmInts[0]);
+        Assert.Equal(indices1.ToArray().Max(), mmInts[1]);
+    }
 }
 
 /// <summary>
@@ -142,12 +253,23 @@ public sealed class SparseRoutingTapeGpuTests : IClassFixture<DirectGpuTensorEng
 /// </summary>
 [Collection("DirectGpuSerial")]
 public sealed class SparseRoutingBackendParityTests
+    : IClassFixture<OpenClBackendTestFixture>, IClassFixture<HipBackendTestFixture>
 {
+    private readonly OpenClBackendTestFixture _openClFixture;
+    private readonly HipBackendTestFixture _hipFixture;
+
+    public SparseRoutingBackendParityTests(OpenClBackendTestFixture openClFixture, HipBackendTestFixture hipFixture)
+    {
+        _openClFixture = openClFixture;
+        _hipFixture = hipFixture;
+    }
+
     public static TheoryData<int, int, int, int> Shapes => new()
     {
         { 18, 16, 4, 40 },
         { 9, 24, 1, 33 },    // top-1; channels not a multiple of 32
         { 31, 12, 5, 70 },   // rows not a multiple of 8; channels > 64
+        { 25, 300, 4, 16 },  // numEntries > 256: exercises both shared-memory and global-atomic count paths
     };
 
     private static void Check(IDirectGpuBackend backend, int rows, int numEntries, int k, int channels)
@@ -162,6 +284,7 @@ public sealed class SparseRoutingBackendParityTests
         var weights = SparseRoutingTapeGpuTests.Rand([rows, k], 25);
         var gradMix = SparseRoutingTapeGpuTests.Rand([rows, channels], 26);
 
+        var idxArr = indices.ToArray();
         var yGather = cpu.TensorGatherRowValues(values, indices).ToArray();
         var dvGather = cpu.TensorGatherRowValuesBackward(gradGather, indices, numEntries).ToArray();
         var yMix = cpu.TopKWeightedRowMix(table, indices, weights).ToArray();
@@ -170,7 +293,7 @@ public sealed class SparseRoutingBackendParityTests
         var counts = cpu.TensorCountIndices<float>(indices, numEntries).ToArray();
 
         using var valB = backend.AllocateBuffer(values.ToArray());
-        using var idxB = backend.AllocateIntBuffer(indices.ToArray());
+        using var idxB = backend.AllocateIntBuffer(idxArr);
         using var ggB = backend.AllocateBuffer(gradGather.ToArray());
         using var tblB = backend.AllocateBuffer(table.ToArray());
         using var wB = backend.AllocateBuffer(weights.ToArray());
@@ -182,6 +305,7 @@ public sealed class SparseRoutingBackendParityTests
         using var dwB = backend.AllocateBuffer(rows * k);
         using var dtB = backend.AllocateBuffer(numEntries * channels);
         using var cntB = backend.AllocateBuffer(numEntries);
+        using var mmB = backend.AllocateBuffer(2);
 
         GpuResidencyScope scope;
         using (scope = GpuResidencyScope.Begin(captureOperations: true))
@@ -192,6 +316,7 @@ public sealed class SparseRoutingBackendParityTests
             sr.TopKWeightedRowMixBackwardWeights(gmB, tblB, idxB, dwB, rows, numEntries, k, channels);
             sr.TopKWeightedRowMixBackwardTable(gmB, idxB, wB, dtB, rows, numEntries, k, channels);
             sr.CountIndicesInt32(idxB, cntB, rows * k, numEntries);
+            sr.MinMaxInt32(idxB, mmB, rows * k);
         }
 
         Assert.True(scope.Uploads + scope.Downloads == 0,
@@ -204,14 +329,21 @@ public sealed class SparseRoutingBackendParityTests
         SparseRoutingTapeGpuTests.AssertClose(dwMix, backend.DownloadBuffer(dwB), "dwMix");
         SparseRoutingTapeGpuTests.AssertClose(dtMix, backend.DownloadBuffer(dtB), "dtMix");
         SparseRoutingTapeGpuTests.AssertClose(counts, backend.DownloadBuffer(cntB), "counts");
+        var mmFloats = backend.DownloadBuffer(mmB);
+        var mmInts = new int[2];
+        Buffer.BlockCopy(mmFloats, 0, mmInts, 0, 2 * sizeof(int));
+        Assert.Equal(idxArr.Min(), mmInts[0]);
+        Assert.Equal(idxArr.Max(), mmInts[1]);
     }
 
     [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void OpenCl_MatchesCpu_OnDevice(int rows, int numEntries, int k, int channels)
     {
-        using var backend = new OpenClBackend();
-        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        var backend = _openClFixture.Backend;
+        if (backend.InitializationState == GpuBackendInitializationState.Failed)
+            throw new InvalidOperationException("OpenCL initialization failed.", backend.InitializationException);
+        Skip.IfNot(_openClFixture.IsAvailable, "OpenCL is not available.");
         Check(backend, rows, numEntries, k, channels);
     }
 
@@ -237,8 +369,10 @@ public sealed class SparseRoutingBackendParityTests
     [MemberData(nameof(Shapes))]
     public void Hip_MatchesCpu_OnDevice(int rows, int numEntries, int k, int channels)
     {
-        using var backend = new HipBackend();
-        Skip.IfNot(backend.IsAvailable, "HIP is not available.");
+        var backend = _hipFixture.Backend;
+        if (backend.InitializationState == GpuBackendInitializationState.Failed)
+            throw new InvalidOperationException("HIP initialization failed.", backend.InitializationException);
+        Skip.IfNot(_hipFixture.IsAvailable, "HIP is not available.");
         Check(backend, rows, numEntries, k, channels);
     }
 

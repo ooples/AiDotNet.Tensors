@@ -92,21 +92,53 @@ public partial class CpuEngine
             var capturedWeight = weight;
             var capturedBias = bias;
             var capturedTargetIds = targetIds;
-            var capturedComputeReadout = computeReadoutGrads;
-            var compiledSavedState = new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads };
-            var graphInputs = computeReadoutGrads ? new[] { hidden, weight, bias } : new[] { hidden };
+            var compiledSavedState = new object[]
+            {
+                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, weight.Version, bias.Version
+            };
+            if (!computeReadoutGrads)
+            {
+                // Keep weight and bias in the forward dependency graph with no backward writer so their producers
+                // execute before the loss without allocating readout gradient buffers or adding readout backward edges.
+                var lossForward = scope.RecordVariadic(
+                    LazyNodeType.Custom,
+                    "FusedLinearCrossEntropyReadoutForward",
+                    new[] { hidden, weight, bias },
+                    new[] { 1 },
+                    (eng, output) =>
+                    {
+                        compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray().Clone();
+                        compiledSavedState[5] = capturedWeight.Version;
+                        compiledSavedState[6] = capturedBias.Version;
+                        var result = eng.FusedLinearCrossEntropyWithLogits(
+                            capturedHidden, capturedWeight, capturedBias, capturedTargetIds, computeReadoutGrads: false);
+                        DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                    },
+                    backwardFn: null);
+                return scope.RecordVariadic(
+                    LazyNodeType.Custom,
+                    "FusedLinearCrossEntropy",
+                    new[] { hidden, lossForward },
+                    new[] { 1 },
+                    (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, lossForward, output),
+                    FusedLinearCrossEntropyIndexBackward<T>,
+                    compiledSavedState);
+            }
+
             return scope.RecordVariadic(
                 LazyNodeType.Custom,
                 "FusedLinearCrossEntropy",
-                graphInputs,
+                new[] { hidden, weight, bias },
                 new[] { 1 },
                 (eng, output) =>
                 {
                     // Labels are not differentiable graph inputs, but they are live training data.
                     // Refresh the backward state on every replay instead of freezing the trace batch.
                     compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray().Clone();
+                    compiledSavedState[5] = capturedWeight.Version;
+                    compiledSavedState[6] = capturedBias.Version;
                     var result = eng.FusedLinearCrossEntropyWithLogits(
-                        capturedHidden, capturedWeight, capturedBias, capturedTargetIds, capturedComputeReadout);
+                        capturedHidden, capturedWeight, capturedBias, capturedTargetIds, computeReadoutGrads: true);
                     DirectGpuTensorEngine.CopyResultInto(eng, result, output);
                 },
                 FusedLinearCrossEntropyIndexBackward<T>,
@@ -159,7 +191,7 @@ public partial class CpuEngine
             "FusedLinearCrossEntropy", output,
             tapeInputs,
             FusedLinearCrossEntropyIndexBackward<T>,
-            savedState: new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads });
+            savedState: new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, weight.Version, bias.Version });
 
         return output;
     }
@@ -378,12 +410,13 @@ public partial class CpuEngine
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        bool computeReadout = savedState.Length <= 4 || (bool)savedState[4];
         var hidden = inputs[0];
-        var weight = inputs.Length > 1 ? inputs[1] : (Tensor<T>)savedState[2];
-        var bias = inputs.Length > 2 ? inputs[2] : (Tensor<T>)savedState[3];
+        var weight = computeReadout && inputs.Length > 1 ? inputs[1] : (Tensor<T>)savedState[2];
+        var bias = computeReadout && inputs.Length > 2 ? inputs[2] : (Tensor<T>)savedState[3];
         var ids = (int[])savedState[0];
         int vocab = (int)savedState[1];
-        bool computeReadout = savedState.Length <= 4 || (bool)savedState[4];
+        ValidateDetachedReadoutVersions(weight, bias, savedState);
 
         bool needHidden = DifferentiableOps.IsGradientRequired(hidden);
         bool needWeight = computeReadout && inputs.Length > 1 && DifferentiableOps.IsGradientRequired(weight);
@@ -571,8 +604,30 @@ public partial class CpuEngine
             "FusedLinearCrossEntropy", output,
             tapeInputs,
             FusedLinearCrossEntropyPrecomputedBackward<T>,
-            savedState: new object[] { (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, precomputed });
+            savedState: new object[]
+            {
+                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, weight.Version, bias.Version, precomputed
+            });
         return output;
+    }
+
+    private static void ValidateDetachedReadoutVersions<T>(Tensor<T> weight, Tensor<T> bias, object[] savedState)
+    {
+        if (InferenceModeFlag.IsActive || savedState.Length < 7) return;
+        int expectedWeightVersion = (int)savedState[5];
+        int expectedBiasVersion = (int)savedState[6];
+        if (weight.Version != expectedWeightVersion)
+        {
+            throw new InvalidOperationException(
+                "Tensor input 1 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +
+                "This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
+        }
+        if (bias.Version != expectedBiasVersion)
+        {
+            throw new InvalidOperationException(
+                "Tensor input 2 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +
+                "This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
+        }
     }
 
     /// <summary>
@@ -584,7 +639,10 @@ public partial class CpuEngine
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         bool computeReadout = (bool)savedState[4];
-        var pre = (FusedCePrecomputedGradients)savedState[5];
+        var weight = computeReadout && inputs.Length > 1 ? inputs[1] : (Tensor<T>)savedState[2];
+        var bias = computeReadout && inputs.Length > 2 ? inputs[2] : (Tensor<T>)savedState[3];
+        ValidateDetachedReadoutVersions(weight, bias, savedState);
+        var pre = (FusedCePrecomputedGradients)savedState[7];
         var dHidden = System.Threading.Interlocked.Exchange(ref pre.Hidden, null);
         var dWeight = System.Threading.Interlocked.Exchange(ref pre.Weight, null);
         var dBias = System.Threading.Interlocked.Exchange(ref pre.Bias, null);

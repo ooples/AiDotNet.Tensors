@@ -712,44 +712,282 @@ struct P { rows: i32, numEntries: i32, k: i32, channels: i32 };
     gradWBuf[gid] = acc;
 }";
 
-    public const string TopKWeightedRowMixBackwardTable = @"
-@group(0) @binding(0) var<storage, read> gradBuf: array<f32>;
-@group(0) @binding(1) var<storage, read> idxBuf: array<i32>;
-@group(0) @binding(2) var<storage, read> wBuf: array<f32>;
-@group(0) @binding(3) var<storage, read_write> gradTblBuf: array<f32>;
-struct P { rows: i32, numEntries: i32, k: i32, channels: i32 };
-@group(0) @binding(4) var<uniform> p: P;
+    public const string SparseZeroInt32 = @"
+@group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+struct P { offset: i32, count: i32 };
+@group(0) @binding(1) var<uniform> p: P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let gid = i32(gid3.x);
-    let R = p.rows; let G = p.numEntries; let K = p.k; let C = p.channels;
-    if (gid >= G * C) { return; }
-    let g = gid / C;
-    let c = gid % C;
-    var acc: f32 = 0.0;
-    for (var r: i32 = 0; r < R; r = r + 1) {
-        let kBase = r * K;
-        for (var j: i32 = 0; j < K; j = j + 1) {
-            if (idxBuf[kBase + j] == g) {
-                acc = acc + wBuf[kBase + j] * gradBuf[r * C + c];
+    if (gid < p.count) {
+        buf[u32(p.offset) + gid3.x] = 0;
+    }
+}";
+
+    public const string TopKCsrTileCounts = @"
+@group(0) @binding(0) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(1) var<storage, read_write> csrBuf: array<i32>;
+struct P { totalSlots: i32, numEntries: i32, numTiles: i32, offTile: i32 };
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let t = i32(gid3.x);
+    let TS = p.totalSlots; let G = p.numEntries; let NT = p.numTiles;
+    if (t >= NT || TS <= 0) { return; }
+    let tileSpan = ((TS - 1) / NT) + 1;
+    if (t > TS / tileSpan) { return; }
+    let start = t * tileSpan;
+    let rem = TS - start;
+    var span = tileSpan;
+    if (rem < span) { span = rem; }
+    let end = start + span;
+    let rowBase = u32(p.offTile) + u32(t) * u32(G);
+    for (var s: i32 = start; s < end; s = s + 1) {
+        let e = idxBuf[s];
+        if (e >= 0 && e < G) {
+            let idx = rowBase + u32(e);
+            csrBuf[idx] = csrBuf[idx] + 1;
+        }
+    }
+}";
+
+    public const string TopKCsrEntryPrefix = @"
+@group(0) @binding(0) var<storage, read_write> csrBuf: array<i32>;
+struct P { numEntries: i32, numTiles: i32, offTile: i32 };
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let g = i32(gid3.x);
+    let G = p.numEntries; let NT = p.numTiles;
+    if (g >= G) { return; }
+    var acc: i32 = 0;
+    let uG = u32(G);
+    let uOff = u32(p.offTile);
+    for (var t: i32 = 0; t < NT; t = t + 1) {
+        let idx = uOff + u32(t) * uG + gid3.x;
+        let c = csrBuf[idx];
+        csrBuf[idx] = acc;
+        acc = acc + c;
+    }
+    csrBuf[gid3.x] = acc;
+}";
+
+    public const string TopKCsrChunkSums = @"
+@group(0) @binding(0) var<storage, read_write> csrBuf: array<i32>;
+struct P { numEntries: i32, offChunk: i32 };
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let cIdx = i32(gid3.x);
+    if (cIdx >= 256) { return; }
+    let G = p.numEntries;
+    var acc: i32 = 0;
+    if (G > 0) {
+        let chunkSpan = ((G - 1) / 256) + 1;
+        if (cIdx <= G / chunkSpan) {
+            let start = cIdx * chunkSpan;
+            let rem = G - start;
+            var span = chunkSpan;
+            if (rem < span) { span = rem; }
+            let end = start + span;
+            for (var g: i32 = start; g < end; g = g + 1) {
+                let c = csrBuf[g];
+                csrBuf[g] = acc;
+                acc = acc + c;
             }
         }
+    }
+    csrBuf[u32(p.offChunk) + gid3.x] = acc;
+}";
+
+    public const string TopKCsrChunkFinalize = @"
+@group(0) @binding(0) var<storage, read_write> csrBuf: array<i32>;
+struct P { numEntries: i32, offChunk: i32 };
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let g = i32(gid3.x);
+    let G = p.numEntries;
+    let uOff = u32(p.offChunk);
+    if (g > G) { return; }
+    if (g == G) {
+        var total: i32 = 0;
+        for (var m: u32 = 0u; m < 256u; m = m + 1u) {
+            total = total + csrBuf[uOff + m];
+        }
+        csrBuf[u32(G)] = total;
+        return;
+    }
+    let chunkSpan = ((G - 1) / 256) + 1;
+    let chunkIdx = g / chunkSpan;
+    var baseOff: i32 = 0;
+    for (var m: i32 = 0; m < chunkIdx; m = m + 1) {
+        baseOff = baseOff + csrBuf[uOff + u32(m)];
+    }
+    csrBuf[gid3.x] = csrBuf[gid3.x] + baseOff;
+}";
+
+    public const string TopKCsrScatterSlots = @"
+@group(0) @binding(0) var<storage, read> idxBuf: array<i32>;
+@group(0) @binding(1) var<storage, read_write> csrBuf: array<i32>;
+struct P { totalSlots: i32, numEntries: i32, numTiles: i32, offSorted: i32, offTile: i32 };
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let t = i32(gid3.x);
+    let TS = p.totalSlots; let G = p.numEntries; let NT = p.numTiles;
+    if (t >= NT || TS <= 0) { return; }
+    let tileSpan = ((TS - 1) / NT) + 1;
+    if (t > TS / tileSpan) { return; }
+    let start = t * tileSpan;
+    let rem = TS - start;
+    var span = tileSpan;
+    if (rem < span) { span = rem; }
+    let end = start + span;
+    let rowBase = u32(p.offTile) + u32(t) * u32(G);
+    let uSorted = u32(p.offSorted);
+    for (var s: i32 = start; s < end; s = s + 1) {
+        let e = idxBuf[s];
+        if (e >= 0 && e < G) {
+            let tileIdx = rowBase + u32(e);
+            let localOff = csrBuf[tileIdx];
+            csrBuf[tileIdx] = localOff + 1;
+            let pos = csrBuf[e] + localOff;
+            csrBuf[uSorted + u32(pos)] = s;
+        }
+    }
+}";
+
+    public const string TopKWeightedRowMixBackwardTable = @"
+@group(0) @binding(0) var<storage, read> gradBuf: array<f32>;
+@group(0) @binding(1) var<storage, read> wBuf: array<f32>;
+@group(0) @binding(2) var<storage, read> csrBuf: array<i32>;
+@group(0) @binding(3) var<storage, read_write> gradTblBuf: array<f32>;
+struct P { numEntries: i32, k: i32, channels: i32, offSorted: i32 };
+@group(0) @binding(4) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = gid3.x;
+    let uG = u32(p.numEntries);
+    let uK = u32(p.k);
+    let uC = u32(p.channels);
+    let uSorted = u32(p.offSorted);
+    if (gid >= uG * uC) { return; }
+    let g = gid / uC;
+    let c = gid % uC;
+    let start = csrBuf[g];
+    let end = csrBuf[g + 1u];
+    var acc: f32 = 0.0;
+    for (var idx: i32 = start; idx < end; idx = idx + 1) {
+        let slot = u32(csrBuf[uSorted + u32(idx)]);
+        let r = slot / uK;
+        acc = acc + wBuf[slot] * gradBuf[r * uC + c];
     }
     gradTblBuf[gid] = acc;
 }";
 
-    public const string CountIndicesInt32 = @"
+    public const string CountIndicesAccumulateInt32 = @"
 @group(0) @binding(0) var<storage, read> idxBuf: array<i32>;
-@group(0) @binding(1) var<storage, read_write> cntBuf: array<f32>;
-struct P { length: i32, numBins: i32 };
+@group(0) @binding(1) var<storage, read_write> cntBuf: array<atomic<i32>>;
+struct P { length: i32, numBins: i32, totalThreads: i32 };
 @group(0) @binding(2) var<uniform> p: P;
+var<workgroup> s_counts: array<atomic<i32>, 256>;
+@compute @workgroup_size(256) fn main(
+    @builtin(global_invocation_id) gid3: vec3<u32>,
+    @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let tid = i32(lid3.x);
+    let gid = i32(gid3.x);
+    let B = p.numBins;
+    let uLen = u32(p.length);
+    let uStride = u32(p.totalThreads);
+    atomicStore(&s_counts[lid3.x], 0);
+    workgroupBarrier();
+    if (B <= 256) {
+        if (gid < p.totalThreads) {
+            for (var i: u32 = gid3.x; i < uLen; i = i + uStride) {
+                let bin = idxBuf[i];
+                if (bin >= 0 && bin < B) {
+                    atomicAdd(&s_counts[bin], 1);
+                }
+            }
+        }
+    } else {
+        if (gid < p.totalThreads) {
+            for (var i: u32 = gid3.x; i < uLen; i = i + uStride) {
+                let bin = idxBuf[i];
+                if (bin >= 0 && bin < B) {
+                    atomicAdd(&cntBuf[bin], 1);
+                }
+            }
+        }
+    }
+    workgroupBarrier();
+    if (B <= 256 && tid < B) {
+        let c = atomicLoad(&s_counts[lid3.x]);
+        if (c != 0) {
+            atomicAdd(&cntBuf[lid3.x], c);
+        }
+    }
+}";
+
+    public const string CountIndicesFinalizeFloat = @"
+@group(0) @binding(0) var<storage, read_write> cntBuf: array<i32>;
+struct P { numBins: i32 };
+@group(0) @binding(1) var<uniform> p: P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let gid = i32(gid3.x);
-    let L = p.length; let B = p.numBins;
-    if (gid >= B) { return; }
-    var cnt: i32 = 0;
-    for (var i: i32 = 0; i < L; i = i + 1) {
-        if (idxBuf[i] == gid) { cnt = cnt + 1; }
+    if (gid < p.numBins) {
+        let c = cntBuf[gid3.x];
+        cntBuf[gid3.x] = bitcast<i32>(f32(c));
     }
-    cntBuf[gid] = f32(cnt);
+}";
+
+    public const string MinMaxInitInt32 = @"
+@group(0) @binding(0) var<storage, read_write> outBuf: array<i32>;
+struct P { count: i32 };
+@group(0) @binding(1) var<uniform> p: P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let gid = i32(gid3.x);
+    if (gid >= p.count) { return; }
+    if (gid == 0) { outBuf[0] = 2147483647; }
+    else if (gid == 1) { outBuf[1] = (-2147483647 - 1); }
+}";
+
+    public const string MinMaxReduceInt32 = @"
+@group(0) @binding(0) var<storage, read> dataBuf: array<i32>;
+@group(0) @binding(1) var<storage, read_write> outBuf: array<atomic<i32>>;
+struct P { length: i32, totalThreads: i32 };
+@group(0) @binding(2) var<uniform> p: P;
+var<workgroup> s_min: atomic<i32>;
+var<workgroup> s_max: atomic<i32>;
+@compute @workgroup_size(256) fn main(
+    @builtin(global_invocation_id) gid3: vec3<u32>,
+    @builtin(local_invocation_id) lid3: vec3<u32>) {
+    let tid = lid3.x;
+    let gid = i32(gid3.x);
+    if (tid == 0u) {
+        atomicStore(&s_min, 2147483647);
+        atomicStore(&s_max, (-2147483647 - 1));
+    }
+    workgroupBarrier();
+    if (gid < p.totalThreads) {
+        let uLen = u32(p.length);
+        let uStride = u32(p.totalThreads);
+        var lo: i32 = 2147483647;
+        var hi: i32 = (-2147483647 - 1);
+        var anyVal: i32 = 0;
+        for (var i: u32 = gid3.x; i < uLen; i = i + uStride) {
+            let v = dataBuf[i];
+            if (v < lo) { lo = v; }
+            if (v > hi) { hi = v; }
+            anyVal = 1;
+        }
+        if (anyVal != 0) {
+            atomicMin(&s_min, lo);
+            atomicMax(&s_max, hi);
+        }
+    }
+    workgroupBarrier();
+    if (tid == 0u) {
+        let bMin = atomicLoad(&s_min);
+        let bMax = atomicLoad(&s_max);
+        if (bMin <= bMax) {
+            atomicMin(&outBuf[0], bMin);
+            atomicMax(&outBuf[1], bMax);
+        }
+    }
 }";
 }
