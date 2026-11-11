@@ -91,6 +91,8 @@ public sealed class MetalShaderCompilationTests
         yield return ("BatchNormRegister", () => BatchNormRegisterKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict: false, as MetalBackend.ConvDgradS2 compiles it (the two-argument overload).
         yield return ("ConvDgradS2", () => ConvDgradS2KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
+        // Strict, as MetalBackend.NumericRecurrence compiles it: the log-domain lattice and the assignment's comparisons.
+        yield return ("NumericRecurrence", () => NumericRecurrenceKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), true);
         // Strict: false, as MetalBackend.ConvWinogradF43 compiles it (the two-argument overload).
         yield return ("WinogradF43", () => WinogradF43KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict: false, as MetalBackend.ConvWinogradFused compiles it (the two-argument overload).
