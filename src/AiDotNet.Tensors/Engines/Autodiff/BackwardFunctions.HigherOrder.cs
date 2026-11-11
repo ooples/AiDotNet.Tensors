@@ -160,6 +160,12 @@ internal static partial class BackwardFunctions<T>
             var result = composite(engine);
             var g = tape.ComputeGradients(result, sources, createGraph: true,
                 seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(result, gradOutput) });
+            // The composite's forward and backward ops are part of the graph the next create-graph backward walks, and
+            // that walk only visits the outer tape's own entries: hand them over. Left on the nested tape, a third
+            // derivative (two create-graph backwards on one tape, as a PINN's training step takes) could not reach the
+            // op's inputs at all, and the gradient silently came back missing. They go BEFORE the accumulation below,
+            // which consumes their results: the reverse walk must meet a consumer before its producer.
+            if (outer is not null) tape.TransferEntriesTo(outer);
             using (GradientTape<T>.RecordOn(outer))
             {
                 foreach (var input in sources)

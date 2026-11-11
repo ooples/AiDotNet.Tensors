@@ -159,6 +159,17 @@ public sealed class GradientTape<T> : IDisposable
     internal TapeEntryArena<T> Entries => _entries;
 
     /// <summary>
+    /// Moves this (nested) tape's entries, in order, to the end of <paramref name="target"/>, with their saved-state
+    /// pins: from then on they belong to the target, whose create-graph walks see them, and this tape holds none.
+    /// </summary>
+    internal void TransferEntriesTo(GradientTape<T> target)
+    {
+        if (ReferenceEquals(target, this)) return;
+        for (int i = 0; i < _entries.Count; i++) target._entries.Add(_entries[i]);
+        _entries.Reset();
+    }
+
+    /// <summary>
     /// Removes the last entry from the tape. Used by fused operations to replace
     /// individual entries with a single fused entry.
     /// </summary>
