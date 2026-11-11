@@ -3213,6 +3213,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 try { Helpers.HostSync.TryMaterialize(kv.Key); }
                 catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ClearActivationCache", capabilityGap); Helpers.HostSync.Remove(kv.Key); }
+                catch (Exception released) when (released is ObjectDisposedException
+                                                 || released.InnerException is ObjectDisposedException)
+                {
+                    // The entry's device buffer was already released (issue #226), so its host copy cannot be
+                    // recovered here either. Throwing would abort the clear -- and Dispose with it, leaking every
+                    // other entry's buffer. The materializer is kept, not removed: a later host read of that tensor
+                    // still fails loudly instead of silently returning a stale array.
+                    AliasDiag($"ClearActivationCache: deferred download of a released buffer skipped: {released.Message}");
+                }
             }
         }
 
@@ -8409,7 +8418,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Not on a partial view: it resolves its whole storage's buffer, so the add would land at element 0 and
         // BindResidentBuffer would then make that buffer authoritative for a storage the view's siblings share (an
         // accumulation into one slice of a stacked gradient hid the other slices' values).
-        if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        // Autocast keeps the resident paths off because activations may be FP16-resident there, but gradient
+        // accumulation is FP32 under autocast too (the master gradients), and ResolveResidentBufferNoUpload never returns
+        // an FP16 activation buffer (!e.IsFp16) nor one shorter than the float length. Excluding it sent every
+        // accumulation of an autocast training step to the host path below, whose download aborted whole-step capture
+        // (CUDA 900): an FP16 transformer step ran eager at 13x its FP32 step time (#1549 head-to-head).
+        if ((!Gpu.AutocastScope.IsEnabled || InGradAccumulation) && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && !IsPartialView(a) && !IsPartialView(b) && a.Length == b.Length
             // The target must be resident in its OWN right (bound buffer / activation), never via a persistent
             // weight-cache copy: after a GPU inference pass cached a weight, `weight -= update` used to write that
