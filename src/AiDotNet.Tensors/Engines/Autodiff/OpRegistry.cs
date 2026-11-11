@@ -30,6 +30,12 @@ internal static class OpRegistry
         // Activations and index-map ops with their own backward (CpuEngine.TorchMisc)
         "TensorCelu", "TensorHardtanh", "TensorLogSigmoid", "TensorSoftsign",
         "TensorRrelu", "TensorMsort", "TensorDiagflat", "TensorDiagonalScatter",
+        // Model-level ops with their own backward (CpuEngine.TorchModelOps): CRF log-partition (forward-backward),
+        // fake quantization (range-masked straight-through), surrogate spikes, top-k routing softmax, time
+        // embeddings, and the fused-activation kernels as standalone activations
+        "TensorCrfForward", "TensorFakeQuantize", "TensorSurrogateSpike", "TensorTopKSoftmax",
+        "TensorSinusoidalTimeEmbedding", "TensorLisht", "TensorBentIdentity", "TensorGaussian",
+        "TensorScaledTanh", "TensorThresholdedRelu", "TensorIsru", "TensorSqrbf",
 
         // Window pooling with its own backward: max routes to the argmax, average splits, Lp scales by
         // (x/y)^(p-1); unpooling is an index map (CpuEngine.TorchPool)
@@ -527,6 +533,11 @@ internal static class OpRegistry
         // Composed from recorded ops (softmax, add/multiply/divide, matmul, batch matmul, reductions)
         "TensorSoftmin", "TensorRsub", "TensorAddcmul", "TensorAddcdiv",
         "TensorAddmv", "TensorAddr", "TensorBaddbmm", "TensorAddbmm",
+
+        // Model-level ops composed from recorded ops (CpuEngine.TorchModelOps): log-softmin (negate + log-softmax),
+        // the Poincaré-ball linear layer (log/exp maps, matmul, Möbius addition), the soft split (one-hot read,
+        // sigmoid, blend) and soft k-NN / locally-weighted regression (distances, softmax, matmul)
+        "TensorLogSoftmin", "TensorHyperbolicLinear", "TensorSoftSplit", "TensorSoftKnn", "TensorSoftLocallyWeighted",
 
         // Shape and statistics ops composed from recorded ops (narrow, reshape, reductions, matmul, index select)
         "TensorAmin", "TensorChunk", "TensorSplitWithSizes", "TensorUnflatten",

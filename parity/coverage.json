@@ -9133,8 +9133,8 @@
       "source": "reviewed"
     },
     "torch:fake_quantize_per_tensor_affine": {
-      "status": "not-applicable",
-      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFakeQuantize",
       "source": "reviewed"
     },
     "torch:fbgemm_linear_fp16_weight": {
