@@ -10252,23 +10252,50 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TaylorSoftmaxBackward<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, int order, int axis)
     {
+        using var __gpuOp = EnterGpuOp();
         int ax = axis < 0 ? input.Rank + axis : axis;
-        // The device formula below evaluates g at x and drops the max-shift term; the forward evaluates g at
-        // x - max(x), so that is the gradient of a different function. The CPU backward has the exact formula; use it
-        // until this path applies the shift and the argmax correction too.
-        if (order >= 0 || IsTapeActive<T>() || Compilation.GraphMode.IsActive
-            || ax < 0 || ax >= input.Rank)
+        if (order < 0 || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+            || ax < 0 || ax >= input.Rank || typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.TaylorSoftmaxBackward(gradOutput, input, output, order, axis);
 
+        // The forward is y = g(z)/Σg(z) with z = x - max(x) (the first maximum along the axis) and
+        // g(z) = Σ_{n≤order} zⁿ/n!, so (CpuEngine.TaylorSoftmaxBackward)
+        //   dz_i = y_i·(gy_i - Σ_j gy_j·y_j)·g'(z_i)/g(z_i),  dx_k = dz_k - [k = argmax]·Σ_i dz_i.
+        // g is not shift-invariant the way exp is, so the max's own gradient (the second term) does not vanish.
+        // Everything below is a device op on the float buffers - no host round trip - and only + - × ÷ (no
+        // transcendental), so a relaxed-math or approximate-intrinsic backend cannot bend it beyond rounding.
         var axes = new[] { ax };
         var numOps = MathHelper.GetNumericOperations<T>();
+        var max = ReduceAxisGpu(input, axes, keepDims: true, backend, ReduceOperation.Max);
+        var z = TensorBroadcastSubtract(input, max);
+
+        // g and g' by accumulating zⁿ/n! term by term (term_n = term_{n-1}·z/n), as the CPU loop does.
+        var inverse = new T[order + 1];
+        for (int n = 1; n <= order; n++) inverse[n] = (T)(object)(float)(1.0 / n);   // T is float here
+        Tensor<T>? g = null, gPrime = null, term = null;
+        for (int n = 1; n <= order; n++)
+        {
+            term = term is null ? z : TensorMultiplyScalar(TensorMultiply(term, z), inverse[n]);
+            g = g is null ? TensorAddScalar(term, numOps.One) : TensorAdd(g, term);
+            if (n < order) gPrime = gPrime is null ? TensorAddScalar(term, numOps.One) : TensorAdd(gPrime, term);
+        }
+
         var dot = ReduceSum(TensorMultiply(gradOutput, output), axes, keepDims: true);
         var softmaxGrad = TensorMultiply(output, TensorBroadcastSubtract(gradOutput, dot));
-        var inputSquared = TensorMultiply(input, input);
-        var g = TensorAddScalar(
-            TensorAdd(input, TensorMultiplyScalar(inputSquared, numOps.FromDouble(0.5))), numOps.One);
-        var gPrime = TensorAddScalar(input, numOps.One);
-        return TensorMultiply(softmaxGrad, TensorDivide(gPrime, g));
+        Tensor<T> dz;
+        if (g is null)
+            dz = softmaxGrad;                                           // order 0: g ≡ 1 (and g' taken as 1, as the CPU loop does)
+        else if (gPrime is null)
+            dz = TensorDivide(softmaxGrad, g!);                         // order 1: g' ≡ 1
+        else
+            dz = TensorMultiply(softmaxGrad, TensorDivide(gPrime, g!));
+
+        // The first maximum along the axis: z is exactly 0 there (x - x), and the running count of zeros along the
+        // axis is 1 only at the first of them.
+        var atMax = ((IEngine)this).TensorEquals(z, numOps.Zero);
+        var firstMax = TensorMultiply(atMax, ((IEngine)this).TensorEquals(((IEngine)this).TensorCumSum(atMax, ax), numOps.One));
+        var shiftGrad = ReduceSum(dz, axes, keepDims: true);
+        return TensorSubtract(dz, TensorBroadcastMultiply(firstMax, shiftGrad));
     }
 
     // #775: spherical softmax = Softmax(x / ||x||_2) along `axis`. L2-normalize on-device (square ->
