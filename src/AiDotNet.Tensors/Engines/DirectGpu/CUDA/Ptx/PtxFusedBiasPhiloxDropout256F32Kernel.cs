@@ -105,8 +105,7 @@ internal sealed class PtxFusedBiasPhiloxDropout256F32Kernel : IDisposable
         int groups = elements / ValuesPerThread;
         int blocks = groups / ThreadsPerBlock;
         var ptx = new StringBuilder(10_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

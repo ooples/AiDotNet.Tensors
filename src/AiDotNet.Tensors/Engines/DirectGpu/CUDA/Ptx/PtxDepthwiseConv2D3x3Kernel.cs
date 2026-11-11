@@ -123,8 +123,7 @@ internal sealed class PtxDepthwiseConv2D3x3Kernel : IDisposable
             $"aidotnet_depthwise_conv2d3x3_n{n}_c{c}_h{h}_w{w}{(relu ? "_relu" : "")}");
 
         var s = new StringBuilder(12288);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

@@ -108,8 +108,7 @@ internal sealed class PtxAnalyticSignalMaskF32Kernel : IDisposable
         int halfN = fftSize >> 1;
 
         var ptx = new StringBuilder(2_816);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape batch={batch} fftSize={fftSize} binLow={binLow} binHigh={binHigh} halfN={halfN} block={blockThreads} op=analytic-signal-mask");
         ptx.AppendLine();

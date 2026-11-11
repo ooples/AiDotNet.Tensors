@@ -104,8 +104,7 @@ internal sealed class PtxPacPhaseBinMiF32Kernel : IDisposable
         int countsByteOffset = NumPhaseBins * 4;     // countsD starts after 18 sums
 
         var ptx = new StringBuilder(4_608);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape batch={batch} numSamples={numSamples} numGammaBands={numGammaBands} gammaIdx={gammaIdx} bins={NumPhaseBins} op=pac-phase-bin-mi");
         ptx.AppendLine();

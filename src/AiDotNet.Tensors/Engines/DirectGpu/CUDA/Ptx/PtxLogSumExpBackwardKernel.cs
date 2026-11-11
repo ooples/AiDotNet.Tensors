@@ -108,8 +108,7 @@ internal sealed class PtxLogSumExpBackwardKernel : IDisposable
         const string Log2e = "0f3FB8AA3B";
 
         var ptx = new StringBuilder(5_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// logsumexp-backward-row M={m} N={n}");
         ptx.AppendLine();

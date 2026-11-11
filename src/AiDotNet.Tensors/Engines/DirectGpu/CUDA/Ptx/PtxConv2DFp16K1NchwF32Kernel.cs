@@ -141,8 +141,7 @@ internal sealed class PtxConv2DFp16K1NchwF32Kernel : IDisposable
         const int weightChannelStrideBytes = 2;                 // FP16 per input channel of a weight row
 
         var ptx = new StringBuilder(16384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

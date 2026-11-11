@@ -91,8 +91,7 @@ internal sealed class PtxCavityBounceInplaceF32Kernel : IDisposable
         string cap = DirectPtxPtxText.Hex(20f), neg = DirectPtxPtxText.Hex(-20f);
 
         var ptx = new StringBuilder(1_920);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape total={total} block={blockThreads} op=cavity-bounce-inplace");
         ptx.AppendLine();

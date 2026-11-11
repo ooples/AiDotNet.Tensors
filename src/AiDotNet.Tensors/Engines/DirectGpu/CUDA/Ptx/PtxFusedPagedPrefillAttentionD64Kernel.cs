@@ -144,8 +144,7 @@ internal sealed class PtxFusedPagedPrefillAttentionD64Kernel : IDisposable
         string scaleHex = FloatLiteral(scale);
         const string log2E = "0f3FB8AA3B";
         var ptx = new StringBuilder(16_384 + maximumKeyLength * 1_200);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

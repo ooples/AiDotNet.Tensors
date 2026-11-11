@@ -103,8 +103,7 @@ internal sealed class PtxWidebandLogBinPoolF32Kernel : IDisposable
         long usableMinusOne = usable - 1, binDen = (long)numBins * numBins;
 
         var ptx = new StringBuilder(3_328);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape totalSegBatch={totalSegBatch} fftSize={fftSize} numBins={numBins} usable={usable} block={blockThreads} op=wideband-log-bin-pool");
         ptx.AppendLine();

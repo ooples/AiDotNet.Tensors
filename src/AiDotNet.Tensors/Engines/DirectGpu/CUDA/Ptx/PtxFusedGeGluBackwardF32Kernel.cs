@@ -101,8 +101,7 @@ internal sealed class PtxFusedGeGluBackwardF32Kernel : IDisposable
         int splitRowBytes = checked(2 * halfDimension * sizeof(float));
         int halfRowBytes = checked(halfDimension * sizeof(float));
         var ptx = new StringBuilder(12_288);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

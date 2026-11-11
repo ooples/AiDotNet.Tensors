@@ -93,8 +93,7 @@ internal sealed class PtxMobiusAddKernel : IDisposable
         const string Two = "0f40000000";  // 2.0
 
         var ptx = new StringBuilder(9_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// mobius-add dim={dim}");
         ptx.AppendLine();

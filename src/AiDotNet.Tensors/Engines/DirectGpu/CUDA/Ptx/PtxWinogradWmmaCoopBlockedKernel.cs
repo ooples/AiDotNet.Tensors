@@ -162,8 +162,7 @@ internal sealed class PtxWinogradWmmaCoopBlockedKernel : IDisposable
             $"aidotnet_winograd_wmma_coopblk_n{n}_c{c}_h{h}_w{w}_k{k}");
 
         var s = new StringBuilder(49152);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

@@ -83,8 +83,7 @@ internal sealed class PtxGemmFp16TransposedKernel : IDisposable
         int noHalfBytes = checked(no * sizeof(ushort)); // C row stride (over No)
 
         var ptx = new StringBuilder(24_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// gemm-fp16-transposed M={m} Kc={kc} No={no} tile={BlockM}x{BlockN}x{BlockK}");
         ptx.AppendLine();
