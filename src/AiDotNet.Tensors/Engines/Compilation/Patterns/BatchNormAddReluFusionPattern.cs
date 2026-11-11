@@ -104,7 +104,7 @@ internal static class BatchNormFusionMatch
     {
         bn = null; dataConsumer = null; statistics = null; mean = null; variance = null; epsilon = 0;
         if (nodes[index] is not LazyNode<float> candidateBn || candidateBn.OpName != "BatchNorm"
-            || !(candidateBn.RecordingEngine is DirectGpuTensorEngine || candidateBn.RecordingEngine is CpuEngine)
+            || !(candidateBn.RecordingEngine.Is<DirectGpuTensorEngine>() || candidateBn.RecordingEngine.Is<CpuEngine>())
             || candidateBn.BackwardFn is null || candidateBn.SavedState is not { Length: 3 } saved
             || saved[0] is not Tensor<float> savedMean || saved[1] is not Tensor<float> savedVariance
             || saved[2] is not double savedEpsilon
@@ -139,7 +139,7 @@ internal static class BatchNormFusionMatch
     /// The CPU engine itself, not <see cref="DirectGpuTensorEngine"/>, which derives from it: GPU-recorded graphs keep
     /// their own fusion rules.
     /// </summary>
-    internal static bool IsCpuOnly(IEngine? engine) => engine is CpuEngine && engine is not DirectGpuTensorEngine;
+    internal static bool IsCpuOnly(IEngine? engine) => engine.Is<CpuEngine>() && !engine.Is<DirectGpuTensorEngine>();
 
     /// <summary>
     /// The fused node: ReLU(BN(x) [+ residual]) into <paramref name="output"/>, refreshing the BatchNorm's saved mean and
@@ -166,7 +166,7 @@ internal static class BatchNormFusionMatch
                 Tensor<float> fusedOutput, freshMean, freshVar;
                 Tensor<float>? kernelOutput = null, kernelMean = null, kernelVar = null;
                 // CPU: BatchNorm and ReLU written straight into the plan's output, the BatchNorm output never stored.
-                if (!capAtSix && residual is null && eng is CpuEngine cpu && !eng.SupportsGpu
+                if (!capAtSix && residual is null && eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu
                     && cpu.TryBatchNormReluTrainingInto(x, gamma, beta, epsilon, result, mean, variance))
                 {
                     forwardUsedKernel[0] = false;
@@ -174,7 +174,7 @@ internal static class BatchNormFusionMatch
                         source.AsSpan().CopyTo(statisticOutput.AsWritableSpan());
                     return;
                 }
-                if (!capAtSix && eng is DirectGpuTensorEngine gpu)
+                if (!capAtSix && eng.TryGet<DirectGpuTensorEngine>(out var gpu))
                     kernelOutput = gpu.TryBatchNormReluForward(x, gamma, beta, epsilon, out kernelMean, out kernelVar, residual);
                 forwardUsedKernel[0] = kernelOutput is not null && kernelMean is not null && kernelVar is not null;
                 if (kernelOutput is not null && kernelMean is not null && kernelVar is not null)
@@ -195,7 +195,7 @@ internal static class BatchNormFusionMatch
                     // The activation runs in place on the normalized values where the device can: a compiled step keeps one
                     // buffer per output an action allocates, so a second output would hold the BatchNorm values all step
                     // (DenseNet-121's first two blocks, past the register kernel's channel size: 0.8 GB).
-                    if (eng is DirectGpuTensorEngine device
+                    if (eng.TryGet<DirectGpuTensorEngine>(out var device)
                         && (capAtSix ? device.TryReLU6InPlace(normalized) : device.TryReLUInPlace(normalized)))
                     {
                         fusedOutput = normalized;

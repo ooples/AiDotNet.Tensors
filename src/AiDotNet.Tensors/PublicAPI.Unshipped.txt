@@ -294,3 +294,11 @@ AiDotNet.Tensors.Engines.Export.EngineValueKind.Void = 0 -> AiDotNet.Tensors.Eng
 AiDotNet.Tensors.Engines.Export.ProgramPackage.Save(System.IO.Stream! stream, bool includeParameterValues) -> void
 AiDotNet.Tensors.Engines.Export.TensorProgram.BindParameters<T>(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! parameters) -> void
 AiDotNet.Tensors.Engines.Export.TensorProgram.ParametersBound.get -> bool
+AiDotNet.Tensors.Engines.EngineWrapperExtensions
+AiDotNet.Tensors.Engines.IEngineWrapper
+AiDotNet.Tensors.Engines.IEngineWrapper.Inner.get -> AiDotNet.Tensors.Engines.IEngine!
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.As<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine) -> TEngine?
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Cast<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine) -> TEngine?
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Is<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine) -> bool
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.TryGet<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine, out TEngine? result) -> bool
+static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Unwrap(this AiDotNet.Tensors.Engines.IEngine? engine) -> AiDotNet.Tensors.Engines.IEngine?

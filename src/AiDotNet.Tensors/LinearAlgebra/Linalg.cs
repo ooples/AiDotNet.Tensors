@@ -52,7 +52,7 @@ public static partial class Linalg
         // GPU fast-path. Established backends cover the upper-triangle mode;
         // the exact direct-PTX 4x4 specialization also has a distinct
         // lower-authoritative entry point. Unsupported contracts fall back.
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (gW, gV) = gpu.TryGpuEigh((Tensor<float>)(object)input, upper);
             if (gW is not null && gV is not null)
@@ -88,7 +88,7 @@ public static partial class Linalg
         // have identical physical extents. R-only reuses the direct factor and
         // suppresses Q at the public boundary.
         if ((mode == "reduced" || mode == "complete" || mode == "r") &&
-            typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+            typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (gQ, gR) = gpu.TryGpuQrReduced((Tensor<float>)(object)input);
             if (gQ is not null && gR is not null)
@@ -118,7 +118,7 @@ public static partial class Linalg
         // Managed CPU reference is the fallback for unsupported types/sizes.
         Tensor<T> factor;
         Tensor<int> info;
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (gFactor, gInfo) = gpu.TryGpuCholesky((Tensor<float>)(object)input, upper);
             if (gFactor is not null && gInfo is not null)
@@ -155,7 +155,7 @@ public static partial class Linalg
     public static (Tensor<T> LU, Tensor<int> Pivots) LuFactor<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (gLu, gPivots) = gpu.TryGpuLuFactor((Tensor<float>)(object)input);
             if (gLu is not null && gPivots is not null)
@@ -168,7 +168,7 @@ public static partial class Linalg
     public static Tensor<T> LuSolve<T>(Tensor<T> lu, Tensor<int> pivots, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             Tensor<float>? result = gpu.TryGpuLuSolve(
                 (Tensor<float>)(object)lu, pivots, (Tensor<float>)(object)b);
@@ -181,7 +181,7 @@ public static partial class Linalg
     public static (Tensor<T> LD, Tensor<int> Pivots) LdlFactor<T>(Tensor<T> input, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (ld, pivots) = gpu.TryGpuLdlFactor((Tensor<float>)(object)input, upper);
             if (ld is not null && pivots is not null) return ((Tensor<T>)(object)ld, pivots);
@@ -193,7 +193,7 @@ public static partial class Linalg
     public static Tensor<T> LdlSolve<T>(Tensor<T> ld, Tensor<int> pivots, Tensor<T> b, bool upper = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             Tensor<float>? result = gpu.TryGpuLdlSolve(
                 (Tensor<float>)(object)ld, pivots, (Tensor<float>)(object)b, upper);
@@ -206,7 +206,7 @@ public static partial class Linalg
     public static (Tensor<T> U, Tensor<T> S, Tensor<T> Vh) Svd<T>(Tensor<T> input, bool fullMatrices = true)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (u, s, vh) = gpu.TryGpuSvdReduced((Tensor<float>)(object)input, fullMatrices);
             if (u is not null && s is not null && vh is not null)
@@ -219,7 +219,7 @@ public static partial class Linalg
     public static Tensor<T> SvdVals<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (_, singularValues, _) = gpu.TryGpuSvdReduced((Tensor<float>)(object)input, fullMatrices: false);
             if (singularValues is not null) return (Tensor<T>)(object)singularValues;
@@ -237,7 +237,7 @@ public static partial class Linalg
     {
         if (rank < 1) throw new ArgumentException("rank must be positive.", nameof(rank));
         _ = q; // The established implementation also reserves q for future randomized iteration.
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (fullU, fullS, fullVh) = gpu.TryGpuSvdReduced(
                 (Tensor<float>)(object)input, fullMatrices: false);
@@ -292,7 +292,7 @@ public static partial class Linalg
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         Tensor<T> result;
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (direct, _) = gpu.TryGpuSolveVector(
                 (Tensor<float>)(object)a, (Tensor<float>)(object)b);
@@ -307,7 +307,7 @@ public static partial class Linalg
     public static (Tensor<T> Solution, Tensor<int> Info) SolveEx<T>(Tensor<T> a, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (solution, info) = gpu.TryGpuSolveVector(
                 (Tensor<float>)(object)a, (Tensor<float>)(object)b);
@@ -320,7 +320,7 @@ public static partial class Linalg
     public static Tensor<T> SolveTriangular<T>(Tensor<T> a, Tensor<T> b, bool upper, bool unitDiagonal = false)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             Tensor<float>? solution = gpu.TryGpuTriangularSolveVector(
                 (Tensor<float>)(object)a, (Tensor<float>)(object)b, upper, unitDiagonal);
@@ -336,7 +336,7 @@ public static partial class Linalg
     {
         if (driver != "gels" && driver != "gelsy" && driver != "gelsd" && driver != "gelss")
             throw new ArgumentException($"Unknown Lstsq driver '{driver}'.", nameof(driver));
-        if (typeof(T) == typeof(float) && AiDotNetEngine.Current is DirectGpuTensorEngine gpu)
+        if (typeof(T) == typeof(float) && AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             var (solution, info) = gpu.TryGpuSolveVector(
                 (Tensor<float>)(object)a, (Tensor<float>)(object)b);

@@ -100,7 +100,7 @@ public partial class DirectGpuTensorEngine
             lastStepOnly ? new[] { b, h } : new[] { b, t, h },
             (eng, output) =>
             {
-                var gpu = (DirectGpuTensorEngine)eng;
+                var gpu = eng.Cast<DirectGpuTensorEngine>();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 // Resolved when the node runs, with the backend live; keyed by this recorded node (stable across
                 // steps), so two calls of one GRU in a step (a siamese encoder, a weight-tied decoder) keep separate
@@ -150,7 +150,7 @@ public partial class DirectGpuTensorEngine
             throw new InvalidOperationException(
                 "The fused GPU GRU node ran its forward again before its backward, so its activation buffers hold the "
                 + "later call's state and these gradients would come from it.");
-        var gpu = (DirectGpuTensorEngine)engine;
+        var gpu = engine.Cast<DirectGpuTensorEngine>();
         var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var (x, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, node.Present);
 

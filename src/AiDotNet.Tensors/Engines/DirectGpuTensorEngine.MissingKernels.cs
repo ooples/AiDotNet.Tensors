@@ -1273,7 +1273,7 @@ public partial class DirectGpuTensorEngine
             {
                 int n = (int)savedState[0];
                 int nf = (int)savedState[1];
-                if (engine is DirectGpuTensorEngine gpu)
+                if (engine.TryGet<DirectGpuTensorEngine>(out var gpu))
                 {
                     var gpuGrad = gpu.RfftAdjointGpu(gradOutput, n, nf, inputs[0]._shape);
                     if (gpuGrad is not null)
@@ -1377,7 +1377,7 @@ public partial class DirectGpuTensorEngine
                 int nf = (int)savedState[0];
                 int n = (int)savedState[1];
                 int outLen = (int)savedState[2];
-                if (engine is DirectGpuTensorEngine gpu)
+                if (engine.TryGet<DirectGpuTensorEngine>(out var gpu))
                 {
                     var gpuGrad = gpu.IrfftAdjointGpu(gradOutput, nf, n, outLen, inputs[0]._shape);
                     if (gpuGrad is not null)
@@ -8594,7 +8594,7 @@ public partial class DirectGpuTensorEngine
         int idxBIh = meta[5], idxBHh = meta[6], idxH0 = meta[7], idxC0 = meta[8];
         int G = 4 * Hd;
 
-        if (engine is not DirectGpuTensorEngine gpu || !gpu.TryGetBackend(out var backend))
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu) || !gpu.TryGetBackend(out var backend))
             throw new InvalidOperationException("GPU LSTM backward requires the DirectGpu backend.");
 
         static Tensor<float> Dense(Tensor<float> t) => t.IsContiguous ? t : (Tensor<float>)t.Contiguous();

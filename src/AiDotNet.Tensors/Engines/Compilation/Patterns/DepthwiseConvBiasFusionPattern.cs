@@ -33,7 +33,7 @@ internal sealed class DepthwiseConvBiasFusionPattern : IFusionPattern
     {
         fused = null;
         if (nodes[index] is not LazyNode<float> conv || conv.OpType != LazyNodeType.DepthwiseConv2D
-            || conv.OpName != "DepthwiseConv2D" || conv.RecordingEngine is not DirectGpuTensorEngine
+            || conv.OpName != "DepthwiseConv2D" || !conv.RecordingEngine.Is<DirectGpuTensorEngine>()
             || conv.SavedState is not { Length: 2 } saved || saved[0] is not int[] stride || saved[1] is not int[] padding
             || stride.Length != 2 || padding.Length != 2 || conv.Input1 is not { } kernel
             || !PatternHelpers.FanOutAtMostOne(conv, consumerCounts))
@@ -49,7 +49,7 @@ internal sealed class DepthwiseConvBiasFusionPattern : IFusionPattern
             {
                 var computed = eng.DepthwiseConv2D(x, kernel, stride, padding);
                 DirectGpuTensorEngine.CopyResultInto(eng, computed, result);
-                if (eng is DirectGpuTensorEngine device && device.TryChannelBiasAddInPlace(result, bias)) return;
+                if (eng.TryGet<DirectGpuTensorEngine>(out var device) && device.TryChannelBiasAddInPlace(result, bias)) return;
                 var biased = eng.TensorChannelBiasAdd(result, bias);
                 DirectGpuTensorEngine.CopyResultInto(eng, biased, result);
             },

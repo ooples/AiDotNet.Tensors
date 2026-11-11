@@ -243,15 +243,15 @@ public sealed class GradientTape<T> : IDisposable
             // had left AiDotNetEngine.Current as a CpuEngine ("dA was computed on the host"). Prefer the tape's own
             // default when it drives that backend (several engines can share one); otherwise the registry's newest
             // live owner. Never a disposed engine.
-            var engine = _defaultEngine is DirectGpuTensorEngine own && !own.IsDisposed
+            var engine = _defaultEngine.TryGet<DirectGpuTensorEngine>(out var own) && !own.IsDisposed
                          && ReferenceEquals(own.QueryBackend, _dataBackend)
                 ? own
                 : DirectGpuTensorEngine.EngineOwning(_dataBackend);
             if (engine is not null) _engine = engine;
-            else if (_engine is DirectGpuTensorEngine { IsDisposed: true }) _engine = CpuFallbackEngine;
+            else if (_engine.As<DirectGpuTensorEngine>() is { IsDisposed: true }) _engine = CpuFallbackEngine;
             return;
         }
-        if (_engine is DirectGpuTensorEngine) _engine = CpuFallbackEngine;
+        if (_engine.Is<DirectGpuTensorEngine>()) _engine = CpuFallbackEngine;
     }
 
     /// <summary>
@@ -360,7 +360,7 @@ public sealed class GradientTape<T> : IDisposable
         // this forward+backward) is released deterministically — see _snapshotEngine.
         // Captured from the construction-time engine; only used at Dispose if the tape
         // still bound to that same instance (guards the rare CPU<->GPU rebind, #350).
-        if (_parent is null && _engine is Engines.DirectGpuTensorEngine snapEngine)
+        if (_parent is null && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var snapEngine))
         {
             _snapshotEngine = snapEngine;
             _activationSnapshot = snapEngine.ActivationCacheTimestampSnapshot();
@@ -1625,7 +1625,7 @@ public sealed class GradientTape<T> : IDisposable
             // The gradients the filter dropped reach no caller: return their device buffers to the pool now (the
             // loss's seed included, which is made fresh each backward). Not under create-graph, where they are part
             // of the higher-order graph.
-            if (!createGraph && _engine is DirectGpuTensorEngine)
+            if (!createGraph && _engine.Is<DirectGpuTensorEngine>())
             {
                 var dropped = new List<Tensor<T>>();
                 foreach (var pair in grads)
@@ -1921,7 +1921,7 @@ public sealed class GradientTape<T> : IDisposable
     private void ReleaseDroppedGradients(List<Tensor<T>> dropped, HashSet<object> forwardStorage,
         Dictionary<Tensor<T>, Tensor<T>> result, Tensor<T> loss)
     {
-                if (dropped.Count == 0 || _engine is not DirectGpuTensorEngine gpu) return;
+                if (dropped.Count == 0 || !_engine.TryGet<DirectGpuTensorEngine>(out var gpu)) return;
         var kept = forwardStorage;
         kept.Add(loss.DataVector);
         foreach (var gradient in result.Values)
@@ -2320,7 +2320,7 @@ public sealed class GradientTape<T> : IDisposable
 
                 // Gradients this cleanup drops belong to no caller: once backward is done they are dead, and their device
                 // buffers go back to the pool now rather than when the GC finds them (see ReleaseDroppedGradients).
-                List<Tensor<T>>? droppedGrads = _engine is DirectGpuTensorEngine && !DifferentiableOps._isBackwardCreateGraph
+                List<Tensor<T>>? droppedGrads = _engine.Is<DirectGpuTensorEngine>() && !DifferentiableOps._isBackwardCreateGraph
                     ? (droppedByChain ??= new List<Tensor<T>>()) : null;
                 if (droppedGrads is not null) forwardStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
                 void DropGrad(Tensor<T> t)
@@ -2549,7 +2549,7 @@ public sealed class GradientTape<T> : IDisposable
                 BackwardScratch<T>.ClearStepsRange(stepCount);
             }
 
-            if (droppedByChain is { Count: > 0 } && _engine is DirectGpuTensorEngine)
+            if (droppedByChain is { Count: > 0 } && _engine.Is<DirectGpuTensorEngine>())
             {
                 var keptForward = ForwardStorageOfEntries();
                 if (forwardStorage is not null) keptForward.UnionWith(forwardStorage);
@@ -2610,7 +2610,7 @@ public sealed class GradientTape<T> : IDisposable
         // As in the graph walk: the gradients the replay did not return, and those dropped below, go back to the pool
         // once they are proven unshared. Always take the replay's slot, so a CPU run leaves nothing behind in it.
         var fromReplay = DroppedGradients<T>.Take();
-        List<Tensor<T>>? replayDropped = _engine is DirectGpuTensorEngine ? (fromReplay ?? new List<Tensor<T>>()) : null;
+        List<Tensor<T>>? replayDropped = _engine.Is<DirectGpuTensorEngine>() ? (fromReplay ?? new List<Tensor<T>>()) : null;
 
         for (int i = 0; i < _entries.Count; i++)
         {

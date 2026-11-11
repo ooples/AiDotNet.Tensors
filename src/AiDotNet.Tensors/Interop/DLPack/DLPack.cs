@@ -64,7 +64,7 @@ public static class DLPack
     /// <param name="deviceId">The ROCm device ordinal.</param>
     /// <exception cref="NotSupportedException">No HIP backend is active for that device.</exception>
     public static IntPtr GetRocmConsumerStream(int deviceId = 0)
-        => GetDeviceBackend(AiDotNetEngine.Current as DirectGpuTensorEngine, DLPackNative.DeviceRocm, deviceId).Device.WorkStreamHandle;
+        => GetDeviceBackend(AiDotNetEngine.Current.As<DirectGpuTensorEngine>(), DLPackNative.DeviceRocm, deviceId).Device.WorkStreamHandle;
 
     // ── Exports ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -415,7 +415,7 @@ public static class DLPack
                 $"{api} DLPack import of a read-only tensor is not supported: GPU-resident tensors have no read-only mode.");
 
         // Leased: the import wraps the memory on the dispatcher's backend, so a concurrent Dispose waits for it.
-        var dispatcher = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        var dispatcher = AiDotNetEngine.Current.As<DirectGpuTensorEngine>();
         using var __gpuOp = dispatcher?.EnterGpuOp() ?? default;
         var (backend, device) = GetDeviceBackend(dispatcher, dl.Device.DeviceType, dl.Device.DeviceId);
         if (count == 0)
@@ -446,7 +446,7 @@ public static class DLPack
     /// <summary>The GPU backend tensors are placed on, as <see cref="Tensor{T}.Gpu"/> chooses it, when it exchanges
     /// CUDA device memory for <paramref name="deviceId"/>.</summary>
     internal static (IDirectGpuBackend Backend, IDLPackDeviceBackend Device) GetCudaBackend(int deviceId)
-        => GetDeviceBackend(AiDotNetEngine.Current as DirectGpuTensorEngine, DLPackNative.DeviceCuda, deviceId);
+        => GetDeviceBackend(AiDotNetEngine.Current.As<DirectGpuTensorEngine>(), DLPackNative.DeviceCuda, deviceId);
 
     // The backend for DLPack device type deviceType (kDLCUDA or kDLROCM) on deviceId, for the dispatcher the caller
     // already read (and leased).

@@ -163,7 +163,7 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
                         allowCachedB: false);
                     output.IncrementVersion();
                 }
-                else if (eng is DirectGpuTensorEngine gpu)
+                else if (eng.TryGet<DirectGpuTensorEngine>(out var gpu))
                 {
                     gpu.FusedSparseLinearInto(
                         output, capturedInput, csr.RowOffsets, csr.ColIndices, csr.Values, capturedBias, capturedActivation);

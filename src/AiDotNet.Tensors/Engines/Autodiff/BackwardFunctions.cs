@@ -54,7 +54,7 @@ internal static class BackwardFunctions<T>
     internal static BackwardFunction<T> MaxPool2DRecomputeOnDeviceOr(int[] poolSize, int[] stride, BackwardFunction<T> fallback) =>
         (gradOutput, inputs, output, savedState, engine, grads) =>
         {
-            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
+            if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
             {
                 var into = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add);
                 if (gpu.TryMaxPool2DBackwardRecomputeResident(gradOutput, inputs[0], poolSize, stride, add ? null : into,
@@ -580,7 +580,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // In a resident step a first contribution is written straight into the input's gradient accumulator.
-        if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
             && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add) is { } into && !add
             && gpu.TryReluBackwardInto(gradOutput, inputs[0], into))
         {
@@ -688,7 +688,7 @@ internal static class BackwardFunctions<T>
         // (GetFlat on a resident tensor) and re-uploads the derivative for the multiply. All engine kernels now use
         // this function's convention (the alpha branch at exactly x == 0, as PyTorch does). The device kernel
         // is float-only, so every other element type keeps the dtype-generic host path below.
-        if (typeof(T) == typeof(float) && engine is DirectGpuTensorEngine)
+        if (typeof(T) == typeof(float) && engine.Is<DirectGpuTensorEngine>())
         {
             var deviceGrad = engine.EluBackward(gradOutput, inputs[0], output, (double)savedState[0]);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -1085,7 +1085,7 @@ internal static class BackwardFunctions<T>
             // #1804). Only when nothing records these ops (no outer tape, not tracing a graph): the helper writes
             // its outputs directly and does not record a backward of its own.
             if (needsInputGradient && needsWeightGradient
-                && engine is DirectGpuTensorEngine gpuBackward
+                && engine.TryGet<DirectGpuTensorEngine>(out var gpuBackward)
                 && !DifferentiableOps.IsRecording<T>()
                 && !Compilation.GraphMode.IsActive)
             {
@@ -1441,7 +1441,7 @@ internal static class BackwardFunctions<T>
         // safe. CPU-only; the GPU engine keeps the allocating path. DirectGpuTensorEngine derives from
         // CpuEngine, so the type test alone sent GPU training down the host path: the kernel gradient came
         // back as a host tensor and the parameter update had to leave the device (#1058).
-        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        if (engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu)
         {
             if (needsInputGradient)
             {
@@ -1548,7 +1548,7 @@ internal static class BackwardFunctions<T>
     {
         bool relu = (bool)savedState[3];
         Tensor<T> gradPreActivation;
-        if (typeof(T) == typeof(float) && engine is CpuEngine cpu && !engine.SupportsGpu
+        if (typeof(T) == typeof(float) && engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu
             && gradOutput.IsContiguous && output.IsContiguous)
         {
             gradPreActivation = Helpers.AutoTensorCache.RentOrAllocate<T>(output._shape);
@@ -1727,7 +1727,7 @@ internal static class BackwardFunctions<T>
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
         Tensor<T> grad;
-        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        if (engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu)
         {
             grad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             cpu.MaxPool2DBackwardRecomputeInto(grad, gradOutput, inputs[0], poolSize[0], poolSize[1], stride[0], stride[1], accumulate: false);
@@ -1758,7 +1758,7 @@ internal static class BackwardFunctions<T>
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
         int padding = (int)savedState[2];
-        var cpu = engine as CpuEngine ?? new CpuEngine();
+        var cpu = engine.As<CpuEngine>() ?? new CpuEngine();
         Tensor<int> maxIndices;
         using (new NoGradScope<T>())
             cpu.MaxPool2DPaddedWithTensorIndices(inputs[0], poolSize[0], stride[0], padding, out maxIndices);
@@ -1824,7 +1824,7 @@ internal static class BackwardFunctions<T>
     // the only forward whose ReLU mask the backward kernel can rebuild bit for bit from the input.
     // The second gradient contribution a compiled GPU step parked for this output (GradientDeferral), or null.
     private static Tensor<T>? TakeParkedGradient(IEngine engine, Tensor<T> output)
-        => engine is DirectGpuTensorEngine { DeferredGradients: { } deferral } ? deferral.Take(output) : null;
+        => engine.As<DirectGpuTensorEngine>()?.DeferredGradients is { } deferral ? deferral.Take(output) : null;
 
     // The fallback of a backward that could not sum the parked contribution in its kernel: gradOutput + parked, as the
     // accumulation would have added it.
@@ -1846,7 +1846,7 @@ internal static class BackwardFunctions<T>
         var epsilon = (double)savedState[2];
         Tensor<T> gradInput, gradGamma, gradBeta;
         var parked = TakeParkedGradient(engine, output);
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon,
                 out var fusedGamma, out var fusedBeta, MaskFromInput(savedState) ? inputs[2] : null, parked) is { } fusedInput)
         {
@@ -1904,7 +1904,7 @@ internal static class BackwardFunctions<T>
         var epsilon = (double)savedState[2];
         Tensor<T> gradInput, gradGamma, gradBeta, gradResidual;
         var parked = TakeParkedGradient(engine, output);
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon, true,
                 out var fusedGamma, out var fusedBeta, out var fusedResidual, gradOutput2: parked) is { } fusedInput)
         {
@@ -1945,7 +1945,7 @@ internal static class BackwardFunctions<T>
         // a GPU engine into the CPU fused backward (host<->device ping-pong, the worst outcome).
         // Only take the CPU fused kernel for a genuine CPU engine; GPU engines use the
         // engine-generic primitive fallback below, which dispatches each op to the GPU backend.
-        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        if (engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu)
         {
             gradInput = cpu.BatchNormAffineBackward(
                 gradOutput, inputs[0], inputs[1], mean, variance, epsilon, out gradGamma, out gradBeta);
@@ -1999,7 +1999,7 @@ internal static class BackwardFunctions<T>
 
         // In a resident step the three gradients land in their accumulators directly (the input's added in the same
         // pass when it is not its first contribution, where the backend can).
-        if (engine is DirectGpuTensorEngine gpuNorm
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpuNorm)
             && !DifferentiableOps.IsRecording<T>()
             && !Compilation.GraphMode.IsActive)
         {
@@ -2221,7 +2221,7 @@ internal static class BackwardFunctions<T>
 
         // PR #638 A1: resident embedding backward — scatter-add into a resident [vocab,dim] table-grad via the
         // forward's stable on-device index buffer, skipping the capturedFloatIdx.GetDataArray() download (CUDA-900).
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deEmb && deEmb.ResidentStepActive)
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deEmb) && deEmb.ResidentStepActive)
         {
             var residentTableGrad = deEmb.TryEmbeddingBackwardResident<T>(
                 gradOutput, capturedFloatIdx.Length, vocabSize, embeddingDim, inputs[0]._shape);
@@ -2235,7 +2235,7 @@ internal static class BackwardFunctions<T>
         // Dense device scatter when no sparse-gradient consumer is wired for this parameter: reads the ids on the
         // device, so neither the ids nor the upstream gradient is downloaded, and the [V, E] result stays resident
         // for accumulation with the other uses of a tied table.
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deFloat
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deFloat)
             && !DifferentiableOps.IsSparseEmbeddingGradWired(inputs[0])
             && deFloat.TryEmbeddingBackwardFromFloatIds(gradOutput, capturedFloatIdx, vocabSize, embeddingDim) is { } deviceTableGrad)
         {
@@ -2326,7 +2326,7 @@ internal static class BackwardFunctions<T>
             return;
         }
 
-        var cpu = engine as CpuEngine ?? new CpuEngine();
+        var cpu = engine.As<CpuEngine>() ?? new CpuEngine();
         var gradValues = cpu.ScatterClassValuesGrad(gradOutput, classIndices, values._shape);
         DifferentiableOps.AccumulateGrad(grads, values, gradValues, engine);
     }
@@ -2546,7 +2546,7 @@ internal static class BackwardFunctions<T>
 
         Tensor<T> gradInput;
         Tensor<T> gradFlow;
-        if (engine is CpuEngine optimized)
+        if (engine.TryGet<CpuEngine>(out var optimized))
         {
             // The normalization field depends only on flow and is identical for both adjoints.
             // Compute it once instead of launching the full splat-weight pass twice.
@@ -2770,7 +2770,7 @@ internal static class BackwardFunctions<T>
         // as the tiling below treats it.
         var reducedAxes = axes.Length == 0 ? Enumerable.Range(0, inputShape.Length).ToArray() : axes;
         if (TryReducedGradientInto(gradOutput, inputs[0], reducedAxes, mean: false, engine, grads)) return;
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryBroadcastReducedGradient(gradOutput, inputShape, reducedAxes, 1f) is { } onDevice)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryBroadcastReducedGradient(gradOutput, inputShape, reducedAxes, 1f) is { } onDevice)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], onDevice, engine);
             return;
@@ -2801,7 +2801,7 @@ internal static class BackwardFunctions<T>
     private static bool TryReducedGradientInto(Tensor<T> gradOutput, Tensor<T> input, int[] axes, bool mean,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is not DirectGpuTensorEngine gpu || DifferentiableOps.IsRecording<T>() || Compilation.GraphMode.IsActive
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu) || DifferentiableOps.IsRecording<T>() || Compilation.GraphMode.IsActive
             || DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add) is not { } into || add)
             return false;
         float scale = 1f;
@@ -2847,7 +2847,7 @@ internal static class BackwardFunctions<T>
             return;
         }
 
-        if (engine is DirectGpuTensorEngine gpu && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
@@ -3046,7 +3046,7 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
         var gradSource = engine.TensorTakeAlongDim(gradOutput, indices, axis);
         // A GPU engine finds the overwritten writes on the device; the host scan is for host engines.
-        var lastWrites = engine is DirectGpuTensorEngine gpu
+        var lastWrites = engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             ? gpu.TryScatterLastWriteMask<T>(indices, axis, output._shape) ?? ScatterLastWriteMask(indices, axis)
             : ScatterLastWriteMask(indices, axis);
         if (lastWrites is not null)
@@ -3313,7 +3313,7 @@ internal static class BackwardFunctions<T>
             start[axis] = offset;
             length[axis] = size;
             // In a resident step a first contribution is gathered straight into the input's gradient accumulator.
-            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+            if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
                 && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[i], engine, out bool add) is { } into && !add
                 && gpu.TryRectSliceInto(gradOutput, start, length, into))
             {
@@ -3350,7 +3350,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // On the GPU engine build gradOutput/n on the device: gradOutput[0] below is a blocking readback.
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryScaleByDeviceScalar<T>(null, inputs[0]._shape, gradOutput, 1f / inputs[0].Length) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -3426,7 +3426,7 @@ internal static class BackwardFunctions<T>
         int batch = inShape[0], channels = inShape[1], inH = inShape[2], inW = inShape[3];
         int outH = (int)savedState[0], outW = (int)savedState[1];
 
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryAdaptiveAvgPool2DBackwardOnDevice(gradOutput, inShape, outH, outW) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -3549,7 +3549,7 @@ internal static class BackwardFunctions<T>
 
         // On the GPU engine keep the gradient on the device: the host slab copy below reads gradOutput through a
         // span (a download of a resident gradient) and returns a host tensor, per narrow, per backward.
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryNarrowBackwardOnDevice(gradOutput, inShape, dim, start, length) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -3592,7 +3592,7 @@ internal static class BackwardFunctions<T>
         var targets = inputs[1];
         var diff = engine.TensorSubtract(predictions, targets);
         // On the GPU engine scale by the upstream gradient on the device: gradOutput[0] is a blocking readback.
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, predictions, deviceGrad, engine);
@@ -3618,7 +3618,7 @@ internal static class BackwardFunctions<T>
         bool needPredictions = DifferentiableOps.IsGradientRequired(predictions);
         bool needTargets = DifferentiableOps.IsGradientRequired(targets);
         if (!needPredictions && !needTargets) return;
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryFusedMseLossBackward(gradOutput, predictions, targets, needTargets, out var deviceTargetGrad) is { } devicePredGrad)
         {
             if (needPredictions) DifferentiableOps.AccumulateGrad(grads, predictions, devicePredGrad, engine);
@@ -3628,7 +3628,7 @@ internal static class BackwardFunctions<T>
 
         var diff = engine.TensorSubtract(predictions, targets);
         Tensor<T> predGrad;
-        if (engine is DirectGpuTensorEngine scaleGpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var scaleGpu)
             && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
         {
             predGrad = deviceScaled;
@@ -3662,7 +3662,7 @@ internal static class BackwardFunctions<T>
         bool needB = b is not null && DifferentiableOps.IsGradientRequired(b);
         bool needY = DifferentiableOps.IsGradientRequired(y);
         if (!needX && !needW && !needB && !needY) return;
-        if (!needY && engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>()
+        if (!needY && engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>()
             && gpu.TryFusedLinearMseLossBackward(gradOutput, x, w, b, y, out var gradX, out var gradW, out var gradB))
         {
             if (needX) DifferentiableOps.AccumulateGrad(grads, x, gradX!, engine);
@@ -3674,7 +3674,7 @@ internal static class BackwardFunctions<T>
         var predictions = engine.FusedLinear(x, w, b, FusedActivationType.None);
         var diff = engine.TensorSubtract(predictions, y);
         Tensor<T> predGrad;
-        if (engine is DirectGpuTensorEngine scaleGpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var scaleGpu)
             && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
         {
             predGrad = deviceScaled;
@@ -4908,7 +4908,7 @@ internal static class BackwardFunctions<T>
         // it is filled on the device: a host zero tensor had to be uploaded, and inside a captured training step that
         // upload aborted CUDA graph capture (the cross-entropy loss's supervised-row count goes through Sign). It is a
         // fill, not upstream * 0, which is NaN for an infinite or NaN upstream element where the gradient is 0.
-        var zero = engine is DirectGpuTensorEngine gpu && gpu.SupportsGpu
+        var zero = engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.SupportsGpu
             && gpu.TryResidentZeros<T>(inputs[0]._shape, out var resident)
             ? resident
             : TensorPool<T>.RentZeroed(inputs[0]._shape);
@@ -6659,7 +6659,7 @@ internal static class BackwardFunctions<T>
         var axis = (int)savedState[1];
 
         // Axis scatter with 1-D indices is index_copy, so the device helpers proven there apply unchanged.
-        if (engine is DirectGpuTensorEngine gpu && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
             && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, deviceIndices) is { } deviceInputGrad
             && gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, deviceIndices,
                 OverwrittenIndexPositions(indices)) is { } deviceValuesGrad
@@ -7005,7 +7005,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var inputShape = inputs[0]._shape;
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryDiagonalBackwardOnDevice(gradOutput, inputShape) is { } deviceGrad)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryDiagonalBackwardOnDevice(gradOutput, inputShape) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
@@ -7112,7 +7112,7 @@ internal static class BackwardFunctions<T>
 
         // Use CpuEngine.ApplyFusedActivationBackward which dispatches via ActivationRegistry
         // This is OCP-compliant: new activations register themselves, no switch needed here
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.ApplyFusedActivationBackward(gradOutput, preActivation, activation, activationParams);
 
         // Fallback for non-CPU engines
@@ -7304,7 +7304,7 @@ internal static class BackwardFunctions<T>
                 // cost two transpose kernels per linear layer per step -- 16 of a Transformer step's 24 -- and a layer
                 // whose input gradient nothing reads (the first one) computed and discarded that GEMM as well.
                 bool gpuDone = false;
-                if (engine is DirectGpuTensorEngine gpuLinear
+                if (engine.TryGet<DirectGpuTensorEngine>(out var gpuLinear)
                     && !DifferentiableOps.IsRecording<T>()
                     && !Compilation.GraphMode.IsActive)
                 {
@@ -7368,7 +7368,7 @@ internal static class BackwardFunctions<T>
                 {
                     // A bias of N elements (any rank) gets the column sums of [rowsG, N]; in a resident step they are
                     // summed straight into its accumulator.
-                    if (engine is DirectGpuTensorEngine gpuBias
+                    if (engine.TryGet<DirectGpuTensorEngine>(out var gpuBias)
                         && inputs[2].Length == N
                         && !DifferentiableOps.IsRecording<T>()
                         && !Compilation.GraphMode.IsActive
@@ -7437,7 +7437,7 @@ internal static class BackwardFunctions<T>
         IEngine engine,
         Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is not DirectGpuTensorEngine gpu
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             || DifferentiableOps.IsRecording<T>()
             || Compilation.GraphMode.IsActive
             || inputs.Length != 2)
@@ -7688,7 +7688,7 @@ internal static class BackwardFunctions<T>
         int repeats = (int)savedState[0];
         int dim = (int)savedState[1];
         var input = inputs[0];
-        if (engine is DirectGpuTensorEngine)
+        if (engine.Is<DirectGpuTensorEngine>())
         {
             // Output element [o, i * repeats + r, n] came from input [o, i, n]: viewed as [outer, axis, repeats, inner]
             // the gradient is a sum over the repeats axis, a device reduction instead of a host walk of gradOutput.
@@ -7893,7 +7893,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var min = (T)savedState[0];
-        if (min is float minBound && engine is DirectGpuTensorEngine gpu
+        if (min is float minBound && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], minBound, lowerBound: true) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -7913,7 +7913,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var max = (T)savedState[0];
-        if (max is float maxBound && engine is DirectGpuTensorEngine gpu
+        if (max is float maxBound && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], maxBound, lowerBound: false) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -8554,7 +8554,7 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceInputGrad)
         {
             if (inputs.Length < 2)
@@ -8648,7 +8648,7 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
@@ -8745,7 +8745,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var mask = (Tensor<Bit>)savedState[0];
-        if (inputs.Length >= 2 && engine is DirectGpuTensorEngine gpu
+        if (inputs.Length >= 2 && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryMaskedScatterBackwardOnDevice(gradOutput, mask, inputs[1]._shape) is { } device)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], device.InputGrad, engine);
@@ -9478,7 +9478,7 @@ internal static class BackwardFunctions<T>
         var mode = (PadMode)savedState[1];
 
         var gradOutputShape = gradOutput._shape;
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryPadNdBackwardOnDevice(gradOutput, input._shape, pad, mode) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
@@ -10191,7 +10191,7 @@ internal static class BackwardFunctions<T>
         // Device adjoint when the backward runs on the GPU engine. A compiled plan records this function from the
         // CPU base (GraphMode), so without this every compiled GPU step ran the transform on the host: a download,
         // a managed FFT per row, an upload (measured: ~26% of an LM's compiled step).
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuRfft
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var gpuRfft)
             && gpuRfft.RfftAdjointGpu(gradOutput, n, nFft, input._shape) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
@@ -10270,7 +10270,7 @@ internal static class BackwardFunctions<T>
 
         // Device adjoint on the GPU engine (see RFFTAdjointBackward: the compiled plan records this CPU-path
         // function and replays it on the GPU engine).
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuIrfft
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var gpuIrfft)
             && gpuIrfft.IrfftAdjointGpu(gradOutput, numFreqs, nFft, outputLength, input._shape) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);

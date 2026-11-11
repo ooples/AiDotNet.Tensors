@@ -84,7 +84,7 @@ public static class Fft
         if (typeof(T) != typeof(float)) return false;
         if (nRequested.HasValue) return false; // GPU kernel doesn't zero-pad / crop
         if (norm != FftNorm.Backward) return false; // GPU kernel applies 1/n on inverse only
-        if (AiDotNetEngine.Current is not DirectGpuTensorEngine gpu) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpu)) return false;
 
         int last = input.Shape[input.Rank - 1];
         if (last % 2 != 0) return false;

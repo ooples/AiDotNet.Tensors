@@ -369,7 +369,7 @@ public partial class CpuEngine
         var ids = (int[])savedState[0];
         int vocab = (int)savedState[1];
 
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
                 gradOutput, hidden, weight, bias, ids, null, out var deviceHidden, out var deviceWeight, out var deviceBias))
         {
             DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
@@ -876,7 +876,7 @@ public partial class CpuEngine
         var bias = inputs[2];
         var target = inputs[3];
 
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
                 gradOutput, hidden, weight, bias, null, target, out var deviceHidden, out var deviceWeight, out var deviceBias))
         {
             DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
