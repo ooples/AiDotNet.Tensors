@@ -25,7 +25,11 @@ public class CompiledGpuRreluTests
             throw new SkipException("No GPU engine: " + ex.GetType().Name);
         }
 
-        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        if (!gpu.IsGpuAvailable)
+        {
+            gpu.Dispose();
+            Skip.If(true, "No GPU device.");
+        }
         return gpu;
     }
 
@@ -39,7 +43,7 @@ public class CompiledGpuRreluTests
     [InlineData(false)]
     public void Rrelu_OnTheGpuEngine_HasTheGradientOfTheSlopesItApplied(bool training)
     {
-        var gpu = Gpu();
+        using var gpu = Gpu();
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu;
         try
@@ -79,7 +83,7 @@ public class CompiledGpuRreluTests
     [SkippableFact]
     public void UnseededTrainingRrelu_CompilesOnTheGpuEngine_WithTheForwardsSlopesInTheBackward()
     {
-        var gpu = Gpu();
+        using var gpu = Gpu();
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu;
         try
@@ -132,7 +136,7 @@ public class CompiledGpuRreluTests
     [SkippableFact]
     public void UnseededTrainingRrelu_KeepsThePlanOutOfCudaGraphCapture()
     {
-        var gpu = Gpu();
+        using var gpu = Gpu();
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu;
         try

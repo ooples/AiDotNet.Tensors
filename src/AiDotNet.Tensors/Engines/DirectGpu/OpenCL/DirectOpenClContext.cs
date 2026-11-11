@@ -37,9 +37,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// (the driver's host budget exhausted by contexts nobody disposed: each holds its compiled programs, ~100 MB)
         /// names the code that leaked them.
         /// </summary>
-        private static readonly ConcurrentDictionary<DirectOpenClContext, string>? s_creationSites =
-            Environment.GetEnvironmentVariable("AIDOTNET_OPENCL_TRACE_CONTEXTS") == "1"
-                ? new ConcurrentDictionary<DirectOpenClContext, string>() : null;
+        private static readonly ConcurrentDictionary<DirectOpenClContext, string>? s_creationSites = CreateCreationSiteTrace();
+
+        // With tracing on, the contexts still alive when the process exits (never disposed) are also written to
+        // %TEMP%/aidotnet-opencl-live-contexts-<pid>.txt, so a leak is found even in a run where it caused no failure.
+        private static ConcurrentDictionary<DirectOpenClContext, string>? CreateCreationSiteTrace()
+        {
+            if (Environment.GetEnvironmentVariable("AIDOTNET_OPENCL_TRACE_CONTEXTS") != "1") return null;
+            var sites = new ConcurrentDictionary<DirectOpenClContext, string>();
+            AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            {
+                try
+                {
+                    var path = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                        $"aidotnet-opencl-live-contexts-{System.Diagnostics.Process.GetCurrentProcess().Id}.txt");
+                    System.IO.File.WriteAllText(path, LiveContextReport());
+                }
+                catch (System.IO.IOException) { }
+                catch (UnauthorizedAccessException) { }
+            };
+            return sites;
+        }
 
         /// <summary>Contexts this process created and has not yet disposed.</summary>
         internal static int LiveContextCount => Volatile.Read(ref s_liveContexts);

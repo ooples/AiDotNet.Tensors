@@ -369,12 +369,23 @@ public partial class DifferentiableOpsGradGradCheckSweep
                         var g2 = tape.ComputeGradients(h, sources, createGraph: true);
                         var k = Contract(g2, sources, w);
                         if (k is null) return 0;
+                        // A source whose first- or second-level gradient is missing leaves third null (see below).
+                        if (differentiate && sources.Any(s => !g1.ContainsKey(s) || !g2.ContainsKey(s))) return k[0];
                         if (differentiate) third = tape.ComputeGradients(k, sources, createGraph: true);
                         return k[0];
                     }
 
                     K(differentiate: true, out var analytic);
                     var bad = new List<string>();
+                    // Every source has a first-order gradient, and the squared output makes every second derivative
+                    // non-zero, so a missing first- or second-level gradient is a backward that dropped the graph, not
+                    // a zero: counting it as 0 against the differences of a K that is then identically 0 passed it
+                    // vacuously. Only the third level may legitimately be absent (zero).
+                    if (analytic is null)
+                    {
+                        failures.Add($"{label}: a create-graph backward returned no gradient at the first or second level");
+                        continue;
+                    }
                     for (int s = 0; s < sources.Length && bad.Count < 3; s++)
                     {
                         var src = sources[s];

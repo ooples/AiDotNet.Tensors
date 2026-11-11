@@ -17,7 +17,7 @@ public class HalfPrecisionBackendTests
     [Fact]
     public void CudaBackend_ImplementsHalfPrecisionInterface_WhenAvailable()
     {
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
         if (backend is null)
             return; // CPU-only host
@@ -38,7 +38,7 @@ public class HalfPrecisionBackendTests
     [Fact]
     public void Hgemm_NullArgs_Throw()
     {
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
         if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsHgemm)
             return;
@@ -52,7 +52,7 @@ public class HalfPrecisionBackendTests
     [Fact]
     public void Hgemm_NonPositiveDim_Throws()
     {
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
         if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsHgemm)
             return;
