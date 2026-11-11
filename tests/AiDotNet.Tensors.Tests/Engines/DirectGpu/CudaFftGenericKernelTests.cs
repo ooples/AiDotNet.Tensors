@@ -323,7 +323,7 @@ public class CudaFftGenericKernelTests
     public async Task NarrowStorageConversionMatchesIndependentHalfAndBFloat16Rounding(FftElementType type)
     {
         await Task.Yield();
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
         Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} storage conversion is unavailable.");
@@ -356,9 +356,10 @@ public class CudaFftGenericKernelTests
     private static float RoundBFloat16NearestEven(float value)
     {
         if (float.IsNaN(value)) return value;
-        uint bits = (uint)BitConverter.SingleToInt32Bits(value);
+        uint bits = System.Runtime.CompilerServices.Unsafe.As<float, uint>(ref value);
         bits += 0x7FFFu + ((bits >> 16) & 1u);
-        return BitConverter.Int32BitsToSingle(unchecked((int)(bits & 0xFFFF0000u)));
+        uint rounded = bits & 0xFFFF0000u;
+        return System.Runtime.CompilerServices.Unsafe.As<uint, float>(ref rounded);
     }
 
     [Fact]
@@ -453,7 +454,7 @@ public class CudaFftGenericKernelTests
         int n)
     {
         await Task.Yield();
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
         Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");
@@ -632,7 +633,7 @@ public class CudaFftGenericKernelTests
         int n)
     {
         await Task.Yield();
-        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver not available.");
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
         Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");

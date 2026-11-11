@@ -27898,7 +27898,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         bool allZeroBits = true;
                         for (int i = 0; i < destination.Length; i++)
                         {
-                            if (System.BitConverter.SingleToInt32Bits(hostDst[i]) != 0)
+                            if (System.Runtime.CompilerServices.Unsafe.As<float, int>(ref hostDst[i]) != 0)
                             {
                                 allZeroBits = false;
                                 break;
