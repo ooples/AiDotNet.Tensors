@@ -72,6 +72,11 @@ public class DifferentiableOpsGradCheckSweep
 
         // Iterative algorithms rather than single ops.
         ["GriffinLim"] = "iterative phase reconstruction, not a single op",
+
+        // Designed gradients that are not the forward's derivative (each is pinned against its formula in
+        // TorchModelOpsTests instead).
+        ["TensorSurrogateSpike"] = "surrogate gradient: a sigmoid derivative stands in for the step's zero derivative",
+        ["TensorFakeQuantize"] = "straight-through estimator: the forward is piecewise constant",
     };
 
     /// <summary>
@@ -114,6 +119,17 @@ public class DifferentiableOpsGradCheckSweep
         ["TensorAdaptiveMaxPool3D"] = r => [SafeTensor([1, 3, 4, 5], r), new[] { 2, 3, 2 }],
         ["TensorGridSample3D"] = r => [SafeTensor([1, 2, 3, 4, 3], r), SafeTensor([1, 2, 2, 2, 3], r), GridSampleMode.Bilinear, GridSamplePadding.Reflection, false],
         ["TensorMaxUnpool"] = r => [SafeTensor([2, 3], r), new Tensor<int>(new[] { 0, 2, 4, 1, 3, 0 }, new[] { 2, 3 }), new[] { 5 }],
+
+        // --- model-level ops (CpuEngine.TorchModelOps) ---
+        // CRF: batched emissions [batch, seqLen, numTags], transitions [numTags, numTags], start/end [numTags].
+        ["TensorCrfForward"] = r => [SafeTensor([2, 3, 3], r), SafeTensor([3, 3], r), SafeTensor([3], r), SafeTensor([3], r)],
+        // Top-2 of 6 distinct scores: a probe of 1e-6 cannot change the selection.
+        ["TensorTopKSoftmax"] = r => [SafeTensor([2, 6], r), 2],
+        ["TensorSinusoidalTimeEmbedding"] = r => [SafeTensor([3], r), 6],
+
+        // acosh is defined from 1: SafeTensor's [0.35, 0.95] gives NaN on both sides, which the old inline harness let
+        // through (NaN never compares greater than a tolerance) and the GradCheck criterion reports, as torch's does.
+        ["TensorAcosh"] = r => [Shifted(SafeTensor([6], r), 1.0)],
 
         // --- elementwise binaries needing matched shapes ---
         ["TensorAddMany"] = r => [new[] { SafeTensor([4], r), SafeTensor([4], r), SafeTensor([4], r) }],
@@ -461,6 +477,12 @@ public class DifferentiableOpsGradCheckSweep
         // from 1 (acos/atanh edges), all strictly positive so domain-restricted ops are valid.
         var t = new Tensor<double>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = 0.35 + rng.NextDouble() * 0.6;
+        return t;
+    }
+
+    private static Tensor<double> Shifted(Tensor<double> t, double offset)
+    {
+        for (int i = 0; i < t.Length; i++) t[i] += offset;
         return t;
     }
 
@@ -813,29 +835,23 @@ public class DifferentiableOpsGradCheckSweep
                     break;
                 }
 
-                // Central finite differences on a few elements.
-                const double eps = 1e-6;
-                var bad = new List<string>();
-                int probes = Math.Min(4, input.Length);
-                for (int k = 0; k < probes; k++)
-                {
-                    double orig = input[k];
-                    double lp, lm;
-                    try
+                // Central finite differences on a few elements of that input, through the library's public checker
+                // (GradCheck): the gradient of the plain sum, |analytical - numerical| <= 1e-4 + 1e-4·|numerical|.
+                // The op reads its tensors from args, which the checker perturbs in place.
+                var check = GradCheck.CheckMany<double>(_ => (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!, tensorInputs,
+                    new GradCheckOptions
                     {
-                        input[k] = orig + eps;
-                        lp = _engine.TensorSum((Tensor<double>)m.Invoke(_engine, CopyArgs(args))!);
-                        input[k] = orig - eps;
-                        lm = _engine.TensorSum((Tensor<double>)m.Invoke(_engine, CopyArgs(args))!);
-                    }
-                    finally { input[k] = orig; }
-
-                    double numerical = (lp - lm) / (2 * eps);
-                    double a = analytical[k];
-                    double denom = Math.Max(1.0, Math.Max(Math.Abs(a), Math.Abs(numerical)));
-                    if (Math.Abs(a - numerical) / denom > 1e-4)
-                        bad.Add($"[{k}] analytical {a:G6} vs numerical {numerical:G6}");
-                }
+                        Engine = _engine,
+                        Epsilon = 1e-6,
+                        AbsoluteTolerance = 1e-4,
+                        RelativeTolerance = 1e-4,
+                        RandomOutputGradient = false,
+                        InputsToCheck = new[] { Array.IndexOf(tensorInputs, input) },
+                        MaxElementsPerInput = 4,
+                    });
+                var bad = check.WorstMismatches
+                    .Select(x => $"[{x.ElementIndex}] analytical {x.Analytical:G6} vs numerical {x.Numerical:G6}")
+                    .ToList();
 
                 if (bad.Count > 0)
                     mismatches.Add($"{name} on {shape.Length}D: " + string.Join("; ", bad.Take(3)));

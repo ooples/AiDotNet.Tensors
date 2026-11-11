@@ -303,3 +303,107 @@ static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Is<TEngine>(this AiDotNe
 static AiDotNet.Tensors.Engines.EngineWrapperExtensions.TryGet<TEngine>(this AiDotNet.Tensors.Engines.IEngine? engine, out TEngine? result) -> bool
 static AiDotNet.Tensors.Engines.EngineWrapperExtensions.Unwrap(this AiDotNet.Tensors.Engines.IEngine? engine) -> AiDotNet.Tensors.Engines.IEngine?
 static AiDotNet.Tensors.Helpers.TensorPool.ForceFreshAllocationsScope(bool forceFresh) -> System.IDisposable!
+AiDotNet.Tensors.Engines.Autodiff.GradCheck
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.AbsoluteError.get -> double
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.Allowed.get -> double
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.Analytical.get -> double
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.ElementIndex.get -> int
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.InputIndex.get -> int
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.Numerical.get -> double
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.Order.get -> int
+AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.RelativeError.get -> double
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.AbsoluteTolerance.get -> double?
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.AbsoluteTolerance.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.CheckSecondOrder.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.CheckSecondOrder.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.Engine.get -> AiDotNet.Tensors.Engines.IEngine?
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.Engine.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.Epsilon.get -> double?
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.Epsilon.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.GradCheckOptions() -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.InputsToCheck.get -> System.Collections.Generic.IReadOnlyList<int>?
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.InputsToCheck.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.MaxElementsPerInput.get -> int?
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.MaxElementsPerInput.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.MaxReportedMismatches.get -> int
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.MaxReportedMismatches.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.RandomOutputGradient.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.RandomOutputGradient.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.RelativeTolerance.get -> double?
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.RelativeTolerance.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.Seed.get -> int
+AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions.Seed.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.ElementsChecked.get -> int
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.FailedElements.get -> int
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.InputsWithoutGradient.get -> System.Collections.Generic.IReadOnlyList<int>!
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.MaxAbsoluteError.get -> double
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.MaxRelativeError.get -> double
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.Passed.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.SecondOrderChecked.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.ThrowIfFailed() -> void
+AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.WorstMismatches.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch!>!
+AiDotNet.Tensors.Engines.IEngine.TensorBentIdentity<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorCrfForward<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! emissions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! transitions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? startScores = null, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? endScores = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorFakeQuantize<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, int numBits = 8, double? scale = null, int? zeroPoint = null, bool symmetric = true) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorGaussian<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorHyperbolicLinear<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! weights, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? bias = null, double curvature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorIsru<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double alpha = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorLisht<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorLogSoftmin<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, int axis = -1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorScaledTanh<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double alpha = 1, double beta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorSinusoidalTimeEmbedding<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! timesteps, int embeddingDim) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorSoftKnn<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! supportVectors, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! labels, double temperature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorSoftLocallyWeighted<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! xTrain, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! yTrain, double bandwidth = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorSoftSplit<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! leftValue, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! rightValue, int featureIndex, double threshold, double temperature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorSqrbf<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double beta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorSurrogateSpike<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! membranePotential, double threshold = 1, double surrogateBeta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorThresholdedRelu<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double threshold = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.IEngine.TensorTopKSoftmax<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! scores, int k) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.Autodiff.GradCheckMismatch.ToString() -> string!
+override AiDotNet.Tensors.Engines.Autodiff.GradCheckResult.ToString() -> string!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorBentIdentity<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorCrfForward<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! emissions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! transitions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? startScores = null, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? endScores = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorFakeQuantize<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, int numBits = 8, double? scale = null, int? zeroPoint = null, bool symmetric = true) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorGaussian<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorHyperbolicLinear<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! weights, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? bias = null, double curvature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorIsru<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double alpha = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLisht<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLogSoftmin<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, int axis = -1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorScaledTanh<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double alpha = 1, double beta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorSinusoidalTimeEmbedding<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! timesteps, int embeddingDim) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorSoftKnn<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! supportVectors, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! labels, double temperature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorSoftLocallyWeighted<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! xTrain, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! yTrain, double bandwidth = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorSoftSplit<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! leftValue, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! rightValue, int featureIndex, double threshold, double temperature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorSqrbf<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double beta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorSurrogateSpike<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! membranePotential, double threshold = 1, double surrogateBeta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorThresholdedRelu<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double threshold = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorTopKSoftmax<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! scores, int k) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.AnalyticalGradients<T>(System.Func<System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! inputs, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! outputGradient, AiDotNet.Tensors.Engines.IEngine? engine = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.Check<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions? options = null) -> AiDotNet.Tensors.Engines.Autodiff.GradCheckResult!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.CheckMany<T>(System.Func<System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! inputs, AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions? options = null) -> AiDotNet.Tensors.Engines.Autodiff.GradCheckResult!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.Compare<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! analytical, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! numerical, double absoluteTolerance, double relativeTolerance, int maxReportedMismatches = 10) -> AiDotNet.Tensors.Engines.Autodiff.GradCheckResult!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.GradGradCheck<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions? options = null) -> AiDotNet.Tensors.Engines.Autodiff.GradCheckResult!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.GradGradCheckMany<T>(System.Func<System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! inputs, AiDotNet.Tensors.Engines.Autodiff.GradCheckOptions? options = null) -> AiDotNet.Tensors.Engines.Autodiff.GradCheckResult!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.NumericalGradient<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, T>! scalarFunction, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, double? epsilon = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.NumericalGradients<T>(System.Func<System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! inputs, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! outputGradient, double? epsilon = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!
+static AiDotNet.Tensors.Engines.Autodiff.GradCheck.NumericalVectorJacobianProduct<T>(System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! function, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! outputGradient, double? epsilon = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorBentIdentity<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorCrfForward<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! emissions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! transitions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? startScores = null, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? endScores = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorFakeQuantize<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, int numBits = 8, double? scale = null, int? zeroPoint = null, bool symmetric = true) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorGaussian<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorHyperbolicLinear<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! weights, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? bias = null, double curvature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorIsru<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double alpha = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorLisht<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorLogSoftmin<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, int axis = -1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorScaledTanh<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double alpha = 1, double beta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorSinusoidalTimeEmbedding<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! timesteps, int embeddingDim) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorSoftKnn<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! supportVectors, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! labels, double temperature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorSoftLocallyWeighted<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! xTrain, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! yTrain, double bandwidth = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorSoftSplit<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! leftValue, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! rightValue, int featureIndex, double threshold, double temperature = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorSqrbf<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double beta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorSurrogateSpike<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! membranePotential, double threshold = 1, double surrogateBeta = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorThresholdedRelu<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, double threshold = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.TensorTopKSoftmax<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! scores, int k) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!

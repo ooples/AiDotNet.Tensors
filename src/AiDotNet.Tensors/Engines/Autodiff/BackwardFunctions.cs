@@ -42,7 +42,7 @@ internal sealed class LayerNormStateRef<T>
 /// Each method is a <see cref="BackwardFunction{T}"/> that computes input gradients
 /// and accumulates them into the gradient dictionary.
 /// </summary>
-internal static class BackwardFunctions<T>
+internal static partial class BackwardFunctions<T>
 {
     /// <summary>
     /// A max pool recorded without indices (a compiled plan's lazy node): on a GPU engine in a resident step, the
