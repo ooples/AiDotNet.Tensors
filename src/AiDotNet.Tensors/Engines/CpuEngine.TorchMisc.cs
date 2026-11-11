@@ -16,23 +16,24 @@ public partial class CpuEngine
     {
         if (alpha == 0) throw new ArgumentOutOfRangeException(nameof(alpha), "alpha must be non-zero.");
         return SpecialUnary("TensorCelu", tensor, x => x > 0 ? x : alpha * (Math.Exp(x / alpha) - 1),
-            (x, _) => x > 0 ? 1 : Math.Exp(x / alpha), e => e.TensorCelu(tensor, alpha));
+            (x, _) => x > 0 ? 1 : Math.Exp(x / alpha), e => e.TensorCelu(tensor, alpha), (e, x, _) => DCelu(e, x, alpha));
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorHardtanh<T>(Tensor<T> tensor, double minValue = -1.0, double maxValue = 1.0)
         => SpecialUnary("TensorHardtanh", tensor, x => Math.Min(Math.Max(x, minValue), maxValue),
-            (x, _) => x > minValue && x < maxValue ? 1 : 0, e => e.TensorHardtanh(tensor, minValue, maxValue));
+            (x, _) => x > minValue && x < maxValue ? 1 : 0, e => e.TensorHardtanh(tensor, minValue, maxValue),
+            (_, x, _) => BackwardFunctions<T>.HostMask(x, v => v > minValue && v < maxValue));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogSigmoid<T>(Tensor<T> tensor)
         => SpecialUnary("TensorLogSigmoid", tensor, x => Math.Min(x, 0) - Math.Log(1 + Math.Exp(-Math.Abs(x))),
-            (x, _) => 1 / (1 + Math.Exp(x)), e => e.TensorLogSigmoid(tensor));
+            (x, _) => 1 / (1 + Math.Exp(x)), e => e.TensorLogSigmoid(tensor), (e, x, _) => e.TensorSigmoid(e.TensorNegate(x)));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSoftsign<T>(Tensor<T> tensor)
         => SpecialUnary("TensorSoftsign", tensor, x => x / (1 + Math.Abs(x)),
-            (x, _) => 1 / ((1 + Math.Abs(x)) * (1 + Math.Abs(x))), e => e.TensorSoftsign(tensor));
+            (x, _) => 1 / ((1 + Math.Abs(x)) * (1 + Math.Abs(x))), e => e.TensorSoftsign(tensor), DSoftsign<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSoftmin<T>(Tensor<T> tensor, int axis = -1) => Softmax(TensorNegate(tensor), axis);
