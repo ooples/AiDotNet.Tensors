@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     {
         public static string GetSource()
         {
-            return @"
+            return ExactFloatKernels.Cuda + @"
 #include <math.h>
 
 // NaN-preserving ReLU. A plain (x > 0 ? x : 0) maps NaN to 0 because every
@@ -787,7 +787,8 @@ extern ""C"" __global__ __launch_bounds__(256) void min_vectors(const float* __r
     if (idx >= size) return;
     float a = A[idx];
     float b = B[idx];
-    C[idx] = a < b ? a : b;
+    // a < b ? a : b (x86 MINPS, the CPU engine), decided on the bit patterns: fast math flushed subnormals to ties.
+    C[idx] = xf_minf(a, b);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void max_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
@@ -796,7 +797,8 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors(const float* __r
     if (idx >= size) return;
     float a = A[idx];
     float b = B[idx];
-    C[idx] = a > b ? a : b;
+    // a > b ? a : b (x86 MAXPS, the CPU engine), decided on the bit patterns: fast math flushed subnormals to ties.
+    C[idx] = xf_maxf(a, b);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void scale_vector(const float* __restrict__ A, float* __restrict__ B, float scalar, int size)
@@ -820,9 +822,9 @@ extern ""C"" __global__ __launch_bounds__(256) void abs_vector(const float* __re
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    // fabsf clears the sign, as abs_vector_vec4 and the CPU engine do. `x < 0 ? -x : x` kept -0 and, with fast
-    // math flushing the comparison, every negative subnormal: the scalar and 128-bit kernels disagreed.
-    B[idx] = fabsf(A[idx]);
+    // The sign bit cleared, as abs_vector_vec4 and the CPU engine do. `x < 0 ? -x : x` kept -0 and, with fast
+    // math flushing the comparison, every negative subnormal; fabsf under --use_fast_math flushed every subnormal.
+    B[idx] = xf_absf(A[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* __restrict__ A, float* __restrict__ B, int size)
@@ -890,7 +892,8 @@ extern ""C"" __global__ __launch_bounds__(256) void sign_vector(const float* __r
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = A[idx];
-    B[idx] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
+    // 1, -1, or +0 for both zeros and NaN (the CPU engine), on the bits so a subnormal keeps its sign under fast math.
+    B[idx] = xf_signf(x);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void squared_deviation_from_mean(
@@ -965,81 +968,86 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* __re
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __restrict__ input, float* __restrict__ output, int size)
 {
-    extern __shared__ float scratch[];
+    extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = (idx < (unsigned int)size) ? __ldg(&input[idx]) : -INFINITY;
+    // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the -inf identity (the CPU scan never
+    // takes one, so an all-NaN input gives -inf), and fmaxf no longer flushes a subnormal under fast math.
+    unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0xFF800000u;
+    if (xf_isnan(val)) val = 0xFF800000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
     {
-        float other = __shfl_down_sync(mask, val, offset);
-        val = fmaxf(val, other);
+        unsigned int other = __shfl_down_sync(mask, val, offset);
+        val = xf_max(other, val);
     }
 
     // Write warp results to shared memory
     unsigned int lane = tid & 31;
     unsigned int warpId = tid >> 5;
     if (lane == 0)
-        scratch[warpId] = val;
+        xf_scratch[warpId] = val;
     __syncthreads();
 
     // Final reduction across warps; inactive logical lanes contribute -infinity.
     unsigned int numWarps = (blockDim.x + 31) >> 5;
     if (warpId == 0)
     {
-        val = lane < numWarps ? scratch[lane] : -INFINITY;
+        val = lane < numWarps ? xf_scratch[lane] : 0xFF800000u;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other = __shfl_down_sync(0xFFFFFFFF, val, offset);
-            val = fmaxf(val, other);
+            unsigned int other = __shfl_down_sync(0xFFFFFFFF, val, offset);
+            val = xf_max(other, val);
         }
 
         if (tid == 0)
-            output[blockIdx.x] = val;
+            output[blockIdx.x] = __uint_as_float(val);
     }
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __restrict__ input, float* __restrict__ output, int size)
 {
-    extern __shared__ float scratch[];
+    extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = (idx < (unsigned int)size) ? __ldg(&input[idx]) : INFINITY;
+    // Exact as reduce_max: NaN skipped, +inf identity.
+    unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0x7F800000u;
+    if (xf_isnan(val)) val = 0x7F800000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
     {
-        float other = __shfl_down_sync(mask, val, offset);
-        val = fminf(val, other);
+        unsigned int other = __shfl_down_sync(mask, val, offset);
+        val = xf_min(other, val);
     }
 
     // Write warp results to shared memory
     unsigned int lane = tid & 31;
     unsigned int warpId = tid >> 5;
     if (lane == 0)
-        scratch[warpId] = val;
+        xf_scratch[warpId] = val;
     __syncthreads();
 
     // Final reduction across warps; inactive logical lanes contribute +infinity.
     unsigned int numWarps = (blockDim.x + 31) >> 5;
     if (warpId == 0)
     {
-        val = lane < numWarps ? scratch[lane] : INFINITY;
+        val = lane < numWarps ? xf_scratch[lane] : 0x7F800000u;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other = __shfl_down_sync(0xFFFFFFFF, val, offset);
-            val = fminf(val, other);
+            unsigned int other = __shfl_down_sync(0xFFFFFFFF, val, offset);
+            val = xf_min(other, val);
         }
 
         if (tid == 0)
-            output[blockIdx.x] = val;
+            output[blockIdx.x] = __uint_as_float(val);
     }
 }
 
@@ -1303,7 +1311,9 @@ extern ""C"" __global__ __launch_bounds__(256) void negate_vector(const float* _
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = -A[idx];
+    // The sign bit flipped on the bits (IEEE negate): -x under --use_fast_math flushed a subnormal to zero, which made
+    // amin = -max(-x) lose every subnormal.
+    B[idx] = xf_negf(A[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void floor_vector(const float* __restrict__ A, float* __restrict__ B, int size)
@@ -1413,10 +1423,10 @@ extern ""C"" __global__ __launch_bounds__(256) void abs_vector_vec4(const float*
     if (idx >= size4) return;
     float4 v = reinterpret_cast<const float4*>(A)[idx];
     float4 r;
-    r.x = fabsf(v.x);
-    r.y = fabsf(v.y);
-    r.z = fabsf(v.z);
-    r.w = fabsf(v.w);
+    r.x = xf_absf(v.x);
+    r.y = xf_absf(v.y);
+    r.z = xf_absf(v.z);
+    r.w = xf_absf(v.w);
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
@@ -1456,7 +1466,7 @@ extern ""C"" __global__ __launch_bounds__(256) void negate_vector_vec4(const flo
     if (idx >= size4) return;
     float4 v = reinterpret_cast<const float4*>(A)[idx];
     float4 r;
-    r.x = -v.x; r.y = -v.y; r.z = -v.z; r.w = -v.w;
+    r.x = xf_negf(v.x); r.y = xf_negf(v.y); r.z = xf_negf(v.z); r.w = xf_negf(v.w);
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
@@ -1529,7 +1539,7 @@ extern ""C"" __global__ __launch_bounds__(256) void min_vectors_vec4(const float
     float4 b = reinterpret_cast<const float4*>(B)[idx];
     float4 c;
     // a < b ? a : b, as min_vectors and the CPU engine (x86 MINPS); see max_vectors_vec4.
-    c.x = a.x < b.x ? a.x : b.x; c.y = a.y < b.y ? a.y : b.y; c.z = a.z < b.z ? a.z : b.z; c.w = a.w < b.w ? a.w : b.w;
+    c.x = xf_minf(a.x, b.x); c.y = xf_minf(a.y, b.y); c.z = xf_minf(a.z, b.z); c.w = xf_minf(a.w, b.w);
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
@@ -1542,7 +1552,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
     float4 c;
     // a > b ? a : b, as max_vectors and the CPU engine (x86 MAXPS: the second operand when either is NaN). fmaxf
     // dropped the NaN instead, so a NaN's fate depended on whether the buffers happened to be 16-byte aligned.
-    c.x = a.x > b.x ? a.x : b.x; c.y = a.y > b.y ? a.y : b.y; c.z = a.z > b.z ? a.z : b.z; c.w = a.w > b.w ? a.w : b.w;
+    c.x = xf_maxf(a.x, b.x); c.y = xf_maxf(a.y, b.y); c.z = xf_maxf(a.z, b.z); c.w = xf_maxf(a.w, b.w);
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 ";
