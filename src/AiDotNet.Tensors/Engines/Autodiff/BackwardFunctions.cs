@@ -1600,6 +1600,14 @@ internal static partial class BackwardFunctions<T>
         var padding = (int)savedState[1];
         var dilation = (int)savedState[2];
 
+        // Under create-graph: bilinear in (input, kernel), so each gradient is recorded with the convolution itself
+        // (one operand swapped for the cotangent) as its adjoint, which stays differentiable at every order. The
+        // backward-input/kernel kernels record a node of their own whose backward is not, so a third derivative
+        // through them came out wrong.
+        if (TryMultilinearBackward("Conv1D", Conv1DBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, x) => e.Conv1D(x[0], x[1], stride, padding, dilation)))
+            return;
+
         var gradInput = engine.Conv1DBackwardInput(
             gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
         var gradKernel = engine.Conv1DBackwardKernel(
@@ -4453,9 +4461,15 @@ internal static partial class BackwardFunctions<T>
         {
             // amin/amax: the upstream gradient routed to each slot's winner (fixed by the forward), as recorded sparse
             // maps. prod: each factor's gradient is g·out/factor as recorded ops; with a zero factor that quotient is
-            // undefined, so a zero factor keeps the kernel below (not differentiable again).
+            // undefined, so zero factors take torch's masked formulation (ScatterReduceProdWithZerosRecorded).
             bool anyZero = false;
             for (int i = 0; i < dstLen && !anyZero; i++) anyZero = zeroCount[i] > 0;
+            if (!isMinMax && anyZero)
+            {
+                ScatterReduceProdWithZerosRecorded(gradOutput, tensor, source, output, dim, idxData, includeSelf,
+                    selfParticipates, outerSize, innerSize, dstAxis, srcAxis, engine, grads);
+                return;
+            }
             if (isMinMax || !anyZero)
             {
                 var keep = new List<int>();

@@ -409,7 +409,8 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, decay, dDecay, engine);
     }
 
-    // The RG-LRU scan as recorded ops: a_t = r_t ⊙ sigmoid(-decay), h_t = a_t ⊙ h_{t-1} + sqrt(max(1 - a_t², 0)) ⊙ i_t ⊙ v_t.
+    // The RG-LRU scan as recorded ops: a_t = r_t ⊙ sigmoid(-decay), h_t = a_t ⊙ h_{t-1} + sqrt(max(1 - a_t², 0)) ⊙ i_t ⊙ v_t,
+    // with the square root differentiated as the kernel differentiates it (see RgLruInputScale).
     private static Tensor<T> RgLruComposite<T>(IEngine e, Tensor<T> value, Tensor<T> recGate, Tensor<T> inpGate, Tensor<T> decay)
     {
         int batch = value.Shape[0], seqLen = value.Shape[1], recDim = value.Shape[2];
@@ -419,11 +420,39 @@ public partial class CpuEngine
         for (int t = 0; t < seqLen; t++)
         {
             var a = RecordedOps<T>.Mul(e, RecordedOps<T>.At(e, recGate, 1, t), baseDecay);
-            var s = e.TensorSqrt(e.ReLU(RecordedOps<T>.Shift(e, e.TensorNegate(e.TensorMultiply(a, a)), 1.0)));
+            var s = RgLruInputScale(e, a);
             var drive = e.TensorMultiply(RecordedOps<T>.At(e, inpGate, 1, t), RecordedOps<T>.At(e, value, 1, t));
             h = e.TensorAdd(RecordedOps<T>.Mul(e, a, h), e.TensorMultiply(s, drive));
             ys.Add(h);
         }
         return RecordedOps<T>.Stack(e, ys, 1);
+    }
+
+    // s = sqrt(max(0, 1 - a²)) carrying the kernel's derivative ds/da = clip(-a/s, ±SqrtDerivativeClip) where s > 0 and
+    // 0 elsewhere (RecurrentGemma clips it for stability; -a/s diverges as a → 1). The create-graph composite must
+    // differentiate the same function the fast backward does, so the clipped derivative is this node's backward, built
+    // from recorded ops so its own derivative (the clip's mask times d(-a/s)/da) follows.
+    private static Tensor<T> RgLruInputScale<T>(IEngine e, Tensor<T> a)
+    {
+        Tensor<T> s;
+        using (new NoGradScope<T>())
+            s = e.TensorSqrt(e.ReLU(RecordedOps<T>.Shift(e, e.TensorNegate(e.TensorMultiply(a, a)), 1.0)));
+        DifferentiableOps.RecordUnary("RgLruInputScale", s, a, RgLruInputScaleBackward);
+        return s;
+    }
+
+    private static void RgLruInputScaleBackward<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var a = inputs[0];
+        Tensor<T> positive;
+        using (new NoGradScope<T>()) positive = engine.TensorGreaterThan(output, ops.Zero);
+        // s where positive, 1 elsewhere (the masked lanes' quotient is discarded; this keeps it finite).
+        var safe = engine.TensorAdd(output, BackwardFunctions<T>.OneMinus(engine, positive));
+        var slope = engine.TensorClamp(engine.TensorNegate(engine.TensorDivide(a, safe)),
+            ops.FromDouble(-SqrtDerivativeClip), ops.FromDouble(SqrtDerivativeClip));
+        DifferentiableOps.AccumulateGrad(grads, a, engine.TensorMultiply(gradOutput, engine.TensorMultiply(positive, slope)), engine);
     }
 }

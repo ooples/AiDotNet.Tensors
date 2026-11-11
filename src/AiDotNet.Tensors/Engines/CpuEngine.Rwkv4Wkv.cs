@@ -502,52 +502,73 @@ public partial class CpuEngine
     }
 
     // The WKV recurrence as recorded ops: a_{t+1} = e^w a_t + e^{k_t} v_t, b_{t+1} = e^w b_t + e^{k_t},
-    // y_t = σ(r_t) (a_t + e^{u+k_t} v_t) / (b_t + e^{u+k_t}), w = -exp(timeDecay). Numerator and denominator are both
-    // scaled by e^{-s}, s = max_t max(k_t, u + k_t) per (batch, channel): a constant shift (the value is invariant to
-    // it, so is every derivative) that keeps the exponentials in range as the kernel's running max does.
+    // y_t = σ(r_t) (a_t + e^{u+k_t} v_t) / (b_t + e^{u+k_t}), w = -exp(timeDecay), in the kernel's max-subtracted form:
+    // a and b are carried scaled by e^{-p_t}, p_t the running maximum exponent, so no exponential ever sees an argument
+    // above 0 whatever the range of the keys (a single global shift underflowed once keys spanned more than ~700).
+    // Every p is a constant: the value does not depend on it (it cancels between numerator and denominator, and in the
+    // carried state), so neither does any derivative, and treating it as one keeps max's kink out of the graph.
     private static Tensor<T> Rwkv4WkvComposite<T>(IEngine e, Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj,
         Tensor<T> timeDecay, Tensor<T> timeFirst)
     {
         int batch = rProj.Shape[0], seqLen = rProj.Shape[1], modelDim = rProj.Shape[2];
-        var shift = Rwkv4CompositeShift(kProj, timeFirst, batch, seqLen, modelDim);
-        var ew = RecordedOps<T>.R(e, e.TensorExp(e.TensorNegate(e.TensorExp(RecordedOps<T>.R(e, timeDecay, modelDim)))), 1, modelDim);
+        var ops = MathHelper.GetNumericOperations<T>();
+        var kValues = RoIAlignPlan.ToDoubles(kProj);
+        var uValues = RoIAlignPlan.ToDoubles(timeFirst);
+        var wValues = RoIAlignPlan.ToDoubles(timeDecay);
+        for (int c = 0; c < wValues.Length; c++) wValues[c] = -Math.Exp(wValues[c]);
+
+        var w = RecordedOps<T>.R(e, e.TensorNegate(e.TensorExp(RecordedOps<T>.R(e, timeDecay, modelDim))), 1, modelDim);
         var u2 = RecordedOps<T>.R(e, timeFirst, 1, modelDim);
-        Tensor<T> num = RecordedOps<T>.Zeros(batch, modelDim);
-        Tensor<T> den = RecordedOps<T>.Zeros(batch, modelDim);
+        Tensor<T> aa = RecordedOps<T>.Zeros(batch, modelDim);
+        Tensor<T> bb = RecordedOps<T>.Zeros(batch, modelDim);
+        // An empty state: e^{pp - p} is exactly 0 for any finite p.
+        var pp = new double[batch * modelDim];
+        for (int i = 0; i < pp.Length; i++) pp[i] = -1e30;
         var ys = new List<Tensor<T>>(seqLen);
         for (int t = 0; t < seqLen; t++)
         {
-            var kt = e.TensorSubtract(RecordedOps<T>.At(e, kProj, 1, t), shift);
+            var kt = RecordedOps<T>.At(e, kProj, 1, t);
             var vt = RecordedOps<T>.At(e, vProj, 1, t);
-            var bonus = e.TensorExp(RecordedOps<T>.Add(e, kt, u2));
-            var wkv = e.TensorDivide(e.TensorAdd(num, e.TensorMultiply(bonus, vt)), e.TensorAdd(den, bonus));
+
+            // Output: p = max(pp, u + k_t).
+            var p = new double[pp.Length];
+            var e1Values = new double[pp.Length];
+            for (int b = 0; b < batch; b++)
+                for (int c = 0; c < modelDim; c++)
+                {
+                    int i = b * modelDim + c;
+                    p[i] = Math.Max(pp[i], uValues[c] + kValues[(b * seqLen + t) * modelDim + c]);
+                    e1Values[i] = Math.Exp(pp[i] - p[i]);
+                }
+            var e1 = Rwkv4Constant<T>(e1Values, batch, modelDim, ops);
+            var e2 = e.TensorExp(e.TensorSubtract(RecordedOps<T>.Add(e, kt, u2), Rwkv4Constant<T>(p, batch, modelDim, ops)));
+            var wkv = e.TensorDivide(e.TensorAdd(e.TensorMultiply(e1, aa), e.TensorMultiply(e2, vt)),
+                e.TensorAdd(e.TensorMultiply(e1, bb), e2));
             ys.Add(e.TensorMultiply(e.TensorSigmoid(RecordedOps<T>.At(e, rProj, 1, t)), wkv));
-            var ek = e.TensorExp(kt);
-            num = e.TensorAdd(RecordedOps<T>.Mul(e, ew, num), e.TensorMultiply(ek, vt));
-            den = e.TensorAdd(RecordedOps<T>.Mul(e, ew, den), ek);
+
+            // State: p' = max(pp + w, k_t).
+            var next = new double[pp.Length];
+            for (int b = 0; b < batch; b++)
+                for (int c = 0; c < modelDim; c++)
+                {
+                    int i = b * modelDim + c;
+                    next[i] = Math.Max(pp[i] + wValues[c], kValues[(b * seqLen + t) * modelDim + c]);
+                }
+            var nextT = Rwkv4Constant<T>(next, batch, modelDim, ops);
+            var decayFactor = e.TensorExp(e.TensorSubtract(RecordedOps<T>.Add(e, w, Rwkv4Constant<T>(pp, batch, modelDim, ops)), nextT));
+            var keyFactor = e.TensorExp(e.TensorSubtract(kt, nextT));
+            aa = e.TensorAdd(e.TensorMultiply(decayFactor, aa), e.TensorMultiply(keyFactor, vt));
+            bb = e.TensorAdd(e.TensorMultiply(decayFactor, bb), keyFactor);
+            pp = next;
         }
         return RecordedOps<T>.Stack(e, ys, 1);
     }
 
-    // s[b, c] = max_t max(k[b,t,c], u[c] + k[b,t,c]): the composite's constant exponent shift.
-    [ScalarKernel("A one-off per-channel max over a few host values that seeds a recorded composite.")]
-    private static Tensor<T> Rwkv4CompositeShift<T>(Tensor<T> kProj, Tensor<T> timeFirst, int batch, int seqLen, int modelDim)
+    [ScalarKernel("Converts a few host-computed per-step exponent shifts that seed a recorded composite.")]
+    private static Tensor<T> Rwkv4Constant<T>(double[] values, int batch, int modelDim, INumericOperations<T> ops)
     {
-        var ops = MathHelper.GetNumericOperations<T>();
-        var k = kProj.GetFlattenedData();
-        var u = timeFirst.GetFlattenedData();
-        var shift = new T[batch * modelDim];
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < modelDim; c++)
-            {
-                double s = double.NegativeInfinity;
-                for (int t = 0; t < seqLen; t++)
-                {
-                    double kv = ops.ToDouble(k[(b * seqLen + t) * modelDim + c]);
-                    s = Math.Max(s, Math.Max(kv, kv + ops.ToDouble(u[c])));
-                }
-                shift[b * modelDim + c] = ops.FromDouble(s);
-            }
-        return new Tensor<T>(shift, new[] { batch, modelDim });
+        var data = new T[values.Length];
+        for (int i = 0; i < data.Length; i++) data[i] = ops.FromDouble(values[i]);
+        return new Tensor<T>(data, new[] { batch, modelDim });
     }
 }

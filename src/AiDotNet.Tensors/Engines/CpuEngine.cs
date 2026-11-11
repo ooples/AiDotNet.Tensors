@@ -10347,14 +10347,20 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Conv1D", input._shape); if (ac is not null) return ac.Execute(); }
 
-        // Reshape to 4D: [B, C, 1, L] and [Cout, Cin, 1, K]
-        var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
-        var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
+        // The reshape / Conv2D / reshape below run unrecorded: Conv1D records itself, and recording the pieces too left
+        // the result with two producers, which a create-graph (tape-walk) backward ran both of, doubling the gradient.
+        Tensor<T> result;
+        using (new NoGradScope<T>())
+        {
+            // Reshape to 4D: [B, C, 1, L] and [Cout, Cin, 1, K]
+            var input4D = Reshape(input, new[] { input._shape[0], input._shape[1], 1, input._shape[2] });
+            var kernel4D = Reshape(kernel, new[] { kernel._shape[0], kernel._shape[1], 1, kernel._shape[2] });
 
-        var result4D = Conv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation });
+            var result4D = Conv2D(input4D, kernel4D, new[] { 1, stride }, new[] { 0, padding }, new[] { 1, dilation });
 
-        // Squeeze height dimension: [B, Cout, 1, outL] -> [B, Cout, outL]
-        var result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+            // Squeeze height dimension: [B, Cout, 1, outL] -> [B, Cout, outL]
+            result = Reshape(result4D, new[] { result4D._shape[0], result4D._shape[1], result4D._shape[3] });
+        }
 
         DifferentiableOps.RecordBinary("Conv1D", result, input, kernel, BackwardFunctions<T>.Conv1DBackward,
             new object[] { stride, padding, dilation });
