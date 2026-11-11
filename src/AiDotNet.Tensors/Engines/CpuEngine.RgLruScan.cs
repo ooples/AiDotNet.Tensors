@@ -368,6 +368,12 @@ public partial class CpuEngine
         var inpGate = inputs[2];
         var decay = inputs[3];
 
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded
+        // ops. Its square root's derivative is the exact one; the kernel below clips it at ±1000 (RecurrentGemma).
+        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+                e => RgLruComposite(e, value, recGate, inpGate, decay)))
+            return;
+
         int batch = value.Shape[0];
         int seqLen = value.Shape[1];
         int recDim = value.Shape[2];
@@ -401,5 +407,23 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, recGate, dR, engine);
         DifferentiableOps.AccumulateGrad(grads, inpGate, dI, engine);
         DifferentiableOps.AccumulateGrad(grads, decay, dDecay, engine);
+    }
+
+    // The RG-LRU scan as recorded ops: a_t = r_t ⊙ sigmoid(-decay), h_t = a_t ⊙ h_{t-1} + sqrt(max(1 - a_t², 0)) ⊙ i_t ⊙ v_t.
+    private static Tensor<T> RgLruComposite<T>(IEngine e, Tensor<T> value, Tensor<T> recGate, Tensor<T> inpGate, Tensor<T> decay)
+    {
+        int batch = value.Shape[0], seqLen = value.Shape[1], recDim = value.Shape[2];
+        var baseDecay = RecordedOps<T>.R(e, e.TensorSigmoid(e.TensorNegate(RecordedOps<T>.R(e, decay, recDim))), 1, recDim);
+        Tensor<T> h = RecordedOps<T>.Zeros(batch, recDim);
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var a = RecordedOps<T>.Mul(e, RecordedOps<T>.At(e, recGate, 1, t), baseDecay);
+            var s = e.TensorSqrt(e.ReLU(RecordedOps<T>.Shift(e, e.TensorNegate(e.TensorMultiply(a, a)), 1.0)));
+            var drive = e.TensorMultiply(RecordedOps<T>.At(e, inpGate, 1, t), RecordedOps<T>.At(e, value, 1, t));
+            h = e.TensorAdd(RecordedOps<T>.Mul(e, a, h), e.TensorMultiply(s, drive));
+            ys.Add(h);
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 }

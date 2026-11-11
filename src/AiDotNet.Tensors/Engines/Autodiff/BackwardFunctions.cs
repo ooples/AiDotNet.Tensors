@@ -10097,6 +10097,11 @@ internal static partial class BackwardFunctions<T>
         // The forward's clamp: max(x, max(AmplitudeToDBFloor, minAmplitude)).
         double minAmp = Math.Max(CpuEngine.AmplitudeToDBFloor, (float)savedState[0]);
         float? topDb = savedState.Length > 1 ? (float?)savedState[1] : null;
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, AmplitudeToDBGradRecorded(gradOutput, input, minAmp, topDb, engine), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input._shape);
         using var srcLease = input.Lease();
@@ -10449,6 +10454,15 @@ internal static partial class BackwardFunctions<T>
         var phase = SavedTensor(nameof(SpectrogramBackward), savedState, 3, "phase");
         int origLength = SavedInt(nameof(SpectrogramBackward), savedState, 4, "origLength");
 
+        // Under create-graph: differentiate |STFT(x)| = sqrt(Re² + Im²) over the recorded linear analysis.
+        if (TryCompositeBackward(gradOutput, new[] { waveform }, engine, grads, e =>
+            {
+                var re = RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength);
+                var im = RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength);
+                return e.TensorSqrt(e.TensorAdd(e.TensorMultiply(re, re), e.TensorMultiply(im, im)));
+            }))
+            return;
+
         var result = MagnitudeStftAdjoint(gradOutput, phase, nFft, hopLength, window, origLength, waveform._shape);
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
@@ -10473,6 +10487,13 @@ internal static partial class BackwardFunctions<T>
         var window = SavedTensor(nameof(StftPhaseBackward), savedState, 2, "window");
         var magnitude = SavedTensor(nameof(StftPhaseBackward), savedState, 3, "magnitude");
         int origLength = SavedInt(nameof(StftPhaseBackward), savedState, 4, "origLength");
+
+        // Under create-graph: differentiate atan2(Im, Re) over the recorded linear analysis.
+        if (TryCompositeBackward(gradOutput, new[] { waveform }, engine, grads, e =>
+                e.TensorAtan2(
+                    RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength),
+                    RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength))))
+            return;
 
         var result = StftAnalysisAdjoint(
             gradOutput, magnitude, output, StftAdjointTarget.Phase,
@@ -10509,6 +10530,12 @@ internal static partial class BackwardFunctions<T>
         int n = SavedInt(nameof(RFFTAdjointBackward), savedState, 0, "signalLength");
         int nFft = SavedInt(nameof(RFFTAdjointBackward), savedState, 1, "nFft");
         int numFreqs = nFft / 2 + 1;
+
+        // Under create-graph: the transform is linear, so the adjoint of this adjoint is the transform itself.
+        var rfftOutputShape = (int[])gradOutput._shape.Clone();
+        if (TryLinearBackward("RFFTAdjointBackward", RFFTAdjointBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => ToShape(e, e.RFFT(w), rfftOutputShape)))
+            return;
 
         // Device adjoint when the backward runs on the GPU engine. A compiled plan records this function from the
         // CPU base (GraphMode), so without this every compiled GPU step ran the transform on the host: a download,
@@ -10589,6 +10616,12 @@ internal static partial class BackwardFunctions<T>
         int numFreqs = SavedInt(nameof(IRFFTAdjointBackward), savedState, 0, "numFreqs");
         int nFft = SavedInt(nameof(IRFFTAdjointBackward), savedState, 1, "nFft");
         int outputLength = SavedInt(nameof(IRFFTAdjointBackward), savedState, 2, "outputLength");
+
+        // Under create-graph: the inverse transform is linear, so the adjoint of this adjoint is the transform itself.
+        var irfftOutputShape = (int[])gradOutput._shape.Clone();
+        if (TryLinearBackward("IRFFTAdjointBackward", IRFFTAdjointBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => ToShape(e, e.IRFFT(w, outputLength), irfftOutputShape)))
+            return;
 
         // Device adjoint on the GPU engine (see RFFTAdjointBackward: the compiled plan records this CPU-path
         // function and replays it on the GPU engine).
@@ -10841,6 +10874,24 @@ internal static partial class BackwardFunctions<T>
         var window = SavedTensor(nameof(IstftBackward), savedState, 2, "window");
         bool center = SavedBool(nameof(IstftBackward), savedState, 3, "center");
         int outputLength = SavedInt(nameof(IstftBackward), savedState, 4, "outputLength");
+
+        if (CreatesGraph)
+        {
+            if (IsConstantSynthesisPhase(phase))
+            {
+                // A call IstftComposite made with a constant phase: linear in the magnitude, so its gradient is the
+                // kernel's magnitude gradient recorded with the synthesis itself as the adjoint; the phase has none.
+                var connected = LinearGrad("IstftBackward", gradOutput,
+                    () => KernelGrads(IstftBackward, gradOutput, inputs, output, savedState, engine)[0]
+                          ?? throw new InvalidOperationException("IstftBackward gave the magnitude no gradient."),
+                    (e, w) => e.ISTFT(w, phase, nFft, hopLength, window, center, outputLength));
+                DifferentiableOps.AccumulateGrad(grads, magnitude, connected, engine);
+                return;
+            }
+            if (TryCompositeBackward(gradOutput, inputs, engine, grads,
+                    e => IstftComposite(e, magnitude, phase, nFft, hopLength, window, center, outputLength)))
+                return;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = magnitude._shape[^2];

@@ -691,6 +691,11 @@ public partial class CpuEngine
         var decayLogit = inputs[4];
         var iclRate = inputs[5];
 
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+                e => Rwkv7SequenceComposite(e, rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads)))
+            return;
+
         int batch = rProj.Shape[0];
         int seqLen = rProj.Shape[1];
         int modelDim = rProj.Shape[2];
@@ -732,5 +737,33 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, vProj, dV, engine);
         DifferentiableOps.AccumulateGrad(grads, decayLogit, dD, engine);
         DifferentiableOps.AccumulateGrad(grads, iclRate, dA, engine);
+    }
+
+    // The RWKV-7 generalised delta rule as recorded ops, per head (see Rwkv7SequenceForward):
+    // κ̂ = κ / sqrt(||κ||² + ε), w = exp(-e^{-1/2} σ(d)), S ← S diag(w) - (S κ̂)(a ⊙ κ̂)ᵀ + v k̃ᵀ, o = S r.
+    private static Tensor<T> Rwkv7SequenceComposite<T>(IEngine e, Tensor<T> rProj, Tensor<T> kappa, Tensor<T> kTilde,
+        Tensor<T> vProj, Tensor<T> decayLogit, Tensor<T> iclRate, int numHeads)
+    {
+        int batch = rProj.Shape[0], seqLen = rProj.Shape[1], modelDim = rProj.Shape[2], headDim = modelDim / numHeads;
+        Tensor<T> state = RecordedOps<T>.Zeros(batch, numHeads, headDim, headDim);
+        Tensor<T> Step(Tensor<T> x, int t) => RecordedOps<T>.R(e, RecordedOps<T>.At(e, x, 1, t), batch, numHeads, headDim);
+        Tensor<T> Row(Tensor<T> x) => RecordedOps<T>.R(e, x, batch, numHeads, 1, headDim);
+        Tensor<T> Col(Tensor<T> x) => RecordedOps<T>.R(e, x, batch, numHeads, headDim, 1);
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var kap = Step(kappa, t);
+            var norm = e.TensorSqrt(RecordedOps<T>.Shift(e, RecordedOps<T>.Sum(e, e.TensorMultiply(kap, kap), 2, keep: true), Rwkv7NormEps));
+            var kh = RecordedOps<T>.Div(e, kap, norm);
+            var w = e.TensorExp(RecordedOps<T>.Scale(e, e.TensorSigmoid(Step(decayLogit, t)), -Rwkv7DecayScale));
+            var akh = e.TensorMultiply(Step(iclRate, t), kh);
+            var p = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, state, Row(kh)), 3, keep: false);       // [B, H, Dv]
+            state = RecordedOps<T>.Add(e,
+                RecordedOps<T>.Sub(e, RecordedOps<T>.Mul(e, state, Row(w)), RecordedOps<T>.Mul(e, Col(p), Row(akh))),
+                RecordedOps<T>.Mul(e, Col(Step(vProj, t)), Row(Step(kTilde, t))));
+            var o = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, state, Row(Step(rProj, t))), 3, keep: false);
+            ys.Add(RecordedOps<T>.R(e, o, batch, modelDim));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 }
