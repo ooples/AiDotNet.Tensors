@@ -51073,7 +51073,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Flatten", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        var result = tensor.Reshape([tensor.Length]);
+        // The engine records Flatten itself: Tensor.Reshape's own view edge would be a second producer of the same
+        // output, which a tape walk (create-graph backward) runs twice, doubling the gradient.
+        Tensor<T> result;
+        using (DifferentiableOps.SuppressTensorViewRecording())
+            result = tensor.Reshape([tensor.Length]);
         DifferentiableOps.RecordUnary("Flatten", result, tensor, BackwardFunctions<T>.FlattenBackward);
         AutoTracer.RecordOp("Flatten", result, eng => eng.TensorFlatten(tensor));
         return result;

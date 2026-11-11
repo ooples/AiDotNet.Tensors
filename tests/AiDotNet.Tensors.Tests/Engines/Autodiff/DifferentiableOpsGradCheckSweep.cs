@@ -42,7 +42,7 @@ public class DifferentiableOpsGradCheckSweep
     /// Ops excluded from the numeric check, with the reason. Anything here is a deliberate,
     /// documented exclusion — not a silent gap.
     /// </summary>
-    private static readonly Dictionary<string, string> Exempt = new(StringComparer.Ordinal)
+    internal static readonly Dictionary<string, string> Exempt = new(StringComparer.Ordinal)
     {
         // Non-smooth at points a random probe can land on. Finite differences straddle the kink
         // and disagree with any one-sided subgradient choice.
