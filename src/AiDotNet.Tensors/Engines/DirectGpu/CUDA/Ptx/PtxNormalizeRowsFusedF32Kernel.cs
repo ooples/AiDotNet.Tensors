@@ -85,8 +85,7 @@ internal sealed class PtxNormalizeRowsFusedF32Kernel : IDisposable
         Validate(rows, cols);
 
         var ptx = new StringBuilder(3_584);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape rows={rows} cols={cols} block={BlockThreads} op=normalize-rows-fused");
         ptx.AppendLine();

@@ -93,8 +93,7 @@ internal sealed class PtxFusedPhiloxRreluF32Kernel : IDisposable
                 "The experimental fused RReLU emitter targets SM86 only.");
         ValidateElementCount(elementCount);
         var ptx = new StringBuilder(12_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

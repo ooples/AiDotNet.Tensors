@@ -150,8 +150,7 @@ internal sealed class PtxDeformableConv2DGroupedForwardKernel : IDisposable
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(45056);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
@@ -407,8 +406,7 @@ internal sealed class PtxDeformableConv2DGroupedBackwardInputKernel : IDisposabl
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(45056);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
@@ -661,8 +659,7 @@ internal sealed class PtxDeformableConv2DGroupedBackwardWeightKernel : IDisposab
         string entry = EntryFor(shape);
 
         var s = new StringBuilder(36864);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

@@ -157,8 +157,7 @@ internal sealed class PtxFusedQkvRopeCacheD64Kernel : IDisposable
         int cacheRowElements = checked(heads * HeadDimension);
 
         var ptx = new StringBuilder(32_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

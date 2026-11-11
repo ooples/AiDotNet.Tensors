@@ -173,8 +173,7 @@ internal sealed class PtxDeformableConv2DNchw3x3F32Kernel : IDisposable
         const int planeStrideBytes = OutHeight * OutWidth * sizeof(float);        // 256 per offset/mask channel
 
         var ptx = new StringBuilder(32768);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

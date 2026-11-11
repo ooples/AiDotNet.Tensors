@@ -93,8 +93,7 @@ internal sealed class PtxPoincareExpMapKernel : IDisposable
         const string Twenty = "0f41A00000";
 
         var ptx = new StringBuilder(9_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// poincare-exp-map dim={dim}");
         ptx.AppendLine();

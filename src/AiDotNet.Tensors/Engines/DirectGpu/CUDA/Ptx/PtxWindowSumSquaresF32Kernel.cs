@@ -100,8 +100,7 @@ internal sealed class PtxWindowSumSquaresF32Kernel : IDisposable
         int numFrames = (outputLength - nFft) / hopLength + 1;
 
         var ptx = new StringBuilder(2_816);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape nFft={nFft} hop={hopLength} outLen={outputLength} numFrames={numFrames} block={blockThreads} op=window-sum-squares");
         ptx.AppendLine();

@@ -86,8 +86,7 @@ internal sealed class PtxGemmContractMKernel : IDisposable
         int kBytes = checked(k * sizeof(float)); // X row stride (over M) and dW row stride (over N)
 
         var ptx = new StringBuilder(24_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// dweight M={m} N={n} K={k} tile(N,K,M)={BlockN}x{BlockK}x{BlockM}");
         ptx.AppendLine();

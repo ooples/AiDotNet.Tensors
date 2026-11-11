@@ -123,8 +123,7 @@ internal sealed class PtxStftMagPhaseF32Kernel : IDisposable
         const string negOne = "0fBF800000";
 
         var ptx = new StringBuilder(5_120);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape batch={batch} Lp={lp} nFft={nFft} hop={hop} numFrames={numFrames} numFreqs={numFreqs} block={blockThreads} op=stft-mag-phase");
         ptx.AppendLine();

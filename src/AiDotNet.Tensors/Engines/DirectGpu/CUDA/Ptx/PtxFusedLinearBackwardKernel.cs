@@ -129,8 +129,7 @@ internal sealed class PtxFusedLinearBackwardKernel : IDisposable
     {
         Validate(m, k, n, activation);
         var ptx = new StringBuilder(12_000);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// fused-linear backward M={m} K={k} N={n} act={activation}; single exact pointer-only ABI");
         if (IsExactChampionshipCell(m, k, n, activation))

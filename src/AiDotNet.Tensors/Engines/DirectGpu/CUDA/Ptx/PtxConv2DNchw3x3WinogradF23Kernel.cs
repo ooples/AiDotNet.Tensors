@@ -235,8 +235,7 @@ internal sealed class PtxConv2DNchw3x3WinogradF23Kernel : IDisposable
             : (filterPretransformed ? 16 : 9) * sizeof(float);
 
         var p = new StringBuilder(65536);
-        p.AppendLine(".version 7.1");
-        p.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(p, computeCapabilityMajor, computeCapabilityMinor);
         p.AppendLine(".address_size 64");
         p.AppendLine();
         p.AppendLine($".visible .entry {entry}(");

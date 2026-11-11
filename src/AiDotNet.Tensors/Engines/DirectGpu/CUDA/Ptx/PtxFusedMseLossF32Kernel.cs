@@ -111,8 +111,7 @@ internal sealed class PtxFusedMseLossF32Kernel : IDisposable
         uint invColumnsBits = PtxCompat.SingleToUInt32Bits(1.0f / columns);
         string invColumns = "0f" + invColumnsBits.ToString("X8", CultureInfo.InvariantCulture);
         var ptx = new StringBuilder(4_096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape rows={rows} columns={columns} block={blockThreads} strategy=warp-row op=mse-loss cache=ca");

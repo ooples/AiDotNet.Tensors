@@ -129,8 +129,7 @@ internal sealed class PtxCsrSegmentedReduceF32Kernel : IDisposable
         string op = max ? "max.ftz.f32" : "min.ftz.f32";
         string initial = max ? MaxInitialLiteral : MinInitialLiteral;
         var ptx = new StringBuilder(4_096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape rows={rows} inner={inner} columns={columns} block={blockThreads} " +
             $"strategy=lanes-per-row-{lanesPerRow} op=csr-segmented-{(max ? "max" : "min")} order=stored index=fp32-truncated");

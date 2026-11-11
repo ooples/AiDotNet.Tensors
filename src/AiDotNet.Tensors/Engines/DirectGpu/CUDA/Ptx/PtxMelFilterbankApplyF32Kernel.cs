@@ -101,8 +101,7 @@ internal sealed class PtxMelFilterbankApplyF32Kernel : IDisposable
         int total = checked(totalSegBatch * melBins);
 
         var ptx = new StringBuilder(2_560);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape totalSegBatch={totalSegBatch} specBins={specBins} melBins={melBins} block={blockThreads} op=mel-filterbank-apply");
         ptx.AppendLine();

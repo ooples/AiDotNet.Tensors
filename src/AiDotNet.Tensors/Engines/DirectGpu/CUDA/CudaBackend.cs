@@ -626,6 +626,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
+            // Record WHY, so a host with a GPU driver but no NVRTC (the CUDA runtime compiler every CUDA-C module of
+            // this backend is built with) is diagnosable instead of reporting "no error".
+            InitializationError = !CudaNativeBindings.IsAvailable
+                ? "The CUDA driver library could not be loaded."
+                : "The CUDA driver is present, but NVRTC (the CUDA runtime compiler this backend compiles its kernels " +
+                  "with) could not be loaded. Install the CUDA toolkit or the nvidia-cuda-nvrtc package, or set " +
+                  "AIDOTNET_CUDA_DIR to the directory containing the NVRTC library.";
             IsAvailable = false;
             DeviceName = "None";
             return;
