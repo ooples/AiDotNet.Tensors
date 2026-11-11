@@ -6097,116 +6097,22 @@ internal static class BackwardFunctions<T>
         var targetLengths = (int[])savedState[3];
         int blank = (int)savedState[4];
 
-        var ops = MathHelper.GetNumericOperations<T>();
-        int maxT = logProbs._shape[0];
-        int batchSize = logProbs._shape[1];
-        int numClasses = logProbs._shape[2];
-
-        var grad = new Tensor<T>(logProbs._shape);
-
-        int targetOffset = 0;
-        for (int n = 0; n < batchSize; n++)
-        {
-            int T_n = inputLengths[n];
-            int U_n = targetLengths[n];
-            int S = 2 * U_n + 1;
-
-            var expandedLabels = new int[S];
-            for (int s = 0; s < S; s++)
-                expandedLabels[s] = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
-
-            double negInf = double.NegativeInfinity;
-
-            // Alpha (forward) pass
-            var alpha = new double[T_n, S];
-            for (int t = 0; t < T_n; t++)
-                for (int s = 0; s < S; s++)
-                    alpha[t, s] = negInf;
-            alpha[0, 0] = ops.ToDouble(logProbs[0, n, expandedLabels[0]]);
-            if (S > 1) alpha[0, 1] = ops.ToDouble(logProbs[0, n, expandedLabels[1]]);
-            for (int t = 1; t < T_n; t++)
-            {
-                for (int s = 0; s < S; s++)
-                {
-                    double lp = ops.ToDouble(logProbs[t, n, expandedLabels[s]]);
-                    double prev = alpha[t - 1, s];
-                    if (s >= 1) prev = LogSumExpHelper(prev, alpha[t - 1, s - 1]);
-                    if (s >= 2 && expandedLabels[s] != blank && expandedLabels[s] != expandedLabels[s - 2])
-                        prev = LogSumExpHelper(prev, alpha[t - 1, s - 2]);
-                    alpha[t, s] = prev + lp;
-                }
-            }
-
-            // Beta (backward) pass
-            var beta = new double[T_n, S];
-            for (int t = 0; t < T_n; t++)
-                for (int s = 0; s < S; s++)
-                    beta[t, s] = negInf;
-            beta[T_n - 1, S - 1] = 0;
-            if (S >= 2) beta[T_n - 1, S - 2] = 0;
-            for (int t = T_n - 2; t >= 0; t--)
-            {
-                for (int s = S - 1; s >= 0; s--)
-                {
-                    double next = beta[t + 1, s] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s]]);
-                    if (s + 1 < S)
-                        next = LogSumExpHelper(next, beta[t + 1, s + 1] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 1]]));
-                    if (s + 2 < S && expandedLabels[s + 2] != blank && expandedLabels[s + 2] != expandedLabels[s])
-                        next = LogSumExpHelper(next, beta[t + 1, s + 2] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 2]]));
-                    beta[t, s] = next;
-                }
-            }
-
-            // Total log prob
-            double logProbTotal = alpha[T_n - 1, S - 1];
-            if (S >= 2) logProbTotal = LogSumExpHelper(logProbTotal, alpha[T_n - 1, S - 2]);
-
-            // Gradient with respect to LOG-PROBABILITIES:
-            //     d(-logP)/d(logProbs[t,n,k]) = -(1/P) * sum_{s : label_s == k} alpha[t,s]*beta[t,s]
-            //                                 = -posterior[t,k]
-            //
-            // This previously computed `prob[t,k] - posterior[t,k]`, which is the gradient with
-            // respect to the pre-softmax LOGITS — the familiar Graves-2006 form, correct only when
-            // you additionally chain through logProbs = log_softmax(logits), where
-            // d logProbs[t,j]/d logits[t,k] = delta_jk - prob[t,k] and sum_j posterior[t,j] = 1
-            // together contribute the extra prob[t,k] term.
-            //
-            // CpuEngine.TensorCTCLoss consumes logProbs DIRECTLY — it runs the forward-backward
-            // recursion in the log domain and never applies a log_softmax — so that extra term does
-            // not belong here. It made the reported gradient wrong by exactly prob[t,k] for every
-            // element, including a spurious NON-ZERO gradient for classes absent from the target
-            // (whose true posterior, and therefore true gradient, is 0).
-            double gOut = ops.ToDouble(gradOutput.GetFlat(n));
-            for (int t = 0; t < T_n; t++)
-            {
-                // Accumulate alpha*beta per class
-                var abSum = new double[numClasses];
-                for (int i = 0; i < numClasses; i++) abSum[i] = negInf;
-                for (int s = 0; s < S; s++)
-                {
-                    int k = expandedLabels[s];
-                    abSum[k] = LogSumExpHelper(abSum[k], alpha[t, s] + beta[t, s]);
-                }
-
-                for (int k = 0; k < numClasses; k++)
-                {
-                    double gradVal = -Math.Exp(abSum[k] - logProbTotal);
-                    grad[t, n, k] = ops.FromDouble(gOut * gradVal);
-                }
-            }
-
-            targetOffset += U_n;
-        }
+        // Gradient with respect to LOG-PROBABILITIES:
+        //     d(-logP)/d(logProbs[t,n,k]) = -(1/P) * sum_{s : label_s == k} alpha[t,s]*beta[t,s]
+        //                                 = -posterior[t,n,k]
+        //
+        // Not prob[t,k] - posterior[t,k]: that is the gradient with respect to the pre-softmax LOGITS (the
+        // Graves-2006 form), correct only when chaining through logProbs = log_softmax(logits). TensorCTCLoss
+        // consumes logProbs DIRECTLY, so the extra prob term does not belong here (it gave classes absent from
+        // the target a spurious non-zero gradient).
+        //
+        // The posteriors come from the engine op that shares the loss's lattice (CtcLattice), so they run on the
+        // device on a GPU engine; times past an item's input length get zero.
+        var gamma = engine.TensorCTCLabelPosteriors(logProbs, targets, inputLengths, targetLengths, blank);
+        var scale = engine.Reshape(engine.TensorNegate(gradOutput), new[] { 1, logProbs._shape[1], 1 });
+        var grad = engine.TensorMultiply(gamma, scale);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-    }
-
-    private static double LogSumExpHelper(double a, double b)
-    {
-        if (double.IsNegativeInfinity(a)) return b;
-        if (double.IsNegativeInfinity(b)) return a;
-        double max = Math.Max(a, b);
-        return max + Math.Log(Math.Exp(a - max) + Math.Exp(b - max));
     }
 
     // ──────────────────────────────────────────────────────────────
