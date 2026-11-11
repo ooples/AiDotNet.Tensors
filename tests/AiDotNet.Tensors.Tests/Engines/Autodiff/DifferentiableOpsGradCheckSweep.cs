@@ -427,8 +427,22 @@ public partial class DifferentiableOpsGradCheckSweep
         AddCasesReductionsAndIndexing(all);
         AddCasesSpatialAndAttention(all);
         AddCasesLinearAlgebraAndLosses(all);
+        AddCasesVariants(all);
         return all;
     }
+
+    /// <summary>
+    /// The argument factory of a parameter variant, keyed "<c>Op|Fingerprint|param=Value</c>" (one overload) or
+    /// "<c>Op|param=Value</c>": arguments valid for that value when the base ones are not.
+    /// </summary>
+    internal static bool TryGetVariantCase(MethodInfo m, string variantLabel, out Func<Random, object[]> factory)
+    {
+        var name = m.Name.Contains('`') ? m.Name.Substring(0, m.Name.IndexOf('`')) : m.Name;
+        return OpCases.TryGetValue($"{name}|{ParamFingerprint(m)}|{variantLabel}", out factory!)
+            || OpCases.TryGetValue($"{name}|{variantLabel}", out factory!);
+    }
+
+    static partial void AddCasesVariants(Dictionary<string, Func<Random, object[]>> cases);
 
     static partial void AddCasesFusedActivations(Dictionary<string, Func<Random, object[]>> cases);
     static partial void AddCasesReductionsAndIndexing(Dictionary<string, Func<Random, object[]>> cases);
