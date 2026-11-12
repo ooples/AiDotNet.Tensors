@@ -345,11 +345,11 @@ jobs:
         # The suites run as two test hosts, each with its own watchdog and TRX, so a part that overruns still leaves
         # the other's per-test results (2026-11-11/12: the single 120-minute run hit its watchdog on main and on #1718
         # with no other process on the GPU, and left no TRX to say which tests had grown). The last passing SM86 run
-        # (2026-11-08, 78 minutes) spent 70 test-minutes in Engines.DirectGpu and 44 in the rest. On an RTX 3080 the
-        # parts get 100 and 65 minutes; on a slower cuda-pr runner 140 and 90, and elsewhere 130 and 85. The job
+        # (2026-11-08, 78 minutes) spent 70 test-minutes in Engines.DirectGpu and 44 in the rest; split on 2026-11-12 they
+        # took 93 and 34 minutes. On an RTX 3080 the parts get 115 and 50 minutes; on a slower cuda-pr runner 140 and 90, and elsewhere 130 and 85. The job
         # limit less the reserve caps each part's deadline anyway.
-        SUITE_WATCHDOG_DIRECTGPU_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '100' || matrix.arch == 'pr' && '140' || '130' }}
-        SUITE_WATCHDOG_REST_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '65' || matrix.arch == 'pr' && '90' || '85' }}
+        SUITE_WATCHDOG_DIRECTGPU_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '115' || matrix.arch == 'pr' && '140' || '130' }}
+        SUITE_WATCHDOG_REST_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '50' || matrix.arch == 'pr' && '90' || '85' }}
         JOB_LIMIT_MINUTES: ${{ matrix.arch == 'pr' && 200 || matrix.arch == 'sm86' && 560 || 240 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
@@ -420,8 +420,10 @@ jobs:
               $idColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'pid' } | Select-Object -First 1
               $nameColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'process_name' } | Select-Object -First 1
               $id = [uint32]0
-              if ($idColumn -and [uint32]::TryParse($idColumn.Value.Trim(), [ref]$id) -and -not $ownIds.ContainsKey($id)) {
-                $name = if ($nameColumn) { Split-Path -Leaf $nameColumn.Value.Trim() } else { 'unknown' }
+              # A row cut short when nvidia-smi was stopped leaves later columns null; it names no process.
+              if ($idColumn -and $null -ne $idColumn.Value -and [uint32]::TryParse($idColumn.Value.Trim(), [ref]$id) -and
+                  -not $ownIds.ContainsKey($id)) {
+                $name = if ($nameColumn -and $null -ne $nameColumn.Value) { Split-Path -Leaf $nameColumn.Value.Trim() } else { 'unknown' }
                 "$name ($id)"
               } } | Sort-Object -Unique)
             if ($others.Count -gt 0) {
@@ -577,6 +579,8 @@ jobs:
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
+      #   - platform requirements: a Linux-only driver path (the RM ioctl interface), and the no-NVRTC diagnostic,
+      #     which only runs where NVRTC is missing and the lane always installs it;
       #   - architecture requirements (an sm_ level, AVX-512 on the host CPU; off SM86, the specializations validated only
       #     there: the SM86/GA10x and Ampere reasons, and the declared generated-kernel route, which is released on
       #     sm_75 and sm_86 only and so skips on the SM89 Ada);
@@ -589,7 +593,7 @@ jobs:
       # The two main parts and the torch interop host are checked apart, so each must have run tests of its own: a
       # filter that selected nothing cannot pass on another part's tests.
       env:
-        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)'' || '''' }}'
+        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|Linux-only|^NVRTC is present|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)'' || '''' }}'
         ALLOWED_SKIP_TEST: '(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\.'
       run: |
         $failed = $false
