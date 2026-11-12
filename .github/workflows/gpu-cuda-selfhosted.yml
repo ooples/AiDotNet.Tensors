@@ -436,7 +436,7 @@ jobs:
           function Read-Number($row, $prefix) {
             $column = $row.PSObject.Properties | Where-Object { $_.Name.Trim() -like "$prefix*" } | Select-Object -First 1
             $value = 0.0
-            if ($column -and [double]::TryParse(($column.Value.Trim() -split ' ')[0], [ref]$value)) { return $value }
+            if ($column -and [double]::TryParse(("$($column.Value)".Trim() -split ' ')[0], [ref]$value)) { return $value }
             return $null
           }
           $clocks = @($rows | ForEach-Object { Read-Number $_ 'clocks.current.sm' } | Where-Object { $null -ne $_ })
