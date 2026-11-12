@@ -49902,12 +49902,11 @@ public partial class CpuEngine : ITensorLevelEngine
         int keptSize = 1;
         foreach (int dim in keptShape) keptSize *= dim;
         var centre = LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: false, correction: 0, squareRoot: false);
-        var scale = LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: true, correction: 0, squareRoot: true);
-        for (int i = 0; i < scale.Length; i++)
-        {
-            double s = numOps.ToDouble(scale[i]);
-            if (!(s > 0) || double.IsInfinity(s)) scale[i] = numOps.One; // a constant slice keeps std 0 and its gradient
-        }
+        var scaleF = WidenToFloat(
+            LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: true, correction: 0, squareRoot: true), keptSize);
+        for (int i = 0; i < scaleF.Length; i++)
+            if (!(scaleF[i] > 0f) || float.IsInfinity(scaleF[i])) scaleF[i] = 1f; // a constant slice keeps std 0 and its gradient
+        var scale = NarrowFromFloat<T>(scaleF);
         var centreKept = new Tensor<T>(centre, (int[])keptShape.Clone());
         var scaleKept = new Tensor<T>(scale, (int[])keptShape.Clone());
         var standardized = TensorDivide(
