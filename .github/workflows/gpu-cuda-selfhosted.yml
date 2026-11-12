@@ -155,6 +155,9 @@ jobs:
         FullyQualifiedName~.EmptyBroadcastGpuTests.|
         FullyQualifiedName~.GridSampleBackwardAlignCornersTests.|
         FullyQualifiedName~.DirectGpuLinalgRoutingTests.|
+        FullyQualifiedName~.LowPrecisionGpuReductionTests.|
+        FullyQualifiedName~.LinalgElementTypeCoverageTests.|
+        FullyQualifiedName~.LinalgDecimalGpuFallbackTests.|
         FullyQualifiedName~.StreamingTensorJournalTests.|
         FullyQualifiedName~.TensorCowInferenceReadPathTests.|
         FullyQualifiedName~.TensorAddActivationTests.|
