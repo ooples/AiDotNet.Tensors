@@ -358,27 +358,28 @@ var<workgroup> wgEnd: i32;
 }
 ";
 
+    // GROUP_SIZE and GROUP_HALF are filled in from MoeKernelTemplate.GroupSize, the work-group width Entry declares.
     private const string DScoresBody = Entry + @"
     let t = grp + pm.baseOffset;
     for (var j = 0; j < pm.TOPK; j = j + 1) {
         let p = i32(pos[t * pm.TOPK + j]);
         var a = 0.0;
-        for (var c = tid; c < pm.D; c = c + 256) { a = fma(o[p * pm.D + c], dy[t * pm.D + c], a); }
+        for (var c = tid; c < pm.D; c = c + GROUP_SIZE) { a = fma(o[p * pm.D + c], dy[t * pm.D + c], a); }
         sm[tid] = a;
         workgroupBarrier();
-        for (var h = 128; h > 0; h = h / 2) {
+        for (var h = GROUP_HALF; h > 0; h = h / 2) {
             if (tid < h) { sm[tid] = sm[tid] + sm[tid + h]; }
             workgroupBarrier();
         }
-        if (tid == 0) { sm[256 + j] = sm[0]; }
+        if (tid == 0) { sm[GROUP_SIZE + j] = sm[0]; }
         workgroupBarrier();
     }
     var dot = 0.0;
-    for (var j = 0; j < pm.TOPK; j = j + 1) { dot = fma(sm[256 + j], gates[t * pm.TOPK + j], dot); }
-    for (var e = tid; e < pm.G; e = e + 256) {
+    for (var j = 0; j < pm.TOPK; j = j + 1) { dot = fma(sm[GROUP_SIZE + j], gates[t * pm.TOPK + j], dot); }
+    for (var e = tid; e < pm.G; e = e + GROUP_SIZE) {
         var v = 0.0;
         for (var j = 0; j < pm.TOPK; j = j + 1) {
-            if (i32(ids[t * pm.TOPK + j]) == e) { v = (sm[256 + j] - dot) / ssum[t]; }
+            if (i32(ids[t * pm.TOPK + j]) == e) { v = (sm[GROUP_SIZE + j] - dot) / ssum[t]; }
         }
         ds[t * pm.G + e] = v;
     }
@@ -411,7 +412,7 @@ var<workgroup> wgEnd: i32;
             "h13[row * F2 + col] = v;", false));
         Add(MoeKernelTemplate.Down, GroupedRows(ActA, "w2[(g * pm.Kd + brow) * pm.N + bcol]", "o[row * pm.N + col] = v;", false));
         Add(MoeKernelTemplate.Combine, CombineBody);
-        Add(MoeKernelTemplate.DScores, DScoresBody);
+        Add(MoeKernelTemplate.DScores, MoeKernelTemplate.DScoresSource(DScoresBody));
         Add(MoeKernelTemplate.DAct, GroupedRows(
             "gates[i32(perm[arow])] * dy[(i32(perm[arow]) / pm.TOPK) * pm.Kd + acol]",
             "w2[(g * pm.N + bcol) * pm.Kd + brow]",
