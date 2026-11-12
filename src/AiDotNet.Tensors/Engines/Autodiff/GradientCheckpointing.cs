@@ -86,9 +86,19 @@ public static class GradientCheckpointing<T>
         if (segmentSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(segmentSize), "Must be positive.");
 
-        int numSegments = (functions.Count + segmentSize - 1) / segmentSize;
-        if (segmentParameters is not null && segmentParameters.Count != numSegments)
-            throw new ArgumentException($"Expected {numSegments} segment parameter lists, got {segmentParameters.Count}.", nameof(segmentParameters));
+        // 1 + (n - 1) / size, not (n + size - 1) / size: the latter overflows for a segment size near int.MaxValue.
+        int numSegments = 1 + (functions.Count - 1) / segmentSize;
+        if (segmentParameters is not null)
+        {
+            if (segmentParameters.Count != numSegments)
+                throw new ArgumentException($"Expected {numSegments} segment parameter lists, got {segmentParameters.Count}.", nameof(segmentParameters));
+            // A null list would silently select the unfiltered mode (every touched leaf gets a gradient) for that segment.
+            for (int seg = 0; seg < numSegments; seg++)
+            {
+                if (segmentParameters[seg] is null)
+                    throw new ArgumentException($"Segment parameter list {seg} is null; pass an empty list for a segment with no trainable parameters.", nameof(segmentParameters));
+            }
+        }
 
         var tape = GradientTape<T>.Current;
         if (tape is null)
@@ -214,6 +224,12 @@ public static class GradientCheckpointing<T>
                         // is recycled as soon as this scope disposes.
                         var savedIndexedGrads = DifferentiableOps._indexedGrads;
                         var savedSparseGrads = DifferentiableOps._indexedSparseGrads;
+                        // The tables are addressed by each tensor's _gradIndex, so those are suspended too. A parameter
+                        // shared with the outer pass keeps the index that pass assigned: the nested tape walk would not
+                        // reassign it (so a new nested tensor could take the same slot and the two would accumulate
+                        // into one), and its cleanup sets every index it touched to -1 (so the outer pass would lose
+                        // the parameter's indexed and sparse gradients). Clear them for the nested pass and restore them.
+                        var savedGradIndices = SuspendGradIndices(recomputeTape);
                         DifferentiableOps.ClearIndexedGrads();
                         DifferentiableOps.ClearIndexedSparseGrads();
                         Dictionary<Tensor<T>, Tensor<T>> segGrads;
@@ -225,6 +241,8 @@ public static class GradientCheckpointing<T>
                         {
                             DifferentiableOps._indexedGrads = savedIndexedGrads;
                             DifferentiableOps._indexedSparseGrads = savedSparseGrads;
+                            foreach (var (tensor, index) in savedGradIndices)
+                                tensor._gradIndex = index;
                         }
 
                         // Segment-recompute arrays and GPU intermediates must not escape their bounded scope.
@@ -248,6 +266,10 @@ public static class GradientCheckpointing<T>
                                 }
                                 if (consumed)
                                 {
+                                    // The nested backward mirrored the gradient into Grad; it belongs to
+                                    // recomputeGpuScope and is released below, and no outer accumulation will
+                                    // replace it. Clear the mirror only while it still points at that gradient.
+                                    if (ReferenceEquals(kvp.Key.Grad, kvp.Value)) kvp.Key.Grad = null;
                                     continue;
                                 }
                             }
@@ -284,6 +306,37 @@ public static class GradientCheckpointing<T>
         }
 
         return current2;
+    }
+
+    /// <summary>
+    /// Sets every gradient index assigned on a tensor the tape recorded to -1 and returns the previous values, so a
+    /// nested backward over that tape starts from unindexed tensors and the caller can restore the outer pass's indices.
+    /// </summary>
+    private static List<(Tensor<T> Tensor, int Index)> SuspendGradIndices(GradientTape<T> tape)
+    {
+        var saved = new List<(Tensor<T>, int)>();
+        var entries = tape.Entries;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            ref var entry = ref entries[i];
+            Suspend(entry.Output, saved);
+            Suspend(entry.Input0, saved);
+            if (entry.InputCount >= 2) Suspend(entry.Input1, saved);
+            if (entry.InputCount >= 3) Suspend(entry.Input2, saved);
+            if (entry.InputsOverflow is not null)
+            {
+                foreach (var extra in entry.InputsOverflow)
+                    Suspend(extra, saved);
+            }
+        }
+        return saved;
+
+        static void Suspend(Tensor<T>? tensor, List<(Tensor<T>, int)> into)
+        {
+            if (tensor is null || tensor._gradIndex < 0) return;
+            into.Add((tensor, tensor._gradIndex));
+            tensor._gradIndex = -1;
+        }
     }
 
     /// <summary>
