@@ -9,6 +9,7 @@ internal static class MetalExtendedConvKernels
     public const string Source = @"
 #include <metal_stdlib>
 using namespace metal;
+" + ExactFloatKernels.Msl + @"
 
 kernel void trilinear_interpolate(
     device const float* grid [[buffer(0)]],
@@ -301,14 +302,16 @@ kernel void adaptive_max_pool2d(
     int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
     int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
-    float maxV = -INFINITY;
+    // The CPU max-pool rule on the bits: the bin's first cell, then only a strictly greater one.
+    uint maxBits = 0xFF800000u;
+    bool have = false;
     for (int ih = hStart; ih < hEnd; ih++) {
         for (int iw = wStart; iw < wEnd; iw++) {
-            float v = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
-            if (v > maxV) maxV = v;
+            uint v = as_type<uint>(input[((b * channels + c) * inHeight + ih) * inWidth + iw]);
+            if (!have || xf_gt(v, maxBits)) { maxBits = v; have = true; }
         }
     }
-    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = maxV;
+    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = as_type<float>(maxBits);
 }
 
 kernel void conv3d_backward_input(

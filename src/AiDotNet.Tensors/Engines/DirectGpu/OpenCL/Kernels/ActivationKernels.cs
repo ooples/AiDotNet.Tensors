@@ -911,7 +911,8 @@ __kernel void hardtanh(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    output[idx] = fmin(fmax(input[idx], minVal), maxVal);
+    // The CPU's x < lo ? lo : (x > hi ? hi : x), on bits: NaN stays NaN and -0 keeps its sign.
+    output[idx] = as_float(xf_clamp(as_uint(input[idx]), as_uint(minVal), as_uint(maxVal)));
 }
 
 // ===========================================================================
@@ -1063,7 +1064,8 @@ __kernel void hardtanh_backward(
 __kernel void relu6(__global const float* input, __global float* output, const int size)
 {
     const int idx = get_global_id(0); if (idx >= size) return;
-    float x = input[idx]; output[idx] = fmin(fmax(x, 0.0f), 6.0f);
+    // The CPU clamp(x, 0, 6) on bits: -0 stays -0 (-cl-no-signed-zeros let fmax return +0) and NaN stays NaN.
+    output[idx] = as_float(xf_clamp(as_uint(input[idx]), 0u, 0x40C00000u));
 }
 __kernel void relu6_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const int size)
 {
@@ -1183,9 +1185,18 @@ __kernel void max_pool1d(__global const float* input, __global float* output, co
     const int idx = get_global_id(0); int total = batch * channels * outLength; if (idx >= total) return;
     int o = idx % outLength; int c = (idx / outLength) % channels; int b = idx / (outLength * channels);
     int inOff = (b * channels + c) * inLength;
-    float maxVal = -3.402823466e+38f;
-    for (int k = 0; k < kernelSize; k++) { int pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, input[inOff + pos]); }
-    output[idx] = maxVal;
+    // The CPU max-pool rule on bit patterns: the window's first cell, then only a strictly greater one. The
+    // -FLT_MAX seed answered -FLT_MAX for a -inf window, and max() dropped NaN and ordered the zeros its own way.
+    uint maxBits = 0xFF800000u;
+    int have = 0;
+    for (int k = 0; k < kernelSize; k++) {
+        int pos = o * stride + k;
+        if (pos < inLength) {
+            uint v = as_uint(input[inOff + pos]);
+            if (!have || xf_gt(v, maxBits)) { maxBits = v; have = 1; }
+        }
+    }
+    output[idx] = as_float(maxBits);
 }
 
 // Bilinear upsample — matches PyTorch's align_corners=False (the

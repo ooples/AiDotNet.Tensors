@@ -2170,13 +2170,15 @@ void main() {
     // Activation kernels (forward + backward)
     // =====================================================================
 
-    public static string Relu6 => Header + TwoBufferLayout + @"
+    // The CPU clamp(x, 0, 6) on uint-bound bit patterns: -0 and NaN pass through, a subnormal is never flushed.
+    public static string Relu6 => Header + ExactFloatKernels.Glsl + @"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) writeonly buffer B { uint b[]; };
 layout(push_constant) uniform Params { uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= size) return;
-    float x = a[idx];
-    b[idx] = min(max(x, 0.0), 6.0);
+    b[idx] = xf_clamp(a[idx], 0u, 0x40C00000u);   // bounds +0 and 6.0
 }";
 
     public static string Relu6Backward => Header + ThreeBufferLayout + @"
@@ -2354,7 +2356,10 @@ void main() {
     b[idx] = cnt > 0 ? sum / float(cnt) : 0.0;
 }";
 
-    public static string MaxPool1DGlsl => Header + TwoBufferLayout + @"
+    // The CPU max-pool rule on uint-bound bit patterns: the window's first cell, then only a strictly greater one.
+    public static string MaxPool1DGlsl => Header + ExactFloatKernels.Glsl + @"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) writeonly buffer B { uint b[]; };
 layout(push_constant) uniform Params { uint batch; uint channels; uint inLength; uint outLength; uint kernelSize; uint stride; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -2362,8 +2367,12 @@ void main() {
     if (idx >= total) return;
     uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint batchIndex = idx / (outLength * channels);
     uint inOff = (batchIndex * channels + ch) * inLength;
-    float maxVal = -3.402823466e+38;
-    for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, a[inOff + pos]); }
+    uint maxVal = 0xFF800000u;
+    bool have = false;
+    for (uint k = 0; k < kernelSize; k++) {
+        uint pos = o * stride + k;
+        if (pos < inLength) { uint v = a[inOff + pos]; if (!have || xf_gt(v, maxVal)) { maxVal = v; have = true; } }
+    }
     b[idx] = maxVal;
 }";
 
