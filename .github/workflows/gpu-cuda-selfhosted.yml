@@ -47,9 +47,9 @@ on:
         default: ''
       # Runs one architecture's job alone (for example to exercise a newly registered runner) instead of all of them.
       arch:
-        description: Run only this architecture's job (all runs every architecture the nightly schedule runs)
+        description: Run only this architecture's job (all runs every architecture the nightly schedule runs; pr-models runs only the AiDotNet model families on an RTX 3080)
         type: choice
-        options: [all, sm86, sm75, sm89]
+        options: [all, sm86, sm75, sm89, pr-models]
         default: all
   # Pull requests run this workflow through ci.yml, as one job of the pull request's single CI run, when ci.yml's
   # changes job finds a file matching its path filter (cuda in .github/ci-path-filters.yml). Pushes to main do not
