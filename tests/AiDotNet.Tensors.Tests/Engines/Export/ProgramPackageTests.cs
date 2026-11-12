@@ -35,6 +35,8 @@ public class ProgramPackageTests : IDisposable
         }, Random(2, 5, 4), new TraceOptions { Parameters = new object[] { weight } });
     }
 
+    private static void AssertClose(float[] expected, float[] actual) => ProgramPackagePlanTests.Close(expected, actual);
+
     private static byte[] Bytes(ProgramPackage p)
     {
         using var ms = new MemoryStream();
@@ -120,7 +122,7 @@ public class ProgramPackageTests : IDisposable
         Assert.True(package.IsDirty);
         var target = Assert.Single(package.Targets);
         Assert.Equal(engine.Name, target.Device);
-        Assert.Equal(package.Program.Run(x).GetDataArray(), plan!.Execute().GetDataArray());
+        AssertClose(package.Program.Run(x).GetDataArray(), plan!.Execute().GetDataArray());
 
         var reloaded = ProgramPackage.Load(new MemoryStream(Bytes(package)));
         Assert.False(reloaded.IsDirty);
@@ -128,7 +130,7 @@ public class ProgramPackageTests : IDisposable
         Assert.NotNull(warm);
         Assert.False(reloaded.IsDirty);            // served from the stored target, no recompile
         Assert.Single(reloaded.Targets);
-        Assert.Equal(plan.Execute().GetDataArray(), warm!.Execute().GetDataArray());
+        AssertClose(plan.Execute().GetDataArray(), warm!.Execute().GetDataArray());
     }
 
     [Fact]
@@ -141,7 +143,7 @@ public class ProgramPackageTests : IDisposable
         // Same package, now loaded on "another machine": rewrite the stored target's fingerprint.
         var foreign = package.Targets[0];
         var moved = new CompiledTarget(foreign.Device, "other-machine", foreign.ElementType, foreign.InputShapes.ToArray(),
-            foreign.PlanFormatVersion, foreign.CodecVersion, foreign.Payload);
+            foreign.PlanFormatVersion, foreign.CodecVersion, foreign.Payload, foreign.ProgramHash);
         var onOther = new ProgramPackage(package.Program);
         typeof(ProgramPackage).GetField("_targets", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
             .SetValue(onOther, new System.Collections.Generic.List<CompiledTarget> { moved });

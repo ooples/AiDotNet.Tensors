@@ -152,4 +152,10 @@ internal interface IEngineCallRecorder
 
     /// <summary>An op with no portable form was called.</summary>
     void Opaque(int op);
+
+    /// <summary>True when the current call is made off the tracing thread, outside any recorded call.</summary>
+    bool IsOffThread { get; }
+
+    /// <summary>An op called off the tracing thread, with its arguments (not recorded).</summary>
+    void OffThread(int op, object?[] args);
 }

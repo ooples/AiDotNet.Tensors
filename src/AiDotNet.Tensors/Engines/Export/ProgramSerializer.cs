@@ -15,6 +15,9 @@ public sealed class ProgramFormatException : Exception
 {
     /// <summary>Creates the exception.</summary>
     public ProgramFormatException(string message) : base(message) { }
+
+    /// <summary>Creates the exception for a failure <paramref name="inner"/> raised while reading a malformed file.</summary>
+    public ProgramFormatException(string message, Exception inner) : base(message, inner) { }
 }
 
 /// <summary>
@@ -25,7 +28,7 @@ public sealed class ProgramFormatException : Exception
 internal static class ProgramSerializer
 {
     internal const uint Magic = 0x504E5441; // "ATNP"
-    internal const ushort Version = 1;
+    internal const ushort Version = 2; // 2: compiled targets reference the program's parameters and record its hash
 
     internal const byte SectionProgram = 1;
     internal const byte SectionTensors = 2;
@@ -175,10 +178,60 @@ internal static class ProgramSerializer
         var diagnostics = new List<string>(diagCount);
         for (int i = 0; i < diagCount; i++) diagnostics.Add(r.String());
 
+        var traced = ElementTypes.TypeOf(elementType)!;
         foreach (var v in values.Where(v => v.Role is ProgramValueRole.Constant or ProgramValueRole.Parameter))
-            if (!stored.ContainsKey(v.Id)) throw new ProgramFormatException($"Value %{v.Id} ({v.Role}) has no stored tensor.");
+        {
+            if (!stored.TryGetValue(v.Id, out var tensor)) throw new ProgramFormatException($"Value %{v.Id} ({v.Role}) has no stored tensor.");
+            var (storedElement, storedShape) = tensor is UnboundTensor u ? (u.Element, u.Shape) : StoredTypeAndShape(tensor);
+            var expectedElement = v.ElementType == "$T" ? traced : ElementTypes.TypeOf(v.ElementType)!;
+            if (storedElement != expectedElement || !storedShape.SequenceEqual(v.Shape))
+                throw new ProgramFormatException($"The stored tensor for %{v.Id} does not match its declared type and shape.");
+            if (tensor is UnboundTensor && v.Role != ProgramValueRole.Parameter)
+                throw new ProgramFormatException($"Constant %{v.Id} was stored without its values.");
+            if (v.Container == "Vector" && v.Shape.Length != 1 || v.Container == "Matrix" && v.Shape.Length != 2)
+                throw new ProgramFormatException($"Value %{v.Id} is a {v.Container} of rank {v.Shape.Length}.");
+        }
+        foreach (var id in stored.Keys)
+            if (id < 0 || id >= valueCount || values[id].Role is not (ProgramValueRole.Constant or ProgramValueRole.Parameter))
+                throw new ProgramFormatException($"A stored tensor names %{id}, which is not a constant or parameter.");
+        foreach (var id in inputs)
+            if (values[id].Role != ProgramValueRole.Input)
+                throw new ProgramFormatException($"Input %{id} is not an input value.");
+        foreach (var node in nodes) ValidateNode(node, values);
 
         return new TensorProgram(elementType, values, nodes, inputs, outputs, stored, dims, symbols, diagnostics) { OpSetHash = opSetHash };
+    }
+
+    private static (Type Element, int[] Shape) StoredTypeAndShape(object tensor)
+    {
+        var (_, element, shape) = TensorValues.Describe(tensor);
+        return (element, shape);
+    }
+
+    // The outputs a node lists must be the ones its op produces (one per returned tensor, out tensor and in-place
+    // target), and an in-place target must be the value passed to the parameter the op writes: replay indexes both.
+    private static void ValidateNode(ProgramNode node, List<ProgramValue> values)
+    {
+        var op = node.Op;
+        int fixedOutputs = op.Parameters.Count(p => p.Kind == EngineValueKind.OutTensor) + (node.InPlaceInput >= 0 ? 1 : 0);
+        int returned = node.Outputs.Count - fixedOutputs;
+        bool ok = op.ReturnKind switch
+        {
+            EngineValueKind.Void => returned == 0,
+            EngineValueKind.TensorArray or EngineValueKind.TensorList or EngineValueKind.TensorTuple => returned >= 0,
+            _ => returned == 1,
+        };
+        if (!ok) throw new ProgramFormatException($"Node {op.Name} lists {node.Outputs.Count} outputs, which its op does not produce.");
+        if (node.InPlaceInput >= 0)
+        {
+            if (op.InPlaceParameter < 0) throw new ProgramFormatException($"Node {op.Name} writes a value in place, which its op does not.");
+            var arg = node.Args[op.InPlaceParameter];
+            if (arg.Kind != ProgramArgKind.Value || arg.Values[0] != node.InPlaceInput)
+                throw new ProgramFormatException($"Node {op.Name} names in-place value %{node.InPlaceInput}, which is not the value it writes.");
+        }
+        foreach (var output in node.Outputs)
+            if (values[output].Role != ProgramValueRole.Intermediate)
+                throw new ProgramFormatException($"Node {op.Name} writes %{output}, which is not an intermediate value.");
     }
 
     private static int[] OneValue(int[] ids, int node) =>
@@ -248,6 +301,15 @@ internal static class ProgramSerializer
         w.Write(stored.Count);
         foreach (var kv in stored.OrderBy(k => k.Key))
         {
+            if (kv.Value is UnboundTensor placeholder)
+            {
+                // Loaded by shape only and not bound since: still shape only.
+                w.Write(kv.Key);
+                w.Write(ElementTypes.KeyOf(placeholder.Element)!);
+                WriteInts(w, placeholder.Shape);
+                w.Write(false);
+                continue;
+            }
             var element = kv.Value.GetType().GetGenericArguments()[0];
             var key = ElementTypes.KeyOf(element) ?? throw new NotSupportedException($"Element type {element.Name} cannot be saved.");
             w.Write(kv.Key);
@@ -264,33 +326,42 @@ internal static class ProgramSerializer
         return ms.ToArray();
     }
 
-    internal static Dictionary<int, object> ReadTensors(byte[] data, HashSet<int> unbound)
+    internal static Dictionary<int, object> ReadTensors(byte[] data, HashSet<int> unbound, long maxUnboundElements = long.MaxValue)
     {
         var r = new Reader(data);
         int count = r.Count(11);
         var result = new Dictionary<int, object>(count);
+        long unboundElements = 0;
         for (int i = 0; i < count; i++)
         {
             int id = r.Int();
+            if (result.ContainsKey(id)) throw new ProgramFormatException($"Stored tensor %{id} appears twice.");
             string key = r.String();
             var element = ElementTypes.TypeOf(key) ?? throw new ProgramFormatException($"Stored tensor %{id} has unknown element type '{key}'.");
             var shape = r.Ints();
+            // A dimension product above int.MaxValue is not a tensor this runtime can hold; checking each step keeps
+            // the product from overflowing a long as well.
             long elements = 1;
             foreach (var d in shape)
             {
                 if (d < 0) throw new ProgramFormatException($"Stored tensor %{id} has a negative dimension.");
-                elements = checked(elements * d);
+                elements *= d;
+                if (elements > int.MaxValue) throw new ProgramFormatException($"Stored tensor %{id} has more elements than a tensor can hold.");
             }
             if (!r.Bool())
             {
-                // Saved without values: a zero tensor of the right shape until the caller binds the real one.
+                // Saved without values: nothing is allocated (a shape-only entry costs the file a few bytes, so
+                // materializing it would let a tiny file ask for gigabytes). The caller binds the real tensor.
+                unboundElements += elements;
+                if (unboundElements > maxUnboundElements)
+                    throw new ProgramFormatException($"The program declares more than {maxUnboundElements} unbound parameter elements.");
                 unbound.Add(id);
-                result[id] = Generic(nameof(TensorFromBytes), element).Invoke(null, new object[] { new byte[checked((int)(elements * StoredSize(element)))], shape })!;
+                result[id] = new UnboundTensor(element, shape);
                 continue;
             }
             int length = r.Count(1);
-            var bytes = r.Bytes(length);
             if (elements * StoredSize(element) != length) throw new ProgramFormatException($"Stored tensor %{id} has {length} bytes for {elements} elements.");
+            var bytes = r.Bytes(length);
             result[id] = Generic(nameof(TensorFromBytes), element).Invoke(null, new object[] { bytes, shape })!;
         }
         return result;
@@ -345,6 +416,8 @@ internal static class ProgramSerializer
         private const int MaxDepth = 4;
 
         internal Reader(byte[] data) => _data = data;
+
+        internal int Remaining => _data.Length - _pos;
 
         private void Need(long n)
         {

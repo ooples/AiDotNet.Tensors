@@ -190,6 +190,17 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Saves the plan with every tensor in <paramref name="externals"/> written as a reference to its index rather than
+    /// its data. Loading it (InferencePlanReader with the same list) binds those tensors to the caller's, so a saved plan
+    /// runs on live weights and stores none of them.
+    /// </summary>
+    internal void Save(Stream stream, IReadOnlyList<Tensor<T>?> externals)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        InferencePlanWriter.Write(stream, _steps, _finalOutput, _compiledInputShape, _compiledInputTensors, externals);
+    }
+
     /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)
     {
@@ -1072,8 +1083,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             var src = inputs[i] ?? throw new ArgumentException(
                 $"inputs[{i}] is null.", nameof(inputs));
             ValidateShapesMatch(_compiledInputTensors[i], src, $"inputs[{i}]");
-            using var srcKeep1 = new KeepAliveScope(src);
-            src.AsSpanUnmarked().CopyTo(_compiledInputTensors[i].AsWritableSpan());
+            CopyIntoSlot(_compiledInputTensors[i], src, i);
         }
     }
 
@@ -1087,8 +1097,30 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 $"{nameof(SetInput)} requires exactly one.");
 
         ValidateShapesMatch(_compiledInputTensors[0], input, nameof(input));
-        using var inputKeep1 = new KeepAliveScope(input);
-        input.AsSpanUnmarked().CopyTo(_compiledInputTensors[0].AsWritableSpan());
+        CopyIntoSlot(_compiledInputTensors[0], input, 0);
+    }
+
+    /// <summary>
+    /// Copies a caller's input into a captured input slot, in place. The specialized kernels read the slot's backing
+    /// array as it was when the plan was built, so the write must land in that same array: a slot that shares its
+    /// storage copy-on-write (the caller cloned it after compiling) would detach on this write and leave the kernels
+    /// reading the old array, so every later call would return the result for the input the plan was traced on.
+    /// That is refused rather than served stale; callers that own the plan recompile.
+    /// </summary>
+    private static void CopyIntoSlot(Tensor<T> slot, Tensor<T> src, int index)
+    {
+        if (ReferenceEquals(slot, src)) return; // the caller refilled the slot itself
+        if (slot.IsCowShared)
+            throw new InvalidOperationException(
+                $"Input slot {index} of this compiled plan now shares its storage copy-on-write with another tensor " +
+                "(it was cloned after the plan was compiled), so the plan can no longer be fed through it. Recompile the plan.");
+        var storageBefore = slot.StorageIdentity;
+        var before = slot.GetLiveBackingArrayIdentityOrNull();
+        using var srcKeep1 = new KeepAliveScope(src);
+        src.AsSpanUnmarked().CopyTo(slot.AsWritableSpan());
+        if (!ReferenceEquals(storageBefore, slot.StorageIdentity) || !ReferenceEquals(before, slot.GetLiveBackingArrayIdentityOrNull()))
+            throw new InvalidOperationException(
+                $"Writing input slot {index} replaced its storage, so the compiled kernels would not see the new input. Recompile the plan.");
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
@@ -1419,6 +1451,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                     ? (int[])inputTensor._shape.Clone()
                     : Array.Empty<int>();
         }
+
+        // The mutable input slots are written in place by SetInputs on every call, while specialization below
+        // captures each slot's backing array once. A slot that shares its storage copy-on-write (a caller that
+        // cloned its input before tracing, which Clone() does by default) would detach on that first write and leave
+        // the kernels reading the trace-time array: every later call returned the first input's result. Privatize the
+        // slots now, before anything captures their arrays (the contract PrepareForInPlaceWrite documents).
+        foreach (var slot in compiledInputTensors ?? (inputTensor is null ? Array.Empty<Tensor<T>>() : new[] { inputTensor }))
+            slot.PrepareForInPlaceWrite();
 
         // Run step-mutating optimization passes BEFORE specialization.
         // Specialization pins raw pointers into each input/output buffer

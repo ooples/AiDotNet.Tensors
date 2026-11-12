@@ -44,18 +44,69 @@ internal sealed class ProgramRecorder : IEngineCallRecorder
 
     internal void Stop() => _enabled = false;
 
+    // The trace is installed for the tracing thread's execution context, which flows into work the traced function
+    // starts (Task.Run, Parallel.For workers). Set while an outer call runs, it flows the same way into work the ENGINE
+    // starts for that call, which is nested and not recorded.
+    private static readonly AsyncLocal<ProgramRecorder?> InCall = new();
+    private readonly int _thread = Environment.CurrentManagedThreadId;
+
     public bool TryEnter()
     {
-        if (!_enabled || _depth > 0) return false;
+        if (!_enabled || ReferenceEquals(InCall.Value, this)) return false;
+        // Off the tracing thread: not recorded (the generated wrapper then calls OffThread with the arguments).
+        if (Environment.CurrentManagedThreadId != _thread) return false;
+        if (_depth > 0) return false;
         _depth++;
+        InCall.Value = this;
         return true;
     }
 
-    public void Exit() => _depth--;
+    public void Exit()
+    {
+        if (--_depth == 0) InCall.Value = null;
+    }
+
+    public bool IsOffThread => _enabled && Environment.CurrentManagedThreadId != _thread && !ReferenceEquals(InCall.Value, this);
+
+    public void OffThread(int op, object?[] args)
+    {
+        // Work on other threads that never touches a traced tensor is independent of the trace and is not part of the
+        // program. Work that does is part of what the function computes: recording it would make the program depend on
+        // thread scheduling (and the recorder is single-threaded), and not recording it would silently drop it, so the
+        // trace fails.
+        foreach (var arg in args)
+        {
+            if (!TouchesTraced(arg)) continue;
+            Failure ??= $"The traced function called {EngineOpCatalog.Ops[op].Name} on a traced tensor from another thread " +
+                        "(Parallel.For, Task.Run or similar). Engine calls made off the tracing thread cannot be recorded " +
+                        "deterministically; trace a sequential version of the function.";
+            return;
+        }
+    }
+
+    private bool TouchesTraced(object? arg)
+    {
+        if (arg is null) return false;
+        lock (_ids)
+        {
+            if (_ids.ContainsKey(arg)) return true;
+        }
+        IEnumerable? items = arg switch
+        {
+            Array arr when !arr.GetType().GetElementType()!.IsValueType => arr,
+            IEnumerable seq when arg.GetType().IsGenericType && arg.GetType().GetGenericTypeDefinition() == typeof(List<>) => seq,
+            _ => null,
+        };
+        if (items is null) return false;
+        foreach (var item in items)
+            if (item is not null && TouchesTraced(item)) return true;
+        return false;
+    }
 
     public void Opaque(int op)
     {
-        if (_enabled && _depth == 0)
+        if (!_enabled || ReferenceEquals(InCall.Value, this) || Environment.CurrentManagedThreadId != _thread) return;
+        if (_depth == 0)
         {
             var d = EngineOpCatalog.Ops[op];
             Failure ??= $"{d.Name} cannot be traced: {d.UntraceableReason}.";
@@ -205,7 +256,7 @@ internal sealed class ProgramRecorder : IEngineCallRecorder
             ?? throw new TraceException($"Element type {element.Name} has no portable form.");
         int id = Values.Count;
         Values.Add(new ProgramValue(id, role, key, shape, container));
-        _ids[tensor] = id;
+        lock (_ids) _ids[tensor] = id;
         return id;
     }
 }
@@ -268,6 +319,8 @@ internal static class TensorValues
     /// <summary>Rebuilds a stored tensor as the container the program recorded, converting element type to <typeparamref name="TOut"/> when asked.</summary>
     internal static object Materialize(object stored, string container, Type element)
     {
+        if (stored is UnboundTensor)
+            throw new InvalidOperationException("The program was saved without parameter values and they are not bound at this element type; call BindParameters before running it.");
         var src = stored.GetType().GetGenericArguments()[0];
         return Generic(nameof(MaterializeOf), src, element).Invoke(null, new object[] { stored, container })!;
     }
@@ -328,10 +381,47 @@ internal static class TensorValues
         };
     }
 
+    /// <summary>A deep copy of a Tensor, Vector or Matrix, as the same container and element type.</summary>
+    internal static object Copy(object value)
+    {
+        var (container, element, _) = Describe(value);
+        return Materialize(Snapshot(value), container, element);
+    }
+
+    /// <summary>Whether two stored tensors have the same element type, shape and values.</summary>
+    internal static bool SameData(object a, object b)
+    {
+        if (a is UnboundTensor || b is UnboundTensor) return false;
+        var (ca, ea, sa) = Describe(a);
+        var (cb, eb, sb) = Describe(b);
+        if (ea != eb || !sa.SequenceEqual(sb)) return false;
+        return (bool)Generic(nameof(SameDataOf), ea).Invoke(null, new[] { a, b })!;
+    }
+
+    private static bool SameDataOf<T>(object a, object b) =>
+        SnapshotOf<T>(a).AsSpan().ToArray().SequenceEqual(SnapshotOf<T>(b).AsSpan().ToArray(), EqualityComparer<T>.Default);
+
     private static Matrix<T> MatrixFrom<T>(T[] data, int rows, int cols)
     {
         var m = new Matrix<T>(rows, cols);
         data.AsSpan().CopyTo(m.AsWritableSpan());
         return m;
     }
+}
+
+/// <summary>
+/// A parameter loaded by shape only (its package was saved without parameter values). Nothing is allocated for it:
+/// the caller binds the real tensor with <see cref="TensorProgram.BindParameters{T}"/>, and replaying it unbound fails.
+/// </summary>
+internal sealed class UnboundTensor
+{
+    internal UnboundTensor(Type element, int[] shape)
+    {
+        Element = element;
+        Shape = shape;
+    }
+
+    internal Type Element { get; }
+
+    internal int[] Shape { get; }
 }

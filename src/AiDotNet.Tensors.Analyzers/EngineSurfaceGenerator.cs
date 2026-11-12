@@ -122,22 +122,40 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
         var bad = method.Parameters.Select((p, i) => (p, k: op.ParamKinds[i])).FirstOrDefault(x => x.k == "Unsupported");
         if (bad.p is not null) op.UntraceableReason = $"parameter '{bad.p.Name}' of type {bad.p.Type.ToDisplayString()} has no portable form";
         else if (op.ReturnKind == "Unsupported") op.UntraceableReason = $"return type {method.ReturnType.ToDisplayString()} has no portable form";
-        else if (method.TypeParameters.Length > 1) op.UntraceableReason = null; // replayed through the reflection binder
+        else if (method.TypeParameters.Length > 2) op.UntraceableReason = "it takes more than two type parameters, which replay does not bind";
+        else if (method.TypeParameters.Length == 2 && !CanReplayTwoTypeParameters(method))
+            op.UntraceableReason = "its type parameters carry constraints the generated replay cannot satisfy";
         op.Traceable = op.UntraceableReason is null;
 
         if (method.ReturnsVoid)
         {
-            for (int i = 0; i < method.Parameters.Length; i++)
-            {
-                if (op.ParamKinds[i] is "Tensor" or "TensorFixed" or "Vector" or "Matrix")
-                {
-                    op.InPlace = true;
-                    op.InPlaceParam = i;
-                    break;
-                }
-            }
+            op.InPlaceParam = WrittenParameter(method, op.ParamKinds);
+            op.InPlace = op.InPlaceParam >= 0;
         }
         return op;
+    }
+
+    // Parameter names that, on a void op, name the tensor the op writes (TensorCopy(source, destination),
+    // MatMulInto(destination, a, b), GroupNormInto(output, ...)), in order of preference.
+    private static readonly string[] DestinationNames = { "destination", "output", "result", "dst", "dest", "target" };
+
+    /// <summary>
+    /// The tensor parameter a void op writes, or -1 when it writes none. A parameter named as a destination wins (so
+    /// TensorCopy(source, destination) writes destination, not its first tensor). Otherwise an op whose results are all
+    /// <c>out</c> tensors (FFT, IFFT, SinCos, STFT) writes nothing it was given; and an in-place op
+    /// (TensorAddInPlace(a, b), ReLUInPlace(tensor), ScatterInPlace(input, ...)) writes its first tensor parameter.
+    /// </summary>
+    private static int WrittenParameter(IMethodSymbol method, string[] kinds)
+    {
+        static bool TensorLike(string k) => k is "Tensor" or "TensorFixed" or "Vector" or "Matrix" or "NullableTensor";
+        foreach (var name in DestinationNames)
+            for (int i = 0; i < method.Parameters.Length; i++)
+                if (TensorLike(kinds[i]) && string.Equals(method.Parameters[i].Name, name, StringComparison.OrdinalIgnoreCase))
+                    return i;
+        if (kinds.Any(k => k == "OutTensor")) return -1;
+        for (int i = 0; i < method.Parameters.Length; i++)
+            if (TensorLike(kinds[i])) return i;
+        return -1;
     }
 
     private static string RefPrefix(IParameterSymbol p) => p.RefKind switch
@@ -291,15 +309,21 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
                 sb.AppendLine("    }");
                 continue;
             }
-            sb.AppendLine($"        if (!_recorder.TryEnter()) {{ {(method.ReturnsVoid ? call + "; return;" : "return " + call + ";")} }}");
-            sb.AppendLine("        try");
-            sb.AppendLine("        {");
             var typeArgs = method.TypeParameters.Length == 0
                 ? "global::System.Type.EmptyTypes"
                 : "new global::System.Type[] { " + string.Join(", ", method.TypeParameters.Select(t => $"typeof({t.Name})")) + " }";
             var boxed = method.Parameters.Length == 0
                 ? "global::System.Array.Empty<object?>()"
                 : "new object?[] { " + string.Join(", ", method.Parameters.Select(p => p.RefKind == RefKind.Out ? "null" : "@" + p.Name)) + " }";
+            // A call the recorder does not take is passed through; one made off the tracing thread is shown to the
+            // recorder first, which fails the trace when it touches a traced tensor.
+            sb.AppendLine("        if (!_recorder.TryEnter())");
+            sb.AppendLine("        {");
+            sb.AppendLine($"            if (_recorder.IsOffThread) _recorder.OffThread({op.Index}, {boxed});");
+            sb.AppendLine($"            {(method.ReturnsVoid ? call + "; return;" : "return " + call + ";")}");
+            sb.AppendLine("        }");
+            sb.AppendLine("        try");
+            sb.AppendLine("        {");
             sb.AppendLine($"            var __args = {boxed};");
             if (method.ReturnsVoid)
             {
@@ -373,8 +397,70 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
         sb.AppendLine("            default: return false;");
         sb.AppendLine("        }");
         sb.AppendLine("    }");
+
+        // Ops with a second type parameter (TensorEmbeddingLookup<TValue, TIndex>): one direct call per allowlisted
+        // element type the second parameter's constraints admit, chosen by the program's recorded type key. The first
+        // type parameter is the replay element type, as for every other op.
+        sb.AppendLine();
+        sb.AppendLine($"    internal static bool TryInvoke2({iface} e, int op, global::System.Type second, object?[] a, out object? result)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        result = null;");
+        sb.AppendLine("        switch (op)");
+        sb.AppendLine("        {");
+        foreach (var op in m.Ops)
+        {
+            var method = op.Method;
+            if (!op.Traceable || method.TypeParameters.Length != 2) continue;
+            if (method.Parameters.Any(p => p.RefKind is RefKind.Ref or RefKind.In or RefKind.Out)) continue;
+            var decl = op.Declaring.ToDisplayString(TypeFormat);
+            sb.AppendLine($"            case {op.Index}:");
+            foreach (var (_, typeName) in SecondTypeCandidates(method.TypeParameters[1]))
+            {
+                string Subst(ITypeSymbol t)
+                {
+                    var s = t.ToDisplayString(TypeFormat);
+                    s = System.Text.RegularExpressions.Regex.Replace(s, @"\b" + method.TypeParameters[0].Name + @"\b", "TElem");
+                    return System.Text.RegularExpressions.Regex.Replace(s, @"\b" + method.TypeParameters[1].Name + @"\b", typeName);
+                }
+                var args = method.Parameters.Select((p, i) =>
+                    $"global::AiDotNet.Tensors.Engines.Export.EngineArgCoercion.As<{Subst(p.Type)}>(a[{i}])");
+                var call = $"(({decl})e).{method.Name}<TElem, {typeName}>({string.Join(", ", args)})";
+                sb.AppendLine($"                if (second == typeof({typeName})) {{ {(method.ReturnsVoid ? call + ";" : "result = " + call + ";")} return true; }}");
+            }
+            sb.AppendLine("                return false;");
+        }
+        sb.AppendLine("            default: return false;");
+        sb.AppendLine("        }");
+        sb.AppendLine("    }");
         sb.AppendLine("}");
         return sb.ToString();
+    }
+
+    // The element types a program may name (ElementTypes), as C# type names.
+    private static readonly (string Key, string TypeName)[] ElementTypeNames =
+    {
+        ("float", "float"), ("double", "double"), ("half", "global::System.Half"), ("int", "int"), ("long", "long"),
+        ("short", "short"), ("byte", "byte"), ("sbyte", "sbyte"), ("bool", "bool"), ("uint", "uint"), ("ulong", "ulong"),
+        ("ushort", "ushort"), ("decimal", "decimal"),
+    };
+
+    // Every element type is an unmanaged struct, so a struct or unmanaged constraint admits all of them; any other
+    // constraint (a base type or interface) is not something the generator can check, so it admits none.
+    private static IEnumerable<(string Key, string TypeName)> SecondTypeCandidates(ITypeParameterSymbol tp)
+    {
+        if (tp.HasReferenceTypeConstraint || tp.ConstraintTypes.Length > 0) return Array.Empty<(string, string)>();
+        return ElementTypeNames;
+    }
+
+    // An op with two type parameters replays through TryInvoke2 only when its first type parameter is unconstrained
+    // (it is instantiated with the replay element type) and its second admits at least one element type.
+    private static bool CanReplayTwoTypeParameters(IMethodSymbol method)
+    {
+        var first = method.TypeParameters[0];
+        if (first.HasReferenceTypeConstraint || first.HasValueTypeConstraint || first.HasUnmanagedTypeConstraint
+            || first.HasConstructorConstraint || first.ConstraintTypes.Length > 0) return false;
+        if (method.Parameters.Any(p => p.RefKind is RefKind.Ref or RefKind.In or RefKind.Out)) return false;
+        return SecondTypeCandidates(method.TypeParameters[1]).Any();
     }
 
 }
