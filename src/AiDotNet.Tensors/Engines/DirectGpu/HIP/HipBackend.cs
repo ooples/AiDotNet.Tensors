@@ -281,14 +281,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     DeviceMemoryAccount IDeviceMemoryAccounted.MemoryAccount => _memoryAccount;
 
     // A backend collected without Dispose: its modules, hipBLAS handle, stream and pinned host blocks were never released
-    // (there was no finalizer), so every abandoned backend kept them for the life of the process. Its Dispose is handed to
-    // the deferred-free queue the buffer finalizers use, so it runs on an ordinary thread (the next allocation, or the
-    // next HipBackend constructor) and never concurrently with a release of one of its own buffers - the pattern the
-    // OpenCL backend's context and CudaBackend.DrainPendingAbandonedBackends follow.
+    // (there was no finalizer), so every abandoned backend kept them for the life of the process. It is queued for
+    // DrainPendingAbandonedBackends, which runs on an ordinary thread (the next allocation, after that allocation's
+    // buffer frees, or the next HipBackend constructor) and never concurrently with a release of one of its own buffers
+    // - the pattern the OpenCL backend's context and CudaBackend.DrainPendingAbandonedBackends follow. The deferred
+    // teardown binds this backend's device and restores the draining thread's device (TryDisposeAbandoned).
     ~HipBackend()
     {
         if (_disposed || !IsAvailable || DeviceMemoryReclaim.ProcessExiting || RuntimeShutdown.IsTearingDown) return;
-        HipGpuBuffer.PendingFrees.Enqueue(Dispose);
+        PendingAbandonedBackends.Enqueue(this);
     }
 
     // Every module this backend loaded and has not unloaded: unloads claim theirs (UnloadModule), and Dispose unloads
@@ -313,6 +314,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         // Backends collected without Dispose release their resources before this one takes more.
         if (!HipGpuBuffer.PendingFrees.IsEmpty) HipGpuBuffer.PendingFrees.Drain();
+        DrainPendingAbandonedBackends();
         _memoryAccount = DeviceMemoryAccount.For("hip", deviceIndex);
         _kernelCache = new Dictionary<string, IntPtr>();
         DeviceName = "None";
@@ -1610,13 +1612,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         // Imported DLPack memory whose tensor was finalized: the producer gets it back behind our queued work.
         if (!PendingExternalReleases.IsEmpty) DrainPendingExternalReleases();
-        if (HipGpuBuffer.PendingFrees.IsEmpty) return;
-        // A collected buffer re-enters the pool without the implicit device synchronization hipFree performed. On one
-        // in-order stream the next use is ordered after every earlier one; once a caller has its own streams, queued work
-        // there may still be reading it, so wait for the device before anything can rent it again.
-        if (HipGpuBuffer.SecondaryStreamsInUse)
-            HipNativeBindings.CheckError(HipNativeBindings.hipDeviceSynchronize(), "hipDeviceSynchronize");
-        HipGpuBuffer.PendingFrees.Drain();
+        if (!HipGpuBuffer.PendingFrees.IsEmpty)
+        {
+            // A collected buffer re-enters the pool without the implicit device synchronization hipFree performed. On
+            // one in-order stream the next use is ordered after every earlier one; once a caller has its own streams,
+            // queued work there may still be reading it, so wait for the device before anything can rent it again.
+            if (HipGpuBuffer.SecondaryStreamsInUse)
+                HipNativeBindings.CheckError(HipNativeBindings.hipDeviceSynchronize(), "hipDeviceSynchronize");
+            HipGpuBuffer.PendingFrees.Drain();
+        }
+        // After the buffer frees, so an abandoned backend's own buffers are back before its pool is torn down.
+        DrainPendingAbandonedBackends();
     }
 
     // reclaimEpoch: the epoch the allocation's charge is counted in (DeviceMemoryReclaim.OnDeviceRelease).
@@ -11553,11 +11559,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (_disposed) return;
         GC.SuppressFinalize(this);
-        // Finish the device's queued work before anything is torn down: once _disposed is set, the release of an
-        // imported DLPack buffer no longer waits (SynchronizeDeviceForRelease), so its producer's deleter must not be
-        // able to run while one of our kernels still reads the memory.
-        if (IsAvailable && !DeviceMemoryReclaim.ProcessExiting)
+        if (!IsAvailable || DeviceMemoryReclaim.ProcessExiting)
         {
+            DisposeResources();
+            return;
+        }
+        // hipSetDevice is per thread: the teardown binds this backend's device, and the caller's device comes back
+        // afterwards, so disposing a backend of another device does not move the caller's later work.
+        RunBoundToDevice(_hipDeviceIndex, CurrentDeviceOfThisThread, BindDeviceToThisThread, () =>
+        {
+            // Finish the device's queued work before anything is torn down: once _disposed is set, the release of an
+            // imported DLPack buffer no longer waits (SynchronizeDeviceForRelease), so its producer's deleter must not
+            // be able to run while one of our kernels still reads the memory.
             try
             {
                 ((IThreadContextBackend)this).EnsureContextCurrent();
@@ -11568,7 +11581,96 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 // A faulted device has no work left running; tear down regardless.
                 System.Diagnostics.Debug.WriteLine($"HIP device synchronize before Dispose failed: {ex}");
             }
+            DisposeResources();
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> with <paramref name="device"/> bound to the calling thread and binds the thread's
+    /// previous device again afterwards (also when <paramref name="body"/> throws) — the HIP counterpart of CUDA's
+    /// cuCtxPushCurrent/cuCtxPopCurrent around a teardown. The device query and bind are parameters so the
+    /// save/restore contract is testable without a HIP device.
+    /// </summary>
+    internal static bool RunBoundToDevice(int device, Func<int> currentDevice, Action<int> bindDevice, Func<bool> body)
+    {
+        int previous = currentDevice();
+        bool rebind = previous != device;
+        if (rebind) bindDevice(device);
+        try
+        {
+            return body();
         }
+        finally
+        {
+            if (rebind) bindDevice(previous);
+        }
+    }
+
+    private static int CurrentDeviceOfThisThread() => HipNativeBindings.GetCurrentDevice("hipGetDevice(Dispose)");
+
+    private static void BindDeviceToThisThread(int device) =>
+        HipNativeBindings.SetCurrentDevice(device, "hipSetDevice(Dispose)");
+
+    // Backends collected without Dispose (queued by the finalizer). Each is disposed on an ordinary thread - the next
+    // allocation's drain, or the next HipBackend constructor - after the buffer frees queued before it.
+    internal static readonly System.Collections.Concurrent.ConcurrentQueue<HipBackend> PendingAbandonedBackends = new();
+
+    [ThreadStatic] private static bool t_drainingAbandonedBackends;
+
+    /// <summary>
+    /// Disposes the backends collected without Dispose whose work has finished. One still running is put back for a
+    /// later drain rather than waited for: the draining thread belongs to an unrelated operation, possibly on another
+    /// device, and must not stall on (or synchronize) that device.
+    /// </summary>
+    internal static void DrainPendingAbandonedBackends()
+    {
+        if (PendingAbandonedBackends.IsEmpty || t_drainingAbandonedBackends) return;
+        t_drainingAbandonedBackends = true;
+        try
+        {
+            // Only the backends queued when the drain began: one put back is retried at a later drain, not spun on.
+            for (int pending = PendingAbandonedBackends.Count; pending > 0; pending--)
+            {
+                if (!PendingAbandonedBackends.TryDequeue(out var backend)) break;
+                bool done;
+                try { done = backend.TryDisposeAbandoned(); }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    // A device gone or faulted: the driver reclaims what is left with the process.
+                    System.Diagnostics.Debug.WriteLine($"Deferred HIP backend dispose failed: {ex}");
+                    done = true;
+                }
+                if (!done) PendingAbandonedBackends.Enqueue(backend);
+            }
+        }
+        finally
+        {
+            t_drainingAbandonedBackends = false;
+        }
+    }
+
+    /// <summary>
+    /// The deferred Dispose of a backend collected without Dispose. Its device is bound for the teardown (module
+    /// unloads, frees and handle destroys act on the current device) and the draining thread's device is bound again
+    /// afterwards. There is no device-wide synchronize: nothing can queue new work on an unreachable backend, so its
+    /// own stream finishing is all the teardown needs, and that is polled (hipStreamQuery) rather than waited for.
+    /// Returns false, changing nothing, while that stream still has work.
+    /// </summary>
+    private bool TryDisposeAbandoned()
+    {
+        if (_disposed || !IsAvailable || DeviceMemoryReclaim.ProcessExiting || RuntimeShutdown.IsTearingDown) return true;
+        return RunBoundToDevice(_hipDeviceIndex, CurrentDeviceOfThisThread, BindDeviceToThisThread, () =>
+        {
+            if (_stream != IntPtr.Zero && HipNativeBindings.hipStreamQuery(_stream) == HipError.ErrorNotReady)
+                return false;
+            DisposeResources();
+            return true;
+        });
+    }
+
+    private void DisposeResources()
+    {
         _disposed = true;
 
         DisposeCompiledCodegenKernels();

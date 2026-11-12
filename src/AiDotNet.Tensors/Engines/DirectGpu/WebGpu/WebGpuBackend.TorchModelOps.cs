@@ -10,9 +10,8 @@ public sealed partial class WebGpuBackend : ITorchModelOpsBackend
         => PortableTorchModelOps.ActivationBackward(LaunchBatch, op, gradOutput, input, gradInput, n, p0, p1);
 
     void ITorchModelOpsBackend.ModelFakeQuantize(IGpuBuffer input, IGpuBuffer partial, IGpuBuffer minMax, IGpuBuffer output, IGpuBuffer mask, int n,
-        bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint)
-        => PortableTorchModelOps.FakeQuantize(LaunchBatch, input, partial, minMax, output, mask, n, derive, symmetric, hasZeroPoint,
-            qMin, qMax, fixedStep, zeroPoint);
+        int numBits, bool symmetric, double scale, int? zeroPoint)
+        => PortableTorchModelOps.FakeQuantize(LaunchBatch, input, partial, minMax, output, mask, n, numBits, symmetric, scale, zeroPoint);
 
     void ITorchModelOpsBackend.ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratchValues, IGpuBuffer scratchIndices, IGpuBuffer scratchWeights, IGpuBuffer output, int rows, int width, int k)
         => PortableTorchModelOps.TopKSoftmax(LaunchBatch, input, scratchValues, scratchIndices, scratchWeights, output, rows, width, k);

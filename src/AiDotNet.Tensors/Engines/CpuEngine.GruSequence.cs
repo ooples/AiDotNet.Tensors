@@ -273,8 +273,7 @@ public partial class CpuEngine
         var (input, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, present);
         // Under create-graph the gradient must itself be differentiable: differentiate the recurrence written as
         // recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => GruSequenceComposite(e, input, h0, wIh, wHh, bIh, bHh, c.ResetAfter)))
+        if (BackwardFunctions<T>.CreatesGraph && GruSequenceBackwardOnHostCreateGraph<T>(gradOutput, inputs, engine, grads, input, h0, wIh, wHh, bIh, bHh, c))
             return;
         int batch = c.Batch, seqLen = c.SeqLen, hidden = c.Hidden, inFeatures = c.Input, g3 = 3 * hidden;
         var gy = ToDoubles(gradOutput);
@@ -373,6 +372,22 @@ public partial class CpuEngine
         if (bIh is not null) DifferentiableOps.AccumulateGrad(grads, bIh, FromDoubles<T>(gbi, new[] { g3 }), engine);
         if (bHh is not null) DifferentiableOps.AccumulateGrad(grads, bHh, FromDoubles<T>(gbh, new[] { g3 }), engine);
     }
+
+    // The create-graph path of GruSequenceBackwardOnHost, kept out of it so its first-order path allocates no closure.
+    private static bool GruSequenceBackwardOnHostCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> input,
+            Tensor<T>? h0,
+            Tensor<T> wIh,
+            Tensor<T> wHh,
+            Tensor<T>? bIh,
+            Tensor<T>? bHh,
+            GruSequenceCache c)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => GruSequenceComposite(e, input, h0, wIh, wHh, bIh, bHh, c.ResetAfter));
 
     // ── The float path: SIMD GEMMs over time-major caches, batch chunks in parallel ────────────────────────────────
 
@@ -582,8 +597,7 @@ public partial class CpuEngine
         var cache = (GruSequenceCacheFloat)savedState[0];
         var present = (GruOptionalInputs)savedState[1];
         var (input, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, present);
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => GruSequenceComposite(e, input, h0, wIh, wHh, bIh, bHh, cache.ResetAfter)))
+        if (BackwardFunctions<T>.CreatesGraph && GruSequenceBackwardFloatCreateGraph<T>(gradOutput, inputs, engine, grads, input, h0, wIh, wHh, bIh, bHh, cache))
             return;
         int batch = cache.Batch, seqLen = cache.SeqLen, hidden = cache.Hidden, inFeatures = cache.Input;
         int g3 = 3 * hidden, rows = seqLen * batch;
@@ -679,6 +693,22 @@ public partial class CpuEngine
             pool.Return(gxTimeMajor);
         }
     }
+
+    // The create-graph path of GruSequenceBackwardFloat, kept out of it so its first-order path allocates no closure.
+    private static bool GruSequenceBackwardFloatCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> input,
+            Tensor<T>? h0,
+            Tensor<T> wIh,
+            Tensor<T> wHh,
+            Tensor<T>? bIh,
+            Tensor<T>? bHh,
+            GruSequenceCacheFloat cache)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => GruSequenceComposite(e, input, h0, wIh, wHh, bIh, bHh, cache.ResetAfter));
 
     /// <summary>
     /// One row of the GRU backward's gate gradients (see <see cref="GruSequenceBackwardFloat{T}"/>), SIMD-wide: each

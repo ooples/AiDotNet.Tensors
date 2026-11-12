@@ -158,6 +158,17 @@ public sealed class GradientTape<T> : IDisposable
     /// <summary>Internal access to tape entries for compiled backward hash validation.</summary>
     internal TapeEntryArena<T> Entries => _entries;
 
+    // How many records a bounded tape (MaxEntries) has dropped since it was created. A caller that walks a span of
+    // entries it just recorded (BackwardFunctions.TryCompositeBackward) compares it before and after: a drop means the
+    // span is missing ops, and walking it would leave some inputs without a gradient.
+    private long _droppedEntryCount;
+
+    /// <summary>How many records this bounded tape has dropped at capacity (see <see cref="GradientTapeOptions.MaxEntries"/>).</summary>
+    internal long DroppedEntryCount => _droppedEntryCount;
+
+    /// <summary>True when a bounded tape has no room for another entry.</summary>
+    internal bool IsAtCapacity => _options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries;
+
     /// <summary>
     /// Removes the last entry from the tape. Used by fused operations to replace
     /// individual entries with a single fused entry.
@@ -437,6 +448,7 @@ public sealed class GradientTape<T> : IDisposable
         // the checkpoint segments are replayed with fresh tapes.
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
+            _droppedEntryCount++;
             return; // Drop new entries when at capacity
         }
 
@@ -524,6 +536,7 @@ public sealed class GradientTape<T> : IDisposable
         // Drop new entries when at capacity (bounded tape)
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
+            _droppedEntryCount++;
             accepted = false;
             _discardSlot = default;
             return ref _discardSlot;

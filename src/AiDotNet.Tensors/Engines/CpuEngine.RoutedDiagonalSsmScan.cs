@@ -132,8 +132,7 @@ public partial class CpuEngine
         var input = inputs[0]; var mask = inputs[1]; var transition = inputs[2];
         var inputMap = inputs[3]; var outputMap = inputs[4]; var skip = inputs[5];
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => RoutedDiagonalSsmComposite(e, input, mask, transition, inputMap, outputMap, skip)))
+        if (BackwardFunctions<T>.CreatesGraph && RoutedDiagonalSsmBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, input, mask, transition, inputMap, outputMap, skip))
             return;
         int batch = input.Shape[0], time = input.Shape[1], model = input.Shape[2];
         int experts = mask.Shape[2], state = transition.Shape[1];
@@ -156,6 +155,21 @@ public partial class CpuEngine
         Tensor<T>[] computed = { dx, dm, da, db, dc, dd };
         for (int i = 0; i < inputs.Length; i++) DifferentiableOps.AccumulateGrad(grads, inputs[i], computed[i], engine);
     }
+
+    // The create-graph path of RoutedDiagonalSsmBackward, kept out of it so its first-order path allocates no closure.
+    private static bool RoutedDiagonalSsmBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> input,
+            Tensor<T> mask,
+            Tensor<T> transition,
+            Tensor<T> inputMap,
+            Tensor<T> outputMap,
+            Tensor<T> skip)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => RoutedDiagonalSsmComposite(e, input, mask, transition, inputMap, outputMap, skip));
 
     // The routed scan as recorded ops (the create-graph backward differentiates it):
     // h_t = m_t ⊙ (A ⊙ h_{t-1} + B x_t),  y_t = m_t ⊙ (skip ⊙ x_t + C h_t), per expert.

@@ -56,9 +56,7 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         Tensor<T> input = inputs[0], grid = inputs[1];
         // Under create-graph: differentiate the trilinear (or nearest) sample as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
-                BackwardFunctions<T>.GridSampleRecorded(e, input, grid, (GridSampleMode)savedState[0],
-                    (GridSamplePadding)savedState[1], (bool)savedState[2])))
+        if (BackwardFunctions<T>.CreatesGraph && GridSample3DBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, input, grid, savedState))
             return;
         var x = ToDoubles(input, ops);
         var g = ToDoubles(grid, ops);
@@ -89,6 +87,19 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, input, FromDoubles<T>((int[])input._shape.Clone(), i => dx[i]), engine);
         DifferentiableOps.AccumulateGrad(grads, grid, FromDoubles<T>((int[])grid._shape.Clone(), i => dg[i]), engine);
     }
+
+    // The create-graph path of GridSample3DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GridSample3DBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> input,
+            Tensor<T> grid,
+            object[] savedState)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            BackwardFunctions<T>.GridSampleRecorded(e, input, grid, (GridSampleMode)savedState[0],
+                (GridSamplePadding)savedState[1], (bool)savedState[2]));
 
     // Per-point taps of a 3-D grid sample: up to 8 voxels with their weights and each weight's derivative with
     // respect to the normalized grid coordinates (following PyTorch's GridSampler: unnormalize, then clip or

@@ -603,8 +603,19 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var state = (CrfForwardState)savedState[0];
-        var sourceIndices = Enumerable.Range(0, inputs.Length).ToArray();
-        if (TryCompositeBackwardFor(gradOutput, inputs, engine, grads, sourceIndices, e =>
+        if (CreatesGraph && CrfForwardBackwardWithSecondOrderCreateGraph(gradOutput, inputs, engine, grads, state))
+            return;
+        CrfForwardBackward(gradOutput, inputs, output, savedState, engine, grads);
+    }
+
+    // The create-graph path of CrfForwardBackwardWithSecondOrder, kept out of it so its first-order path allocates no closure.
+    private static bool CrfForwardBackwardWithSecondOrderCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            CrfForwardState state)
+        => TryCompositeBackwardFor(gradOutput, inputs, engine, grads, Enumerable.Range(0, inputs.Length).ToArray(), e =>
             {
                 int batch = state.Batch, steps = state.SeqLen, tags = state.NumTags;
                 var emissions = e.Reshape(inputs[0], new[] { batch, steps, tags });
@@ -624,10 +635,7 @@ internal static partial class BackwardFunctions<T>
                 }
                 if (end is not null) alpha = e.TensorAdd(alpha, Bcast(e, e.Reshape(end, new[] { 1, tags }), alpha._shape));
                 return e.TensorLogSumExp(alpha, 1, keepDims: false);
-            }))
-            return;
-        CrfForwardBackward(gradOutput, inputs, output, savedState, engine, grads);
-    }
+            });
 
     /// <summary>[sin(t·f), cos(t·f)] per timestep (a zero column for an odd width), as recorded ops.</summary>
     internal static void SinusoidalTimeEmbeddingBackwardWithSecondOrder(Tensor<T> gradOutput, Tensor<T>[] inputs,
@@ -635,7 +643,20 @@ internal static partial class BackwardFunctions<T>
     {
         var freq = (double[])savedState[0];
         int embeddingDim = (int)savedState[1];
-        if (TryCompositeBackwardFor(gradOutput, inputs, engine, grads, FirstInput, e =>
+        if (CreatesGraph && SinusoidalTimeEmbeddingBackwardWithSecondOrderCreateGraph(gradOutput, inputs, engine, grads, freq, embeddingDim))
+            return;
+        SinusoidalTimeEmbeddingBackward(gradOutput, inputs, output, savedState, engine, grads);
+    }
+
+    // The create-graph path of SinusoidalTimeEmbeddingBackwardWithSecondOrder, kept out of it so its first-order path allocates no closure.
+    private static bool SinusoidalTimeEmbeddingBackwardWithSecondOrderCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            double[] freq,
+            int embeddingDim)
+        => TryCompositeBackwardFor(gradOutput, inputs, engine, grads, FirstInput, e =>
             {
                 int batch = inputs[0]._shape[0], half = freq.Length;
                 var angle = e.TensorMultiply(Bcast(e, e.Reshape(inputs[0], new[] { batch, 1 }), new[] { batch, half }),
@@ -643,10 +664,7 @@ internal static partial class BackwardFunctions<T>
                 var parts = new List<Tensor<T>> { e.TensorSin(angle), e.TensorCos(angle) };
                 if (embeddingDim > 2 * half) parts.Add(new Tensor<T>(new[] { batch, embeddingDim - 2 * half }));
                 return e.Concat(parts, 1);
-            }))
-            return;
-        SinusoidalTimeEmbeddingBackward(gradOutput, inputs, output, savedState, engine, grads);
-    }
+            });
 
     /// <summary>
     /// The CTC loss −log P(target | x) per batch element by the alpha recursion in log space, as recorded ops over the

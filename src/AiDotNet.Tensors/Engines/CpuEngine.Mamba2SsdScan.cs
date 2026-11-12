@@ -464,8 +464,7 @@ public partial class CpuEngine
         var dParam = inputs[5];
 
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => Mamba2SsdComposite(e, x, delta, aLog, bParam, cParam, dParam, numHeads)))
+        if (BackwardFunctions<T>.CreatesGraph && Mamba2SsdScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, x, delta, aLog, bParam, cParam, dParam, numHeads))
             return;
 
         int batch = x.Shape[0];
@@ -511,6 +510,22 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, cParam, dC, engine);
         DifferentiableOps.AccumulateGrad(grads, dParam, dD, engine);
     }
+
+    // The create-graph path of Mamba2SsdScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool Mamba2SsdScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> x,
+            Tensor<T> delta,
+            Tensor<T> aLog,
+            Tensor<T> bParam,
+            Tensor<T> cParam,
+            Tensor<T> dParam,
+            int numHeads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => Mamba2SsdComposite(e, x, delta, aLog, bParam, cParam, dParam, numHeads));
 
     // The SSD recurrence as recorded ops, per head h: h_t = exp(Δ_t[h]·-exp(aLog[h])) h_{t-1} + Δ_t[h] B_t x_t,
     // y_t = Σ_n C_t h_t + D[h] x_t.

@@ -370,8 +370,7 @@ public partial class CpuEngine
 
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded
         // ops. Its square root's derivative is the exact one; the kernel below clips it at ±1000 (RecurrentGemma).
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => RgLruComposite(e, value, recGate, inpGate, decay)))
+        if (BackwardFunctions<T>.CreatesGraph && RgLruScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, value, recGate, inpGate, decay))
             return;
 
         int batch = value.Shape[0];
@@ -408,6 +407,19 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, inpGate, dI, engine);
         DifferentiableOps.AccumulateGrad(grads, decay, dDecay, engine);
     }
+
+    // The create-graph path of RgLruScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool RgLruScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> value,
+            Tensor<T> recGate,
+            Tensor<T> inpGate,
+            Tensor<T> decay)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => RgLruComposite(e, value, recGate, inpGate, decay));
 
     // The RG-LRU scan as recorded ops: a_t = r_t ⊙ sigmoid(-decay), h_t = a_t ⊙ h_{t-1} + sqrt(max(1 - a_t², 0)) ⊙ i_t ⊙ v_t,
     // with the square root differentiated as the kernel differentiates it (see RgLruInputScale).

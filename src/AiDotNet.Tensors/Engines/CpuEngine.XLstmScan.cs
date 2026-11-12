@@ -529,8 +529,7 @@ public partial class CpuEngine
     {
         int numHeads = (int)savedState[0];
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => XLstmScanComposite(e, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], numHeads)))
+        if (BackwardFunctions<T>.CreatesGraph && XLstmScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, numHeads))
             return;
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
@@ -586,6 +585,16 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, fGate, dF, engine);
         DifferentiableOps.AccumulateGrad(grads, oGate, dO, engine);
     }
+
+    // The create-graph path of XLstmScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool XLstmScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int numHeads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => XLstmScanComposite(e, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], numHeads));
 
     // The mLSTM recurrence as recorded ops (see XLstmScanForward). The input gate's clamp and the normaliser's
     // max(|n·q|, 1) select their branch through constant masks read from the values, as their derivatives do.

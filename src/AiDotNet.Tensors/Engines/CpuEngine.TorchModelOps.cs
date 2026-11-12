@@ -250,8 +250,19 @@ public partial class CpuEngine
 
     #region Linear-chain CRF
 
-    /// <inheritdoc/>
-    public virtual Tensor<T> TensorCrfForward<T>(Tensor<T> emissions, Tensor<T> transitions, Tensor<T>? startScores = null, Tensor<T>? endScores = null)
+    /// <summary>
+    /// The largest forward-backward state <see cref="TensorCrfForward{T}"/> accepts:
+    /// batch * seqLen * numTags + 2 * batch * (seqLen + 1) elements (the log-alpha rows plus two per-step offsets per
+    /// sequence, the GPU's scratch layout), which must index with an int.
+    /// </summary>
+    internal const long MaxCrfStateLength = int.MaxValue;
+
+    /// <summary>
+    /// Every argument check of <see cref="TensorCrfForward{T}"/>, shared by every engine and run before anything is
+    /// recorded, allocated or launched, so the CPU and GPU engines reject the same inputs with the same exception.
+    /// </summary>
+    private protected static void ValidateCrfForwardArguments<T>(Tensor<T> emissions, Tensor<T> transitions, Tensor<T>? startScores,
+        Tensor<T>? endScores)
     {
         if (emissions == null) throw new ArgumentNullException(nameof(emissions));
         if (transitions == null) throw new ArgumentNullException(nameof(transitions));
@@ -269,6 +280,22 @@ public partial class CpuEngine
             throw new ArgumentException($"startScores must hold {numTags} scores; got {startScores.Length}.", nameof(startScores));
         if (endScores is not null && endScores.Length != numTags)
             throw new ArgumentException($"endScores must hold {numTags} scores; got {endScores.Length}.", nameof(endScores));
+        long stateLength = (long)batch * seqLen * numTags + 2L * batch * (seqLen + 1L);
+        if (stateLength > MaxCrfStateLength)
+            throw new ArgumentException(
+                $"emissions [batch={batch}, seqLen={seqLen}, numTags={numTags}] is too large for TensorCrfForward: its " +
+                $"forward-backward state, batch * seqLen * numTags + 2 * batch * (seqLen + 1) = {stateLength} elements, " +
+                $"exceeds {MaxCrfStateLength}. Split the batch or the sequences.", nameof(emissions));
+    }
+
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorCrfForward<T>(Tensor<T> emissions, Tensor<T> transitions, Tensor<T>? startScores = null, Tensor<T>? endScores = null)
+    {
+        ValidateCrfForwardArguments(emissions, transitions, startScores, endScores);
+        bool batched = emissions.Rank == 3;
+        int batch = batched ? emissions._shape[0] : 1;
+        int seqLen = emissions._shape[emissions.Rank - 2];
+        int numTags = emissions._shape[emissions.Rank - 1];
         if (TryRecordCompiledOp("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores },
                 e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var compiledNode))
             return compiledNode;

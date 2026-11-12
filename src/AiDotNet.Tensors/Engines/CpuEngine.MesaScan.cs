@@ -218,8 +218,7 @@ public partial class CpuEngine
         int batch = q.Shape[0], time = q.Shape[1], model = q.Shape[2], dim = model / heads;
 
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => MesaScanComposite(e, q, k, v, w0, MathHelper.GetNumericOperations<T>().ToDouble(regularization), heads)))
+        if (BackwardFunctions<T>.CreatesGraph && MesaScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, q, k, v, w0, regularization, heads))
             return;
 
         var dq = new Tensor<T>(q.Shape.ToArray());
@@ -249,6 +248,21 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, v, dv, engine);
         DifferentiableOps.AccumulateGrad(grads, w0, dw0, engine);
     }
+
+    // The create-graph path of MesaScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool MesaScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> q,
+            Tensor<T> k,
+            Tensor<T> v,
+            Tensor<T> w0,
+            T regularization,
+            int heads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => MesaScanComposite(e, q, k, v, w0, MathHelper.GetNumericOperations<T>().ToDouble(regularization), heads));
 
     // The recursive-least-squares scan as recorded ops, per head (P_0 = I/λ, W_0 = initialWeights[h]):
     // p = P k, P ← P - p pᵀ / (1 + kᵀ p), W ← W - (W k - v)(kᵀ P), y = W q.

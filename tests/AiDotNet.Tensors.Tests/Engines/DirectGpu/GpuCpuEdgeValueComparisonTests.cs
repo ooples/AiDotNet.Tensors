@@ -60,6 +60,40 @@ public sealed class GpuCpuEdgeValueComparisonTests
         return (a, b);
     }
 
+    /// <summary>Every (x, lo, hi) triple of the edge values: x varies fastest.</summary>
+    private static (float[] X, float[] Lo, float[] Hi) Triples()
+    {
+        var x = new float[N * N * N];
+        var lo = new float[N * N * N];
+        var hi = new float[N * N * N];
+        int k = 0;
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < N; j++)
+                for (int m = 0; m < N; m++, k++)
+                {
+                    x[k] = Edges[m];
+                    lo[k] = Edges[j];
+                    hi[k] = Edges[i];
+                }
+        return (x, lo, hi);
+    }
+
+    /// <summary>
+    /// Max-pool inputs: one channel per (a, b) pairing, laid out [1, N*N, 2, 4] with every row a, b, b, a, so a 2x2
+    /// window holds a, b, a, b and the next one b, a, b, a (both orders of each pair, ties included).
+    /// </summary>
+    private static float[] PoolPlanes(float[] pa, float[] pb)
+    {
+        var planes = new float[N * N * 8];
+        for (int c = 0; c < N * N; c++)
+            for (int row = 0; row < 2; row++)
+            {
+                int o = c * 8 + row * 4;
+                planes[o] = pa[c]; planes[o + 1] = pb[c]; planes[o + 2] = pb[c]; planes[o + 3] = pa[c];
+            }
+        return planes;
+    }
+
     // An op runs its engine calls and returns a reader of its results, called only after the run, so that reading the
     // results back is not counted as a transfer of the op.
     private delegate Func<float[]> Op(IEngine engine, Func<float[], int[], Tensor<float>> make);
@@ -135,6 +169,26 @@ public sealed class GpuCpuEdgeValueComparisonTests
         yield return ("ClampTensorMin", (e, make) => F(e.TensorClampTensor(make(pa, pairShape), make(pb, pairShape), null)), true);
         yield return ("ClampTensorMax", (e, make) => F(e.TensorClampTensor(make(pa, pairShape), null, make(pb, pairShape))), true);
 
+        // Clamp with any scalar bounds: NaN bounds (ignored on the CPU) and inverted bounds (the upper bound wins).
+        yield return ("ClampAnyBounds", (e, make) =>
+        {
+            var t = make(Edges, edgeShape);
+            return All(from lo in Edges from hi in Edges select F(e.TensorClamp(t, lo, hi)));
+        }, true);
+        yield return ("Clip", (e, make) =>
+        {
+            var t = make(Edges, edgeShape);
+            var bounds = Edges.Where(v => !float.IsNaN(v)).ToArray();
+            return All(from lo in bounds from hi in bounds where lo <= hi select F(e.TensorClip(t, lo, hi)));
+        }, true);
+
+        // Tensor clamp with both bounds over every (x, lo, hi) triple of edge values.
+        var (tx, tlo, thi) = Triples();
+        int[] tripleFlatShape = { N * N * N };
+        yield return ("ClampTensorBoth", (e, make) =>
+            F(e.TensorClampTensor(make(tx, tripleFlatShape), make(tlo, tripleFlatShape), make(thi, tripleFlatShape))), true);
+        yield return ("ReLU6", (e, make) => F(e.TensorReLU6(make(Edges, edgeShape))), true);
+
         // Unary forms.
         (string, Func<IEngine, Tensor<float>, Func<float[]>>)[] unary =
         {
@@ -144,6 +198,8 @@ public sealed class GpuCpuEdgeValueComparisonTests
             ("IsNan", (e, t) => F(e.TensorIsNan(t))),
             ("IsInf", (e, t) => F(e.TensorIsInf(t))),
             ("IsFinite", (e, t) => F(e.TensorIsFinite(t))),
+            ("NanToNum", (e, t) => F(e.TensorNanToNum(t))),
+            ("NanToNumValues", (e, t) => F(e.TensorNanToNum(t, 7.0, 1.5, -2.5))),
         };
         foreach (var (name, f) in unary)
             yield return (name, (e, make) => f(e, make(Edges, edgeShape)), true);
@@ -174,6 +230,43 @@ public sealed class GpuCpuEdgeValueComparisonTests
             yield return (name + "Pairs", (e, make) => f(e, make(rows, rowShape)), true);
             yield return (name + "Triples", (e, make) => f(e, make(triples, tripleShape)), true);
         }
+
+        // Running max / min along the last axis (pairs and triples) and along a leading axis.
+        var columns = pa.Concat(pb).ToArray();
+        int[] columnShape = { 2, N * N };
+        (string, Func<IEngine, Tensor<float>, int, Func<float[]>>)[] scans =
+        {
+            ("CumMax", (e, t, axis) => F(e.TensorCumMax(t, axis))),
+            ("CumMin", (e, t, axis) => F(e.TensorCumMin(t, axis))),
+        };
+        foreach (var (name, f) in scans)
+        {
+            yield return (name + "Pairs", (e, make) => f(e, make(rows, rowShape), 1), true);
+            yield return (name + "Triples", (e, make) => f(e, make(triples, tripleShape), 1), true);
+            yield return (name + "Axis0", (e, make) => f(e, make(columns, columnShape), 0), true);
+        }
+
+        // Max pooling: every window holds one (a, b) pairing in both orders.
+        var planes = PoolPlanes(pa, pb);
+        int[] planeShape = { 1, N * N, 2, 4 };
+        (string, Func<IEngine, Func<int[], Tensor<float>>, Func<float[]>>)[] pools =
+        {
+            ("MaxPool2D", (e, p) => F(e.MaxPool2D(p(planeShape), 2))),
+            ("MaxPool2DPadded", (e, p) => F(e.MaxPool2D(p(planeShape), 3, 1, 1))),
+            ("TensorMaxPool2D", (e, p) => F(e.TensorMaxPool2D(p(planeShape), 2, 2, 0))),
+            ("MaxPool2DWithIndices", (e, p) =>
+            {
+                var values = e.MaxPool2DWithTensorIndices(p(planeShape), new[] { 2, 2 }, new[] { 2, 2 }, out var indices);
+                return All(new[] { F(values), F(indices) });
+            }),
+            ("MaxPool3D", (e, p) => F(e.MaxPool3D(p(new[] { 1, N * N, 2, 2, 2 }), 2))),
+            ("MaxPool1D", (e, p) => F(e.TensorMaxPool1D(p(new[] { 1, N * N, 8 }), 2, 2))),
+            ("GlobalMaxPool2D", (e, p) => F(e.GlobalMaxPool2D(p(planeShape)))),
+            ("AdaptiveMaxPool2D", (e, p) => F(e.TensorAdaptiveMaxPool2D(p(planeShape), new[] { 1, 2 }))),
+            ("AdaptiveMaxPool2DGlobal", (e, p) => F(e.TensorAdaptiveMaxPool2D(p(planeShape), new[] { 1, 1 }))),
+        };
+        foreach (var (name, f) in pools)
+            yield return (name, (e, make) => f(e, shape => make(planes, shape)), true);
 
         // Whole-tensor extrema of every pair (these return a host scalar, so the residency check does not apply).
         yield return ("MaxValue", (e, make) =>

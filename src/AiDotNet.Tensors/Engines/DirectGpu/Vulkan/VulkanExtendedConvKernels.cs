@@ -256,10 +256,13 @@ void main() {
     gradWeights[idx] = sum;
 }";
 
+    // The CPU max-pool rule on uint-bound bit patterns (ExactFloatKernels): the bin's first cell, then only a
+    // strictly greater one.
     public static readonly string AdaptiveMaxPool2D = @"#version 450
 layout(local_size_x = 256) in;
-layout(set=0,binding=0) readonly buffer Input { float input_[]; };
-layout(set=0,binding=1) writeonly buffer Output { float output_[]; };
+" + ExactFloatKernels.Glsl + @"
+layout(set=0,binding=0) readonly buffer Input { uint input_[]; };
+layout(set=0,binding=1) writeonly buffer Output { uint output_[]; };
 layout(push_constant) uniform PC { int batch; int channels; int inHeight; int inWidth; int outHeight; int outWidth; };
 void main() {
     int idx = int(gl_GlobalInvocationID.x);
@@ -272,11 +275,12 @@ void main() {
     int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
     int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
-    float maxV = -3.402823466e38;
+    uint maxV = 0xFF800000u;
+    bool have = false;
     for (int ih = hStart; ih < hEnd; ih++) {
         for (int iw = wStart; iw < wEnd; iw++) {
-            float v = input_[((b * channels + c) * inHeight + ih) * inWidth + iw];
-            if (v > maxV) maxV = v;
+            uint v = input_[((b * channels + c) * inHeight + ih) * inWidth + iw];
+            if (!have || xf_gt(v, maxV)) { maxV = v; have = true; }
         }
     }
     output_[((b * channels + c) * outHeight + oh) * outWidth + ow] = maxV;
