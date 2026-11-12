@@ -339,6 +339,33 @@ public class LinalgDecimalReferenceTests
         Assert.True(Math.Abs((float)Linalg.Det(t).GetDataArray()[0] - 70f) <= 1f);
     }
 
+    // Eig of diag(1, 2) in a narrow type: each eigenvector must be the axis of its own eigenvalue. An early exit once
+    // accepted the first seed (the other eigenvalue's axis, residual 0.5 after scaling) and returned duplicate directions.
+    [Fact]
+    public void BFloat16_Eig_OfDiagonal_ReturnsEachEigenvalueItsOwnAxis() =>
+        AssertDiagonalEigAxes(new[] { BFloat16.FromFloat(1f), BFloat16.FromFloat(0f), BFloat16.FromFloat(0f), BFloat16.FromFloat(2f) });
+
+    [Fact]
+    public void Half_Eig_OfDiagonal_ReturnsEachEigenvalueItsOwnAxis() =>
+        AssertDiagonalEigAxes(new[] { (Half)1f, (Half)0f, (Half)0f, (Half)2f });
+
+    private static void AssertDiagonalEigAxes<TNum>(TNum[] values)
+        where TNum : unmanaged, IEquatable<TNum>, IComparable<TNum>
+    {
+        var ops = AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<TNum>();
+        var (w, v) = Linalg.Eig(new Tensor<TNum>(values, new[] { 2, 2 }));
+        var wd = w.ToArray(); var vd = v.ToArray();
+        for (int k = 0; k < 2; k++)
+        {
+            double lambda = ops.ToDouble(wd[k * 2]);
+            int axis = Math.Abs(lambda - 1.0) < 0.05 ? 0 : 1;
+            Assert.True(Math.Abs(lambda - (axis + 1)) < 0.05, $"eigenvalue {k} = {lambda}, expected 1 or 2");
+            // Column k is +-e_axis: unit magnitude on its own axis, zero on the other.
+            Assert.True(Math.Abs(Math.Abs(ops.ToDouble(vd[(axis * 2 + k) * 2])) - 1.0) < 0.02, $"column {k} is not on axis {axis}");
+            Assert.True(Math.Abs(ops.ToDouble(vd[((1 - axis) * 2 + k) * 2])) < 0.02, $"column {k} has a component off axis {axis}");
+        }
+    }
+
     [Fact]
     public void Half_Eigh_And_Solve_WithinHalfPrecision()
     {

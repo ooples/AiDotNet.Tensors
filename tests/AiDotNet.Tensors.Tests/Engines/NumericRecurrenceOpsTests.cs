@@ -376,11 +376,14 @@ public class NumericRecurrenceOpsTests
     // 2^53 + 1 and 2^53 are one double: through double all four costs tie and the lowest column wins, [0, 1], at an
     // exact cost of 2^54 + 2; the exact minimum is [1, 0] at 2^54. Decimal costs below double's precision likewise.
     [Fact]
-    public void Assignment_LongAndDecimalCosts_CompareExactly()
+    public void Assignment_LongULongAndDecimalCosts_CompareExactly()
     {
         const long p = 9007199254740992L;
         var longs = new Tensor<long>(new[] { p + 1, p, p, p + 1 }, new[] { 2, 2 });
         Assert.Equal(new[] { 1, 0 }, _engine.TensorLinearSumAssignment(longs).ToArray());
+        const ulong up = 9007199254740992UL;
+        var ulongs = new Tensor<ulong>(new[] { up + 1, up, up, up + 1 }, new[] { 2, 2 });
+        Assert.Equal(new[] { 1, 0 }, _engine.TensorLinearSumAssignment(ulongs).ToArray());
         decimal q = 1m, e = 0.0000000000000000000001m;
         var decimals = new Tensor<decimal>(new[] { q + e, q, q, q + e }, new[] { 2, 2 });
         Assert.Equal(new[] { 1, 0 }, _engine.TensorLinearSumAssignment(decimals).ToArray());

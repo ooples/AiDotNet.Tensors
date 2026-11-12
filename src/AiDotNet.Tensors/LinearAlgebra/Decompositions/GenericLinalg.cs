@@ -850,8 +850,12 @@ internal static class GenericLinalg<T>
         Real<T> bestResidual = Real<T>.Zero;
         bool haveBest = false;
         // Rounding in the residual grows with n, so the acceptance does too; the first seed that reaches it ends the
-        // search (each further seed costs three O(m^2) solves and an O(n^2) residual).
-        Real<T> accept = Real<T>.Int(EigenvectorAcceptFactor) * Real<T>.Int(Math.Max(n, 1)) * Eps;
+        // search (each further seed costs three O(m^2) solves and an O(n^2) residual). It never exceeds sqrt(Eps): in
+        // BFloat16 (Eps = 1/128) the n-scaled bound reaches 1 for n = 2, which accepted a seed still parallel to another
+        // eigenvalue's axis (residual 0.5 on diag(0.5, 1)); sqrt(Eps) leaves double's bound unchanged.
+        Real<T> scaledAccept = Real<T>.Int(EigenvectorAcceptFactor) * Real<T>.Int(Math.Max(n, 1)) * Eps;
+        Real<T> rootEps = Real<T>.Sqrt(Eps);
+        Real<T> accept = scaledAccept < rootEps ? scaledAccept : rootEps;
         for (int seed = 0; seed < n; seed++)
         {
             if (haveBest && bestResidual <= accept) break;

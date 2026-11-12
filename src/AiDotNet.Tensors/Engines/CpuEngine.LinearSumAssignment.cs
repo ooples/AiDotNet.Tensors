@@ -18,9 +18,10 @@ public partial class CpuEngine
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
         var (batch, size) = LinearSumAssignmentShape(cost);
-        // long and decimal costs can differ below double's 53-bit mantissa (2^53 + 1 and 2^53 are one double), so they
-        // solve in decimal, which holds every long exactly; every other element type converts to double exactly.
-        var result = typeof(T) == typeof(long) || typeof(T) == typeof(decimal)
+        // long, ulong and decimal costs can differ below double's 53-bit mantissa (2^53 + 1 and 2^53 are one double), so
+        // they solve in decimal, which holds every long and ulong exactly; every other element type converts to double
+        // exactly.
+        var result = typeof(T) == typeof(long) || typeof(T) == typeof(ulong) || typeof(T) == typeof(decimal)
             ? LinearSumAssignmentExact(ToDecimals(cost), batch, size)
             : LinearSumAssignmentHost(RoIAlignPlan.ToDoubles(cost), batch, size);
         return new Tensor<int>(result, cost.Rank == 2 ? new[] { size } : new[] { batch, size });
@@ -32,15 +33,17 @@ public partial class CpuEngine
         var result = new decimal[cost.Length];
         if (values is long[] longs)
             for (int i = 0; i < result.Length; i++) result[i] = longs[i];
+        else if (values is ulong[] ulongs)
+            for (int i = 0; i < result.Length; i++) result[i] = ulongs[i];
         else
             Array.Copy((decimal[])(object)values, result, result.Length);
         return result;
     }
 
     /// <summary>
-    /// <see cref="LinearSumAssignmentHost"/> in decimal arithmetic, for long and decimal costs. The solver's duals and
+    /// <see cref="LinearSumAssignmentHost"/> in decimal arithmetic, for long, ulong and decimal costs. The solver's duals and
     /// path costs stay within (2S + 2) times the largest cost magnitude, so the costs must satisfy
-    /// <c>max|cost| * 4 (S + 1) &lt;= decimal.MaxValue</c> (every long cost does for S below 2 * 10^9).
+    /// <c>max|cost| * 4 (S + 1) &lt;= decimal.MaxValue</c> (every long or ulong cost does for S below 10^9).
     /// </summary>
     internal static int[] LinearSumAssignmentExact(decimal[] cost, int batch, int size)
     {
