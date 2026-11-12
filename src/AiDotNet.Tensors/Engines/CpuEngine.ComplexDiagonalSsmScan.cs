@@ -211,8 +211,7 @@ public partial class CpuEngine
     {
         var xTensor = inputs[0];
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => ComplexDiagonalSsmComposite(e, inputs)))
+        if (BackwardFunctions<T>.CreatesGraph && ComplexDiagonalSsmScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads))
             return;
         int batch = xTensor.Shape[0];
         int time = xTensor.Shape[1];
@@ -237,6 +236,15 @@ public partial class CpuEngine
         for (int i = 0; i < gradients.Length; i++)
             DifferentiableOps.AccumulateGrad(grads, inputs[i], gradients[i], engine);
     }
+
+    // The create-graph path of ComplexDiagonalSsmScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ComplexDiagonalSsmScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => ComplexDiagonalSsmComposite(e, inputs));
 
     // The complex diagonal scan as recorded ops (the create-graph backward differentiates it):
     // h_t = A ⊙ h_{t-1} + B x_t (complex A, B; real x),  y_t = skip ⊙ x_t + Re(C h_t).

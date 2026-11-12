@@ -535,8 +535,7 @@ public partial class CpuEngine
     {
         int numHeads = (int)savedState[0];
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => GlaScanComposite(e, inputs[0], inputs[1], inputs[2], inputs[3], numHeads)))
+        if (BackwardFunctions<T>.CreatesGraph && GlaScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, numHeads))
             return;
         // Device backward on the GPU engine. A compiled plan records this function from the CPU base (GraphMode)
         // and replays it on the GPU engine, so it ran the managed BPTT recurrence with host copies around it on
@@ -598,6 +597,16 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, vProj, dV, engine);
         DifferentiableOps.AccumulateGrad(grads, gate, dG, engine);
     }
+
+    // The create-graph path of GlaScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GlaScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int numHeads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => GlaScanComposite(e, inputs[0], inputs[1], inputs[2], inputs[3], numHeads));
 
     // The GLA recurrence as recorded ops, per head: S_t = g_t S_{t-1} + v_t k_tᵀ, o_t = S_t q_t.
     private static Tensor<T> GlaScanComposite<T>(IEngine e, Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,

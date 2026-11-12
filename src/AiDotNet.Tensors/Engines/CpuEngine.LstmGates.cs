@@ -72,18 +72,7 @@ public partial class CpuEngine
     {
         // Under create-graph: differentiate the packet [h, c] written with the recorded gate ops (the decomposed form
         // the non-float element types run), so the gradient stays a node of the graph.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradient, inputs, engine, grads, e =>
-            {
-                var gates = inputs[0];
-                var previousCell = inputs[1];
-                int hidden = previousCell.Shape[previousCell.Rank - 1];
-                Tensor<T> Gate(int i) => e.TensorNarrow(gates, gates.Rank - 1, i * hidden, hidden);
-                var c = e.TensorAdd(e.TensorMultiply(e.TensorSigmoid(Gate(1)), previousCell),
-                    e.TensorMultiply(e.TensorSigmoid(Gate(0)), e.Tanh(Gate(2))));
-                var h = e.TensorMultiply(e.TensorSigmoid(Gate(3)), e.Tanh(c));
-                int count = previousCell.Length;
-                return e.Concat(new[] { e.Reshape(h, new[] { count }), e.Reshape(c, new[] { count }) }, 0);
-            }))
+        if (BackwardFunctions<T>.CreatesGraph && LstmGateBackwardCreateGraph(gradient, inputs, engine, grads))
             return;
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryLstmGateBackward(gradient, inputs, output, grads)) return;
         if (typeof(T) == typeof(float))
@@ -119,6 +108,23 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dg, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], dc, engine);
     }
+
+    // The create-graph path of LstmGateBackward, kept out of it so its first-order path allocates no closure.
+    private static bool LstmGateBackwardCreateGraph<T>(Tensor<T> gradient, Tensor<T>[] inputs, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradient, inputs, engine, grads, e =>
+            {
+                var gates = inputs[0];
+                var previousCell = inputs[1];
+                int hidden = previousCell.Shape[previousCell.Rank - 1];
+                Tensor<T> Gate(int i) => e.TensorNarrow(gates, gates.Rank - 1, i * hidden, hidden);
+                var c = e.TensorAdd(e.TensorMultiply(e.TensorSigmoid(Gate(1)), previousCell),
+                    e.TensorMultiply(e.TensorSigmoid(Gate(0)), e.Tanh(Gate(2))));
+                var h = e.TensorMultiply(e.TensorSigmoid(Gate(3)), e.Tanh(c));
+                int count = previousCell.Length;
+                return e.Concat(new[] { e.Reshape(h, new[] { count }), e.Reshape(c, new[] { count }) }, 0);
+            });
+
     private static float[] ActivateLstmGatesFloat(Tensor<float> gates, int hidden)
     {
         var pre = gates.GetFlattenedData();

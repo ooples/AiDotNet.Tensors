@@ -692,8 +692,7 @@ public partial class CpuEngine
         var iclRate = inputs[5];
 
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => Rwkv7SequenceComposite(e, rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads)))
+        if (BackwardFunctions<T>.CreatesGraph && Rwkv7SequenceBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads))
             return;
 
         int batch = rProj.Shape[0];
@@ -738,6 +737,22 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, decayLogit, dD, engine);
         DifferentiableOps.AccumulateGrad(grads, iclRate, dA, engine);
     }
+
+    // The create-graph path of Rwkv7SequenceBackward, kept out of it so its first-order path allocates no closure.
+    private static bool Rwkv7SequenceBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> rProj,
+            Tensor<T> kappa,
+            Tensor<T> kTilde,
+            Tensor<T> vProj,
+            Tensor<T> decayLogit,
+            Tensor<T> iclRate,
+            int numHeads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => Rwkv7SequenceComposite(e, rProj, kappa, kTilde, vProj, decayLogit, iclRate, numHeads));
 
     // The RWKV-7 generalised delta rule as recorded ops, per head (see Rwkv7SequenceForward):
     // κ̂ = κ / sqrt(||κ||² + ε), w = exp(-e^{-1/2} σ(d)), S ← S diag(w) - (S κ̂)(a ⊙ κ̂)ᵀ + v k̃ᵀ, o = S r.

@@ -452,8 +452,7 @@ public partial class CpuEngine
         var timeFirst = inputs[4];
 
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => Rwkv4WkvComposite(e, rProj, kProj, vProj, timeDecay, timeFirst)))
+        if (BackwardFunctions<T>.CreatesGraph && Rwkv4WkvBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, rProj, kProj, vProj, timeDecay, timeFirst))
             return;
 
         int batch = rProj.Shape[0];
@@ -500,6 +499,20 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, timeDecay, dTimeDecay, engine);
         DifferentiableOps.AccumulateGrad(grads, timeFirst, dTimeFirst, engine);
     }
+
+    // The create-graph path of Rwkv4WkvBackward, kept out of it so its first-order path allocates no closure.
+    private static bool Rwkv4WkvBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> rProj,
+            Tensor<T> kProj,
+            Tensor<T> vProj,
+            Tensor<T> timeDecay,
+            Tensor<T> timeFirst)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => Rwkv4WkvComposite(e, rProj, kProj, vProj, timeDecay, timeFirst));
 
     // The WKV recurrence as recorded ops: a_{t+1} = e^w a_t + e^{k_t} v_t, b_{t+1} = e^w b_t + e^{k_t},
     // y_t = σ(r_t) (a_t + e^{u+k_t} v_t) / (b_t + e^{u+k_t}), w = -exp(timeDecay), in the kernel's max-subtracted form:

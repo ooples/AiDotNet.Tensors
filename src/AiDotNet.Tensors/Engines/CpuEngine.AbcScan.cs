@@ -602,8 +602,7 @@ public partial class CpuEngine
         var slotKeys = inputs[4];
 
         // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
-        if (BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-                e => AbcScanComposite(e, qProj, kProj, vProj, forgetGate, slotKeys, numHeads, initScale)))
+        if (BackwardFunctions<T>.CreatesGraph && AbcScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, qProj, kProj, vProj, forgetGate, slotKeys, numHeads, initScale))
             return;
 
         int batch = qProj.Shape[0];
@@ -647,6 +646,22 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, forgetGate, dFG, engine);
         DifferentiableOps.AccumulateGrad(grads, slotKeys, dSK, engine);
     }
+
+    // The create-graph path of AbcScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool AbcScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> qProj,
+            Tensor<T> kProj,
+            Tensor<T> vProj,
+            Tensor<T> forgetGate,
+            Tensor<T> slotKeys,
+            int numHeads,
+            double initScale)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => AbcScanComposite(e, qProj, kProj, vProj, forgetGate, slotKeys, numHeads, initScale));
 
     // The ABC slot recurrence as recorded ops, per head (see AbcScanForward): softmax write against the slot keys,
     // forget-and-write update of the slots, softmax read against the updated slots.
