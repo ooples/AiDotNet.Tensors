@@ -45,9 +45,17 @@ public sealed class CompiledRecurrentCellTests
         plan.SetInputs(new[] { input });
         var actual = plan.Execute().AsSpan().ToArray();
         Assert.Equal(expected.Length, actual.Length);
+        // Eager and compiled need not sum in the same order: outside BlasProvider's deterministic mode a GEMM picks its
+        // kernel by shape and by CpuParallelSettings.MaxDegreeOfParallelism, a process-wide setting other tests change
+        // while this one runs (at one thread [64,512]x[512,1024] takes another kernel than at two or more). Reordering a
+        // K-term fp32 sum moves a result by about eps * sum|terms|, which tracks the output's scale rather than the
+        // element's own size, so an element near zero beside outputs of ~100 moved 4.6e-5 and failed a 1e-5 floor.
+        // The bound therefore scales with the largest output; a miscompile (a wrong or doubled op) errs by O(1) of it.
+        float scale = 1f;
+        foreach (var v in expected) scale = Math.Max(scale, Math.Abs(v));
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f + 1e-4f * Math.Abs(expected[i]),
-                $"{label} [{i}] eager {expected[i]} compiled {actual[i]}");
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * scale + 1e-4f * Math.Abs(expected[i]),
+                $"{label} [{i}] eager {expected[i]} compiled {actual[i]} (output scale {scale})");
     }
 
     /// <summary>

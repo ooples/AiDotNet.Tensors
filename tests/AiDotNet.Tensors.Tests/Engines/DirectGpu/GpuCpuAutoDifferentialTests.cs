@@ -767,6 +767,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "RoutedDiagonalSsmScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
         "Mamba2SsdScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
         "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<Int32>)",
+        "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<Int32>,Boolean)",
         "FusedLinearCrossEntropyWithLogits(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
         // GPU-missing-kernels audit (PR #582): each is verified by a dedicated GPU-vs-CPU parity
         // assertion in GpuMissingKernelsParityTests.cs. They are not driveable by the generic

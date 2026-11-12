@@ -35,10 +35,14 @@ public abstract class StepCountRatchetBase
         var counts = HeadToHeadNetworkHarness.MeasureCompiledStepCounts(root, network, gpu);
         // CPU allocations can differ between the AVX2 and AVX-512 code paths, and CUDA graphs between devices (routes are
         // tuned per device), so each count is keyed by what it depends on. An unseeded combination defers with its value.
+        // CUDA graphs also depend on whether cuDNN serves the convolutions: its kernels replace the engine's own, so the
+        // same device captures a different number of nodes with and without it (the CNN on an RTX 1000 Ada: 37 without,
+        // 43 with). The CUDA lane always installs cuDNN, a developer machine may not, so the two keep separate baselines.
         string device = gpu is null
             ? "cpu:" + (System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated ? "avx512"
                 : System.Runtime.Intrinsics.X86.Avx2.IsSupported ? "avx2" : "scalar")
-            : "cuda:" + (gpu.GetBackend() is { } backend ? backend.DeviceName : "unknown");
+            : "cuda:" + (gpu.GetBackend() is { } backend ? backend.DeviceName : "unknown")
+              + (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.UseCudnnForConv ? ":cudnn" : "");
         string key = $"{network}:{device}";
         _output.WriteLine($"{key}: {counts.AllocatedBytesPerStep} bytes/step" +
             (counts.KernelNodes is { } k ? $", graph kernels {k}, memcpy {counts.MemcpyNodes}, memset {counts.MemsetNodes}" : "") +

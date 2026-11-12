@@ -272,7 +272,64 @@ public sealed unsafe partial class VulkanBackend
         // Issue #285: per-allocation cap check before VkBuffer creation.
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Vulkan);
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && data.Length > 0)
+            return AllocateAndRecordBatchUpload(data);
         return VulkanGpuBuffer.Create(data, _transfer);
+    }
+
+    private VulkanGpuBuffer AllocateAndRecordBatchUpload(float[] data)
+    {
+        var buffer = VulkanGpuBuffer.Create(data.Length);
+        try
+        {
+            if (buffer.Staging.Handle == IntPtr.Zero)
+                throw new InvalidOperationException("Staging buffer handle is invalid after allocation.");
+            buffer.Staging.WriteData(data);
+            lock (_computeLock)
+            {
+                if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
+                {
+                    var batchCmd = _batchThreadRes.CommandBuffer;
+                    ulong copySize = Math.Min((ulong)data.Length * sizeof(float),
+                        Math.Min(buffer.Staging.SizeInBytes, buffer.Storage.SizeInBytes));
+                    var copyRegion = new VkBufferCopy
+                    {
+                        srcOffset = buffer.Staging.Offset,
+                        dstOffset = buffer.Storage.Offset,
+                        size = copySize
+                    };
+                    VulkanNativeBindings.vkCmdCopyBuffer(
+                        batchCmd, buffer.Staging.Handle, buffer.Storage.Handle, 1, &copyRegion);
+
+                    var barrier = new VkBufferMemoryBarrier
+                    {
+                        sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                        pNext = null,
+                        srcAccessMask = VkAccessFlags.VK_ACCESS_TRANSFER_WRITE_BIT,
+                        dstAccessMask = VkAccessFlags.VK_ACCESS_SHADER_READ_BIT | VkAccessFlags.VK_ACCESS_SHADER_WRITE_BIT,
+                        srcQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                        dstQueueFamilyIndex = VulkanNativeBindings.VK_QUEUE_FAMILY_IGNORED,
+                        buffer = buffer.Storage.Handle,
+                        offset = 0,
+                        size = VulkanNativeBindings.VK_WHOLE_SIZE
+                    };
+                    VulkanNativeBindings.vkCmdPipelineBarrier(
+                        batchCmd,
+                        VkPipelineStageFlags.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0, 0, IntPtr.Zero, 1, &barrier, 0, IntPtr.Zero);
+                    HoldBatchUploadBuffer(buffer);
+                    return buffer;
+                }
+            }
+            _transfer!.CopyToDevice(buffer.Staging, buffer.Storage);
+            return buffer;
+        }
+        catch
+        {
+            buffer.Dispose();
+            throw;
+        }
     }
 
     public IGpuBuffer AllocateBuffer(int size)
@@ -290,6 +347,7 @@ public sealed unsafe partial class VulkanBackend
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        ThrowIfPendingBatchUpload(vb, "readback");
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         var result = new float[vb.Size];
@@ -305,6 +363,7 @@ public sealed unsafe partial class VulkanBackend
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        ThrowIfPendingBatchUpload(vb, "readback");
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         vb.Staging.ReadData(destination);
@@ -320,6 +379,7 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({vb.SizeInBytes}).", nameof(byteCount));
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        ThrowIfPendingBatchUpload(vb, "readback");
         GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.Vulkan);
 
         var result = new byte[byteCount];
@@ -368,6 +428,8 @@ public sealed unsafe partial class VulkanBackend
             throw new GpuCapabilityUnavailableException("Vulkan transfer manager not initialized.");
         if (source is not VulkanGpuBuffer src || destination is not VulkanGpuBuffer dst)
             throw new ArgumentException("Buffers must be VulkanGpuBuffer instances.");
+        ThrowIfPendingBatchUpload(src, "copy");
+        ThrowIfPendingBatchUpload(dst, "copy");
 
         GpuLaunchProbe.OnLaunch();
         _transfer.CopyDeviceToDevice(
@@ -397,6 +459,8 @@ public sealed unsafe partial class VulkanBackend
             floatData[i] = Int32BitsToSingleCompat(data[i]);
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
+        if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && floatData.Length > 0)
+            return AllocateAndRecordBatchUpload(floatData);
         return VulkanGpuBuffer.Create(floatData, _transfer);
     }
 

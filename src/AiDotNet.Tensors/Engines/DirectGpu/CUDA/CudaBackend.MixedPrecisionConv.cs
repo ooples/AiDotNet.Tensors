@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// dtype. Consumers that want mixed-precision conv downcast the backend
 /// reference to this interface and dispatch through it.
 /// </summary>
-public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
+public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend, INativeReducedPrecisionConv
 {
     /// <summary>
     /// IDirectGpuBackend.MixedPrecisionConv: CUDA ships the cuDNN-backed
@@ -27,6 +27,14 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend
     /// </summary>
     bool IGpuMixedPrecisionConvBackend.SupportsHalfConv
         => CudaDispatchPolicy.UseCudnnForConv;
+
+    /// <summary>
+    /// cuDNN runs the 16-bit convolutions on tensor cores (math type TensorOp) where the device has them: compute
+    /// capability 7.0+ for FP16 (BF16's own 8.0 floor is <see cref="IGpuMixedPrecisionConvBackend.SupportsBFloat16Conv"/>).
+    /// Below that the "half" convolution is no faster than FP32, so autocast keeps convolutions in FP32 there.
+    /// </summary>
+    bool INativeReducedPrecisionConv.NativeReducedPrecisionMath
+        => CudaDispatchPolicy.UseCudnnForConv && _ccMajor >= 7;
 
     /// <summary>
     /// True when cuDNN BF16 conv is supported — requires compute capability

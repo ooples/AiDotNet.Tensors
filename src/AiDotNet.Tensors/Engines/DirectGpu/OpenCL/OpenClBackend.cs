@@ -9202,8 +9202,8 @@ KERNEL VARIANTS (A/B testing):
             // float bit pattern (net471-compatible), so convert and write the floats into the existing
             // buffer in place (blocking) rather than allocating a new one.
             var floatData = new float[data.Length];
-            for (int i = 0; i < data.Length; i++)
-                floatData[i] = BitConverter.ToSingle(BitConverter.GetBytes(data[i]), 0);
+            if (data.Length > 0)
+                Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
             ((DirectOpenClGpuBuffer)buffer).Buffer.CopyFromHost(floatData);
         }
 
@@ -9258,11 +9258,8 @@ KERNEL VARIANTS (A/B testing):
 
             // Convert int array to float array for storage (net471 compatible)
             var floatData = new float[data.Length];
-            for (int i = 0; i < data.Length; i++)
-            {
-                byte[] bytes = BitConverter.GetBytes(data[i]);
-                floatData[i] = BitConverter.ToSingle(bytes, 0);
-            }
+            if (data.Length > 0)
+                Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, floatData));
