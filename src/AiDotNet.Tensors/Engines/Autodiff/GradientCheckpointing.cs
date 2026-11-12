@@ -64,6 +64,10 @@ public static class GradientCheckpointing<T>
     /// Optional callback invoked during segment backward for each parameter gradient produced by that segment.
     /// Return <c>true</c> when the parameter was updated in-place and its gradient storage can be reclaimed immediately;
     /// return <c>false</c> to accumulate the gradient into the outer tape's gradient dictionary (e.g., for shared/tied weights).
+    /// Requires <paramref name="segmentParameters"/>: without it the recompute differentiates every touched leaf, and the
+    /// callback would be offered intermediate tensors as parameters. The callback runs outside the recompute's tensor
+    /// scope so the optimizer state it creates persists; it should dispose any temporary it creates (an update tensor
+    /// it discards), which otherwise waits for finalization to release its device memory.
     /// </param>
     /// <returns>The final output tensor, with backward support.</returns>
     public static Tensor<T> CheckpointSegments(
@@ -72,7 +76,13 @@ public static class GradientCheckpointing<T>
         IReadOnlyList<IReadOnlyList<Tensor<T>>>? segmentParameters,
         int segmentSize = 2,
         Func<Tensor<T>, Tensor<T>, bool>? tryConsumeParameterGradient = null)
-        => CheckpointCore(functions, input, parameterSourceFactory: null, segmentParameters, segmentSize, tryConsumeParameterGradient);
+    {
+        if (tryConsumeParameterGradient is not null && segmentParameters is null)
+            throw new ArgumentException(
+                "A parameter-gradient consumer needs explicit segment parameter lists: without them every touched leaf, "
+                + "intermediates included, would be offered to it as a parameter.", nameof(segmentParameters));
+        return CheckpointCore(functions, input, parameterSourceFactory: null, segmentParameters, segmentSize, tryConsumeParameterGradient);
+    }
 
     private static Tensor<T> CheckpointCore(
         IReadOnlyList<Func<Tensor<T>, Tensor<T>>> functions,

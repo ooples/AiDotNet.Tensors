@@ -260,6 +260,20 @@ public class GradientCheckpointingSegmentsTests
     }
 
     [Fact]
+    public void CheckpointSegments_ThrowsOnAGradientConsumerWithoutSegmentParameters()
+    {
+        var x = new Tensor<float>(new float[] { 1f, 2f }, new[] { 1, 2 });
+        var funcs = new Func<Tensor<float>, Tensor<float>>[] { h => h, h => h };
+        int offered = 0;
+
+        // Unfiltered, the recompute would offer the consumer every touched leaf, intermediates included.
+        Assert.Throws<ArgumentException>(() =>
+            GradientCheckpointing<float>.CheckpointSegments(funcs, x, segmentParameters: null, segmentSize: 1,
+                tryConsumeParameterGradient: (_, _) => { offered++; return true; }));
+        Assert.Equal(0, offered);
+    }
+
+    [Fact]
     public void CheckpointSegments_SegmentSizeNearIntMax_RunsEveryFunctionAsOneSegment()
     {
         var engine = AiDotNetEngine.Current;
