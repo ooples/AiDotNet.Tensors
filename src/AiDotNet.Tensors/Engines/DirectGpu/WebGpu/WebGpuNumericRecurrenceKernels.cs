@@ -199,6 +199,13 @@ struct Params { T: i32, N: i32, C: i32, SM: i32, blank: i32, first: i32, pad0: i
 
 fn nrec_bits(b: u32) -> f32 { return bitcast<f32>(b); }
 
+// The forward-backward kernel's reader: a stored negative infinity becomes the finite sentinel by its bits, since
+// WGSL may assume no infinities and a direct comparison on -inf is undefined.
+fn nrec_in(x: f32) -> f32 {
+    if (bitcast<u32>(x) == 0xff800000u) { return -1.0e30; }
+    return max(x, -1.0e30);
+}
+
 @compute @workgroup_size(256)
 fn nrec_ctc_posteriors(@builtin(global_invocation_id) gidv: vec3<u32>) {
     let idx = i32(gidv.x) + pm.first * 256;
@@ -209,7 +216,7 @@ fn nrec_ctc_posteriors(@builtin(global_invocation_id) gidv: vec3<u32>) {
     for (var c = 0; c < pm.C; c = c + 1) { gm[o + c] = 0.0; }
     let tn = i32(lens[n]);
     if (t >= tn) { return; }
-    let z = lz[n];
+    let z = nrec_in(lz[n]);
     if (z <= -1.0e29) {
         let qnan = nrec_bits(0x7fc00000u);
         for (var c = 0; c < pm.C; c = c + 1) { gm[o + c] = qnan; }
@@ -220,8 +227,8 @@ fn nrec_ctc_posteriors(@builtin(global_invocation_id) gidv: vec3<u32>) {
     let S = 2 * un + 1;
     let row = (n * pm.T + t) * pm.SM;
     for (var s = 0; s < S; s = s + 1) {
-        let a = la[row + s];
-        let bt = lb[row + s];
+        let a = nrec_in(la[row + s]);
+        let bt = nrec_in(lb[row + s]);
         if (a > -1.0e29 && bt > -1.0e29) {
             var lab = pm.blank;
             if ((s & 1) == 1) { lab = i32(tg[off + (s >> 1u)]); }

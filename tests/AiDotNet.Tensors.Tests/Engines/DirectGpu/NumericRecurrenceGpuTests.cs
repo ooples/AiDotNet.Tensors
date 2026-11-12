@@ -32,6 +32,8 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
     public void TridiagonalSolve_AndGradients_MatchCpu()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        // The fallback record is process-wide: clear what earlier tests left before this test's device work.
+        GpuLaunchProbe.Reset();
         int batch = 4, n = 23;
         var lo = Ref.Random(31, 1, 0, batch, n - 1); var up = Ref.Random(32, 1, 0, batch, n - 1);
         var dg = Ref.Random(33, 1, 4, batch, n); var rh = Ref.Random(34, 1, 0, batch, n);
@@ -60,6 +62,8 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
     public void FritschCarlsonLimit_MatchesScalarRecurrence()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        // The fallback record is process-wide: clear what earlier tests left before this test's device work.
+        GpuLaunchProbe.Reset();
         int batch = 3, rows = 5, n = 41;
         var m = Ref.Random(41, 3, 0, batch, rows, n); var d = Ref.Random(42, 1, 0, batch, rows, n - 1);
         var r = _fixture.Gpu.TensorFritschCarlsonLimit(m, d);
@@ -74,6 +78,8 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
     public void CtcForwardBackward_AndPosteriors_MatchTorch()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        // The fallback record is process-wide: clear what earlier tests left before this test's device work.
+        GpuLaunchProbe.Reset();
         var lp = CtcLogProbsF();
         var (alpha, beta) = _fixture.Gpu.TensorCTCForwardBackward(lp, Ref.CtcTargets, Ref.CtcInputLengths, Ref.CtcTargetLengths, 0);
         Ref.AssertClose(Ref.TorchLogAlpha, alpha, 1e-5, "alpha");
@@ -90,6 +96,8 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
     public void CtcLossGradient_IsMinusTorchPosteriors()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        // The fallback record is process-wide: clear what earlier tests left before this test's device work.
+        GpuLaunchProbe.Reset();
         var lp = CtcLogProbsF();
         Dictionary<Tensor<float>, Tensor<float>> grads;
         using (var tape = new GradientTape<float>())
@@ -105,6 +113,8 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
     public void LinearSumAssignment_MatchesCpu_AndScipyExample()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        // The fallback record is process-wide: clear what earlier tests left before this test's device work.
+        GpuLaunchProbe.Reset();
         var doc = new Tensor<float>(new[] { 4f, 1, 3, 2, 0, 5, 3, 2, 2 }, new[] { 3, 3 });
         Assert.Equal(new[] { 1, 0, 2 }, _fixture.Gpu.TensorLinearSumAssignment(doc).ToArray());
         var cost = Ref.Random(51, 5, 0, 5, 12, 12);
@@ -118,6 +128,8 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
     public void LinearSumAssignment_ExtremeCosts_DoNotOverflowTheAugmentingPath()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        // The fallback record is process-wide: clear what earlier tests left before this test's device work.
+        GpuLaunchProbe.Reset();
         float h = float.MaxValue;
         var finite = new Tensor<float>(new[] { h, -h, -h, h }, new[] { 2, 2 });
         Assert.Equal(new[] { 1, 0 }, _fixture.Gpu.TensorLinearSumAssignment(finite).ToArray());
@@ -167,6 +179,8 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
     public void LargeProblems_StayOnTheDevice()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        // The fallback record is process-wide: clear what earlier tests left before this test's device work.
+        GpuLaunchProbe.Reset();
         var cost = Ref.Random(52, 5, 0, 450, 450);
         Assert.Equal(_fixture.Cpu.TensorLinearSumAssignment(cost).ToArray(), _fixture.Gpu.TensorLinearSumAssignment(cost).ToArray());
 

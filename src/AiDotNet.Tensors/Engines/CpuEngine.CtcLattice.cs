@@ -79,8 +79,13 @@ internal static class CtcLattice
         using (var lease = targets.Lease())
             lease.Span.Slice(0, total).CopyTo(p.Targets);
         foreach (int label in p.Targets)
+        {
             if (label < 0 || label >= p.Classes)
                 throw new ArgumentOutOfRangeException(nameof(targets), $"Target label {label} must be in [0, {p.Classes}).");
+            // A blank target would interleave blank with blank, and the lattice would count duplicate paths.
+            if (label == p.Blank)
+                throw new ArgumentException($"Target labels must exclude the blank index {p.Blank}.", nameof(targets));
+        }
         return p;
     }
 
@@ -191,7 +196,7 @@ public partial class CpuEngine
     public virtual (Tensor<T> LogAlpha, Tensor<T> LogBeta) TensorCTCForwardBackward<T>(Tensor<T> logProbs, Tensor<int> targets,
         int[] inputLengths, int[] targetLengths, int blank = 0)
     {
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         var p = CtcLattice.Prepare(logProbs, targets, inputLengths, targetLengths, blank);
         var (alpha, beta, _) = CtcLatticeHost(logProbs, p);
         int[] shape = { p.Batch, p.MaxTime, p.MaxStates };

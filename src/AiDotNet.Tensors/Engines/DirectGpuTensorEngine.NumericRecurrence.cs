@@ -11,16 +11,30 @@ public partial class DirectGpuTensorEngine
     // one thread or one work-group per independent problem, so no intermediate returns to the host. The tridiagonal
     // solve records the CPU op's tape node, whose backward calls back into this override. Float only, as every device
     // kernel here; other element types, a graph trace, or a shape past the kernels' 32-bit
-    // indices or float-exact integers run the CPU op (refusals are logged); no op falls back for its lattice or problem size.
+    // indices or float-exact integers run the CPU op. A graph trace and a non-float T are intended CPU routes; every
+    // other refusal of a float call (no recurrence backend, a shape past the kernels' limits, a failed launch) is
+    // recorded through GpuLaunchProbe.OnFallback, so a host fallback never runs silently.
+
+    // Records a float call's guard refusal (no exception, so the probe keys it as a declined guard). Returns true so
+    // CtcDeviceAdmits can return !RefuseRecurrence(op).
+    private static bool RefuseRecurrence(string op)
+    {
+        GpuLaunchProbe.OnFallback(op, null);
+        return true;
+    }
 
     /// <inheritdoc />
     public override Tensor<T> TensorTridiagonalSolve<T>(Tensor<T> lower, Tensor<T> diagonal, Tensor<T> upper, Tensor<T> rhs)
     {
         using var __gpuOp = EnterGpuOp();
         var (batch, n) = TridiagonalShape(lower, diagonal, upper, rhs);
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || batch == 0 || !TryGetBackend(out var backend)
-            || backend is not INumericRecurrenceBackend recurrences)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || batch == 0)
             return base.TensorTridiagonalSolve(lower, diagonal, upper, rhs);
+        if (!TryGetBackend(out var backend) || backend is not INumericRecurrenceBackend recurrences)
+        {
+            RefuseRecurrence("TridiagonalSolve");
+            return base.TensorTridiagonalSolve(lower, diagonal, upper, rhs);
+        }
 
         using var dB = GetOrAllocateBuffer(backend, diagonal);
         using var rB = GetOrAllocateBuffer(backend, rhs);
@@ -46,9 +60,13 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         var (batch, n) = FritschCarlsonShape(slopes, secants);
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || batch == 0 || !TryGetBackend(out var backend)
-            || backend is not INumericRecurrenceBackend recurrences)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || batch == 0)
             return base.TensorFritschCarlsonLimit(slopes, secants);
+        if (!TryGetBackend(out var backend) || backend is not INumericRecurrenceBackend recurrences)
+        {
+            RefuseRecurrence("FritschCarlsonLimit");
+            return base.TensorFritschCarlsonLimit(slopes, secants);
+        }
 
         using var mB = GetOrAllocateBuffer(backend, slopes);
         using var dB = n > 1 ? GetOrAllocateBuffer(backend, secants) : (OwnedBuffer?)null;
@@ -79,20 +97,33 @@ public partial class DirectGpuTensorEngine
         return (targets, lengths);
     }
 
-    private static bool CtcDeviceAdmits(CtcLattice.Problem p) =>
-        p.Batch > 0 && p.MaxTime > 0 && p.MaxStates < (1 << 24)
-        && p.TotalTargets < (1 << 24) && p.Classes < (1 << 24);
+    // The kernels index the lattice [N, T, S] and gamma [T, N, C] in 32-bit ints, and read labels and lengths as floats
+    // that are exact below 2^24. An empty problem has no device work.
+    private static bool CtcDeviceAdmits(CtcLattice.Problem p, string op)
+    {
+        if (p.Batch <= 0 || p.MaxTime <= 0)
+            return false;
+        if (p.MaxStates >= (1 << 24) || p.TotalTargets >= (1 << 24) || p.Classes >= (1 << 24))
+            return !RefuseRecurrence(op);
+        if ((long)p.Batch * p.MaxTime * p.MaxStates > int.MaxValue || (long)p.MaxTime * p.Batch * p.Classes > int.MaxValue)
+            return !RefuseRecurrence(op);
+        return true;
+    }
 
     /// <inheritdoc />
     public override (Tensor<T> LogAlpha, Tensor<T> LogBeta) TensorCTCForwardBackward<T>(Tensor<T> logProbs, Tensor<int> targets,
         int[] inputLengths, int[] targetLengths, int blank = 0)
     {
         using var __gpuOp = EnterGpuOp();
-        Compilation.GraphMode.ThrowIfInferenceUnsupported(Compilation.GraphCaptureLimitation.HeterogeneousOutput);
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(Compilation.GraphCaptureLimitation.HeterogeneousInput);
         var p = CtcLattice.Prepare(logProbs, targets, inputLengths, targetLengths, blank);
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !CtcDeviceAdmits(p) || !TryGetBackend(out var backend)
-            || backend is not INumericRecurrenceBackend recurrences)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !CtcDeviceAdmits(p, "CTCForwardBackward"))
             return base.TensorCTCForwardBackward(logProbs, targets, inputLengths, targetLengths, blank);
+        if (!TryGetBackend(out var backend) || backend is not INumericRecurrenceBackend recurrences)
+        {
+            RefuseRecurrence("CTCForwardBackward");
+            return base.TensorCTCForwardBackward(logProbs, targets, inputLengths, targetLengths, blank);
+        }
 
         var (targetValues, lengthValues) = CtcDeviceInputs(p);
         int count = p.Batch * p.MaxTime * p.MaxStates;
@@ -123,9 +154,13 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         Compilation.GraphMode.ThrowIfInferenceUnsupported(Compilation.GraphCaptureLimitation.HeterogeneousInput);
         var p = CtcLattice.Prepare(logProbs, targets, inputLengths, targetLengths, blank);
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !CtcDeviceAdmits(p) || !TryGetBackend(out var backend)
-            || backend is not INumericRecurrenceBackend recurrences)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !CtcDeviceAdmits(p, "CTCLabelPosteriors"))
             return base.TensorCTCLabelPosteriors(logProbs, targets, inputLengths, targetLengths, blank);
+        if (!TryGetBackend(out var backend) || backend is not INumericRecurrenceBackend recurrences)
+        {
+            RefuseRecurrence("CTCLabelPosteriors");
+            return base.TensorCTCLabelPosteriors(logProbs, targets, inputLengths, targetLengths, blank);
+        }
 
         var (targetValues, lengthValues) = CtcDeviceInputs(p);
         int count = p.Batch * p.MaxTime * p.MaxStates, gammaCount = p.MaxTime * p.Batch * p.Classes;
@@ -156,11 +191,15 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         Compilation.GraphMode.ThrowIfInferenceUnsupported(Compilation.GraphCaptureLimitation.MixedElementTypes);
         var (batch, size) = LinearSumAssignmentShape(cost);
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || batch == 0 || size == 0
-            || size > NumericRecurrenceKernelTemplate.AssignmentMaxSize || (long)batch * 8 * size > int.MaxValue
-            || !TryGetBackend(out var backend)
-            || backend is not INumericRecurrenceBackend recurrences)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || batch == 0 || size == 0)
             return base.TensorLinearSumAssignment(cost);
+        // The solver state is 8 * size floats per item, in one buffer with 32-bit indices.
+        if (size > NumericRecurrenceKernelTemplate.AssignmentMaxSize || (long)batch * 8 * size > int.MaxValue
+            || !TryGetBackend(out var backend) || backend is not INumericRecurrenceBackend recurrences)
+        {
+            RefuseRecurrence("LinearSumAssignment");
+            return base.TensorLinearSumAssignment(cost);
+        }
 
         using var cB = GetOrAllocateBuffer(backend, cost);
         using var aB = AllocateFullyWrittenOutputBuffer(backend, batch * size);
