@@ -29,8 +29,9 @@ public sealed class MixtureOfExpertsGpuTests : IClassFixture<GpuCpuCorrectnessFi
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
         var gpu = _fixture.Gpu;
-        Assert.True(gpu.GetBackend() is IMoeKernelBackend { MoeKernelsReady: true },
-            "the device has no fused MoE kernels");
+        var backend = gpu.GetBackend();
+        Assert.True(backend is IMoeKernelBackend { MoeKernelsReady: true },
+            $"the device has no fused MoE kernels ({backend?.GetType().Name ?? "no backend"})");
         const int n = 96, d = 40, g = 12, k = 3, f = 24, b = 2;
         var x = Ref.Random<float>(1, -1, 1, n, d);
         var s = Ref.Random<float>(2, 0.05, 0.95, n, g);
