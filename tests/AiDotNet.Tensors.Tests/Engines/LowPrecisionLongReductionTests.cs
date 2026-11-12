@@ -267,6 +267,100 @@ public class LowPrecisionLongReductionTests
         AssertBFloat16(SumSqDev(x, 0, N, 1) / N, _engine.ReduceVariance(t, new[] { 0 }, keepDims: false).ToArray()[0], "ReduceVariance bf16");
     }
 
+    private static Tensor<Half> HalfConst(int n, double v) => new Tensor<Half>(HalfData(n, _ => v), new[] { n });
+
+    // Normalised value of the reference statistics; only elements well away from zero are compared, where one Half
+    // ulp of the output is the meaningful bound.
+    private static void AssertNormalized(double[] x, double mean, double variance, double eps, Half[] y, string what)
+    {
+        double invStd = 1.0 / Math.Sqrt(variance + eps);
+        int checkedCount = 0;
+        for (int i = 0; i < x.Length; i += 997)
+        {
+            double expected = (x[i] - mean) * invStd;
+            if (Math.Abs(expected) < 0.25) continue;
+            AssertHalf(expected, y[i], $"{what}[{i}]");
+            checkedCount++;
+        }
+        Assert.True(checkedCount > 20, $"{what}: only {checkedCount} elements compared");
+    }
+
+    [Fact]
+    public void BatchNorm_Half_ChannelOver70000Elements()
+    {
+        const int h = 300, w = 250;   // 75,000 elements in the single channel
+        var data = HalfData(h * w, Signal);
+        var x = ToDouble(data);
+        var y = _engine.BatchNorm(new Tensor<Half>(data, new[] { 1, 1, h, w }), HalfConst(1, 1.0), HalfConst(1, 0.0), 1e-5,
+            out var mean, out var variance);
+        double m = Mean(x, 0, h * w, 1), v = SumSqDev(x, 0, h * w, 1) / (h * w);
+        AssertHalf(m, mean.ToArray()[0], "BatchNorm mean");
+        AssertHalf(v, variance.ToArray()[0], "BatchNorm variance");
+        AssertNormalized(x, m, v, 1e-5, y.ToArray(), "BatchNorm output");
+    }
+
+    [Fact]
+    public void LayerNorm_Half_FeatureOver70000Elements()
+    {
+        var data = HalfData(N, Signal);
+        var x = ToDouble(data);
+        var y = _engine.LayerNorm(new Tensor<Half>(data, new[] { 1, N }), HalfConst(N, 1.0), HalfConst(N, 0.0), 1e-5,
+            out var mean, out var variance);
+        double m = Mean(x, 0, N, 1), v = SumSqDev(x, 0, N, 1) / N;
+        AssertHalf(m, mean.ToArray()[0], "LayerNorm mean");
+        AssertHalf(v, variance.ToArray()[0], "LayerNorm variance");
+        AssertNormalized(x, m, v, 1e-5, y.ToArray(), "LayerNorm output");
+    }
+
+    [Fact]
+    public void GroupNorm_Half_GroupOver70000Elements()
+    {
+        var data = HalfData(2 * N, Signal);   // [1, 2, N], one group of 140,000 elements
+        var x = ToDouble(data);
+        var y = _engine.GroupNorm(new Tensor<Half>(data, new[] { 1, 2, N }), 1, HalfConst(2, 1.0), HalfConst(2, 0.0), 1e-5,
+            out var mean, out var variance);
+        double m = Mean(x, 0, 2 * N, 1), v = SumSqDev(x, 0, 2 * N, 1) / (2 * N);
+        AssertHalf(m, mean.ToArray()[0], "GroupNorm mean");
+        AssertHalf(v, variance.ToArray()[0], "GroupNorm variance");
+        AssertNormalized(x, m, v, 1e-5, y.ToArray(), "GroupNorm output");
+    }
+
+    [Fact]
+    public void BatchNormAndLayerNormBackward_Half_Over70000Elements()
+    {
+        // dx = gamma invStd / N (N dy - sum(dy) - xhat sum(dy xhat)), gradBeta = sum(dy), with the saved (Half) mean
+        // and variance; the standard batch/layer norm gradient (Ioffe & Szegedy 2015; torch native_batch_norm_backward).
+        var data = HalfData(N, Signal);
+        var dyData = HalfData(N, i => 1e-3 * (1.0 + 0.5 * Math.Sin(0.013 * i)));
+        var x = ToDouble(data);
+        var dy = ToDouble(dyData);
+        double m = Mean(x, 0, N, 1), v = SumSqDev(x, 0, N, 1) / N;
+        double mh = (double)(Half)m, vh = (double)(Half)v, eps = 1e-5;
+        double invStd = 1.0 / Math.Sqrt(vh + eps);
+        double sumDy = 0, sumDyXhat = 0;
+        for (int i = 0; i < N; i++) { sumDy += dy[i]; sumDyXhat += dy[i] * (x[i] - mh) * invStd; }
+
+        var mean = new Tensor<Half>(new[] { (Half)m }, new[] { 1 });
+        var variance = new Tensor<Half>(new[] { (Half)v }, new[] { 1 });
+        var bnDx = _engine.BatchNormBackward(new Tensor<Half>(dyData, new[] { N, 1 }), new Tensor<Half>(data, new[] { N, 1 }),
+            HalfConst(1, 1.0), mean, variance, eps, out _, out var bnGradBeta).ToArray();
+        var lnDx = _engine.LayerNormBackward(new Tensor<Half>(dyData, new[] { 1, N }), new Tensor<Half>(data, new[] { 1, N }),
+            HalfConst(N, 1.0), mean, variance, eps, out _, out _).ToArray();
+
+        AssertHalf(sumDy, bnGradBeta.ToArray()[0], "BatchNormBackward gradBeta");
+        int compared = 0;
+        for (int i = 0; i < N; i += 997)
+        {
+            double xhat = (x[i] - mh) * invStd;
+            double expected = invStd / N * (N * dy[i] - sumDy - xhat * sumDyXhat);
+            if (Math.Abs(expected) < 1e-4) continue;
+            AssertHalf(expected, bnDx[i], $"BatchNormBackward dx[{i}]");
+            AssertHalf(expected, lnDx[i], $"LayerNormBackward dx[{i}]");
+            compared++;
+        }
+        Assert.True(compared > 20, $"only {compared} gradients compared");
+    }
+
     [Fact]
     public void FloatAndDouble_ReduceMean_Unchanged_ForShortInputs()
     {
