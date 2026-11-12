@@ -249,7 +249,7 @@ public static partial class WebGpuNativeBindings
     /// Zeroes <paramref name="sizeBytes"/> bytes of a buffer on the device, ordered before every later submission and
     /// without waiting for it.
     /// </summary>
-    public static void ClearBuffer(int bufferId, int offsetBytes, int sizeBytes)
+    internal static void ClearBuffer(int bufferId, int offsetBytes, int sizeBytes)
     {
         if (Host is { } host) host.Invoke("clearBuffer", Args(bufferId, offsetBytes, sizeBytes));
         else JsClearBuffer(bufferId, offsetBytes, sizeBytes);
