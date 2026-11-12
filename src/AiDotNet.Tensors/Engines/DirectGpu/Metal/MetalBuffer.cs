@@ -63,6 +63,11 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     /// <inheritdoc/>
     void IPoolableGpuBuffer.MarkRented(int size)
     {
+        // The pool is exact-size (MetalDevice.BufferPool), so a rent is always for this buffer's whole capacity and nothing
+        // about the wrapper changes; anything else would hand out a wrong-sized buffer.
+        if (size != Size)
+            throw new InvalidOperationException(
+                $"The exact-size Metal pool rented a {Size}-element buffer for a {size}-element request.");
     }
 
     /// <inheritdoc/>

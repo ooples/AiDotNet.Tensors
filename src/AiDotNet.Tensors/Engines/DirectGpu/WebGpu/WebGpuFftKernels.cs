@@ -8,6 +8,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu
     {
         public const int SharedBatchedFftMaxN = 2048;
 
+        /// <summary>Threads per workgroup of <see cref="SharedBatchedFft"/>; the host dispatches this many per row.</summary>
+        public const int SharedBatchedFftWorkgroupSize = 256;
+
         public static string[] GetKernelNames() => new[]
         {
             "parity212_fft",
@@ -72,7 +75,13 @@ fn fft_1d(@builtin(global_invocation_id) gid: vec3<u32>) {
         /// Loads in natural order into the bit-reversed slot, runs every radix-2 DIT stage on chip, and writes once
         /// (scaled by 1/n for an inverse): O(n log n) in a single dispatch.
         /// </summary>
-        public const string SharedBatchedFft = @"
+        // The shader's workgroup size, its loop strides and its row storage come from the constants above, which the
+        // host dispatch also reads, so one of them cannot change without the others.
+        public static readonly string SharedBatchedFft =
+            "const WG: u32 = " + SharedBatchedFftWorkgroupSize + "u;\n" +
+            "const MAX_N: u32 = " + SharedBatchedFftMaxN + "u;\n" + SharedBatchedFftBody;
+
+        private const string SharedBatchedFftBody = @"
 @group(0) @binding(0) var<storage, read> input_real: array<f32>;
 @group(0) @binding(1) var<storage, read> input_imag: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output_real: array<f32>;
@@ -86,10 +95,10 @@ struct Params {
 }
 @group(0) @binding(4) var<uniform> params: Params;
 
-var<workgroup> sre: array<f32, 2048>;
-var<workgroup> sim: array<f32, 2048>;
+var<workgroup> sre: array<f32, MAX_N>;
+var<workgroup> sim: array<f32, MAX_N>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(WG)
 fn batched_fft_shared(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) li: vec3<u32>)
@@ -97,7 +106,7 @@ fn batched_fft_shared(
     let lid = li.x;
     let base = (params.row_base + wg.x) * params.n;
     let shift = 32u - params.log2n;
-    for (var i: u32 = lid; i < params.n; i = i + 256u) {
+    for (var i: u32 = lid; i < params.n; i = i + WG) {
         let r = reverseBits(i) >> shift;
         sre[r] = input_real[base + i];
         sim[r] = input_imag[base + i];
@@ -108,7 +117,7 @@ fn batched_fft_shared(
     let half_n = params.n >> 1u;
     for (var lg: u32 = 0u; lg < params.log2n; lg = lg + 1u) {
         let hs = 1u << lg;
-        for (var k: u32 = lid; k < half_n; k = k + 256u) {
+        for (var k: u32 = lid; k < half_n; k = k + WG) {
             let w = k & (hs - 1u);
             let top = ((k >> lg) << (lg + 1u)) + w;
             let bot = top + hs;
@@ -130,7 +139,7 @@ fn batched_fft_shared(
     }
 
     let scale = select(1.0, 1.0 / f32(params.n), params.inverse != 0u);
-    for (var i: u32 = lid; i < params.n; i = i + 256u) {
+    for (var i: u32 = lid; i < params.n; i = i + WG) {
         output_real[base + i] = sre[i] * scale;
         output_imag[base + i] = sim[i] * scale;
     }

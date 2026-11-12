@@ -47,7 +47,10 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
 
     private static long s_driverAllocations;
 
-    /// <summary>Buffers allocated from WebGPU (pool misses) since the process started.</summary>
+    /// <summary>
+    /// Default-usage storage buffers allocated from WebGPU (pool misses) since the process started. Only those are pooled,
+    /// so a uniform or staging buffer an op creates for itself is not a pool miss and is not counted.
+    /// </summary>
     internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
 
     // The count is process-wide, so it is kept by a static method rather than written from each constructor.
@@ -72,6 +75,11 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
     /// <inheritdoc/>
     void IPoolableGpuBuffer.MarkRented(int size)
     {
+        // The pool is exact-size (a WebGPU buffer has no logical size below its allocation), so a rent is always for this
+        // buffer's whole capacity and nothing about the wrapper changes; anything else would hand out a wrong-sized buffer.
+        if (size != _elementCount)
+            throw new InvalidOperationException(
+                $"The exact-size WebGPU pool rented a {_elementCount}-element buffer for a {size}-element request.");
     }
 
     /// <inheritdoc/>
@@ -85,12 +93,16 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
         }
     }
 
+    // The parked-storage budget never drops below 16M floats (64 MB): a device reporting a small maximum buffer size
+    // would otherwise cap the pool below a single large activation, and every allocation of that size would miss.
+    private const long MinPooledElements = 16L * 1024 * 1024;
+
     internal static void ConfigurePoolBudget(long maxBufferBytes)
     {
         if (maxBufferBytes > 0)
         {
             // Bound total parked storage to MaxBufferSize (e.g. 256 MB default -> 64M float elements).
-            Pool.MaxPooledElements = Math.Max(maxBufferBytes / sizeof(float), 16_777_216L);
+            Pool.MaxPooledElements = Math.Max(maxBufferBytes / sizeof(float), MinPooledElements);
         }
     }
 
@@ -190,7 +202,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
         {
             throw new InvalidOperationException("Failed to create WebGPU buffer");
         }
-        CountDriverAllocation();
+        if (usage == DefaultStorageUsage) CountDriverAllocation();
         _pooled = usage == DefaultStorageUsage && WebGpuDevice.Instance.IsInitialized;
         _memory.OnAllocated(Account, alignedSize);
     }

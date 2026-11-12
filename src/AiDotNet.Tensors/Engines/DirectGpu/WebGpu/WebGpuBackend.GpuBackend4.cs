@@ -699,7 +699,8 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
                     BitConverter.Int32BitsToSingle(inverse ? 1 : 0)
                 };
                 Dispatch4BufferAsync("SharedBatchedFft", WebGpuFftKernels.SharedBatchedFft, "batched_fft_shared",
-                    inputReal, inputImag, outputReal, outputImag, uniforms, checked(rows * 256)).GetAwaiter().GetResult();
+                    inputReal, inputImag, outputReal, outputImag, uniforms,
+                    checked(rows * WebGpuFftKernels.SharedBatchedFftWorkgroupSize)).GetAwaiter().GetResult();
             }
             return;
         }
