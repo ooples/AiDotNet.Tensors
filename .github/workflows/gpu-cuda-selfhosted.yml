@@ -674,11 +674,15 @@ jobs:
           Write-Output "::group::Processes of this run"
           $tree | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
           Write-Output "::endgroup::"
+          # Each diagnostic is bounded, so a stalled driver, install or attach cannot outlast the step.
           Write-Output "::group::nvidia-smi"
-          nvidia-smi
+          $smi = Start-Process nvidia-smi -NoNewWindow -PassThru
+          if (-not $smi.WaitForExit(30000)) {
+            Stop-Process -Id $smi.Id -Force -ErrorAction SilentlyContinue
+            Write-Output "::warning::nvidia-smi did not finish within 30 seconds."
+          }
           Write-Output "::endgroup::"
 
-          # Each diagnostic is bounded, so a stalled install or attach cannot outlast the step.
           $tools = "${{ runner.temp }}/dotnet-stack"
           if (-not (Test-Path "$tools/dotnet-stack*")) {
             $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
