@@ -75,7 +75,7 @@ public partial class CpuEngine
         {
             float y = values[i] - compensation;
             float t = sum + y;
-            compensation = (t - sum) - y;
+            compensation = float.IsInfinity(t) ? 0f : (t - sum) - y;
             sum = t;
         }
         return sum;
@@ -96,7 +96,7 @@ public partial class CpuEngine
             float d = x[i] - mean;
             float y = d * d - compensation;
             float t = sum + y;
-            compensation = (t - sum) - y;
+            compensation = float.IsInfinity(t) ? 0f : (t - sum) - y;
             sum = t;
         }
         sumSquaredDeviation = sum;
@@ -167,7 +167,7 @@ public partial class CpuEngine
             else { float d = x[i] - centre[o]; term = d * d; }
             float y = term - compensation[o];
             float t = acc[o] + y;
-            compensation[o] = (t - acc[o]) - y;
+            compensation[o] = float.IsInfinity(t) ? 0f : (t - acc[o]) - y;
             acc[o] = t;
             for (int d = rank - 1; d >= 0; d--)
             {

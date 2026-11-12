@@ -114,6 +114,18 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
         AssertNoHostFallback("LinearSumAssignment");
     }
 
+    [SkippableFact]
+    public void LinearSumAssignment_ExtremeCosts_DoNotOverflowTheAugmentingPath()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        float h = float.MaxValue;
+        var finite = new Tensor<float>(new[] { h, -h, -h, h }, new[] { 2, 2 });
+        Assert.Equal(new[] { 1, 0 }, _fixture.Gpu.TensorLinearSumAssignment(finite).ToArray());
+        var forced = new Tensor<float>(new[] { float.NaN, float.NaN, h, -h }, new[] { 2, 2 });
+        Assert.Equal(new[] { 0, 1 }, _fixture.Gpu.TensorLinearSumAssignment(forced).ToArray());
+        AssertNoHostFallback("LinearSumAssignment");
+    }
+
     // The limiter and the CTC posteriors on random batched inputs (ragged lengths, repeated labels) against the CPU
     // engine itself, not only the scalar / PyTorch references above.
     [SkippableFact]

@@ -59,12 +59,17 @@ public partial class CpuEngine
             double c = cost[offset + k];
             if (!double.IsNaN(c) && !double.IsInfinity(c)) maxAbs = Math.Max(maxAbs, Math.Abs(c));
         }
-        double big = (size + 1) * (2 * maxAbs + 1);
+        // Scale by an exact power of two before forming penalties or reduced costs. Otherwise finite
+        // costs near MaxValue overflow, leaving an augmenting path without a predecessor.
+        double scale = maxAbs > 1.0
+            ? BitConverter.Int64BitsToDouble(BitConverter.DoubleToInt64Bits(maxAbs) & 0x7ff0000000000000L)
+            : 1.0;
+        double big = (size + 1.0) * (2 * (maxAbs / scale) + 1);
         var c2 = new double[size * size];
         for (int k = 0; k < c2.Length; k++)
         {
             double c = cost[offset + k];
-            c2[k] = double.IsNaN(c) || double.IsPositiveInfinity(c) ? big : double.IsNegativeInfinity(c) ? -big : c;
+            c2[k] = double.IsNaN(c) || double.IsPositiveInfinity(c) ? big : double.IsNegativeInfinity(c) ? -big : c / scale;
         }
 
         var u = new double[size];

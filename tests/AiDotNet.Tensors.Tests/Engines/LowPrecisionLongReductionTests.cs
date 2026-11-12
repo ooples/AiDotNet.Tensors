@@ -17,6 +17,19 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// </summary>
 public class LowPrecisionLongReductionTests
 {
+    [Fact]
+    public void InfiniteMeanAndLoss_DoNotBecomeNaNFromCompensation()
+    {
+        var x = new Tensor<Half>(new[] { Half.PositiveInfinity, (Half)1, (Half)2 }, new[] { 3 });
+        Assert.True(Half.IsPositiveInfinity(CpuEngine.LowPrecisionMean(x.ToArray(), 3)));
+        var axis = new CpuEngine().ReduceMean(x, new[] { 0 }, false).ToArray()[0];
+        Assert.True(Half.IsPositiveInfinity(axis));
+        var loss = CpuEngine.LowPrecisionPairMean(x, new Tensor<Half>(new[] { 3 }), (a, b) => (a - b) * (a - b));
+        Assert.True(Half.IsPositiveInfinity(loss));
+        var mixed = new[] { Half.PositiveInfinity, Half.NegativeInfinity };
+        Assert.True(Half.IsNaN(CpuEngine.LowPrecisionMean(mixed, 2)));
+    }
+
     private const int N = 70_000;
 
     private readonly CpuEngine _engine = new CpuEngine();

@@ -100,19 +100,8 @@ internal readonly struct Real<T> : IEquatable<Real<T>>
 internal static class GenericLinalg<T>
     where T : unmanaged, IEquatable<T>, IComparable<T>
 {
-    private static bool _epsReady;
-    private static Real<T> _eps;
-
-    /// <summary>Machine epsilon of <typeparamref name="T"/>, measured in <typeparamref name="T"/> arithmetic.</summary>
-    private static Real<T> Eps
-    {
-        get
-        {
-            if (!_epsReady) { _eps = MachineEpsilon(); _epsReady = true; }
-            return _eps;
-        }
-    }
-
+    /// <summary>Machine epsilon, published atomically by generic static initialization.</summary>
+    private static readonly Real<T> Eps = MachineEpsilon();
     /// <summary>True when <typeparamref name="T"/> is a real field type the generic kernels support.</summary>
     internal static bool IsSupported =>
         MathHelper.IsFloatingPoint<T>() || typeof(T) == typeof(decimal);
@@ -321,8 +310,10 @@ internal static class GenericLinalg<T>
             var v = new Real<T>[colLen];
             for (int i = 0; i < colLen; i++) v[i] = aD[(j + i) * n + j];
             Real<T> norm = Norm2(v);
-            // Same reflector sign as the float path: alpha = −sign(v0)·‖v‖ with sign(0) → −1.
-            Real<T> alpha = v[0] > Real<T>.Zero ? -norm : norm;
+            // A dimensionless reflector avoids squaring the input scale (overflow in Half/decimal).
+            if (!norm.IsZero)
+                for (int i = 0; i < colLen; i++) v[i] /= norm;
+            Real<T> alpha = norm.IsZero ? Real<T>.Zero : v[0] > Real<T>.Zero ? -Real<T>.One : Real<T>.One;
             v[0] -= alpha;
             Real<T> vNorm2 = Real<T>.Zero;
             for (int i = 0; i < colLen; i++) vNorm2 += v[i] * v[i];
@@ -488,19 +479,20 @@ internal static class GenericLinalg<T>
         EnsureSupported("Eig");
         if (n == 0) return;
         var a0 = Load(src, offSrc, n * n);
+        Real<T> scale = Real<T>.Zero;
+        for (int i = 0; i < n * n; i++) scale = Real<T>.Max(scale, Real<T>.Abs(a0[i]));
+        if (scale.IsZero) scale = Real<T>.One;
+        // QR's products and inverse iteration operate on an O(1) matrix, not on squared input magnitudes.
+        for (int i = 0; i < a0.Length; i++) a0[i] /= scale;
         var h = (Real<T>[])a0.Clone();
         HessenbergReduce(h, n);
         var (wr, wi) = FrancisQr(h, n);
 
-        Real<T> scale = Real<T>.Zero;
-        for (int i = 0; i < n * n; i++) scale = Real<T>.Max(scale, Real<T>.Abs(a0[i]));
-        if (scale.IsZero) scale = Real<T>.One;
-
         for (int k = 0; k < n; k++)
         {
-            w[offW + k * 2] = wr[k].V;
-            w[offW + k * 2 + 1] = wi[k].V;
-            var (xr, xi) = InverseIteration(a0, n, wr[k], wi[k], scale);
+            w[offW + k * 2] = (wr[k] * scale).V;
+            w[offW + k * 2 + 1] = (wi[k] * scale).V;
+            var (xr, xi) = InverseIteration(a0, n, wr[k], wi[k], Real<T>.One, wr, wi, k, v, offV);
             for (int r = 0; r < n; r++)
             {
                 v[offV + (r * n + k) * 2] = xr[r].V;
@@ -519,7 +511,8 @@ internal static class GenericLinalg<T>
             for (int i = 0; i < colLen; i++) vv[i] = h[(k + 1 + i) * n + k];
             Real<T> norm = Norm2(vv);
             if (norm.IsZero) continue;
-            Real<T> alpha = vv[0] > Real<T>.Zero ? -norm : norm;
+            for (int i = 0; i < colLen; i++) vv[i] /= norm;
+            Real<T> alpha = vv[0] > Real<T>.Zero ? -Real<T>.One : Real<T>.One;
             vv[0] -= alpha;
             Real<T> vNorm2 = Real<T>.Zero;
             for (int i = 0; i < colLen; i++) vNorm2 += vv[i] * vv[i];
@@ -733,6 +726,57 @@ internal static class GenericLinalg<T>
         for (int i = 0; i < n; i++) { outR[i] = wr[i + 1]; outI[i] = wi[i + 1]; }
         return (outR, outI);
     }
+    // Remove only vectors for the same eigenvalue; vectors for distinct eigenvalues of a non-normal
+    // matrix need not be orthogonal. Two modified Gram-Schmidt passes preserve repeated eigenspaces.
+    private static void ProjectRepeatedEigenvectors(Real<T>[] x, int n, bool complex, Real<T> re, Real<T> im,
+        Real<T>[] wr, Real<T>[] wi, int count, T[] vectors, int offset)
+    {
+        Real<T> tol = Real<T>.Int(8) * Eps * (Real<T>.One + Real<T>.Abs(re) + Real<T>.Abs(im));
+        for (int pass = 0; pass < 2; pass++)
+            for (int k = 0; k < count; k++)
+            {
+                if (Real<T>.Abs(wr[k] - re) > tol || Real<T>.Abs(wi[k] - im) > tol) continue;
+                Real<T> dotR = Real<T>.Zero, dotI = Real<T>.Zero, normSq = Real<T>.Zero;
+                for (int i = 0; i < n; i++)
+                {
+                    Real<T> vr = vectors[offset + (i * n + k) * 2];
+                    Real<T> vi = vectors[offset + (i * n + k) * 2 + 1];
+                    Real<T> xi = complex ? x[i + n] : Real<T>.Zero;
+                    dotR += vr * x[i] + vi * xi;
+                    dotI += vr * xi - vi * x[i];
+                    normSq += vr * vr + vi * vi;
+                }
+                if (normSq.IsZero) continue;
+                dotR /= normSq; dotI /= normSq;
+                for (int i = 0; i < n; i++)
+                {
+                    Real<T> vr = vectors[offset + (i * n + k) * 2];
+                    Real<T> vi = vectors[offset + (i * n + k) * 2 + 1];
+                    x[i] -= vr * dotR - vi * dotI;
+                    if (complex) x[i + n] -= vr * dotI + vi * dotR;
+                }
+            }
+    }
+
+    private static Real<T> EigenResidual(Real<T>[] a, Real<T>[] x, int n, bool complex, Real<T> re, Real<T> im)
+    {
+        Real<T> residual = Real<T>.Zero;
+        for (int i = 0; i < n; i++)
+        {
+            Real<T> xi = complex ? x[i + n] : Real<T>.Zero;
+            Real<T> rr = -re * x[i] + im * xi;
+            Real<T> ri = -im * x[i] - re * xi;
+            for (int j = 0; j < n; j++)
+            {
+                rr += a[i * n + j] * x[j];
+                if (complex) ri += a[i * n + j] * x[j + n];
+            }
+            residual = Real<T>.Max(residual, Real<T>.Abs(rr) + Real<T>.Abs(ri));
+        }
+        return residual;
+    }
+
+
 
     /// <summary>
     /// Right eigenvector of <paramref name="a"/> for λ = re + i·im by inverse iteration with a shift
@@ -740,7 +784,8 @@ internal static class GenericLinalg<T>
     /// system. The result has unit 2-norm and, for complex λ, its largest component is made real.
     /// </summary>
     private static (Real<T>[] Xr, Real<T>[] Xi) InverseIteration(
-        Real<T>[] a, int n, Real<T> re, Real<T> im, Real<T> scale)
+        Real<T>[] a, int n, Real<T> re, Real<T> im, Real<T> scale,
+        Real<T>[] wr, Real<T>[] wi, int eigenIndex, T[] previousVectors, int vectorOffset)
     {
         bool complex = !im.IsZero;
         int m = complex ? 2 * n : n;
@@ -765,14 +810,57 @@ internal static class GenericLinalg<T>
         var piv = new int[m];
         LuInPlace(mat, piv, m, Eps * scale);
 
+        // Try a basis of seeds: an all-ones seed can be exactly orthogonal to the desired eigenspace.
+        // For a repeated eigenvalue, remove already found directions after every solve. Linear combinations
+        // inside that eigenspace remain eigenvectors, so independent eigenvectors are not collapsed together.
         var x = new Real<T>[m];
-        for (int i = 0; i < m; i++) x[i] = i < n ? Real<T>.One : Real<T>.Zero;
-        for (int iter = 0; iter < 3; iter++)
+        Real<T> bestResidual = Real<T>.Zero;
+        bool haveBest = false;
+        for (int seed = 0; seed < n; seed++)
         {
-            SolveInPlace(mat, piv, x, m);
-            Real<T> nrm = Norm2(x);
-            if (nrm.IsZero) break;
-            for (int i = 0; i < m; i++) x[i] /= nrm;
+            var candidate = new Real<T>[m];
+            for (int i = 0; i < m; i++) candidate[i] = i == seed ? Real<T>.One : Real<T>.Zero;
+            bool usable = true;
+            for (int iter = 0; iter < 3; iter++)
+            {
+                SolveInPlace(mat, piv, candidate, m);
+                ProjectRepeatedEigenvectors(candidate, n, complex, re, im, wr, wi, eigenIndex, previousVectors, vectorOffset);
+                Real<T> nrm = Norm2(candidate);
+                if (nrm <= Eps) { usable = false; break; }
+                for (int i = 0; i < m; i++) candidate[i] /= nrm;
+            }
+            if (!usable) continue;
+            Real<T> residual = EigenResidual(a, candidate, n, complex, re, im);
+            if (!haveBest || residual < bestResidual)
+            {
+                haveBest = true;
+                bestResidual = residual;
+                Array.Copy(candidate, x, m);
+            }
+        }
+        // A defective matrix need not have another independent vector for a repeated eigenvalue.
+        // Retain an ordinary inverse iterate in that case, as geev does, rather than returning a zero vector.
+        if (!haveBest || bestResidual > Real<T>.Int(64) * Eps)
+        {
+            for (int seed = 0; seed < n; seed++)
+            {
+                var candidate = new Real<T>[m];
+                for (int i = 0; i < m; i++) candidate[i] = i == seed ? Real<T>.One : Real<T>.Zero;
+                for (int iter = 0; iter < 3; iter++)
+                {
+                    SolveInPlace(mat, piv, candidate, m);
+                    Real<T> nrm = Norm2(candidate);
+                    if (nrm.IsZero) break;
+                    for (int i = 0; i < m; i++) candidate[i] /= nrm;
+                }
+                Real<T> residual = EigenResidual(a, candidate, n, complex, re, im);
+                if (!haveBest || residual < bestResidual)
+                {
+                    haveBest = true;
+                    bestResidual = residual;
+                    Array.Copy(candidate, x, m);
+                }
+            }
         }
 
         var xr = new Real<T>[n];

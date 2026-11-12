@@ -266,7 +266,14 @@ internal static class NumericRecurrenceKernelTemplate
         BARRIER();
     }
     float sz = S;
-    float big = (sz + 1.0f) * (2.0f * sm[0] + 1.0f);
+    // Split exact power-of-two scaling: a Vulkan reciprocal of 2^127 is subnormal and may flush
+    // to zero. Both divisors below are at most 2^64, so their reciprocals remain normal floats.
+    int exponent = (FBITS(sm[0]) >> 23) - 127;
+    if (exponent < 0) exponent = 0;
+    int halfExponent = exponent / 2;
+    float scaleA = FVALUE((halfExponent + 127) << 23);
+    float scaleB = FVALUE((exponent - halfExponent + 127) << 23);
+    float big = (sz + 1.0f) * (2.0f * ((sm[0] / scaleA) / scaleB) + 1.0f);
     for (int j = lid; j < S; j += 256)
     {
         ws[wu + j] = 0.0f;
@@ -310,6 +317,7 @@ internal static class NumericRecurrenceKernelTemplate
                         c = big;
                         if (bits == -8388608) c = -big;
                     }
+                    else c = (c / scaleA) / scaleB;
                     float r = minv + c - ui - ws[wv + j];
                     if (r < ws[wd + j])
                     {
@@ -445,6 +453,7 @@ internal static class NumericRecurrenceKernelTemplate
                 _ => "__float_as_int(",
             })
             .Replace("NEGINF", bitsToFloat + "(-8388608)")
+            .Replace("FVALUE(", bitsToFloat + "(")
             .Replace("QNAN", bitsToFloat + "(2143289344)");
     }
 

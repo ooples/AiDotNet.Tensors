@@ -3862,7 +3862,7 @@ internal static class BackwardFunctions<T>
         {
             // Half/BFloat16: sign(p - y) g / n in float32, rounded once.
             DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionGradients.Pairwise(inputs[0], target,
-                LowPrecisionGradients.Upstream(gradOutput) / inputs[0].Length, (p, y) => Math.Sign(p - y)), engine);
+                LowPrecisionGradients.Upstream(gradOutput) / inputs[0].Length, (p, y) => p > y ? 1.0 : p < y ? -1.0 : 0.0), engine);
             return;
         }
 

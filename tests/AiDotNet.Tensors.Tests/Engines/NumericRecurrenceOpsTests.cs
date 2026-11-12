@@ -363,6 +363,16 @@ public class NumericRecurrenceOpsTests
     }
 
     // The unique optimum over all S! permutations (the random costs have no ties).
+    [Fact]
+    public void Assignment_ExtremeFiniteCostsAndNonFinitePenalties_StayFiniteInternally()
+    {
+        double h = double.MaxValue;
+        var finite = new Tensor<double>(new[] { h, -h, -h, h }, new[] { 2, 2 });
+        Assert.Equal(new[] { 1, 0 }, _engine.TensorLinearSumAssignment(finite).ToArray());
+        var forced = new Tensor<double>(new[] { double.NaN, double.NaN, h, -h }, new[] { 2, 2 });
+        Assert.Equal(new[] { 0, 1 }, _engine.TensorLinearSumAssignment(forced).ToArray());
+    }
+
     internal static int[] BruteForceAssignment(float[] cost, int b, int size)
     {
         int[] best = Array.Empty<int>();

@@ -57,6 +57,16 @@ public class LowPrecisionBackwardScaleTests
     }
 
     private static readonly Half[] P = HalfData(N, i => 1.0 + 0.5 * Math.Sin(0.37 * i));
+    [Fact]
+    public void MaeBackward_Half_NaNHasZeroSignWithoutThrowing()
+    {
+        var p = T1(new[] { Half.NaN, (Half)2 }, 2);
+        var target = T1(new[] { (Half)0, (Half)0 }, 2);
+        var g = Run(BackwardFunctions<Half>.L1LossBackward, Upstream(1), new[] { p, target }, Array.Empty<object>());
+        Assert.Equal((Half)0, g[0]);
+        Assert.Equal((Half)(G / 2), g[1]);
+    }
+
     private static readonly Half[] Tg = HalfData(N, i => 0.5 + 0.25 * Math.Cos(0.11 * i));
 
     [Fact]

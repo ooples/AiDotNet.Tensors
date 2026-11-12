@@ -267,7 +267,11 @@ fn nrec_linear_sum_assignment(@builtin(local_invocation_index) lidx: u32, @built
         workgroupBarrier();
     }
     let sz = f32(S);
-    let big = (sz + 1.0) * (2.0 * sm[0] + 1.0);
+    let exponent = max(0, i32(bitcast<u32>(sm[0]) >> 23u) - 127);
+    let halfExponent = exponent / 2;
+    let scaleA = bitcast<f32>(u32(halfExponent + 127) << 23u);
+    let scaleB = bitcast<f32>(u32(exponent - halfExponent + 127) << 23u);
+    let big = (sz + 1.0) * (2.0 * ((sm[0] / scaleA) / scaleB) + 1.0);
     for (var j = lid; j < S; j = j + 256) {
         ws[wu + j] = 0.0;
         ws[wv + j] = 0.0;
@@ -305,7 +309,7 @@ fn nrec_linear_sum_assignment(@builtin(local_invocation_index) lidx: u32, @built
                     if ((bits & 2139095040) == 2139095040) {
                         c = big;
                         if (bits == -8388608) { c = -big; }
-                    }
+                    } else { c = (c / scaleA) / scaleB; }
                     let r = minv + c - ui - ws[wv + j];
                     if (r < ws[wd + j]) {
                         ws[wp + j] = f32(i);

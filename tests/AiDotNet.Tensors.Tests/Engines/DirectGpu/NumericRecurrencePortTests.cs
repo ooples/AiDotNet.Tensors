@@ -119,6 +119,7 @@ public class NumericRecurrencePortTests
         CheckAssignment(backend, nr, 2, 9, withNaN: true);
         // Past the 400 rows a shared-memory solver could hold: the state lives in the global workspace.
         CheckAssignment(backend, nr, 1, 450, withNaN: false);
+        CheckExtremeAssignment(backend, nr);
     }
 
     private static float[] Random(int count, int seed, double scale, double shift)
@@ -242,6 +243,19 @@ public class NumericRecurrencePortTests
         var actual = backend.DownloadBuffer(ba);
         for (int i = 0; i < expected.Length; i++)
             Assert.True(expected[i] == actual[i], $"assignment B{batch} S{size}[{i}]: expected {expected[i]}, got {actual[i]}");
+    }
+
+    private static void CheckExtremeAssignment(IDirectGpuBackend backend, INumericRecurrenceBackend nr)
+    {
+        float h = float.MaxValue;
+        // Finite costs of both signs, and a forced non-finite row in a second batch item.
+        var cost = new[] { h, -h, -h, h, float.NaN, float.NaN, h, -h };
+        using var bc = backend.AllocateBuffer(cost);
+        using var ba = Output(backend, 4);
+        using var work = Output(backend, 32);
+        Assert.True(nr.TryLinearSumAssignment(bc, ba, work, 2, 2));
+        backend.Synchronize();
+        Assert.Equal(new[] { 1f, 0f, 0f, 1f }, backend.DownloadBuffer(ba));
     }
 
     private static void Compare(string what, double[] expected, float[] actual, double tolerance)
