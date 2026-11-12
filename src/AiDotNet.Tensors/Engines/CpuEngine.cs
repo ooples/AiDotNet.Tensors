@@ -51632,6 +51632,30 @@ public partial class CpuEngine : ITensorLevelEngine
         using var outDataLease = result.LeaseArray();
         var outData = outDataLease.Array;
 
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: window sums and the divide in float32, rounded once (the kernel size is +Inf in Half
+            // above 65,504 and a Half running sum overflows).
+            var lowIn = WidenToFloat(inData, input.Length);
+            var lowOut = new float[batch * channels * outW];
+            for (int p = 0; p < batch * channels; p++)
+                for (int ow = 0; ow < outW; ow++)
+                {
+                    float sum = 0f, compensation = 0f;
+                    int start = p * width + ow * stride;
+                    for (int k = 0; k < kernelSize; k++)
+                    {
+                        float y = lowIn[start + k] - compensation;
+                        float t = sum + y;
+                        compensation = (t - sum) - y;
+                        sum = t;
+                    }
+                    lowOut[p * outW + ow] = sum / kernelSize;
+                }
+            Array.Copy(NarrowFromFloat<T>(lowOut), outData, lowOut.Length);
+            goto avgPool1DRecord;
+        }
+
         for (int b = 0; b < batch; b++)
             for (int c = 0; c < channels; c++)
                 for (int ow = 0; ow < outW; ow++)
@@ -51642,6 +51666,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         sum = numOps.Add(sum, inData[(b * channels + c) * width + startW + k]);
                     outData[(b * channels + c) * outW + ow] = numOps.Divide(sum, numOps.FromDouble(kernelSize));
                 }
+    avgPool1DRecord:
         DifferentiableOps.RecordUnary("AvgPool1D", result, input, BackwardFunctions<T>.AvgPool1DBackward,
             savedState: new object[] { kernelSize, stride });
         AutoTracer.RecordOp("AvgPool1D", result, eng => eng.TensorAvgPool1D(input, kernelSize, stride));
