@@ -160,10 +160,10 @@ public partial class DirectGpuTensorEngine
             int n = scores.Length, rows = n / width;
             using var x = GetOrAllocateBuffer(backend, scores.IsContiguous ? scores : scores.Contiguous());
             var plan = TorchModelOpsCodes.PlanTopK(rows, width, k);
-            // The direct plan reads only the values scratch; the row-group plan only the (int) counts and the weights.
-            using var values = AllocateTransientScratch(backend, plan.RowGroups ? 1 : plan.ScratchLength, fullyWritten: true);
-            using var indices = AllocateTransientScratch(backend, plan.RowGroups ? plan.ScratchLength : 1, fullyWritten: true);
-            using var weights = AllocateTransientScratch(backend, plan.RowGroups ? plan.ScratchLength : 1, fullyWritten: true);
+            // Direct reads only the values scratch, row groups only the (int) counts and the weights, chunked all three.
+            using var values = AllocateTransientScratch(backend, plan.UsesValues ? plan.ScratchLength : 1, fullyWritten: true);
+            using var indices = AllocateTransientScratch(backend, plan.UsesIndicesAndWeights ? plan.ScratchLength : 1, fullyWritten: true);
+            using var weights = AllocateTransientScratch(backend, plan.UsesIndicesAndWeights ? plan.ScratchLength : 1, fullyWritten: true);
             result = DispatchDeferredGpuOp<T>(backend, n, (int[])scores._shape.Clone(),
                 output => models.ModelTopKSoftmax(x.Buffer, values.Buffer, indices.Buffer, weights.Buffer, output, rows, width, k),
                 fullyWritten: true);

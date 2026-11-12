@@ -127,7 +127,7 @@ internal static class PortableTorchModelOps
         Require(input, total, nameof(input), "rows * width");
         Require(output, total, nameof(output), "rows * width");
         var plan = TorchModelOpsCodes.PlanTopK(rows, width, k);
-        if (!plan.RowGroups)
+        if (plan.Mode == TorchModelOpsCodes.TopKMode.Direct)
         {
             // Short rows: every element ranks itself against its row (width threads per row, O(width) each).
             Require(scratchValues, plan.ScratchLength, nameof(scratchValues), "PlanTopK scratch");
@@ -135,7 +135,20 @@ internal static class PortableTorchModelOps
             launch("mo_topk_normalize", (int)total, scratchValues, output, rows, width);
             return;
         }
-        // Long rows: one work group of TopKGroupSize lanes per row (radix selection, then the softmax), one launch.
+        if (plan.Mode == TorchModelOpsCodes.TopKMode.Chunked)
+        {
+            // Long rows, small k: each chunk keeps its k best, then the candidates are ranked and scattered.
+            Require(scratchValues, plan.ScratchLength, nameof(scratchValues), "PlanTopK scratch");
+            Require(scratchIndices, plan.ScratchLength, nameof(scratchIndices), "PlanTopK scratch");
+            Require(scratchWeights, plan.ScratchLength, nameof(scratchWeights), "PlanTopK scratch");
+            int candidates = plan.ScratchLength;   // rows * chunks * k
+            launch("mo_topk_chunk", rows * plan.Chunks, input, scratchValues, scratchIndices, rows, width, plan.PerChunk, plan.ChunkLength, plan.Chunks);
+            launch("mo_topk_rank", candidates, scratchValues, scratchIndices, scratchWeights, rows, plan.PerChunk, plan.Chunks, k);
+            launch("mo_topk_zero", (int)total, output, (int)total);
+            launch("mo_topk_scatter", candidates, scratchIndices, scratchWeights, output, rows, plan.PerChunk * plan.Chunks, width);
+            return;
+        }
+        // Long rows, larger k: one work group of TopKGroupSize lanes per row (radix selection, then the softmax), one launch.
         Require(scratchIndices, plan.ScratchLength, nameof(scratchIndices), "PlanTopK scratch");
         Require(scratchWeights, plan.ScratchLength, nameof(scratchWeights), "PlanTopK scratch");
         launch("mo_topk_row", rows * TorchModelOpsCodes.TopKGroupSize, input, scratchIndices, scratchWeights, output, rows, width, k);

@@ -34,6 +34,7 @@ internal static class TorchModelOpsKernels
         "mo_surrogate_spike", "mo_activation_backward",
         "mo_minmax_partial", "mo_minmax_final", "mo_fake_quantize",
         "mo_topk_select", "mo_topk_normalize", "mo_topk_row",
+        "mo_topk_chunk", "mo_topk_rank", "mo_topk_zero", "mo_topk_scatter",
         "mo_time_embedding", "mo_time_embedding_backward",
         "mo_crf_forward", "mo_crf_backward",
         "mo_crf_boundary_grad", "mo_crf_transition_grad",
@@ -658,6 +659,111 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_topk_normalize(const floa
         if (!(ej < 0.0f)) { s = s + ej; }
     }
     y[g] = v / s;
+}
+
+// Long rows with a small k (a router's top-k over a vocabulary-sized row): many short independent selections, so the
+// whole device takes part even for one row. Each (row, chunk) slot keeps its chunk's kk best entries, best first, by
+// insertion: once the list is full an element that loses to its last entry costs one comparison, so a chunk costs
+// O(chunk) plus O(kk) per entry that enters the list. The global top k of a row are among these candidates: every entry
+// ahead of a top-k entry in the CPU's order is itself top-k, so it is in its chunk's list. Unfilled slots get (NaN, an
+// index past the row), which come after every real entry (NaN has the lowest key; ties go to the lower index).
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_chunk(const float* x, float* candVal, int* candIdx, int rows, int width, int kk, int chunk, int chunks)
+{
+    int g = bx_gid();
+    if (g >= rows * chunks) { return; }
+    int r = g / chunks;
+    int c = g - r * chunks;
+    int base = r * width;
+    int dst = g * kk;
+    int begin = c * chunk;
+    int end = begin + chunk;
+    if (end > width) { end = width; }
+    int count = 0;
+    for (int j = begin; j < end; j++)
+    {
+        float v = x[base + j];
+        int slot = count;
+        if (count == kk)
+        {
+            if (!mo_before(v, j, candVal[dst + kk - 1], candIdx[dst + kk - 1])) { continue; }
+            slot = kk - 1;
+        }
+        int pos = slot;
+        for (int s = slot; s > 0; s--)
+        {
+            if (!mo_before(v, j, candVal[dst + s - 1], candIdx[dst + s - 1])) { break; }
+            candVal[dst + s] = candVal[dst + s - 1];
+            candIdx[dst + s] = candIdx[dst + s - 1];
+            pos = s - 1;
+        }
+        candVal[dst + pos] = v;
+        candIdx[dst + pos] = j;
+        if (count < kk) { count = count + 1; }
+    }
+    for (int s = count; s < kk; s++)
+    {
+        candVal[dst + s] = mo_nan();
+        candIdx[dst + s] = width + s;
+    }
+}
+
+// A candidate's rank among its row's candidates: per chunk list (sorted best first), a binary search for the entries
+// ahead of it. w = exp(v - top) for the k best, -1 for the rest (so a selected entry whose exp underflows to 0, or is
+// NaN, still takes part in the normalization).
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_rank(const float* candVal, const int* candIdx, float* w, int rows, int kk, int chunks, int k)
+{
+    int g = bx_gid();
+    int m = chunks * kk;
+    if (g >= rows * m) { return; }
+    int base = (g / m) * m;
+    float v = candVal[g];
+    int vi = candIdx[g];
+    int rank = 0;
+    float top = candVal[base];
+    int topIndex = candIdx[base];
+    for (int c = 0; c < chunks; c++)
+    {
+        int list = base + c * kk;
+        if (mo_before(candVal[list], candIdx[list], top, topIndex)) { top = candVal[list]; topIndex = candIdx[list]; }
+        int lo = 0;
+        int hi = kk;
+        for (int it = 0; it < 32; it++)
+        {
+            if (lo >= hi) { break; }
+            int mid = (lo + hi) / 2;
+            if (mo_before(candVal[list + mid], candIdx[list + mid], v, vi)) { lo = mid + 1; }
+            else { hi = mid; }
+        }
+        rank = rank + lo;
+    }
+    float r0 = -1.0f;
+    if (rank < k) { r0 = expf(v - top); }
+    w[g] = r0;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_zero(float* y, int n)
+{
+    int g = bx_gid();
+    if (g >= n) { return; }
+    y[g] = 0.0f;
+}
+
+// y[row, index] = w / (row sum of the selected w) for the k selected candidates (w = -1 marks the rest; NaN is kept).
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_scatter(const int* candIdx, const float* w, float* y, int rows, int m, int width)
+{
+    int g = bx_gid();
+    if (g >= rows * m) { return; }
+    float v = w[g];
+    if (v < 0.0f) { return; }
+    int r = g / m;
+    int base = r * m;
+    float s = 0.0f;
+    for (int j = 0; j < m; j++)
+    {
+        float wj = w[base + j];
+        if (!(wj < 0.0f)) { s = s + wj; }
+    }
+    y[r * width + candIdx[g]] = v / s;
 }
 
 // Long rows (a vocabulary), one work group per row (launched with rows * 256 threads): a selection whose every pass

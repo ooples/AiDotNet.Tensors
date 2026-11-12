@@ -70,26 +70,58 @@ internal static class TorchModelOpsCodes
     /// <summary>Slots of the first min / max pass of fake quantization.</summary>
     public const int MinMaxSlots = 1024;
 
+    /// <summary>The kernels a top-k softmax runs.</summary>
+    internal enum TopKMode
+    {
+        /// <summary>Every element ranks itself against its row (mo_topk_select, mo_topk_normalize): rows up to
+        /// <see cref="TopKDirectWidth"/> wide.</summary>
+        Direct,
+        /// <summary>Chunks keep their k best by insertion, then the candidates are ranked and scattered (mo_topk_chunk,
+        /// mo_topk_rank, mo_topk_zero, mo_topk_scatter): long rows with a small k.</summary>
+        Chunked,
+        /// <summary>One work group per row selects by radix (mo_topk_row): long rows with a larger k.</summary>
+        RowGroups,
+    }
+
     /// <summary>How a top-k softmax runs, and the length of each of its scratch buffers.</summary>
     internal readonly struct TopKPlan
     {
-        public TopKPlan(bool rowGroups, int scratchLength)
+        public TopKPlan(TopKMode mode, int scratchLength, int chunkLength = 0, int chunks = 0, int perChunk = 0)
         {
-            RowGroups = rowGroups;
+            Mode = mode;
             ScratchLength = scratchLength;
+            ChunkLength = chunkLength;
+            Chunks = chunks;
+            PerChunk = perChunk;
         }
 
-        /// <summary>
-        /// False: every element ranks itself against its row (rows up to <see cref="TopKDirectWidth"/> wide), reading
-        /// only the values scratch. True: one work group per row selects (mo_topk_row), reading only the indices and
-        /// weights scratch.
-        /// </summary>
-        public bool RowGroups { get; }
+        public TopKMode Mode { get; }
+
+        /// <summary>Length of each scratch buffer the mode reads: values (Direct); values, indices and weights
+        /// (Chunked); indices, as int counts, and weights (RowGroups).</summary>
         public int ScratchLength { get; }
+
+        /// <summary>Whether the mode reads the values scratch.</summary>
+        public bool UsesValues => Mode != TopKMode.RowGroups;
+
+        /// <summary>Whether the mode reads the indices and weights scratch.</summary>
+        public bool UsesIndicesAndWeights => Mode != TopKMode.Direct;
+
+        /// <summary>Chunked: entries per chunk, chunks per row, and candidates each chunk keeps (k).</summary>
+        public int ChunkLength { get; }
+        public int Chunks { get; }
+        public int PerChunk { get; }
     }
 
-    /// <summary>Rows wider than this run one work group per row; narrower rows rank every element against its row.</summary>
+    /// <summary>The widest row the direct ranking is meant for (O(width) per element): past it, it is never the fastest.</summary>
     public const int TopKDirectWidth = 1024;
+
+    /// <summary>Rows up to this wide rank directly whatever k is (measured crossover).</summary>
+    public const int TopKDirectPreferredWidth = 256;
+
+    /// <summary>Rows up to this wide rank directly when k is above <see cref="TopKChunkedMaxK"/>: one work group per row
+    /// only overtakes the direct ranking past it (measured crossover).</summary>
+    public const int TopKDirectLargeKWidth = 512;
 
     /// <summary>Lanes of a mo_topk_row work group: the group size every backend launches the kernel with.</summary>
     public const int TopKGroupSize = 256;
@@ -98,20 +130,58 @@ internal static class TorchModelOpsCodes
     public const int TopKRowScratch = 4 * TopKGroupSize;
 
     /// <summary>
+    /// The largest k a row wider than <see cref="TopKDirectPreferredWidth"/> runs chunked; above it, one work group per row
+    /// (or the direct ranking up to <see cref="TopKDirectLargeKWidth"/>). Measured by TorchModelOpsGpuTimingTests.TopKSoftmax_DispatchTable.
+    /// </summary>
+    public const int TopKChunkedMaxK = 8;
+
+    /// <summary>Forces the mode on this thread (timing comparisons and tests only); null lets <see cref="PlanTopK"/> choose.</summary>
+    [ThreadStatic]
+    internal static TopKMode? ForcedMode;
+
+    /// <summary>The mode <see cref="PlanTopK"/> runs a [rows, width] top-k in (see <see cref="TopKChunkedMaxK"/>).</summary>
+    public static TopKMode ChooseTopKMode(int rows, int width, int k)
+    {
+        // Measured on CUDA and OpenCL (RTX 1000 Ada) over k 1..8192, widths 64..50,000 and 1..64 rows: the direct ranking
+        // wins on short rows; past them a small k (a router's top 1..8) runs chunked, where even one row fills the device,
+        // and a larger k one work group per row, whose cost does not grow with k.
+        if (width <= TopKDirectPreferredWidth) return TopKMode.Direct;
+        if (k <= TopKChunkedMaxK) return TopKMode.Chunked;
+        return width <= TopKDirectLargeKWidth ? TopKMode.Direct : TopKMode.RowGroups;
+    }
+
+    /// <summary>
     /// The top-k plan for a [rows, width] input. Short rows rank each element against its row (O(width) per element, all
-    /// parallel). Long rows run one work group per row: a radix selection of the k-th largest order key (32 counting
-    /// passes, one per key bit), a count of the entries above and at it, and, when only some entries equal to it are
-    /// selected, a binary search for the index cut among them (log2(width) passes), then the softmax. Each pass costs a
-    /// lane O(width / 256) whatever k is, so a vocabulary-sized row with a large k stays a few milliseconds.
+    /// parallel). A long row with a small k splits into chunks that each keep their k best by insertion (O(chunk) per
+    /// chunk once the list fills), and the rows * chunks * k candidates are ranked by a binary search per chunk list:
+    /// many independent selections, so even one row fills the device. With a larger k the insertion grows with k, so a
+    /// long row runs one work group instead: a radix selection of the k-th largest order key (32 counting passes), a
+    /// count of the entries above and at it, a binary search for the index cut among the tied ones, then the softmax,
+    /// each pass O(width / 256) per lane whatever k is. Every mode selects exactly the CPU's top k (integer order keys,
+    /// ties to the lower index).
     /// </summary>
     public static TopKPlan PlanTopK(int rows, int width, int k)
     {
-        if (width <= TopKDirectWidth)
-            return new TopKPlan(false, checked(rows * width));
+        if (rows < 0 || width < 1 || k < 1 || k > width) throw new ArgumentOutOfRangeException(nameof(k));
+        var mode = ForcedMode ?? ChooseTopKMode(rows, width, k);
+        if (mode == TopKMode.Direct)
+            return new TopKPlan(TopKMode.Direct, checked(rows * width));
+        if (mode == TopKMode.Chunked)
+        {
+            // A small k: chunks long enough that a row keeps about 1024 candidates. A larger k: chunks of a few hundred
+            // entries, so a chunk's insertion stays short.
+            long chunk = k <= 32 ? Math.Max(256L, ((long)width * k + 1023) / 1024) : Math.Max(512L, k);
+            chunk = Math.Min(chunk, width);
+            int chunks = (int)((width + chunk - 1) / chunk);
+            long candidates = (long)rows * chunks * k;
+            if (candidates > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(rows), "rows * chunks * k must fit an int.");
+            return new TopKPlan(TopKMode.Chunked, (int)candidates, (int)chunk, chunks, k);
+        }
         long scratch = (long)rows * TopKRowScratch;
         if (scratch > int.MaxValue || (long)rows * TopKGroupSize > int.MaxValue)
             throw new ArgumentOutOfRangeException(nameof(rows), "rows * 1024 must fit an int.");
-        return new TopKPlan(true, (int)scratch);
+        return new TopKPlan(TopKMode.RowGroups, (int)scratch);
     }
 
     /// <summary>The activation code mo_activation_backward reads for a model activation, or -1.</summary>

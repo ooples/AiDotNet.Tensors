@@ -405,6 +405,44 @@ public abstract class TorchModelOpsGpuTestsBase
         }
     }
 
+    /// <summary>
+    /// Every top-k mode (each forced in turn: direct ranking, chunked insertion, one work group per row) selects exactly
+    /// the CPU's entries over the stress rows (ties cut inside a group of equal values, signed zeros, NaN, -inf), for a
+    /// k on both sides of the chunked/row-group crossover. The planner picks between them by speed alone.
+    /// </summary>
+    [SkippableFact]
+    public void TopKSoftmax_EveryMode_MatchesCpuSelectionExactly()
+    {
+        var gpu = GpuOrSkip();
+        const int width = 3000;
+        var x = TopKStressRows(37, width);
+        try
+        {
+            foreach (var mode in new[] { TorchModelOpsCodes.TopKMode.Direct, TorchModelOpsCodes.TopKMode.Chunked, TorchModelOpsCodes.TopKMode.RowGroups })
+            {
+                TorchModelOpsCodes.ForcedMode = mode;
+                foreach (int k in new[] { 1, 2, 7, 32, 33, 64, 257 })
+                {
+                    var cpuY = new CpuEngine().TensorTopKSoftmax(Copy(x), k).ToArray();
+                    var gpuY = gpu.TensorTopKSoftmax(gpu.TensorMultiplyScalar(Copy(x), 1f), k).ToArray();
+                    Assert.Equal(cpuY.Length, gpuY.Length);
+                    for (int i = 0; i < cpuY.Length; i++)
+                    {
+                        Assert.True(float.IsNaN(cpuY[i]) == float.IsNaN(gpuY[i]) && (cpuY[i] == 0f) == (gpuY[i] == 0f),
+                            $"{mode} k={k} row {i / width} index {i % width} (x {x[i]:R}): cpu {cpuY[i]:R} gpu {gpuY[i]:R}");
+                        if (!float.IsNaN(cpuY[i]))
+                            Assert.True(Math.Abs(cpuY[i] - gpuY[i]) <= 2e-6 + 1e-5 * Math.Abs(cpuY[i]),
+                                $"{mode} k={k} row {i / width} index {i % width}: cpu {cpuY[i]:R} gpu {gpuY[i]:R}");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            TorchModelOpsCodes.ForcedMode = null;
+        }
+    }
+
     [SkippableFact]
     public void SinusoidalTimeEmbedding_MatchesCpu_OnDevice()
     {
