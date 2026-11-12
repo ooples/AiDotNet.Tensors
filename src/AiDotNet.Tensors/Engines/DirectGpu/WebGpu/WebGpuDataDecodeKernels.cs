@@ -114,42 +114,104 @@ fn dd_f64_to_f32(hi: u32, lo: u32) -> u32 {
     return sgn | dd_round_shift(shi, lo, -97 - ue);
 }
 
-fn dd_div_to_f32(num: u32, den: u32, stickyIn: bool) -> u32 {
-    let q = num / den;
-    var r = num - q * den;
-    var m = 0u;
-    var ex2 = 0;
-    var nb = 0;
-    var sticky = stickyIn;
-    if (q != 0u) {
-        let p = dd_msb(q);
-        if (p >= 24) {
-            let s = p - 24;
-            m = q >> u32(s);
-            if ((q & ((1u << u32(s)) - 1u)) != 0u) { sticky = true; }
-            ex2 = s;
-            nb = 25;
-        } else {
-            m = q;
-            nb = p + 1;
+fn dd_mul10_lo(lo: u32, d: u32) -> u32 {
+    let l0 = (lo & 65535u) * 10u + d;
+    let l1 = (lo >> 16u) * 10u + (l0 >> 16u);
+    return (l1 << 16u) | (l0 & 65535u);
+}
+
+fn dd_mul10_carry(lo: u32, d: u32) -> u32 {
+    let l0 = (lo & 65535u) * 10u + d;
+    let l1 = (lo >> 16u) * 10u + (l0 >> 16u);
+    return l1 >> 16u;
+}
+
+fn dd_big_mul10(x: ptr<function, array<u32, 8>>) {
+    var carry = 0u;
+    for (var i = 0; i < 8; i = i + 1) {
+        let v = (*x)[i];
+        let l0 = (v & 65535u) * 10u + carry;
+        let l1 = (v >> 16u) * 10u + (l0 >> 16u);
+        (*x)[i] = (l1 << 16u) | (l0 & 65535u);
+        carry = l1 >> 16u;
+    }
+}
+
+fn dd_big_bitlen(x: ptr<function, array<u32, 8>>) -> i32 {
+    var n = 0;
+    for (var i = 7; i >= 0; i = i - 1) {
+        if (n == 0 && (*x)[i] != 0u) { n = i * 32 + dd_msb((*x)[i]) + 1; }
+    }
+    return n;
+}
+
+fn dd_big_shl(x: ptr<function, array<u32, 8>>, s: i32) {
+    let ls = s >> 5u;
+    let bs = s & 31;
+    for (var i = 7; i >= 0; i = i - 1) {
+        let j = i - ls;
+        var v = 0u;
+        if (j >= 0) {
+            v = (*x)[j] << u32(bs);
+            if (bs != 0 && j >= 1) { v = v | ((*x)[j - 1] >> u32(32 - bs)); }
+        }
+        (*x)[i] = v;
+    }
+}
+
+fn dd_big_ge(x: ptr<function, array<u32, 8>>, y: ptr<function, array<u32, 8>>) -> bool {
+    var r = true;
+    var decided = false;
+    for (var i = 7; i >= 0; i = i - 1) {
+        if (!decided && (*x)[i] != (*y)[i]) {
+            decided = true;
+            if ((*x)[i] < (*y)[i]) { r = false; }
         }
     }
-    loop {
-        if (nb >= 25) { break; }
-        r = r << 1u;
-        var bit = 0u;
-        if (r >= den) { bit = 1u; r = r - den; }
-        m = (m << 1u) | bit;
-        ex2 = ex2 - 1;
-        if (m != 0u) { nb = nb + 1; }
+    return r;
+}
+
+fn dd_big_sub(x: ptr<function, array<u32, 8>>, y: ptr<function, array<u32, 8>>) {
+    var borrow = 0u;
+    for (var i = 0; i < 8; i = i + 1) {
+        let u = (*x)[i];
+        let w = (*y)[i];
+        var nb = 0u;
+        if (u < w || (u == w && borrow != 0u)) { nb = 1u; }
+        (*x)[i] = u - w - borrow;
+        borrow = nb;
     }
-    if (r != 0u) { sticky = true; }
+}
+
+fn dd_exact_to_f32(sHi: u32, sLo: u32, e10: i32, stickyIn: bool) -> u32 {
+    var a: array<u32, 8>;
+    var b: array<u32, 8>;
+    a[0] = sLo;
+    a[1] = sHi;
+    b[0] = 1u;
+    for (var t = 0; t < e10; t = t + 1) { dd_big_mul10(&a); }
+    for (var t = 0; t < -e10; t = t + 1) { dd_big_mul10(&b); }
+    let la = dd_big_bitlen(&a);
+    let lb = dd_big_bitlen(&b);
+    var ex2 = la - lb;
+    if (la > lb) { dd_big_shl(&b, la - lb); }
+    else if (lb > la) { dd_big_shl(&a, lb - la); }
+    if (!dd_big_ge(&a, &b)) { dd_big_shl(&a, 1); ex2 = ex2 - 1; }
+    var m = 0u;
+    for (var k = 0; k < 25; k = k + 1) {
+        var bit = 0u;
+        if (dd_big_ge(&a, &b)) { dd_big_sub(&a, &b); bit = 1u; }
+        m = (m << 1u) | bit;
+        dd_big_shl(&a, 1);
+    }
+    var sticky = stickyIn;
+    if (dd_big_bitlen(&a) != 0) { sticky = true; }
     let rb = m & 1u;
     m = m >> 1u;
-    ex2 = ex2 + 1;
     if (rb != 0u && (sticky || (m & 1u) != 0u)) { m = m + 1u; }
     if (m == 16777216u) { m = 8388608u; ex2 = ex2 + 1; }
-    return (u32(ex2 + 150) << 23u) | (m & 8388607u);
+    if (ex2 < -126 || ex2 > 127) { return 0u; }
+    return (u32(ex2 + 127) << 23u) | (m & 8388607u);
 }
 
 fn dd_is_white(b: u32) -> bool { return b == 32u || (b >= 9u && b <= 13u); }
@@ -319,7 +381,8 @@ fn dd_parse_fields(@builtin(global_invocation_id) gidv: vec3<u32>) {
                 q = q + 1;
             }
         }
-        var sig = 0u;
+        var sLo = 0u;
+        var sHi = 0u;
         var nsig = 0;
         var dropped = false;
         var scale = 0;
@@ -330,8 +393,8 @@ fn dd_parse_fields(@builtin(global_invocation_id) gidv: vec3<u32>) {
             if (b < 48u || b > 57u) { break; }
             let d = b - 48u;
             digits = digits + 1;
-            if (sig == 0u && d == 0u) { }
-            else if (nsig < 9) { sig = sig * 10u + d; nsig = nsig + 1; }
+            if (nsig == 0 && d == 0u) { }
+            else if (nsig < 19) { sHi = sHi * 10u + dd_mul10_carry(sLo, d); sLo = dd_mul10_lo(sLo, d); nsig = nsig + 1; }
             else { scale = scale + 1; if (d != 0u) { dropped = true; } }
             q = q + 1;
         }
@@ -345,8 +408,13 @@ fn dd_parse_fields(@builtin(global_invocation_id) gidv: vec3<u32>) {
                     if (c < 48u || c > 57u) { break; }
                     let d = c - 48u;
                     digits = digits + 1;
-                    if (sig == 0u && d == 0u) { scale = scale - 1; }
-                    else if (nsig < 9) { sig = sig * 10u + d; nsig = nsig + 1; scale = scale - 1; }
+                    if (nsig == 0 && d == 0u) { scale = scale - 1; }
+                    else if (nsig < 19) {
+                        sHi = sHi * 10u + dd_mul10_carry(sLo, d);
+                        sLo = dd_mul10_lo(sLo, d);
+                        nsig = nsig + 1;
+                        scale = scale - 1;
+                    }
                     else if (d != 0u) { dropped = true; }
                     q = q + 1;
                 }
@@ -379,27 +447,21 @@ fn dd_parse_fields(@builtin(global_invocation_id) gidv: vec3<u32>) {
         }
         if (q != r) { state = 1; }
         if (state == 0) {
-            if (sig == 0u) {
+            if (nsig == 0) {
                 if (neg) { state = 1; } else { resultBits = 0u; }
             } else {
                 let e10 = scale + ex;
-                var numLo = sig;
-                var numHi = sig;
-                if (dropped) { numHi = sig + 1u; }
-                var den = 1u;
-                if (e10 > 9 || e10 < -9) { state = 1; }
-                else if (e10 >= 0) {
-                    var p10 = 1u;
-                    for (var t = 0; t < e10; t = t + 1) { p10 = p10 * 10u; }
-                    if (numHi > 2147483647u / p10) { state = 1; }
-                    else { numLo = numLo * p10; numHi = numHi * p10; }
-                } else {
-                    for (var t = 0; t < -e10; t = t + 1) { den = den * 10u; }
-                }
-                if (state == 0) {
-                    let lob = dd_div_to_f32(numLo, den, dropped);
-                    if (dropped && dd_div_to_f32(numHi, den, true) != lob) { state = 1; }
-                    else {
+                if (nsig - 1 + e10 < -37 || nsig + e10 > 38) { state = 1; }
+                else {
+                    let lob = dd_exact_to_f32(sHi, sLo, e10, dropped);
+                    if (lob == 0u) { state = 1; }
+                    else if (dropped) {
+                        let hLo = sLo + 1u;
+                        var hHi = sHi;
+                        if (hLo == 0u) { hHi = hHi + 1u; }
+                        if (dd_exact_to_f32(hHi, hLo, e10, true) != lob) { state = 1; }
+                    }
+                    if (state == 0) {
                         resultBits = lob;
                         if (neg) { resultBits = lob | 2147483648u; }
                     }

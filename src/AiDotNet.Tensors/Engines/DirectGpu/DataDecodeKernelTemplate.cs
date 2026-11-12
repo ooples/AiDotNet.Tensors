@@ -19,9 +19,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <item><see cref="Scan"/>: one group's exclusive prefix sum over an int array, in place, and the total.</item>
 /// <item><see cref="ScatterBounds"/>: from each segment's first field index, every field's [start, end) byte range.</item>
 /// <item><see cref="ParseFields"/>: every field parsed to float32, exactly as <c>float.Parse</c> rounds. A field outside
-/// the exactly-rounded fast path (more than nine significant digits whose rounding the dropped digits could change, a
-/// decimal exponent outside [-9, 9], NaN / infinity symbols, a negative zero, any character the fast grammar does not
-/// accept) is flagged for the host instead of guessed.</item>
+/// the exactly-rounded fast path (more than nineteen significant digits whose rounding the dropped digits could change,
+/// a value that may fall outside the normal float range [1e-37, 1e38), NaN / infinity symbols, a negative zero, any
+/// character the fast grammar does not accept) is flagged for the host instead of guessed.</item>
 /// </list>
 /// Per-element kernels take <c>firstItem</c>, so a grid larger than one dispatch's 65535 groups runs as several launches.
 /// </summary>
@@ -208,49 +208,131 @@ FN uint dd_f64_to_f32(uint hi, uint lo)
     return sgn | dd_round_shift(shi, lo, -97 - ue);
 }
 
-// The float32 bits of num / den (num >= 1, num < 2^31, den <= 10^9) rounded to nearest even; stickyIn marks a value
-// strictly above num / den by less than one unit of num.
-FN uint dd_div_to_f32(uint num, uint den, int stickyIn)
+// The low word of lo * 10 + d, and the carry out of it, computed in 16-bit halves (d <= 9).
+FN uint dd_mul10_lo(uint lo, uint d)
 {
-    uint q = num / den;
-    uint r = num - q * den;
+    uint l0 = (lo & 65535u) * 10u + d;
+    uint l1 = (lo >> 16) * 10u + (l0 >> 16);
+    return (l1 << 16) | (l0 & 65535u);
+}
+
+FN uint dd_mul10_carry(uint lo, uint d)
+{
+    uint l0 = (lo & 65535u) * 10u + d;
+    uint l1 = (lo >> 16) * 10u + (l0 >> 16);
+    return l1 >> 16;
+}
+
+// x = x * 10 over eight little-endian words (the callers' bounds keep the product below 2^256).
+FN void dd_big_mul10(LIMBS x LIMBS_END)
+{
+    uint carry = 0u;
+    for (int i = 0; i < 8; i++)
+    {
+        uint v = x[i];
+        uint l0 = (v & 65535u) * 10u + carry;
+        uint l1 = (v >> 16) * 10u + (l0 >> 16);
+        x[i] = (l1 << 16) | (l0 & 65535u);
+        carry = l1 >> 16;
+    }
+}
+
+// The bit length of x (0 for zero).
+FN int dd_big_bitlen(CLIMBS x LIMBS_END)
+{
+    int n = 0;
+    for (int i = 7; i >= 0; i--)
+    {
+        if (n == 0 && x[i] != 0u) n = i * 32 + dd_msb(x[i]) + 1;
+    }
+    return n;
+}
+
+// x = x << s (s >= 0); bits past the top word are dropped (the callers' bounds keep them zero).
+FN void dd_big_shl(LIMBS x LIMBS_END, int s)
+{
+    int ls = s >> 5;
+    int bs = s & 31;
+    for (int i = 7; i >= 0; i--)
+    {
+        int j = i - ls;
+        uint v = 0u;
+        if (j >= 0)
+        {
+            v = x[j] << ITOU(bs);
+            if (bs != 0 && j >= 1) v = v | (x[j - 1] >> ITOU(32 - bs));
+        }
+        x[i] = v;
+    }
+}
+
+// 1 when x >= y.
+FN int dd_big_ge(CLIMBS x LIMBS_END, CLIMBS y LIMBS_END)
+{
+    int r = 1;
+    int decided = 0;
+    for (int i = 7; i >= 0; i--)
+    {
+        if (decided == 0 && x[i] != y[i])
+        {
+            decided = 1;
+            if (x[i] < y[i]) r = 0;
+        }
+    }
+    return r;
+}
+
+// x = x - y (x >= y).
+FN void dd_big_sub(LIMBS x LIMBS_END, CLIMBS y LIMBS_END)
+{
+    uint borrow = 0u;
+    for (int i = 0; i < 8; i++)
+    {
+        uint u = x[i];
+        uint w = y[i];
+        uint nb = 0u;
+        if (u < w || (u == w && borrow != 0u)) nb = 1u;
+        x[i] = u - w - borrow;
+        borrow = nb;
+    }
+}
+
+// The float32 bits of sHi:sLo * 10^e10 (the value > 0, bounded by the caller to the normal range) rounded to nearest
+// even, by exact arithmetic: a = s * 10^max(e10, 0) and b = 10^max(-e10, 0) aligned to the same bit length, 25
+// quotient bits by restoring division, the remainder as the sticky bit. stickyIn marks a value strictly above the
+// quotient. 0 when the result is outside the normal range. The host twin is NumericTextFastPath.ExactToSingleBits.
+FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
+{
+    uint a[8];
+    uint b[8];
+    for (int i = 0; i < 8; i++) { a[i] = 0u; b[i] = 0u; }
+    a[0] = sLo;
+    a[1] = sHi;
+    b[0] = 1u;
+    for (int t = 0; t < e10; t++) dd_big_mul10(a);
+    for (int t = 0; t < -e10; t++) dd_big_mul10(b);
+    int la = dd_big_bitlen(a);
+    int lb = dd_big_bitlen(b);
+    int ex2 = la - lb;
+    if (la > lb) dd_big_shl(b, la - lb);
+    else if (lb > la) dd_big_shl(a, lb - la);
+    if (dd_big_ge(a, b) == 0) { dd_big_shl(a, 1); ex2 = ex2 - 1; }
     uint m = 0u;
-    int ex2 = 0;
-    int nb = 0;
-    int sticky = stickyIn;
-    if (q != 0u)
+    for (int k = 0; k < 25; k++)
     {
-        int p = dd_msb(q);
-        if (p >= 24)
-        {
-            int s = p - 24;
-            m = q >> s;
-            if ((q & ((1u << s) - 1u)) != 0u) sticky = 1;
-            ex2 = s;
-            nb = 25;
-        }
-        else
-        {
-            m = q;
-            nb = p + 1;
-        }
-    }
-    while (nb < 25)
-    {
-        r = r << 1;
         uint bit = 0u;
-        if (r >= den) { bit = 1u; r = r - den; }
+        if (dd_big_ge(a, b) != 0) { dd_big_sub(a, b); bit = 1u; }
         m = (m << 1) | bit;
-        ex2 = ex2 - 1;
-        if (m != 0u) nb = nb + 1;
+        dd_big_shl(a, 1);
     }
-    if (r != 0u) sticky = 1;
+    int sticky = stickyIn;
+    if (dd_big_bitlen(a) != 0) sticky = 1;
     uint rb = m & 1u;
     m = m >> 1;
-    ex2 = ex2 + 1;
     if (rb != 0u && (sticky != 0 || (m & 1u) != 0u)) m = m + 1u;
     if (m == 16777216u) { m = 8388608u; ex2 = ex2 + 1; }
-    return (ITOU(ex2 + 150) << 23) | (m & 8388607u);
+    if (ex2 < -126 || ex2 > 127) return 0u;
+    return (ITOU(ex2 + 127) << 23) | (m & 8388607u);
 }
 ";
 
@@ -357,9 +439,10 @@ FN uint dd_div_to_f32(uint num, uint den, int stickyIn)
 ";
 
     // The fast grammar: [white] [sign] digits [. digits] [(e|E) [sign] digits] [white], each part only where the style
-    // allows it, at least one mantissa digit. Up to nine significant digits are kept; later ones only mark the value as
-    // strictly above the kept prefix. The result is then exact integer division (dd_div_to_f32), and when digits were
-    // dropped the prefix and the prefix plus one unit must round to the same float, so the dropped digits cannot matter.
+    // allows it, at least one mantissa digit. Up to nineteen significant digits are kept (sHi:sLo); later ones only mark
+    // the value as strictly above the kept prefix. A result certainly in the normal range ([1e-37, 1e38)) is then
+    // rounded by exact multi-word division (dd_exact_to_f32), and when digits were dropped the prefix and the prefix
+    // plus one unit must round to the same float, so the dropped digits cannot matter.
     private static readonly string ParseBody = @"
     int f = gid + firstItem;
     if (f >= nItems) return;
@@ -395,7 +478,8 @@ FN uint dd_div_to_f32(uint num, uint den, int stickyIn)
                 q = q + 1;
             }
         }
-        uint sig = 0u;
+        uint sLo = 0u;
+        uint sHi = 0u;
         int nsig = 0;
         int dropped = 0;
         int scale = 0;
@@ -406,8 +490,8 @@ FN uint dd_div_to_f32(uint num, uint den, int stickyIn)
             if (b < 48u || b > 57u) break;
             uint d = b - 48u;
             digits = digits + 1;
-            if (sig == 0u && d == 0u) { }
-            else if (nsig < 9) { sig = sig * 10u + d; nsig = nsig + 1; }
+            if (nsig == 0 && d == 0u) { }
+            else if (nsig < 19) { sHi = sHi * 10u + dd_mul10_carry(sLo, d); sLo = dd_mul10_lo(sLo, d); nsig = nsig + 1; }
             else { scale = scale + 1; if (d != 0u) dropped = 1; }
             q = q + 1;
         }
@@ -424,8 +508,14 @@ FN uint dd_div_to_f32(uint num, uint den, int stickyIn)
                     if (c < 48u || c > 57u) break;
                     uint d = c - 48u;
                     digits = digits + 1;
-                    if (sig == 0u && d == 0u) scale = scale - 1;
-                    else if (nsig < 9) { sig = sig * 10u + d; nsig = nsig + 1; scale = scale - 1; }
+                    if (nsig == 0 && d == 0u) scale = scale - 1;
+                    else if (nsig < 19)
+                    {
+                        sHi = sHi * 10u + dd_mul10_carry(sLo, d);
+                        sLo = dd_mul10_lo(sLo, d);
+                        nsig = nsig + 1;
+                        scale = scale - 1;
+                    }
                     else if (d != 0u) dropped = 1;
                     q = q + 1;
                 }
@@ -462,34 +552,26 @@ FN uint dd_div_to_f32(uint num, uint den, int stickyIn)
         if (q != r) state = 1;
         if (state == 0)
         {
-            if (sig == 0u)
+            if (nsig == 0)
             {
                 if (neg != 0) state = 1; else resultBits = 0u;
             }
             else
             {
                 int e10 = scale + ex;
-                uint numLo = sig;
-                uint numHi = sig;
-                if (dropped != 0) numHi = sig + 1u;
-                uint den = 1u;
-                if (e10 > 9 || e10 < -9) state = 1;
-                else if (e10 >= 0)
-                {
-                    uint p10 = 1u;
-                    for (int t = 0; t < e10; t++) p10 = p10 * 10u;
-                    if (numHi > 2147483647u / p10) state = 1;
-                    else { numLo = numLo * p10; numHi = numHi * p10; }
-                }
+                if (nsig - 1 + e10 < -37 || nsig + e10 > 38) state = 1;
                 else
                 {
-                    for (int t = 0; t < -e10; t++) den = den * 10u;
-                }
-                if (state == 0)
-                {
-                    uint lob = dd_div_to_f32(numLo, den, dropped);
-                    if (dropped != 0 && dd_div_to_f32(numHi, den, 1) != lob) state = 1;
-                    else
+                    uint lob = dd_exact_to_f32(sHi, sLo, e10, dropped);
+                    if (lob == 0u) state = 1;
+                    else if (dropped != 0)
+                    {
+                        uint hLo = sLo + 1u;
+                        uint hHi = sHi;
+                        if (hLo == 0u) hHi = hHi + 1u;
+                        if (dd_exact_to_f32(hHi, hLo, e10, 1) != lob) state = 1;
+                    }
+                    if (state == 0)
                     {
                         resultBits = lob;
                         if (neg != 0) resultBits = lob | 2147483648u;
@@ -621,10 +703,24 @@ FN uint dd_div_to_f32(uint num, uint den, int stickyIn)
         return sb.ToString();
     }
 
-    // The dialect-neutral spellings: helper-function qualifier, the work-group barrier, and the int <-> uint
-    // conversions (GLSL has no C cast).
+    // The dialect-neutral spellings: helper-function qualifier, the work-group barrier, the int <-> uint conversions
+    // (GLSL has no C cast) and the eight-word integer parameters (LIMBS name LIMBS_END, CLIMBS when read-only: an
+    // array copied in / out in GLSL, a pointer to the caller's private array elsewhere).
     private static string Spell(string body, WinogradKernelDialect dialect)
         => body.Replace("FN ", dialect == WinogradKernelDialect.Hip ? "__device__ inline " : "")
+            .Replace("CLIMBS ", dialect switch
+            {
+                WinogradKernelDialect.Glsl => "in uint ",
+                WinogradKernelDialect.Metal => "thread const uint* ",
+                _ => "const uint* ",
+            })
+            .Replace("LIMBS ", dialect switch
+            {
+                WinogradKernelDialect.Glsl => "inout uint ",
+                WinogradKernelDialect.Metal => "thread uint* ",
+                _ => "uint* ",
+            })
+            .Replace(" LIMBS_END", dialect == WinogradKernelDialect.Glsl ? "[8]" : "")
             .Replace("BARRIER();", dialect switch
             {
                 WinogradKernelDialect.OpenCl => "barrier(CLK_LOCAL_MEM_FENCE);",

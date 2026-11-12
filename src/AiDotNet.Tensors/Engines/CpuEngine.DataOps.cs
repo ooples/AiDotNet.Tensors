@@ -500,15 +500,15 @@ internal static class NumericTextFastPath
             neg = s[q] == (byte)'-';
             q++;
         }
-        uint sig = 0;
+        ulong sig = 0;
         int nsig = 0, scale = 0, digits = 0;
         bool dropped = false;
         while (q < r && s[q] >= (byte)'0' && s[q] <= (byte)'9')
         {
             uint d = (uint)(s[q] - '0');
             digits++;
-            if (sig == 0 && d == 0) { }
-            else if (nsig < 9) { sig = sig * 10 + d; nsig++; }
+            if (nsig == 0 && d == 0) { }
+            else if (nsig < MaxKeptDigits) { sig = sig * 10 + d; nsig++; }
             else { scale++; if (d != 0) dropped = true; }
             q++;
         }
@@ -520,8 +520,8 @@ internal static class NumericTextFastPath
             {
                 uint d = (uint)(s[q] - '0');
                 digits++;
-                if (sig == 0 && d == 0) scale--;
-                else if (nsig < 9) { sig = sig * 10 + d; nsig++; scale--; }
+                if (nsig == 0 && d == 0) scale--;
+                else if (nsig < MaxKeptDigits) { sig = sig * 10 + d; nsig++; scale--; }
                 else if (d != 0) dropped = true;
                 q++;
             }
@@ -545,31 +545,151 @@ internal static class NumericTextFastPath
             if (eneg) ex = -ex;
         }
         if (q != r) return Undecided;
-        if (sig == 0)
+        if (nsig == 0)
         {
             if (neg) return Undecided;   // "-0": .NET Framework and .NET Core disagree on its sign
             bits = 0;
             return Parsed;
         }
-        long e10 = (long)scale + ex;
-        uint numLo = sig, numHi = dropped ? sig + 1 : sig, den = 1;
-        if (e10 > 9 || e10 < -9) return Undecided;
-        if (e10 >= 0)
-        {
-            uint p10 = 1;
-            for (int t = 0; t < e10; t++) p10 *= 10;
-            if (numHi > 2147483647u / p10) return Undecided;
-            numLo *= p10;
-            numHi *= p10;
-        }
-        else
-        {
-            for (long t = 0; t < -e10; t++) den *= 10;
-        }
-        uint lo = DivToSingleBits(numLo, den, dropped);
-        if (dropped && DivToSingleBits(numHi, den, true) != lo) return Undecided;
+        // The kept prefix lies in [10^(nsig-1), 10^nsig); decide only results that are certainly normal and finite
+        // (in [1e-37, 1e38)), so overflow, underflow and subnormals stay with float.Parse.
+        int e10 = scale + ex;
+        if (nsig - 1 + e10 < MinDecimalExponent || nsig + e10 > MaxDecimalExponent) return Undecided;
+        uint lo;
+        if (!dropped && TrySmallQuotient(sig, e10, out uint num, out uint den)) lo = DivToSingleBits(num, den, false);
+        else lo = ExactToSingleBits(sig, e10, dropped);
+        if (lo == 0) return Undecided;
+        if (dropped && ExactToSingleBits(sig + 1, e10, true) != lo) return Undecided;
         bits = neg ? lo | 0x80000000u : lo;
         return Parsed;
+    }
+
+    /// <summary>Significant digits kept exactly (a prefix below 10^19 fits 64 bits); later ones only mark the value as
+    /// strictly above the prefix, and the prefix plus one unit must then round to the same float.</summary>
+    internal const int MaxKeptDigits = 19;
+
+    /// <summary>The decided range: a value in [10^-37, 10^38) is a normal, finite float32 (2^-126 &lt; 10^-37 and
+    /// 10^38 &lt; float.MaxValue).</summary>
+    internal const int MinDecimalExponent = -37, MaxDecimalExponent = 38;
+
+    /// <summary>Words of the exact path's integers: the largest divisor, 10^55 (under 2^183), aligned and shifted by
+    /// one bit per quotient step still fits 256 bits.</summary>
+    private const int Limbs = 8;
+
+    // sig * 10^e10 as num / den with num < 2^31 and den <= 10^9, when it fits: the cheap exact division. It decides
+    // exactly what ExactToSingleBits would (both are exact), only sooner.
+    private static bool TrySmallQuotient(ulong sig, int e10, out uint num, out uint den)
+    {
+        num = 0;
+        den = 1;
+        if (sig > int.MaxValue || e10 > 9 || e10 < -9) return false;
+        ulong n = sig;
+        for (int t = 0; t < e10; t++) n *= 10;
+        if (n > int.MaxValue) return false;
+        for (int t = 0; t < -e10; t++) den *= 10;
+        num = (uint)n;
+        return true;
+    }
+
+    /// <summary>
+    /// The float32 bits of <paramref name="sig"/> * 10^<paramref name="e10"/> (sig &gt; 0, the caller has bounded the
+    /// result to the normal range) rounded to nearest even, by exact multi-word arithmetic: a = sig * 10^max(e10, 0)
+    /// and b = 10^max(-e10, 0) aligned to the same bit length, 25 quotient bits by restoring division, and the
+    /// remainder as the sticky bit. <paramref name="stickyIn"/> marks a value strictly above the quotient. 0 when the
+    /// result is outside the normal range. The GPU kernels run the same steps (dd_exact_to_f32).
+    /// </summary>
+    internal static uint ExactToSingleBits(ulong sig, int e10, bool stickyIn)
+    {
+        Span<uint> a = stackalloc uint[Limbs];
+        Span<uint> b = stackalloc uint[Limbs];
+        a.Clear();
+        b.Clear();
+        a[0] = (uint)sig;
+        a[1] = (uint)(sig >> 32);
+        b[0] = 1;
+        for (int t = 0; t < e10; t++) MulTen(a);
+        for (int t = 0; t < -e10; t++) MulTen(b);
+        int la = BitLength(a), lb = BitLength(b);
+        int ex2 = la - lb;
+        if (la > lb) ShiftLeft(b, la - lb);
+        else if (lb > la) ShiftLeft(a, lb - la);
+        if (!GreaterOrEqual(a, b)) { ShiftLeft(a, 1); ex2--; }
+        uint m = 0;
+        for (int k = 0; k < 25; k++)
+        {
+            uint bit = 0;
+            if (GreaterOrEqual(a, b)) { Subtract(a, b); bit = 1; }
+            m = (m << 1) | bit;
+            ShiftLeft(a, 1);
+        }
+        bool sticky = stickyIn || BitLength(a) != 0;
+        uint rb = m & 1u;
+        m >>= 1;
+        if (rb != 0 && (sticky || (m & 1u) != 0)) m++;
+        if (m == 1u << 24) { m = 1u << 23; ex2++; }
+        if (ex2 < -126 || ex2 > 127) return 0;
+        return ((uint)(ex2 + 127) << 23) | (m & 0x7FFFFFu);
+    }
+
+    // x *= 10 in 16-bit halves, as the kernels do it (WGSL has no 64-bit integer).
+    private static void MulTen(Span<uint> x)
+    {
+        uint carry = 0;
+        for (int i = 0; i < x.Length; i++)
+        {
+            uint v = x[i];
+            uint lo = (v & 0xFFFFu) * 10u + carry;
+            uint hi = (v >> 16) * 10u + (lo >> 16);
+            x[i] = (hi << 16) | (lo & 0xFFFFu);
+            carry = hi >> 16;
+        }
+    }
+
+    private static int BitLength(ReadOnlySpan<uint> x)
+    {
+        for (int i = x.Length - 1; i >= 0; i--)
+            if (x[i] != 0) return i * 32 + (32 - LeadingZeros(x[i]));
+        return 0;
+    }
+
+    // x <<= s; bits shifted past the top word are dropped (the callers' bounds keep them zero).
+    private static void ShiftLeft(Span<uint> x, int s)
+    {
+        int ls = s >> 5, bs = s & 31;
+        for (int i = x.Length - 1; i >= 0; i--)
+        {
+            int j = i - ls;
+            uint v = 0;
+            if (j >= 0)
+            {
+                v = x[j] << bs;
+                if (bs != 0 && j >= 1) v |= x[j - 1] >> (32 - bs);
+            }
+            x[i] = v;
+        }
+    }
+
+    private static bool GreaterOrEqual(ReadOnlySpan<uint> x, ReadOnlySpan<uint> y)
+    {
+        for (int i = x.Length - 1; i >= 0; i--)
+        {
+            if (x[i] > y[i]) return true;
+            if (x[i] < y[i]) return false;
+        }
+        return true;
+    }
+
+    // x -= y, x >= y.
+    private static void Subtract(Span<uint> x, ReadOnlySpan<uint> y)
+    {
+        uint borrow = 0;
+        for (int i = 0; i < x.Length; i++)
+        {
+            uint u = x[i], w = y[i];
+            uint nb = (u < w || (u == w && borrow != 0)) ? 1u : 0u;
+            x[i] = u - w - borrow;
+            borrow = nb;
+        }
     }
 
     /// <summary>The float32 bits of num / den (1 &lt;= num &lt; 2^31, den &lt;= 10^9) rounded to nearest even; a sticky
