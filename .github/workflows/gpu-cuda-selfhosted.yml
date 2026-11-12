@@ -546,9 +546,14 @@ jobs:
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
+      #   - platform requirements: a Linux-only driver path (the RM ioctl interface), and the no-NVRTC diagnostic,
+      #     which only runs where NVRTC is missing and the lane always installs it;
       #   - architecture requirements (an sm_ level, AVX-512 on the host CPU; off SM86, the specializations validated only
-      #     there: the SM86/GA10x and Ampere reasons, and the declared generated-kernel route, which is released on
-      #     sm_75 and sm_86 only and so skips on the SM89 Ada);
+      #     there: the SM86/GA10x and Ampere reasons, the DirectPtx families' "<family>-architecture-not-implemented"
+      #     (DirectPtxArchitecture admits each on SM 8.6 only) and the experimental generated convolution (SM 8.6 only),
+      #     and the declared generated-kernel route, which is released on sm_75 and sm_86 only and so skips on the SM89
+      #     Ada; there the declared tests' "needs the sm_75+ conveyor" reasons are that release check too, since
+      #     DeclaredKernelsEnabled is false);
       #   - tracked baselines, each a listed gap with its own marker (NEEDS SPEC, TAPE-GRADIENT BASELINE, a forward with
       #     no differentiable leaf, the PTX transfer campaign's progress check);
       #   - opt-in benchmarks and probes, and wall-clock perf gates (they skip under CI=true);
@@ -558,7 +563,7 @@ jobs:
       # The main suites and the torch interop host are checked apart, so each must have run tests of its own: a main
       # filter that selected nothing cannot pass on the interop tests alone.
       env:
-        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)'' || '''' }}'
+        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|Linux-only|^NVRTC is present|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b|-architecture-not-implemented$|^Experimental generated convolution is unavailable on this GPU architecture'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)|^The declared route needs the sm_75\+ conveyor|^A declared resident program needs the sm_75\+ conveyor'' || '''' }}'
         ALLOWED_SKIP_TEST: '(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\.'
       run: |
         $failed = $false
