@@ -1752,6 +1752,12 @@ public sealed class GradientTape<T> : IDisposable
             foreach (var retained in _retainGrad) relevant.Add(retained);
         if (_hooks is not null)
             foreach (var hooked in _hooks.Keys) relevant.Add(hooked);
+        // An opaque entry's backward reaches leaves it never recorded as inputs, so no walk over recorded inputs can
+        // tell whether it depends on a source: keep it. Only when something was requested: an explicitly empty request
+        // (no sources, retained or hooked tensors) must stay empty, or an unfiltered checkpoint's recompute would run
+        // and hand every touched leaf to its gradient consumer.
+        if (_opaqueOutputs is not null && relevant.Count > 0)
+            foreach (var opaque in _opaqueOutputs) relevant.Add(opaque);
 
         // Prefer the GradFn graph because it can cross tape boundaries. Higher-order
         // differentiation intentionally returns a gradient whose producer nodes belong to an
@@ -2724,6 +2730,18 @@ public sealed class GradientTape<T> : IDisposable
     /// <summary>
     /// Clears all recorded entries from the tape without disposing it.
     /// </summary>
+    /// <summary>
+    /// Marks a recorded output whose backward produces gradients for leaves it did not record as inputs (an unfiltered
+    /// gradient checkpoint differentiates every leaf its recomputed forward touches). Requested-source pruning follows
+    /// recorded inputs only, so it always keeps such an entry.
+    /// </summary>
+    internal void MarkOpaqueOutput(Tensor<T> output)
+    {
+        (_opaqueOutputs ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)).Add(output);
+    }
+
+    private HashSet<Tensor<T>>? _opaqueOutputs;
+
     public void Reset()
     {
         if (_disposed)
@@ -2733,6 +2751,7 @@ public sealed class GradientTape<T> : IDisposable
 
         ReleaseSavedStatePins(_entries.Count);
         _entries.Reset();
+        _opaqueOutputs = null;
         // The cached backward chain addresses the entries just dropped.
         _cachedDelegateChain?.Clear();
         _cachedDelegateChain = null;
@@ -2853,7 +2872,20 @@ public sealed class GradientTape<T> : IDisposable
             ref var e = ref _entries[i];
             if (e.Output is null) continue;
             bool producer = ReferenceEquals(e.Output, target);
-            if (producer) e.Output = old;
+            if (producer)
+            {
+                e.Output = old;
+                // The opaque mark belongs to the producer's entry, which now outputs the snapshot. The mark on target
+                // stays for any other holder; the added mark changes no entry count, so drop the cached relevance.
+                if (_opaqueOutputs is not null && _opaqueOutputs.Contains(target))
+                {
+                    _opaqueOutputs.Add(old);
+                    _cachedGradientRelevance = null;
+                    _cachedGradientRelevanceLoss = null;
+                    _cachedGradientRelevanceSources = null;
+                    _cachedGradientRelevanceEntryCount = -1;
+                }
+            }
             if (ReferenceEquals(e.Input0, target)) { e.Input0 = old; e.Version0 = old.Version; }
             if (ReferenceEquals(e.Input1, target)) { e.Input1 = old; e.Version1 = old.Version; }
             if (ReferenceEquals(e.Input2, target)) { e.Input2 = old; e.Version2 = old.Version; }

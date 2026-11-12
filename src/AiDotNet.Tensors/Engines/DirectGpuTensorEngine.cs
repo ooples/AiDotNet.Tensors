@@ -776,12 +776,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Cache the FP16 copy of each conv weight (constant across denoising steps), keyed by its resident FP32
     // buffer handle. Converted ONCE (sync, on the pre-residency pass — not while stream-capturing); reused on
     // every captured replay. The Tensor-Core GemmFp16 conv path needs the weights as FP16.
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, IGpuBuffer> _fp16WeightCache = new();
+    // A released FP32 buffer's handle can come back as another model's weights, so an entry also names the buffer that
+    // owns the converted memory (weakly, so the cache never keeps released weights alive) and a hit needs that same owner:
+    // a reused handle on a different buffer converts again instead of returning the previous model's weights. The owner
+    // is the root of a view chain, not the view: a weight resolved as a parameter view gets a new view object on every
+    // call, and the handle (root pointer plus offset) already tells two views of one root apart.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, (WeakReference<IGpuBuffer> Source, IGpuBuffer Half)> _fp16WeightCache = new();
     private IGpuBuffer GetOrCacheFp16Weights(IDirectGpuBackend backend, IGpuBuffer wFp32, int count)
     {
+        var owner = GpuBufferViewRoot.Of(wFp32);
         if (_fp16WeightCache.TryGetValue(wFp32.Handle, out var cached)
-            && cached.Handle != System.IntPtr.Zero && cached.SizeInBytes >= (long)count * 2)
-            return cached;
+            && cached.Source.TryGetTarget(out var source) && ReferenceEquals(source, owner)
+            && cached.Half.Handle != System.IntPtr.Zero && cached.Half.SizeInBytes >= (long)count * 2)
+            return cached.Half;
         // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
         // Allocating/converting inside cuStreamBeginCapture aborts the graph (CUDA 906) — fail loudly instead.
         if (backend is IGpuGraphCapture capCb && capCb.IsStreamCapturing())
@@ -789,7 +796,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 "FP16 conv weight cache miss during CUDA stream capture — convert the weights on the pre-residency pass before cuStreamBeginCapture.");
         var half = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
         backend.ConvertToFp16(wFp32, half, count);
-        _fp16WeightCache[wFp32.Handle] = half;
+        _fp16WeightCache[wFp32.Handle] = (new WeakReference<IGpuBuffer>(owner), half);
         return half;
     }
 
@@ -8728,7 +8735,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         bool isRecording = Gpu.DeferredScope.Current?.IsRecording == true;
-        if (!isRecording && !tensor.IsGpuResident) return false;
+        if (!isRecording && !tensor.IsGpuResident && !tensor.HasPendingGpuData && !IsDeviceAuthoritative(tensor)) return false;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         // Read the optional backing WITHOUT materializing. Zero-allocation deferred tensors have no
@@ -9529,6 +9536,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (CacheMayFreeReleasedBuffers)
                 foreach (var retired in _retiredWeightBuffers) retired.Dispose();
             _retiredWeightBuffers.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Drops all cached weight buffers WITHOUT materializing pending GPU→CPU downloads.
+    /// Use ONLY between sequential model runs when all previously trained weight tensors are dead
+    /// and will never be read on the host again (mirrors <see cref="DropActivationCache"/>).
+    /// </summary>
+    public void DropAllWeightCaches()
+    {
+        if (System.Threading.Volatile.Read(ref _liveCapturedGraphs) > 0)
+            return;
+
+        List<KeyValuePair<object, GpuBufferCacheEntry>> toDispose;
+        List<IGpuBuffer> retiredToDispose;
+        lock (_persistentBufferLock)
+        {
+            toDispose = new List<KeyValuePair<object, GpuBufferCacheEntry>>(_persistentBufferCache);
+            _persistentBufferCache.Clear();
+            _tensorVersions.Clear();
+            _persistentWeightHostVersion.Clear();
+            retiredToDispose = new List<IGpuBuffer>(_retiredWeightBuffers);
+            _retiredWeightBuffers.Clear();
+        }
+
+        // The FP16 conv weights are converted from the persistent FP32 buffers released here, so they go with them.
+        // TryRemove per key, so an entry another thread removes first is disposed once, by that thread.
+        var fp16ToDispose = _fp16WeightCache.Keys
+            .Select(handle => _fp16WeightCache.TryRemove(handle, out var fp16) ? fp16.Half : null)
+            .OfType<IGpuBuffer>()
+            .ToList();
+
+        foreach (var pair in toDispose)
+        {
+            Helpers.HostSync.Remove(pair.Key);
+            if (CacheMayFreeReleasedBuffers)
+                pair.Value.Dispose();
+        }
+        if (CacheMayFreeReleasedBuffers)
+        {
+            foreach (var retired in retiredToDispose)
+                retired.Dispose();
+            foreach (var half in fp16ToDispose)
+                half.Dispose();
         }
     }
 
@@ -15036,7 +15087,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (key is null)
             return;
 
+        // The device copy may be the only current one (an optimizer stepped it on the device): bring it to the host
+        // before any cleanup. A failed download propagates with the pending record, binding and buffer intact, so the
+        // tensor still reports its host values as invalid instead of serving the pre-update ones as current.
+        if (Helpers.HostSync.IsPending(key))
+            Helpers.HostSync.TryMaterialize(key);
         _pendingPersistentRoles.Remove(key);
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
+        // The host now holds the only copy: a GPU device with no attached buffer would report IsGpuResident while
+        // Buffer throws (InvalidateResidentWeightBuffer clears the device the same way).
+        tensor.Device = TensorDevice.CPU;
         lock (_persistentBufferLock)
         {
             if (_persistentBufferCache.TryRemove(key, out var entry))
@@ -28043,6 +28105,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override void SwishInPlace<T>(Tensor<T> tensor)
     {
+        // Under a gradient tape the device kernels below would skip the derivative; the base records the write. (Here as
+        // well as in the IEngine entry: a caller holding the concrete engine type reaches this override directly.)
+        if (IsRecordingInPlace<T>()) { base.SwishInPlace(tensor); return; }
         if (TryRunUnaryInPlaceResident(tensor, static (backend, buf, size) => backend.Swish(buf, buf, size)))
             return;
         if (TryRunUnaryInPlace(tensor, static (backend, buf, size) => backend.Swish(buf, buf, size)))
@@ -29838,7 +29903,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the buffers the backend's pool keeps for reuse. Live tensors and ops running on other threads are untouched.
     /// Returns how many pooled buffers were freed.
     /// </summary>
-    internal int ReleaseUnusedDeviceMemory()
+    public int ReleaseUnusedDeviceMemory()
     {
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IDeviceMemoryPressure pressure) return 0;

@@ -18,7 +18,7 @@ public sealed partial class CudaBackend : IGpuBufferViews
     /// Non-owning float view into a parent device buffer. The device pointer is recomputed from the parent on each
     /// access, and the view holds the parent so it cannot be collected while the view is in use.
     /// </summary>
-    private sealed class CudaBufferView : IGpuBuffer
+    private sealed class CudaBufferView : IGpuBuffer, IGpuBufferViewSource
     {
         private readonly IGpuBuffer _parent;
         private readonly int _elementOffset;
@@ -32,6 +32,7 @@ public sealed partial class CudaBackend : IGpuBufferViews
 
         public int Size { get; }
         public long SizeInBytes => (long)Size * sizeof(float);
+        IGpuBuffer IGpuBufferViewSource.ViewParent => _parent;
         public IntPtr Handle => _parent.Handle == IntPtr.Zero
             ? IntPtr.Zero
             : _parent.Handle + (_elementOffset * sizeof(float));

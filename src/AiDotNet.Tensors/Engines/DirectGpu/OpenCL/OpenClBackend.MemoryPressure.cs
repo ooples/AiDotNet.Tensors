@@ -16,7 +16,16 @@ public sealed partial class OpenClBackend : IDeviceMemoryPressure
 
     void IDeviceMemoryPressure.ReclaimNow() => DeviceMemorySweep.Run();
 
-    int IDeviceMemoryPressure.ReleaseCachedBuffers() => _bufferPool.DrainAll();
+    int IDeviceMemoryPressure.ReleaseCachedBuffers()
+    {
+        DrainCollectedBuffers();
+        int drained = _bufferPool.DrainAll();
+        // A drained buffer still used by queued work is retired behind a completion marker, not freed: wait for those
+        // markers so the memory is actually released when this returns.
+        _context?.WaitAndReleaseRetiredMemory();
+        return drained;
+    }
 
-    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => false;
+    /// <remarks>AllocateReclaiming collects unreachable buffers, drains the pool and retries once on out-of-memory.</remarks>
+    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => true;
 }

@@ -1,6 +1,7 @@
 ﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Metal GPU backend - FFT, Signal Processing, and RNG operations.
 
+using System;
 using AiDotNet.Tensors.Helpers;
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
@@ -29,7 +30,7 @@ public sealed partial class MetalBackend
     public void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
     {
         ThrowIfDisposed();
-        DispatchSplitFftMetal(inputReal, inputImag, outputReal, outputImag, 1, n, n, 1, inverse);
+        DispatchBatchedFftCore(inputReal, inputImag, outputReal, outputImag, 1, n, inverse);
     }
 
     /// <summary>
@@ -45,7 +46,7 @@ public sealed partial class MetalBackend
         using var fullReal = AllocateBuffer(n);
         using var fullImaginary = AllocateBuffer(n);
         Fill(zeroImaginary, 0f, n);
-        DispatchSplitFftMetal(input, zeroImaginary, fullReal, fullImaginary, 1, n, n, 1, false);
+        DispatchBatchedFftCore(input, zeroImaginary, fullReal, fullImaginary, 1, n, false);
         Copy(fullReal, 0, outputReal, 0, halfLength);
         Copy(fullImaginary, 0, outputImag, 0, halfLength);
     }
@@ -64,7 +65,7 @@ public sealed partial class MetalBackend
         using var transformedImaginary = AllocateBuffer(n);
         DispatchResidentMetal("irfft_reconstruct", n,
             new[] { inputReal, inputImag, fullReal, fullImaginary }, (uint)n);
-        DispatchSplitFftMetal(fullReal, fullImaginary, transformedReal, transformedImaginary, 1, n, n, 1, true);
+        DispatchBatchedFftCore(fullReal, fullImaginary, transformedReal, transformedImaginary, 1, n, true);
         Copy(transformedReal, output, n);
     }
 
@@ -75,8 +76,79 @@ public sealed partial class MetalBackend
         int batch, int n, bool inverse)
     {
         ThrowIfDisposed();
-        DispatchSplitFftMetal(inputReal, inputImag, outputReal, outputImag,
-            batch, n, n, 1, inverse);
+        DispatchBatchedFftCore(inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
+    }
+
+    private void DispatchBatchedFftCore(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
+        int batch, int n, bool inverse)
+    {
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw new ArgumentException($"FFT size must be a positive power of two, got {n}", nameof(n));
+        if (ReferenceEquals(outputReal, outputImag))
+            throw new ArgumentException("Real and imaginary FFT outputs must use distinct buffers.");
+        if (batch <= 0) return;
+        PortableGenericFft.ValidateBatchedExtent(inputReal, inputImag, outputReal, outputImag, batch, n);
+
+        if (n == 1)
+        {
+            // A length-1 transform is the identity. When the outputs cross-alias the inputs (real out is imaginary in,
+            // or the reverse), the first copy would overwrite an input the second still reads, so stage one first.
+            bool crossAliased = ReferenceEquals(outputReal, inputImag) || ReferenceEquals(outputImag, inputReal);
+            if (crossAliased)
+            {
+                using var stagedImag = AllocateBuffer(batch);
+                Copy(inputImag, stagedImag, batch);
+                if (!ReferenceEquals(inputReal, outputReal)) Copy(inputReal, outputReal, batch);
+                Copy(stagedImag, outputImag, batch);
+                return;
+            }
+            if (!ReferenceEquals(inputReal, outputReal)) Copy(inputReal, outputReal, batch);
+            if (!ReferenceEquals(inputImag, outputImag)) Copy(inputImag, outputImag, batch);
+            return;
+        }
+
+        if (inputReal is not MetalGpuBuffer inReBuf || inputImag is not MetalGpuBuffer inImBuf ||
+            outputReal is not MetalGpuBuffer outReBuf || outputImag is not MetalGpuBuffer outImBuf)
+        {
+            throw new ArgumentException("Buffers must be MetalGpuBuffer.");
+        }
+
+        // Single-launch on-chip path when a row (2 * n floats) fits in Metal threadgroup memory (32 KB -> n <= 4096).
+        if (_residentLibrary != IntPtr.Zero && 2L * n * sizeof(float) <= LocalMemoryBytes)
+        {
+            var pipeline = GetPipeline("Resident", _residentLibrary, "batched_fft_threadgroup");
+            int log2n = 0;
+            while ((1 << log2n) < n) log2n++;
+
+            int groupSize = Math.Min(256, Math.Min(pipeline.MaxTotalThreadsPerThreadgroup, Math.Max(1, n / 2)));
+            while ((groupSize & (groupSize - 1)) != 0) groupSize &= groupSize - 1;
+            uint sharedBytes = (uint)(n * sizeof(float));
+
+            const int maxRowsPerSlice = 65535;
+            for (int row = 0; row < batch; row += maxRowsPerSlice)
+            {
+                int rows = Math.Min(maxRowsPerSlice, batch - row);
+                using var encoder = _commandQueue.CreateScopedComputeEncoder();
+                encoder.SetPipelineState(pipeline.Handle);
+                encoder.SetBuffer(inReBuf, 0);
+                encoder.SetBuffer(inImBuf, 1);
+                encoder.SetBuffer(outReBuf, 2);
+                encoder.SetBuffer(outImBuf, 3);
+                encoder.SetBytes((uint)row, 4);
+                encoder.SetBytes((uint)n, 5);
+                encoder.SetBytes((uint)log2n, 6);
+                encoder.SetBytes(inverse ? 1u : 0u, 7);
+                encoder.SetThreadgroupMemoryLength(sharedBytes, 0);
+                encoder.SetThreadgroupMemoryLength(sharedBytes, 1);
+                encoder.DispatchThreadgroups(
+                    new MTLSize((ulong)rows, 1, 1),
+                    new MTLSize((ulong)groupSize, 1, 1));
+            }
+            return;
+        }
+
+        // Rows exceeding threadgroup memory fall back to the parallel O(n log n) multi-pass radix-2 butterfly kernels.
+        PortableGenericFft.BatchedRadix2(this, LaunchBatch, inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
     }
 
     /// <summary>

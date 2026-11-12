@@ -42,6 +42,8 @@ AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions
 static AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions.TensorAddActivation<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.Engines.FusedActivationType activation) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu() -> bool
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu(System.TimeSpan drainTimeout) -> bool
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.DropAllWeightCaches() -> void
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ReleaseUnusedDeviceMemory() -> int
 AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm
 AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.Dispose() -> void
 AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.IsFinite.get -> bool
@@ -158,3 +160,4 @@ static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TopKWeightedRowMix
 static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TopKWeightedRowMixBackwardWeights<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! table, AiDotNet.Tensors.LinearAlgebra.Tensor<int>! indices) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TopKWeightedRowMixBackwardTable<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<int>! indices, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! weights, int numEntries) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TensorCountIndices<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<int>! indices, int numBins) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.Autodiff.GradientCheckpointing<T>.CheckpointSegments(System.Collections.Generic.IReadOnlyList<System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!>! functions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, System.Collections.Generic.IReadOnlyList<System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!>? segmentParameters, int segmentSize = 2, System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, bool>? tryConsumeParameterGradient = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!

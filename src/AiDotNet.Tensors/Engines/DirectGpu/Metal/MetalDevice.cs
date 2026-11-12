@@ -34,6 +34,15 @@ public sealed class MetalDevice : IDisposable
     private bool _disposed;
     private readonly object _lock = new();
 
+    private const int MaxPooledBuffersPerBucket = 4096;
+    private const int PooledMemoryDivisor = 6;
+
+    /// <summary>Released StorageModeShared buffers kept for reuse on this Metal device.</summary>
+    internal readonly GpuBufferPool<MetalGpuBuffer> BufferPool =
+        new(MaxPooledBuffersPerBucket, int.MaxValue, exactSizes: true);
+
+    internal bool IsDisposed => _disposed;
+
     /// <summary>
     /// Gets whether Metal is available on this system.
     /// </summary>
@@ -210,6 +219,10 @@ public sealed class MetalDevice : IDisposable
             // Get recommended working set size
             RecommendedMaxWorkingSetSize = SendMessageULongReturn(_device, Selectors.RecommendedMaxWorkingSetSize);
             MaxBufferLength = SendMessageULongReturn(_device, Selectors.MaxBufferLength);
+            if (RecommendedMaxWorkingSetSize > 0)
+            {
+                BufferPool.MaxPooledElements = (long)(RecommendedMaxWorkingSetSize / PooledMemoryDivisor / sizeof(float));
+            }
 
             // Get registry ID
             RegistryID = SendMessageULongReturn(_device, Selectors.RegistryID);
@@ -578,6 +591,9 @@ public sealed class MetalDevice : IDisposable
             }
 
             _disposed = true;
+
+            MetalGpuBuffer.PendingFrees.Drain();
+            BufferPool.Dispose();
 
             if (_device != IntPtr.Zero)
             {
