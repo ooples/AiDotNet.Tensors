@@ -483,9 +483,26 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         var reduce = (axes ?? AllAxes(tensor.Rank)).Select(a => NormalizeDim(a, tensor.Rank)).ToArray();
         int count = reduce.Aggregate(1, (a, k) => a * tensor._shape[k]);
+        bool lowPrecision = IsLowPrecisionFloat<T>();
+        if (lowPrecision && !DifferentiableOps.IsTapeActiveForThread<T>() && !GraphMode.IsActive)
+        {
+            // Half/BFloat16: mean and variance accumulated and divided in float32, rounded once. The count and
+            // 1/(count - correction) do not survive conversion to Half above 65,504 elements.
+            var distinct = reduce.Distinct().ToArray();
+            var data = tensor.GetFlattenedData();
+            var varShape = LowPrecisionReducedShape(tensor._shape, distinct, keepDims);
+            int outSize = varShape.Aggregate(1, (a, k) => a * k);
+            var lowVar = TensorAllocator.Rent<T>(varShape, LowPrecisionAxisStatistic(data, tensor._shape, distinct, outSize, variance: true, correction: correction, squareRoot: false));
+            var lowMean = TensorAllocator.Rent<T>((int[])varShape.Clone(), LowPrecisionAxisStatistic(data, tensor._shape, distinct, outSize, variance: false, correction: 0, squareRoot: false));
+            return (lowVar, lowMean);
+        }
         var meanKept = ReduceMean(tensor, reduce, keepDims: true);
         var centered = TensorSubtract(tensor, TensorBroadcastTo(meanKept, LikeShape(tensor)));
-        var variance = TensorMultiplyScalar(ReduceSum(TensorSquare(centered), reduce, keepDims), ops.FromDouble(1.0 / (count - correction)));
+        // Under a tape, Half/BFloat16 differentiate through the float32-accumulating ReduceMean and an O(1) factor
+        // instead of a Half sum (overflows) times 1/(count - correction) (subnormal or zero in Half).
+        var variance = lowPrecision
+            ? TensorMultiplyScalar(ReduceMean(TensorSquare(centered), reduce, keepDims), ops.FromDouble((double)count / (count - correction)))
+            : TensorMultiplyScalar(ReduceSum(TensorSquare(centered), reduce, keepDims), ops.FromDouble(1.0 / (count - correction)));
         var mean = keepDims ? meanKept : ReduceMean(tensor, reduce, keepDims: false);
         return (variance, mean);
     }
