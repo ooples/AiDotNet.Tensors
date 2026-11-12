@@ -44,8 +44,10 @@ internal static class PlanFormatConstants
     /// double plan keeps the caller's exact hyperparameters; version 10 plans are rejected rather than read misaligned.
     /// Version 12 adds the TagInt32Tensor saved-state entry (a GPU ReduceMax's argmax): version 11 readers do not know
     /// the tag, so they must reject these plans by version rather than fail on it mid-read.
+    /// Version 13 adds TensorFlagExternal tensor-table entries (a reference to a tensor the loader supplies instead of
+    /// stored data). Version 12 readers would allocate them as zero tensors, so they must reject these plans by version.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 12;
+    internal const ushort CurrentFormatVersion = 13;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:
@@ -125,4 +127,12 @@ internal static class PlanFormatConstants
     internal const byte TensorFlagLeafInput    = 0x02; // external input
     internal const byte TensorFlagIntermediate = 0x04; // pre-allocated buffer
     internal const byte TensorFlagHasData      = 0x08; // data section follows (weights have data; intermediates don't)
+    // The tensor is not stored: the plan references one of the tensors the loader supplies (a portable program's
+    // parameters and constants, by value id), so the plan runs on the caller's live weights and holds no copy of them.
+    internal const byte TensorFlagExternal     = 0x10;
+
+    // Upper bound on the elements a plan file may make the reader allocate (every tensor in the table, data-bearing or
+    // not), unless the caller passes its own. A plan names its intermediate buffers by shape only, so without a bound a
+    // few bytes could ask for gigabytes.
+    internal const long DefaultMaxTableElements = 1L << 31;
 }

@@ -96,15 +96,21 @@ void main() {
     int row = gid / outLen;
     int sBase = row * inLen;
     float cutoff = 1.0 / float(up > down ? up : down);
-    float srcIdx = float(ot) * float(down) / float(up);
-    int centre = int(floor(srcIdx));
+    // Exact source position in 32-bit integers (ot = q*up + r; the host guarantees up*down < 2^31).
+    int q = ot / up; int r = ot - q * up;
+    int rd = r * down;
+    int centre = q * down + rd / up;
+    float frac = float(rd - (rd / up) * up) / float(up);
     float acc = 0.0, wSum = 0.0;
     const float PI = 3.14159265358979323846;
     for (int k = -halfWidth; k <= halfWidth; k++) {
         int idx = centre + k;
         if (idx < 0 || idx >= inLen) continue;
-        float tt = (float(idx) - srcIdx) * cutoff;
-        float sinc = abs(tt) < 1e-12 ? 1.0 : sin(PI * tt) / (PI * tt);
+        float tt = (float(k) - frac) * cutoff;
+        // Near zero, sin(x)/x by its Taylor series: a fast or relaxed sin has ~1e-7 absolute error, which turns
+        // sin(x)/x for x ~ 1e-8 (a tap almost exactly on the source position) into garbage. Error below 1e-14.
+        float px = PI * tt;
+        float sinc = abs(px) < 1e-3 ? 1.0 - px * px * (1.0 / 6.0) : sin(px) / px;
         float hann = 0.5 - 0.5 * cos(2.0 * PI * float(k + halfWidth) / float(2 * halfWidth));
         float w = sinc * hann;
         acc += w * input_[sBase + idx];

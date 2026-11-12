@@ -64,7 +64,10 @@ public sealed class GradientTapeOptions
 
     /// <summary>
     /// Maximum number of tape entries. 0 means unlimited.
-    /// When the limit is reached, the oldest entries are discarded.
+    /// When the limit is reached, further operations are not recorded (the entries already on the tape are kept), so
+    /// gradients do not flow through ops recorded past the limit. A create-graph backward that would differentiate a
+    /// composite of recorded ops falls back to the op's first-order kernel when the composite does not fit, so every
+    /// input still gets its exact gradient (not differentiable again, as nothing more fits on the tape).
     /// </summary>
     public int MaxEntries { get; init; }
 

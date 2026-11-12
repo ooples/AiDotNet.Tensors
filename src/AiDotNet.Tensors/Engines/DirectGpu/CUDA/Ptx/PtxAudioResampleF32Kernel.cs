@@ -107,10 +107,10 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
         int total = checked(leading * outLen);
         int twoHalfWidth = 2 * halfWidth;
         string cutoff = DirectPtxPtxText.Hex(1f / (up > down ? up : down));
-        string downF = DirectPtxPtxText.Hex(down), upF = DirectPtxPtxText.Hex(up);
+        string upF = DirectPtxPtxText.Hex(up);
         string piC = DirectPtxPtxText.Hex((float)Math.PI), twoPi = DirectPtxPtxText.Hex((float)(2.0 * Math.PI)), inv2Pi = DirectPtxPtxText.Hex((float)(1.0 / (2.0 * Math.PI)));
         string piOverHalf = DirectPtxPtxText.Hex((float)(Math.PI / halfWidth));
-        string tiny = DirectPtxPtxText.Hex(1e-12f);
+        string taylorBound = DirectPtxPtxText.Hex(1e-3f), negSixth = DirectPtxPtxText.Hex(-1f / 6f);
         const string half = "0f3F000000", negHalf = "0fBF000000", one = "0f3F800000", zero = "0f00000000";
 
         var ptx = new StringBuilder(5_632);
@@ -138,11 +138,14 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
         ptx.AppendLine($"    rem.u32 %r3, %r2, {outLen};");              // ot
         ptx.AppendLine($"    div.u32 %r4, %r2, {outLen};");              // row
         ptx.AppendLine($"    mul.lo.u32 %r9, %r4, {inLen};");           // sBase = row*inLen
-        // srcIdx = (float)ot * down / up
-        ptx.AppendLine("    cvt.rn.f32.u32 %f0, %r3;");                    // otF
-        ptx.AppendLine($"    mul.rn.f32 %f0, %f0, {downF};");
-        ptx.AppendLine($"    div.rn.f32 %f0, %f0, {upF};");              // srcIdx
-        ptx.AppendLine("    cvt.rmi.s32.f32 %r5, %f0;");                   // centre = floor(srcIdx)
+        // Exact source position ot*down/up: integer centre and a fraction from 64-bit integer division. A float
+        // srcIdx rounds positions just below an integer up, which moves the whole tap window by one sample.
+        ptx.AppendLine($"    mul.wide.u32 %rd6, %r3, {down};");          // num = ot*down
+        ptx.AppendLine($"    div.u64 %rd7, %rd6, {up};");                // centre
+        ptx.AppendLine($"    rem.u64 %rd8, %rd6, {up};");                // num % up
+        ptx.AppendLine("    cvt.u32.u64 %r5, %rd7;");                       // centre
+        ptx.AppendLine("    cvt.rn.f32.u64 %f0, %rd8;");
+        ptx.AppendLine($"    div.rn.f32 %f0, %f0, {upF};");              // frac
         ptx.AppendLine("    mov.f32 %f1, 0f00000000;");                    // acc
         ptx.AppendLine("    mov.f32 %f2, 0f00000000;");                    // wSum
         ptx.AppendLine("    mov.u32 %r6, 0;");                             // kk = 0..2*halfWidth
@@ -155,13 +158,17 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
         ptx.AppendLine("    @%p2 bra $RS_SKIP;");
         ptx.AppendLine($"    setp.ge.s32 %p3, %r8, {inLen};");
         ptx.AppendLine("    @%p3 bra $RS_SKIP;");
-        // t = (idx - srcIdx) * cutoff
-        ptx.AppendLine("    cvt.rn.f32.s32 %f3, %r8;");                    // idxF
+        // t = (idx - srcIdx) * cutoff = (k - frac) * cutoff
+        ptx.AppendLine("    cvt.rn.f32.s32 %f3, %r7;");                    // kF
         ptx.AppendLine("    sub.rn.f32 %f4, %f3, %f0;");
         ptx.AppendLine($"    mul.rn.f32 %f4, %f4, {cutoff};");           // t
         ptx.AppendLine($"    mul.rn.f32 %f5, %f4, {piC};");             // sincArg = pi*t
-        ptx.AppendLine("    abs.f32 %f6, %f4;");
-        ptx.AppendLine($"    setp.lt.f32 %p4, %f6, {tiny};");           // |t| < 1e-12
+        // Near zero, sinc by its Taylor series 1 - x^2/6: sin.approx has ~1e-7 absolute error, which ruins sin(x)/x
+        // for a tap almost exactly on the source position (x ~ 1e-8).
+        ptx.AppendLine("    abs.f32 %f6, %f5;");
+        ptx.AppendLine($"    setp.lt.f32 %p4, %f6, {taylorBound};");     // |pi t| < 1e-3
+        ptx.AppendLine("    mul.rn.f32 %f21, %f5, %f5;");
+        ptx.AppendLine($"    fma.rn.f32 %f22, %f21, {negSixth}, {one};"); // 1 - x^2/6
         // sin(sincArg) with range reduction to [-pi, pi]
         ptx.AppendLine($"    mul.rn.f32 %f7, %f5, {inv2Pi};");
         ptx.AppendLine("    cvt.rni.f32.f32 %f7, %f7;");                  // round(x/2pi)
@@ -169,7 +176,7 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
         ptx.AppendLine("    sub.rn.f32 %f8, %f5, %f8;");                  // reduced sinc arg
         ptx.AppendLine("    sin.approx.f32 %f9, %f8;");
         ptx.AppendLine("    div.rn.f32 %f10, %f9, %f5;");                 // sin(pi t)/(pi t)
-        ptx.AppendLine($"    selp.f32 %f11, {one}, %f10, %p4;");        // sinc
+        ptx.AppendLine("    selp.f32 %f11, %f22, %f10, %p4;");          // sinc
         // hann = 0.5 - 0.5*cos(pi*kk/halfWidth), range reduced
         ptx.AppendLine("    cvt.rn.f32.u32 %f12, %r6;");                  // kkF
         ptx.AppendLine($"    mul.rn.f32 %f13, %f12, {piOverHalf};");    // hannArg
@@ -227,7 +234,7 @@ internal sealed class PtxAudioResampleF32Kernel : IDisposable
                 MinBlocksPerMultiprocessor: 1024 / blockThreads),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "output[row,ot] = sum_k sinc((idx-srcIdx)*cutoff)*hann(k)*input[row,idx] / sum_k w; srcIdx=ot*down/up",
+                ["formula"] = "output[row,ot] = sum_k sinc((idx-srcIdx)*cutoff)*hann(k)*input[row,idx] / sum_k w; srcIdx=ot*down/up taken exactly as integer centre + (ot*down mod up)/up",
                 ["mode"] = "inference-forward-audio-resample",
                 ["arithmetic"] = "range-reduced sin.approx/cos.approx (reduced to [-pi,pi]) + fma; tolerance-based parity",
                 ["loop"] = "per output sample, over the [-halfWidth, halfWidth] tap window with a bounds skip",

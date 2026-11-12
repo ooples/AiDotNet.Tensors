@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// <summary>Correctness-first resident kernels for operations that cannot use a host fallback.</summary>
 internal static class MetalResidentKernels
 {
-    public const string Source = MetalBiasCorrectionPrelude.Source + @"
+    public const string Source = MetalBiasCorrectionPrelude.Source + ExactFloatKernels.Msl + @"
 
 kernel void hyperbolic_linear_forward(
     device const float* input [[buffer(0)]],
@@ -766,8 +766,9 @@ kernel void comparison_binary(
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= count) return;
-    if (operation == 0u) { output[gid] = a[gid] > b[gid] ? 1.0f : 0.0f; return; }
-    if (operation == 1u) { output[gid] = a[gid] < b[gid] ? 1.0f : 0.0f; return; }
+    // greater / less decided on the bit patterns (ExactFloatKernels): a float compare may flush subnormals.
+    if (operation == 0u) { output[gid] = xf_gtf(a[gid], b[gid]) ? 1.0f : 0.0f; return; }
+    if (operation == 1u) { output[gid] = xf_ltf(a[gid], b[gid]) ? 1.0f : 0.0f; return; }
     uint ab = as_type<uint>(a[gid]);
     uint bb = as_type<uint>(b[gid]);
     uint aa = ab & 0x7FFFFFFFu;
@@ -781,7 +782,8 @@ kernel void comparison_where(
     device const float* condition [[buffer(0)]], device const float* a [[buffer(1)]], device const float* b [[buffer(2)]], device float* output [[buffer(3)]],
     constant uint& count [[buffer(4)]], uint gid [[thread_position_in_grid]])
 {
-    if (gid < count) output[gid] = condition[gid] != 0.0f ? a[gid] : b[gid];
+    // condition != 0 on the bits (NaN true, either zero false), the chosen operand passed through bit for bit.
+    if (gid < count) output[gid] = xf_selectf(condition[gid], a[gid], b[gid]);
 }
 
 kernel void comparison_not_equal_scalar(
@@ -816,11 +818,13 @@ kernel void arg_extrema_axis(
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= outerSize) return;
+    // The CPU arg-extremum scan, exact on the bits (ExactFloatKernels): start at the first element and move only on a
+    // strictly better value, so the first of equal extrema wins, a later NaN is skipped and a leading NaN is kept.
     uint offset = gid * reduceSize, bestIndex = 0u;
-    float best = maximum != 0u ? -3.402823466e+38f : 3.402823466e+38f;
-    for (uint i = 0; i < reduceSize; ++i) {
-        float value = input[offset + i];
-        if ((maximum != 0u && value > best) || (maximum == 0u && value < best)) { best = value; bestIndex = i; }
+    uint best = reduceSize > 0u ? as_type<uint>(input[offset]) : 0u;
+    for (uint i = 1; i < reduceSize; ++i) {
+        uint value = as_type<uint>(input[offset + i]);
+        if (maximum != 0u ? xf_gt(value, best) : xf_lt(value, best)) { best = value; bestIndex = i; }
     }
     indices[gid] = float(bestIndex);
 }

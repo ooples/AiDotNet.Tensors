@@ -279,7 +279,7 @@ public sealed partial class HipBackend
         }
         finally
         {
-            if (module != IntPtr.Zero) HipNativeBindings.hipModuleUnload(module);
+            if (module != IntPtr.Zero) UnloadModule(module);
             if (code != IntPtr.Zero) Marshal.FreeHGlobal(code);
             if (program != IntPtr.Zero) HipNativeBindings.hiprtcDestroyProgram(ref program);
         }
@@ -350,6 +350,7 @@ public sealed partial class HipBackend
             }
             if (_module != IntPtr.Zero)
             {
+                // A codegen kernel's module was never registered with its backend: unload it directly.
                 HipNativeBindings.hipModuleUnload(_module);
                 _module = IntPtr.Zero;
             }

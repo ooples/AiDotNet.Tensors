@@ -121,7 +121,7 @@ public partial class DirectGpuTensorEngine
     private static void GruSequenceBackwardOnDevice<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is not DirectGpuTensorEngine gpu || !gpu.TryGetBackend(out var backend)
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu) || !gpu.TryGetBackend(out var backend)
             || backend is not IFusedLstmSequenceTraining fused)
             throw new InvalidOperationException("A device GRU node must be differentiated by the GPU engine that recorded it.");
         var dims = (int[])savedState[0];

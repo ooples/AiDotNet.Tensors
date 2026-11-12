@@ -23,6 +23,9 @@ public class CudaImplicitConvTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         int outH = (inH + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (inW + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
         var random = new Random(inC * 31 + outC);
@@ -70,6 +73,9 @@ public class CudaImplicitConvTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         int outH = (inH + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (inW + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
         var random = new Random(inC * 13 + outC);
@@ -113,6 +119,9 @@ public class CudaImplicitConvTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         using var xBuf = backend.AllocateBuffer(batch * inC * inH * inW);
         using var wBuf = backend.AllocateBuffer(outC * inC * 9);
         using var yBuf = backend.AllocateBuffer(batch * outC * inH * inW);

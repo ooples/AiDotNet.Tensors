@@ -43,7 +43,11 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
 {
     private sealed class Bucket
     {
-        public readonly ConcurrentDictionary<GpuBufferPoolAffinity, ConcurrentBag<TBuffer>> Buffers = new();
+        // A stack, not a ConcurrentBag: a bag keeps each thread's items in a ThreadLocal, i.e. in that thread's static
+        // storage, so a pooled buffer was rooted by every thread that ever returned one - and through the buffer's
+        // return-to-pool delegate, the whole backend (its OpenCL context and compiled programs, ~110 MB): a backend
+        // dropped without Dispose was never collected.
+        public readonly ConcurrentDictionary<GpuBufferPoolAffinity, ConcurrentStack<TBuffer>> Buffers = new();
         public int Count;
     }
 
@@ -143,7 +147,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             && bucket.Buffers.TryGetValue(affinity, out var affinityBuffers))
         {
             List<TBuffer>? undersized = null;
-            while (affinityBuffers.TryTake(out var candidate))
+            while (affinityBuffers.TryPop(out var candidate))
             {
                 // Debited as it leaves the bag, like the count: an undersized candidate goes back through Return, which
                 // credits it again, so debiting only the chosen one counted every passed-over buffer twice.
@@ -225,7 +229,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             // Marked before it is visible to a rent, which clears the mark.
             if (Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasuringOnThisThread)
                 _measurementParked[buffer] = 0;
-            bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentBag<TBuffer>()).Add(buffer);
+            bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentStack<TBuffer>()).Push(buffer);
         }
     }
 
@@ -246,7 +250,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 foreach (var affinityBuffers in bucket.Buffers.Values)
                 {
                     kept.Clear();
-                    while (affinityBuffers.TryTake(out var buffer))
+                    while (affinityBuffers.TryPop(out var buffer))
                     {
                         if (!_measurementParked.TryRemove(buffer, out _))
                         {
@@ -258,7 +262,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                         buffer.Release();
                         released++;
                     }
-                    foreach (var buffer in kept) affinityBuffers.Add(buffer);
+                    foreach (var buffer in kept) affinityBuffers.Push(buffer);
                 }
             }
         }
@@ -285,7 +289,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         {
             foreach (var affinityBuffers in bucket.Buffers.Values)
             {
-                while (affinityBuffers.TryTake(out var buffer))
+                while (affinityBuffers.TryPop(out var buffer))
                 {
                     Interlocked.Decrement(ref bucket.Count);
                     Interlocked.Add(ref _pooledElements, -buffer.Capacity);
@@ -305,9 +309,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return;
         }
 
-        // At process/AppDomain teardown the ConcurrentBag's backing ThreadLocal may
-        // already be finalized (TryTake then throws ObjectDisposedException) and the GPU
-        // context may be gone (buffer.Release would fault). Either is fatal on the
+        // At process/AppDomain teardown the GPU context may be gone (buffer.Release would fault). Either is fatal on the
         // finalizer thread. The OS reclaims all device memory at exit, so skip the drain.
         if (AiDotNet.Tensors.Engines.RuntimeShutdown.IsTearingDown)
         {
@@ -322,7 +324,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 {
                     foreach (var affinityBuffers in bucket.Buffers.Values)
                     {
-                        while (affinityBuffers.TryTake(out var buffer))
+                        while (affinityBuffers.TryPop(out var buffer))
                         {
                             buffer.Release();
                         }

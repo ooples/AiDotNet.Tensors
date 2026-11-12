@@ -27,6 +27,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         float[] a = Fill(m * k, 1), b = Fill(k * n, 2), c0 = Fill(m * n, 3);
         using var aBuf = backend.AllocateBuffer(a);
         using var bBuf = backend.AllocateBuffer(b);
@@ -64,6 +67,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         float[] a = Fill(m * k, 9), w = Fill(k * n, 10), bias = Fill(n, 11);
         a[k + 1] = float.NaN;   // row 1 of the output is NaN throughout
         using var aBuf = backend.AllocateBuffer(a);
@@ -104,6 +110,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         float[] a = Fill(k * m, 4), b = Fill(k * n, 5), c0 = Fill(m * n, 6);
         using var aBuf = backend.AllocateBuffer(a);
         using var bBuf = backend.AllocateBuffer(b);
@@ -131,6 +140,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         var fused = (AiDotNet.Tensors.Engines.DirectGpu.IWeightBiasGradientBackend)backend;
         float[] a = Fill(k * m, 7), dy = Fill(k * n, 8), w0 = Fill(m * n, 9), b0 = Fill(n, 10);
         using var aBuf = backend.AllocateBuffer(a);
@@ -163,6 +175,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         const int m = 64, n = 64, k = 2048;
         using var aBuf = backend.AllocateBuffer(Fill(k * m, 7));
         using var bBuf = backend.AllocateBuffer(Fill(k * n, 8));
@@ -208,6 +223,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         var usage = backend.KernelResourceUsage(kernel, blockThreads);
         Assert.True(usage.HasValue, $"{kernel} is not loaded");
         Assert.True(usage.Value.LocalBytes == 0,
@@ -222,6 +240,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         using var aBuf = backend.AllocateBuffer(m * k);
         using var bBuf = backend.AllocateBuffer(k * n);
         using var cBuf = backend.AllocateBuffer(m * n);
@@ -261,6 +282,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         float[] a = Fill(m * k, 11), b = Fill(k * n, 12), c0 = Fill(m * n, 13), bias = Fill(n, 14);
         using var aBuf = backend.AllocateBuffer(a);
         using var bBuf = backend.AllocateBuffer(b);
@@ -296,6 +320,9 @@ public class CudaSkinnyGemmTests
     {
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
+        // The reference is cuBLAS, which is optional (it needs cublasLt next to cublas): without it there is nothing to
+        // compare against.
+        Skip.IfNot(backend.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         using var aBuf = backend.AllocateBuffer(new float[m * k]);
         using var bBuf = backend.AllocateBuffer(new float[k * n]);
         using var cBuf = backend.AllocateBuffer(new float[m * n]);

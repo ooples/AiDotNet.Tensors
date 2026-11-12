@@ -7,7 +7,7 @@ public static class BroadcastKernels
 {
     public static string GetSource()
     {
-        return @"
+        return ExactFloatKernels.OpenCl + @"
 __kernel void broadcast_add_last(__global const float* a, __global const float* b, __global float* output, int outerSize, int innerSize) {
     int idx = get_global_id(0); if (idx >= outerSize * innerSize) return;
     output[idx] = a[idx] + b[idx % innerSize];
@@ -71,7 +71,8 @@ __kernel void frac_kernel(__global const float* input, __global float* output, i
 }
 __kernel void clip_kernel(__global const float* input, __global float* output, float minVal, float maxVal, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
-    output[idx] = fmin(fmax(input[idx], minVal), maxVal);
+    // The clamp contract (ExactFloatKernels): x < lo ? lo : x, then above hi -> hi, on the bit patterns.
+    output[idx] = as_float(xf_clamp(as_uint(input[idx]), as_uint(minVal), as_uint(maxVal)));
 }
 __kernel void rsqrt_kernel(__global const float* input, __global float* output, int size) {
     int idx = get_global_id(0); if (idx >= size) return;

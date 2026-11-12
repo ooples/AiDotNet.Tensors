@@ -47,7 +47,49 @@ public static class TensorPool
     /// regression the pool was designed to avoid. Don't enable
     /// globally unless you have a measured determinism need.</para>
     /// </summary>
-    public static bool ForceFreshAllocations { get; set; } = IsEnvTrue("AIDOTNET_FORCE_FRESH_ALLOCATIONS");
+    /// <remarks>
+    /// The setter changes the process-wide default. Code that needs fresh allocations for one operation (tracing a
+    /// compiled step, a determinism check) should use <see cref="ForceFreshAllocationsScope"/> instead: it applies to
+    /// the calling thread only, so other threads renting tensors at the same time keep their pooling and arena reuse.
+    /// </remarks>
+    public static bool ForceFreshAllocations
+    {
+        get
+        {
+            var local = _threadForceFresh;
+            return local == 0 ? _forceFreshDefault : local > 0;
+        }
+        set => _forceFreshDefault = value;
+    }
+
+    private static bool _forceFreshDefault = IsEnvTrue("AIDOTNET_FORCE_FRESH_ALLOCATIONS");
+
+    // 0: follow the process default; 1: force fresh; -1: force pooling. Per thread, set by ForceFreshAllocationsScope.
+    [ThreadStatic] private static int _threadForceFresh;
+
+    /// <summary>
+    /// Overrides <see cref="ForceFreshAllocations"/> for the calling thread until the returned scope is disposed.
+    /// Scopes nest; disposing restores the previous value.
+    /// </summary>
+    public static IDisposable ForceFreshAllocationsScope(bool forceFresh)
+    {
+        var previous = _threadForceFresh;
+        _threadForceFresh = forceFresh ? 1 : -1;
+        return new FreshScope(previous);
+    }
+
+    private sealed class FreshScope : IDisposable
+    {
+        private readonly int _previous;
+        private bool _disposed;
+        public FreshScope(int previous) => _previous = previous;
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _threadForceFresh = _previous;
+        }
+    }
 
     /// <summary>
     /// Bytes of IDLE cross-arena buffers one thread may keep: buffers whose (type, size) bucket no arena has rented or

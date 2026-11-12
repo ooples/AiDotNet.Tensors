@@ -601,6 +601,10 @@ public partial class CpuEngine
         var forgetGate = inputs[3];
         var slotKeys = inputs[4];
 
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.CreatesGraph && AbcScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, qProj, kProj, vProj, forgetGate, slotKeys, numHeads, initScale))
+            return;
+
         int batch = qProj.Shape[0];
         int seqLen = qProj.Shape[1];
         int modelDim = qProj.Shape[2];
@@ -641,5 +645,48 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, vProj, dV, engine);
         DifferentiableOps.AccumulateGrad(grads, forgetGate, dFG, engine);
         DifferentiableOps.AccumulateGrad(grads, slotKeys, dSK, engine);
+    }
+
+    // The create-graph path of AbcScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool AbcScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> qProj,
+            Tensor<T> kProj,
+            Tensor<T> vProj,
+            Tensor<T> forgetGate,
+            Tensor<T> slotKeys,
+            int numHeads,
+            double initScale)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => AbcScanComposite(e, qProj, kProj, vProj, forgetGate, slotKeys, numHeads, initScale));
+
+    // The ABC slot recurrence as recorded ops, per head (see AbcScanForward): softmax write against the slot keys,
+    // forget-and-write update of the slots, softmax read against the updated slots.
+    private static Tensor<T> AbcScanComposite<T>(IEngine e, Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,
+        Tensor<T> forgetGate, Tensor<T> slotKeys, int numHeads, double initScale)
+    {
+        int batch = qProj.Shape[0], seqLen = qProj.Shape[1], modelDim = qProj.Shape[2];
+        int headDim = modelDim / numHeads, numSlots = slotKeys.Shape[1];
+        double scale = 1.0 / Math.Sqrt(headDim);
+        var sk = RecordedOps<T>.R(e, slotKeys, 1, numHeads, numSlots, headDim);
+        Tensor<T> slot = RecordedOps<T>.Scale(e, sk, initScale);
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var k = RecordedOps<T>.R(e, RecordedOps<T>.At(e, kProj, 1, t), batch, numHeads, 1, headDim);
+            var v = RecordedOps<T>.R(e, RecordedOps<T>.At(e, vProj, 1, t), batch, numHeads, 1, headDim);
+            var q = RecordedOps<T>.R(e, RecordedOps<T>.At(e, qProj, 1, t), batch, numHeads, 1, headDim);
+            var fg = RecordedOps<T>.R(e, RecordedOps<T>.At(e, forgetGate, 1, t), batch, numHeads, 1, 1);
+            var w = e.Softmax(RecordedOps<T>.Scale(e, RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, k, sk), 3, keep: false), scale), 2);
+            slot = RecordedOps<T>.Add(e, RecordedOps<T>.Mul(e, fg, slot),
+                RecordedOps<T>.Mul(e, RecordedOps<T>.R(e, w, batch, numHeads, numSlots, 1), v));
+            var r = e.Softmax(RecordedOps<T>.Scale(e, RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, q, slot), 3, keep: false), scale), 2);
+            var o = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, RecordedOps<T>.R(e, r, batch, numHeads, numSlots, 1), slot), 2, keep: false);
+            ys.Add(RecordedOps<T>.R(e, o, batch, modelDim));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 }

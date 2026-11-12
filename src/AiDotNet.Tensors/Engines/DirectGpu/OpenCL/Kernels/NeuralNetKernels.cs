@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         public static string GetSource()
         {
-            return @"
+            return ExactFloatKernels.OpenCl + @"
 // ===========================================================================
 // ATOMIC OPERATIONS FOR OPENCL 1.x COMPATIBILITY
 // ===========================================================================
@@ -383,12 +383,9 @@ __kernel void clamp_values(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    // torch.clamp propagates NaN; fmin/fmax would return the bound. NaN is tested on the bits (magnitude above the
-    // +Inf pattern) because fast/finite math may fold isnan() away.
-    const uint F32_ABS_MASK = 0x7fffffffu;       // IEEE-754 binary32: every bit but the sign
-    const uint F32_POS_INF_BITS = 0x7f800000u;   // IEEE-754 binary32: +Inf
-    const float x = input[idx];
-    output[idx] = ((as_uint(x) & F32_ABS_MASK) > F32_POS_INF_BITS) ? x : fmin(fmax(x, minVal), maxVal);
+    // The CPU clamp: x < lo ? lo : x, then above hi -> hi. A NaN input propagates (fmin/fmax would return a bound),
+    // and the decision is made on the bit patterns: fast math flushed subnormals and lost the sign of zero.
+    output[idx] = as_float(xf_clamp(as_uint(input[idx]), as_uint(minVal), as_uint(maxVal)));
 }
 
 // Clip by value (symmetric around 0)
@@ -462,7 +459,8 @@ __kernel void copy_buffer(
     dst[idx] = src[idx];
 }
 
-// Comparison: greater than
+// Comparison: greater than. Decided on the bit patterns (ExactFloatKernels): under this program's fast math a float
+// compare flushed subnormals, so 1.4e-45 > 0 was false while the CPU says true.
 __kernel void greater_than(
     __global const float* A,
     __global const float* B,
@@ -472,10 +470,10 @@ __kernel void greater_than(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    C[idx] = A[idx] > B[idx] ? 1.0f : 0.0f;
+    C[idx] = xf_bool(xf_gt(as_uint(A[idx]), as_uint(B[idx])));
 }
 
-// Comparison: less than
+// Comparison: less than (exact, as greater_than).
 __kernel void less_than(
     __global const float* A,
     __global const float* B,
@@ -485,7 +483,7 @@ __kernel void less_than(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    C[idx] = A[idx] < B[idx] ? 1.0f : 0.0f;
+    C[idx] = xf_bool(xf_lt(as_uint(A[idx]), as_uint(B[idx])));
 }
 
 // Comparison: equal
@@ -507,7 +505,8 @@ __kernel void equal_values(
     C[idx] = equal ? 1.0f : 0.0f;
 }
 
-// Where (conditional select)
+// Where (conditional select): the CPU's condition != 0 (a negative or NaN condition selects A, either zero selects B),
+// tested on the bits, and the chosen operand copied bit for bit (a float select lost -0 under -cl-no-signed-zeros).
 __kernel void where_select(
     __global const float* condition,
     __global const float* A,
@@ -518,7 +517,9 @@ __kernel void where_select(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    C[idx] = condition[idx] > 0.0f ? A[idx] : B[idx];
+    __global const uint* a = (__global const uint*)A;
+    __global const uint* b = (__global const uint*)B;
+    ((__global uint*)C)[idx] = xf_truthy(as_uint(condition[idx])) ? a[idx] : b[idx];
 }
 
 // Mean along axis
@@ -558,7 +559,9 @@ __kernel void var_axis(
     variance[outer] = sum / (float)reduceSize;
 }
 
-// ArgMax along axis
+// ArgMax along axis: the CPU scan. It starts at the first element and moves only on a strictly greater value, so
+// the first of equal maxima wins, a NaN later in the row is skipped, and a NaN first element is never left. The
+// compares are exact on the bit patterns (fast math flushed subnormals to ties).
 __kernel void argmax_axis(
     __global const float* input,
     __global float* indices,
@@ -568,19 +571,21 @@ __kernel void argmax_axis(
     const int outer = get_global_id(0);
     if (outer >= outerSize) return;
 
-    float maxVal = -INFINITY;
+    if (reduceSize <= 0) { indices[outer] = 0.0f; return; }
+    __global const uint* row = (__global const uint*)input + (size_t)outer * reduceSize;
+    uint best = row[0];
     int maxIdx = 0;
-    for (int i = 0; i < reduceSize; i++) {
-        float val = input[outer * reduceSize + i];
-        if (val > maxVal) {
-            maxVal = val;
+    for (int i = 1; i < reduceSize; i++) {
+        uint val = row[i];
+        if (xf_gt(val, best)) {
+            best = val;
             maxIdx = i;
         }
     }
     indices[outer] = (float)maxIdx;
 }
 
-// ArgMin along axis
+// ArgMin along axis: the CPU scan, as argmax_axis with a strictly smaller value.
 __kernel void argmin_axis(
     __global const float* input,
     __global float* indices,
@@ -590,12 +595,14 @@ __kernel void argmin_axis(
     const int outer = get_global_id(0);
     if (outer >= outerSize) return;
 
-    float minVal = INFINITY;
+    if (reduceSize <= 0) { indices[outer] = 0.0f; return; }
+    __global const uint* row = (__global const uint*)input + (size_t)outer * reduceSize;
+    uint best = row[0];
     int minIdx = 0;
-    for (int i = 0; i < reduceSize; i++) {
-        float val = input[outer * reduceSize + i];
-        if (val < minVal) {
-            minVal = val;
+    for (int i = 1; i < reduceSize; i++) {
+        uint val = row[i];
+        if (xf_lt(val, best)) {
+            best = val;
             minIdx = i;
         }
     }

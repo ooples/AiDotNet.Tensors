@@ -19,7 +19,8 @@ internal static class InferencePlanReader
     /// element type mismatch). Throws <see cref="InvalidDataException"/> on
     /// corruption (bad magic, truncated, checksum mismatch).
     /// </summary>
-    internal static ICompiledPlan<T>? Read<T>(Stream stream, IEngine engine)
+    internal static ICompiledPlan<T>? Read<T>(Stream stream, IEngine engine,
+        IReadOnlyList<Tensor<T>?>? externals = null, long maxElements = PlanFormatConstants.DefaultMaxTableElements)
     {
         // Read the entire stream for checksum validation.
         byte[] allBytes;
@@ -108,7 +109,7 @@ internal static class InferencePlanReader
                 $"got type {planType}. Use LoadTrainingAsync for training plans.");
 
         // ── Tensor table ────────────────────────────────────────────────
-        var tensorTable = TensorTableReader.Read<T>(reader);
+        var tensorTable = TensorTableReader.Read<T>(reader, externals, maxElements);
 
         // Ordered mutable-input identities (format v6+).
         int compiledInputCount = reader.ReadInt32();
@@ -131,6 +132,8 @@ internal static class InferencePlanReader
             throw new InvalidDataException(
                 $"Step count mismatch: header says {stepCount}, op section says {savedStepCount}.");
 
+        // Each step takes at least its op byte, name length, input count, output id and saved-state count.
+        RequireWithinStream(bodyStream, (long)stepCount * 17, nameof(stepCount));
         var steps = new CompiledStep<T>[stepCount];
         for (int i = 0; i < stepCount; i++)
         {
@@ -201,8 +204,16 @@ internal static class InferencePlanReader
         var savedState = SavedStateSerializer.Read<T>(reader, tensorTable);
 
         // Rebuild the forward closure via the op registry.
-        var execute = OpSerializationRegistry<T>.RebuildForwardClosure(
-            opType, inputs, outputBuffer, savedState);
+        Action<IEngine, Tensor<T>> execute;
+        try
+        {
+            execute = OpSerializationRegistry<T>.RebuildForwardClosure(opType, inputs, outputBuffer, savedState);
+        }
+        catch (Exception ex) when (ex is not InvalidDataException)
+        {
+            // An op byte or saved state the registry cannot rebuild is a corrupt (or foreign) plan, not a crash.
+            throw new InvalidDataException($"Step '{opName}' ({opType}) cannot be rebuilt: {ex.Message}", ex);
+        }
 
         return new CompiledStep<T>(opName, execute, outputBuffer, inputs, backwardFn: null, savedState);
     }

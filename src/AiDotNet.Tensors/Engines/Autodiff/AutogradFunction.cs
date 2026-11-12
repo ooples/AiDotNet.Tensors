@@ -38,18 +38,37 @@ public abstract class AutogradFunction<T>
     public abstract Tensor<T> Forward(AutogradContext ctx, params Tensor<T>[] inputs);
 
     /// <summary>
-    /// Computes gradients w.r.t. inputs given the gradient of the output.
-    /// Must call DifferentiableOps.AccumulateGrad for each input that needs gradients.
+    /// Computes the gradient of each input given the gradient of the output, as torch.autograd.Function.backward
+    /// does: element <c>i</c> is the gradient of <c>inputs[i]</c>, or null when that input gets none. Override this
+    /// overload or the accumulating one, not both.
     /// </summary>
-    public abstract void Backward(AutogradContext ctx, Tensor<T> gradOutput,
-        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads);
+    public virtual Tensor<T>?[] Backward(AutogradContext ctx, Tensor<T> gradOutput) =>
+        throw new NotImplementedException(
+            $"{GetType().Name} must override Backward(AutogradContext, Tensor<T>) or the accumulating Backward overload.");
+
+    /// <summary>
+    /// Computes gradients w.r.t. inputs given the gradient of the output and adds them into <paramref name="grads"/>.
+    /// The default implementation calls <see cref="Backward(AutogradContext, Tensor{T})"/> and accumulates the
+    /// gradient it returns for each input.
+    /// </summary>
+    public virtual void Backward(AutogradContext ctx, Tensor<T> gradOutput,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var inputs = ctx.Inputs as Tensor<T>[] ?? throw new InvalidOperationException("The autograd context has no recorded inputs.");
+        var perInput = Backward(ctx, gradOutput);
+        if (perInput.Length != inputs.Length)
+            throw new InvalidOperationException(
+                $"{GetType().Name}.Backward returned {perInput.Length} gradient(s) for {inputs.Length} input(s).");
+        for (int i = 0; i < inputs.Length; i++)
+            if (perInput[i] is { } g) DifferentiableOps.AccumulateGrad(grads, inputs[i], g, engine);
+    }
 
     /// <summary>
     /// Applies this custom function: runs forward and registers backward on the active tape.
     /// </summary>
     public Tensor<T> Apply(params Tensor<T>[] inputs)
     {
-        var ctx = new AutogradContext();
+        var ctx = new AutogradContext { Inputs = (Tensor<T>[])inputs.Clone() };
 
         // Suppress tape recording during Forward to prevent double-recording:
         // The custom function's forward ops would otherwise record to the tape,
@@ -81,6 +100,9 @@ public sealed class AutogradContext : ISavedStateTensorContainer
     private readonly List<object> _saved = [];
 
     /// <summary>Saves a tensor for use in the backward pass.</summary>
+    /// <summary>The inputs <see cref="AutogradFunction{T}.Apply"/> was called with (typed as the function's T).</summary>
+    internal System.Array? Inputs { get; set; }
+
     public void SaveForBackward<TItem>(Tensor<TItem> tensor) => _saved.Add(tensor);
 
     /// <summary>Saves multiple tensors.</summary>

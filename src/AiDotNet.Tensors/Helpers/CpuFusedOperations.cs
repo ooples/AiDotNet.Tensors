@@ -1703,7 +1703,7 @@ public static class CpuFusedOperations
             }
             case FusedActivationType.RReLU:
             {
-                double a = p?.Alpha ?? 0.22916667;
+                double a = p?.Alpha ?? 0.22916667f;  // the forward's (float) slope, so f' is the derivative of f
                 return x => x > 0.0 ? 1.0 : a;
             }
             case FusedActivationType.ELU:

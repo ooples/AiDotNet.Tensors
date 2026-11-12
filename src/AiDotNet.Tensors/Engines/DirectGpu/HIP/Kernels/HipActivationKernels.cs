@@ -10,7 +10,7 @@ internal static class HipActivationKernels
     {
         // Note: hiprtc provides device intrinsics built-in, no includes needed
         // blockIdx, blockDim, threadIdx, expf, tanhf, etc. are all available
-        return @"
+        return ExactFloatKernels.Cuda + @"
 // HIP RTC Compatibility - no includes needed, device intrinsics are built-in
 #ifndef INFINITY
 #define INFINITY __builtin_huge_valf()
@@ -255,7 +255,8 @@ extern ""C"" __global__ __launch_bounds__(256) void min_vectors(const float* A, 
     if (idx >= size) return;
     float a = A[idx];
     float b = B[idx];
-    C[idx] = a < b ? a : b;
+    // a < b ? a : b (x86 MINPS, the CPU engine), decided on the bit patterns (ExactFloatKernels): fast math flushes subnormals.
+    C[idx] = xf_minf(a, b);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void max_vectors(const float* A, const float* B, float* C, int size)
@@ -264,7 +265,8 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors(const float* A, 
     if (idx >= size) return;
     float a = A[idx];
     float b = B[idx];
-    C[idx] = a > b ? a : b;
+    // a > b ? a : b (x86 MAXPS, the CPU engine), decided on the bit patterns.
+    C[idx] = xf_maxf(a, b);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void scale_vector(const float* A, float* B, float scalar, int size)
@@ -288,7 +290,8 @@ extern ""C"" __global__ __launch_bounds__(256) void abs_vector(const float* A, f
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = A[idx];
-    B[idx] = x < 0.0f ? -x : x;
+    // The sign bit cleared, as abs_vector_vec4 and the CPU engine: x < 0 ? -x : x kept -0 and lost subnormals to fast math.
+    B[idx] = xf_absf(x);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* A, float* B, int size)
@@ -352,7 +355,8 @@ extern ""C"" __global__ __launch_bounds__(256) void sign_vector(const float* A, 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = A[idx];
-    B[idx] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f);
+    // 1, -1, or +0 for both zeros and NaN (the CPU engine), on the bits so a subnormal keeps its sign under fast math.
+    B[idx] = xf_signf(x);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void squared_deviation_from_mean(
@@ -426,50 +430,55 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_sum(const float* inpu
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* input, float* output, int size)
 {
-    extern __shared__ float scratch[];
+    extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = (idx < (unsigned int)size) ? input[idx] : -INFINITY;
-    scratch[tid] = val;
+    // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the -inf identity (the CPU scan never
+    // takes one), and the compare no longer flushes a subnormal under fast math. Ties keep the left operand.
+    unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(input[idx]) : 0xFF800000u;
+    if (xf_isnan(val)) val = 0xFF800000u;
+    xf_scratch[tid] = val;
     __syncthreads();
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
     {
         if (tid < s)
         {
-            float other = scratch[tid + s];
-            if (other > scratch[tid])
-                scratch[tid] = other;
+            unsigned int other = xf_scratch[tid + s];
+            if (xf_gt(other, xf_scratch[tid]))
+                xf_scratch[tid] = other;
         }
         __syncthreads();
     }
 
     if (tid == 0)
-        output[blockIdx.x] = scratch[0];
+        output[blockIdx.x] = __uint_as_float(xf_scratch[0]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* input, float* output, int size)
 {
-    extern __shared__ float scratch[];
+    extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = (idx < (unsigned int)size) ? input[idx] : INFINITY;
-    scratch[tid] = val;
+    // Exact as reduce_max: NaN skipped, +inf identity.
+    unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(input[idx]) : 0x7F800000u;
+    if (xf_isnan(val)) val = 0x7F800000u;
+    xf_scratch[tid] = val;
     __syncthreads();
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
     {
         if (tid < s)
         {
-            float other = scratch[tid + s];
-            if (other < scratch[tid])
-                scratch[tid] = other;
+            unsigned int other = xf_scratch[tid + s];
+            if (xf_lt(other, xf_scratch[tid]))
+                xf_scratch[tid] = other;
         }
         __syncthreads();
     }
 
     if (tid == 0)
-        output[blockIdx.x] = scratch[0];
+        output[blockIdx.x] = __uint_as_float(xf_scratch[0]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void sum_axis(const float* input, float* output, int outerSize, int reduceSize)
@@ -650,7 +659,7 @@ extern ""C"" __global__ __launch_bounds__(256) void negate_vector(const float* A
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = -A[idx];
+    B[idx] = xf_negf(A[idx]); // the sign bit flipped: -x under fast math flushed a subnormal
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void floor_vector(const float* A, float* B, int size)
@@ -732,7 +741,7 @@ extern ""C"" __global__ __launch_bounds__(256) void hardtanh_vector(const float*
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = fminf(fmaxf(A[idx], minVal), maxVal);
+    B[idx] = xf_clampf(A[idx], minVal, maxVal);   // the CPU clamp, exact: NaN stays NaN, -0 keeps its sign
 }
 
 // ===========================================================================
@@ -883,8 +892,8 @@ extern ""C"" __global__ __launch_bounds__(256) void relu6(const float* input, fl
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float x = input[idx];
-    output[idx] = fminf(fmaxf(x, 0.0f), 6.0f);
+    // The CPU clamp(x, 0, 6), exact: -0 stays -0 and NaN stays NaN (fmaxf returned 0 for both).
+    output[idx] = xf_clampf(input[idx], 0.0f, 6.0f);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void relu6_backward(const float* gradOutput, const float* input, float* gradInput, int size)
@@ -1061,9 +1070,18 @@ extern ""C"" __global__ __launch_bounds__(256) void max_pool1d(const float* inpu
     if (idx >= total) return;
     int o = idx % outLength; int c = (idx / outLength) % channels; int b = idx / (outLength * channels);
     int inOffset = (b * channels + c) * inLength;
-    float maxVal = -3.402823466e+38f;
-    for (int k = 0; k < kernelSize; k++) { int pos = o * stride + k; if (pos < inLength) { maxVal = fmaxf(maxVal, input[inOffset + pos]); } }
-    output[idx] = maxVal;
+    // The CPU max-pool rule on bit patterns: the window's first cell, then only a strictly greater one. The
+    // -FLT_MAX seed answered -FLT_MAX for a -inf window, and fmaxf dropped NaN.
+    unsigned int maxBits = 0xFF800000u;
+    bool have = false;
+    for (int k = 0; k < kernelSize; k++) {
+        int pos = o * stride + k;
+        if (pos < inLength) {
+            unsigned int v = __float_as_uint(input[inOffset + pos]);
+            if (!have || xf_gt(v, maxBits)) { maxBits = v; have = true; }
+        }
+    }
+    output[idx] = __uint_as_float(maxBits);
 }
 
 // Bilinear upsample — matches PyTorch's align_corners=False (the
@@ -1211,7 +1229,7 @@ extern ""C"" __global__ __launch_bounds__(256) void abs_vector_vec4(const float*
     if (idx >= size4) return;
     float4 v = reinterpret_cast<const float4*>(A)[idx];
     float4 r;
-    r.x = fabsf(v.x); r.y = fabsf(v.y); r.z = fabsf(v.z); r.w = fabsf(v.w);
+    r.x = xf_absf(v.x); r.y = xf_absf(v.y); r.z = xf_absf(v.z); r.w = xf_absf(v.w);
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
@@ -1251,7 +1269,7 @@ extern ""C"" __global__ __launch_bounds__(256) void negate_vector_vec4(const flo
     if (idx >= size4) return;
     float4 v = reinterpret_cast<const float4*>(A)[idx];
     float4 r;
-    r.x = -v.x; r.y = -v.y; r.z = -v.z; r.w = -v.w;
+    r.x = xf_negf(v.x); r.y = xf_negf(v.y); r.z = xf_negf(v.z); r.w = xf_negf(v.w);
     reinterpret_cast<float4*>(B)[idx] = r;
 }
 
@@ -1321,7 +1339,8 @@ extern ""C"" __global__ __launch_bounds__(256) void min_vectors_vec4(const float
     float4 a = reinterpret_cast<const float4*>(A)[idx];
     float4 b = reinterpret_cast<const float4*>(B)[idx];
     float4 c;
-    c.x = fminf(a.x, b.x); c.y = fminf(a.y, b.y); c.z = fminf(a.z, b.z); c.w = fminf(a.w, b.w);
+    // a < b ? a : b exactly, as min_vectors (fminf dropped the NaN the CPU returns).
+    c.x = xf_minf(a.x, b.x); c.y = xf_minf(a.y, b.y); c.z = xf_minf(a.z, b.z); c.w = xf_minf(a.w, b.w);
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 
@@ -1332,7 +1351,8 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
     float4 a = reinterpret_cast<const float4*>(A)[idx];
     float4 b = reinterpret_cast<const float4*>(B)[idx];
     float4 c;
-    c.x = fmaxf(a.x, b.x); c.y = fmaxf(a.y, b.y); c.z = fmaxf(a.z, b.z); c.w = fmaxf(a.w, b.w);
+    // a > b ? a : b exactly, as max_vectors.
+    c.x = xf_maxf(a.x, b.x); c.y = xf_maxf(a.y, b.y); c.z = xf_maxf(a.z, b.z); c.w = xf_maxf(a.w, b.w);
     reinterpret_cast<float4*>(C)[idx] = c;
 }
 ";

@@ -39,7 +39,7 @@ internal sealed class LinearMseLossFusionPattern : IFusionPattern
         fused = null;
         // The head: a bias-or-not FusedLinear with no activation (SavedState carries the activation when there is one).
         if (nodes[index] is not LazyNode<float> { OpType: LazyNodeType.FusedLinear } linear
-            || linear.RecordingEngine is not DirectGpuTensorEngine gpu || linear.SavedState is not null
+            || !linear.RecordingEngine.TryGet<DirectGpuTensorEngine>(out var gpu) || linear.SavedState is not null
             || linear.InputCount is not (2 or 3) || linear.Input1 is null
             || linear.Input0.Rank != 2 || linear.Input1.Rank != 2 || linear.Output.Rank != 2
             || !gpu.SupportsFusedLinearMseLoss(linear.Input0._shape[0], linear.Input0._shape[1], linear.Input1._shape[1]))
@@ -80,11 +80,11 @@ internal sealed class LinearMseLossFusionPattern : IFusionPattern
         var node = new LazyNode<float>(LazyNodeType.Custom, "FusedLinearMseLoss", inputs, mean.Output,
             (eng, result) =>
             {
-                Tensor<float>? loss = eng is DirectGpuTensorEngine gpu ? gpu.TryFusedLinearMseLoss(x, w, bias, targets, outputShape) : null;
+                Tensor<float>? loss = eng.TryGet<DirectGpuTensorEngine>(out var gpu) ? gpu.TryFusedLinearMseLoss(x, w, bias, targets, outputShape) : null;
                 if (loss is null)
                 {
                     var predictions = eng.FusedLinear(x, w, bias, FusedActivationType.None);
-                    loss = eng is DirectGpuTensorEngine lossGpu ? lossGpu.TryFusedMseLoss(predictions, targets, outputShape) : null;
+                    loss = eng.TryGet<DirectGpuTensorEngine>(out var lossGpu) ? lossGpu.TryFusedMseLoss(predictions, targets, outputShape) : null;
                     if (loss is null)
                     {
                         var diff = eng.TensorSubtract(predictions, targets);

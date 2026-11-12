@@ -2135,9 +2135,19 @@ public interface IDirectGpuBackend : IDisposable
 
     #region Comparison Operations
 
+    // The comparisons, Where, Min/Max, Clamp, Sign, Abs, Negate and the arg / max reductions must give the CPU engine's
+    // answer for EVERY float (subnormals, signed zeros, infinities, NaN) whatever fast-math flags a backend compiles
+    // with: implementations decide and select on the IEEE-754 bit patterns (see ExactFloatKernels).
+
+    /// <summary>C[i] = A[i] &gt; B[i] ? 1 : 0, IEEE-ordered (false when either is NaN; -0 and +0 are equal).</summary>
     void GreaterThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
+    /// <summary>C[i] = A[i] &lt; B[i] ? 1 : 0, IEEE-ordered.</summary>
     void LessThan(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
     void Equal(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
+    /// <summary>
+    /// C[i] = condition[i] != 0 ? A[i] : B[i], as the CPU engine: a negative or NaN condition selects A, either zero
+    /// selects B, and the selected value is copied bit for bit.
+    /// </summary>
     void Where(IGpuBuffer condition, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size);
 
     /// <summary>

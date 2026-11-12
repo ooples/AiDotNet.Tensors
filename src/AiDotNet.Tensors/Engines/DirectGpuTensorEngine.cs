@@ -4434,16 +4434,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var dArr = dest.GetBackingArrayForCacheLookupUnsafe();
             if (dArr is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[dArr] = s_currentForwardOp;
         }
-        if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
+        if (eng.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
-        AliasDiag(eng is DirectGpuTensorEngine ? "FELLBACK host-copy" : "not-gpu-engine");
+        AliasDiag(eng.Is<DirectGpuTensorEngine>() ? "FELLBACK host-copy" : "not-gpu-engine");
         // The host copy below makes dest's HOST data authoritative, so every device-side copy of dest is stale from
         // here on and must go: its bound buffer and pending download (the next read would run that download over the
         // fresh host values), and any activation- or persistent-cache entry keyed by its backing array (those lookups
         // have no version check and would keep serving the old device values to the next GPU consumer). Measured in
         // compiled training: the replayed GPU RMSNorm read a trace-time rms buffer (dW 4461 vs -0.134), and a GELU fed
         // by a replayed broadcast add kept reading the trace-time input, so the forward froze after the first step.
-        if (eng is DirectGpuTensorEngine destEngine)
+        if (eng.TryGet<DirectGpuTensorEngine>(out var destEngine))
         {
             if (dest.IsGpuResident) dest.Cpu();   // device-resident proper: return it to the host before overwriting
             destEngine.InvalidateResidentWeightBuffer(dest);
@@ -10101,7 +10101,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var biased = bias is null ? conv
                 : bias.Rank == 1 ? TensorChannelBiasAdd(conv, bias)
                 : TensorBroadcastAdd(conv, bias);
-            return ActivationRegistry.Get(activation) is { } handler ? handler.Apply(this, biased) : biased;
+            // The activation as recorded ops: most fused activations' handlers compute on the host and record nothing.
+            // Gumbel-Softmax keeps its sampling forward (which records its own relaxation backward).
+            return activation == FusedActivationType.GumbelSoftmax && ActivationRegistry.Get(activation) is { } gumbel
+                ? gumbel.Apply(this, biased)
+                : Autodiff.BackwardFunctions<T>.ApplyFusedActivationRecorded(this, biased, activation, null);
         }
 
         if (!TryGetBackend(out var backend))
@@ -10455,6 +10459,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         FusedActivationType activation)
     {
         using var __gpuOp = EnterGpuOp();
+        // A recording tape (or graph capture) takes the base composition of recorded ops: the device kernels below
+        // record nothing, so the inputs got no gradient at all under a tape.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
         if (!TryGetBackend(out var backend))
             return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
 
@@ -10642,6 +10650,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         FusedActivationType activation)
     {
         using var __gpuOp = EnterGpuOp();
+        // A recording tape (or graph capture) takes the base composition of recorded ops (see FusedConv3D).
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.FusedConvTranspose2D(input, kernel, bias, strideH, strideW, padH, padW, outputPadH, outputPadW, activation);
         if (!TryGetBackend(out var backend))
             return base.FusedConvTranspose2D(input, kernel, bias, strideH, strideW, padH, padW, outputPadH, outputPadW, activation);
 
@@ -12661,6 +12672,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> saveVar)
     {
         using var __gpuOp = EnterGpuOp();
+        // A recording tape (or graph capture) takes the base composition of recorded ops (see FusedConv3D).
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.FusedBatchNorm(input, gamma, beta, runningMean, runningVar, epsilon, momentum, training, activation, out saveMean, out saveVar);
         if (!TryGetBackend(out var backend))
             return base.FusedBatchNorm(input, gamma, beta, runningMean, runningVar, epsilon, momentum, training, activation, out saveMean, out saveVar);
 
@@ -12852,7 +12866,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 static (gradOutput, inputs, output, savedState, engine, grads) =>
                 {
                     int heads = (int)savedState[0];
-                    if (engine is DirectGpuTensorEngine gpu
+                    if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
                         && gpu.GlaScanBackwardGpu(gradOutput, inputs, heads) is { } gpuGrads)
                     {
                         for (int i = 0; i < 4; i++)
@@ -12970,33 +12984,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // contiguous buffers. Materialize those permutations device-to-device for this composition;
         // otherwise GetOrAllocateBuffer must download the resident parent merely to pack the view.
         Tensor<T> PermuteForCompute(Tensor<T> input, int[] axes) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.PermuteContiguousGpu(input, axes)
                 : e.TensorPermute(input, axes);
         Tensor<T> SliceAxisForCompute(Tensor<T> input, int axis, int index) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.SliceAxisContiguousGpu(input, axis, index)
                 : e.TensorSliceAxis(input, axis, index);
         Tensor<T> TileForCompute(Tensor<T> input, int[] multiples) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.TileSingleAxisContiguousGpu(input, multiples)
                 : e.TensorTile(input, multiples);
         Tensor<T> ScaleForCompute(Tensor<T> input, T scalar) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.ScaleContiguousGpu(input, scalar)
                 : e.TensorMultiplyScalar(input, scalar);
         Tensor<T> MultiplyForCompute(Tensor<T> left, Tensor<T> right) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.BinaryContiguousGpu(left, right, static (backend, a, b, output, length) =>
                     backend.Multiply(a, b, output, length))
                 : e.TensorMultiply(left, right);
         Tensor<T> AddForCompute(Tensor<T> left, Tensor<T> right) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.BinaryContiguousGpu(left, right, static (backend, a, b, output, length) =>
                     backend.Add(a, b, output, length))
                 : e.TensorAdd(left, right);
         Tensor<T> ConcatenateForCompute(Tensor<T>[] tensors, int axis) =>
-            e is DirectGpuTensorEngine gpu
+            e.TryGet<DirectGpuTensorEngine>(out var gpu)
                 ? gpu.ConcatenateContiguousGpu(tensors, axis)
                 : e.TensorConcatenate(tensors, axis);
 
@@ -30688,6 +30702,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rank = tensor.Rank;
                 int normalizedAxis = axis < 0 ? rank + axis : axis;
+                if (normalizedAxis >= 0 && normalizedAxis < rank - 1 && tensor.Length > 0 && !Compilation.GraphMode.IsActive)
+                {
+                    // Any other axis: move it last on the device, run the row path below, move it back, and record one
+                    // node on the input (its backward reduces along the saved axis with device ops). This used to fall
+                    // to the CPU, a host round trip for e.g. log-softmin over the batch axis.
+                    Tensor<T> moved;
+                    using (new Autodiff.NoGradScope<T>())
+                        moved = AlongLastAxis(tensor, normalizedAxis, t => ((IEngine)this).TensorLogSoftmax(t, -1));
+                    Autodiff.DifferentiableOps.RecordUnary("LogSoftmax", moved, tensor,
+                        Autodiff.BackwardFunctions<T>.LogSoftmaxBackward, new object[] { normalizedAxis });
+                    return moved;
+                }
                 if (normalizedAxis == rank - 1 && tensor.Length > 0)
                 {
                     int features = tensor.Shape._dims[normalizedAxis];
@@ -32369,6 +32395,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.SpectralFilter(inBuf.Buffer, filterReal, filterImaginary,
                         output, batchCount, h, w, filterSliceCount));
                 backend.Synchronize();
+                RecordSpectralFilter("NativeSpectralFilter", result, input, filter, batched: false);
                 return result;
             }
             finally
@@ -32445,6 +32472,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.SpectralFilter(inBuf.Buffer, filterReal, filterImaginary,
                         output, totalSlices, h, w, filterSliceCount));
                 backend.Synchronize();
+                RecordSpectralFilter("NativeSpectralFilterBatch", result, input, filter, batched: true);
                 return result;
             }
             finally

@@ -2115,8 +2115,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
         var expectedData = expected.GetDataArray();
         var actualData = actual.GetDataArray();
+        // The GPU sums each 513-tap resample window in float32 and the CPU in float64, so outputs near zero (where
+        // the window's terms cancel) differ by float32 rounding, ~1e-7 absolute, which a purely relative bound
+        // cannot absorb. Same absolute floor as the PitchShift op-parity case (1e-5); 0.5% relative elsewhere.
         for (int i = 0; i < expectedData.Length; i++)
-            Assert.True(AreCloseRelative(expectedData[i], actualData[i], 5e-3f),
+            Assert.True(Math.Abs(expectedData[i] - actualData[i]) <= 1e-5f + 5e-3f * Math.Abs(expectedData[i]),
                 $"PitchShift mismatch at {i}: CPU={expectedData[i]}, GPU={actualData[i]}");
     }
 

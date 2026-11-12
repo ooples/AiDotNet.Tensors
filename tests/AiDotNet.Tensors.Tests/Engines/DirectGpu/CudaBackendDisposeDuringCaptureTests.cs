@@ -20,6 +20,7 @@ public class CudaBackendDisposeDuringCaptureTests
     {
         using var capturer = new CudaBackend();
         Skip.IfNot(capturer.IsAvailable, "CUDA is not available.");
+        Skip.IfNot(capturer.IsCublasAvailable, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
         const int n = 1 << 16;
         using var x = capturer.AllocateBuffer(new float[n]);
         using var y = capturer.AllocateBuffer(n);

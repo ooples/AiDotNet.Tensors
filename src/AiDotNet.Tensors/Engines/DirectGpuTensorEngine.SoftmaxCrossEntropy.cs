@@ -45,7 +45,7 @@ public partial class DirectGpuTensorEngine
         return scope.RecordVariadic(LazyNodeType.Custom, "SoftmaxCrossEntropy", new[] { logits, target }, Array.Empty<int>(),
             (eng, output) =>
             {
-                var gpu = (DirectGpuTensorEngine)eng;
+                var gpu = eng.Cast<DirectGpuTensorEngine>();
                 using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var fused = (ISoftmaxCrossEntropyBackend)backend;
@@ -75,7 +75,7 @@ public partial class DirectGpuTensorEngine
             },
             (gradOutput, inputs, output, savedState, engine, grads) =>
             {
-                var gpu = (DirectGpuTensorEngine)engine;
+                var gpu = engine.Cast<DirectGpuTensorEngine>();
                 using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 var fused = (ISoftmaxCrossEntropyBackend)backend;

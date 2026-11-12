@@ -29,7 +29,11 @@ public sealed class CompiledRecurrentCellTests
     {
         if (engineCase == 0) return new CpuEngine();
         var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend.");
+        if (!gpu.IsGpuAvailable)
+        {
+            gpu.Dispose();
+            Skip.If(true, "No DirectGpu backend.");
+        }
         return gpu;
     }
 
@@ -69,6 +73,9 @@ public sealed class CompiledRecurrentCellTests
     public void LinearWithASharedActivation_CompiledMatchesEager(int engineCase, int activation)
     {
         var engine = EngineFor(engineCase);
+        // Each GPU engine holds an OpenCL context with every compiled program (~100 MB of host memory); undisposed,
+        // they accumulate over a test run until the driver refuses to create another (CL_OUT_OF_HOST_MEMORY).
+        using var ownedEngine = engine as IDisposable;
         var w = Random(new[] { 5, 8 }, 11);
         var b = Random(new[] { 8 }, 14);
         var input = Random(new[] { 1, 5 }, 13);
@@ -174,6 +181,7 @@ public sealed class CompiledRecurrentCellTests
         // 0-6: CpuEngine; 10-16: the GPU engine, when there is one.
         int upTo = upToAndEngine % 10;
         var engine = EngineFor(upToAndEngine / 10);
+        using var ownedEngine = engine as IDisposable;
         const int hidden = 8, order = 4;
         var w1 = Random(new[] { 1 + hidden, 1 }, 1);
         var b1 = Random(new[] { 1 }, 2);

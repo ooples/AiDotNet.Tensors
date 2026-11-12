@@ -68,7 +68,7 @@ public sealed partial class CudaBackend
             var status = CudaNativeBindings.cuModuleGetFunction(out function, module, artifact.EntryPoint);
             if (status != CudaResult.Success)
             {
-                CudaNativeBindings.cuModuleUnload(module);
+                UnloadModule(module);
                 rejection = $"{artifact.CandidateId}: entry point {artifact.EntryPoint} not found ({status})";
                 return false;
             }
@@ -190,7 +190,7 @@ public sealed partial class CudaBackend
         {
             foreach (var module in _externalKernelModules)
             {
-                try { CudaNativeBindings.cuModuleUnload(module); } catch { }
+                try { UnloadModule(module); } catch { }
             }
             _externalKernelModules.Clear();
         }

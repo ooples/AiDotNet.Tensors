@@ -25,7 +25,7 @@ public static class OpenClParity210Kernels
         "parity210_clamp_min_max",
     };
 
-    public static string GetSource() => @"
+    public static string GetSource() => ExactFloatKernels.OpenCl + @"
 // OpenCL 1.2 parity-210 kernels.  float, log, exp, hypot, fmod, floor,
 // pow, erf, erfc, lgamma are all standard OpenCL C built-ins — we use
 // native_* only where accuracy is acceptable.
@@ -158,14 +158,17 @@ __kernel void parity210_cummax_axis(
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
     if (axisSize <= 0) return;
-    // Bootstrap from input[0] so a leading NaN propagates (NaN > -INF is
-    // false, which would otherwise silently shadow it with the sentinel).
-    float acc = input[base_];
-    output[base_] = acc;
+    // The CPU rule (ScanKernels.RunningMaxFloat): start at input[0] and move only to a strictly greater
+    // element, so a leading NaN stays and ties keep the earlier element. Decided on bit patterns because this
+    // program is built with fast/finite-math flags, which flushed subnormals in the float compare.
+    __global const uint* in_ = (__global const uint*)input;
+    __global uint* out_ = (__global uint*)output;
+    uint acc = in_[base_];
+    out_[base_] = acc;
     for (int k = 1; k < axisSize; ++k) {
-        float v = input[base_ + k * innerSize];
-        if (v > acc) acc = v;
-        output[base_ + k * innerSize] = acc;
+        uint v = in_[base_ + k * innerSize];
+        if (xf_gt(v, acc)) acc = v;
+        out_[base_ + k * innerSize] = acc;
     }
 }
 
@@ -180,14 +183,15 @@ __kernel void parity210_cummin_axis(
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
     if (axisSize <= 0) return;
-    // Bootstrap from input[0] so a leading NaN propagates (NaN < +INF is
-    // false, which would otherwise silently shadow it with the sentinel).
-    float acc = input[base_];
-    output[base_] = acc;
+    // input[0], then only a strictly smaller element (ScanKernels.RunningMinFloat), on bit patterns.
+    __global const uint* in_ = (__global const uint*)input;
+    __global uint* out_ = (__global uint*)output;
+    uint acc = in_[base_];
+    out_[base_] = acc;
     for (int k = 1; k < axisSize; ++k) {
-        float v = input[base_ + k * innerSize];
-        if (v < acc) acc = v;
-        output[base_ + k * innerSize] = acc;
+        uint v = in_[base_ + k * innerSize];
+        if (xf_lt(v, acc)) acc = v;
+        out_[base_ + k * innerSize] = acc;
     }
 }
 
@@ -641,7 +645,8 @@ __kernel void parity210_is_finite(
 {
     int gid = get_global_id(0);
     if (gid >= size) return;
-    output[gid] = isfinite(input[gid]) ? 1.0f : 0.0f;
+    // Classified on the bit pattern: -cl-finite-math-only lets the compiler fold isfinite/isnan/isinf to constants.
+    output[gid] = (as_uint(input[gid]) & 0x7F800000u) != 0x7F800000u ? 1.0f : 0.0f;
 }
 
 __kernel void parity210_is_nan(
@@ -649,7 +654,7 @@ __kernel void parity210_is_nan(
 {
     int gid = get_global_id(0);
     if (gid >= size) return;
-    output[gid] = isnan(input[gid]) ? 1.0f : 0.0f;
+    output[gid] = xf_isnan(as_uint(input[gid])) ? 1.0f : 0.0f;
 }
 
 __kernel void parity210_is_inf(
@@ -657,7 +662,7 @@ __kernel void parity210_is_inf(
 {
     int gid = get_global_id(0);
     if (gid >= size) return;
-    output[gid] = isinf(input[gid]) ? 1.0f : 0.0f;
+    output[gid] = (as_uint(input[gid]) & 0x7FFFFFFFu) == 0x7F800000u ? 1.0f : 0.0f;
 }
 
 __kernel void parity210_nan_to_num(
@@ -666,10 +671,12 @@ __kernel void parity210_nan_to_num(
 {
     int gid = get_global_id(0);
     if (gid >= size) return;
-    float x = input[gid];
-    if (isnan(x)) output[gid] = nanVal;
-    else if (isinf(x)) output[gid] = (x > 0.0f) ? posInfVal : negInfVal;
-    else output[gid] = x;
+    // On the bit pattern: -cl-finite-math-only let the compiler assume isnan/isinf false and pass NaN/inf through.
+    uint x = as_uint(input[gid]);
+    uint mag = x & 0x7FFFFFFFu;
+    if (mag > 0x7F800000u) output[gid] = nanVal;
+    else if (mag == 0x7F800000u) output[gid] = (x & 0x80000000u) == 0u ? posInfVal : negInfVal;
+    else output[gid] = as_float(x);
 }
 
 // ============================================================================
@@ -721,10 +728,11 @@ __kernel void parity210_clamp_min_max(
 {
     int gid = get_global_id(0);
     if (gid >= size) return;
-    float x = input[gid];
-    if (hasLo) { float l = lo[gid]; if (x < l) x = l; }
-    if (hasHi) { float h = hi[gid]; if (x > h) x = h; }
-    output[gid] = x;
+    // x < lo ? lo : x, then c > hi ? hi : c (the CPU clamp), on bit patterns: immune to the fast/finite-math flags.
+    uint x = as_uint(input[gid]);
+    if (hasLo) { uint l = as_uint(lo[gid]); if (xf_lt(x, l)) x = l; }
+    if (hasHi) { uint h = as_uint(hi[gid]); if (xf_gt(x, h)) x = h; }
+    output[gid] = as_float(x);
 }
 ";
 }

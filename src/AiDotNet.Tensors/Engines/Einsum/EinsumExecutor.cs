@@ -377,6 +377,12 @@ public static class EinsumExecutor
         var aShape = A.Shape;
         var bShape = B.Shape;
 
+        // A label-less operand is a scalar factor of every term: its VALUE multiplies in, not 1. (Reading it as 1 made
+        // einsum ",i->i" ignore the scalar - the backward of a full contraction such as TensorInner/TensorDot, which
+        // feeds the scalar upstream gradient as that operand, then dropped the upstream gradient entirely.)
+        var aScalar = la.Length == 0 ? A.GetFlat(0) : numOps.One;
+        var bScalar = lb.Length == 0 ? B.GetFlat(0) : numOps.One;
+
         var iter = new int[allLabels.Count];
         var aIdx = new int[la.Length];
         var bIdx = new int[lb.Length];
@@ -407,8 +413,8 @@ public static class EinsumExecutor
                 tIdx[i] = iter[labelPos];
             }
 
-            var a = la.Length == 0 ? numOps.One : A[aIdx];
-            var b = lb.Length == 0 ? numOps.One : B[bIdx];
+            var a = la.Length == 0 ? aScalar : A[aIdx];
+            var b = lb.Length == 0 ? bScalar : B[bIdx];
             var prod = numOps.Multiply(a, b);
             var cur = result[tIdx];
             result[tIdx] = numOps.Add(cur, prod);
