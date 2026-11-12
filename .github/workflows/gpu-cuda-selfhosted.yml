@@ -119,7 +119,9 @@ jobs:
     # them (about 5 minutes), and the 30-minute reserve: 20 + 140 + 5 + 90 + 30 = 285 on the slowest cuda-pr runner,
     # 270 elsewhere. A DirectGpu overrun then still leaves the second part its whole watchdog, so it keeps its TRX.
     # pr-models: setup and the model families (about 18 minutes, bounded at 22).
-    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || matrix.arch == 'pr-models' && 60 || 560 }}
+    # sm86: setup (20), the suite parts (115 + 50) with diagnostics (5), torch interop (5), the model families (22) and
+    # the nightly ratchet (360): 577, so 600.
+    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || matrix.arch == 'pr-models' && 60 || 600 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -354,7 +356,7 @@ jobs:
         SUITE_WATCHDOG_DIRECTGPU_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '115' || matrix.arch == 'pr' && '140' || '130' }}
         SUITE_WATCHDOG_REST_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '50' || matrix.arch == 'pr' && '90' || '85' }}
         # Must equal the job's timeout-minutes.
-        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || 560 }}
+        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || 600 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
@@ -647,7 +649,7 @@ jobs:
     # The CUDA step-time ratchets: each network's ours/PyTorch step ratio on this machine class may not rise above the
     # one recorded in parity/head-to-head-baseline.json. PyTorch compiles each network in every mode for up to an hour
     # (the runner's RunnerTimeout), far past a pull request's budget and the 15-minute hang blame, so they run nightly
-    # and on dispatch on the RTX 3080 only (the SM86 job's limit rises to 560 minutes then: at most about 160 minutes
+    # and on dispatch on the RTX 3080 only (the SM86 job's limit is 600 minutes for it: at most about 217 minutes
     # before this step, 360 in it, and the upload). They run only after every earlier step passed, so a red night does
     # not hold the shared runner for hours more. A deferral (no baseline for the machine class, a torch that cannot reach
     # the device) fails the step, and so does a missing network: each of the nine must report a pass or a failure.
