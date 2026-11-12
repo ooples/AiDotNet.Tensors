@@ -1895,6 +1895,45 @@ public static class OpParityRegistry
             ParityTol.Accum(1e-3), opMethod: "TensorCTCLoss",
             graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
 
+        // The CTC lattice itself: log-alpha and log-beta [N, T, 2U+1] (both T-typed, the integer targets an input).
+        // Unreachable lattice cells are -inf, so both outputs are compared as probabilities, exp(log) in [0, 1].
+        // Both lattice ops take log-probabilities as given and are not recorded for autograd (like aten._ctc_loss's
+        // log_alpha), so the inputs are log-softmaxed here on the host rather than through a recorded engine op.
+        var latticeLp = OpInput.From(CtcLogSoftmaxRows(5 * 2, 4), new[] { 5, 2, 4 });
+        var latticeTargets = new Tensor<int>(new[] { 1, 2, 3, 3 }, new[] { 4 });
+        yield return HomogeneousOutputCase("TensorCTCForwardBackward[T5,N2,C4][all-outputs]", "loss",
+            "TensorCTCForwardBackward",
+            e =>
+            {
+                var (alpha, beta) = e.TensorCTCForwardBackward(latticeLp.F(), latticeTargets,
+                    new[] { 5, 4 }, new[] { 2, 2 }, 0);
+                return new[] { e.TensorExp(alpha), e.TensorExp(beta) };
+            },
+            e =>
+            {
+                var (alpha, beta) = e.TensorCTCForwardBackward(latticeLp.D(), latticeTargets,
+                    new[] { 5, 4 }, new[] { 2, 2 }, 0);
+                return new[] { e.TensorExp(alpha), e.TensorExp(beta) };
+            }, ParityTol.Accum(1e-3), GraphCaptureExpectation.HeterogeneousInput);
+
+        // The label posteriors gamma [T, N, C] (each valid row sums to one) from the same lattice.
+        yield return new OpCase("TensorCTCLabelPosteriors[T5,N2,C4]", "loss",
+            e => e.TensorCTCLabelPosteriors(latticeLp.F(), latticeTargets, new[] { 5, 4 },
+                new[] { 2, 2 }, 0),
+            e => e.TensorCTCLabelPosteriors(latticeLp.D(), latticeTargets, new[] { 5, 4 },
+                new[] { 2, 2 }, 0),
+            ParityTol.Accum(1e-3), opMethod: "TensorCTCLabelPosteriors",
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+
+        // Optimal assignment (Hungarian / Jonker-Volgenant): integer columns per row, projected through an embedding
+        // lookup so the parity harness compares T-typed values. Distinct random costs give a unique optimum.
+        var assignmentCost = OpInput.Rand(5412, new[] { 2, 5, 5 });
+        yield return new OpCase("TensorLinearSumAssignment[2,5,5]", "optimization",
+            e => ProjectIndices(e, e.TensorLinearSumAssignment(assignmentCost.F()), 8),
+            e => ProjectIndicesDouble(e, e.TensorLinearSumAssignment(assignmentCost.D()), 8),
+            ParityTol.Exact, opMethod: "TensorLinearSumAssignment", gpuMinimumKernelLaunches: 2,
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousOutput);
+
         // Batched spectral filter: 4D input [B,C,H,W], complex filter matching [H,W].
         var sfIn = OpInput.Rand(5420, new[] { 1, 2, 4, 8 });
         var fRe = OpInput.Rand(5421, new[] { 4, 8 });
@@ -1906,6 +1945,20 @@ public static class OpParityRegistry
             ParityTol.Accum(2e-3), opMethod: "NativeSpectralFilterBatch",
             graphCaptureExpectation: GraphCaptureExpectation.MixedElementTypes,
             graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+    }
+
+    // rows x classes log-softmaxed scores from a fixed smooth pattern (row r, class c: 1.5 sin(0.7 (r * classes + c))).
+    private static double[] CtcLogSoftmaxRows(int rows, int classes)
+    {
+        var values = new double[rows * classes];
+        for (int r = 0; r < rows; r++)
+        {
+            double sum = 0;
+            for (int c = 0; c < classes; c++) sum += Math.Exp(1.5 * Math.Sin(0.7 * (r * classes + c)));
+            double logSum = Math.Log(sum);
+            for (int c = 0; c < classes; c++) values[r * classes + c] = 1.5 * Math.Sin(0.7 * (r * classes + c)) - logSum;
+        }
+        return values;
     }
 
     // Spherical harmonics, multiresolution hash encoding, gaussian rasterization.
