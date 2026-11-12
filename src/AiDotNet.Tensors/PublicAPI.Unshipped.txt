@@ -42,6 +42,8 @@ AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions
 static AiDotNet.Tensors.Engines.TensorAddActivationEngineExtensions.TensorAddActivation<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.Engines.FusedActivationType activation) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu() -> bool
 static AiDotNet.Tensors.Engines.AiDotNetEngine.ReleaseGpu(System.TimeSpan drainTimeout) -> bool
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.DropAllWeightCaches() -> void
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ReleaseUnusedDeviceMemory() -> int
 AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm
 AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.Dispose() -> void
 AiDotNet.Tensors.Engines.Gpu.DeviceGradientNorm.IsFinite.get -> bool

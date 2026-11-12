@@ -57,8 +57,8 @@ public static class GpuOptimizer
         if (shape is null) throw new ArgumentNullException(nameof(shape));
         if (AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine
             && gpuEngine.TryCreateDeviceStateTensor(shape, out var state))
-            return state;
-        return new Tensor<float>(shape);
+            return TensorScope.Detach(state);
+        return TensorScope.Detach(new Tensor<float>(shape));
     }
 
     /// <summary>
