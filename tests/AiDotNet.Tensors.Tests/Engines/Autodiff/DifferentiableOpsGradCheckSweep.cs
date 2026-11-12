@@ -526,12 +526,6 @@ public partial class DifferentiableOpsGradCheckSweep
         return t;
     }
 
-    private static Tensor<double> Shifted(Tensor<double> t, double offset)
-    {
-        for (int i = 0; i < t.Length; i++) t[i] += offset;
-        return t;
-    }
-
     /// <summary>
     /// Boxes as <c>[n, 4]</c> in (x1, y1, x2, y2) order with x2 &gt; x1 and y2 &gt; y1.
     /// </summary>
