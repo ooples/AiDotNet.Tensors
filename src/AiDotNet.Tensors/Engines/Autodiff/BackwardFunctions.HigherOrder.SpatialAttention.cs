@@ -296,15 +296,15 @@ internal static partial class BackwardFunctions<T>
                         {
                             int cell = ((b * taps + t) * outH + oh) * outW + ow;
                             int i = t / kw, j = t % kw;
-                            double py = oh * stride[0] - padding[0] + i * dilation[0]
+                            double py = (double)oh * stride[0] - padding[0] + (double)i * dilation[0]
                                 + offsetValues[((b * offChannels + dg * 2 * taps + t) * outH + oh) * outW + ow];
-                            double px = ow * stride[1] - padding[1] + j * dilation[1]
+                            double px = (double)ow * stride[1] - padding[1] + (double)j * dilation[1]
                                 + offsetValues[((b * offChannels + dg * 2 * taps + taps + t) * outH + oh) * outW + ow];
                             outside[cell] = py < -1 || py > height || px < -1 || px > width;
                             int y0 = (int)Math.Floor(py), x0 = (int)Math.Floor(px);
                             // ly = py − y0 = offY − (y0 − base position): the constant part.
-                            baseY[cell] = y0 - (oh * stride[0] - padding[0] + i * dilation[0]);
-                            baseX[cell] = x0 - (ow * stride[1] - padding[1] + j * dilation[1]);
+                            baseY[cell] = y0 - ((double)oh * stride[0] - padding[0] + (double)i * dilation[0]);
+                            baseX[cell] = x0 - ((double)ow * stride[1] - padding[1] + (double)j * dilation[1]);
                             for (int k = 0; k < 4; k++)
                             {
                                 int yy = y0 + (k >> 1), xx = x0 + (k & 1);
