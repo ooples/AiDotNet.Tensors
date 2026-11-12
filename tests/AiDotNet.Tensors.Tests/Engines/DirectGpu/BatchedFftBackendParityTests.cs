@@ -27,6 +27,8 @@ public sealed class BatchedFftBackendParityTests
         { 3, 8, true },
         { 5, 1024, false },
         { 5, 1024, true },
+        { 4, 2048, false },
+        { 4, 2048, true },
         { 3, 4096, false },
         { 3, 4096, true },
         { 2, 8192, false },
@@ -160,6 +162,7 @@ public sealed class BatchedFftBackendParityTests
         using var backend = new MetalBackend();
         Skip.IfNot(backend.IsAvailable, "Metal is not available.");
         Check(backend, batch, n, inverse);
+        CheckInPlace(backend, batch, n, inverse);
     }
 
 #if NET7_0_OR_GREATER
@@ -169,6 +172,7 @@ public sealed class BatchedFftBackendParityTests
     {
         var backend = DawnHostedWebGpu.BackendOrSkip();   // the real backend, executing on Dawn; shared, so not disposed
         Check(backend, batch, n, inverse);
+        CheckInPlace(backend, batch, n, inverse);
     }
 #endif
 }

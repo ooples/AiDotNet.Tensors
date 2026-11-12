@@ -647,7 +647,13 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
 
     public void FFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag, int n, bool inverse)
     {
-        // FFTSource fft_1d: batched DFT kernel, batch_size=1 for single FFT
+        if (n > 0 && (n & (n - 1)) == 0)
+        {
+            BatchedFFT(inputReal, inputImag, outputReal, outputImag, 1, n, inverse);
+            return;
+        }
+
+        // FFTSource fft_1d: batched DFT kernel, batch_size=1 for single non-power-of-two FFT
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(n),
@@ -655,9 +661,8 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
             BitConverter.Int32BitsToSingle(inverse ? 1 : 0),
             0
         };
-        Dispatch4BufferAsync("FFT", WebGpuKernels.FFTSource, "fft_1d",
+        Dispatch4BufferAsync("FFT", WebGpuFftKernels.DirectDft1D, "fft_1d",
             inputReal, inputImag, outputReal, outputImag, uniforms, n).GetAwaiter().GetResult();
-        // For inverse FFT, the kernel already handles 1/N normalization
     }
 
     public void IRFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer output, int n)
@@ -669,15 +674,43 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
     public void BatchedFFT(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal, IGpuBuffer outputImag,
         int batch, int n, bool inverse)
     {
-        // #965: a power-of-two length runs the radix-2 kernels (O(n log n)); fft_1d below is a direct O(n^2) DFT, kept for
-        // the other lengths. The generic FFT's power-of-two transforms and all three Bluestein transforms land here.
+        if (batch <= 0) return;
+
+        // Single-launch on-chip path when a row fits in the guaranteed 16 KB workgroup storage (n <= 2048)
+        // and input/output buffers do not alias (WebGPU forbids read + read_write aliasing in one bind group).
+        if (n >= 2 && (n & (n - 1)) == 0 && n <= WebGpuFftKernels.SharedBatchedFftMaxN
+            && !ReferenceEquals(inputReal, outputReal) && !ReferenceEquals(inputReal, outputImag)
+            && !ReferenceEquals(inputImag, outputReal) && !ReferenceEquals(inputImag, outputImag)
+            && !ReferenceEquals(outputReal, outputImag))
+        {
+            int log2n = 0;
+            while ((1 << log2n) < n) log2n++;
+            int sliceRows = Math.Min(_device.MaxWorkgroupsPerDimension, 65535);
+            for (int row = 0; row < batch; row += sliceRows)
+            {
+                int rows = Math.Min(sliceRows, batch - row);
+                var uniforms = new float[]
+                {
+                    BitConverter.Int32BitsToSingle(row),
+                    BitConverter.Int32BitsToSingle(n),
+                    BitConverter.Int32BitsToSingle(log2n),
+                    BitConverter.Int32BitsToSingle(inverse ? 1 : 0)
+                };
+                Dispatch4BufferAsync("SharedBatchedFft", WebGpuFftKernels.SharedBatchedFft, "batched_fft_shared",
+                    inputReal, inputImag, outputReal, outputImag, uniforms, checked(rows * 256)).GetAwaiter().GetResult();
+            }
+            return;
+        }
+
+        // #965: larger power-of-two lengths (or aliasing buffers) run the multi-pass radix-2 kernels (O(n log n));
+        // fft_1d below is a direct O(n^2) DFT kept for non-power-of-two lengths.
         if (n > 0 && (n & (n - 1)) == 0)
         {
             PortableGenericFft.BatchedRadix2(this, LaunchBatch, inputReal, inputImag, outputReal, outputImag, batch, n, inverse);
             return;
         }
-        // FFTSource fft_1d: batched DFT kernel
-        var uniforms = new float[]
+        // DirectDft1D fft_1d: batched DFT kernel with modular angle reduction
+        var dftUniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(n),
             BitConverter.Int32BitsToSingle(batch),
@@ -685,8 +718,8 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
             0
         };
         int total = batch * n;
-        Dispatch4BufferAsync("FFT", WebGpuKernels.FFTSource, "fft_1d",
-            inputReal, inputImag, outputReal, outputImag, uniforms, total).GetAwaiter().GetResult();
+        Dispatch4BufferAsync("FFT", WebGpuFftKernels.DirectDft1D, "fft_1d",
+            inputReal, inputImag, outputReal, outputImag, dftUniforms, total).GetAwaiter().GetResult();
     }
 
     /// <inheritdoc/>

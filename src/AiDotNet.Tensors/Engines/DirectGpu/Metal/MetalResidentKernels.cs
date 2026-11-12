@@ -858,8 +858,11 @@ kernel void split_dft_strided(
     uint offset = sequence * baseStride;
     float realSum = 0.0f, imagSum = 0.0f;
     float direction = inverse != 0u ? 1.0f : -1.0f;
+    uint prod = 0u;
     for (uint sample = 0u; sample < length; ++sample) {
-        float angle = direction * 6.283185307179586f * float(frequency) * float(sample) / float(length);
+        float angle = direction * 6.283185307179586f * float(prod) / float(length);
+        prod += frequency;
+        if (prod >= length) prod -= length;
         float c = cos(angle), s = sin(angle);
         uint index = offset + sample * elementStride;
         float r = inputReal[index], i = inputImag[index];
@@ -919,6 +922,57 @@ kernel void split_fft_strided_serial(
     }
     if (inverse != 0u)
         for (uint i = 0; i < length; ++i) { uint index = base + i * elementStride; outputReal[index] /= float(length); outputImag[index] /= float(length); }
+}
+
+// Power-of-two batched FFT, one threadgroup per row with the row held in threadgroup memory (2 * n floats).
+// Loads in natural order into the bit-reversed slot, runs every radix-2 DIT stage on chip, and writes once
+// (scaled by 1/n for an inverse): O(n log n) in a single dispatch, safe for in-place as well as out-of-place buffers.
+kernel void batched_fft_threadgroup(
+    device const float* inputReal [[buffer(0)]],
+    device const float* inputImag [[buffer(1)]],
+    device float* outputReal [[buffer(2)]],
+    device float* outputImag [[buffer(3)]],
+    constant uint& rowBase [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    constant uint& log2n [[buffer(6)]],
+    constant uint& inverse [[buffer(7)]],
+    threadgroup float* sre [[threadgroup(0)]],
+    threadgroup float* sim [[threadgroup(1)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lsz [[threads_per_threadgroup]])
+{
+    uint base = (rowBase + gid) * n;
+    uint shift = 32u - log2n;
+    for (uint i = lid; i < n; i += lsz) {
+        uint r = reverse_bits(i) >> shift;
+        sre[r] = inputReal[base + i];
+        sim[r] = inputImag[base + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sgn = inverse != 0u ? 1.0f : -1.0f;
+    uint halfN = n >> 1u;
+    for (uint lg = 0u; lg < log2n; ++lg) {
+        uint hs = 1u << lg;
+        for (uint k = lid; k < halfN; k += lsz) {
+            uint w = k & (hs - 1u);
+            uint top = ((k >> lg) << (lg + 1u)) + w;
+            uint bot = top + hs;
+            float a = 3.14159265358979323846f * sgn * float(w) / float(hs);
+            float c = precise::cos(a), s = precise::sin(a);
+            float br = sre[bot], bi = sim[bot];
+            float tr = br * c - bi * s, ti = br * s + bi * c;
+            float ar = sre[top], ai = sim[top];
+            sre[top] = ar + tr; sim[top] = ai + ti;
+            sre[bot] = ar - tr; sim[bot] = ai - ti;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = inverse != 0u ? 1.0f / float(n) : 1.0f;
+    for (uint i = lid; i < n; i += lsz) {
+        outputReal[base + i] = sre[i] * scale;
+        outputImag[base + i] = sim[i] * scale;
+    }
 }
 
 kernel void irfft_reconstruct(

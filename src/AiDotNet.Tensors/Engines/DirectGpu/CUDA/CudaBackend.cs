@@ -328,7 +328,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private static long ReadMemPoolBytes(IntPtr pool, int attribute)
         => CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value) == CudaResult.Success ? (long)value : 0;
 
-    private const int MaxPooledBufferElements = 16_777_216;
+    private const int MaxPooledBufferElements = int.MaxValue;
     private const int MaxPooledBuffersPerSize = 4096;
     private const int PooledMemoryDivisor = 6;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =

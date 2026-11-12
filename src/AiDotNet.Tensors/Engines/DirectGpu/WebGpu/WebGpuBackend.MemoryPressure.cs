@@ -17,9 +17,13 @@ public sealed partial class WebGpuBackend : IDeviceMemoryPressure
 
     void IDeviceMemoryPressure.ReclaimNow() => DeviceMemorySweep.Run();
 
-    // No buffer pool: a freed buffer goes straight back to the driver.
-    int IDeviceMemoryPressure.ReleaseCachedBuffers() => 0;
+    int IDeviceMemoryPressure.ReleaseCachedBuffers()
+    {
+        WebGpuBuffer.PendingFrees.Drain();
+        return WebGpuBuffer.Pool.DrainAll();
+    }
 
-    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => false;
+    /// <remarks>WebGpuBuffer collects unreachable buffers, drains the pool and retries once on allocation failure.</remarks>
+    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => true;
 }
 #endif

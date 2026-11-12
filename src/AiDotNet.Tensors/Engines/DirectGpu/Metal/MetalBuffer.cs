@@ -29,17 +29,49 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// <item><b>Managed</b>: Metal manages synchronization (macOS only).</item>
 /// </list>
 /// </remarks>
-public sealed class MetalGpuBuffer : IGpuBuffer
+public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 {
+    private const long MinimumReclaimCharge = 128 * 1024;
+
+    /// <summary>AIDOTNET_METAL_BUFFER_POOL=0 disables Metal buffer pooling.</summary>
+    internal static bool PoolingEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_METAL_BUFFER_POOL") != "0";
+
+    private static long s_driverAllocations;
+
+    /// <summary>Buffers allocated from the Metal driver (pool misses) since the process started.</summary>
+    internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
+
     private readonly MetalDevice? _device;
     private IntPtr _buffer;
     private bool _disposed;
+    private readonly bool _pooled;
     private readonly object _lock = new();
     private readonly long _byteOffset;
     // A view keeps its parent reachable, so the parent's finalizer cannot release memory the view still addresses.
     private readonly MetalGpuBuffer? _viewParent;
     private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory (nothing for a view)
+    private long _reclaimCharge;
+    private long _reclaimEpoch = -1;
 
+    /// <inheritdoc/>
+    int IPoolableGpuBuffer.Capacity => Size;
+
+    /// <inheritdoc/>
+    void IPoolableGpuBuffer.MarkRented(int size)
+    {
+    }
+
+    /// <inheritdoc/>
+    void IPoolableGpuBuffer.Release()
+    {
+        _memory.OnFreed();
+        if (_buffer != IntPtr.Zero)
+        {
+            Release(_buffer);
+            _buffer = IntPtr.Zero;
+        }
+    }
     /// <summary>
     /// Gets the native Metal buffer handle.
     /// </summary>
@@ -122,8 +154,8 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         _buffer = device.CreateBuffer(sizeInBytes, options);
         if (_buffer == IntPtr.Zero)
         {
-            // Out of memory: free what unreachable buffers hold, then retry once (see DeviceMemoryReclaim).
-            ReclaimForRetry();
+            // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
+            ReclaimForRetry(device);
             _buffer = device.CreateBuffer(sizeInBytes, options);
         }
 
@@ -131,7 +163,107 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         {
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes");
         }
+        System.Threading.Interlocked.Increment(ref s_driverAllocations);
+        _pooled = options == MTLResourceOptions.StorageModeShared;
         _memory.OnAllocated(device.MemoryAccount, (long)sizeInBytes);
+    }
+
+    private MetalGpuBuffer(MetalDevice device, IntPtr buffer, int elementCount, MTLResourceOptions options)
+    {
+        _device = device;
+        _buffer = buffer;
+        Size = elementCount;
+        StorageMode = options;
+        _pooled = options == MTLResourceOptions.StorageModeShared;
+    }
+
+    /// <summary>
+    /// Rents a pooled StorageModeShared Metal buffer when available, or allocates a new one.
+    /// </summary>
+    internal static MetalGpuBuffer Create(MetalDevice device, int elementCount, bool zeroInitialize = true)
+    {
+        if (device is null || !device.IsAvailable)
+            throw new ArgumentException("Invalid Metal device", nameof(device));
+        if (elementCount <= 0)
+            throw new ArgumentOutOfRangeException(nameof(elementCount), "Element count must be positive");
+
+        if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        long charge = Math.Max((long)elementCount * sizeof(float), MinimumReclaimCharge);
+        long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(charge);
+
+        MetalGpuBuffer buffer;
+        if (PoolingEnabled && device.BufferPool.TryRent(elementCount, out var parked) && parked is not null)
+        {
+            buffer = FromParked(device, parked, elementCount);
+            if (zeroInitialize) buffer.Clear();
+        }
+        else if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss() &&
+                 PendingFreesDrainAndTryRent(device, elementCount, out parked) && parked is not null)
+        {
+            buffer = FromParked(device, parked, elementCount);
+            if (zeroInitialize) buffer.Clear();
+        }
+        else
+        {
+            // MTLDevice newBufferWithLength: guarantees zero-filled memory on fresh driver allocations.
+            buffer = new MetalGpuBuffer(device, elementCount, MTLResourceOptions.StorageModeShared);
+        }
+
+        buffer._reclaimCharge = charge;
+        buffer._reclaimEpoch = reclaimEpoch;
+        return buffer;
+    }
+
+    /// <summary>
+    /// Rents a pooled StorageModeShared Metal buffer and copies <paramref name="data"/> into unified memory,
+    /// or allocates a new buffer initialized with <paramref name="data"/>.
+    /// </summary>
+    internal static MetalGpuBuffer Create(MetalDevice device, float[] data)
+    {
+        if (device is null || !device.IsAvailable)
+            throw new ArgumentException("Invalid Metal device", nameof(device));
+        if (data is null || data.Length == 0)
+            throw new ArgumentException("Data cannot be null or empty", nameof(data));
+
+        if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        long charge = Math.Max((long)data.Length * sizeof(float), MinimumReclaimCharge);
+        long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(charge);
+
+        MetalGpuBuffer buffer;
+        if (PoolingEnabled && device.BufferPool.TryRent(data.Length, out var parked) && parked is not null)
+        {
+            buffer = FromParked(device, parked, data.Length);
+            buffer.CopyFrom(data);
+        }
+        else if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss() &&
+                 PendingFreesDrainAndTryRent(device, data.Length, out parked) && parked is not null)
+        {
+            buffer = FromParked(device, parked, data.Length);
+            buffer.CopyFrom(data);
+        }
+        else
+        {
+            buffer = new MetalGpuBuffer(device, data, MTLResourceOptions.StorageModeShared);
+        }
+
+        buffer._reclaimCharge = charge;
+        buffer._reclaimEpoch = reclaimEpoch;
+        return buffer;
+    }
+
+    private static bool PendingFreesDrainAndTryRent(MetalDevice device, int elementCount, out MetalGpuBuffer? parked)
+    {
+        PendingFrees.Drain();
+        return device.BufferPool.TryRent(elementCount, out parked);
+    }
+
+    private static MetalGpuBuffer FromParked(MetalDevice device, MetalGpuBuffer parked, int size)
+    {
+        var rented = new MetalGpuBuffer(device, parked._buffer, size, parked.StorageMode);
+        parked._buffer = IntPtr.Zero;
+        rented._memory = parked._memory.TransferToLease();
+        rented._memory.OnRented();
+        return rented;
     }
 
     /// <summary>
@@ -165,8 +297,8 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             _buffer = device.CreateBufferWithData(handle.AddrOfPinnedObject(), sizeInBytes, options);
             if (_buffer == IntPtr.Zero)
             {
-                // Out of memory: free what unreachable buffers hold, then retry once (see DeviceMemoryReclaim).
-                ReclaimForRetry();
+                // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
+                ReclaimForRetry(device);
                 _buffer = device.CreateBufferWithData(handle.AddrOfPinnedObject(), sizeInBytes, options);
             }
         }
@@ -179,6 +311,8 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         {
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes with data");
         }
+        System.Threading.Interlocked.Increment(ref s_driverAllocations);
+        _pooled = options == MTLResourceOptions.StorageModeShared;
         _memory.OnAllocated(device.MemoryAccount, (long)sizeInBytes);
     }
 
@@ -555,6 +689,10 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             return;
         }
 
+        IntPtr bufferToPark = IntPtr.Zero;
+        DeviceMemoryHold memoryLease = default;
+        MetalDevice? poolDevice = null;
+
         lock (_lock)
         {
             if (_disposed)
@@ -563,39 +701,108 @@ public sealed class MetalGpuBuffer : IGpuBuffer
             }
 
             _disposed = true;
-            _memory.OnFreed();
+            long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
+            if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
 
-            if (_buffer != IntPtr.Zero)
+            if (_pooled && PoolingEnabled && _viewParent is null && _buffer != IntPtr.Zero &&
+                _device is { IsDisposed: false } dev)
             {
-                Release(_buffer);
+                _memory.OnReturned();
+                memoryLease = _memory.TransferToLease();
+                bufferToPark = _buffer;
                 _buffer = IntPtr.Zero;
+                poolDevice = dev;
+            }
+            else
+            {
+                _memory.OnFreed();
+                if (_buffer != IntPtr.Zero)
+                {
+                    Release(_buffer);
+                    _buffer = IntPtr.Zero;
+                }
             }
         }
+
         GC.SuppressFinalize(this);
+
+        if (poolDevice is not null && bufferToPark != IntPtr.Zero)
+        {
+            var parked = new MetalGpuBuffer(poolDevice, bufferToPark, Size, StorageMode)
+            {
+                _disposed = true,
+                _memory = memoryLease
+            };
+            GC.SuppressFinalize(parked);
+            poolDevice.BufferPool.Return(parked);
+        }
     }
 
     /// <summary>Frees of Metal buffers collected without Dispose, run by the next allocation.</summary>
     internal static readonly DeviceFreeQueue PendingFrees = new();
 
-    private static void ReclaimForRetry()
+    private static void ReclaimForRetry(MetalDevice? device)
     {
         DeviceMemoryReclaim.CollectUnreachable();
         PendingFrees.Drain();
+        device?.BufferPool.DrainAll();
     }
 
-    // An undisposed buffer (a result nothing references any more) releases its MTLBuffer through the queue.
+    // An undisposed buffer (a result nothing references any more) returns to the pool or releases through the queue.
     ~MetalGpuBuffer()
     {
         IntPtr buffer;
+        DeviceMemoryHold memoryLease = default;
+        MetalDevice? poolDevice = null;
+        int size = Size;
+        MTLResourceOptions storageMode = StorageMode;
+
         lock (_lock)
         {
             if (_disposed) return;
             _disposed = true;
-            _memory.OnFreed();
+            long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
+            DeviceMemoryReclaim.OnDeviceFinalized(charge, _reclaimEpoch);
             buffer = _buffer;
             _buffer = IntPtr.Zero;
+
+            if (_pooled && PoolingEnabled && _viewParent is null && buffer != IntPtr.Zero &&
+                _device is { IsDisposed: false } dev)
+            {
+                memoryLease = _memory.TransferToLease();
+                poolDevice = dev;
+            }
+            else
+            {
+                _memory.OnFreed();
+            }
         }
-        if (buffer != IntPtr.Zero) PendingFrees.Enqueue(() => Release(buffer));
+
+        if (buffer == IntPtr.Zero) return;
+        if (poolDevice is not null)
+        {
+            PendingFrees.Enqueue(() =>
+            {
+                if (poolDevice.IsDisposed || !PoolingEnabled)
+                {
+                    memoryLease.OnFreed();
+                    Release(buffer);
+                    return;
+                }
+                memoryLease.OnReturned();
+                var parked = new MetalGpuBuffer(poolDevice, buffer, size, storageMode)
+                {
+                    _disposed = true,
+                    _memory = memoryLease
+                };
+                GC.SuppressFinalize(parked);
+                poolDevice.BufferPool.Return(parked);
+            });
+        }
+        else
+        {
+            PendingFrees.Enqueue(() => Release(buffer));
+        }
     }
 
     public override string ToString()

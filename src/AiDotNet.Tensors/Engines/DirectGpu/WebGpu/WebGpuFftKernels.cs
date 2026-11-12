@@ -6,10 +6,136 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu
 {
     internal static class WebGpuFftKernels
     {
+        public const int SharedBatchedFftMaxN = 2048;
+
         public static string[] GetKernelNames() => new[]
         {
             "parity212_fft",
+            "batched_fft_shared",
+            "fft_1d",
         };
+
+        /// <summary>
+        /// Arbitrary-length split-complex batched DFT with modular angle reduction (prod = (k * j) mod n)
+        /// so non-power-of-two transforms preserve full FP32 phase precision across large indices.
+        /// </summary>
+        public const string DirectDft1D = @"
+@group(0) @binding(0) var<storage, read> input_real: array<f32>;
+@group(0) @binding(1) var<storage, read> input_imag: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_real: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output_imag: array<f32>;
+
+struct Params {
+    n: u32,
+    batch_size: u32,
+    inverse: u32,
+    _pad: u32,
+}
+@group(0) @binding(4) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn fft_1d(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.batch_size * params.n;
+    if (idx >= total) { return; }
+    let b = idx / params.n;
+    let k = idx % params.n;
+    let off = b * params.n;
+    let sign = select(-1.0, 1.0, params.inverse > 0u);
+    let PI2 = 6.283185307179586;
+    var sum_r: f32 = 0.0;
+    var sum_i: f32 = 0.0;
+    var prod: u32 = 0u;
+    for (var j: u32 = 0u; j < params.n; j = j + 1u) {
+        let angle = sign * PI2 * f32(prod) / f32(params.n);
+        prod = prod + k;
+        if (prod >= params.n) { prod = prod - params.n; }
+        let c = cos(angle);
+        let s = sin(angle);
+        sum_r = sum_r + input_real[off + j] * c - input_imag[off + j] * s;
+        sum_i = sum_i + input_real[off + j] * s + input_imag[off + j] * c;
+    }
+    if (params.inverse > 0u) {
+        let inv_n = 1.0 / f32(params.n);
+        output_real[idx] = sum_r * inv_n;
+        output_imag[idx] = sum_i * inv_n;
+    } else {
+        output_real[idx] = sum_r;
+        output_imag[idx] = sum_i;
+    }
+}
+";
+
+        /// <summary>
+        /// Power-of-two split-complex batched FFT, one workgroup per row with the row held in workgroup memory
+        /// (2 * 2048 floats = 16 KB, fitting the WebGPU guaranteed minimum maxComputeWorkgroupStorageSize).
+        /// Loads in natural order into the bit-reversed slot, runs every radix-2 DIT stage on chip, and writes once
+        /// (scaled by 1/n for an inverse): O(n log n) in a single dispatch.
+        /// </summary>
+        public const string SharedBatchedFft = @"
+@group(0) @binding(0) var<storage, read> input_real: array<f32>;
+@group(0) @binding(1) var<storage, read> input_imag: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_real: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output_imag: array<f32>;
+
+struct Params {
+    row_base: u32,
+    n: u32,
+    log2n: u32,
+    inverse: u32,
+}
+@group(0) @binding(4) var<uniform> params: Params;
+
+var<workgroup> sre: array<f32, 2048>;
+var<workgroup> sim: array<f32, 2048>;
+
+@compute @workgroup_size(256)
+fn batched_fft_shared(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) li: vec3<u32>)
+{
+    let lid = li.x;
+    let base = (params.row_base + wg.x) * params.n;
+    let shift = 32u - params.log2n;
+    for (var i: u32 = lid; i < params.n; i = i + 256u) {
+        let r = reverseBits(i) >> shift;
+        sre[r] = input_real[base + i];
+        sim[r] = input_imag[base + i];
+    }
+    workgroupBarrier();
+
+    let sgn = select(-1.0, 1.0, params.inverse != 0u);
+    let half_n = params.n >> 1u;
+    for (var lg: u32 = 0u; lg < params.log2n; lg = lg + 1u) {
+        let hs = 1u << lg;
+        for (var k: u32 = lid; k < half_n; k = k + 256u) {
+            let w = k & (hs - 1u);
+            let top = ((k >> lg) << (lg + 1u)) + w;
+            let bot = top + hs;
+            let a = 3.14159265358979323846 * sgn * f32(w) / f32(hs);
+            let c = cos(a);
+            let s = sin(a);
+            let br = sre[bot];
+            let bi = sim[bot];
+            let tr = br * c - bi * s;
+            let ti = br * s + bi * c;
+            let ar = sre[top];
+            let ai = sim[top];
+            sre[top] = ar + tr;
+            sim[top] = ai + ti;
+            sre[bot] = ar - tr;
+            sim[bot] = ai - ti;
+        }
+        workgroupBarrier();
+    }
+
+    let scale = select(1.0, 1.0 / f32(params.n), params.inverse != 0u);
+    for (var i: u32 = lid; i < params.n; i = i + 256u) {
+        output_real[base + i] = sre[i] * scale;
+        output_imag[base + i] = sim[i] * scale;
+    }
+}
+";
 
         public static string Fft => @"
 @group(0) @binding(0) var<storage, read_write> buf : array<f32>;
