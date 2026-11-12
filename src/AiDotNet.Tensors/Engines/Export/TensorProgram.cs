@@ -135,7 +135,58 @@ public sealed partial class TensorProgram
         }
         _parameterCache[typeof(T)] = parameters.Cast<object>().ToArray();
         Unbound.Clear();
+        Interlocked.Increment(ref _parameterGeneration);
     }
+
+    private int _parameterGeneration;
+
+    /// <summary>Changes whenever the parameter or constant tensors a replay binds are replaced (BindParameters, SetStored).</summary>
+    internal int ParameterGeneration => Volatile.Read(ref _parameterGeneration);
+
+    /// <summary>
+    /// The tensors a replay at <typeparamref name="T"/> binds for parameters and constants, indexed by value id (null for
+    /// every other value, and for a value that is not a <c>Tensor&lt;T&gt;</c>). A compiled plan stores references to these
+    /// indices instead of copies, so it runs on whatever the program currently binds.
+    /// </summary>
+    internal Tensor<T>?[] ExternalTensors<T>()
+    {
+        var result = new Tensor<T>?[Values.Count];
+        var parameters = GetParameterObjects<T>();
+        var constants = (object?[])GetConstants<T>();
+        int pi = 0;
+        foreach (var v in Values)
+        {
+            var bound = v.Role == ProgramValueRole.Parameter ? parameters[pi++]
+                : v.Role == ProgramValueRole.Constant ? constants[v.Id] : null;
+            if (bound is not null && !InPlaceTargets.Contains(v.Id)) result[v.Id] = bound as Tensor<T>;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The stored tensors to write when saving with values: a parameter that was loaded by shape only and has since
+    /// been bound is written from the bound tensor (at the traced element type), so a re-save keeps the weights.
+    /// </summary>
+    internal IReadOnlyDictionary<int, object> StoredForSave()
+    {
+        if (!Stored.Values.Any(v => v is UnboundTensor)) return Stored;
+        var traced = ElementTypes.TypeOf(TracedElementType)!;
+        var bound = _parameterCache.TryGetValue(traced, out var same) ? same : _parameterCache.Values.FirstOrDefault();
+        if (bound is null) return Stored;
+        var ids = ParameterIds.ToArray();
+        var result = new Dictionary<int, object>(Stored);
+        for (int i = 0; i < ids.Length; i++)
+            if (result[ids[i]] is UnboundTensor u)
+                result[ids[i]] = TensorValues.Materialize(TensorValues.Snapshot(bound[i]), "Tensor", u.Element);
+        return result;
+    }
+
+    private HashSet<int>? _inPlaceTargets;
+
+    /// <summary>Parameter and constant value ids some node writes in place: a replay works on a private copy of each.</summary>
+    internal HashSet<int> InPlaceTargets => _inPlaceTargets ??= new HashSet<int>(
+        Nodes.Where(n => n.InPlaceInput >= 0).Select(n => n.InPlaceInput)
+             .Where(id => Values[id].Role is ProgramValueRole.Constant or ProgramValueRole.Parameter));
 
     /// <summary>The parameter value ids, in definition order.</summary>
     public IEnumerable<int> ParameterIds => Values.Where(v => v.Role == ProgramValueRole.Parameter).Select(v => v.Id);
@@ -195,6 +246,9 @@ public sealed partial class TensorProgram
             if (options.VerificationInputs is not null) extra.AddRange(options.VerificationInputs.OfType<Tensor<T>[]>());
             var reversed = examples.Select(Reverse).ToArray();
             if (reversed.Where((r, i) => !SameValues(r, examples[i])).Any()) extra.Add(reversed);
+            // A dynamic dimension is checked at a size other than the traced one too: a size-dependent value the probes
+            // did not expose would replay the traced size's result there.
+            if (program.Symbols.Count > 0) extra.Add(AtProbedSize(program, examples));
             foreach (var inputs in extra)
             {
                 Tensor<T>[] expected, actual;
@@ -216,6 +270,16 @@ public sealed partial class TensorProgram
         }
         return program;
     }
+
+    // The examples with every symbolic axis one larger (rows copied cyclically, so values stay ones the input holds).
+    private static Tensor<T>[] AtProbedSize<T>(TensorProgram program, Tensor<T>[] examples) =>
+        examples.Select((e, i) =>
+        {
+            var dims = program.InputDimensions[i];
+            for (int axis = 0; axis < dims.Count; axis++)
+                if (dims[axis].Symbol >= 0) e = Resize(e, new[] { axis }, e._shape[axis] + 1);
+            return e;
+        }).ToArray();
 
     private static Tensor<T> Reverse<T>(Tensor<T> t)
     {
@@ -301,6 +365,15 @@ public sealed partial class TensorProgram
             }
             if (!ok) continue;
 
+            // The node arguments can be identical while a captured value depends on the size (x * Tensor{1/x.Shape[0]}):
+            // the program would then replay the traced size's constant at every size. Such a dimension stays static.
+            var capturedWhy = CompareCaptured(program, probes[0]) ?? CompareCaptured(program, probes[1]);
+            if (capturedWhy is not null)
+            {
+                diagnostics.Add($"Size {baseSize} kept static: {capturedWhy}");
+                continue;
+            }
+
             int symbol = symbols.Count;
             var updated = Generalize(nodes, probes[0].Nodes, probes[1].Nodes, baseSize, symbol, out var why);
             if (updated is null)
@@ -318,6 +391,22 @@ public sealed partial class TensorProgram
         {
             LiveParameters = program.LiveParameters,
         };
+    }
+
+    // Constants and parameters captured by two traces at different sizes must be the same values.
+    private static string? CompareCaptured(TensorProgram a, TensorProgram b)
+    {
+        if (a.Values.Count != b.Values.Count) return "the number of values depends on it.";
+        foreach (var v in a.Values)
+        {
+            if (v.Role is not (ProgramValueRole.Constant or ProgramValueRole.Parameter)) continue;
+            var w = b.Values[v.Id];
+            if (w.Role != v.Role || w.ElementType != v.ElementType || w.Container != v.Container || !w.Shape.SequenceEqual(v.Shape))
+                return $"captured {v.Role.ToString().ToLowerInvariant()} %{v.Id} changes shape with it.";
+            if (v.Role == ProgramValueRole.Constant && !TensorValues.SameData(a.Stored[v.Id], b.Stored[w.Id]))
+                return $"captured constant %{v.Id} holds values computed from it.";
+        }
+        return null;
     }
 
     // The three traces must be the same graph; integer literals that differ must be linear in the size.
@@ -449,10 +538,16 @@ public sealed partial class TensorProgram
         var parameters = GetParameterObjects<T>();
         var constants = GetConstants<T>();
         int pi = 0;
+        var inPlace = InPlaceTargets;
         foreach (var v in Values)
         {
             if (v.Role == ProgramValueRole.Parameter) env[v.Id] = parameters[pi++];
             else if (v.Role == ProgramValueRole.Constant) env[v.Id] = ((object?[])constants)[v.Id];
+            else continue;
+            // A node writes this captured value in place: the shared (cached) tensor must not change, or the next
+            // replay, and any replay running concurrently, would read the mutated value. Each replay writes a copy.
+            if (inPlace.Count > 0 && inPlace.Contains(v.Id) && env[v.Id] is { } shared)
+                env[v.Id] = TensorValues.Copy(shared);
         }
 
         foreach (var node in Nodes) Execute(engine, node, env, symbols, typeof(T));
@@ -495,6 +590,7 @@ public sealed partial class TensorProgram
         Stored[id] = TensorValues.Snapshot(tensor);
         _parameterCache.Clear();
         _constantCache.Clear();
+        Interlocked.Increment(ref _parameterGeneration);
     }
 
     private static Type ElementOf(ProgramValue v, Type replay) =>
@@ -539,6 +635,19 @@ public sealed partial class TensorProgram
         };
     });
 
+    private static readonly ConcurrentDictionary<Type, Func<IEngine, int, Type, object?[], (bool, object?)>> Invokers2 = new();
+
+    private static Func<IEngine, int, Type, object?[], (bool, object?)> InvokerFor2(Type element) => Invokers2.GetOrAdd(element, t =>
+    {
+        var m = typeof(EngineOpInvoker<>).MakeGenericType(t).GetMethod("TryInvoke2", BindingFlags.NonPublic | BindingFlags.Static)!;
+        return (e, op, second, a) =>
+        {
+            var args = new object?[] { e, op, second, a, null };
+            bool ok = (bool)m.Invoke(null, args)!;
+            return (ok, args[4]);
+        };
+    });
+
     private static void Execute(IEngine engine, ProgramNode node, object?[] env, long[] symbols, Type replay)
     {
         var d = node.Op;
@@ -563,7 +672,15 @@ public sealed partial class TensorProgram
             : ElementTypes.TypeOf(node.TypeArguments[0]) ?? throw new InvalidOperationException($"Unknown element type {node.TypeArguments[0]}.");
         bool ok;
         object? result;
-        if (element == replay && replay == typeof(float)) ok = EngineOpInvoker<float>.TryInvoke(engine, d.Index, args, out result);
+        if (node.TypeArguments.Count == 2)
+        {
+            // An op with a second type parameter (an index type, as in TensorEmbeddingLookup<TValue, TIndex>): the
+            // generated invoker names the call for each allowlisted element type, so no type comes from the file.
+            var second = node.TypeArguments[1] == "$T" ? replay
+                : ElementTypes.TypeOf(node.TypeArguments[1]) ?? throw new InvalidOperationException($"Unknown element type {node.TypeArguments[1]}.");
+            (ok, result) = InvokerFor2(element)(engine, d.Index, second, args);
+        }
+        else if (element == replay && replay == typeof(float)) ok = EngineOpInvoker<float>.TryInvoke(engine, d.Index, args, out result);
         else if (element == replay && replay == typeof(double)) ok = EngineOpInvoker<double>.TryInvoke(engine, d.Index, args, out result);
         else (ok, result) = InvokerFor(element)(engine, d.Index, args);
         if (!ok) throw new NotSupportedException($"{d.Id} has no typed replay (it takes more than one type parameter).");

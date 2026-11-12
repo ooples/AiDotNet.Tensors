@@ -42,18 +42,20 @@ public static class AiDotNetEngine
     private static DirectGpuTensorEngine? _adoptedGpu;
     private static readonly object _adoptionLock = new object();
 
-    [ThreadStatic] private static IEngine? _threadEngine;
+    // An AsyncLocal, not a thread-static: the override flows into work the calling code starts (Task.Run, Parallel.For
+    // workers, awaits), so a program trace sees engine calls made on worker threads instead of silently missing them.
+    private static readonly AsyncLocal<IEngine?> _threadEngine = new();
     private static int _threadOverrides;
 
     /// <summary>
-    /// Makes <see cref="Current"/> return <paramref name="engine"/> on the calling thread only, until the returned
-    /// scope is disposed. Other threads keep seeing the process-wide engine. Scopes nest.
+    /// Makes <see cref="Current"/> return <paramref name="engine"/> in the calling execution context (the calling thread
+    /// and work it starts), until the returned scope is disposed. Other threads keep seeing the process-wide engine. Scopes nest.
     /// </summary>
     internal static System.IDisposable PushThreadEngine(IEngine engine)
     {
         if (engine is null) throw new System.ArgumentNullException(nameof(engine));
-        var previous = _threadEngine;
-        _threadEngine = engine;
+        var previous = _threadEngine.Value;
+        _threadEngine.Value = engine;
         Interlocked.Increment(ref _threadOverrides);
         return new ThreadEngineScope(previous);
     }
@@ -66,7 +68,7 @@ public static class AiDotNetEngine
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            _threadEngine = _previous;
+            _threadEngine.Value = _previous;
             Interlocked.Decrement(ref _threadOverrides);
         }
     }
@@ -114,7 +116,7 @@ public static class AiDotNetEngine
         {
             // A thread override (a program trace) is visible only to the thread that installed it. The counter keeps
             // the thread-static read off the hot path while no override exists anywhere.
-            if (Volatile.Read(ref _threadOverrides) != 0 && _threadEngine is { } local) return local;
+            if (Volatile.Read(ref _threadOverrides) != 0 && _threadEngine.Value is { } local) return local;
             return Volatile.Read(ref _current);
         }
         set

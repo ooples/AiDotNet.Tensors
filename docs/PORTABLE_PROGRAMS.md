@@ -41,19 +41,33 @@ if (loaded.IsDirty) loaded.Save("classifier.atnp");                        // it
 
 - **`EngineSurfaceGenerator`** (in `AiDotNet.Tensors.Analyzers`) reads `IEngine` and emits the op catalog (stable ids
   `Name`arity(param types)`, parameter names and kinds, in-place flags), the `TracingEngine` decorator, and a typed
-  replay invoker per element type. Replay calls the interface method directly, with no reflection.
+  replay invoker per element type. Replay calls the interface method directly, with no reflection; an op with a second
+  type parameter (`TensorEmbeddingLookup<TValue, TIndex>`) gets one generated call per allowlisted element type. A void
+  op's in-place flag names the parameter it writes: a destination-named parameter (`TensorCopy(source, destination)`),
+  none for ops whose results are all `out` tensors (`FFT`), else the first tensor. Replay writes in-place targets that
+  are captured constants or parameters into a per-run copy, so runs never change the program and may run concurrently.
 - **`TracingEngine`** forwards every call to the engine it wraps and records only outer calls. Nested calls an engine makes
   through `AiDotNetEngine.Current` are suppressed, so the program is the logical graph before fusion. It is an
   `IEngineWrapper`, so `engine.Is<T>()` / `As<T>()` (analyzer rule TENS0020) see through it.
-- **Tracing is thread-local.** `Trace` installs the tracer with a per-thread override of `AiDotNetEngine.Current`. Other
-  threads, and the engine's own worker threads, keep the process engine.
+- **Tracing follows the calling context.** `Trace` installs the tracer as an `AsyncLocal` override of
+  `AiDotNetEngine.Current`, so work the traced function starts (`Task.Run`, `Parallel.For`) sees it too. A call made on
+  another thread that touches a traced tensor fails the trace (it cannot be recorded deterministically); unrelated work
+  on other threads, and the engine's own worker threads, are not recorded.
 - **`ProgramPackage`** layout: a header, then the program section, the tensor section, one section per compiled target,
   and the checksum. A target is keyed by engine name, hardware fingerprint, element type, input shapes, and plan
-  format and codec versions. A stale target is dropped and rebuilt from the program.
+  format and codec versions, and records a hash of the program section and parameter shapes; a target that does not
+  match its program, or a stale one, is dropped and rebuilt from the program.
+- **Compiled targets hold no weights.** A plan references the program's parameters and constants by value id and is
+  bound to the program's current tensors when it is loaded or compiled, so `BindParameters` and in-place weight updates
+  are what runs (the plan is rebuilt when they change), and the file holds the weights at most once (never, when saved
+  with `includeParameterValues: false`).
+- **Every plan is checked before use.** When a target is compiled or loaded it is run once against eager replay on a
+  second input with the values permuted; a plan that does not follow its input, or fails, is dropped and that shape is
+  served by eager replay. `Execute` returns tensors the caller owns and is safe to call from several threads (a small
+  pool of plan instances, each running one call at a time).
 
 ## Limits
 
 - A function must do its tensor work through `IEngine`. Reading values back to the host (`TensorSum` returning a
   scalar, element access) makes the result data-dependent, and the trace fails.
 - Programs with several outputs replay eagerly; compiled plans cover single-output programs.
-- A compiled target stores the weights it was compiled with. Re-save the package after training so the targets match.

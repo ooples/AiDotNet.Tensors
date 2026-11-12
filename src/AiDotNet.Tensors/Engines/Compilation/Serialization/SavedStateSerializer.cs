@@ -230,17 +230,37 @@ internal static class SavedStateSerializer
         string typeName = Encoding.UTF8.GetString(nameBytes);
         long rawValue = reader.ReadInt64();
 
-        var enumType = Type.GetType(typeName, throwOnError: false);
-        if (enumType is null || !enumType.IsEnum)
+        var enumType = ResolveEnumType(typeName);
+        if (enumType is null)
             throw new InvalidDataException(
-                $"SavedState enum type '{typeName}' cannot be resolved or is not an enum. " +
+                $"SavedState enum type '{typeName}' is not an enum of AiDotNet.Tensors. " +
                 "The plan may have been saved by a different assembly version.");
 
         // Narrow through the underlying type so Enum.ToObject constructs the
         // right boxed value even for byte/short-backed enums.
         var underlying = Enum.GetUnderlyingType(enumType);
-        object narrowed = Convert.ChangeType(rawValue, underlying);
+        object narrowed;
+        try { narrowed = Convert.ChangeType(rawValue, underlying, System.Globalization.CultureInfo.InvariantCulture); }
+        catch (OverflowException)
+        {
+            throw new InvalidDataException($"SavedState enum value {rawValue} does not fit {enumType.Name}. The plan file is corrupt.");
+        }
         return Enum.ToObject(enumType, narrowed);
+    }
+
+    /// <summary>
+    /// Resolves a saved enum type name. The writer stores an assembly-qualified name, but the reader never hands file
+    /// data to <see cref="Type.GetType(string)"/> (which would load whatever assembly the name says): only the type name
+    /// is looked up, and only in this assembly, and only an enum is accepted. Every enum a plan's saved state holds is
+    /// one of this library's own (activation and op-configuration enums).
+    /// </summary>
+    private static Type? ResolveEnumType(string assemblyQualifiedName)
+    {
+        int comma = assemblyQualifiedName.IndexOf(',');
+        var fullName = (comma < 0 ? assemblyQualifiedName : assemblyQualifiedName.Substring(0, comma)).Trim();
+        if (fullName.Length == 0 || fullName.IndexOf('[') >= 0) return null; // no generic or array types
+        var type = typeof(SavedStateSerializer).Assembly.GetType(fullName, throwOnError: false);
+        return type is { IsEnum: true } ? type : null;
     }
 
     private static Tensor<T> ReadTensorRef<T>(BinaryReader reader, Tensor<T>[] tensorTable)

@@ -21,7 +21,8 @@ internal static class InferencePlanWriter
         CompiledStep<T>[] steps,
         Tensor<T> finalOutput,
         int[] compiledInputShape,
-        Tensor<T>[] compiledInputTensors)
+        Tensor<T>[] compiledInputTensors,
+        IReadOnlyList<Tensor<T>?>? externals = null)
     {
         // Write the body to a MemoryStream first so we can hash it (XXHash64
         // is one-shot, not incremental) before streaming to the destination.
@@ -54,7 +55,7 @@ internal static class InferencePlanWriter
 
         // ── Tensor table ────────────────────────────────────────────────
         var tensorMap = TensorTableWriter.BuildMap(steps, compiledInputTensors);
-        TensorTableWriter.Write(writer, tensorMap, steps, compiledInputTensors, parameterTensors: null);
+        TensorTableWriter.Write(writer, tensorMap, steps, compiledInputTensors, parameterTensors: null, externals);
 
         // Ordered mutable-input identities (format v6+). Tensor-table flags alone cannot preserve
         // slot order and historically only tensor ID 0 was restored after load.

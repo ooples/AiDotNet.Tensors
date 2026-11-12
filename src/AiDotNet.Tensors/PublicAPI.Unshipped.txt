@@ -250,11 +250,14 @@ AiDotNet.Tensors.Engines.Export.CompiledTarget.PlanFormatVersion.get -> int
 AiDotNet.Tensors.Engines.Export.CompiledTarget.SizeInBytes.get -> int
 AiDotNet.Tensors.Engines.Export.ProgramFormatException
 AiDotNet.Tensors.Engines.Export.ProgramFormatException.ProgramFormatException(string! message) -> void
+AiDotNet.Tensors.Engines.Export.ProgramFormatException.ProgramFormatException(string! message, System.Exception! inner) -> void
 AiDotNet.Tensors.Engines.Export.ProgramLoadOptions
 AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.KeepForeignTargets.get -> bool
 AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.KeepForeignTargets.set -> void
 AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.MaxBytes.get -> long
 AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.MaxBytes.set -> void
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.MaxUnboundElements.get -> long
+AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.MaxUnboundElements.set -> void
 AiDotNet.Tensors.Engines.Export.ProgramLoadOptions.ProgramLoadOptions() -> void
 AiDotNet.Tensors.Engines.Export.ProgramPackage
 AiDotNet.Tensors.Engines.Export.ProgramPackage.ClearTargets() -> void
