@@ -648,68 +648,81 @@ jobs:
           Write-Output "AiDotNet.Evolution: AiDotNet pins $($pin.Groups[2].Value), this Tensors needs $want; using $want."
           Set-Content $props ($text.Remove($pin.Groups[2].Index, $pin.Groups[2].Length).Insert($pin.Groups[2].Index, $want)) -NoNewline
         }
-        $runArgs = 'run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- ' +
-          "--models $env:MODEL_FAMILIES --device cuda --epochs 1 --train-batches 2 --batch-size 64 " +
-          "--inference-iterations 3 --warmup-iterations 1 --output `"${{ runner.temp }}/aidotnet-cuda.json`""
-        $run = Start-Process dotnet -ArgumentList $runArgs -NoNewWindow -PassThru
-        $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
-        if ($run.WaitForExit(20 * 60 * 1000)) {
-          if ($run.ExitCode -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
-          exit 0
-        }
+        # A process per family releases the CUDA context and every cached allocation before the next model.
+        # DenseNet inference stalled at 11.8/12 GiB after nine earlier families in run 43219966801.
+        # Keep one overall deadline, including the first host's build, so isolation cannot multiply the job budget.
+        $modelDeadline = (Get-Date).AddMinutes(20)
+        $firstModel = $true
+        foreach ($model in ($env:MODEL_FAMILIES -split ',')) {
+        $buildOption = if ($firstModel) { '' } else { '--no-build ' }
+        $firstModel = $false
+          $runArgs = 'run -c Release ' + $buildOption + '--project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- ' +
+            "--models $model --device cuda --epochs 1 --train-batches 2 --batch-size 64 " +
+            "--inference-iterations 3 --warmup-iterations 1 --output `"${{ runner.temp }}/aidotnet-cuda-$model.json`""
+          $remainingMs = [Math]::Max(0, [int]($modelDeadline - (Get-Date)).TotalMilliseconds)
+          if ($remainingMs -eq 0) { Write-Output "::error::The model-family watchdog expired before $model could run."; exit 1 }
+          Write-Output "CUDA model family: $model (fresh process)."
+          $run = Start-Process dotnet -ArgumentList $runArgs -NoNewWindow -PassThru
+          $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
+          if ($run.WaitForExit($remainingMs)) {
+            if ($run.ExitCode -ne 0) { Write-Output "::error::AiDotNet model family $model failed on CUDA."; exit 1 }
+            continue
+          }
 
-        Write-Output "::error::The AiDotNet model families were still running 20 minutes in; the last [bench] line above names the model."
-        try {
-          # This run's processes only: the dotnet host and the benchmark it started (dotnet run builds, then runs it).
-          $all = @(Get-CimInstance Win32_Process)
-          $mine = @{}; $mine[[uint32]$run.Id] = $true
-          do {
-            $grew = $false
-            foreach ($p in $all) {
-              if ($mine.ContainsKey([uint32]$p.ParentProcessId) -and -not $mine.ContainsKey([uint32]$p.ProcessId)) {
-                $mine[[uint32]$p.ProcessId] = $true; $grew = $true
+          Write-Output "::error::AiDotNet model family $model was still running at the overall 20-minute watchdog."
+          try {
+            # This run's processes only: the dotnet host and the benchmark it started (dotnet run builds, then runs it).
+            $all = @(Get-CimInstance Win32_Process)
+            $mine = @{}; $mine[[uint32]$run.Id] = $true
+            do {
+              $grew = $false
+              foreach ($p in $all) {
+                if ($mine.ContainsKey([uint32]$p.ParentProcessId) -and -not $mine.ContainsKey([uint32]$p.ProcessId)) {
+                  $mine[[uint32]$p.ProcessId] = $true; $grew = $true
+                }
+              }
+            } while ($grew)
+            $tree = @($all | Where-Object { $mine.ContainsKey([uint32]$_.ProcessId) })
+            Write-Output "::group::Processes of this run"
+            $tree | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
+            Write-Output "::endgroup::"
+            # Each diagnostic is bounded, so a stalled driver, install or attach cannot outlast the step.
+            Write-Output "::group::nvidia-smi"
+            $smi = Start-Process nvidia-smi -NoNewWindow -PassThru
+            if (-not $smi.WaitForExit(30000)) {
+              Stop-Process -Id $smi.Id -Force -ErrorAction SilentlyContinue
+              Write-Output "::warning::nvidia-smi did not finish within 30 seconds."
+            }
+            Write-Output "::endgroup::"
+
+            $tools = "${{ runner.temp }}/dotnet-stack"
+            if (-not (Test-Path "$tools/dotnet-stack*")) {
+              $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
+              if (-not $install.WaitForExit(120000)) {
+                Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "::warning::dotnet-stack did not install within 2 minutes; no stacks printed."
               }
             }
-          } while ($grew)
-          $tree = @($all | Where-Object { $mine.ContainsKey([uint32]$_.ProcessId) })
-          Write-Output "::group::Processes of this run"
-          $tree | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
-          Write-Output "::endgroup::"
-          # Each diagnostic is bounded, so a stalled driver, install or attach cannot outlast the step.
-          Write-Output "::group::nvidia-smi"
-          $smi = Start-Process nvidia-smi -NoNewWindow -PassThru
-          if (-not $smi.WaitForExit(30000)) {
-            Stop-Process -Id $smi.Id -Force -ErrorAction SilentlyContinue
-            Write-Output "::warning::nvidia-smi did not finish within 30 seconds."
-          }
-          Write-Output "::endgroup::"
-
-          $tools = "${{ runner.temp }}/dotnet-stack"
-          if (-not (Test-Path "$tools/dotnet-stack*")) {
-            $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
-            if (-not $install.WaitForExit(120000)) {
-              Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
-              Write-Output "::warning::dotnet-stack did not install within 2 minutes; no stacks printed."
-            }
-          }
-          if (Test-Path "$tools/dotnet-stack*") {
-            foreach ($bench in @($tree | Where-Object { $_.Name -like 'AiDotNet.PyTorchParity*' })) {
-              Write-Output "::group::Managed stacks of AiDotNet.PyTorchParity $($bench.ProcessId)"
-              $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($bench.ProcessId)" -NoNewWindow -PassThru
-              if (-not $report.WaitForExit(120000)) {
-                Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
-                Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($bench.ProcessId)."
+            if (Test-Path "$tools/dotnet-stack*") {
+              foreach ($bench in @($tree | Where-Object { $_.Name -like 'AiDotNet.PyTorchParity*' })) {
+                Write-Output "::group::Managed stacks of AiDotNet.PyTorchParity $($bench.ProcessId)"
+                $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($bench.ProcessId)" -NoNewWindow -PassThru
+                if (-not $report.WaitForExit(120000)) {
+                  Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
+                  Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($bench.ProcessId)."
+                }
+                Write-Output "::endgroup::"
               }
-              Write-Output "::endgroup::"
             }
+          } catch {
+            Write-Output "::warning::Collecting the hang diagnostics failed: $($_.Exception.Message)"
+          } finally {
+            taskkill /T /F /PID $run.Id | Out-Null
           }
-        } catch {
-          Write-Output "::warning::Collecting the hang diagnostics failed: $($_.Exception.Message)"
-        } finally {
-          taskkill /T /F /PID $run.Id | Out-Null
-        }
-        exit 1
+          exit 1
 
+        }
+        exit 0
     # The CUDA step-time ratchets: each network's ours/PyTorch step ratio on this machine class may not rise above the
     # one recorded in parity/head-to-head-baseline.json. PyTorch compiles each network in every mode for up to an hour
     # (the runner's RunnerTimeout), far past a pull request's budget and the 15-minute hang blame, so they run nightly
@@ -781,7 +794,7 @@ jobs:
         path: |
           ${{ runner.temp }}/trx/**
           ${{ runner.temp }}/ratchets/**
-          ${{ runner.temp }}/aidotnet-cuda.json
+          ${{ runner.temp }}/aidotnet-cuda-*.json
         if-no-files-found: ignore
         # A crash dump is the full test host (gigabytes); keep it only long enough to analyse.
         retention-days: 5
