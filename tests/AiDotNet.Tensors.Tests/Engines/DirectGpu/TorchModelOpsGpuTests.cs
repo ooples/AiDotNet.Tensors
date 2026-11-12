@@ -181,6 +181,152 @@ public abstract class TorchModelOpsGpuTestsBase
             new[] { Rand(12, 2.0, 3000) }, 1e-6, 0);
     }
 
+    public static TheoryData<int> QuantizationWidths
+    {
+        get
+        {
+            var data = new TheoryData<int>();
+            for (int bits = 1; bits <= 30; bits++) data.Add(bits);
+            return data;
+        }
+    }
+
+    // Values whose x / step lands on, just inside, just outside and halfway around both clamp bounds (from 25 bits on
+    // these exceed float's 24-bit significand, where a float qMax or a float quotient rounds), plus random values,
+    // signed zeros, subnormals, infinities and NaN.
+    private static Tensor<float> QuantizationInput(int seed, long qMin, long qMax, long zp, double step)
+    {
+        var values = new List<float> { 0f, -0f, 1e-45f, -1e-45f, float.PositiveInfinity, float.NegativeInfinity, float.NaN };
+        foreach (long bound in new[] { qMin - zp, qMax - zp, (qMax - zp) / 2, (qMin - zp) / 2 })
+            for (int k = -4; k <= 4; k++)
+                foreach (double frac in new[] { 0.0, 0.5, 0.25, -0.25 })
+                {
+                    float v = (float)((bound + k + frac) * step);
+                    values.Add(v);
+                    values.Add(NextBits(v, 1));
+                    values.Add(NextBits(v, -1));
+                }
+        var rng = new Random(seed);
+        double span = (qMax - qMin + 4) * step;
+        for (int i = 0; i < 1200; i++) values.Add((float)((rng.NextDouble() - 0.5) * span));
+        return new Tensor<float>(values.ToArray(), new[] { values.Count });
+    }
+
+    // The float whose bit pattern is v's plus delta (an adjacent float for finite v).
+    private static float NextBits(float v, int delta)
+        => BitConverter.ToSingle(BitConverter.GetBytes(BitConverter.ToInt32(BitConverter.GetBytes(v), 0) + delta), 0);
+
+    private static Tensor<float> Finite(Tensor<float> t)
+    {
+        var kept = t.ToArray().Where(v => !float.IsInfinity(v)).ToArray();
+        return new Tensor<float>(kept, new[] { kept.Length });
+    }
+
+    /// <summary>
+    /// Fake quantization at every width the op takes (1 to 30 bits), symmetric and asymmetric, with derived and fixed
+    /// steps and zero points: the GPU's values and pass-through mask (the gradient) equal the CPU's bit for bit. From
+    /// 25 bits qMax and the quantized values no longer fit a float, which once made the device clamp differently.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(QuantizationWidths))]
+    public void FakeQuantize_EveryWidth_MatchesCpuBitForBit(int numBits)
+    {
+        var gpu = GpuOrSkip();
+        foreach (bool symmetric in new[] { true, false })
+        {
+            var (qMin, qMax) = PortableTorchModelOps.FakeQuantizeRange(numBits, symmetric);
+            // Derived step and zero point: the data's extremes map onto the bounds, and +-max/2 onto halfway points.
+            // (NaN is skipped by the min / max; an infinity makes the range infinite and the step 1.)
+            var full = QuantizationInput(numBits, qMin, qMax, 0, 3.7 / Math.Max(1, qMax));
+            foreach (var data in new[] { Finite(full), full })
+            {
+                CheckForwardAndGradients(gpu, "TensorFakeQuantize", (e, v) => e.TensorFakeQuantize(v[0], numBits, null, null, symmetric),
+                    new[] { data }, 0, 0);
+                CheckForwardAndGradients(gpu, "TensorFakeQuantize", (e, v) => e.TensorFakeQuantize(v[0], numBits, 0, 3, symmetric),
+                    new[] { data }, 0, 0);
+            }
+            // All-negative and all-positive data: the asymmetric zero point lands on a bound.
+            foreach (float sign in new[] { -1f, 1f })
+            {
+                var oneSided = new Tensor<float>(Finite(full).ToArray().Select(v => sign * (Math.Abs(v) + 0.5f)).ToArray(), new[] { Finite(full).Length });
+                CheckForwardAndGradients(gpu, "TensorFakeQuantize", (e, v) => e.TensorFakeQuantize(v[0], numBits, null, null, symmetric),
+                    new[] { oneSided }, 0, 0);
+            }
+
+            // Fixed steps: dyadic (x / step exact), non-dyadic (x / step rounds in double), tiny and huge.
+            foreach (double step in new[] { 1.0, 0.25, 1.0 / 3, 0.1, 1e-30, 1e30 })
+                foreach (int? zp in new int?[] { null, symmetric ? -7 : 11 })
+                {
+                    var x = QuantizationInput(numBits * 31 + 7, qMin, qMax, zp ?? 0, step);
+                    CheckForwardAndGradients(gpu, "TensorFakeQuantize", (e, v) => e.TensorFakeQuantize(v[0], numBits, step, zp, symmetric),
+                        new[] { x }, 0, 0);
+                }
+        }
+    }
+
+    /// <summary>
+    /// The widest symmetric case the review found: at 26 bits qMax = 2^25 - 1, which a float rounds up to 2^25, so the
+    /// device passed x = 2^25 (scale 1) that the CPU clamps.
+    /// </summary>
+    [SkippableFact]
+    public void FakeQuantize_ValueJustPastQMax_IsClampedAsOnTheCpu()
+    {
+        var gpu = GpuOrSkip();
+        var x = new Tensor<float>(new[] { 33554432f, 33554430f, -33554432f, -33554436f }, new[] { 4 });
+        var cpu = new CpuEngine();
+        foreach (var engine in new IEngine[] { cpu, gpu })
+        {
+            using var tape = new GradientTape<float>();
+            var input = engine == gpu ? gpu.TensorMultiplyScalar(Copy(x), 1f) : Copy(x);
+            var y = engine.TensorFakeQuantize(input, 26, 1.0, null, symmetric: true);
+            var loss = engine.ReduceSum(y, new[] { 0 }, keepDims: false);
+            var grad = tape.ComputeGradients(loss, new[] { input })[input].ToArray();
+            // The clamped 2^25 - 1 is a float tie, rounded to even 2^25; the mask is what tells it from a pass.
+            Assert.Equal(new[] { 33554432f, 33554430f, -33554432f, -33554432f }, y.ToArray());
+            Assert.Equal(new[] { 0f, 1f, 1f, 0f }, grad);
+        }
+    }
+
+    /// <summary>A zero point so far out that the clamp bounds leave 32-bit integers: the GPU engine computes it on the host.</summary>
+    [SkippableFact]
+    public void FakeQuantize_HugeZeroPoint_MatchesCpu()
+    {
+        var gpu = GpuOrSkip();
+        var x = QuantizationInput(5, -(1L << 29), (1L << 29) - 1, 0, 1.0);
+        foreach (int zp in new[] { int.MaxValue, int.MinValue, int.MaxValue - (1 << 29) })
+            foreach (bool symmetric in new[] { true, false })
+            {
+                var expected = new CpuEngine().TensorFakeQuantize(Copy(x), 30, 1.0, zp, symmetric).ToArray();
+                AssertClose($"zp {zp}", expected, gpu.TensorFakeQuantize(Copy(x), 30, 1.0, zp, symmetric).ToArray(), 0);
+            }
+    }
+
+    /// <summary>
+    /// A CRF whose forward-backward state (batch * seqLen * numTags + 2 * batch * (seqLen + 1)) outgrows an int: the GPU
+    /// engine throws the CPU's ArgumentException, message and parameter included, before allocating or launching
+    /// anything (the emissions are a stride-0 view, so nothing large exists), with and without a tape.
+    /// </summary>
+    [SkippableFact]
+    public void CrfForward_OversizedState_ThrowsTheCpusArgumentException()
+    {
+        var gpu = GpuOrSkip();
+        foreach (var shape in new[] { new[] { 1000, 1_000_000, 1 }, new[] { 2, 400_000_000, 2 }, new[] { 1, 1_073_741_823, 1 } })
+        {
+            var emissions = new Tensor<float>(new[] { 1, 1, 1 }).ExpandTo(shape);
+            var transitions = new Tensor<float>(new[] { shape[2], shape[2] });
+            Assert.True((long)shape[0] * shape[1] * shape[2] <= int.MaxValue);
+            var cpuError = Assert.Throws<ArgumentException>(() => new CpuEngine().TensorCrfForward(emissions, transitions));
+            long launches = GpuLaunchProbe.Count;
+            var gpuError = Assert.Throws<ArgumentException>(() => gpu.TensorCrfForward(emissions, transitions));
+            Assert.Equal(cpuError.Message, gpuError.Message);
+            Assert.Equal("emissions", gpuError.ParamName);
+            Assert.Contains($"batch={shape[0]}, seqLen={shape[1]}, numTags={shape[2]}", gpuError.Message);
+            using (new GradientTape<float>())
+                Assert.Equal(cpuError.Message, Assert.Throws<ArgumentException>(() => gpu.TensorCrfForward(emissions, transitions)).Message);
+            Assert.Equal(launches, GpuLaunchProbe.Count);
+        }
+    }
+
     [SkippableFact]
     public void TopKSoftmax_MatchesCpu_OnDevice()
     {
@@ -486,6 +632,58 @@ public sealed class TorchModelOpsKernelSourceTests
     {
         var modules = AiDotNet.Tensors.Engines.DirectGpu.WebGpu.CudaDialectToWgsl.Translate(TorchParityF32Kernels.GetSource());
         foreach (string name in TorchModelOpsKernels.KernelNames) Assert.True(modules.ContainsKey(name), $"no WGSL module for {name}");
+    }
+
+    [Fact]
+    public void FakeQuantizeStepSplit_IsExact_IncludingSubnormals()
+    {
+        foreach (double step in new[] { 1.0, 1.0 / 3, 0.1, 1e-30, 1e30, double.Epsilon, 3 * double.Epsilon, double.MaxValue, 2.2250738585072014E-308 })
+        {
+            var (lo, hi, exponent) = PortableTorchModelOps.SplitStep(step);
+            long significand = ((long)hi << 32) | (uint)lo;
+            Assert.InRange(significand, 1L << 52, (1L << 53) - 1);
+            // Scaled one binade at a time (exact for these values), so neither 2^exponent nor a partial product leaves
+            // double's range.
+            double value = significand;
+            for (int e = exponent; e > 0; e--) value *= 2;
+            for (int e = exponent; e < 0; e++) value /= 2;
+            Assert.Equal(step, value);
+        }
+        Assert.Throws<ArgumentOutOfRangeException>(() => PortableTorchModelOps.SplitStep(0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => PortableTorchModelOps.SplitStep(double.PositiveInfinity));
+    }
+
+    [Fact]
+    public void FakeQuantizeRange_IsTheCpusRange_AndHugeZeroPointsStayOnTheHost()
+    {
+        Assert.Equal((-(1L << 29), (1L << 29) - 1), PortableTorchModelOps.FakeQuantizeRange(30, true));
+        Assert.Equal((0L, (1L << 30) - 1), PortableTorchModelOps.FakeQuantizeRange(30, false));
+        Assert.True(PortableTorchModelOps.FakeQuantizeFitsDevice(30, false, null));
+        Assert.True(PortableTorchModelOps.FakeQuantizeFitsDevice(30, true, 1 << 30));
+        Assert.False(PortableTorchModelOps.FakeQuantizeFitsDevice(30, true, int.MaxValue));
+        Assert.False(PortableTorchModelOps.FakeQuantizeFitsDevice(30, false, int.MinValue));
+        Assert.False(PortableTorchModelOps.FakeQuantizeFitsDevice(31, true, null));
+    }
+
+    [Fact]
+    public void CrfStateLengths_ReportAnArgumentError_NotAnOverflow()
+    {
+        Assert.Equal(2 * 3 * 4 + 2 * 2 * 4, PortableTorchModelOps.CrfAlphaLength(2, 3, 4));
+        Assert.Equal(2 * 3 * 4 + 2 * 2 * 3, PortableTorchModelOps.CrfBetaLength(2, 3, 4));
+        Assert.Throws<ArgumentOutOfRangeException>(() => PortableTorchModelOps.CrfAlphaLength(1000, 1_000_000, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => PortableTorchModelOps.CrfBetaLength(1000, 1_000_000, 1));
+        Assert.Equal(3_000_002_000L, PortableTorchModelOps.CrfAlphaLengthLong(1000, 1_000_000, 1));
+    }
+
+    [Fact]
+    public void CrfForward_OversizedState_ThrowsArgumentException_OnTheCpu_BeforeAllocating()
+    {
+        var emissions = new Tensor<float>(new[] { 1, 1, 1 }).ExpandTo(new[] { 1000, 1_000_000, 1 });
+        var transitions = new Tensor<float>(new[] { 0.5f }, new[] { 1, 1 });
+        var error = Assert.Throws<ArgumentException>(() => new CpuEngine().TensorCrfForward(emissions, transitions));
+        Assert.Equal("emissions", error.ParamName);
+        Assert.Contains("batch=1000, seqLen=1000000, numTags=1", error.Message);
+        Assert.Contains("3000002000", error.Message);
     }
 
     [Fact]

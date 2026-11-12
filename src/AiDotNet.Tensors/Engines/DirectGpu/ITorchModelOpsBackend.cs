@@ -22,14 +22,15 @@ internal interface ITorchModelOpsBackend
     void ModelActivationBackward(int op, IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int n, float p0, float p1);
 
     /// <summary>
-    /// Fake quantization of n values: <paramref name="output"/> holds the dequantized values and
-    /// <paramref name="mask"/> 1 where the quantized value was in [qMin, qMax], else 0. With
-    /// <paramref name="derive"/> the step (and, without a given zero point, an asymmetric zero point) comes from the
-    /// tensor's min / max, reduced into <paramref name="partial"/> (2 * <see cref="TorchModelOpsCodes.MinMaxSlots"/>
-    /// floats) and <paramref name="minMax"/> (2 floats).
+    /// Fake quantization of n values to <paramref name="numBits"/>-bit integers (1 to 30), bit-identical to the CPU's
+    /// double arithmetic: <paramref name="output"/> holds the dequantized values and <paramref name="mask"/> 1 where the
+    /// quantized value was in [qMin, qMax], else 0. A <paramref name="scale"/> of 0 derives the step (and, without a given
+    /// zero point, an asymmetric zero point) from the tensor's min / max, reduced into <paramref name="partial"/>
+    /// (2 * <see cref="TorchModelOpsCodes.MinMaxSlots"/> floats) and <paramref name="minMax"/> (2 floats). A given
+    /// <paramref name="zeroPoint"/> must satisfy <see cref="PortableTorchModelOps.FakeQuantizeFitsDevice"/>.
     /// </summary>
     void ModelFakeQuantize(IGpuBuffer input, IGpuBuffer partial, IGpuBuffer minMax, IGpuBuffer output, IGpuBuffer mask, int n,
-        bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint);
+        int numBits, bool symmetric, double scale, int? zeroPoint);
 
     /// <summary>Softmax over each row's k largest entries (ties to the lower index), 0 elsewhere. Each scratch buffer holds
     /// <see cref="TorchModelOpsCodes.PlanTopK"/>'s ScratchLength floats (values only for a direct plan, indices and weights only

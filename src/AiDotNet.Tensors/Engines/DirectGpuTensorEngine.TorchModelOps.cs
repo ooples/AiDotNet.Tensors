@@ -97,13 +97,14 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (tensor is null || tensor.Length == 0 || numBits < 1 || numBits > 30
             || (scale is { } given && (double.IsNaN(given) || double.IsInfinity(given) || given < 0))
+            // A zero point so far outside the range that the clamp bounds leave 32-bit integers: the host computes it.
+            || !PortableTorchModelOps.FakeQuantizeFitsDevice(numBits, symmetric, zeroPoint)
             || !TryGetBackend(out var backend) || backend is not ITorchModelOpsBackend models
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;
-        double qMin = symmetric ? -(1L << (numBits - 1)) : 0;
-        double qMax = symmetric ? (1L << (numBits - 1)) - 1 : (1L << numBits) - 1;
-        bool derive = !(scale is { } fixedScale && fixedScale != 0);
-        float fixedStep = derive ? 0f : (float)scale!.Value;
+        // The kernel reproduces the CPU's double arithmetic exactly (the step is passed as a double), so the integer
+        // bounds stay exact up to 30 bits, where a float would round qMax and the quantized values.
+        double step = scale ?? 0;
         int n = tensor.Length;
         var shape = (int[])tensor._shape.Clone();
         OwnedBuffer y = default, mask = default;
@@ -118,8 +119,8 @@ public partial class DirectGpuTensorEngine
             ownsY = true;
             mask = AllocateFullyWrittenOutputBuffer(backend, n);
             ownsMask = true;
-            models.ModelFakeQuantize(x.Buffer, partial.Buffer, minMax.Buffer, y.Buffer, mask.Buffer, n, derive, symmetric,
-                zeroPoint.HasValue, (float)qMin, (float)qMax, fixedStep, zeroPoint ?? 0);
+            models.ModelFakeQuantize(x.Buffer, partial.Buffer, minMax.Buffer, y.Buffer, mask.Buffer, n, numBits, symmetric,
+                step, zeroPoint);
             var result = DeferTensorResult<T>(backend, y.Buffer, n, shape);
             y.RelinquishOwnership();
             ownsY = false;
@@ -271,7 +272,9 @@ public partial class DirectGpuTensorEngine
         int tags = emissions._shape[emissions.Rank - 1];
         if (batch < 1 || seqLen < 1 || tags < 1 || transitions.Rank != 2 || transitions._shape[0] != tags || transitions._shape[1] != tags
             || (startScores is not null && startScores.Length != tags) || (endScores is not null && endScores.Length != tags)
-            || (long)batch * seqLen * tags > int.MaxValue
+            || PortableTorchModelOps.CrfAlphaLengthLong(batch, seqLen, tags) > MaxCrfStateLength
+            // One work group per sequence: a batch whose launch grid outgrows an int runs on the host.
+            || (long)batch * PortableTorchModelOps.CrfGroupSize > int.MaxValue
             || !TryGetBackend(out var backend) || backend is not ITorchModelOpsBackend models
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return null;

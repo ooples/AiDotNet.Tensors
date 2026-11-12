@@ -28,14 +28,81 @@ internal static class PortableTorchModelOps
         launch("mo_activation_backward", n, gradOutput, input, gradInput, n, op, p0, p1);
     }
 
+    /// <summary>
+    /// The quantization range [qMin, qMax] of <paramref name="numBits"/>-bit integers: [-2^(b-1), 2^(b-1) - 1] when
+    /// <paramref name="symmetric"/>, [0, 2^b - 1] otherwise (the CPU's range).
+    /// </summary>
+    public static (long QMin, long QMax) FakeQuantizeRange(int numBits, bool symmetric)
+        => symmetric ? (-(1L << (numBits - 1)), (1L << (numBits - 1)) - 1) : (0L, (1L << numBits) - 1);
+
+    /// <summary>The largest magnitude of the clamp bounds qMin - zeroPoint and qMax - zeroPoint the kernel takes.</summary>
+    public const int FakeQuantizeMaxBound = int.MaxValue - 1;
+
+    /// <summary>
+    /// Whether the kernel computes this quantization: always for a derived zero point, and for a given one when
+    /// qMin - zeroPoint and qMax - zeroPoint both lie within +-<see cref="FakeQuantizeMaxBound"/> (the kernel clamps in
+    /// 32-bit integers). Only zero points far outside the range miss it; the engine computes those on the host.
+    /// </summary>
+    public static bool FakeQuantizeFitsDevice(int numBits, bool symmetric, int? zeroPoint)
+    {
+        if (numBits < 1 || numBits > 30) return false;
+        var (qMin, qMax) = FakeQuantizeRange(numBits, symmetric);
+        long zp = zeroPoint ?? 0;
+        return qMin - zp >= -FakeQuantizeMaxBound && qMax - zp <= FakeQuantizeMaxBound;
+    }
+
+    /// <summary>
+    /// A positive finite double as the kernel reads it: a significand in [2^52, 2^53) split into its low and high
+    /// words, and the exponent e with value = significand * 2^e (a subnormal normalized).
+    /// </summary>
+    public static (int Low, int High, int Exponent) SplitStep(double step)
+    {
+        if (!(step > 0) || double.IsInfinity(step))
+            throw new System.ArgumentOutOfRangeException(nameof(step), "The step must be a positive finite number.");
+        long bits = System.BitConverter.DoubleToInt64Bits(step);
+        int biased = (int)((bits >> 52) & 0x7FF);
+        long significand = bits & 0xFFFFFFFFFFFFFL;
+        int exponent;
+        if (biased != 0)
+        {
+            significand |= 1L << 52;
+            exponent = biased - 1075;
+        }
+        else
+        {
+            int shift = 0;
+            while ((significand & (1L << 52)) == 0)
+            {
+                significand <<= 1;
+                shift++;
+            }
+            exponent = -1074 - shift;
+        }
+        return (unchecked((int)(uint)(significand & 0xFFFFFFFFL)), (int)(significand >> 32), exponent);
+    }
+
+    /// <summary>
+    /// Fake quantization exactly as the CPU computes it (in double): <paramref name="scale"/> 0 derives the step (and,
+    /// asymmetric without a zero point, the zero point) from the tensor's min / max on the device.
+    /// </summary>
     public static void FakeQuantize(PortableGenericFft.Launcher launch, IGpuBuffer input, IGpuBuffer partial, IGpuBuffer minMax,
-        IGpuBuffer output, IGpuBuffer mask, int n, bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax,
-        float fixedStep, float zeroPoint)
+        IGpuBuffer output, IGpuBuffer mask, int n, int numBits, bool symmetric, double scale, int? zeroPoint)
     {
         if (n <= 0) return;
+        if (numBits < 1 || numBits > 30) throw new System.ArgumentOutOfRangeException(nameof(numBits), "numBits must be between 1 and 30.");
+        if (double.IsNaN(scale) || double.IsInfinity(scale) || scale < 0)
+            throw new System.ArgumentOutOfRangeException(nameof(scale), "scale must be a finite non-negative number (0 derives it).");
+        if (!FakeQuantizeFitsDevice(numBits, symmetric, zeroPoint))
+            throw new System.ArgumentOutOfRangeException(nameof(zeroPoint),
+                $"qMin - zeroPoint and qMax - zeroPoint must lie within +-{FakeQuantizeMaxBound} on the device.");
         Require(input, n, nameof(input), "n");
         Require(output, n, nameof(output), "n");
         Require(mask, n, nameof(mask), "n");
+        bool derive = scale == 0;
+        bool deriveZeroPoint = derive && !symmetric && !zeroPoint.HasValue;
+        var (qMin, qMax) = FakeQuantizeRange(numBits, symmetric);
+        long zp = zeroPoint ?? 0;
+        var (stepLo, stepHi, stepExp) = derive ? (0, 0, 0) : SplitStep(scale);
         IGpuBuffer bounds = input;   // unread when the step is fixed; any bound buffer serves
         if (derive)
         {
@@ -46,8 +113,8 @@ internal static class PortableTorchModelOps
             launch("mo_minmax_final", 1, partial, minMax, slots);
             bounds = minMax;
         }
-        launch("mo_fake_quantize", n, input, bounds, output, mask, n, derive ? 1 : 0, symmetric ? 1 : 0, hasZeroPoint ? 1 : 0,
-            qMin, qMax, fixedStep, zeroPoint);
+        launch("mo_fake_quantize", n, input, bounds, output, mask, n, derive ? 1 : 0, symmetric ? 1 : 0, deriveZeroPoint ? 1 : 0,
+            (int)qMin, (int)qMax, (int)(qMin - zp), (int)(qMax - zp), stepLo, stepHi, stepExp);
     }
 
     public static void TopKSoftmax(PortableGenericFft.Launcher launch, IGpuBuffer input, IGpuBuffer scratchValues,
@@ -154,10 +221,23 @@ internal static class PortableTorchModelOps
     }
 
     /// <summary>The forward's alpha buffer: the stored rows, then per sequence (seqLen + 1) (hi, lo) offset pairs.</summary>
+    /// <remarks>The engine rejects larger problems up front (CpuEngine.MaxCrfStateLength, the same bound), so this only
+    /// throws for a direct backend call; it throws the backend's argument exception rather than an overflow.</remarks>
     public static int CrfAlphaLength(int batch, int seqLen, int tags)
-        => checked(batch * seqLen * tags + batch * (seqLen + 1) * 2);
+        => CrfLength(CrfAlphaLengthLong(batch, seqLen, tags), "batch * seqLen * tags + 2 * batch * (seqLen + 1)");
+
+    /// <summary><see cref="CrfAlphaLength"/> in 64 bits, never overflowing for int dimensions.</summary>
+    public static long CrfAlphaLengthLong(int batch, int seqLen, int tags)
+        => (long)batch * seqLen * tags + 2L * batch * (seqLen + 1L);
 
     /// <summary>The backward's beta scratch: the stored rows, then per sequence seqLen (G, H) exponent pairs.</summary>
     public static int CrfBetaLength(int batch, int seqLen, int tags)
-        => checked(batch * seqLen * tags + batch * seqLen * 2);
+        => CrfLength((long)batch * seqLen * tags + 2L * batch * seqLen, "batch * seqLen * tags + 2 * batch * seqLen");
+
+    private static int CrfLength(long length, string formula)
+    {
+        if (length > int.MaxValue)
+            throw new System.ArgumentOutOfRangeException("batch", $"The CRF state {formula} = {length} exceeds {int.MaxValue} elements.");
+        return (int)length;
+    }
 }

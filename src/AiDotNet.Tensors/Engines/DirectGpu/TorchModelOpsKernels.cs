@@ -300,41 +300,321 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_minmax_final(const float*
     minmax[1] = hi;
 }
 
-// y = (clamp(round(x / step) + zp, qMin, qMax) - zp) * step and mask = 1 where round(x / step) + zp was in range.
-// derive != 0 forms step (and, without a given zero point, an asymmetric zp) from minmax as the CPU does; round is
-// half to even, as Math.Round.
-extern ""C"" __global__ __launch_bounds__(256) void mo_fake_quantize(const float* x, const float* minmax, float* y, float* mask, int n, int derive, int symmetric, int hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint)
+// The CPU computes fake quantization in double. The kernel reproduces that arithmetic exactly in 32-bit integers, so
+// the step, the zero point, every clamp decision and every output match the CPU bit for bit at every width (from 25
+// bits the bounds and the quantized values outgrow float's 24-bit significand). A positive double is a 53-bit
+// significand sig in [2^52, 2^53) (a uint2: low word, high word) and an exponent e, value sig * 2^e; each double
+// operation the CPU performs is formed exactly and rounded once, half to even, as the CPU's double arithmetic rounds it.
+
+// 64-bit unsigned integers as (low word, high word).
+__device__ __forceinline__ bool mo_u64_less(uint2 a, uint2 b) { return a.y < b.y || (a.y == b.y && a.x < b.x); }
+__device__ __forceinline__ bool mo_u64_equal(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
+
+__device__ __forceinline__ uint2 mo_u64_add(uint2 a, uint2 b)
+{
+    unsigned int lo = a.x + b.x;
+    unsigned int hi = a.y + b.y;
+    if (lo < a.x) { hi = hi + 1u; }
+    return make_uint2(lo, hi);
+}
+
+__device__ __forceinline__ uint2 mo_u64_sub(uint2 a, uint2 b)
+{
+    unsigned int lo = a.x - b.x;
+    unsigned int hi = a.y - b.y;
+    if (a.x < b.x) { hi = hi - 1u; }
+    return make_uint2(lo, hi);
+}
+
+// Shifts by s; 64 or more gives 0.
+__device__ __forceinline__ uint2 mo_u64_shl(uint2 a, unsigned int s)
+{
+    if (s == 0u) { return a; }
+    if (s >= 64u) { return make_uint2(0u, 0u); }
+    if (s >= 32u) { return make_uint2(0u, a.x << (s - 32u)); }
+    return make_uint2(a.x << s, (a.y << s) | (a.x >> (32u - s)));
+}
+
+__device__ __forceinline__ uint2 mo_u64_shr(uint2 a, unsigned int s)
+{
+    if (s == 0u) { return a; }
+    if (s >= 64u) { return make_uint2(0u, 0u); }
+    if (s >= 32u) { return make_uint2(a.y >> (s - 32u), 0u); }
+    return make_uint2((a.x >> s) | (a.y << (32u - s)), a.y >> s);
+}
+
+// The number of significant bits of v (0 for 0).
+__device__ __forceinline__ int mo_bitlen32(unsigned int v)
+{
+    int bits = 0;
+    for (int k = 0; k < 32; k = k + 1)
+    {
+        if ((v >> (unsigned int)k) != 0u) { bits = k + 1; }
+    }
+    return bits;
+}
+
+__device__ __forceinline__ int mo_u64_bitlen(uint2 a)
+{
+    if (a.y != 0u) { return 32 + mo_bitlen32(a.y); }
+    return mo_bitlen32(a.x);
+}
+
+// a / 2^s with the shifted-out bits' nonzero-ness ORed into bit 0 (a sticky bit), s >= 0.
+__device__ __forceinline__ uint2 mo_shr_sticky(uint2 a, int s)
+{
+    if (s <= 0) { return a; }
+    uint2 q = mo_u64_shr(a, (unsigned int)s);
+    if (!mo_u64_equal(mo_u64_shl(q, (unsigned int)s), a)) { q.x = q.x | 1u; }
+    return q;
+}
+
+// p / 2^d rounded half to even, d in [1, 63].
+__device__ __forceinline__ uint2 mo_round_shift(uint2 p, unsigned int d)
+{
+    uint2 q = mo_u64_shr(p, d);
+    uint2 rest = mo_u64_sub(p, mo_u64_shl(q, d));
+    uint2 halfway = mo_u64_shl(make_uint2(1u, 0u), d - 1u);
+    if (mo_u64_less(halfway, rest) || (mo_u64_equal(rest, halfway) && (q.x & 1u) != 0u)) { q = mo_u64_add(q, make_uint2(1u, 0u)); }
+    return q;
+}
+
+// floor(a * 2^56 / b) for a, b in [2^52, 2^53), with a nonzero remainder ORed into bit 0: the quotient's leading bit is
+// bit 56 or 55, so dropping mo_quotient_drop's 4 or 3 low bits (the sticky bit among them) rounds it once to 53 bits.
+__device__ __forceinline__ uint2 mo_sig_div(uint2 a, uint2 b)
+{
+    uint2 r = a;
+    uint2 q = make_uint2(0u, 0u);
+    if (!mo_u64_less(r, b)) { r = mo_u64_sub(r, b); q.x = 1u; }
+    for (int k = 0; k < 56; k = k + 1)
+    {
+        r = mo_u64_shl(r, 1u);
+        q = mo_u64_shl(q, 1u);
+        if (!mo_u64_less(r, b)) { r = mo_u64_sub(r, b); q.x = q.x | 1u; }
+    }
+    if (r.x != 0u || r.y != 0u) { q.x = q.x | 1u; }
+    return q;
+}
+
+__device__ __forceinline__ unsigned int mo_quotient_drop(uint2 p)
+{
+    if ((p.y >> 24u) != 0u) { return 4u; }
+    return 3u;
+}
+
+// |x|'s significand scaled to [2^52, 2^53), for finite nonzero x; |x| = mo_float_sig(x) * 2^mo_float_exp(x).
+__device__ __forceinline__ uint2 mo_float_sig(float x)
+{
+    unsigned int b = __float_as_uint(x) & 0x7FFFFFFFu;
+    unsigned int m = b & 0x7FFFFFu;
+    if ((b >> 23u) != 0u) { m = m | 0x800000u; }
+    return mo_u64_shl(make_uint2(m, 0u), (unsigned int)(53 - mo_bitlen32(m)));
+}
+
+__device__ __forceinline__ int mo_float_exp(float x)
+{
+    unsigned int b = __float_as_uint(x) & 0x7FFFFFFFu;
+    int e = (int)(b >> 23u);
+    if (e != 0) { return e - 179; }
+    return mo_bitlen32(b & 0x7FFFFFu) - 202;
+}
+
+// |big| + |sml| (add != 0) or |big| - |sml| as a 64-bit window scaled by 2^(mo_float_exp(big) - 7), for finite floats
+// with |big| > |sml| (sml may be zero). Up to a 36-bit exponent gap it is exact; past that the small operand's dropped
+// bits leave a sticky bit 0, and as the big operand's window is even, the result's last bit is then 1: rounding the
+// window to 53 bits (7 or more bits dropped) rounds the exact value.
+__device__ __forceinline__ uint2 mo_magnitude_window(float big, float sml, int add)
+{
+    uint2 bw = mo_u64_shl(mo_float_sig(big), 7u);
+    if ((__float_as_uint(sml) & 0x7FFFFFFFu) == 0u) { return bw; }
+    uint2 sw = mo_shr_sticky(mo_u64_shl(mo_float_sig(sml), 7u), mo_float_exp(big) - mo_float_exp(sml));
+    if (add != 0) { return mo_u64_add(bw, sw); }
+    return mo_u64_sub(bw, sw);
+}
+
+// round(fl64(x / s)) half to even (Math.Round of the CPU's double quotient) for s = sig * 2^es > 0 and x not NaN,
+// saturated to +-2147483647, which no clamp bound reaches.
+__device__ __forceinline__ int mo_div_round(float x, uint2 sig, int es)
+{
+    unsigned int b = __float_as_uint(x);
+    int sgn = 1;
+    if ((b & 0x80000000u) != 0u) { sgn = -1; }
+    if ((b & 0x7FFFFFFFu) == 0u) { return 0; }
+    if ((b & 0x7FFFFFFFu) >= 0x7F800000u) { return sgn * 2147483647; }
+    uint2 p = mo_sig_div(mo_float_sig(x), sig);
+    unsigned int d = mo_quotient_drop(p);
+    uint2 q = mo_round_shift(p, d);
+    int g = mo_float_exp(x) - es - 56 + (int)d;
+    if (g >= 0) { return sgn * 2147483647; }
+    if (g < -54) { return 0; }
+    uint2 r = mo_round_shift(q, (unsigned int)(0 - g));
+    if (r.y != 0u || r.x > 2147483646u) { return sgn * 2147483647; }
+    return sgn * (int)(r.x);
+}
+
+// v * 2^e (0 < v < 2^54) rounded half to even to float, with sign bit neg.
+__device__ __forceinline__ float mo_to_float(uint2 v, int e, unsigned int neg)
+{
+    int len = mo_u64_bitlen(v);
+    int el = e + len - 24;
+    if (el < -149) { el = -149; }
+    int drop = el - e;
+    if (drop > len) { return __uint_as_float(neg); }
+    uint2 m = v;
+    if (drop > 0) { m = mo_round_shift(v, (unsigned int)drop); }
+    if (drop < 0) { m = mo_u64_shl(v, (unsigned int)(0 - drop)); }
+    unsigned int mm = m.x;
+    if (mm >= 0x1000000u) { mm = mm >> 1u; el = el + 1; }
+    if (mm < 0x800000u) { return __uint_as_float(mm | neg); }
+    int biased = el + 150;
+    if (biased >= 255) { return __uint_as_float(0x7F800000u | neg); }
+    return __uint_as_float((((unsigned int)biased) << 23u) | (mm & 0x7FFFFFu) | neg);
+}
+
+// The 64-bit product a * b.
+__device__ __forceinline__ uint2 mo_mul_wide(unsigned int a, unsigned int b)
+{
+    unsigned int a0 = a & 0xFFFFu;
+    unsigned int a1 = a >> 16u;
+    unsigned int b0 = b & 0xFFFFu;
+    unsigned int b1 = b >> 16u;
+    unsigned int p00 = a0 * b0;
+    unsigned int p01 = a0 * b1;
+    unsigned int p10 = a1 * b0;
+    unsigned int mid = (p00 >> 16u) + (p01 & 0xFFFFu) + (p10 & 0xFFFFu);
+    unsigned int lo = (p00 & 0xFFFFu) | (mid << 16u);
+    unsigned int hi = a1 * b1 + (p01 >> 16u) + (p10 >> 16u) + (mid >> 16u);
+    return make_uint2(lo, hi);
+}
+
+// (float)fl64(c * s) for an integer c and s = sig * 2^es: the CPU's (clamped - zp) * step, rounded to double and then
+// to float.
+__device__ __forceinline__ float mo_scale_to_float(int c, uint2 sig, int es)
+{
+    if (c == 0) { return 0.0f; }
+    unsigned int neg = 0u;
+    unsigned int mag = (unsigned int)c;
+    if (c < 0) { neg = 0x80000000u; mag = (unsigned int)(0 - c); }
+    uint2 lo = mo_mul_wide(mag, sig.x);
+    uint2 hi = mo_mul_wide(mag, sig.y);
+    unsigned int w1 = lo.y + hi.x;
+    unsigned int w2 = hi.y;
+    if (w1 < lo.y) { w2 = w2 + 1u; }
+    uint2 win = make_uint2(lo.x, w1);
+    int e = es;
+    if (w2 != 0u)
+    {
+        // Past 64 bits: the top 64 with the rest as a sticky bit (11 or more bits are rounded off below).
+        unsigned int k = (unsigned int)(mo_bitlen32(w2));
+        win = make_uint2((lo.x >> k) | (w1 << (32u - k)), (w1 >> k) | (w2 << (32u - k)));
+        if ((lo.x & ((1u << k) - 1u)) != 0u) { win.x = win.x | 1u; }
+        e = es + (int)k;
+    }
+    int len = mo_u64_bitlen(win);
+    if (len > 53)
+    {
+        win = mo_round_shift(win, (unsigned int)(len - 53));
+        e = e + len - 53;
+    }
+    return mo_to_float(win, e, neg);
+}
+
+// y = (clamp(round(x / step) + zp, qMin, qMax) - zp) * step and mask = 1 where round(x / step) + zp was in range, as
+// the CPU computes them in double. The step is (stepLo, stepHi) * 2^stepExp unless derive != 0, when it comes from
+// minmax: max(|min|, |max|) / qMax when symmetric, (max - min) / (qMax - qMin) otherwise, and 1 when that is zero or
+// not finite. The clamp runs on round(x / step) against [lowR, highR] = [qMin - zp, qMax - zp], which the host forms
+// for a known zero point; deriveZeroPoint != 0 (an asymmetric derived step, so qMin = 0) derives
+// zp = clamp(round(qMin - min / step), qMin, qMax) here.
+extern ""C"" __global__ __launch_bounds__(256) void mo_fake_quantize(const float* x, const float* minmax, float* y, float* mask, int n, int derive, int symmetric, int deriveZeroPoint, int qMin, int qMax, int lowR, int highR, int stepLo, int stepHi, int stepExp)
 {
     int i = bx_gid();
     if (i >= n) { return; }
-    float stp = fixedStep;
-    float zp = zeroPoint;
+    uint2 sig = make_uint2((unsigned int)stepLo, (unsigned int)stepHi);
+    int es = stepExp;
+    int lowBound = lowR;
+    int highBound = highR;
     if (derive != 0)
     {
-        float lo = minmax[0];
-        float hi = minmax[1];
-        if (symmetric != 0) { stp = fmaxf(fabsf(lo), fabsf(hi)) / qMax; }
-        else { stp = (hi - lo) / (qMax - qMin); }
-        if (stp == 0.0f || !mo_isfinite(stp)) { stp = 1.0f; }
-        if (hasZeroPoint == 0)
+        float mn = minmax[0];
+        float mx = minmax[1];
+        sig = make_uint2(0u, 0x100000u);
+        es = -52;
+        uint2 num = make_uint2(0u, 0u);
+        int en = 0;
+        int den = qMax;
+        if (symmetric != 0)
         {
-            zp = 0.0f;
-            if (symmetric == 0)
+            float m = fmaxf(fabsf(mn), fabsf(mx));
+            if (mo_isfinite(m) && __float_as_uint(m) != 0u && qMax > 0)
             {
-                zp = rintf(qMin - lo / stp);
-                if (zp < qMin) { zp = qMin; }
-                if (zp > qMax) { zp = qMax; }
+                num = mo_float_sig(m);
+                en = mo_float_exp(m);
             }
         }
+        else if (mo_isfinite(mn) && mo_isfinite(mx) && mx > mn)
+        {
+            // fl64(max - min): the exact difference of the two floats, rounded once to 53 bits.
+            den = qMax - qMin;
+            float big = mx;
+            float sml = mn;
+            int add = 0;
+            if (mn < 0.0f && mx > 0.0f)
+            {
+                add = 1;
+                if (fabsf(mn) > fabsf(mx)) { big = mn; sml = mx; }
+            }
+            else if (mx <= 0.0f) { big = mn; sml = mx; }
+            uint2 w = mo_magnitude_window(big, sml, add);
+            int len = mo_u64_bitlen(w);
+            en = mo_float_exp(big) - 7;
+            if (len > 53)
+            {
+                num = mo_round_shift(w, (unsigned int)(len - 53));
+                en = en + len - 53;
+            }
+            else
+            {
+                num = mo_u64_shl(w, (unsigned int)(53 - len));
+                en = en - (53 - len);
+            }
+            if (num.y >= 0x200000u) { num = mo_u64_shr(num, 1u); en = en + 1; }
+        }
+        if (num.x != 0u || num.y != 0u)
+        {
+            // fl64(num / den) for the positive integer den.
+            int dl = mo_bitlen32((unsigned int)den);
+            uint2 dn = mo_u64_shl(make_uint2((unsigned int)den, 0u), (unsigned int)(53 - dl));
+            uint2 p = mo_sig_div(num, dn);
+            unsigned int d = mo_quotient_drop(p);
+            sig = mo_round_shift(p, d);
+            es = en - dl - 3 + (int)d;
+            if (sig.y >= 0x200000u) { sig = mo_u64_shr(sig, 1u); es = es + 1; }
+        }
+        if (deriveZeroPoint != 0)
+        {
+            // round(0 - min / step) = -round(min / step) (half to even is symmetric), clamped to [qMin, qMax].
+            int zp = 0 - mo_div_round(mn, sig, es);
+            if (zp < qMin) { zp = qMin; }
+            if (zp > qMax) { zp = qMax; }
+            lowBound = qMin - zp;
+            highBound = qMax - zp;
+        }
     }
-    float q = rintf(x[i] / stp) + zp;
+    float v = x[i];
+    if (mo_isnan(v))
+    {
+        mask[i] = 0.0f;
+        y[i] = v;
+        return;
+    }
+    int r = mo_div_round(v, sig, es);
     float keep = 0.0f;
-    if (q >= qMin && q <= qMax) { keep = 1.0f; }
-    float c = q;
-    if (q < qMin) { c = qMin; }
-    else if (q > qMax) { c = qMax; }
+    if (r >= lowBound && r <= highBound) { keep = 1.0f; }
+    int c = r;
+    if (r < lowBound) { c = lowBound; }
+    else if (r > highBound) { c = highBound; }
     mask[i] = keep;
-    y[i] = (c - zp) * stp;
+    y[i] = mo_scale_to_float(c, sig, es);
 }
 
 // ---- top-k softmax over the last axis ----

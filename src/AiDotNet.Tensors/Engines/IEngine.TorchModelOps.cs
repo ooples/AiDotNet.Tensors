@@ -26,6 +26,13 @@ public partial interface IEngine
     /// <param name="startScores">Optional scores for the first tag, <c>[numTags]</c>; zero when null.</param>
     /// <param name="endScores">Optional scores for the last tag, <c>[numTags]</c>; zero when null.</param>
     /// <returns><c>[1]</c> for unbatched emissions, <c>[batch]</c> for batched ones.</returns>
+    /// <exception cref="System.ArgumentNullException"><paramref name="emissions"/> or <paramref name="transitions"/> is null.</exception>
+    /// <exception cref="System.ArgumentException">
+    /// A shape does not match, or the problem is too large: the forward-backward state,
+    /// batch * seqLen * numTags + 2 * batch * (seqLen + 1) elements, must not exceed <see cref="int.MaxValue"/>. Every
+    /// engine (CPU and GPU) checks this before allocating anything and throws the same exception and message; split the
+    /// batch or the sequences to go past it.
+    /// </exception>
     Tensor<T> TensorCrfForward<T>(Tensor<T> emissions, Tensor<T> transitions, Tensor<T>? startScores = null, Tensor<T>? endScores = null);
 
     /// <summary>
