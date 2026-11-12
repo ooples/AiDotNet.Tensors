@@ -163,3 +163,65 @@ public class LinalgElementTypeCoverageTests
     [Fact] public void Factorizations_Reject_Int16() => AssertRejected<short>();
     [Fact] public void Factorizations_Reject_Byte() => AssertRejected<byte>();
 }
+
+/// <summary>
+/// GPU backends have no decimal kernels: with a <see cref="AiDotNet.Tensors.Engines.DirectGpuTensorEngine"/>
+/// as the current engine every bound Linalg method must still run decimal on the CPU kernels and give the
+/// same values as with the CPU engine.
+/// </summary>
+[Collection("EngineCurrentGlobalState")]
+public sealed class LinalgDecimalGpuFallbackTests
+{
+    private static Tensor<decimal> Spd()
+    {
+        var t = new Tensor<decimal>(new[] { 3, 3 });
+        var d = t.GetDataArray();
+        decimal[] v = { 4m, 1m, 2m, 1m, 5m, 3m, 2m, 3m, 6m };
+        for (int i = 0; i < v.Length; i++) d[i] = v[i];
+        return t;
+    }
+
+    private static List<decimal[]> RunAll()
+    {
+        var a = Spd();
+        var b = new Tensor<decimal>(new[] { 3, 1 });
+        var bd = b.GetDataArray();
+        bd[0] = 1m; bd[1] = 2m; bd[2] = 3m;
+        var (l, _) = Linalg.CholeskyEx(a);
+        var (lu, piv) = Linalg.LuFactor(a);
+        var (w, v) = Linalg.Eigh(a);
+        var (ew, _) = Linalg.Eig(a);
+        var (q, r) = Linalg.QR(a);
+        var (_, lo, up) = Linalg.LU(a);
+        var (_, s, _) = Linalg.Svd(a);
+        return new List<decimal[]>
+        {
+            l.GetDataArray(), Linalg.Det(a).GetDataArray(), Linalg.Inv(a).GetDataArray(),
+            w.GetDataArray(), v.GetDataArray(), ew.GetDataArray(), Linalg.SolveEx(a, b).Solution.GetDataArray(),
+            q.GetDataArray(), r.GetDataArray(), lo.GetDataArray(), up.GetDataArray(),
+            Linalg.SolveTriangular(l, b, upper: false).GetDataArray(), s.GetDataArray(),
+            Linalg.Diagonal(a).GetDataArray(), Linalg.CholeskySolve(b, l).GetDataArray(),
+            Linalg.CholeskyInverse(l).GetDataArray(), Linalg.Solve(a, b).GetDataArray(),
+            lu.GetDataArray(), Linalg.LuSolve(lu, piv, b).GetDataArray(),
+        };
+    }
+
+    [Fact]
+    public void DecimalLinalg_UnderDirectGpuEngine_FallsBackToCpuKernels()
+    {
+        var cpu = RunAll();
+        var previous = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        using var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        try
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+            var onGpuEngine = RunAll();
+            Assert.Equal(cpu.Count, onGpuEngine.Count);
+            for (int i = 0; i < cpu.Count; i++) Assert.Equal(cpu[i], onGpuEngine[i]);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = previous;
+        }
+    }
+}
