@@ -197,7 +197,29 @@ internal static class ProgramSerializer
         foreach (var id in inputs)
             if (values[id].Role != ProgramValueRole.Input)
                 throw new ProgramFormatException($"Input %{id} is not an input value.");
-        foreach (var node in nodes) ValidateNode(node, values);
+        var available = new HashSet<int>(stored.Keys);
+        foreach (var id in inputs)
+            if (!available.Add(id)) throw new ProgramFormatException($"Input %{id} is listed more than once.");
+        foreach (var value in values)
+            if (value.Role == ProgramValueRole.Input && !available.Contains(value.Id))
+                throw new ProgramFormatException($"Input %{value.Id} has no input binding.");
+        for (int i = 0; i < inputs.Length; i++)
+            if (dims[i].Length != values[inputs[i]].Shape.Length)
+                throw new ProgramFormatException($"Input {i}'s dimension table has the wrong rank.");
+        foreach (var node in nodes)
+        {
+            ValidateNode(node, values);
+            foreach (var arg in node.Args)
+                foreach (var id in arg.Values)
+                    if (!available.Contains(id))
+                        throw new ProgramFormatException($"Node {node.Op.Name} reads %{id} before it is defined.");
+            foreach (var id in node.Outputs)
+                if (!available.Add(id))
+                    throw new ProgramFormatException($"Node {node.Op.Name} redefines %{id}.");
+        }
+        foreach (var id in outputs)
+            if (!available.Contains(id))
+                throw new ProgramFormatException($"Output %{id} has no definition.");
 
         return new TensorProgram(elementType, values, nodes, inputs, outputs, stored, dims, symbols, diagnostics) { OpSetHash = opSetHash };
     }

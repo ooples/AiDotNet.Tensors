@@ -183,10 +183,10 @@ public sealed class ProgramPackage
     public Tensor<T>[] Execute<T>(IEngine engine, Tensor<T>[] inputs)
     {
         var entry = EnsureEntry(engine, inputs);
-        if (entry is null) return Program.Run(engine, inputs);
+        if (entry is null) return Program.Run(engine, inputs).Select(Owned).ToArray();
 
         var instance = Acquire(entry, engine, inputs);
-        if (instance is null) return Program.Run(engine, inputs);
+        if (instance is null) return Program.Run(engine, inputs).Select(Owned).ToArray();
         try
         {
             instance.Plan.SetInputs(inputs);
@@ -198,7 +198,7 @@ public sealed class ProgramPackage
         {
             Trace.WriteLine($"[ProgramPackage] The plan for {entry.Device} failed ({ex.Message}); this shape now replays eagerly.");
             lock (_lock) entry.Eager = true;
-            return Program.Run(engine, inputs);
+            return Program.Run(engine, inputs).Select(Owned).ToArray();
         }
         finally
         {
@@ -531,21 +531,20 @@ public sealed class ProgramPackage
         }
     }
 
-    [Helpers.ScalarKernel("One-time comparison of a freshly built plan with eager replay, with a tolerance and NaN handling.")]
-    private static bool Agrees<T>(Tensor<T> expected, Tensor<T> actual)
+    [Helpers.ScalarKernel("One-time comparison of a freshly built plan with eager replay, with a per-element tolerance and NaN handling.")]
+    internal static bool Agrees<T>(Tensor<T> expected, Tensor<T> actual)
     {
         if (!expected._shape.SequenceEqual(actual._shape)) return false;
         var ops = Helpers.MathHelper.GetNumericOperations<T>();
         var e = expected.Contiguous().AsSpan();
         var a = actual.Contiguous().AsSpan();
-        double scale = 1;
-        for (int i = 0; i < e.Length; i++) scale = Math.Max(scale, Math.Abs(ops.ToDouble(e[i])));
-        double tolerance = typeof(T) == typeof(float) || typeof(T) == typeof(Half) || typeof(T) == typeof(double) ? 1e-3 * scale : 0;
+        double tolerance = typeof(T) == typeof(float) || typeof(T) == typeof(Half) || typeof(T) == typeof(double) ? 1e-3 : 0;
         for (int i = 0; i < e.Length; i++)
         {
             double x = ops.ToDouble(e[i]), y = ops.ToDouble(a[i]);
-            if (double.IsNaN(x) && double.IsNaN(y)) continue;
-            if (!(Math.Abs(x - y) <= tolerance)) return false;
+            if (x == y || (double.IsNaN(x) && double.IsNaN(y))) continue;
+            if (double.IsNaN(x) || double.IsNaN(y) || double.IsInfinity(x) || double.IsInfinity(y)
+                || !(Math.Abs(x - y) <= tolerance * Math.Max(1, Math.Abs(x)))) return false;
         }
         return true;
     }

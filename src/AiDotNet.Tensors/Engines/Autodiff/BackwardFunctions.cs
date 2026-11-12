@@ -5005,14 +5005,14 @@ internal static partial class BackwardFunctions<T>
         if (CreatesGraph && (isMinMax || mode == ScatterReduceMode.Prod))
         {
             // amin/amax: the upstream gradient routed to each slot's winner (fixed by the forward), as recorded sparse
-            // maps. prod: each factor's gradient is g·out/factor as recorded ops; with a zero factor that quotient is
-            // undefined, so zero factors take torch's masked formulation (ScatterReduceProdWithZerosRecorded).
+            // maps. prod: each factor's gradient is g·out/factor as recorded ops; zero factors instead use
+            // prefix/suffix products so mixed derivatives remain connected without division by zero.
             bool anyZero = false;
             for (int i = 0; i < dstLen && !anyZero; i++) anyZero = zeroCount[i] > 0;
             if (!isMinMax && anyZero)
             {
-                ScatterReduceProdWithZerosRecorded(gradOutput, tensor, source, output, dim, idxData, includeSelf,
-                    selfParticipates, outerSize, innerSize, dstAxis, srcAxis, engine, grads);
+                ScatterReduceProdWithZerosRecorded(gradOutput, tensor, source, idxData, includeSelf,
+                    outerSize, innerSize, dstAxis, srcAxis, engine, grads);
                 return;
             }
             if (isMinMax || !anyZero)

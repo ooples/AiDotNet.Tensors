@@ -318,11 +318,27 @@ public static class GradCheck
         return sum;
     }
 
+    private static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
+
+    private static void ValidateEpsilon(double epsilon)
+    {
+        if (!IsFinite(epsilon) || epsilon <= 0)
+            throw new ArgumentOutOfRangeException(nameof(epsilon), "The finite-difference step must be finite and positive.");
+    }
+
+    private static void ValidatePerturbation(double step, int element)
+    {
+        if (!IsFinite(step) || step <= 0)
+            throw new InvalidOperationException($"The finite-difference step does not produce distinct finite values at input[{element}]. Use finite inputs and a larger epsilon.");
+    }
+
+
     // d evaluate / d input[i] for the first `count` elements, by central differences with the step the element type
     // actually represents (x ± ε rounds in float), with recording suppressed and each element restored afterwards.
     [ScalarKernel("Finite differences perturb one element at a time and re-run the whole function between writes.")]
     private static double[] CentralDifferences<T>(Tensor<T> input, double epsilon, Func<double> evaluate, int count)
     {
+        ValidateEpsilon(epsilon);
         var ops = MathHelper.GetNumericOperations<T>();
         var gradient = new double[input.Length];
         using var noGrad = new NoGradScope<T>();
@@ -333,13 +349,14 @@ public static class GradCheck
             T plus = ops.FromDouble(center + epsilon);
             T minus = ops.FromDouble(center - epsilon);
             double step = ops.ToDouble(plus) - ops.ToDouble(minus);
+            ValidatePerturbation(step, i);
             try
             {
                 input[i] = plus;
                 double high = evaluate();
                 input[i] = minus;
                 double low = evaluate();
-                gradient[i] = step != 0 ? (high - low) / step : 0;
+                gradient[i] = (high - low) / step;
             }
             finally
             {
@@ -358,6 +375,8 @@ public static class GradCheck
 
         internal Tally(double atol, double rtol)
         {
+            if (!IsFinite(atol) || atol < 0) throw new ArgumentOutOfRangeException("absoluteTolerance");
+            if (!IsFinite(rtol) || rtol < 0) throw new ArgumentOutOfRangeException("relativeTolerance");
             _atol = atol;
             _rtol = rtol;
         }
@@ -373,8 +392,9 @@ public static class GradCheck
                 if (scale > 0) _maxRel = Math.Max(_maxRel, diff / scale);
             }
             double allowed = _atol + _rtol * Math.Abs(numerical);
-            // A NaN on either side is a failure, never a silent pass.
-            if (!(diff <= allowed))
+            // Non-finite derivatives cannot establish differentiability; infinity must not pass an infinite bound.
+            if (!IsFinite(analytical) || !IsFinite(numerical)) _maxAbs = _maxRel = double.PositiveInfinity;
+            if (!IsFinite(analytical) || !IsFinite(numerical) || !(diff <= allowed))
                 _failures.Add(new GradCheckMismatch(order, inputIndex, element, analytical, numerical, allowed));
         }
 
@@ -409,6 +429,11 @@ public static class GradCheck
                 if (index < 0 || index >= inputs.Count)
                     throw new ArgumentOutOfRangeException(nameof(options), $"InputsToCheck names input {index}; there are {inputs.Count}.");
             _epsilon = options.Epsilon ?? DefaultEpsilon<T>();
+            ValidateEpsilon(_epsilon);
+            if (options.MaxElementsPerInput is <= 0)
+                throw new ArgumentOutOfRangeException(nameof(options), "MaxElementsPerInput must be positive.");
+            if (_checkedInputs.Length == 0 || _checkedInputs.Distinct().Count() != _checkedInputs.Length)
+                throw new ArgumentException("Select at least one input, without duplicate indices.", nameof(options));
         }
 
         internal GradCheckResult Execute()
@@ -528,6 +553,7 @@ public static class GradCheck
         [ScalarKernel("Finite differences perturb one element at a time and re-run the whole function between writes.")]
         private static double[] CentralDifferencesRecording(Tensor<T> input, double epsilon, Func<double> evaluate, int count)
         {
+            ValidateEpsilon(epsilon);
             var ops = MathHelper.GetNumericOperations<T>();
             var gradient = new double[input.Length];
             for (int i = 0; i < count; i++)
@@ -537,13 +563,14 @@ public static class GradCheck
                 T plus = ops.FromDouble(center + epsilon);
                 T minus = ops.FromDouble(center - epsilon);
                 double step = ops.ToDouble(plus) - ops.ToDouble(minus);
+                ValidatePerturbation(step, i);
                 try
                 {
                     input[i] = plus;
                     double high = evaluate();
                     input[i] = minus;
                     double low = evaluate();
-                    gradient[i] = step != 0 ? (high - low) / step : 0;
+                    gradient[i] = (high - low) / step;
                 }
                 finally
                 {

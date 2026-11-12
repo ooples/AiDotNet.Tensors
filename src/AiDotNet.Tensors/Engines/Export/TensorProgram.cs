@@ -133,6 +133,10 @@ public sealed partial class TensorProgram
             if (!parameters[i]._shape.SequenceEqual(expected))
                 throw new ArgumentException($"Parameter {i} (%{ids[i]}) must have shape [{string.Join(", ", expected)}]; got [{string.Join(", ", parameters[i]._shape)}].", nameof(parameters));
         }
+        // A rebind replaces the live source as well as this dtype's cache. Other replay dtypes must
+        // materialize these weights, not the original snapshot (or an unbound placeholder).
+        for (int i = 0; i < ids.Length; i++) LiveParameters[ids[i]] = parameters[i];
+        _parameterCache.Clear();
         _parameterCache[typeof(T)] = parameters.Cast<object>().ToArray();
         Unbound.Clear();
         Interlocked.Increment(ref _parameterGeneration);
@@ -164,20 +168,23 @@ public sealed partial class TensorProgram
     }
 
     /// <summary>
-    /// The stored tensors to write when saving with values: a parameter that was loaded by shape only and has since
-    /// been bound is written from the bound tensor (at the traced element type), so a re-save keeps the weights.
+    /// The current parameter tensors to write when saving with values, converted to their declared element type.
+    /// Live updates and rebinding must replace the trace-time snapshot in the saved package.
     /// </summary>
     internal IReadOnlyDictionary<int, object> StoredForSave()
     {
-        if (!Stored.Values.Any(v => v is UnboundTensor)) return Stored;
         var traced = ElementTypes.TypeOf(TracedElementType)!;
         var bound = _parameterCache.TryGetValue(traced, out var same) ? same : _parameterCache.Values.FirstOrDefault();
-        if (bound is null) return Stored;
         var ids = ParameterIds.ToArray();
         var result = new Dictionary<int, object>(Stored);
         for (int i = 0; i < ids.Length; i++)
-            if (result[ids[i]] is UnboundTensor u)
-                result[ids[i]] = TensorValues.Materialize(TensorValues.Snapshot(bound[i]), "Tensor", u.Element);
+        {
+            var value = Values[ids[i]];
+            var current = bound is not null ? bound[i]
+                : LiveParameters.TryGetValue(ids[i], out var live) ? live : null;
+            if (current is not null)
+                result[ids[i]] = TensorValues.Materialize(TensorValues.Snapshot(current), value.Container, ElementOf(value, traced));
+        }
         return result;
     }
 
@@ -216,6 +223,8 @@ public sealed partial class TensorProgram
         if (function is null) throw new ArgumentNullException(nameof(function));
         if (examples is null || examples.Length == 0) throw new ArgumentException("At least one example input is required.", nameof(examples));
         options ??= new TraceOptions();
+        if (options.Tolerance < 0 || double.IsNaN(options.Tolerance) || double.IsInfinity(options.Tolerance))
+            throw new ArgumentOutOfRangeException(nameof(options), "Trace tolerance must be finite and non-negative.");
 
         var (program, eager) = TraceOnce(function, examples, options);
         var diagnostics = (List<string>)program.Diagnostics;
@@ -505,8 +514,9 @@ public sealed partial class TensorProgram
         for (int i = 0; i < e.Length; i++)
         {
             double x = ops.ToDouble(e[i]), y = ops.ToDouble(a[i]);
-            if (double.IsNaN(x) && double.IsNaN(y)) continue;
-            if (Math.Abs(x - y) > tol + tol * Math.Abs(x)) return $"element {i}: {y} vs {x}";
+            if (x == y || (double.IsNaN(x) && double.IsNaN(y))) continue;
+            if (double.IsNaN(x) || double.IsNaN(y) || double.IsInfinity(x) || double.IsInfinity(y)
+                || !(Math.Abs(x - y) <= tol + tol * Math.Abs(x))) return $"element {i}: {y} vs {x}";
         }
         return null;
     }
@@ -570,8 +580,9 @@ public sealed partial class TensorProgram
 
     private object[] GetParameterObjects<T>() => _parameterCache.GetOrAdd(typeof(T), _ =>
         Values.Where(v => v.Role == ProgramValueRole.Parameter)
-              .Select(v => LiveParameters.TryGetValue(v.Id, out var live) && ElementOf(v, typeof(T)) == TensorValues.Describe(live).Element
-                  ? live
+              .Select(v => LiveParameters.TryGetValue(v.Id, out var live)
+                  ? ElementOf(v, typeof(T)) == TensorValues.Describe(live).Element ? live
+                    : TensorValues.Materialize(TensorValues.Snapshot(live), v.Container, ElementOf(v, typeof(T)))
                   : TensorValues.Materialize(Stored[v.Id], v.Container, ElementOf(v, typeof(T))))
               .ToArray());
 
@@ -588,6 +599,8 @@ public sealed partial class TensorProgram
     internal void SetStored(int id, object tensor)
     {
         Stored[id] = TensorValues.Snapshot(tensor);
+        LiveParameters.Remove(id);
+        Unbound.Remove(id);
         _parameterCache.Clear();
         _constantCache.Clear();
         Interlocked.Increment(ref _parameterGeneration);
