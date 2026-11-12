@@ -3602,6 +3602,48 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
+    /// <summary>
+    /// The Half/BFloat16 gradient of a mean-reduced pairwise loss, <c>term(a[i], b[i]) * g / n</c>, evaluated in float32
+    /// and rounded once (2/n is subnormal in Half, and a Half product chain overflows). Under a createGraph backward it
+    /// is also recorded as an op of a, b and the upstream gradient g, whose backward is that map's exact float32
+    /// derivative: <c>u * g / n * dTermDa</c> for a, <c>u * g / n * dTermDb</c> for b and <c>sum(u * term) / n</c> for g.
+    /// The float32 helper alone returned an unrecorded tensor, so a second derivative through it was zero.
+    /// </summary>
+    private static Tensor<T> LowPrecisionLossGradient(Tensor<T> a, Tensor<T> b, Tensor<T> gradOutput,
+        Func<double, double, double> term, Func<double, double, double> dTermDa, Func<double, double, double> dTermDb)
+    {
+        int n = a.Length;
+        var gradient = LowPrecisionGradients.Pairwise(a, b, LowPrecisionGradients.Upstream(gradOutput) / n, term);
+        if (!DifferentiableOps._isBackwardCreateGraph) return gradient;
+        BackwardFunction<T> secondOrder = (upstream, ins, _, _, eng, secondGrads) =>
+        {
+            var u = LowPrecisionGradients.Widen(upstream);
+            var x = LowPrecisionGradients.Widen(ins[0]);
+            var y = LowPrecisionGradients.Widen(ins[1]);
+            double scale = LowPrecisionGradients.Upstream(ins[2]) / n;
+            if (DifferentiableOps.IsGradientRequired(ins[0]))
+            {
+                var da = new float[x.Length];
+                for (int i = 0; i < da.Length; i++) da[i] = (float)(u[i] * scale * dTermDa(x[i], y[i]));
+                DifferentiableOps.AccumulateGrad(secondGrads, ins[0], LowPrecisionGradients.Narrow<T>(da, ins[0]._shape), eng);
+            }
+            if (DifferentiableOps.IsGradientRequired(ins[1]))
+            {
+                var db = new float[x.Length];
+                for (int i = 0; i < db.Length; i++) db[i] = (float)(u[i] * scale * dTermDb(x[i], y[i]));
+                DifferentiableOps.AccumulateGrad(secondGrads, ins[1], LowPrecisionGradients.Narrow<T>(db, ins[1]._shape), eng);
+            }
+            if (DifferentiableOps.IsGradientRequired(ins[2]))
+            {
+                double sum = 0;
+                for (int i = 0; i < x.Length; i++) sum += u[i] * term(x[i], y[i]);
+                DifferentiableOps.AccumulateGrad(secondGrads, ins[2], LowPrecisionGradients.Filled<T>(ins[2]._shape, sum / n), eng);
+            }
+        };
+        DifferentiableOps.RecordIfActive("LowPrecisionLossGradient", gradient, new[] { a, b, gradOutput }, secondOrder);
+        return gradient;
+    }
+
     /// <summary>MSE loss backward: d(MSE)/d(pred) = 2*(pred-target)/n</summary>
     internal static void MSELossBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -3622,8 +3664,8 @@ internal static class BackwardFunctions<T>
         if (LowPrecisionGradients.Applies<T>())
         {
             // Half/BFloat16: 2 (p - y) g / n in float32, rounded once (2/n is subnormal in Half).
-            DifferentiableOps.AccumulateGrad(grads, predictions, LowPrecisionGradients.Pairwise(predictions, targets,
-                LowPrecisionGradients.Upstream(gradOutput) / predictions.Length, (p, y) => 2.0 * (p - y)), engine);
+            DifferentiableOps.AccumulateGrad(grads, predictions, LowPrecisionLossGradient(predictions, targets, gradOutput,
+                (p, y) => 2.0 * (p - y), (_, _) => 2.0, (_, _) => -2.0), engine);
             return;
         }
 
@@ -3664,8 +3706,8 @@ internal static class BackwardFunctions<T>
         else if (LowPrecisionGradients.Applies<T>())
         {
             // Half/BFloat16: 2 (p - y) g / n in float32, rounded once.
-            predGrad = LowPrecisionGradients.Pairwise(predictions, targets,
-                LowPrecisionGradients.Upstream(gradOutput) / predictions.Length, (p, t) => 2.0 * (p - t));
+            predGrad = LowPrecisionLossGradient(predictions, targets, gradOutput,
+                (p, t) => 2.0 * (p - t), (_, _) => 2.0, (_, _) => -2.0);
         }
         else
         {
@@ -3716,8 +3758,8 @@ internal static class BackwardFunctions<T>
         else if (LowPrecisionGradients.Applies<T>())
         {
             // Half/BFloat16: 2 (p - y) g / n in float32, rounded once.
-            predGrad = LowPrecisionGradients.Pairwise(predictions, y,
-                LowPrecisionGradients.Upstream(gradOutput) / predictions.Length, (p, t) => 2.0 * (p - t));
+            predGrad = LowPrecisionLossGradient(predictions, y, gradOutput,
+                (p, t) => 2.0 * (p - t), (_, _) => 2.0, (_, _) => -2.0);
         }
         else
         {
@@ -3741,8 +3783,10 @@ internal static class BackwardFunctions<T>
         if (LowPrecisionGradients.Applies<T>())
         {
             // Half/BFloat16: (sigmoid(x) - t) g / n in float32, rounded once.
-            DifferentiableOps.AccumulateGrad(grads, logits, LowPrecisionGradients.Pairwise(logits, targets,
-                LowPrecisionGradients.Upstream(gradOutput) / logits.Length, (x, t) => 1.0 / (1.0 + Math.Exp(-x)) - t), engine);
+            DifferentiableOps.AccumulateGrad(grads, logits, LowPrecisionLossGradient(logits, targets, gradOutput,
+                (x, t) => 1.0 / (1.0 + Math.Exp(-x)) - t,
+                (x, _) => { double s = 1.0 / (1.0 + Math.Exp(-x)); return s * (1.0 - s); },
+                (_, _) => -1.0), engine);
             return;
         }
 
@@ -3885,9 +3929,10 @@ internal static class BackwardFunctions<T>
         if (LowPrecisionGradients.Applies<T>())
         {
             // Half/BFloat16: clamp(p - y, -delta, delta) g / n in float32, rounded once.
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionGradients.Pairwise(inputs[0], target,
-                LowPrecisionGradients.Upstream(gradOutput) / inputs[0].Length,
-                (p, y) => Math.Max(-delta, Math.Min(delta, p - y))), engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionLossGradient(inputs[0], target, gradOutput,
+                (p, y) => Math.Max(-delta, Math.Min(delta, p - y)),
+                (p, y) => Math.Abs(p - y) <= delta ? 1.0 : 0.0,
+                (p, y) => Math.Abs(p - y) <= delta ? -1.0 : 0.0), engine);
             return;
         }
         T scaleT = numOps.FromDouble(numOps.ToDouble(gradOutput[0]) / inputs[0].Length);
