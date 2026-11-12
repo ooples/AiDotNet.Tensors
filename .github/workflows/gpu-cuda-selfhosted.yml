@@ -425,11 +425,12 @@ jobs:
             $others = @($apps | ForEach-Object {
               $idColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'pid' } | Select-Object -First 1
               $nameColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'process_name' } | Select-Object -First 1
+              # A short row (nvidia-smi on a WDDM laptop GPU can print one) leaves a column's value null, so each value is
+              # read as a string before trimming.
               $id = [uint32]0
-              # A row cut short when nvidia-smi was stopped leaves later columns null; it names no process.
-              if ($idColumn -and $null -ne $idColumn.Value -and [uint32]::TryParse($idColumn.Value.Trim(), [ref]$id) -and
-                  -not $ownIds.ContainsKey($id)) {
-                $name = if ($nameColumn -and $null -ne $nameColumn.Value) { Split-Path -Leaf $nameColumn.Value.Trim() } else { 'unknown' }
+              if ($idColumn -and [uint32]::TryParse("$($idColumn.Value)".Trim(), [ref]$id) -and -not $ownIds.ContainsKey($id)) {
+                $rawName = if ($nameColumn) { "$($nameColumn.Value)".Trim() } else { '' }
+                $name = if ($rawName) { Split-Path -Leaf $rawName } else { 'unknown' }
                 "$name ($id)"
               } } | Sort-Object -Unique)
             if ($others.Count -gt 0) {
