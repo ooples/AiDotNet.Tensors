@@ -4908,9 +4908,11 @@ internal static partial class BackwardFunctions<T>
         var inShape = inputs[0]._shape;
         int batch = inShape[0], channels = inShape[1], length = inShape[2];
         int outLength = (length - kernelSize) / stride + 1;
-        if (LowPrecisionGradients.Applies<T>())
+        if (LowPrecisionGradients.Applies<T>() && !CreatesGraph)
         {
-            // Half/BFloat16: g / kernelSize in float32, rounded once (1/kernelSize is subnormal in Half).
+            // Half/BFloat16: g / kernelSize in float32, rounded once (1/kernelSize is subnormal in Half). Not under
+            // createGraph: that array-built tensor is unrecorded, so a second backward through the pool would see no
+            // dependency on gradOutput; the recorded sparse map below keeps it, as MeanBackward's create-graph path does.
             DifferentiableOps.AccumulateGrad(grads, inputs[0],
                 LowPrecisionGradients.AvgPool1DBackward(gradOutput, inShape, kernelSize, stride), engine);
             return;
@@ -7173,8 +7175,9 @@ internal static partial class BackwardFunctions<T>
         // The posteriors come from the engine op that shares the loss's lattice (CtcLattice), so they run on the
         // device on a GPU engine; times past an item's input length get zero.
         var gamma = engine.TensorCTCLabelPosteriors(logProbs, targets, inputLengths, targetLengths, blank);
+        // Broadcast explicitly: the [1, N, 1] scale against [T, N, C] would throw under a caller's ShapePolicy.Strict().
         var scale = engine.Reshape(engine.TensorNegate(gradOutput), new[] { 1, logProbs._shape[1], 1 });
-        var grad = engine.TensorMultiply(gamma, scale);
+        var grad = engine.TensorMultiply(gamma, engine.TensorBroadcastTo(scale, gamma._shape));
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }

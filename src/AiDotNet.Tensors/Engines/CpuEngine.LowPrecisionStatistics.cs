@@ -87,8 +87,29 @@ public partial class CpuEngine
     internal static Tensor<T> RentLowPrecisionStatistic<T>(int[] shape, float[] exact)
     {
         var statistic = TensorAllocator.Rent<T>(shape, NarrowFromFloat<T>(exact));
-        s_float32Statistics.Add(statistic, exact);
+        // Replace, not Add: a statistic a compiled replay returned to the pool can come back here as the same object.
+        lock (s_float32Statistics)
+        {
+            s_float32Statistics.Remove(statistic);
+            s_float32Statistics.Add(statistic, exact);
+        }
         return statistic;
+    }
+
+    /// <summary>
+    /// Moves the float32 values remembered for <paramref name="fresh"/> onto <paramref name="refreshed"/>, the statistic a
+    /// compiled replay has just copied <paramref name="fresh"/>'s narrowed values into. Without this the refreshed tensor
+    /// keeps the trace's float32 values, and a step whose new statistics narrow to the same Half values (two variances
+    /// both +Inf, say) would hand the backward the trace's statistics instead of its own.
+    /// </summary>
+    internal static void CarryLowPrecisionStatistic<T>(Tensor<T> fresh, Tensor<T> refreshed)
+    {
+        lock (s_float32Statistics)
+        {
+            s_float32Statistics.Remove(refreshed);
+            if (s_float32Statistics.TryGetValue(fresh, out var exact))
+                s_float32Statistics.Add(refreshed, (float[])exact.Clone());
+        }
     }
 
     /// <summary>

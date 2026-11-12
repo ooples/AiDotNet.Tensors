@@ -26586,6 +26586,8 @@ public partial class CpuEngine : ITensorLevelEngine
                             DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                             DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedMean);
                             DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedVar);
+                            CarryLowPrecisionStatistic(freshMean, capturedMean);
+                            CarryLowPrecisionStatistic(freshVar, capturedVar);
                         }
                         finally
                         {
@@ -30221,6 +30223,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedGNMean);
                         DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedGNVar);
+                        CarryLowPrecisionStatistic(freshMean, capturedGNMean);
+                        CarryLowPrecisionStatistic(freshVar, capturedGNVar);
                     },
                     // SavedState order per #178 fix above: numGroups must come first so
                     // GroupNormBackward reads savedState[0] as int (not as Tensor).
@@ -49881,6 +49885,38 @@ public partial class CpuEngine : ITensorLevelEngine
         return LayerNorm(input, gamma, beta, epsilon, out _, out _);
     }
 
+    /// <summary>
+    /// The recorded standard deviation for Half/BFloat16. A Half variance overflows long before the standard deviation
+    /// does ([0, 1000] has variance 250,000 but standard deviation 500), so the recorded composition runs on
+    /// (x - c) / s, where c and s are each slice's mean and standard deviation computed in float32 and held constant:
+    /// that has unit variance, and std(x) = s * std((x - c) / s) is exact in value and gradient (the standard deviation
+    /// is shift-invariant and homogeneous of degree one in x).
+    /// </summary>
+    private Tensor<T> LowPrecisionTapedStd<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var stdAxes = ValidateAndNormalizeAxes(axes is null || axes.Length == 0 ? Enumerable.Range(0, input.Rank).ToArray() : axes, input.Rank);
+        var dense = input.IsContiguous ? input : input.Contiguous();
+        var data = dense.GetFlattenedData();
+        var keptShape = LowPrecisionReducedShape(dense._shape, stdAxes, keepDims: true);
+        int keptSize = 1;
+        foreach (int dim in keptShape) keptSize *= dim;
+        var centre = LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: false, correction: 0, squareRoot: false);
+        var scale = LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: true, correction: 0, squareRoot: true);
+        for (int i = 0; i < scale.Length; i++)
+        {
+            double s = numOps.ToDouble(scale[i]);
+            if (!(s > 0) || double.IsInfinity(s)) scale[i] = numOps.One; // a constant slice keeps std 0 and its gradient
+        }
+        var centreKept = new Tensor<T>(centre, (int[])keptShape.Clone());
+        var scaleKept = new Tensor<T>(scale, (int[])keptShape.Clone());
+        var standardized = TensorDivide(
+            TensorSubtract(input, TensorBroadcastTo(centreKept, input._shape)),
+            TensorBroadcastTo(scaleKept, input._shape));
+        var unitStd = TensorSqrt(TensorClampMin(ReduceVariance(standardized, stdAxes, keepDims), numOps.Zero));
+        return TensorMultiply(unitStd, keepDims ? scaleKept : Reshape(scaleKept, unitStd._shape));
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
@@ -49909,7 +49945,11 @@ public partial class CpuEngine : ITensorLevelEngine
         // nothing, so ReduceStd had NO gradient at all -- eager training through it failed with "the tape has no
         // recorded operations" and compiled training silently dropped it.
         if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+        {
+            if (IsLowPrecisionFloat<T>())
+                return LowPrecisionTapedStd(input, axes, keepDims);
             return TensorSqrt(TensorClampMin(ReduceVariance(input, axes, keepDims), numOps.Zero));
+        }
 
         if (IsLowPrecisionFloat<T>())
         {

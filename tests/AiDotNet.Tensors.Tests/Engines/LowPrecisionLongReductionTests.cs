@@ -375,6 +375,50 @@ public class LowPrecisionLongReductionTests
     }
 
     [Fact]
+    public void ReduceStd_Half_UnderTape_StaysFiniteWhereTheVarianceOverflows()
+    {
+        // [0, 1000]: variance 250,000 is +Inf in Half, standard deviation 500 is not. The recorded path must give the
+        // untaped value and the exact gradient (x - mean) / (n * std) = -0.5, +0.5.
+        var x = new Tensor<Half>(new[] { (Half)0, (Half)1000 }, new[] { 2 });
+        Assert.Equal(500.0, (double)_engine.ReduceStd(x, new[] { 0 }, keepDims: false).ToArray()[0]);
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<Half>();
+        var std = _engine.ReduceStd(x, new[] { 0 }, keepDims: false);
+        Assert.Equal(500.0, (double)std.ToArray()[0]);
+        var g = tape.ComputeGradients(std, new[] { x })[x].ToArray();
+        Assert.Equal(-0.5, (double)g[0]);
+        Assert.Equal(0.5, (double)g[1]);
+    }
+
+    [Fact]
+    public void TensorVarMean_Half_EmptyAxes_ReduceEveryAxisWithAndWithoutATape()
+    {
+        // Empty axes mean every axis (torch.var_mean(dim=None)); the untaped path used to keep the input's shape.
+        var x = new Tensor<Half>(new[] { (Half)0, (Half)2 }, new[] { 2 });
+        var (variance, mean) = _engine.TensorVarMean(x, Array.Empty<int>(), correction: 0);
+        Assert.Equal(new[] { 1.0 }, Array.ConvertAll(variance.ToArray(), h => (double)h));
+        Assert.Equal(new[] { 1.0 }, Array.ConvertAll(mean.ToArray(), h => (double)h));
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<Half>();
+        var (tapedVariance, tapedMean) = _engine.TensorVarMean(x, Array.Empty<int>(), correction: 0);
+        Assert.Equal(variance._shape, tapedVariance._shape);
+        Assert.Equal(mean._shape, tapedMean._shape);
+        Assert.Equal(1.0, (double)tapedVariance.ToArray()[0]);
+    }
+
+    [Fact]
+    public void TensorVarMean_Half_UnderTape_CorrectionFactorBeyondHalfRange_StaysFinite()
+    {
+        // One 1 among 65,536 elements with correction 65,535: the factor count / (count - correction) = 65,536 is +Inf
+        // in Half, but the corrected variance, 65,535 / 65,536, rounds to 1.
+        const int n = 65_536;
+        var data = new Half[n];
+        data[0] = (Half)1;
+        var x = new Tensor<Half>(data, new[] { n });
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<Half>();
+        var (variance, _) = _engine.TensorVarMean(x, new[] { 0 }, correction: n - 1);
+        AssertHalf((double)(n - 1) / n, variance.ToArray()[0], "TensorVarMean corrected var");
+    }
+
+    [Fact]
     public void FloatAndDouble_ReduceMean_Unchanged_ForShortInputs()
     {
         // Regression guard for the fast paths: float/double still produce exact sums for small integer data.
