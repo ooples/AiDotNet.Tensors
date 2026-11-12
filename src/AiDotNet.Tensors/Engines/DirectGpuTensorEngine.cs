@@ -23020,7 +23020,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // GPU-RESIDENT compiled-step path: negate into a stable resident buffer, no download (the host TryRunUnary
         // download aborted capture at the cross-entropy -log(p)). Records the backward exactly as the eager path.
-        if (typeof(T) == typeof(float))
+        // Only inside a resident step, as TensorMultiplyScalar's: eagerly, the resident output's host array was a
+        // fresh allocation on every call (SwishBackward negates once per SiLU per step), where the deferred result
+        // below allocates nothing on the host.
+        if (ResidentStepActive && typeof(T) == typeof(float))
         {
             using var __gpuOp = EnterGpuOp();
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"
