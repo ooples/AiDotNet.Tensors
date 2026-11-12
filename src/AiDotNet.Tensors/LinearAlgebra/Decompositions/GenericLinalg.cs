@@ -121,11 +121,37 @@ internal static class GenericLinalg<T>
                 $"got {typeof(T).Name}. Integer element types are not supported, matching torch.linalg.");
     }
 
+    // Halvings tried while searching for the machine epsilon: decimal's is 1e-28 (about 2^-93), the smallest of the
+    // supported types, so the search always ends well before this.
+    private const int EpsilonSearchLimit = 400;
+
+    // Cyclic Jacobi sweeps (Eigh and the one-sided SVD) before the loop stops: Jacobi converges quadratically, so a
+    // well-posed problem needs a handful.
+    private const int MaxJacobiSweeps = 100;
+
+    // A Jacobi loop that reaches MaxJacobiSweeps still rotating has converged to rounding level when its largest
+    // remaining off-diagonal value (Eigh) or column cosine (SVD) is within this many times n times the rotation
+    // threshold: in Half and BFloat16 each rotation reintroduces off-diagonal rounding of the threshold's order, so a
+    // sweep can keep rotating there. Beyond it the decomposition has not converged and the loop throws.
+    private const int JacobiStallFactor = 4;
+
+    // Inverse-iteration solves per seed vector, and the residual (in units of n times machine epsilon) at which a seed's
+    // eigenvector is accepted and the search stops.
+    private const int InverseIterationSteps = 3;
+    private const int EigenvectorAcceptFactor = 64;
+
+    // Francis QR iterations allowed per eigenvalue (EISPACK hqr's 30 per eigenvalue, at least 10 eigenvalues' worth).
+    private const int QrIterationsPerEigenvalue = 30;
+    private const int MinQrEigenvalueBudget = 10;
+
+    // Two eigenvalues are the same repeated one when they agree within this many machine epsilons (relative to 1 + |λ|).
+    private const int RepeatedEigenvalueFactor = 8;
+
     private static Real<T> MachineEpsilon()
     {
         if (!IsSupported) return Real<T>.Zero;
         Real<T> one = Real<T>.One, two = Real<T>.Int(2), e = one;
-        for (int i = 0; i < 400; i++)
+        for (int i = 0; i < EpsilonSearchLimit; i++)
         {
             Real<T> half = e / two;
             if (one + half == one) break;
@@ -402,9 +428,12 @@ internal static class GenericLinalg<T>
         for (int i = 0; i < n * n; i++) scale = Real<T>.Max(scale, Real<T>.Abs(a[i]));
         Real<T> skip = Eps * scale;
 
-        for (int sweep = 0; sweep < 100; sweep++)
+        bool converged = false;
+        Real<T> largestRotated = Real<T>.Zero;
+        for (int sweep = 0; sweep < MaxJacobiSweeps; sweep++)
         {
             bool rotated = false;
+            largestRotated = Real<T>.Zero;
             for (int p = 0; p < n - 1; p++)
             {
                 for (int q = p + 1; q < n; q++)
@@ -412,6 +441,7 @@ internal static class GenericLinalg<T>
                     Real<T> apq = a[p * n + q];
                     if (Real<T>.Abs(apq) <= skip) continue;
                     rotated = true;
+                    largestRotated = Real<T>.Max(largestRotated, Real<T>.Abs(apq));
                     var (c, s) = JacobiRotation(a[p * n + p], a[q * n + q], apq);
                     for (int i = 0; i < n; i++)
                     {
@@ -435,8 +465,11 @@ internal static class GenericLinalg<T>
                     }
                 }
             }
-            if (!rotated) break;
+            if (!rotated) { converged = true; break; }
         }
+        if (!converged && largestRotated > Real<T>.Int(JacobiStallFactor * n) * skip)
+            throw new ArithmeticException(
+                $"Eigh: the Jacobi iteration failed to converge for {typeof(T).Name} input in {MaxJacobiSweeps} sweeps (LAPACK info > 0).");
 
         var vals = new Real<T>[n];
         for (int i = 0; i < n; i++) vals[i] = a[i * n + i];
@@ -569,7 +602,7 @@ internal static class GenericLinalg<T>
 
         int nn = n;
         Real<T> t = zero;
-        int maxIts = 30 * Math.Max(n, 10);
+        int maxIts = QrIterationsPerEigenvalue * Math.Max(n, MinQrEigenvalueBudget);
         // s, x, y, z and w are assigned before each read, so they start unset (an initial zero was never read).
         Real<T> p = zero, q = zero, r = zero, s, x, y, z, w;
         while (nn >= 1)
@@ -731,7 +764,7 @@ internal static class GenericLinalg<T>
     private static void ProjectRepeatedEigenvectors(Real<T>[] x, int n, bool complex, Real<T> re, Real<T> im,
         Real<T>[] wr, Real<T>[] wi, int count, T[] vectors, int offset)
     {
-        Real<T> tol = Real<T>.Int(8) * Eps * (Real<T>.One + Real<T>.Abs(re) + Real<T>.Abs(im));
+        Real<T> tol = Real<T>.Int(RepeatedEigenvalueFactor) * Eps * (Real<T>.One + Real<T>.Abs(re) + Real<T>.Abs(im));
         for (int pass = 0; pass < 2; pass++)
             for (int k = 0; k < count; k++)
             {
@@ -816,12 +849,16 @@ internal static class GenericLinalg<T>
         var x = new Real<T>[m];
         Real<T> bestResidual = Real<T>.Zero;
         bool haveBest = false;
+        // Rounding in the residual grows with n, so the acceptance does too; the first seed that reaches it ends the
+        // search (each further seed costs three O(m^2) solves and an O(n^2) residual).
+        Real<T> accept = Real<T>.Int(EigenvectorAcceptFactor) * Real<T>.Int(Math.Max(n, 1)) * Eps;
         for (int seed = 0; seed < n; seed++)
         {
+            if (haveBest && bestResidual <= accept) break;
             var candidate = new Real<T>[m];
             for (int i = 0; i < m; i++) candidate[i] = i == seed ? Real<T>.One : Real<T>.Zero;
             bool usable = true;
-            for (int iter = 0; iter < 3; iter++)
+            for (int iter = 0; iter < InverseIterationSteps; iter++)
             {
                 SolveInPlace(mat, piv, candidate, m);
                 ProjectRepeatedEigenvectors(candidate, n, complex, re, im, wr, wi, eigenIndex, previousVectors, vectorOffset);
@@ -840,13 +877,14 @@ internal static class GenericLinalg<T>
         }
         // A defective matrix need not have another independent vector for a repeated eigenvalue.
         // Retain an ordinary inverse iterate in that case, as geev does, rather than returning a zero vector.
-        if (!haveBest || bestResidual > Real<T>.Int(64) * Eps)
+        if (!haveBest || bestResidual > accept)
         {
             for (int seed = 0; seed < n; seed++)
             {
+                if (haveBest && bestResidual <= accept) break;
                 var candidate = new Real<T>[m];
                 for (int i = 0; i < m; i++) candidate[i] = i == seed ? Real<T>.One : Real<T>.Zero;
-                for (int iter = 0; iter < 3; iter++)
+                for (int iter = 0; iter < InverseIterationSteps; iter++)
                 {
                     SolveInPlace(mat, piv, candidate, m);
                     Real<T> nrm = Norm2(candidate);
@@ -992,9 +1030,12 @@ internal static class GenericLinalg<T>
         Real<T> one = Real<T>.One, two = Real<T>.Int(2);
         var colP = new Real<T>[m];
         var colQ = new Real<T>[m];
-        for (int sweep = 0; sweep < 100; sweep++)
+        bool converged = false;
+        Real<T> largestCosine = Real<T>.Zero;
+        for (int sweep = 0; sweep < MaxJacobiSweeps; sweep++)
         {
             bool rotated = false;
+            largestCosine = Real<T>.Zero;
             for (int p = 0; p < n - 1; p++)
             {
                 for (int q = p + 1; q < n; q++)
@@ -1007,6 +1048,7 @@ internal static class GenericLinalg<T>
                     // gamma is now the cosine between the columns; rotate unless already orthogonal.
                     if (Real<T>.Abs(gamma) <= tol) continue;
                     rotated = true;
+                    largestCosine = Real<T>.Max(largestCosine, Real<T>.Abs(gamma));
                     Real<T> zeta = (nq / np - np / nq) / (two * gamma);
                     Real<T> absZeta = Real<T>.Abs(zeta);
                     Real<T> t;
@@ -1028,8 +1070,11 @@ internal static class GenericLinalg<T>
                     }
                 }
             }
-            if (!rotated) break;
+            if (!rotated) { converged = true; break; }
         }
+        if (!converged && largestCosine > Real<T>.Int(JacobiStallFactor * n) * tol)
+            throw new ArithmeticException(
+                $"Svd: the Jacobi iteration failed to converge for {typeof(T).Name} input in {MaxJacobiSweeps} sweeps (LAPACK info > 0).");
 
         var sigma = new Real<T>[n];
         for (int j = 0; j < n; j++)
