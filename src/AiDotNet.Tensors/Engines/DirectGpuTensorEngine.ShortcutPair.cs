@@ -47,6 +47,9 @@ public partial class DirectGpuTensorEngine : IConvShortcutPairEngine
             || gradOutput1._shape[2] != gradOutput3._shape[2] || gradOutput1._shape[3] != gradOutput3._shape[3]
             || gradOutput3._shape[1] != kernel3._shape[0] || gradOutput1._shape[1] != kernel1._shape[0])
             return null;
+        // Under FP16/BF16 autocast each input gradient runs in that precision (#1549); the pair kernel is FP32.
+        if (TryResolveAutocastConvRoute(backend, out _))
+            return null;
         int batch = inputShape[0], inC = inputShape[1], inH = inputShape[2], inW = inputShape[3];
         int k3 = kernel3._shape[0], k1 = kernel1._shape[0], outH = gradOutput3._shape[2], outW = gradOutput3._shape[3];
         try

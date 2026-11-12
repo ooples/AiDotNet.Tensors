@@ -601,7 +601,8 @@ internal static class WinogradF23KernelTemplate
     }
 
     // The bodies' dialect-neutral spellings: the work-group barrier, fused multiply-add, reciprocal square root, float
-    // maximum, and an int parameter's bits read as a float (float parameters ride in the int list).
+    // maximum, an int parameter's bits read as a float (float parameters ride in the int list), and a float value
+    // converted to int (GLSL has no C cast).
     private static string Spell(string body, WinogradKernelDialect dialect)
         => body.Replace("BARRIER();", dialect switch
         {
@@ -623,6 +624,9 @@ internal static class WinogradF23KernelTemplate
             _ => "fmax(",
         })
         .Replace("PRECISE ", dialect == WinogradKernelDialect.Glsl ? "precise " : "")
+        .Replace("TOINT(", dialect == WinogradKernelDialect.Glsl ? "int(" : "(int)(")
+        .Replace("TOFLOAT(", dialect == WinogradKernelDialect.Glsl ? "float(" : "(float)(")
+        .Replace("EXP(", dialect == WinogradKernelDialect.Hip ? "expf(" : "exp(")
         .Replace("IBITS(", dialect switch
         {
             WinogradKernelDialect.OpenCl => "as_float(",

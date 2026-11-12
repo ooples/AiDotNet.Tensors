@@ -2866,14 +2866,24 @@ public sealed class GradientTape<T> : IDisposable
                     }
             // A backward may keep the value in its saved state instead of (or as well as) its inputs.
             if (e.SavedState is { } saved)
+            {
                 for (int k = 0; k < saved.Length; k++)
+                {
                     if (ReferenceEquals(saved[k], target)) saved[k] = old;
+                    else if (saved[k] is CpuEngine.ReadoutMutationGuard<T> guard) guard.Rebase(target, old);
+                }
+            }
             if (e.Output.GradFn is { } consumer && !ReferenceEquals(consumer, node))
             {
                 RepointNodeInputs(consumer, target, old);
                 if (consumer.SavedState is { } nodeSaved && !ReferenceEquals(nodeSaved, e.SavedState))
+                {
                     for (int k = 0; k < nodeSaved.Length; k++)
+                    {
                         if (ReferenceEquals(nodeSaved[k], target)) nodeSaved[k] = old;
+                        else if (nodeSaved[k] is CpuEngine.ReadoutMutationGuard<T> guard) guard.Rebase(target, old);
+                    }
+                }
             }
             if (producer) return true;
         }

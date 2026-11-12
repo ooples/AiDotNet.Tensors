@@ -49,7 +49,15 @@ jobs:
   gpu-parity-pocl:
     # Skip on the release-please Release PR and the release merge-commit push (mirrors build.yml).
     if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
-    runs-on: ubuntu-latest
+    # Overflow onto self-hosted Linux runners labelled `pocl`: the shards named in the repository variable
+    # POCL_SELF_HOSTED_SHARDS (comma-separated matrix names, e.g. op-forward-1,op-forward-2) run there instead of on a
+    # GitHub-hosted runner, so a queue of pull requests is not held by the hosted concurrency limit alone. Only for
+    # this repository's own branches: a fork's pull request always runs hosted (a self-hosted runner must not execute
+    # untrusted code). Clear the variable while those runners are offline, or the listed shards wait for them.
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+          && contains(format(',{0},', vars.POCL_SELF_HOSTED_SHARDS), format(',{0},', matrix.name))
+          && fromJSON('["self-hosted","Linux","X64","pocl"]') || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -96,11 +104,20 @@ jobs:
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+    # setup-dotnet installs into /usr/share/dotnet on Linux. On a self-hosted runner install into the runner's home
+    # instead (kept between runs, so the SDK is fetched once), not into a system directory the job would have to sudo.
+    - name: SDK location (self-hosted)
+      if: runner.environment == 'self-hosted'
+      run: echo "DOTNET_INSTALL_DIR=$HOME/.dotnet" >> "$GITHUB_ENV"
+
     - name: Setup .NET
       uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
       with:
         dotnet-version: '10.0.x'
-        dotnet-quality: 'preview'
+        # GA on a self-hosted runner: 'preview' on the 10.0 channel resolves to 10.0.100-rc.2, whose NuGet fails the restore
+        # with NU1510. Hosted runners mask that with the image's newer preinstalled SDK; a self-hosted runner has none
+        # (the CUDA lane pins GA for the same reason).
+        dotnet-quality: ${{ runner.environment == 'self-hosted' && 'ga' || 'preview' }}
 
     - name: Install POCL (CPU OpenCL device) + ICD loader
       run: |
