@@ -222,13 +222,19 @@ fn dd_is_white(b: u32) -> bool { return b == 32u || (b >= 9u && b <= 13u); }
 fn dd_byte(k: i32) -> u32 { return (words[u32(k) >> 2u] >> ((u32(k) & 3u) * 8u)) & 255u; }
 ";
 
-    internal const string Decode = @"
+    // The host sizes segments and work-groups from DataDecodeKernelTemplate; every module declares the same values as
+    // WGSL constants, so a change to the template reaches the kernels instead of leaving WebGPU on stale boundaries.
+    private static readonly string TemplateConstants =
+        "const DD_GROUP: i32 = " + DataDecodeKernelTemplate.GroupSize + ";\n" +
+        "const DD_SEGMENT: i32 = " + DataDecodeKernelTemplate.SegmentBytes + ";\n";
+
+    internal static readonly string Decode = TemplateConstants + @"
 struct Params { nItems: i32, typeCode: i32, elemSize: i32, littleEndian: i32, firstItem: i32, pad0: i32, pad1: i32, pad2: i32, }
 @group(0) @binding(0) var<storage, read> words: array<u32>;
 @group(0) @binding(1) var<storage, read_write> outBits: array<u32>;
 @group(0) @binding(2) var<uniform> pm: Params;
 " + Helpers + ByteFn + @"
-@compute @workgroup_size(256)
+@compute @workgroup_size(DD_GROUP)
 fn dd_decode_bytes(@builtin(global_invocation_id) gidv: vec3<u32>) {
     let i = i32(gidv.x) + pm.firstItem;
     if (i >= pm.nItems) { return; }
@@ -255,19 +261,19 @@ fn dd_decode_bytes(@builtin(global_invocation_id) gidv: vec3<u32>) {
 }
 ";
 
-    internal const string CountSeparators = @"
+    internal static readonly string CountSeparators = TemplateConstants + @"
 struct Params { textLen: i32, delim: i32, nSegs: i32, firstItem: i32, pad0: i32, pad1: i32, pad2: i32, pad3: i32, }
 @group(0) @binding(0) var<storage, read> words: array<u32>;
 @group(0) @binding(1) var<storage, read_write> counts: array<i32>;
 @group(0) @binding(2) var<uniform> pm: Params;
 " + ByteFn + @"
-@compute @workgroup_size(256)
+@compute @workgroup_size(DD_GROUP)
 fn dd_count_separators(@builtin(global_invocation_id) gidv: vec3<u32>) {
     let seg = i32(gidv.x) + pm.firstItem;
     if (seg >= pm.nSegs) { return; }
-    let start = seg * 64;
+    let start = seg * DD_SEGMENT;
     var stop = pm.textLen;
-    if (start + 64 < pm.textLen) { stop = start + 64; }
+    if (start + DD_SEGMENT < pm.textLen) { stop = start + DD_SEGMENT; }
     let dl = u32(pm.delim);
     var c = 0;
     for (var k = start; k < stop; k = k + 1) {
@@ -278,18 +284,18 @@ fn dd_count_separators(@builtin(global_invocation_id) gidv: vec3<u32>) {
 }
 ";
 
-    internal const string Scan = @"
+    internal static readonly string Scan = TemplateConstants + @"
 struct Params { nItems: i32, pad0: i32, pad1: i32, pad2: i32, pad3: i32, pad4: i32, pad5: i32, pad6: i32, }
 @group(0) @binding(0) var<storage, read_write> vals: array<i32>;
 @group(0) @binding(1) var<storage, read_write> total: array<i32>;
 @group(0) @binding(2) var<uniform> pm: Params;
-var<workgroup> sm: array<i32, 256>;
+var<workgroup> sm: array<i32, DD_GROUP>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(DD_GROUP)
 fn dd_exclusive_scan(@builtin(local_invocation_index) lidx: u32) {
     let lid = i32(lidx);
     let n = pm.nItems;
-    let per = (n + 255) / 256;
+    let per = (n + DD_GROUP - 1) / DD_GROUP;
     let lo0 = lid * per;
     var hi0 = n;
     if (lo0 + per < n) { hi0 = lo0 + per; }
@@ -299,7 +305,7 @@ fn dd_exclusive_scan(@builtin(local_invocation_index) lidx: u32) {
     workgroupBarrier();
     if (lid == 0) {
         var run = 0;
-        for (var t = 0; t < 256; t = t + 1) { let v = sm[t]; sm[t] = run; run = run + v; }
+        for (var t = 0; t < DD_GROUP; t = t + 1) { let v = sm[t]; sm[t] = run; run = run + v; }
         total[0] = run;
     }
     workgroupBarrier();
@@ -308,20 +314,20 @@ fn dd_exclusive_scan(@builtin(local_invocation_index) lidx: u32) {
 }
 ";
 
-    internal const string ScatterBounds = @"
+    internal static readonly string ScatterBounds = TemplateConstants + @"
 struct Params { textLen: i32, delim: i32, nSegs: i32, trailingNewline: i32, firstItem: i32, pad0: i32, pad1: i32, pad2: i32, }
 @group(0) @binding(0) var<storage, read> words: array<u32>;
 @group(0) @binding(1) var<storage, read> offs: array<i32>;
 @group(0) @binding(2) var<storage, read_write> bounds: array<i32>;
 @group(0) @binding(3) var<uniform> pm: Params;
 " + ByteFn + @"
-@compute @workgroup_size(256)
+@compute @workgroup_size(DD_GROUP)
 fn dd_scatter_bounds(@builtin(global_invocation_id) gidv: vec3<u32>) {
     let seg = i32(gidv.x) + pm.firstItem;
     if (seg >= pm.nSegs) { return; }
-    let start = seg * 64;
+    let start = seg * DD_SEGMENT;
     var stop = pm.textLen;
-    if (start + 64 < pm.textLen) { stop = start + 64; }
+    if (start + DD_SEGMENT < pm.textLen) { stop = start + DD_SEGMENT; }
     let dl = u32(pm.delim);
     var f = offs[seg];
     if (seg == 0) { bounds[0] = 0; }
@@ -347,7 +353,7 @@ fn dd_scatter_bounds(@builtin(global_invocation_id) gidv: vec3<u32>) {
 }
 ";
 
-    internal const string ParseFields = @"
+    internal static readonly string ParseFields = TemplateConstants + @"
 struct Params { nItems: i32, styleMask: i32, missingBits: i32, firstItem: i32, pad0: i32, pad1: i32, pad2: i32, pad3: i32, }
 @group(0) @binding(0) var<storage, read> words: array<u32>;
 @group(0) @binding(1) var<storage, read> bounds: array<i32>;
@@ -355,7 +361,7 @@ struct Params { nItems: i32, styleMask: i32, missingBits: i32, firstItem: i32, p
 @group(0) @binding(3) var<storage, read_write> status: array<i32>;
 @group(0) @binding(4) var<uniform> pm: Params;
 " + Helpers + ByteFn + @"
-@compute @workgroup_size(256)
+@compute @workgroup_size(DD_GROUP)
 fn dd_parse_fields(@builtin(global_invocation_id) gidv: vec3<u32>) {
     let f = i32(gidv.x) + pm.firstItem;
     if (f >= pm.nItems) { return; }
