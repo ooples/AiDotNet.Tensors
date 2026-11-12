@@ -463,70 +463,77 @@ jobs:
         }
 
         $exitCode = 0
-        foreach ($part in $parts) {
-          $testArgs = 'test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj ' +
-            '--configuration Release --no-build --framework net10.0 ' +
-            "--filter `"$($part.Filter)`" " +
-            "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=$($part.Trx)`" " +
-            '--blame-hang --blame-hang-timeout 900s --blame-crash'
-          $deadline = (Get-Date).AddMinutes($part.Minutes)
-          if ($jobDeadline -lt $deadline) { $deadline = $jobDeadline }
-          Write-Output "GPU suites, $($part.Name): watchdog deadline $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
+        # Sampling stops however the loop ends, so the summary and the sample files are always written.
+        try {
+          foreach ($part in $parts) {
+            $testArgs = 'test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj ' +
+              '--configuration Release --no-build --framework net10.0 ' +
+              "--filter `"$($part.Filter)`" " +
+              "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=$($part.Trx)`" " +
+              '--blame-hang --blame-hang-timeout 900s --blame-crash'
+            $deadline = (Get-Date).AddMinutes($part.Minutes)
+            if ($jobDeadline -lt $deadline) { $deadline = $jobDeadline }
+            Write-Output "GPU suites, $($part.Name): watchdog deadline $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
 
-          $run = Start-Process dotnet -ArgumentList $testArgs -NoNewWindow -PassThru
-          $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
-          # Wait in 30-second slices (the sampling interval), recording the run's processes at each.
-          $finished = $false
-          while ($true) {
-            $null = Update-RunTree
-            $waitMs = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalMilliseconds)
-            if ($run.WaitForExit([Math]::Min($waitMs, 30000))) { $finished = $true; break }
-            if ($waitMs -le 30000) { break }
-          }
-          if ($finished) {
-            if ($run.ExitCode -ne 0) { $exitCode = $run.ExitCode }
-            continue
-          }
-
-          Write-Output "::error::The GPU suites ($($part.Name)) were still running at the watchdog deadline."
-          $exitCode = 1
-          try {
-            # Only this run's processes, so another workload's test host on the runner is never inspected.
-            $mine = Update-RunTree
-            Write-Output "::group::Processes of this run"
-            $mine | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
-            Write-Output "::endgroup::"
-
-            # Each diagnostic is bounded, so a stalled install or attach cannot spend the reserve.
-            $tools = "${{ runner.temp }}/dotnet-stack"
-            if (-not (Test-Path "$tools/dotnet-stack*")) {
-              $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
-              if (-not $install.WaitForExit(180000)) {
-                Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
-                Write-Output "::warning::dotnet-stack did not install within 3 minutes; no stacks printed."
-              }
+            $run = Start-Process dotnet -ArgumentList $testArgs -NoNewWindow -PassThru
+            $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
+            # Wait in 30-second slices (the sampling interval), recording the run's processes at each.
+            $finished = $false
+            while ($true) {
+              $null = Update-RunTree
+              $waitMs = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalMilliseconds)
+              if ($run.WaitForExit([Math]::Min($waitMs, 30000))) { $finished = $true; break }
+              if ($waitMs -le 30000) { break }
             }
-            if (Test-Path "$tools/dotnet-stack*") {
-              foreach ($testHost in @($mine | Where-Object { $_.Name -like 'testhost*' })) {
-                Write-Output "::group::Managed stacks of testhost $($testHost.ProcessId)"
-                $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($testHost.ProcessId)" -NoNewWindow -PassThru
-                if (-not $report.WaitForExit(120000)) {
-                  Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
-                  Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($testHost.ProcessId)."
+            if ($finished) {
+              if ($run.ExitCode -ne 0) { $exitCode = $run.ExitCode }
+              continue
+            }
+
+            Write-Output "::error::The GPU suites ($($part.Name)) were still running at the watchdog deadline."
+            $exitCode = 1
+            try {
+              # Only this run's processes, so another workload's test host on the runner is never inspected.
+              $mine = Update-RunTree
+              Write-Output "::group::Processes of this run"
+              $mine | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
+              Write-Output "::endgroup::"
+
+              # Each diagnostic is bounded, so a stalled install or attach cannot spend the reserve.
+              $tools = "${{ runner.temp }}/dotnet-stack"
+              if (-not (Test-Path "$tools/dotnet-stack*")) {
+                $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
+                if (-not $install.WaitForExit(180000)) {
+                  Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
+                  Write-Output "::warning::dotnet-stack did not install within 3 minutes; no stacks printed."
                 }
-                Write-Output "::endgroup::"
               }
+              if (Test-Path "$tools/dotnet-stack*") {
+                foreach ($testHost in @($mine | Where-Object { $_.Name -like 'testhost*' })) {
+                  Write-Output "::group::Managed stacks of testhost $($testHost.ProcessId)"
+                  $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($testHost.ProcessId)" -NoNewWindow -PassThru
+                  if (-not $report.WaitForExit(120000)) {
+                    Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
+                    Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($testHost.ProcessId)."
+                  }
+                  Write-Output "::endgroup::"
+                }
+              }
+            } catch {
+              # A diagnostic that cannot start must not end the script: the next part still runs.
+              Write-Output "::warning::GPU suites ($($part.Name)) diagnostics failed: $($_.Exception.Message)"
+            } finally {
+              taskkill /T /F /PID $run.Id | Out-Null
             }
-          } finally {
-            taskkill /T /F /PID $run.Id | Out-Null
+            # Past the job's own deadline there is no time left for another part.
+            if ((Get-Date) -ge $jobDeadline) {
+              Write-Output "::error::The job deadline passed; the remaining GPU suite parts did not run."
+              break
+            }
           }
-          # Past the job's own deadline there is no time left for another part.
-          if ((Get-Date) -ge $jobDeadline) {
-            Write-Output "::error::The job deadline passed; the remaining GPU suite parts did not run."
-            break
-          }
+        } finally {
+          Stop-GpuSampling
         }
-        Stop-GpuSampling
         exit $exitCode
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
       # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
