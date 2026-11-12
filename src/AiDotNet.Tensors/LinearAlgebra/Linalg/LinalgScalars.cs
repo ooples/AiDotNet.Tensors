@@ -36,6 +36,14 @@ internal static class LinalgScalars
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= input._shape[i];
 
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        {
+            // decimal / Half / BFloat16: product of the pivots carried out in T.
+            for (int b = 0; b < batch; b++)
+                detData[b] = GenericLinalg<T>.DetFromLu(luData, b * n * n, pivData, b * n, n);
+            return det;
+        }
+
         for (int b = 0; b < batch; b++)
         {
             double val = 1.0;

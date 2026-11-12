@@ -36,11 +36,35 @@ internal static class LinearSolvers
                 goto default;
             default:
                 var (lu, pivots) = LuDecomposition.Factor(a);
+                if (!GenericLinalg<T>.HasNaN && typeof(T) != typeof(float) && typeof(T) != typeof(double))
+                    ThrowIfSingular(lu);
                 return LuDecomposition.Solve(lu, pivots, b);
         }
     }
 
     private enum MatrixStructure { General, LowerTriangular, UpperTriangular, SymmetricPositiveDefinite }
+
+    /// <summary>
+    /// Element types without NaN (decimal) cannot signal a singular system through the solution the
+    /// way float/double do, so <see cref="Solve{T}"/> raises instead — the torch.linalg.solve contract.
+    /// <see cref="SolveEx{T}"/> reports the same condition through its info tensor without throwing.
+    /// </summary>
+    private static void ThrowIfSingular<T>(Tensor<T> lu)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        int rank = lu.Rank;
+        int n = lu.Shape[rank - 1];
+        int batch = 1;
+        for (int i = 0; i < rank - 2; i++) batch *= lu.Shape[i];
+        using var lease = lu.LeaseArray();
+        for (int bi = 0; bi < batch; bi++)
+        {
+            int status = GenericLinalg<T>.FirstZeroDiagonal(lease.Array, bi * n * n, n);
+            if (status != 0)
+                throw new ArgumentException(
+                    $"Solve: the input matrix is singular (U[{status - 1},{status - 1}] is zero).", nameof(lu));
+        }
+    }
 
     private static MatrixStructure DetectStructure<T>(Tensor<T> a)
         where T : unmanaged, IEquatable<T>, IComparable<T>
@@ -56,6 +80,8 @@ internal static class LinearSolvers
 
         using var dLease = a.LeaseArray();
         var d = dLease.Array;
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return DetectStructureGeneric(d, n);
         const double tol = 1e-8;
 
         bool upperTri = true;
@@ -89,6 +115,29 @@ internal static class LinearSolvers
         return MatrixStructure.General;
     }
 
+    // Same classification as DetectStructure, evaluated in T for decimal / Half / BFloat16.
+    private static MatrixStructure DetectStructureGeneric<T>(T[] d, int n)
+        where T : unmanaged, IEquatable<T>, IComparable<T>
+    {
+        if (!GenericLinalg<T>.IsSupported) return MatrixStructure.General;
+        Real<T> tol = Real<T>.Ops.FromDouble(1e-8);
+        bool upperTri = true, lowerTri = true, symmetric = true;
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+            {
+                Real<T> v = d[i * n + j];
+                if (i > j && Real<T>.Abs(v) > tol) upperTri = false;
+                if (i < j && Real<T>.Abs(v) > tol) lowerTri = false;
+                if (i != j && Real<T>.Abs(v - d[j * n + i]) > tol) symmetric = false;
+            }
+        if (upperTri) return MatrixStructure.UpperTriangular;
+        if (lowerTri) return MatrixStructure.LowerTriangular;
+        if (!symmetric) return MatrixStructure.General;
+        for (int i = 0; i < n; i++)
+            if (((Real<T>)d[i * n + i]) <= Real<T>.Zero) return MatrixStructure.General;
+        return MatrixStructure.SymmetricPositiveDefinite;
+    }
+
     internal static (Tensor<T> Solution, Tensor<int> Info) SolveEx<T>(Tensor<T> a, Tensor<T> b)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
@@ -111,10 +160,17 @@ internal static class LinearSolvers
         for (int bi = 0; bi < batch; bi++)
         {
             int status = 0;
-            for (int k = 0; k < n; k++)
+            if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             {
-                double diag = ToDouble(luData[bi * n * n + k * n + k]);
-                if (diag == 0.0) { status = k + 1; break; }
+                status = GenericLinalg<T>.FirstZeroDiagonal(luData, bi * n * n, n);
+            }
+            else
+            {
+                for (int k = 0; k < n; k++)
+                {
+                    double diag = ToDouble(luData[bi * n * n + k * n + k]);
+                    if (diag == 0.0) { status = k + 1; break; }
+                }
             }
             iData[bi] = status;
         }
@@ -383,8 +439,8 @@ internal static class LinearSolvers
         // ToDouble/FromDouble conversion. The row update x[i,:] −= a_ij·x[j,:] and the
         // diagonal divide x[i,:] /= div are written as flat in-place loops over the
         // nrhs RHS columns that RyuJIT auto-vectorizes (same raw-loop style as the
-        // streaming / LSTM-cell kernels — no external SIMD). Generic T keeps the
-        // double-accumulating scalar path below.
+        // streaming / LSTM-cell kernels — no external SIMD). Other element types run
+        // the generic kernel in T.
         if (typeof(T) == typeof(float))
         {
             TriangularSolveSingleFloat((float[])(object)a, offA, (float[])(object)x, offX,
@@ -398,45 +454,8 @@ internal static class LinearSolvers
             return;
         }
 
-        // Four cases:
-        //   upper + !transpose: U·x = b (backward substitution)
-        //   upper +  transpose: Uᵀ·x = b (forward substitution)
-        //   !upper + !transpose: L·x = b (forward substitution)
-        //   !upper +  transpose: Lᵀ·x = b (backward substitution)
-        bool backward = upper ^ transpose;
-        for (int c = 0; c < nrhs; c++)
-        {
-            if (backward)
-            {
-                for (int i = n - 1; i >= 0; i--)
-                {
-                    double sum = ToDouble(x[offX + i * nrhs + c]);
-                    for (int j = i + 1; j < n; j++)
-                    {
-                        int aRow = transpose ? j : i;
-                        int aCol = transpose ? i : j;
-                        sum -= ToDouble(a[offA + aRow * n + aCol]) * ToDouble(x[offX + j * nrhs + c]);
-                    }
-                    double div = unitDiagonal ? 1.0 : ToDouble(a[offA + i * n + i]);
-                    x[offX + i * nrhs + c] = FromDouble<T>(sum / div);
-                }
-            }
-            else
-            {
-                for (int i = 0; i < n; i++)
-                {
-                    double sum = ToDouble(x[offX + i * nrhs + c]);
-                    for (int j = 0; j < i; j++)
-                    {
-                        int aRow = transpose ? j : i;
-                        int aCol = transpose ? i : j;
-                        sum -= ToDouble(a[offA + aRow * n + aCol]) * ToDouble(x[offX + j * nrhs + c]);
-                    }
-                    double div = unitDiagonal ? 1.0 : ToDouble(a[offA + i * n + i]);
-                    x[offX + i * nrhs + c] = FromDouble<T>(sum / div);
-                }
-            }
-        }
+        // decimal / Half / BFloat16: forward / backward substitution carried out in T.
+        GenericLinalg<T>.TriangularSolve(a, offA, x, offX, n, nrhs, upper, transpose, unitDiagonal);
     }
 
     // #379 float fast path for TriangularSolveSingle. Restructures the solve so the

@@ -167,6 +167,13 @@ internal static class LuDecomposition
                 return;
         }
 
+        // decimal / Half / BFloat16: the same partial-pivot Doolittle carried out in T.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        {
+            GenericLinalg<T>.LuFactor(a, offA, piv, offPiv, m, n);
+            return;
+        }
+
         // Managed reference.
         for (int j = 0; j < k; j++)
         {
@@ -215,6 +222,11 @@ internal static class LuDecomposition
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         int colsX = bIsVector ? 1 : nrhs;
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        {
+            GenericLinalg<T>.LuSolve(lu, offLU, piv, offPiv, x, offX, n, colsX);
+            return;
+        }
 
         // Apply pivots to RHS.
         for (int i = 0; i < n; i++)
@@ -292,13 +304,15 @@ internal static class LuDecomposition
         int uBase = batchIdx * uStride;
         int pBase = batchIdx * pStride;
 
+        T one = Helpers.MathHelper.GetNumericOperations<T>().One;
+
         // L: lower of LU with unit diagonal, width k.
         for (int i = 0; i < m; i++)
         {
             for (int j = 0; j < k; j++)
             {
                 if (i > j) lData[lBase + i * k + j] = luData[luBase + i * n + j];
-                else if (i == j) lData[lBase + i * k + j] = FromDouble<T>(1.0);
+                else if (i == j) lData[lBase + i * k + j] = one;
                 else lData[lBase + i * k + j] = default;
             }
         }
@@ -317,7 +331,7 @@ internal static class LuDecomposition
         for (int i = 0; i < m; i++)
         {
             for (int j = 0; j < m; j++)
-                pData[pBase + i * m + j] = i == j ? FromDouble<T>(1.0) : default;
+                pData[pBase + i * m + j] = i == j ? one : default;
         }
         for (int i = 0; i < k; i++)
         {
