@@ -4563,11 +4563,7 @@ internal static partial class BackwardFunctions<T>
         if (TrySecondOrderHuberLoss(gradOutput, inputs, engine, grads, delta)) return;
         if (LowPrecisionGradients.Applies<T>())
         {
-            // Half/BFloat16: clamp(p - y, -delta, delta) g / n in float32, rounded once.
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionLossGradient(inputs[0], target, gradOutput,
-                (p, y) => Math.Max(-delta, Math.Min(delta, p - y)),
-                (p, y) => Math.Abs(p - y) <= delta ? 1.0 : 0.0,
-                (p, y) => Math.Abs(p - y) <= delta ? -1.0 : 0.0), engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionHuberGradient(inputs[0], target, gradOutput, delta), engine);
             return;
         }
         T scaleT = numOps.FromDouble(numOps.ToDouble(gradOutput[0]) / inputs[0].Length);
@@ -4578,6 +4574,14 @@ internal static partial class BackwardFunctions<T>
         var grad = engine.TensorMultiplyScalar(clamped, scaleT);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // Half/BFloat16: clamp(p - y, -delta, delta) g / n in float32, rounded once. Its own method: the lambdas capture
+    // delta, and a capture inside HuberLossBackward allocated a closure on every call, first-order float ones too.
+    private static Tensor<T> LowPrecisionHuberGradient(Tensor<T> predictions, Tensor<T> target, Tensor<T> gradOutput, double delta) =>
+        LowPrecisionLossGradient(predictions, target, gradOutput,
+            (p, y) => Math.Max(-delta, Math.Min(delta, p - y)),
+            (p, y) => Math.Abs(p - y) <= delta ? 1.0 : 0.0,
+            (p, y) => Math.Abs(p - y) <= delta ? -1.0 : 0.0);
 
     /// <summary>KL divergence loss backward</summary>
     internal static void KLDivLossBackward(

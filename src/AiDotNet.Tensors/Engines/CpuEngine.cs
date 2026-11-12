@@ -49905,7 +49905,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var scaleF = WidenToFloat(
             LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: true, correction: 0, squareRoot: true), keptSize);
         for (int i = 0; i < scaleF.Length; i++)
-            if (!(scaleF[i] > 0f) || float.IsInfinity(scaleF[i])) scaleF[i] = 1f; // a constant slice keeps std 0 and its gradient
+            if (float.IsNaN(scaleF[i]) || scaleF[i] <= 0f || float.IsInfinity(scaleF[i])) scaleF[i] = 1f; // a constant slice keeps std 0 and its gradient
         var scale = NarrowFromFloat<T>(scaleF);
         var centreKept = new Tensor<T>(centre, (int[])keptShape.Clone());
         var scaleKept = new Tensor<T>(scale, (int[])keptShape.Clone());

@@ -4746,7 +4746,7 @@ public partial class DirectGpuTensorEngine
             // index tie-break that makes the sort stable) is no longer exact, so such rows sort on the host. Decided
             // before any contiguous copy, which the host sort does not need.
             if (numRows == 0 || L > MaxFloatExactSortIndexColumns) return base.TensorSort(input, axis, descending);
-            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            var c = input.IsContiguous ? input : input.Contiguous();
             // Resident: keep the sorted values AND the int indices on the GPU (FinishGpuOp). The index
             // tensor rides as a float buffer (int-as-float); downstream TakeAlongDim/gather reuse it in
             // place (no re-upload) — completing the argsort -> gather int-residency chain.
