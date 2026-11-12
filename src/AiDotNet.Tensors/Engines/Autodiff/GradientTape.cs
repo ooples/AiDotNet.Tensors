@@ -1752,6 +1752,10 @@ public sealed class GradientTape<T> : IDisposable
             foreach (var retained in _retainGrad) relevant.Add(retained);
         if (_hooks is not null)
             foreach (var hooked in _hooks.Keys) relevant.Add(hooked);
+        // An opaque entry's backward reaches leaves it never recorded as inputs, so no walk over recorded inputs can
+        // tell whether it depends on a source: keep it.
+        if (_opaqueOutputs is not null)
+            foreach (var opaque in _opaqueOutputs) relevant.Add(opaque);
 
         // Prefer the GradFn graph because it can cross tape boundaries. Higher-order
         // differentiation intentionally returns a gradient whose producer nodes belong to an
@@ -2724,6 +2728,18 @@ public sealed class GradientTape<T> : IDisposable
     /// <summary>
     /// Clears all recorded entries from the tape without disposing it.
     /// </summary>
+    /// <summary>
+    /// Marks a recorded output whose backward produces gradients for leaves it did not record as inputs (an unfiltered
+    /// gradient checkpoint differentiates every leaf its recomputed forward touches). Requested-source pruning follows
+    /// recorded inputs only, so it always keeps such an entry.
+    /// </summary>
+    internal void MarkOpaqueOutput(Tensor<T> output)
+    {
+        (_opaqueOutputs ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)).Add(output);
+    }
+
+    private HashSet<Tensor<T>>? _opaqueOutputs;
+
     public void Reset()
     {
         if (_disposed)
@@ -2733,6 +2749,7 @@ public sealed class GradientTape<T> : IDisposable
 
         ReleaseSavedStatePins(_entries.Count);
         _entries.Reset();
+        _opaqueOutputs = null;
         // The cached backward chain addresses the entries just dropped.
         _cachedDelegateChain?.Clear();
         _cachedDelegateChain = null;

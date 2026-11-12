@@ -82,9 +82,15 @@ public static class GradientCheckpointing<T>
         int segmentSize,
         Func<Tensor<T>, Tensor<T>, bool>? tryConsumeParameterGradient)
     {
-        if (functions == null || functions.Count == 0) return input;
         if (segmentSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(segmentSize), "Must be positive.");
+        if (functions == null || functions.Count == 0)
+        {
+            // No functions means zero segments; a supplied list of segment lists must say so too.
+            if (segmentParameters is not null && segmentParameters.Count != 0)
+                throw new ArgumentException($"Expected 0 segment parameter lists, got {segmentParameters.Count}.", nameof(segmentParameters));
+            return input;
+        }
 
         // 1 + (n - 1) / size, not (n + size - 1) / size: the latter overflows for a segment size near int.MaxValue.
         int numSegments = 1 + (functions.Count - 1) / segmentSize;
@@ -121,6 +127,7 @@ public static class GradientCheckpointing<T>
 
             // Run segment forward WITHOUT recording (save memory) on both CPU (TensorArena) and GPU (TensorScope).
             Tensor<T> segmentOutput;
+            IReadOnlyList<Tensor<T>>? selected;
             using (var segmentGpuScope = TensorScope.Begin())
             using (var segmentArena = TensorArena.Create(poolWhenNested: true))
             using (GradientTape<T>.NoGrad())
@@ -131,6 +138,17 @@ public static class GradientCheckpointing<T>
                 // Only the segment boundary escapes. Copy it out (device-resident on GPU, arena-independent on CPU),
                 // then release every internal activation immediately on scope disposal.
                 segmentOutput = segmentGpuScope.Keep(CloneCheckpointBoundary(segmentOutput, engine));
+                // Select the parameters while the scope is still open: a layer that creates a GPU parameter on its first
+                // forward registers it here, and the scope would release its storage on disposal. Parameters outlive
+                // every activation scope, so each selected one is handed back to its own lifetime.
+                selected = segmentParameters is not null
+                    ? segmentParameters[seg]
+                    : parameterSourceFactory?.Invoke();
+                if (selected is not null)
+                {
+                    for (int i = 0; i < selected.Count; i++)
+                        if (selected[i] is { } parameter) TensorScope.Detach(parameter);
+                }
             }
 
             // Record a single "checkpoint" op that recomputes during backward. A selective
@@ -138,9 +156,6 @@ public static class GradientCheckpointing<T>
             // boundary. Besides making the dependency explicit, this lets requested-source graph
             // pruning retain the checkpoint when a caller asks only for trainable parameters.
             Tensor<T>[]? checkpointInputs = null;
-            IReadOnlyList<Tensor<T>>? selected = segmentParameters is not null
-                ? segmentParameters[seg]
-                : parameterSourceFactory?.Invoke();
             if (selected is not null)
             {
                 var unique = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
@@ -295,6 +310,9 @@ public static class GradientCheckpointing<T>
             {
                 DifferentiableOps.RecordUnary<T>(
                     $"Checkpoint_seg{seg}", segmentOutput, segmentInput, backward);
+                // The unfiltered recompute differentiates every leaf the segment touches, and none is a recorded
+                // input: without the mark, pruning for a parameter-only gradient request drops this segment.
+                tape.MarkOpaqueOutput(segmentOutput);
             }
             else
             {
