@@ -87,7 +87,7 @@ public partial class CpuEngine
             }
             else if (destination is int[] n)
             {
-                for (int i = from; i < to; i++) n[i] = unchecked((int)DecodeAsInt64(p + (long)i * width, type, littleEndian));
+                for (int i = from; i < to; i++) n[i] = DecodeAsInt32(p + (long)i * width, type, littleEndian);
             }
             else if (staging is not null)
             {
@@ -149,14 +149,39 @@ public partial class CpuEngine
         ulong raw = ReadRaw(p, type.GetByteWidth(), littleEndian);
         switch (type)
         {
-            // A floating source truncates toward zero, as torch's .to(int64) does.
             case NumericStorageType.Float16:
             case NumericStorageType.Float32:
             case NumericStorageType.Float64:
-                return (long)DecodeAsDouble(p, type, littleEndian);
+                return SaturateToInt64(DecodeAsDouble(p, type, littleEndian));
             default:
                 return DecodeAsInt64Raw(raw, type);
         }
+    }
+
+    // An integer source narrows by two's-complement wrap (as torch's integer .to(int32) does); a floating source truncates
+    // toward zero and saturates, with NaN as 0.
+    private static unsafe int DecodeAsInt32(byte* p, NumericStorageType type, bool littleEndian)
+    {
+        switch (type)
+        {
+            case NumericStorageType.Float16:
+            case NumericStorageType.Float32:
+            case NumericStorageType.Float64:
+                return (int)Math.Max(int.MinValue, Math.Min(int.MaxValue, SaturateToInt64(DecodeAsDouble(p, type, littleEndian))));
+            default:
+                return unchecked((int)DecodeAsInt64(p, type, littleEndian));
+        }
+    }
+
+    // A floating value truncated toward zero, saturated to the long range, NaN as 0: one rule on every target framework.
+    // The unchecked cast saturates on .NET 9+ but returns long.MinValue for NaN and out-of-range values on .NET 8 and
+    // .NET Framework x64. 2^63 is exactly representable, so ">= 2^63" is the overflow test.
+    private static long SaturateToInt64(double value)
+    {
+        if (double.IsNaN(value)) return 0;
+        if (value >= 9223372036854775808.0) return long.MaxValue;
+        if (value < -9223372036854775808.0) return long.MinValue;
+        return (long)value;
     }
 
     private static long DecodeAsInt64Raw(ulong raw, NumericStorageType type) => type switch

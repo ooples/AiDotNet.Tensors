@@ -235,6 +235,27 @@ public partial class DirectGpuTensorEngine
         return DeferTensorResult<T>(backend, buffer, count, (int[])shape.Clone());
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// A device-resident float destination receives the same row-major draws as a device result that is then aliased
+    /// into it, so the values never round-trip through the host. A host-resident destination is filled in place on the
+    /// host as on the CPU engine: an upload would only be read back.
+    /// </remarks>
+    public override void TensorRandomUniformFromGeneratorInto<T>(Random generator, Tensor<T> destination, double min, double max)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (generator is null) throw new ArgumentNullException(nameof(generator));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (typeof(T) != typeof(float) || destination.IsSparse || !destination.IsContiguous || destination.Length == 0
+            || !(destination.IsGpuResident || destination.HasPendingGpuData))
+        {
+            base.TensorRandomUniformFromGeneratorInto(generator, destination, min, max);
+            return;
+        }
+        var drawn = TensorRandomUniformFromGenerator<T>(generator, (int[])destination._shape.Clone(), min, max);
+        CopyResultInto(this, drawn, destination);
+    }
+
     private static int ValidateShapeElements(int[] shape)
     {
         if (shape is null) throw new ArgumentNullException(nameof(shape));

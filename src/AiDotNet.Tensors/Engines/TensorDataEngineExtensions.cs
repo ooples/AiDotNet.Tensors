@@ -42,7 +42,9 @@ public static class TensorDataEngineExtensions
     /// <c>numpy.frombuffer(buf, dtype=src).reshape(shape).astype(dtype)</c> (big-endian: <c>dtype('&gt;f8')</c>).</para>
     /// <para>Conversions round to nearest even (an int64 or float64 into float32 rounds once, a float64 too small for a
     /// float32 subnormal becomes a signed zero, one too large an infinity); a floating source converts to an integer
-    /// <typeparamref name="T"/> by truncation toward zero; NaN and infinity carry over to floating types. On
+    /// <typeparamref name="T"/> by truncation toward zero, and into <c>int</c> or <c>long</c> it saturates at the type's range
+    /// with NaN as 0 on every target framework; an integer source narrows into <c>int</c> by two's-complement wrap. NaN
+    /// and infinity carry over to floating types. On
     /// DirectGpuTensorEngine a float32 result is decoded on the device on all six backends.</para>
     /// </remarks>
     /// <exception cref="ArgumentException">The buffer's length does not match the shape, or a dimension is negative.</exception>
