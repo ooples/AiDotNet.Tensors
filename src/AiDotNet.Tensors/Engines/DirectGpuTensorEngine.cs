@@ -9559,11 +9559,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // The FP16 conv weights are converted from the persistent FP32 buffers released here, so they go with them.
-        var fp16ToDispose = new List<IGpuBuffer>();
-        foreach (var handle in _fp16WeightCache.Keys)
-        {
-            if (_fp16WeightCache.TryRemove(handle, out var fp16)) fp16ToDispose.Add(fp16.Half);
-        }
+        // TryRemove per key, so an entry another thread removes first is disposed once, by that thread.
+        var fp16ToDispose = _fp16WeightCache.Keys
+            .Select(handle => _fp16WeightCache.TryRemove(handle, out var fp16) ? fp16.Half : null)
+            .OfType<IGpuBuffer>()
+            .ToList();
 
         foreach (var pair in toDispose)
         {
