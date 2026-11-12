@@ -118,9 +118,9 @@ jobs:
     # pr and sm75/sm89: setup (up to 20 minutes), both suite parts at their full watchdogs with the diagnostics between
     # them (about 5 minutes), and the 30-minute reserve: 20 + 140 + 5 + 90 + 30 = 285 on the slowest cuda-pr runner,
     # 270 elsewhere. A DirectGpu overrun then still leaves the second part its whole watchdog, so it keeps its TRX.
-    # pr-models: setup and the model families (about 18 minutes, bounded at 22).
-    # sm86: setup (20), the suite parts (115 + 50) with diagnostics (5), torch interop (5), the model families (22) and
-    # the nightly ratchet (360): 577, so 600.
+    # pr-models: setup and the model families (about 18 minutes, bounded at 26).
+    # sm86: setup (20), the suite parts (115 + 50) with diagnostics (5), torch interop (5), the model families (26) and
+    # the nightly ratchet (360): 581, so 600.
     timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || matrix.arch == 'pr-models' && 60 || 600 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
@@ -342,7 +342,7 @@ jobs:
         # host's managed stacks and the processes under the runner, then fails the step so the steps below still run.
         # Passing SM86 runs take 78 to 101 minutes here; the SM75 suites take about 3 hours. The reserve also covers the
         # steps after the suites on a pull request: the torch interop step (at most 5 minutes), the model families
-        # (about 18, bounded at 22) and the upload. The deadline counts from
+        # (about 18, bounded at 26) and the upload. The deadline counts from
         # the job's start (the runner worker's), not this step's, and stops DIAGNOSTICS_RESERVE_MINUTES short of the job
         # limit, so slow setup cannot let the job timeout cancel the step before the watchdog fires.
         # A pull request's suites ("pr") run where they land; the model families run in their own job there.
@@ -624,8 +624,11 @@ jobs:
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
       if: (matrix.arch == 'sm86' || matrix.arch == 'pr-models') && !inputs.ratchets_only
-      # About 18 minutes in a passing run; bounded so the job budget above holds.
-      timeout-minutes: 22
+      # About 18 minutes in a passing run (6 of them building AiDotNet); bounded so the job budget above holds.
+      # densenet121's training hung on 2026-11-08 (main) and 2026-11-12 (#1724) and passed in 15 s in between; the step
+      # timeout killed it with nothing printed. A watchdog 20 minutes in prints the GPU's processes and the managed
+      # stacks of the benchmark process, then stops it, leaving the rest of the 26 minutes for the diagnostics.
+      timeout-minutes: 26
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
       # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
       run: |
@@ -642,10 +645,63 @@ jobs:
           Write-Output "AiDotNet.Evolution: AiDotNet pins $($pin.Groups[2].Value), this Tensors needs $want; using $want."
           Set-Content $props ($text.Remove($pin.Groups[2].Index, $pin.Groups[2].Length).Insert($pin.Groups[2].Index, $want)) -NoNewline
         }
-        dotnet run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- `
-          --models $env:MODEL_FAMILIES --device cuda --epochs 1 --train-batches 2 --batch-size 64 `
-          --inference-iterations 3 --warmup-iterations 1 --output "${{ runner.temp }}/aidotnet-cuda.json"
-        if ($LASTEXITCODE -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
+        $runArgs = 'run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- ' +
+          "--models $env:MODEL_FAMILIES --device cuda --epochs 1 --train-batches 2 --batch-size 64 " +
+          "--inference-iterations 3 --warmup-iterations 1 --output `"${{ runner.temp }}/aidotnet-cuda.json`""
+        $run = Start-Process dotnet -ArgumentList $runArgs -NoNewWindow -PassThru
+        $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
+        if ($run.WaitForExit(20 * 60 * 1000)) {
+          if ($run.ExitCode -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
+          exit 0
+        }
+
+        Write-Output "::error::The AiDotNet model families were still running 20 minutes in; the last [bench] line above names the model."
+        try {
+          # This run's processes only: the dotnet host and the benchmark it started (dotnet run builds, then runs it).
+          $all = @(Get-CimInstance Win32_Process)
+          $mine = @{}; $mine[[uint32]$run.Id] = $true
+          do {
+            $grew = $false
+            foreach ($p in $all) {
+              if ($mine.ContainsKey([uint32]$p.ParentProcessId) -and -not $mine.ContainsKey([uint32]$p.ProcessId)) {
+                $mine[[uint32]$p.ProcessId] = $true; $grew = $true
+              }
+            }
+          } while ($grew)
+          $tree = @($all | Where-Object { $mine.ContainsKey([uint32]$_.ProcessId) })
+          Write-Output "::group::Processes of this run"
+          $tree | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
+          Write-Output "::endgroup::"
+          Write-Output "::group::nvidia-smi"
+          nvidia-smi
+          Write-Output "::endgroup::"
+
+          # Each diagnostic is bounded, so a stalled install or attach cannot outlast the step.
+          $tools = "${{ runner.temp }}/dotnet-stack"
+          if (-not (Test-Path "$tools/dotnet-stack*")) {
+            $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
+            if (-not $install.WaitForExit(120000)) {
+              Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
+              Write-Output "::warning::dotnet-stack did not install within 2 minutes; no stacks printed."
+            }
+          }
+          if (Test-Path "$tools/dotnet-stack*") {
+            foreach ($bench in @($tree | Where-Object { $_.Name -like 'AiDotNet.PyTorchParity*' })) {
+              Write-Output "::group::Managed stacks of AiDotNet.PyTorchParity $($bench.ProcessId)"
+              $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($bench.ProcessId)" -NoNewWindow -PassThru
+              if (-not $report.WaitForExit(120000)) {
+                Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($bench.ProcessId)."
+              }
+              Write-Output "::endgroup::"
+            }
+          }
+        } catch {
+          Write-Output "::warning::Collecting the hang diagnostics failed: $($_.Exception.Message)"
+        } finally {
+          taskkill /T /F /PID $run.Id | Out-Null
+        }
+        exit 1
 
     # The CUDA step-time ratchets: each network's ours/PyTorch step ratio on this machine class may not rise above the
     # one recorded in parity/head-to-head-baseline.json. PyTorch compiles each network in every mode for up to an hour
