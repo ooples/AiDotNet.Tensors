@@ -555,9 +555,9 @@ internal static class NumericTextFastPath
         // (in [1e-37, 1e38)), so overflow, underflow and subnormals stay with float.Parse.
         int e10 = scale + ex;
         if (nsig - 1 + e10 < MinDecimalExponent || nsig + e10 > MaxDecimalExponent) return Undecided;
-        uint lo;
-        if (!dropped && TrySmallQuotient(sig, e10, out uint num, out uint den)) lo = DivToSingleBits(num, den, false);
-        else lo = ExactToSingleBits(sig, e10, dropped);
+        uint lo = !dropped && TrySmallQuotient(sig, e10, out uint num, out uint den)
+            ? DivToSingleBits(num, den, false)
+            : ExactToSingleBits(sig, e10, dropped);
         if (lo == 0) return Undecided;
         if (dropped && ExactToSingleBits(sig + 1, e10, true) != lo) return Undecided;
         bits = neg ? lo | 0x80000000u : lo;

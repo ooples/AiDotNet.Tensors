@@ -577,7 +577,8 @@ internal static class GenericLinalg<T>
         int nn = n;
         Real<T> t = zero;
         int maxIts = 30 * Math.Max(n, 10);
-        Real<T> p = zero, q = zero, r = zero, s = zero, x = zero, y = zero, z = zero, w = zero;
+        // s, x, y, z and w are assigned before each read, so they start unset (an initial zero was never read).
+        Real<T> p = zero, q = zero, r = zero, s, x, y, z, w;
         while (nn >= 1)
         {
             int its = 0;
