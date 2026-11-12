@@ -18,8 +18,42 @@ public partial class CpuEngine
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
         var (batch, size) = LinearSumAssignmentShape(cost);
-        var result = LinearSumAssignmentHost(RoIAlignPlan.ToDoubles(cost), batch, size);
+        // long and decimal costs can differ below double's 53-bit mantissa (2^53 + 1 and 2^53 are one double), so they
+        // solve in decimal, which holds every long exactly; every other element type converts to double exactly.
+        var result = typeof(T) == typeof(long) || typeof(T) == typeof(decimal)
+            ? LinearSumAssignmentExact(ToDecimals(cost), batch, size)
+            : LinearSumAssignmentHost(RoIAlignPlan.ToDoubles(cost), batch, size);
         return new Tensor<int>(result, cost.Rank == 2 ? new[] { size } : new[] { batch, size });
+    }
+
+    private static decimal[] ToDecimals<T>(Tensor<T> cost)
+    {
+        var values = cost.GetFlattenedData();
+        var result = new decimal[cost.Length];
+        if (values is long[] longs)
+            for (int i = 0; i < result.Length; i++) result[i] = longs[i];
+        else
+            Array.Copy((decimal[])(object)values, result, result.Length);
+        return result;
+    }
+
+    /// <summary>
+    /// <see cref="LinearSumAssignmentHost"/> in decimal arithmetic, for long and decimal costs. The solver's duals and
+    /// path costs stay within (2S + 2) times the largest cost magnitude, so the costs must satisfy
+    /// <c>max|cost| * 4 (S + 1) &lt;= decimal.MaxValue</c> (every long cost does for S below 2 * 10^9).
+    /// </summary>
+    internal static int[] LinearSumAssignmentExact(decimal[] cost, int batch, int size)
+    {
+        var result = new int[batch * size];
+        if (size == 0) return result;
+        decimal maxAbs = 0m;
+        foreach (decimal c in cost) maxAbs = Math.Max(maxAbs, Math.Abs(c));
+        if (maxAbs > decimal.MaxValue / (4m * (size + 1m)))
+            throw new ArgumentOutOfRangeException(nameof(cost),
+                $"Assignment costs must satisfy max|cost| * 4 (S + 1) <= decimal.MaxValue; got max|cost| = {maxAbs} for S = {size}.");
+        CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * size * size * size, b =>
+            SolveAssignmentExact(cost, b * size * size, size, result, b * size), deterministicSafe: true);
+        return result;
     }
 
     /// <summary>Validates a [B, S, S] or [S, S] cost; returns (B, S).</summary>
@@ -100,6 +134,70 @@ public partial class CpuEngine
                 {
                     if (sc[j]) continue;
                     double r = minVal + c2[i * size + j] - u[i] - v[j];
+                    if (r < spc[j]) { path[j] = i; spc[j] = r; }
+                    int key = (row4col[j] < 0 ? 0 : size) + j;
+                    if (spc[j] < best || (spc[j] == best && key < bestKey)) { best = spc[j]; bestKey = key; bestCol = j; }
+                }
+                minVal = best;
+                sc[bestCol] = true;
+                if (row4col[bestCol] == -1) sink = bestCol;
+                else i = row4col[bestCol];
+            }
+
+            u[curRow] += minVal;
+            for (int r = 0; r < size; r++)
+                if (sr[r] && r != curRow) u[r] += minVal - spc[col4row[r]];
+            for (int j = 0; j < size; j++)
+                if (sc[j]) v[j] -= minVal - spc[j];
+
+            for (int j = sink; ;)
+            {
+                int row = path[j];
+                row4col[j] = row;
+                int previous = col4row[row];
+                col4row[row] = j;
+                j = previous;
+                if (row == curRow) break;
+            }
+        }
+        Array.Copy(col4row, 0, result, resultOffset, size);
+    }
+
+    /// <summary>
+    /// <see cref="SolveAssignment"/>'s steps in decimal, with the same scan order and tie-breaks. Decimal has no
+    /// non-finite values to replace or overflow to scale away (the caller bounds the magnitudes), and decimal.MaxValue
+    /// stands for an unreached column's path cost.
+    /// </summary>
+    private static void SolveAssignmentExact(decimal[] cost, int offset, int size, int[] result, int resultOffset)
+    {
+        var u = new decimal[size];
+        var v = new decimal[size];
+        var spc = new decimal[size];
+        var path = new int[size];
+        var row4col = new int[size];
+        var col4row = new int[size];
+        var sr = new bool[size];
+        var sc = new bool[size];
+        row4col.AsSpan().Fill(-1);
+        col4row.AsSpan().Fill(-1);
+        path.AsSpan().Fill(-1);
+
+        for (int curRow = 0; curRow < size; curRow++)
+        {
+            spc.AsSpan().Fill(decimal.MaxValue);
+            Array.Clear(sr, 0, size);
+            Array.Clear(sc, 0, size);
+            decimal minVal = 0m;
+            int i = curRow, sink = -1;
+            while (sink == -1)
+            {
+                sr[i] = true;
+                decimal best = decimal.MaxValue;
+                int bestKey = int.MaxValue, bestCol = -1;
+                for (int j = 0; j < size; j++)
+                {
+                    if (sc[j]) continue;
+                    decimal r = minVal + cost[offset + i * size + j] - u[i] - v[j];
                     if (r < spc[j]) { path[j] = i; spc[j] = r; }
                     int key = (row4col[j] < 0 ? 0 : size) + j;
                     if (spc[j] < best || (spc[j] == best && key < bestKey)) { best = spc[j]; bestKey = key; bestCol = j; }

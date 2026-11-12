@@ -10011,6 +10011,10 @@ public partial interface IEngine
     /// <para>A NaN (or infinite) cost is a last resort: it is replaced by a value larger than the cost of any
     /// assignment that avoids it, so it is used only where no assignment can avoid it (negative infinity becomes the
     /// most preferred value instead). Not differentiable.</para>
+    /// <para>Costs of every real element type compare exactly: long and decimal solve in decimal arithmetic (a long
+    /// such as 2^53 + 1 is not a double), with <c>max|cost| * 4 (S + 1) &lt;= decimal.MaxValue</c> required (any long
+    /// cost for S below 2 * 10^9) and <see cref="System.ArgumentOutOfRangeException"/> otherwise; the other types
+    /// convert to double exactly.</para>
     /// </remarks>
     Tensor<int> TensorLinearSumAssignment<T>(Tensor<T> cost);
 
