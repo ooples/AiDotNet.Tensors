@@ -329,7 +329,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         => CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value) == CudaResult.Success ? (long)value : 0;
 
     private const int MaxPooledBufferElements = 16_777_216;
-    private const int MaxPooledBuffersPerSize = 4;
+    private const int MaxPooledBuffersPerSize = 4096;
+    private const int PooledMemoryDivisor = 6;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
 
@@ -667,6 +668,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuDeviceTotalMem(out ulong totalMem, device), "cuDeviceTotalMem");
             GlobalMemoryBytes = (long)totalMem;
+            _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
             // Issue #285: per-allocation cap. CUDA has no formal cap attribute;
             // practical limit is the largest contiguous free block. We use
             // total VRAM as the upper bound. NOTE: this means the cap guard
