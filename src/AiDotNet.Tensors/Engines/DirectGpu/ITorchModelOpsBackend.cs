@@ -32,7 +32,8 @@ internal interface ITorchModelOpsBackend
         bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint);
 
     /// <summary>Softmax over each row's k largest entries (ties to the lower index), 0 elsewhere. Each scratch buffer holds
-    /// <see cref="TorchModelOpsCodes.PlanTopK"/>'s ScratchLength floats (indices and weights only for a chunked plan).</summary>
+    /// <see cref="TorchModelOpsCodes.PlanTopK"/>'s ScratchLength floats (values only for a direct plan, indices and weights only
+    /// for a row-group plan).</summary>
     void ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratchValues, IGpuBuffer scratchIndices, IGpuBuffer scratchWeights, IGpuBuffer output, int rows, int width, int k);
 
     /// <summary>[batch, dim] sinusoidal embedding of the timesteps; <paramref name="frequencies"/> holds 3 * halfDim
@@ -71,45 +72,45 @@ internal static class TorchModelOpsCodes
     /// <summary>How a top-k softmax runs, and the length of each of its scratch buffers.</summary>
     internal readonly struct TopKPlan
     {
-        public TopKPlan(bool chunked, int chunkLength, int chunks, int perChunk, int scratchLength)
+        public TopKPlan(bool rowGroups, int scratchLength)
         {
-            Chunked = chunked;
-            ChunkLength = chunkLength;
-            Chunks = chunks;
-            PerChunk = perChunk;
+            RowGroups = rowGroups;
             ScratchLength = scratchLength;
         }
 
-        /// <summary>False: every element ranks itself against its row (rows up to 1024 wide). True: chunk selection.</summary>
-        public bool Chunked { get; }
-        public int ChunkLength { get; }
-        public int Chunks { get; }
-        /// <summary>Candidates each chunk keeps (k).</summary>
-        public int PerChunk { get; }
+        /// <summary>
+        /// False: every element ranks itself against its row (rows up to <see cref="TopKDirectWidth"/> wide), reading
+        /// only the values scratch. True: one work group per row selects (mo_topk_row), reading only the indices and
+        /// weights scratch.
+        /// </summary>
+        public bool RowGroups { get; }
         public int ScratchLength { get; }
     }
 
-    /// <summary>Rows wider than this use chunk selection; narrower rows rank every element against its row.</summary>
+    /// <summary>Rows wider than this run one work group per row; narrower rows rank every element against its row.</summary>
     public const int TopKDirectWidth = 1024;
+
+    /// <summary>Lanes of a mo_topk_row work group: the group size every backend launches the kernel with.</summary>
+    public const int TopKGroupSize = 256;
+
+    /// <summary>Scratch ints (and floats) per row of mo_topk_row: two halves of (gt, eq) lane partials.</summary>
+    public const int TopKRowScratch = 4 * TopKGroupSize;
 
     /// <summary>
     /// The top-k plan for a [rows, width] input. Short rows rank each element against its row (O(width) per element, all
-    /// parallel). Long rows split into chunks that each keep their k best by insertion (O(chunk) per chunk once the list
-    /// fills, as an element that loses to the list's last entry costs one comparison), then rank the rows * chunks * k
-    /// candidates by a binary search per chunk list (O(chunks log k) each). For a small k the chunk length keeps a row's
-    /// candidates near 1024; for a large k it is a few hundred elements so a chunk's insertion stays short.
+    /// parallel). Long rows run one work group per row: a radix selection of the k-th largest order key (32 counting
+    /// passes, one per key bit), a count of the entries above and at it, and, when only some entries equal to it are
+    /// selected, a binary search for the index cut among them (log2(width) passes), then the softmax. Each pass costs a
+    /// lane O(width / 256) whatever k is, so a vocabulary-sized row with a large k stays a few milliseconds.
     /// </summary>
     public static TopKPlan PlanTopK(int rows, int width, int k)
     {
         if (width <= TopKDirectWidth)
-            return new TopKPlan(false, width, 1, k, checked(rows * width));
-        long chunk = k <= 32 ? Math.Max(256L, ((long)width * k + 1023) / 1024) : Math.Max(512L, k);
-        chunk = Math.Min(chunk, width);
-        int chunks = (int)((width + chunk - 1) / chunk);
-        long scratch = (long)rows * chunks * k;
-        if (scratch > int.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(rows), "rows * chunks * k must fit an int.");
-        return new TopKPlan(true, (int)chunk, chunks, k, (int)scratch);
+            return new TopKPlan(false, checked(rows * width));
+        long scratch = (long)rows * TopKRowScratch;
+        if (scratch > int.MaxValue || (long)rows * TopKGroupSize > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(rows), "rows * 1024 must fit an int.");
+        return new TopKPlan(true, (int)scratch);
     }
 
     /// <summary>The activation code mo_activation_backward reads for a model activation, or -1.</summary>

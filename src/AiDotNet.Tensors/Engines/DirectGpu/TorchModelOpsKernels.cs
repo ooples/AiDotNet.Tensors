@@ -20,8 +20,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <para>
 /// The CRF recursions run one work group per sequence that walks the time steps itself, separated by a group barrier
 /// (<c>__syncthreads()</c>, with <c>threadIdx.x</c> / <c>blockIdx.x</c> / <c>blockDim.x</c>, which every dialect
-/// translation maps); the forward is one launch, the backward three. Top-k softmax over a long row selects per chunk
-/// and then among the chunk candidates. Every other op is one to three launches.
+/// translation maps); the forward is one launch, the backward three. Top-k softmax over a long row is one work group
+/// per row as well (a radix selection of the k-th key, then the tie cut by index). Every other op is one to three
+/// launches.
 /// </para>
 /// </remarks>
 internal static class TorchModelOpsKernels
@@ -32,7 +33,7 @@ internal static class TorchModelOpsKernels
         "mo_lisht", "mo_bent_identity", "mo_gaussian", "mo_scaled_tanh", "mo_thresholded_relu", "mo_isru", "mo_sqrbf",
         "mo_surrogate_spike", "mo_activation_backward",
         "mo_minmax_partial", "mo_minmax_final", "mo_fake_quantize",
-        "mo_topk_select", "mo_topk_normalize", "mo_topk_chunk", "mo_topk_rank", "mo_topk_zero", "mo_topk_scatter",
+        "mo_topk_select", "mo_topk_normalize", "mo_topk_row",
         "mo_time_embedding", "mo_time_embedding_backward",
         "mo_crf_forward", "mo_crf_backward",
         "mo_crf_boundary_grad", "mo_crf_transition_grad",
@@ -107,15 +108,26 @@ __device__ __forceinline__ float2 mo_sincos_product(float tv, float f1, float f2
     return make_float2(-c, s);
 }
 
-// The CPU's top-k order: larger first (NaN below every number, NaN equal to NaN), ties to the lower index.
+// The CPU's top-k order (double CompareTo, larger first) as an unsigned key, larger key first: NaN is 0, below every
+// number, and equal to NaN; -0 and +0 share a key; every other float maps monotonically (the sign bit set for a
+// non-negative float, all bits flipped for a negative one). Integer instructions only, as ExactFloatKernels, so no
+// float compare a relaxed-math build or a subnormal-flushing device could change decides the selection.
+__device__ __forceinline__ unsigned int mo_order_key(float u)
+{
+    unsigned int b = __float_as_uint(u);
+    if ((b & 0x7FFFFFFFu) > 0x7F800000u) { return 0u; }
+    if (b == 0x80000000u) { return 0x80000000u; }
+    if ((b & 0x80000000u) != 0u) { return ~b; }
+    return b | 0x80000000u;
+}
+
+// The CPU's top-k order: larger key first, ties to the lower index.
 __device__ __forceinline__ bool mo_before(float a, int ia, float b, int ib)
 {
-    bool an = mo_isnan(a);
-    bool bn = mo_isnan(b);
-    if (!an && bn) { return true; }
-    if (a > b) { return true; }
-    bool same = a == b || (an && bn);
-    return same && ia < ib;
+    unsigned int ka = mo_order_key(a);
+    unsigned int kb = mo_order_key(b);
+    if (ka != kb) { return ka > kb; }
+    return ia < ib;
 }
 
 // ---- pointwise activations (the parity unary contract: x, y, n, p0, p1) ----
@@ -327,7 +339,8 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_fake_quantize(const float
 
 // ---- top-k softmax over the last axis ----
 
-// e = exp(x - top) for the k entries of each row that come first in the CPU's order, 0 elsewhere.
+// Short rows: e = exp(x - top) for the k entries of each row that come first in the CPU's order, -1 elsewhere (so a
+// selected entry whose exp underflows to 0 still takes part in the normalization).
 extern ""C"" __global__ __launch_bounds__(256) void mo_topk_select(const float* x, float* e, int rows, int width, int k)
 {
     int g = bx_gid();
@@ -345,124 +358,171 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_topk_select(const float* 
         if (mo_before(xj, j, xi, i)) { rank = rank + 1; }
         if (mo_before(xj, j, top, topIndex)) { top = xj; topIndex = j; }
     }
-    float r0 = 0.0f;
+    float r0 = -1.0f;
     if (rank < k) { r0 = expf(xi - top); }
     e[g] = r0;
 }
 
-// y = e / (row sum of e); entries outside the top k stay exactly 0.
+// y = e / (row sum of the selected e); entries outside the top k (e = -1) are exactly 0. A NaN e is selected.
 extern ""C"" __global__ __launch_bounds__(256) void mo_topk_normalize(const float* e, float* y, int rows, int width)
 {
     int g = bx_gid();
     if (g >= rows * width) { return; }
     int base = (g / width) * width;
     float v = e[g];
-    if (v == 0.0f) { y[g] = 0.0f; return; }
+    if (v < 0.0f) { y[g] = 0.0f; return; }
     float s = 0.0f;
-    for (int j = 0; j < width; j++) { s = s + e[base + j]; }
+    for (int j = 0; j < width; j++)
+    {
+        float ej = e[base + j];
+        if (!(ej < 0.0f)) { s = s + ej; }
+    }
     y[g] = v / s;
 }
 
-// Long rows (a vocabulary): each (row, chunk) slot keeps its chunk's kk best entries, best first, by insertion (one
-// comparison per element once the list is full and the element loses to its last entry). The global top k of a row
-// are among these candidates: every entry ranking ahead of a top-k entry is itself top-k, so it is in its chunk's list.
-// Unfilled slots get (NaN, an index past the row), which rank after every real entry.
-extern ""C"" __global__ __launch_bounds__(256) void mo_topk_chunk(const float* x, float* candVal, int* candIdx, int rows, int width, int kk, int chunk, int chunks)
+// Long rows (a vocabulary), one work group per row (launched with rows * 256 threads): a selection whose every pass
+// costs each lane O(width / 256), whatever k is.
+//  1. top: the row's first entry in the CPU's order (its largest key), for exp(x - top).
+//  2. threshold: the k-th largest key t, built bit by bit from the most significant (32 passes): a bit stays set when
+//     at least k entries have a key at or above the prefix with it set.
+//  3. gt / eq: the entries above t are all selected, and of the eq entries equal to t the need = k - gt with the
+//     lowest indices (the CPU's tie rule).
+//  4. the tie cut: when only some entries equal to t are selected, the index of the need-th of them, built bit by bit
+//     the same way (a lane skips the scans, not the barriers, when every entry equal to t is selected).
+//  5. the sum of exp(x - top) over the selection, then y.
+// A pass's per-lane counts meet in cnt (TopKRowScratch ints per row) and every lane sums the group's partials in lane
+// order, so all lanes hold the same total. Successive passes alternate between two halves of cnt: a lane writes a half
+// again only after the next barrier, which every lane reaches after reading it. acc (TopKRowScratch floats per row)
+// holds the lanes' top candidates and partial sums. Every loop holding a barrier runs a count fixed by the scalars, so
+// the barriers sit in uniform control flow.
+extern ""C"" __global__ __launch_bounds__(256) void mo_topk_row(const float* x, int* cnt, float* acc, float* y, int rows, int width, int k)
 {
-    int g = bx_gid();
-    if (g >= rows * chunks) { return; }
-    int r = g / chunks;
-    int c = g - r * chunks;
+    int r = blockIdx.x;
+    if (r >= rows) { return; }
+    int lane = threadIdx.x;
+    int lanes = blockDim.x;
     int base = r * width;
-    int dst = g * kk;
-    int begin = c * chunk;
-    int end = begin + chunk;
-    if (end > width) { end = width; }
-    int count = 0;
-    for (int j = begin; j < end; j++)
+    int slots = r * 4 * lanes;
+
+    float best = x[base];
+    unsigned int bestKey = mo_order_key(best);
+    for (int j = lane; j < width; j = j + lanes)
     {
         float v = x[base + j];
-        int slot = count;
-        if (count == kk)
+        unsigned int kv = mo_order_key(v);
+        if (kv > bestKey)
         {
-            if (!mo_before(v, j, candVal[dst + kk - 1], candIdx[dst + kk - 1])) { continue; }
-            slot = kk - 1;
+            best = v;
+            bestKey = kv;
         }
-        int pos = slot;
-        for (int s = slot; s > 0; s--)
-        {
-            if (!mo_before(v, j, candVal[dst + s - 1], candIdx[dst + s - 1])) { break; }
-            candVal[dst + s] = candVal[dst + s - 1];
-            candIdx[dst + s] = candIdx[dst + s - 1];
-            pos = s - 1;
-        }
-        candVal[dst + pos] = v;
-        candIdx[dst + pos] = j;
-        if (count < kk) { count = count + 1; }
     }
-    for (int s = count; s < kk; s++)
+    acc[slots + lane] = best;
+    __syncthreads();
+    float top = acc[slots];
+    unsigned int topKey = mo_order_key(top);
+    for (int q = 1; q < lanes; q++)
     {
-        candVal[dst + s] = mo_nan();
-        candIdx[dst + s] = width + s;
-    }
-}
-
-// A candidate's rank among its row's candidates: per chunk list (sorted best first), a binary search for the entries
-// ahead of it. w = exp(v - top) for the k best, -1 for the rest.
-extern ""C"" __global__ __launch_bounds__(256) void mo_topk_rank(const float* candVal, const int* candIdx, float* w, int rows, int kk, int chunks, int k)
-{
-    int g = bx_gid();
-    int m = chunks * kk;
-    if (g >= rows * m) { return; }
-    int base = (g / m) * m;
-    float v = candVal[g];
-    int vi = candIdx[g];
-    int rank = 0;
-    float top = candVal[base];
-    int topIndex = candIdx[base];
-    for (int c = 0; c < chunks; c++)
-    {
-        int list = base + c * kk;
-        if (mo_before(candVal[list], candIdx[list], top, topIndex)) { top = candVal[list]; topIndex = candIdx[list]; }
-        int lo = 0;
-        int hi = kk;
-        for (int it = 0; it < 32; it++)
+        float v = acc[slots + q];
+        unsigned int kv = mo_order_key(v);
+        if (kv > topKey)
         {
-            if (lo >= hi) { break; }
-            int mid = (lo + hi) / 2;
-            if (mo_before(candVal[list + mid], candIdx[list + mid], v, vi)) { lo = mid + 1; }
-            else { hi = mid; }
+            top = v;
+            topKey = kv;
         }
-        rank = rank + lo;
     }
-    float r0 = -1.0f;
-    if (rank < k) { r0 = expf(v - top); }
-    w[g] = r0;
-}
 
-extern ""C"" __global__ __launch_bounds__(256) void mo_topk_zero(float* y, int n)
-{
-    int g = bx_gid();
-    if (g >= n) { return; }
-    y[g] = 0.0f;
-}
+    int flip = 0;
+    unsigned int prefix = 0u;
+    unsigned int probe = 0x80000000u;
+    for (int it = 0; it < 32; it++)
+    {
+        unsigned int cand = prefix | probe;
+        int c = 0;
+        for (int j = lane; j < width; j = j + lanes)
+        {
+            if (mo_order_key(x[base + j]) >= cand) { c = c + 1; }
+        }
+        int part = slots + flip * 2 * lanes;
+        cnt[part + lane] = c;
+        __syncthreads();
+        int total = 0;
+        for (int q = 0; q < lanes; q++) { total = total + cnt[part + q]; }
+        if (total >= k) { prefix = cand; }
+        flip = 1 - flip;
+        probe = probe >> 1u;
+    }
+    unsigned int thr = prefix;
 
-// y[row, index] = w / (row sum of the selected w) for the k selected candidates (w -1 marks the rest; NaN is kept).
-extern ""C"" __global__ __launch_bounds__(256) void mo_topk_scatter(const int* candIdx, const float* w, float* y, int rows, int m, int width)
-{
-    int g = bx_gid();
-    if (g >= rows * m) { return; }
-    float v = w[g];
-    if (v < 0.0f) { return; }
-    int r = g / m;
-    int base = r * m;
+    int gtLane = 0;
+    int eqLane = 0;
+    for (int j = lane; j < width; j = j + lanes)
+    {
+        unsigned int kv = mo_order_key(x[base + j]);
+        if (kv > thr) { gtLane = gtLane + 1; }
+        if (kv == thr) { eqLane = eqLane + 1; }
+    }
+    int counts = slots + flip * 2 * lanes;
+    cnt[counts + lane] = gtLane;
+    cnt[counts + lanes + lane] = eqLane;
+    __syncthreads();
+    int gt = 0;
+    int eq = 0;
+    for (int q = 0; q < lanes; q++)
+    {
+        gt = gt + cnt[counts + q];
+        eq = eq + cnt[counts + lanes + q];
+    }
+    flip = 1 - flip;
+    int need = k - gt;
+    bool someTies = eq > need;
+
+    int stride = 1;
+    for (int q = 0; q < 30; q++)
+    {
+        if (stride * 2 <= width) { stride = stride * 2; }
+    }
+    int last = 0;
+    for (int s2 = stride; s2 > 0; s2 = s2 / 2)
+    {
+        int bound = last + s2;
+        int c = 0;
+        if (someTies)
+        {
+            int end = bound;
+            if (end > width) { end = width; }
+            for (int j = lane; j < end; j = j + lanes)
+            {
+                if (mo_order_key(x[base + j]) == thr) { c = c + 1; }
+            }
+        }
+        int part = slots + flip * 2 * lanes;
+        cnt[part + lane] = c;
+        __syncthreads();
+        int total = 0;
+        for (int q = 0; q < lanes; q++) { total = total + cnt[part + q]; }
+        if (total < need) { last = bound; }
+        flip = 1 - flip;
+    }
+    int cut = width;
+    if (someTies) { cut = last + 1; }
+
     float s = 0.0f;
-    for (int j = 0; j < m; j++)
+    for (int j = lane; j < width; j = j + lanes)
     {
-        float wj = w[base + j];
-        if (!(wj < 0.0f)) { s = s + wj; }
+        unsigned int kv = mo_order_key(x[base + j]);
+        if (kv > thr || (kv == thr && j < cut)) { s = s + expf(x[base + j] - top); }
     }
-    y[r * width + candIdx[g]] = v / s;
+    acc[slots + lanes + lane] = s;
+    __syncthreads();
+    float sum = 0.0f;
+    for (int q = 0; q < lanes; q++) { sum = sum + acc[slots + lanes + q]; }
+    for (int j = lane; j < width; j = j + lanes)
+    {
+        unsigned int kv = mo_order_key(x[base + j]);
+        float o = 0.0f;
+        if (kv > thr || (kv == thr && j < cut)) { o = expf(x[base + j] - top) / sum; }
+        y[base + j] = o;
+    }
 }
 
 // ---- sinusoidal time embedding ----
