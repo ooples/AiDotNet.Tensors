@@ -9911,7 +9911,7 @@ internal static partial class BackwardFunctions<T>
             double term = 1.0, sum = 1.0;
             for (int k = 1; k < 25; k++)
             {
-                term *= halfSq / (k * (k + 1));
+                term *= halfSq / ((double)k * (k + 1));
                 sum += term;
                 if (term < 1e-16 * sum) break;
             }
@@ -9954,7 +9954,7 @@ internal static partial class BackwardFunctions<T>
             double term = 1.0, sum = 1.0;
             for (int k = 1; k < 25; k++)
             {
-                term *= halfSq / (k * k);
+                term *= halfSq / ((double)k * k);
                 sum += term;
                 if (term < 1e-16 * sum) break;
             }
@@ -11912,7 +11912,7 @@ internal static partial class BackwardFunctions<T>
             int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outH);
             int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outW);
             if (ry < 1) ry = 1; if (rx < 1) rx = 1;
-            double gridArea = ry * rx;
+            double gridArea = (double)ry * rx;
 
             for (int co = 0; co < outChans; co++)
             for (int ph = 0; ph < outH; ph++)
