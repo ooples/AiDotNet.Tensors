@@ -450,6 +450,14 @@ public static class GpuOptimizer
         {
             lmQ = cb.AllocateByteBuffer(length);
             lvQ = cb.AllocateByteBuffer(length);
+            if (length > 0)
+            {
+                var mInitial = new byte[length];
+                for (int i = 0; i < mInitial.Length; i++)
+                    mInitial[i] = Compilation.DynamicQuantizationCodebook.SignedZeroIndex;
+                cb.UploadByteBuffer(lmQ, mInitial);
+                cb.UploadByteBuffer(lvQ, new byte[length]);
+            }
             lmScales = cb.AllocateBuffer(new float[nb]);
             lvScales = cb.AllocateBuffer(new float[nb]);
         }
@@ -556,8 +564,15 @@ public static class GpuOptimizer
         DirectGpu.IGpuBuffer? lm = null, lv = null;
         try
         {
-            lm = cb.AllocateByteBuffer(length * sizeof(ushort));
-            lv = cb.AllocateByteBuffer(length * sizeof(ushort));
+            int byteLength = checked(length * sizeof(ushort));
+            lm = cb.AllocateByteBuffer(byteLength);
+            lv = cb.AllocateByteBuffer(byteLength);
+            if (byteLength > 0)
+            {
+                var zeroBytes = new byte[byteLength];
+                cb.UploadByteBuffer(lm, zeroBytes);
+                cb.UploadByteBuffer(lv, zeroBytes);
+            }
         }
         catch
         {
