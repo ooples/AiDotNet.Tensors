@@ -1753,8 +1753,10 @@ public sealed class GradientTape<T> : IDisposable
         if (_hooks is not null)
             foreach (var hooked in _hooks.Keys) relevant.Add(hooked);
         // An opaque entry's backward reaches leaves it never recorded as inputs, so no walk over recorded inputs can
-        // tell whether it depends on a source: keep it.
-        if (_opaqueOutputs is not null)
+        // tell whether it depends on a source: keep it. Only when something was requested: an explicitly empty request
+        // (no sources, retained or hooked tensors) must stay empty, or an unfiltered checkpoint's recompute would run
+        // and hand every touched leaf to its gradient consumer.
+        if (_opaqueOutputs is not null && relevant.Count > 0)
             foreach (var opaque in _opaqueOutputs) relevant.Add(opaque);
 
         // Prefer the GradFn graph because it can cross tape boundaries. Higher-order
@@ -2870,7 +2872,20 @@ public sealed class GradientTape<T> : IDisposable
             ref var e = ref _entries[i];
             if (e.Output is null) continue;
             bool producer = ReferenceEquals(e.Output, target);
-            if (producer) e.Output = old;
+            if (producer)
+            {
+                e.Output = old;
+                // The opaque mark belongs to the producer's entry, which now outputs the snapshot. The mark on target
+                // stays for any other holder; the added mark changes no entry count, so drop the cached relevance.
+                if (_opaqueOutputs is not null && _opaqueOutputs.Contains(target))
+                {
+                    _opaqueOutputs.Add(old);
+                    _cachedGradientRelevance = null;
+                    _cachedGradientRelevanceLoss = null;
+                    _cachedGradientRelevanceSources = null;
+                    _cachedGradientRelevanceEntryCount = -1;
+                }
+            }
             if (ReferenceEquals(e.Input0, target)) { e.Input0 = old; e.Version0 = old.Version; }
             if (ReferenceEquals(e.Input1, target)) { e.Input1 = old; e.Version1 = old.Version; }
             if (ReferenceEquals(e.Input2, target)) { e.Input2 = old; e.Version2 = old.Version; }
