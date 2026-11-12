@@ -35,6 +35,18 @@ public sealed class BatchedFftBackendParityTests
         { 2, 8192, true },
     };
 
+    // Lengths that are not powers of two. WebGPU transforms them with its direct DFT kernel; the batched APIs of the
+    // other backends reject them, so these shapes stay out of Shapes.
+    public static TheoryData<int, int, bool> NonPowerOfTwoShapes => new()
+    {
+        { 3, 3, false },
+        { 3, 3, true },
+        { 2, 5, false },
+        { 2, 12, true },
+        { 2, 100, false },
+        { 2, 100, true },
+    };
+
     private static (float[] re, float[] im) Signal(int batch, int n)
     {
         var rng = new Random(1000 + n);
@@ -169,6 +181,15 @@ public sealed class BatchedFftBackendParityTests
     [SkippableTheory]
     [MemberData(nameof(Shapes))]
     public void WebGpu_BatchedFft_MatchesDft(int batch, int n, bool inverse)
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();   // the real backend, executing on Dawn; shared, so not disposed
+        Check(backend, batch, n, inverse);
+        CheckInPlace(backend, batch, n, inverse);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(NonPowerOfTwoShapes))]
+    public void WebGpu_BatchedFft_NonPowerOfTwo_MatchesDft(int batch, int n, bool inverse)
     {
         var backend = DawnHostedWebGpu.BackendOrSkip();   // the real backend, executing on Dawn; shared, so not disposed
         Check(backend, batch, n, inverse);

@@ -720,7 +720,21 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
             BitConverter.Int32BitsToSingle(inverse ? 1 : 0),
             0
         };
-        int total = batch * n;
+        int total = checked(batch * n);
+        // Every output bin reads the whole input row, and WebGPU forbids binding one buffer as both a read input and a
+        // read_write output, so an output that aliases an input runs from a staged copy of the inputs.
+        bool aliased = ReferenceEquals(inputReal, outputReal) || ReferenceEquals(inputReal, outputImag)
+            || ReferenceEquals(inputImag, outputReal) || ReferenceEquals(inputImag, outputImag);
+        if (aliased)
+        {
+            using var stagedReal = AllocateBufferCore(total, zeroInitialize: false);
+            using var stagedImag = AllocateBufferCore(total, zeroInitialize: false);
+            Copy(inputReal, stagedReal, total);
+            Copy(inputImag, stagedImag, total);
+            Dispatch4BufferAsync("FFT", WebGpuFftKernels.DirectDft1D, "fft_1d",
+                stagedReal, stagedImag, outputReal, outputImag, dftUniforms, total).GetAwaiter().GetResult();
+            return;
+        }
         Dispatch4BufferAsync("FFT", WebGpuFftKernels.DirectDft1D, "fft_1d",
             inputReal, inputImag, outputReal, outputImag, dftUniforms, total).GetAwaiter().GetResult();
     }

@@ -297,6 +297,18 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
     /// Copies data from a float array to the GPU buffer.
     /// </summary>
     /// <param name="data">Source data array.</param>
+    /// <summary>
+    /// Zeroes the first <paramref name="count"/> elements on the device without waiting: the clear is queued ahead of any
+    /// later submission, so nothing reads the buffer before it.
+    /// </summary>
+    internal void ClearOnDevice(int count)
+    {
+        ThrowIfDisposed();
+        if (count < 0 || count > _elementCount) throw new ArgumentOutOfRangeException(nameof(count));
+        if (count == 0) return;
+        WebGpuNativeBindings.ClearBuffer(_bufferId, _offsetBytes, count * sizeof(float));
+    }
+
     public void CopyFrom(float[] data)
     {
         ThrowIfDisposed();

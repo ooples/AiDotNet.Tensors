@@ -208,7 +208,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var buffer = WebGpuBuffer.Rent(elementCount, out bool fromPool);
         if (fromPool && zeroInitialize)
         {
-            Fill(buffer, 0f, elementCount);
+            // A queued device clear, not Fill: Fill waits for its dispatch, and a browser's single .NET thread cannot
+            // block on the JavaScript promise that wait depends on (SharedDummyBuffer reaches this through AllocateBuffer(1)).
+            buffer.ClearOnDevice(elementCount);
         }
         return buffer;
     }
