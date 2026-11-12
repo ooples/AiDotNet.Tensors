@@ -84,7 +84,9 @@ public class GradientCheckpointingSegmentsTests
     public void CheckpointSegments_PostAccumulateConsumer_StepsSingleTouchInPlace_AndAccumulatesSharedWeights()
     {
         var engine = AiDotNetEngine.Current;
-        const float lr = 0.05f;
+        // Large enough that every weight's SGD update is observable: at 0.05 the largest unique-weight update was
+        // 6.8e-6, below what a weight near 0.25 can be compared at.
+        const float lr = 1.0f;
 
         var x = CreateLinearWeight(3, 4, seed: 101);
         var wSharedEager = CreateLinearWeight(4, 4, seed: 201);
