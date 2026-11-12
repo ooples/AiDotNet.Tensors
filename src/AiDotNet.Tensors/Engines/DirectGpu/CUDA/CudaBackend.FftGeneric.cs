@@ -149,15 +149,36 @@ public sealed partial class CudaBackend : IGenericFftBackend
             return false;
         }
 
-        return type switch
+        return FftElementTypeHardwareSupported(type) && type switch
         {
             FftElementType.Float32 => _fftGenericFloat32Module != IntPtr.Zero,
-            FftElementType.Float16 =>
-                ((_ccMajor * 10) + _ccMinor >= 53) && _fftGenericFloat16Module != IntPtr.Zero,
-            FftElementType.BFloat16 => _ccMajor >= 8 && _fftGenericBFloat16Module != IntPtr.Zero,
+            FftElementType.Float16 => _fftGenericFloat16Module != IntPtr.Zero,
+            FftElementType.BFloat16 => _fftGenericBFloat16Module != IntPtr.Zero,
             _ => throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown FFT element type."),
         };
     }
+
+    /// <summary>
+    /// Whether the device's compute capability has the conversion intrinsics <paramref name="type"/> needs, regardless
+    /// of whether its module compiled: <see cref="SupportsFftElementType"/> is false for both, and only this separates a
+    /// compile failure (a defect) from hardware that cannot run the type.
+    /// </summary>
+    internal bool FftElementTypeHardwareSupported(FftElementType type) => type switch
+    {
+        FftElementType.Float32 => true,
+        FftElementType.Float16 => (_ccMajor * 10) + _ccMinor >= 53,
+        FftElementType.BFloat16 => _ccMajor >= 8,
+        _ => throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown FFT element type."),
+    };
+
+    /// <summary>The NVRTC error that left <paramref name="type"/>'s module unbuilt, or null when it built.</summary>
+    internal string? FftElementTypeCompileError(FftElementType type) => type switch
+    {
+        FftElementType.Float32 => _fftGenericFloat32CompileError,
+        FftElementType.Float16 => _fftGenericFloat16CompileError,
+        FftElementType.BFloat16 => _fftGenericBFloat16CompileError,
+        _ => throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown FFT element type."),
+    };
 
     internal unsafe void ConvertFloatToFftStorage(
         IGpuBuffer source,
@@ -306,13 +327,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
             return;
         }
 
-        string? error = type switch
-        {
-            FftElementType.Float32 => _fftGenericFloat32CompileError,
-            FftElementType.Float16 => _fftGenericFloat16CompileError,
-            FftElementType.BFloat16 => _fftGenericBFloat16CompileError,
-            _ => throw new ArgumentOutOfRangeException(nameof(type), type, "Unknown FFT element type."),
-        };
+        string? error = FftElementTypeCompileError(type);
         string detail = string.IsNullOrWhiteSpace(error) ? string.Empty : $" NVRTC: {error}";
         throw new NotSupportedException(
             $"CUDA generic FFT storage {type} is unavailable on compute capability {_ccMajor}.{_ccMinor}.{detail}");

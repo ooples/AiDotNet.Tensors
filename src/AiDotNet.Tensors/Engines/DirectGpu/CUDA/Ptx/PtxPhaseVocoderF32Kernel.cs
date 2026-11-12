@@ -125,8 +125,7 @@ internal sealed class PtxPhaseVocoderF32Kernel : IDisposable
         const string one = "0f3F800000";
 
         var ptx = new StringBuilder(4_352);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape leading={leading} nFramesV={nFramesV} nFreqV={nFreqV} outFrames={outFrames} block={blockThreads} op=phase-vocoder");
         ptx.AppendLine();

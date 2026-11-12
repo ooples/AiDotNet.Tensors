@@ -704,5 +704,312 @@ kernel void gated_delta_scan_reduce(
         dB[gIdx] = sb;
     }
 }
+
+// ── Sparse routing & codebook primitives (ISparseRoutingBackend) ──────────────────────────────────
+kernel void gather_row_values_forward(
+    device const float* valBuf [[buffer(0)]], device const int* idxBuf [[buffer(1)]], device float* outBuf [[buffer(2)]],
+    constant int& rows [[buffer(3)]], constant int& cols [[buffer(4)]], constant int& k [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * k;
+    if ((int)gid >= total) return;
+    int r = (int)gid / k;
+    int col = idxBuf[gid];
+    outBuf[gid] = (col >= 0 && col < cols) ? valBuf[r * cols + col] : 0.0f;
+}
+
+kernel void gather_row_values_backward(
+    device const float* gradBuf [[buffer(0)]], device const int* idxBuf [[buffer(1)]], device float* gradValBuf [[buffer(2)]],
+    constant int& rows [[buffer(3)]], constant int& cols [[buffer(4)]], constant int& k [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * cols;
+    if ((int)gid >= total) return;
+    int r = (int)gid / cols;
+    int c = (int)gid % cols;
+    int kBase = r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        if (idxBuf[kBase + j] == c) acc += gradBuf[kBase + j];
+    }
+    gradValBuf[gid] = acc;
+}
+
+kernel void topk_weighted_row_mix_forward(
+    device const float* tblBuf [[buffer(0)]], device const int* idxBuf [[buffer(1)]],
+    device const float* wBuf [[buffer(2)]], device float* outBuf [[buffer(3)]],
+    constant int& rows [[buffer(4)]], constant int& numEntries [[buffer(5)]],
+    constant int& k [[buffer(6)]], constant int& channels [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * channels;
+    if ((int)gid >= total) return;
+    int r = (int)gid / channels;
+    int c = (int)gid % channels;
+    int kBase = r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        int entry = idxBuf[kBase + j];
+        if (entry >= 0 && entry < numEntries)
+            acc += wBuf[kBase + j] * tblBuf[entry * channels + c];
+    }
+    outBuf[gid] = acc;
+}
+
+kernel void topk_weighted_row_mix_backward_weights(
+    device const float* gradBuf [[buffer(0)]], device const float* tblBuf [[buffer(1)]],
+    device const int* idxBuf [[buffer(2)]], device float* gradWBuf [[buffer(3)]],
+    constant int& rows [[buffer(4)]], constant int& numEntries [[buffer(5)]],
+    constant int& k [[buffer(6)]], constant int& channels [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int total = rows * k;
+    if ((int)gid >= total) return;
+    int r = (int)gid / k;
+    int entry = idxBuf[gid];
+    float acc = 0.0f;
+    if (entry >= 0 && entry < numEntries) {
+        int goBase = r * channels;
+        int tbBase = entry * channels;
+        for (int c = 0; c < channels; c++)
+            acc += gradBuf[goBase + c] * tblBuf[tbBase + c];
+    }
+    gradWBuf[gid] = acc;
+}
+
+kernel void sparse_zero_int32(
+    device int* buf [[buffer(0)]],
+    constant int& offset [[buffer(1)]], constant int& count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid < count) buf[(long)offset + (long)gid] = 0;
+}
+
+kernel void topk_csr_tile_counts(
+    device const int* idxBuf [[buffer(0)]], device int* csrBuf [[buffer(1)]],
+    constant int& totalSlots [[buffer(2)]], constant int& numEntries [[buffer(3)]],
+    constant int& numTiles [[buffer(4)]], constant int& offTile [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int t = (int)gid;
+    if (t >= numTiles || totalSlots <= 0) return;
+    int tileSpan = ((totalSlots - 1) / numTiles) + 1;
+    if (t > totalSlots / tileSpan) return;
+    int start = t * tileSpan;
+    int rem = totalSlots - start;
+    int end = start + (rem < tileSpan ? rem : tileSpan);
+    long rowBase = (long)offTile + (long)t * numEntries;
+    for (int s = start; s < end; s++) {
+        int e = idxBuf[s];
+        if (e >= 0 && e < numEntries)
+            csrBuf[rowBase + e] += 1;
+    }
+}
+
+kernel void topk_csr_entry_prefix(
+    device int* csrBuf [[buffer(0)]],
+    constant int& numEntries [[buffer(1)]], constant int& numTiles [[buffer(2)]],
+    constant int& offTile [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int g = (int)gid;
+    if (g >= numEntries) return;
+    int acc = 0;
+    for (int t = 0; t < numTiles; t++) {
+        long idx = (long)offTile + (long)t * numEntries + g;
+        int c = csrBuf[idx];
+        csrBuf[idx] = acc;
+        acc += c;
+    }
+    csrBuf[g] = acc;
+}
+
+kernel void topk_csr_chunk_sums(
+    device int* csrBuf [[buffer(0)]],
+    constant int& numEntries [[buffer(1)]], constant int& offChunk [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int cIdx = (int)gid;
+    if (cIdx >= 256) return;
+    int acc = 0;
+    if (numEntries > 0) {
+        int chunkSpan = ((numEntries - 1) / 256) + 1;
+        if (cIdx <= numEntries / chunkSpan) {
+            int start = cIdx * chunkSpan;
+            int rem = numEntries - start;
+            int end = start + (rem < chunkSpan ? rem : chunkSpan);
+            for (int g = start; g < end; g++) {
+                int c = csrBuf[g];
+                csrBuf[g] = acc;
+                acc += c;
+            }
+        }
+    }
+    csrBuf[offChunk + cIdx] = acc;
+}
+
+kernel void topk_csr_chunk_finalize(
+    device int* csrBuf [[buffer(0)]],
+    constant int& numEntries [[buffer(1)]], constant int& offChunk [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int g = (int)gid;
+    if (g > numEntries) return;
+    if (g == numEntries) {
+        int total = 0;
+        for (int m = 0; m < 256; m++) total += csrBuf[offChunk + m];
+        csrBuf[numEntries] = total;
+        return;
+    }
+    int chunkSpan = ((numEntries - 1) / 256) + 1;
+    int chunkIdx = g / chunkSpan;
+    int baseOff = 0;
+    for (int m = 0; m < chunkIdx; m++) baseOff += csrBuf[offChunk + m];
+    csrBuf[g] += baseOff;
+}
+
+kernel void topk_csr_scatter_slots(
+    device const int* idxBuf [[buffer(0)]], device int* csrBuf [[buffer(1)]],
+    constant int& totalSlots [[buffer(2)]], constant int& numEntries [[buffer(3)]],
+    constant int& numTiles [[buffer(4)]], constant int& offSorted [[buffer(5)]],
+    constant int& offTile [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int t = (int)gid;
+    if (t >= numTiles || totalSlots <= 0) return;
+    int tileSpan = ((totalSlots - 1) / numTiles) + 1;
+    if (t > totalSlots / tileSpan) return;
+    int start = t * tileSpan;
+    int rem = totalSlots - start;
+    int end = start + (rem < tileSpan ? rem : tileSpan);
+    long rowBase = (long)offTile + (long)t * numEntries;
+    for (int s = start; s < end; s++) {
+        int e = idxBuf[s];
+        if (e >= 0 && e < numEntries) {
+            int localOff = csrBuf[rowBase + e];
+            csrBuf[rowBase + e] = localOff + 1;
+            int pos = csrBuf[e] + localOff;
+            csrBuf[offSorted + pos] = s;
+        }
+    }
+}
+
+kernel void topk_weighted_row_mix_backward_table(
+    device const float* gradBuf [[buffer(0)]], device const float* wBuf [[buffer(1)]],
+    device const int* csrBuf [[buffer(2)]], device float* gradTblBuf [[buffer(3)]],
+    constant int& numEntries [[buffer(4)]], constant int& k [[buffer(5)]],
+    constant int& channels [[buffer(6)]], constant int& offSorted [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    long total = (long)numEntries * channels;
+    if ((long)gid >= total) return;
+    int g = (int)((long)gid / channels);
+    int c = (int)((long)gid % channels);
+    int start = csrBuf[g];
+    int end = csrBuf[g + 1];
+    float acc = 0.0f;
+    for (int p = start; p < end; p++) {
+        int slot = csrBuf[offSorted + p];
+        int r = slot / k;
+        acc += wBuf[slot] * gradBuf[(long)r * channels + c];
+    }
+    gradTblBuf[gid] = acc;
+}
+
+kernel void count_indices_accumulate_int32(
+    device const int* idxBuf [[buffer(0)]], device atomic_int* cntBuf [[buffer(1)]],
+    constant int& length [[buffer(2)]], constant int& numBins [[buffer(3)]],
+    constant int& totalThreads [[buffer(4)]],
+    uint gid [[thread_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint bdim [[threads_per_threadgroup]])
+{
+    threadgroup atomic_int s_counts[256];
+    uint uLen = (uint)length;
+    uint uStride = (uint)totalThreads;
+    if (numBins <= 256) {
+        for (int b = (int)tid; b < numBins; b += (int)bdim)
+            atomic_store_explicit(&s_counts[b], 0, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((int)gid < totalThreads) {
+            for (uint i = gid; i < uLen; i += uStride) {
+                int bin = idxBuf[i];
+                if (bin >= 0 && bin < numBins)
+                    atomic_fetch_add_explicit(&s_counts[bin], 1, memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int b = (int)tid; b < numBins; b += (int)bdim) {
+            int c = atomic_load_explicit(&s_counts[b], memory_order_relaxed);
+            if (c != 0) atomic_fetch_add_explicit(&cntBuf[b], c, memory_order_relaxed);
+        }
+    } else {
+        if ((int)gid < totalThreads) {
+            for (uint i = gid; i < uLen; i += uStride) {
+                int bin = idxBuf[i];
+                if (bin >= 0 && bin < numBins)
+                    atomic_fetch_add_explicit(&cntBuf[bin], 1, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+kernel void count_indices_finalize_float(
+    device int* cntBuf [[buffer(0)]], constant int& numBins [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid < numBins) {
+        int c = cntBuf[gid];
+        cntBuf[gid] = as_type<int>((float)c);
+    }
+}
+
+kernel void minmax_init_int32(
+    device int* outBuf [[buffer(0)]], constant int& count [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= count) return;
+    if (gid == 0) outBuf[0] = 2147483647;
+    else if (gid == 1) outBuf[1] = (-2147483647 - 1);
+}
+
+kernel void minmax_reduce_int32(
+    device const int* dataBuf [[buffer(0)]], device atomic_int* outBuf [[buffer(1)]],
+    constant int& length [[buffer(2)]], constant int& totalThreads [[buffer(3)]],
+    uint gid [[thread_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup atomic_int s_min;
+    threadgroup atomic_int s_max;
+    if (tid == 0) {
+        atomic_store_explicit(&s_min, 2147483647, memory_order_relaxed);
+        atomic_store_explicit(&s_max, (-2147483647 - 1), memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((int)gid < totalThreads) {
+        uint uLen = (uint)length;
+        uint uStride = (uint)totalThreads;
+        int lo = 2147483647;
+        int hi = (-2147483647 - 1);
+        int anyVal = 0;
+        for (uint i = gid; i < uLen; i += uStride) {
+            int v = dataBuf[i];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            anyVal = 1;
+        }
+        if (anyVal != 0) {
+            atomic_fetch_min_explicit(&s_min, lo, memory_order_relaxed);
+            atomic_fetch_max_explicit(&s_max, hi, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int bMin = atomic_load_explicit(&s_min, memory_order_relaxed);
+        int bMax = atomic_load_explicit(&s_max, memory_order_relaxed);
+        if (bMin <= bMax) {
+            atomic_fetch_min_explicit(&outBuf[0], bMin, memory_order_relaxed);
+            atomic_fetch_max_explicit(&outBuf[1], bMax, memory_order_relaxed);
+        }
+    }
+}
 ";
 }

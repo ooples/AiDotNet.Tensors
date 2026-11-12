@@ -167,8 +167,7 @@ internal sealed class PtxFusedResidualRmsNormD64Kernel : IDisposable
         if (warpsPerBlock is not (1 or 2 or 4 or 8))
             throw new ArgumentOutOfRangeException(nameof(warpsPerBlock));
         var ptx = new StringBuilder(8192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

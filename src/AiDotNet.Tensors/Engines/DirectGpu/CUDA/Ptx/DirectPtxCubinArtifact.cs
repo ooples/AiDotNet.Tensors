@@ -79,6 +79,8 @@ internal static class DirectPtxCubinArtifactCache
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         PtxCompat.ThrowIfNullOrWhiteSpace(ptx, nameof(ptx));
         ptx = CanonicalizePtx(ptx);
+        // The emitters write .version 7.1 with the device's own target; a newer target needs a newer ISA (sm_89: 7.8).
+        ptx = DirectPtxPtxText.EnsureIsaCoversTarget(ptx);
         string sourceKey = ComputeSourceKey(
             ptx, runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor);
 

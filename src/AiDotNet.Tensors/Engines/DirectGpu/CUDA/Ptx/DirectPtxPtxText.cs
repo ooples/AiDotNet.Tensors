@@ -16,11 +16,82 @@ internal static class DirectPtxPtxText
         if (computeCapabilityMajor <= 0) throw new ArgumentOutOfRangeException(nameof(computeCapabilityMajor));
         if (computeCapabilityMinor < 0) throw new ArgumentOutOfRangeException(nameof(computeCapabilityMinor));
 
-        text.AppendLine(".version 7.1");
-        text.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(text, computeCapabilityMajor, computeCapabilityMinor);
         text.AppendLine(".address_size 64");
         if (disableLoopUnrolling)
             text.AppendLine(".pragma \"nounroll\";");
+    }
+
+    /// <summary>
+    /// The lowest PTX ISA version whose <c>.target</c> list includes <c>sm_{major}{minor}</c> (suffix-free), or null
+    /// for targets the 7.1 ISA the emitters write already covers.
+    /// </summary>
+    internal static (int Major, int Minor)? MinimumIsaForTarget(int target)
+        => target switch
+        {
+            <= 86 => null,
+            87 => (7, 4),
+            88 => (9, 0),
+            89 or 90 => (7, 8),
+            100 or 101 => (8, 6),
+            103 => (8, 8),
+            110 => (9, 0),
+            120 => (8, 7),
+            121 => (8, 8),
+            _ => throw new NotSupportedException(
+                $"Direct PTX target sm_{target} has no mapped minimum PTX ISA version; add an explicit mapping before assembling for this architecture."),
+        };
+
+    /// <summary>
+    /// <see cref="MinimumIsaForTarget(int)"/> for a suffixed target. An architecture-specific target (<c>a</c>) can need
+    /// a newer ISA than its base: <c>sm_90a</c> arrived in PTX 8.0, after <c>sm_90</c> in 7.8; the later <c>a</c> targets
+    /// arrived with their base. Family-specific targets (<c>f</c>) arrived in PTX 8.8.
+    /// </summary>
+    internal static (int Major, int Minor)? MinimumIsaForTarget(int target, string suffix)
+    {
+        var baseIsa = MinimumIsaForTarget(target);
+        (int Major, int Minor)? suffixIsa = suffix switch
+        {
+            "" => null,
+            "a" when target == 90 => (8, 0),
+            "a" => null,
+            "f" => (8, 8),
+            _ => throw new NotSupportedException(
+                $"Direct PTX target sm_{target}{suffix} has an unknown suffix; add an explicit mapping before assembling for it."),
+        };
+        if (suffixIsa is not { } fromSuffix) return baseIsa;
+        if (baseIsa is not { } fromBase) return fromSuffix;
+        return fromBase.Major > fromSuffix.Major || (fromBase.Major == fromSuffix.Major && fromBase.Minor >= fromSuffix.Minor)
+            ? fromBase
+            : fromSuffix;
+    }
+
+    private static readonly TimeSpan HeaderRegexTimeout = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Raises the module's <c>.version</c> to the lowest PTX ISA that knows its <c>.target</c>. The emitters write
+    /// <c>.version 7.1</c> with the device's own target, and ptxas rejects a target newer than the ISA (PTX 7.1 stops at
+    /// sm_86: "PTX .version 7.1 does not support .target sm_89" on Ada). PTX is backward compatible, so the raised
+    /// version assembles the same instructions; a module whose version already covers its target is returned unchanged.
+    /// </summary>
+    internal static string EnsureIsaCoversTarget(string ptx)
+    {
+        if (ptx is null) throw new ArgumentNullException(nameof(ptx));
+        var target = System.Text.RegularExpressions.Regex.Match(ptx, @"^\s*\.target\s+sm_(\d+)([a-z]?)\b",
+            System.Text.RegularExpressions.RegexOptions.Multiline, HeaderRegexTimeout);
+        var version = System.Text.RegularExpressions.Regex.Match(ptx, @"^\s*\.version\s+(\d+)\.(\d+)",
+            System.Text.RegularExpressions.RegexOptions.Multiline, HeaderRegexTimeout);
+        if (!target.Success || !version.Success) return ptx;
+        if (MinimumIsaForTarget(int.Parse(target.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture),
+                target.Groups[2].Value)
+            is not { } needed)
+            return ptx;
+        int major = int.Parse(version.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+        int minor = int.Parse(version.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture);
+        if (major > needed.Major || (major == needed.Major && minor >= needed.Minor)) return ptx;
+        var group = version.Groups[1];
+        int end = version.Groups[2].Index + version.Groups[2].Length;
+        return ptx.Substring(0, group.Index) + needed.Major + "." + needed.Minor + ptx.Substring(end);
     }
 
     internal static string Hex(float value)

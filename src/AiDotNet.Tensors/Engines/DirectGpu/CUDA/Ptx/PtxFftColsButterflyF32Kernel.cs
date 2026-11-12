@@ -101,8 +101,7 @@ internal sealed class PtxFftColsButterflyF32Kernel : IDisposable
         string twoPi = DirectPtxPtxText.Hex((float)(2.0 * Math.PI)), negTwoPi = DirectPtxPtxText.Hex((float)(-2.0 * Math.PI));
 
         var ptx = new StringBuilder(4_608);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape height={height} width={width} block={blockThreads} op=fft-cols-butterfly (stride,inverse are .param)");
         ptx.AppendLine();

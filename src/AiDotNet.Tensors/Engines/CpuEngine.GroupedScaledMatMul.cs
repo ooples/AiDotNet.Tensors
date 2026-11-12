@@ -40,9 +40,10 @@ public enum ScaleSwizzle
 /// the block-scaled low-precision GEMM.
 /// </summary>
 /// <remarks>
-/// <para>Grouped products are composed from <see cref="IEngine.TensorNarrow{T}"/>, <see cref="IEngine.TensorMatMul{T}"/>
-/// and <see cref="IEngine.TensorConcatenate{T}"/>, so they are differentiable and run on whatever engine executes
-/// them.</para>
+/// <para>The jagged-rows form (2-D a, 3-D b: a mixture-of-experts layer's expert GEMMs) is one native, differentiable op
+/// on every engine (CpuEngine.GroupedMatMul.cs). The other grouped forms are composed from
+/// <see cref="IEngine.TensorNarrow{T}"/>, <see cref="IEngine.TensorMatMul{T}"/> and
+/// <see cref="IEngine.TensorConcatenate{T}"/>, so they are differentiable and run on whatever engine executes them.</para>
 /// <para>Scaled products take the operands as their decoded values (the library has no 8- or 4-bit element type) with
 /// the decoding scales of torch's recipes: <c>mm(a * scale_a, b * scale_b) + bias</c>, which is the value torch
 /// computes. Like torch's scaled_mm they are not recorded for autograd.</para>
@@ -78,24 +79,12 @@ public partial class CpuEngine
         if (a.Rank == 2 && b.Rank == 3)
         {
             // Jagged rows: rows [ends[i-1], ends[i]) of a times b[i]. Rows past the last offset are zero.
-            int k = a._shape[1], n = b._shape[2];
+            int k = a._shape[1];
             if (b._shape[0] != groups || b._shape[1] != k) throw new ArgumentException($"Expected b of shape [{groups}, {k}, N]; got [{string.Join(", ", b._shape)}].", nameof(b));
             if (ends[groups - 1] > a._shape[0]) throw new ArgumentException("The last offset passes the rows of a.", nameof(offsets));
-            var parts = new List<Tensor<T>>();
-            int start = 0;
-            for (int g = 0; g < groups; g++)
-            {
-                int rows = ends[g] - start;
-                if (rows > 0)
-                {
-                    var part = e.TensorMatMul(e.TensorNarrow(a, 0, start, rows), e.Reshape(e.TensorNarrow(b, 0, g, 1), new[] { k, n }));
-                    if (bias is not null) part = ((CpuEngine)e).TensorBroadcastAdd(part, GroupBias(e, bias, g, groups, n));
-                    parts.Add(part);
-                }
-                start = ends[g];
-            }
-            if (start < a._shape[0]) parts.Add(new Tensor<T>(new[] { a._shape[0] - start, n }));
-            return parts.Count == 1 ? parts[0] : e.TensorConcatenate(parts.ToArray(), 0);
+            // One native tape node on every engine, the bias included (CpuEngine.GroupedMatMul.cs; DirectGpuTensorEngine
+            // runs it on each backend's IGroupedGemmBackend).
+            return GroupedRowsMatMul(a, b, ends, false, bias);
         }
 
         if (a.Rank == 2 && b.Rank == 2)
@@ -156,7 +145,7 @@ public partial class CpuEngine
     // A grouped bias is [N] (shared by every group) or [G, N] (one row per group). Checked up front so a mismatch
     // names the expected shape instead of failing later inside a narrow or a broadcast. n < 0 means the caller's
     // per-group output width varies (jagged columns) and is enforced by the caller's own narrow.
-    private static void ValidateGroupBias<T>(Tensor<T> bias, int groups, int n)
+    internal static void ValidateGroupBias<T>(Tensor<T> bias, int groups, int n)
     {
         bool ok = bias.Rank switch
         {

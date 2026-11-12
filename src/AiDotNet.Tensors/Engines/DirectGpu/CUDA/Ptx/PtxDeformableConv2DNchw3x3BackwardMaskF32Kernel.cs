@@ -170,8 +170,7 @@ internal sealed class PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel : IDisposa
         const int offsetPlaneStrideBytes = SpatialElements * sizeof(float);        // 256 (offY->offX)
 
         var ptx = new StringBuilder(16384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

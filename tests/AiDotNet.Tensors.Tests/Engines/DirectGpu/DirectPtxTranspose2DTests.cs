@@ -99,6 +99,8 @@ public class DirectPtxTranspose2DTests
     public void BackendTranspose_UnsupportedShapeAndDisabledGateFailClosed()
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        // CudaBackend (unlike the driver-only DirectPtxRuntime) compiles its CUDA-C kernels with NVRTC.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "Requires a CUDA backend (driver and NVRTC).");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.Transpose2DExperimentOverride;
         try

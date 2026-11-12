@@ -117,8 +117,7 @@ internal sealed class PtxFusedIndexSelectF32Kernel : IDisposable
         int innerShift = PtxCompat.Log2((uint)innerSize);
 
         var ptx = new StringBuilder(4_096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape indices={numIndices} inner={innerSize} block={blockThreads} strategy=linear-element op=index-select-f32");

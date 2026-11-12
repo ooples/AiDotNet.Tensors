@@ -140,8 +140,7 @@ internal sealed class PtxConv1DKernel : IDisposable
         string entry = shape.Entry;
 
         var s = new StringBuilder(12288);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

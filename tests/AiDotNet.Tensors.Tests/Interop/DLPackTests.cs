@@ -19,7 +19,11 @@ namespace AiDotNet.Tensors.Tests.Interop;
 /// finalized CUDA import; an export outlives its source; a repeated deleter call is not a double free), version and
 /// dtype refusal, the read-only flag, and a CUDA round trip on a CUDA machine.
 /// </summary>
-[Collection("DLPack")]
+// EngineCurrentGlobalState runs alone (DisableParallelization): these tests set AiDotNetEngine.Current, and Tensor.Gpu(),
+// ToDLPack and FromDLPack place on whatever engine is current. In the CUDA lane's shared host another class swapped it
+// between a test's assignment and its import, which then wrapped the memory for another backend ("Every buffer must
+// belong to this CUDA backend").
+[Collection("EngineCurrentGlobalState")]
 public sealed class DLPackTests
 {
     // ── A minimal C producer, built in unmanaged memory, with a counting deleter ─────────────────────────────────
@@ -661,7 +665,9 @@ public sealed class DLPackTests
             var backend = (CudaBackend)gpu.PlacementBackend!;
             // Centered on zero so the ReLU kernel has both halves to get right.
             var values = Iota(4, 8).ToArray().Select(v => v - 16f).ToArray();
-            using var source = new Tensor<float>(values, new[] { 4, 8 }).Gpu();
+            // Uploaded through this engine rather than Tensor.Gpu(), which places on whatever engine is current.
+            using var source = gpu.UploadToGpu(new Tensor<float>(values, new[] { 4, 8 }),
+                AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.Activation);
             using var imported = Tensor<float>.FromDLPack(source.ToDLPack());
 
             var graph = AiDotNet.Tensors.Engines.Compilation.Codegen.Ir.CodegenLowering.LowerUnaryPointwise<float>(

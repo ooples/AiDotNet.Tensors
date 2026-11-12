@@ -88,8 +88,7 @@ internal sealed class PtxApplyWindowF32Kernel : IDisposable
         ValidateBlockThreads(count, blockThreads);
 
         var ptx = new StringBuilder(1_792);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape count={count} block={blockThreads} op=apply-window");
         ptx.AppendLine();

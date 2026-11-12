@@ -173,8 +173,7 @@ internal sealed class PtxDeformableConv2DGroupedNchw3x3BackwardWeightF32Kernel :
         const int maskGroupStrideBytes = TapsPerChannel * planeStrideBytes;       // 2304 per group
 
         var ptx = new StringBuilder(16384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

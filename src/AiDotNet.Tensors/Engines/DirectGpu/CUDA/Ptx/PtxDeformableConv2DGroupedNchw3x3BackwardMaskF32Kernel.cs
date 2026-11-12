@@ -176,8 +176,7 @@ internal sealed class PtxDeformableConv2DGroupedNchw3x3BackwardMaskF32Kernel : I
         const int maskChannelSpanElems = 2 * TapsPerChannel * SpatialElements;     // g index scale for offsets = 1152
 
         var ptx = new StringBuilder(16384);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{computeCapabilityMajor}{computeCapabilityMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, computeCapabilityMajor, computeCapabilityMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

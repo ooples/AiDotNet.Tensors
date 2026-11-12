@@ -626,6 +626,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
+            // Record WHY, so a host with a GPU driver but no NVRTC (the CUDA runtime compiler every CUDA-C module of
+            // this backend is built with) is diagnosable instead of reporting "no error".
+            InitializationError = !CudaNativeBindings.IsAvailable
+                ? "The CUDA driver library could not be loaded."
+                : "The CUDA driver is present, but NVRTC (the CUDA runtime compiler this backend compiles its kernels " +
+                  "with) could not be loaded. Install the CUDA toolkit or the nvidia-cuda-nvrtc package, or set " +
+                  "AIDOTNET_CUDA_DIR to the directory containing the NVRTC library.";
             IsAvailable = false;
             DeviceName = "None";
             return;
@@ -4134,6 +4141,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public void AddRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         if (TryDeclaredAddActivation("relu", A, B, C, size)) return;
+        // Where the declared route is not released (it is on sm_75/sm_86; not on sm_80, sm_89, sm_90 and newer) the add and
+        // the ReLU still run as one pass: bias_add_out over one row whose "bias" is B is C[i] = relu_nan_safe(A[i] + B[i]),
+        // the add_vectors sum and the relu kernel's operation, so bit-identical to the two launches it replaces.
+        if (size > 0 && _kernelCache.ContainsKey("bias_add_out"))
+        {
+            // The same operand checks as the two-launch path: bias_add_out reads A and B and writes C over size.
+            ValidateElementwiseOperands("add_relu", A, B, C, size);
+            LaunchBiasAdd(A, B, C, 1, size, relu: true);
+            return;
+        }
         Add(A, B, C, size); Relu(C, C, size);
     }
     public void AddSigmoid(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
@@ -6126,6 +6143,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    private static void ValidateElementwiseOperands(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
+    {
+        if (A.Handle == IntPtr.Zero || B.Handle == IntPtr.Zero || C.Handle == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand was DISPOSED (Handle=0): A={(long)A.Handle:X} B={(long)B.Handle:X} C={(long)C.Handle:X} — use-after-free guard.");
+        // In bytes: a byte buffer's Size counts bytes, so an element-count compare would pass a quarter-sized one.
+        long requiredBytes = (long)size * sizeof(float);
+        if (A.SizeInBytes < requiredBytes || B.SizeInBytes < requiredBytes || C.SizeInBytes < requiredBytes)
+            throw new InvalidOperationException(
+                $"Elementwise '{kernelName}' operand buffer too small for {requiredBytes} bytes ({size} floats): A={A.SizeInBytes} B={B.SizeInBytes} C={C.SizeInBytes}.");
+    }
+
     private unsafe void LaunchElementwiseKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
     {
         // PR #638 (CUDA-700 root fix): never launch an elementwise kernel over a buffer SMALLER than `size`. A
@@ -6134,12 +6163,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // the context with a sticky CUDA-700 (localized to add_vectors / op=TensorAdd via the post-launch check;
         // the GPU never exceeds ~2.6/12GB, so it was never a real OOM). Throw BEFORE the launch so the caller's
         // try/catch falls back to the correct (reallocating) host path instead of corrupting the context.
-        if (A.Handle == IntPtr.Zero || B.Handle == IntPtr.Zero || C.Handle == IntPtr.Zero)
-            throw new InvalidOperationException(
-                $"Elementwise '{kernelName}' operand was DISPOSED (Handle=0): A={(long)A.Handle:X} B={(long)B.Handle:X} C={(long)C.Handle:X} — use-after-free guard.");
-        if (A.Size < size || B.Size < size || C.Size < size)
-            throw new InvalidOperationException(
-                $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
+        ValidateElementwiseOperands(kernelName, A, B, C, size);
         // A declared kernel first (#890 phase 4a), computing this kernel's own expression.
         if (TryDeclaredElementwise(kernelName, C, size, A, B)) return;
         // Try vec4 variant for 4x throughput on bandwidth-limited ops
@@ -20477,6 +20501,43 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// <summary>Test hook: the unreleased bytes of the current quantum.</summary>
     internal static long CudaReclaimPendingBytesForTests => Volatile.Read(ref s_cudaReclaimState) & CudaReclaimByteMask;
 
+    private static void InitCudaBufferLifecycle(
+        IntPtr context, long chargeBytes,
+        out bool allocatedDuringCapture, out long contextGeneration,
+        out long reclaimCharge, out long reclaimEpoch)
+    {
+        allocatedDuringCapture = IsCapturingOnThisThread;
+        contextGeneration = ContextGenerationOf(context);
+        if (chargeBytes > 0 && !allocatedDuringCapture && !IsRuntimeTearingDown && !ProcessExiting)
+        {
+            reclaimCharge = chargeBytes;
+            reclaimEpoch = ChargeCudaReclaim(chargeBytes);
+        }
+        else
+        {
+            reclaimCharge = 0;
+            reclaimEpoch = -1;
+        }
+    }
+
+    private static bool TryDeferCudaBufferAction(
+        CaptureMemoryPool[]? pins, bool allocatedDuringCapture, Action outerAction, Action coreAction)
+    {
+        if (CaptureMemoryPool.TryDeferRelease(pins, outerAction)) return true;
+        if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(coreAction)) return true;
+        if (TryDeferReleaseUntilCaptureEnds(allocatedDuringCapture, coreAction)) return true;
+        return false;
+    }
+
+    private static void CompleteCudaBufferReclaimOrFinalizer(
+        long reclaimCharge, long reclaimEpoch,
+        IntPtr finalizerPtr, IntPtr context, long contextGeneration, IntPtr asyncFreeStream)
+    {
+        if (reclaimCharge > 0) CreditCudaReclaim(reclaimCharge, reclaimEpoch);
+        if (finalizerPtr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
+            PendingFinalizerFrees.Enqueue((finalizerPtr, context, contextGeneration, asyncFreeStream));
+    }
+
     internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     {
         private IntPtr _context;
@@ -20494,15 +20555,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void ChargeReclaim(long bytes)
         {
-            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
-            _reclaimCharge = bytes;
-            _reclaimEpoch = ChargeCudaReclaim(bytes);
+            InitCudaBufferLifecycle(IntPtr.Zero, bytes, out _, out _, out long charge, out long epoch);
+            if (charge > 0)
+            {
+                _reclaimCharge = charge;
+                _reclaimEpoch = epoch;
+            }
         }
 
         private void CreditReclaim()
         {
             long charge = Interlocked.Exchange(ref _reclaimCharge, 0);
-            if (charge > 0) CreditCudaReclaim(charge, _reclaimEpoch);
+            if (charge > 0)
+                CompleteCudaBufferReclaimOrFinalizer(charge, _reclaimEpoch, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         }
 
         public int Size => Volatile.Read(ref _size);
@@ -20541,9 +20606,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 capture.Pin(ref _capturePins, this);
                 _capturedAllocation = true;
             }
-            _allocatedDuringCapture = IsCapturingOnThisThread;
-            _contextGeneration = ContextGenerationOf(context);
-            if (account is not null) ChargeReclaim((long)size * sizeof(float));
+            InitCudaBufferLifecycle(
+                context, account is not null ? (long)size * sizeof(float) : 0,
+                out _allocatedDuringCapture, out _contextGeneration, out _reclaimCharge, out _reclaimEpoch);
         }
 
         // Allocated during a capture: never returned to the shared pool (another rent could hand it out while a
@@ -20584,9 +20649,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // #642: while a deferred-execution scope is recording/replaying, queue the free
             // until after the graph runs — the recorded op graph still references this buffer.
             // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
-            if (CaptureMemoryPool.TryDeferRelease(Volatile.Read(ref _capturePins), Release)) return;
-            if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
-            if (TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, ReleaseCore)) return;
+            if (TryDeferCudaBufferAction(Volatile.Read(ref _capturePins), _allocatedDuringCapture, Release, ReleaseCore))
+                return;
             ReleaseCore();
         }
 
@@ -20657,11 +20721,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // scope finishes — returning to the pool mid-record could re-rent + overwrite a
             // buffer the recorded graph still reads. Runs normally once the gate is cleared.
             // A captured graph's memory goes back to no pool while the graph can replay (CaptureMemoryPool).
-            if (CaptureMemoryPool.TryDeferRelease(Volatile.Read(ref _capturePins), Dispose)) return;
-            if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(DisposeCore)) return;
-            // Pool return counts too: a pre-capture buffer recycled mid-capture could be re-rented by the capture and
-            // then handed to another owner after it, while every graph launch still writes it.
-            if (TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, DisposeCore)) return;
+            if (TryDeferCudaBufferAction(Volatile.Read(ref _capturePins), _allocatedDuringCapture, Dispose, DisposeCore))
+                return;
             DisposeCore();
         }
 
@@ -20696,8 +20757,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // enqueue nothing, so the pointer is never freed twice (the double-free that crashed the host).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
             if (ptr != IntPtr.Zero) _memory.OnFreed();
-            if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
-                PendingFinalizerFrees.Enqueue((ptr, _context, _contextGeneration, _asyncFreeStream));
+            CompleteCudaBufferReclaimOrFinalizer(0, -1, ptr, _context, _contextGeneration, _asyncFreeStream);
             _context = IntPtr.Zero;
         }
     }

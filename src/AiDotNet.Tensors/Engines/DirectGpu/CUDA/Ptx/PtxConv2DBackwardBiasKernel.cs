@@ -111,8 +111,7 @@ internal sealed class PtxConv2DBackwardBiasKernel : IDisposable
             $"aidotnet_conv2d_backward_bias_n{batch}_k{k}_h{h}_w{w}");
 
         var s = new StringBuilder(8192);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");

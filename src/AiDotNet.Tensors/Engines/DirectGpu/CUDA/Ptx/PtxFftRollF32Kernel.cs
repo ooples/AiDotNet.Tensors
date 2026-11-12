@@ -103,8 +103,7 @@ internal sealed class PtxFftRollF32Kernel : IDisposable
         int forward = dim - shift;   // output[i] = input[(i + (dim - shift)) mod dim]
 
         var ptx = new StringBuilder(2_048);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine($"// exact-shape dim={dim} shift={shift} batch={batch} block={blockThreads} op=fft-roll");
         ptx.AppendLine();

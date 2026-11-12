@@ -369,7 +369,6 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
             selectedWarpsPerBlock > queryTiles || queryTiles % selectedWarpsPerBlock != 0)
             throw new ArgumentOutOfRangeException(nameof(warpsPerBlock));
         int warps = selectedWarpsPerBlock;
-        string target = $"sm_{ccMajor}{ccMinor}";
         string scaleHex = FloatLiteral(scale);
         const string log2E = "0f3FB8AA3B";
         const string ln2 = "0f3F317218";
@@ -386,8 +385,7 @@ internal sealed class PtxOnlineFusedAttention128x64Kernel : IDisposable
         int sharedBytes = betaShared + 256;
 
         var ptx = new StringBuilder(96 * 1024);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target {target}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

@@ -5,8 +5,12 @@ using P = AiDotNet.Tensors.Engines.DirectGpu.PortableMixedPrecisionConv;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed partial class VulkanBackend : IGpuMixedPrecisionConvBackend
+public sealed partial class VulkanBackend : IGpuMixedPrecisionConvBackend, INativeReducedPrecisionConv
 {
+    // The portable mixed-precision conv widens to FP32, convolves and narrows: 16-bit storage, FP32 math. Autocast
+    // keeps convolutions on the FP32 kernels here, since that route would only add the conversions (#1549).
+    bool INativeReducedPrecisionConv.NativeReducedPrecisionMath => false;
+
     /// <summary>Mixed-precision convolution runs here through <see cref="PortableMixedPrecisionConv"/>.</summary>
     public IGpuMixedPrecisionConvBackend? MixedPrecisionConv => this;
 

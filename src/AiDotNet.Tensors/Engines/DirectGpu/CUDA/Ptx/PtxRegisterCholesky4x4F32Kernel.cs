@@ -105,8 +105,7 @@ internal sealed class PtxRegisterCholesky4x4F32Kernel : IDisposable
         ValidateBatchCount(batchCount);
         DirectPtxSolver4x4Autotuner.ValidateBlockThreads(blockThreads);
         var ptx = new StringBuilder(8_192);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");

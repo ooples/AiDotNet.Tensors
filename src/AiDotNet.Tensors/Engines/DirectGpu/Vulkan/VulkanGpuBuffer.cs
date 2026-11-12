@@ -16,6 +16,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal readonly VulkanBuffer Staging;
     private int _disposed;
     private readonly VulkanGpuBuffer? _viewParent;
+    private VulkanBackend? _batchUploadOwner;
     // What GpuMemoryStats counts for the device-local storage buffer (the staging buffer is host-visible memory).
     private DeviceMemoryHold _memory;
 
@@ -251,6 +252,21 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         return buffer;
     }
 
+    internal void HoldForBatchUpload(VulkanBackend owner) =>
+        System.Threading.Volatile.Write(ref _batchUploadOwner, owner);
+
+    /// <summary>True while this buffer's upload is recorded in an open batch and has not run yet.</summary>
+    /// <remarks>A view reports its parent's pending upload: they share the allocation. Batch uploads only ever target a
+    /// freshly allocated buffer (never a view), so the parent chain covers every alias.</remarks>
+    internal bool HasPendingBatchUpload =>
+        System.Threading.Volatile.Read(ref _batchUploadOwner) is not null || _viewParent?.HasPendingBatchUpload == true;
+
+    internal void ClearBatchUploadHold() =>
+        System.Threading.Interlocked.Exchange(ref _batchUploadOwner, null);
+
+    internal static void CompleteDeferredBatchDispose(VulkanGpuBuffer buffer) =>
+        ReleaseWhenIdle(buffer);
+
     /// <inheritdoc/>
     public void Dispose()
     {
@@ -260,6 +276,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         // its buffers). Without the credit a TensorScope's frees still counted toward a forced collection.
         long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
         if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
+        var batchOwner = System.Threading.Interlocked.Exchange(ref _batchUploadOwner, null);
+        if (batchOwner is not null && batchOwner.TryDeferDisposedBatchUpload(this))
+            return;
         ReleaseWhenIdle(this);
     }
 

@@ -206,6 +206,278 @@ extern ""C"" __global__ void causal_dwconv1d_backward_kernel(
         dw[j * channels + c] = s;
     }
 }
+
+// Sparse routing & codebook primitives (ISparseRoutingBackend): zero atomics, deterministic ascending reductions.
+extern ""C"" __global__ void gather_row_values_forward(
+    const float* values, const int* indices, float* output, int rows, int cols, int k)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * k;
+    if (gid >= total) return;
+    int r = (int)(gid / k);
+    int col = indices[gid];
+    output[gid] = (col >= 0 && col < cols) ? values[(long)r * cols + col] : 0.0f;
+}
+
+extern ""C"" __global__ void gather_row_values_backward(
+    const float* gradOut, const int* indices, float* gradValues, int rows, int cols, int k)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * cols;
+    if (gid >= total) return;
+    int r = (int)(gid / cols);
+    int c = (int)(gid % cols);
+    long kBase = (long)r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        if (indices[kBase + j] == c) acc += gradOut[kBase + j];
+    }
+    gradValues[gid] = acc;
+}
+
+extern ""C"" __global__ void topk_weighted_row_mix_forward(
+    const float* table, const int* indices, const float* weights, float* output,
+    int rows, int numEntries, int k, int channels)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * channels;
+    if (gid >= total) return;
+    int r = (int)(gid / channels);
+    int c = (int)(gid % channels);
+    long kBase = (long)r * k;
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++) {
+        int entry = indices[kBase + j];
+        if (entry >= 0 && entry < numEntries)
+            acc += weights[kBase + j] * table[(long)entry * channels + c];
+    }
+    output[gid] = acc;
+}
+
+extern ""C"" __global__ void topk_weighted_row_mix_backward_weights(
+    const float* gradOut, const float* table, const int* indices, float* gradWeights,
+    int rows, int numEntries, int k, int channels)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)rows * k;
+    if (gid >= total) return;
+    int r = (int)(gid / k);
+    int entry = indices[gid];
+    float acc = 0.0f;
+    if (entry >= 0 && entry < numEntries) {
+        long goBase = (long)r * channels;
+        long tbBase = (long)entry * channels;
+        for (int c = 0; c < channels; c++)
+            acc += gradOut[goBase + c] * table[tbBase + c];
+    }
+    gradWeights[gid] = acc;
+}
+
+extern ""C"" __global__ void sparse_zero_int32(int* buf, int offset, int count)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid < count) buf[(long)offset + gid] = 0;
+}
+
+extern ""C"" __global__ void topk_csr_tile_counts(
+    const int* indices, int* csr, int totalSlots, int numEntries, int numTiles, int offTile)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= numTiles || totalSlots <= 0) return;
+    int tileSpan = ((totalSlots - 1) / numTiles) + 1;
+    if (t > totalSlots / tileSpan) return;
+    int start = t * tileSpan;
+    int rem = totalSlots - start;
+    int end = start + (rem < tileSpan ? rem : tileSpan);
+    long rowBase = (long)offTile + (long)t * numEntries;
+    for (int s = start; s < end; s++) {
+        int e = indices[s];
+        if (e >= 0 && e < numEntries)
+            csr[rowBase + e] += 1;
+    }
+}
+
+extern ""C"" __global__ void topk_csr_entry_prefix(
+    int* csr, int numEntries, int numTiles, int offTile)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= numEntries) return;
+    int acc = 0;
+    for (int t = 0; t < numTiles; t++) {
+        long idx = (long)offTile + (long)t * numEntries + g;
+        int c = csr[idx];
+        csr[idx] = acc;
+        acc += c;
+    }
+    csr[g] = acc;
+}
+
+extern ""C"" __global__ void topk_csr_chunk_sums(
+    int* csr, int numEntries, int offChunk)
+{
+    int cIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cIdx >= 256) return;
+    int acc = 0;
+    if (numEntries > 0) {
+        int chunkSpan = ((numEntries - 1) / 256) + 1;
+        if (cIdx <= numEntries / chunkSpan) {
+            int start = cIdx * chunkSpan;
+            int rem = numEntries - start;
+            int end = start + (rem < chunkSpan ? rem : chunkSpan);
+            for (int g = start; g < end; g++) {
+                int c = csr[g];
+                csr[g] = acc;
+                acc += c;
+            }
+        }
+    }
+    csr[offChunk + cIdx] = acc;
+}
+
+extern ""C"" __global__ void topk_csr_chunk_finalize(
+    int* csr, int numEntries, int offChunk)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g > numEntries) return;
+    if (g == numEntries) {
+        int total = 0;
+        for (int m = 0; m < 256; m++) total += csr[offChunk + m];
+        csr[numEntries] = total;
+        return;
+    }
+    int chunkSpan = ((numEntries - 1) / 256) + 1;
+    int chunkIdx = g / chunkSpan;
+    int baseOff = 0;
+    for (int m = 0; m < chunkIdx; m++) baseOff += csr[offChunk + m];
+    csr[g] += baseOff;
+}
+
+extern ""C"" __global__ void topk_csr_scatter_slots(
+    const int* indices, int* csr, int totalSlots, int numEntries, int numTiles, int offSorted, int offTile)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= numTiles || totalSlots <= 0) return;
+    int tileSpan = ((totalSlots - 1) / numTiles) + 1;
+    if (t > totalSlots / tileSpan) return;
+    int start = t * tileSpan;
+    int rem = totalSlots - start;
+    int end = start + (rem < tileSpan ? rem : tileSpan);
+    long rowBase = (long)offTile + (long)t * numEntries;
+    for (int s = start; s < end; s++) {
+        int e = indices[s];
+        if (e >= 0 && e < numEntries) {
+            int localOff = csr[rowBase + e];
+            csr[rowBase + e] = localOff + 1;
+            int pos = csr[e] + localOff;
+            csr[offSorted + pos] = s;
+        }
+    }
+}
+
+extern ""C"" __global__ void topk_weighted_row_mix_backward_table(
+    const float* gradOut, const float* weights, const int* csr, float* gradTable,
+    int numEntries, int k, int channels, int offSorted)
+{
+    long gid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)numEntries * channels;
+    if (gid >= total) return;
+    int g = (int)(gid / channels);
+    int c = (int)(gid % channels);
+    int start = csr[g];
+    int end = csr[g + 1];
+    float acc = 0.0f;
+    for (int p = start; p < end; p++) {
+        int slot = csr[offSorted + p];
+        int r = slot / k;
+        acc += weights[slot] * gradOut[(long)r * channels + c];
+    }
+    gradTable[gid] = acc;
+}
+
+extern ""C"" __global__ void count_indices_accumulate_int32(
+    const int* indices, int* countsInt, int length, int numBins, int totalThreads)
+{
+    __shared__ int s_counts[256];
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    long gid = (long)blockIdx.x * bdim + tid;
+    unsigned int uLen = (unsigned int)length;
+    unsigned int uStride = (unsigned int)totalThreads;
+    if (numBins <= 256) {
+        for (int b = tid; b < numBins; b += bdim) s_counts[b] = 0;
+        __syncthreads();
+        if (gid < totalThreads) {
+            for (unsigned int i = (unsigned int)gid; i < uLen; i += uStride) {
+                int bin = indices[i];
+                if (bin >= 0 && bin < numBins) atomicAdd(&s_counts[bin], 1);
+            }
+        }
+        __syncthreads();
+        for (int b = tid; b < numBins; b += bdim) {
+            int c = s_counts[b];
+            if (c != 0) atomicAdd(&countsInt[b], c);
+        }
+    } else {
+        if (gid < totalThreads) {
+            for (unsigned int i = (unsigned int)gid; i < uLen; i += uStride) {
+                int bin = indices[i];
+                if (bin >= 0 && bin < numBins) atomicAdd(&countsInt[bin], 1);
+            }
+        }
+    }
+}
+
+extern ""C"" __global__ void count_indices_finalize_float(int* countsBuf, int numBins)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid < numBins) {
+        int c = countsBuf[gid];
+        ((float*)countsBuf)[gid] = (float)c;
+    }
+}
+
+extern ""C"" __global__ void minmax_init_int32(int* outMinMax)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid == 0) outMinMax[0] = 2147483647;
+    else if (gid == 1) outMinMax[1] = (-2147483647 - 1);
+}
+
+extern ""C"" __global__ void minmax_reduce_int32(
+    const int* data, int* outMinMax, int length, int totalThreads)
+{
+    __shared__ int s_min;
+    __shared__ int s_max;
+    int tid = threadIdx.x;
+    long gid = (long)blockIdx.x * blockDim.x + tid;
+    if (tid == 0) {
+        s_min = 2147483647;
+        s_max = (-2147483647 - 1);
+    }
+    __syncthreads();
+    if (gid < totalThreads) {
+        unsigned int uLen = (unsigned int)length;
+        unsigned int uStride = (unsigned int)totalThreads;
+        int lo = 2147483647;
+        int hi = (-2147483647 - 1);
+        int any = 0;
+        for (unsigned int i = (unsigned int)gid; i < uLen; i += uStride) {
+            int v = data[i];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            any = 1;
+        }
+        if (any != 0) {
+            atomicMin(&s_min, lo);
+            atomicMax(&s_max, hi);
+        }
+    }
+    __syncthreads();
+    if (tid == 0 && s_min <= s_max) {
+        atomicMin(&outMinMax[0], s_min);
+        atomicMax(&outMinMax[1], s_max);
+    }
+}
 ";
     }
 
@@ -217,7 +489,22 @@ extern ""C"" __global__ void causal_dwconv1d_backward_kernel(
             "gla_scan_backward_ckpt",
             "causal_dwconv1d_forward",
             "causal_dwconv1d_backward_input",
-            "causal_dwconv1d_backward_kernel"
+            "causal_dwconv1d_backward_kernel",
+            "gather_row_values_forward",
+            "gather_row_values_backward",
+            "topk_weighted_row_mix_forward",
+            "topk_weighted_row_mix_backward_weights",
+            "sparse_zero_int32",
+            "topk_csr_tile_counts",
+            "topk_csr_entry_prefix",
+            "topk_csr_chunk_sums",
+            "topk_csr_chunk_finalize",
+            "topk_csr_scatter_slots",
+            "topk_weighted_row_mix_backward_table",
+            "count_indices_accumulate_int32",
+            "count_indices_finalize_float",
+            "minmax_init_int32",
+            "minmax_reduce_int32"
         };
     }
 }

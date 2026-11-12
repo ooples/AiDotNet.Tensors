@@ -108,8 +108,7 @@ internal sealed class PtxFusedRowL2NormalizeF32Kernel : IDisposable
         int shuffleReg = valuesPerLane + 1;
         int invNormReg = valuesPerLane + 2;
         var ptx = new StringBuilder(4_096);
-        ptx.AppendLine(".version 7.1");
-        ptx.AppendLine($".target sm_{ccMajor}{ccMinor}");
+        PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
         ptx.AppendLine(
             $"// exact-shape rows={rows} columns={columns} block={blockThreads} strategy=warp-row op=l2normalize cache=ca");

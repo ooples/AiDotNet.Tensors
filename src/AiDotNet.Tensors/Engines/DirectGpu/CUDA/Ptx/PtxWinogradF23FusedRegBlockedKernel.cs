@@ -168,8 +168,7 @@ internal sealed class PtxWinogradF23FusedRegBlockedKernel : IDisposable
         int Midx(int xi, int im, int jn) => xi * (tm * tn) + im * tn + jn;
 
         var s = new StringBuilder(131072);
-        s.AppendLine(".version 7.1");
-        s.AppendLine($".target sm_{major}{minor}");
+        PtxIsa.AppendVersionAndTarget(s, major, minor);
         s.AppendLine(".address_size 64");
         s.AppendLine();
         s.AppendLine($".visible .entry {entry}(");
