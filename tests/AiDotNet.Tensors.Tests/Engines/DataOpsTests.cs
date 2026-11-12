@@ -66,7 +66,8 @@ public sealed class DataOpsTests
             Math.Pow(2, -149),            // smallest float subnormal, exact
             Math.Pow(2, -150),            // half of it: tie to even, +0
             1.5 * Math.Pow(2, -150),      // above the tie: 2^-149
-            -3.4028235677973366E+38,      // above -float.MaxValue by less than half an ulp: -float.MaxValue
+            -3.4028235677973362E+38,      // above -float.MaxValue by less than half an ulp: -float.MaxValue
+            -3.4028235677973366E+38,      // exactly -(MaxValue + half an ulp), the tie: to even (2^128), so -inf
             1e39,                         // beyond float range: +inf
             -0.0,
             double.NegativeInfinity,
@@ -75,7 +76,8 @@ public sealed class DataOpsTests
         var t = Cpu.TensorFromBytes<float>(Bytes(values, BitConverter.GetBytes), NumericStorageType.Float64, new[] { values.Length });
         AssertBits(new[]
         {
-            0.333333343f, 16777216f, 16777220f, 1.401298E-45f, 0f, 1.401298E-45f, -float.MaxValue, float.PositiveInfinity,
+            0.333333343f, 16777216f, 16777220f, 1.401298E-45f, 0f, 1.401298E-45f, -float.MaxValue, float.NegativeInfinity,
+            float.PositiveInfinity,
             -0f, float.NegativeInfinity, float.NaN,
         }, t.ToArray());
     }
