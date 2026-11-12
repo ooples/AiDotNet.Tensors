@@ -105,6 +105,12 @@ public class GenericLinalgAdversarialTests
     private static void AssertEigenResidual(decimal[] a, decimal[] w, decimal[] v, int n, decimal tol)
     {
         for (int k = 0; k < n; k++)
+        {
+            // A zero vector satisfies every residual: Eig returns unit 2-norm eigenvectors (?geev), so check that first.
+            decimal normSq = 0;
+            for (int i = 0; i < n; i++)
+                normSq += v[(i * n + k) * 2] * v[(i * n + k) * 2] + v[(i * n + k) * 2 + 1] * v[(i * n + k) * 2 + 1];
+            Assert.True(Math.Abs(normSq - 1m) < tol, $"eigenvector {k} has squared norm {normSq}, not 1");
             for (int i = 0; i < n; i++)
             {
                 decimal rr = 0, ri = 0;
@@ -117,5 +123,6 @@ public class GenericLinalgAdversarialTests
                 Assert.True(Math.Abs(rr - (w[k * 2] * xr - w[k * 2 + 1] * xi)) < tol);
                 Assert.True(Math.Abs(ri - (w[k * 2] * xi + w[k * 2 + 1] * xr)) < tol);
             }
+        }
     }
 }

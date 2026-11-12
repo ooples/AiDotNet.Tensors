@@ -48,6 +48,23 @@ public class LinalgElementTypeCoverageTests
             Assert.False(ops.IsNaN(d[i]) || ops.IsInfinity(d[i]), $"{what}[{i}] is not finite: {d[i]}");
     }
 
+    // A·x must reproduce b to within the element type's precision (the 16-bit types keep about 3 significant digits).
+    private static void AssertSolves<T>(Tensor<T> a, Tensor<T> x, Tensor<T> b)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        double tol = typeof(T) == typeof(Half) || typeof(T) == typeof(BFloat16) ? 0.1 : 1e-4;
+        var ad = a.GetDataArray(); var xd = x.GetDataArray(); var bd = b.GetDataArray();
+        int n = a.Shape[0], k = b.Shape[1];
+        for (int i = 0; i < n; i++)
+            for (int c = 0; c < k; c++)
+            {
+                double sum = 0;
+                for (int j = 0; j < n; j++) sum += ops.ToDouble(ad[i * n + j]) * ops.ToDouble(xd[j * k + c]);
+                double expected = ops.ToDouble(bd[i * k + c]);
+                Assert.True(Math.Abs(sum - expected) <= tol, $"(A·x)[{i},{c}] = {sum}, b = {expected}");
+            }
+    }
+
     /// <summary>Calls each bound Linalg method once; returns method name to thrown exception (null = ok).</summary>
     private static List<(string Method, Exception? Error)> Probe<T>()
         where T : unmanaged, IEquatable<T>, IComparable<T>
@@ -55,9 +72,6 @@ public class LinalgElementTypeCoverageTests
         var a = Make<T>(new[] { 3, 3 }, SpdValues);
         var l = Make<T>(new[] { 3, 3 }, LowerValues);
         var b = Make<T>(new[] { 3, 2 }, RhsValues);
-        var identityPivots = new Tensor<int>(new[] { 3 });
-        var pv = identityPivots.GetDataArray();
-        for (int i = 0; i < 3; i++) pv[i] = i;
 
         var calls = new List<(string, Action)>
         {
@@ -111,7 +125,14 @@ public class LinalgElementTypeCoverageTests
                 AssertFinite(lu, "LU");
                 Assert.Equal(3, piv.Length);
             }),
-            ("LuSolve", () => AssertFinite(Linalg.LuSolve(a, identityPivots, b), "x")),
+            ("LuSolve", () =>
+            {
+                // LuSolve takes LuFactor's packed factor and pivots; the solution must reproduce b.
+                var (lu, piv) = Linalg.LuFactor(a);
+                var x = Linalg.LuSolve(lu, piv, b);
+                AssertFinite(x, "x");
+                AssertSolves(a, x, b);
+            }),
         };
 
         var results = new List<(string, Exception?)>();
@@ -154,9 +175,7 @@ public class LinalgElementTypeCoverageTests
     [Fact] public void AllBoundMethods_RunFor_Double() => AssertAllSucceed<double>();
     [Fact] public void AllBoundMethods_RunFor_Decimal() => AssertAllSucceed<decimal>();
     [Fact] public void AllBoundMethods_RunFor_BFloat16() => AssertAllSucceed<BFloat16>();
-#if NET5_0_OR_GREATER
     [Fact] public void AllBoundMethods_RunFor_Half() => AssertAllSucceed<Half>();
-#endif
 
     [Fact] public void Factorizations_Reject_Int32() => AssertRejected<int>();
     [Fact] public void Factorizations_Reject_Int64() => AssertRejected<long>();
@@ -206,12 +225,14 @@ public sealed class LinalgDecimalGpuFallbackTests
         };
     }
 
-    [Fact]
+    [SkippableFact]
     public void DecimalLinalg_UnderDirectGpuEngine_FallsBackToCpuKernels()
     {
         var cpu = RunAll();
         var previous = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         using var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        // Without a backend the engine runs as a CPU engine, and the comparison would be CPU against CPU.
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available on this system.");
         try
         {
             AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;

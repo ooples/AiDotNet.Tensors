@@ -339,7 +339,6 @@ public class LinalgDecimalReferenceTests
         Assert.True(Math.Abs((float)Linalg.Det(t).GetDataArray()[0] - 70f) <= 1f);
     }
 
-#if NET5_0_OR_GREATER
     [Fact]
     public void Half_Eigh_And_Solve_WithinHalfPrecision()
     {
@@ -354,5 +353,4 @@ public class LinalgDecimalReferenceTests
         for (int i = 0; i < 6; i++)
             Assert.True(Math.Abs((double)(float)x[i] - (double)SolveAB[i]) <= 0.01, $"half x[{i}] = {(float)x[i]}");
     }
-#endif
 }

@@ -89,6 +89,9 @@ public sealed class DataOpsGpuParityTests : IClassFixture<GpuCpuCorrectnessFixtu
         var gpu = _fixture.Gpu.TensorParse<float>(text, (byte)',', new[] { 50, 100 }, NumberStyles.Float,
             CultureInfo.InvariantCulture, float.NaN);
         AssertNoFallback("TensorParse");
+        // The host-finish path for undecided fields records no fallback but returns a host tensor: an all-decided
+        // parse must come back as the device result.
+        Assert.True(gpu.IsGpuResident || gpu.HasPendingGpuData, "the parse was finished on the host");
         Assert.Equal(new[] { 50, 100 }, gpu.Shape.ToArray());
         var cpu = _fixture.Cpu.TensorParse<float>(text, (byte)',', new[] { 50, 100 }, NumberStyles.Float,
             CultureInfo.InvariantCulture, float.NaN);

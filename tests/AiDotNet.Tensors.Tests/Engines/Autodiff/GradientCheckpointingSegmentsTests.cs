@@ -288,21 +288,15 @@ public class GradientCheckpointingSegmentsTests
 [Collection("DirectGpuSerial")]
 public class GradientCheckpointingSegmentsGpuTests : IDisposable
 {
-    private readonly DirectGpuTensorEngine? _gpu;
+    private readonly DirectGpuTensorEngine _gpu;
     private readonly bool _available;
 
     public GradientCheckpointingSegmentsGpuTests()
     {
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _available = _gpu.IsGpuAvailable;
-        }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
-        {
-            // No usable device backend on this machine: the test skips.
-            _available = false;
-        }
+        // A machine without a device backend constructs the engine with IsGpuAvailable false, and the test skips. Any
+        // exception is a real initialization failure on a GPU runner, so it fails the test instead of skipping it.
+        _gpu = new DirectGpuTensorEngine();
+        _available = _gpu.IsGpuAvailable;
     }
 
     // The flat indexer reads a device-resident tensor back through the engine.
@@ -315,7 +309,7 @@ public class GradientCheckpointingSegmentsGpuTests : IDisposable
 
     public void Dispose()
     {
-        _gpu?.Dispose();
+        _gpu.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -323,7 +317,7 @@ public class GradientCheckpointingSegmentsGpuTests : IDisposable
     public void CheckpointSegments_GpuConsumer_ConsumedAndDeclinedGradientsMatchEager()
     {
         Skip.If(!_available, "GPU backend not available");
-        if (_gpu is not { } gpu) return;
+        var gpu = _gpu;
         var cpu = new CpuEngine();
 
         var x = GradientCheckpointingSegmentsTests.CreateLinearWeight(3, 4, seed: 401);
