@@ -195,6 +195,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.WebGpu);
     }
 
+    /// <summary>Allocates a zero-initialized device buffer of float elements.</summary>
     /// <param name="elementCount">Number of float elements.</param>
     /// <returns>A new zero-initialized GPU buffer.</returns>
     public IGpuBuffer AllocateBuffer(int elementCount) => AllocateBufferCore(elementCount, zeroInitialize: true);

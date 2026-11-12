@@ -15071,15 +15071,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (key is null)
             return;
 
-        _pendingPersistentRoles.Remove(key);
+        // The device copy may be the only current one (an optimizer stepped it on the device): bring it to the host
+        // before any cleanup. A failed download propagates with the pending record, binding and buffer intact, so the
+        // tensor still reports its host values as invalid instead of serving the pre-update ones as current.
         if (Helpers.HostSync.IsPending(key))
-        {
-            try { Helpers.HostSync.TryMaterialize(key); }
-            catch (Exception) { Helpers.HostSync.Remove(key); }
-        }
+            Helpers.HostSync.TryMaterialize(key);
+        _pendingPersistentRoles.Remove(key);
         tensor._gpuBuffer = null;
         tensor._gpuBackend = null;
         tensor._gpuBufferVersion = -1;
+        // The host now holds the only copy: a GPU device with no attached buffer would report IsGpuResident while
+        // Buffer throws (InvalidateResidentWeightBuffer clears the device the same way).
+        tensor.Device = TensorDevice.CPU;
         lock (_persistentBufferLock)
         {
             if (_persistentBufferCache.TryRemove(key, out var entry))

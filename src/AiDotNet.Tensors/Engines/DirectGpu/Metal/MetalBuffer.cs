@@ -42,6 +42,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     /// <summary>Buffers allocated from the Metal driver (pool misses) since the process started.</summary>
     internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
 
+    // The count is process-wide, so it is kept by a static method rather than written from each constructor.
+    private static void CountDriverAllocation() => System.Threading.Interlocked.Increment(ref s_driverAllocations);
+
     private readonly MetalDevice? _device;
     private IntPtr _buffer;
     private bool _disposed;
@@ -163,7 +166,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         {
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes");
         }
-        System.Threading.Interlocked.Increment(ref s_driverAllocations);
+        CountDriverAllocation();
         _pooled = options == MTLResourceOptions.StorageModeShared;
         _memory.OnAllocated(device.MemoryAccount, (long)sizeInBytes);
     }
@@ -311,7 +314,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         {
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes with data");
         }
-        System.Threading.Interlocked.Increment(ref s_driverAllocations);
+        CountDriverAllocation();
         _pooled = options == MTLResourceOptions.StorageModeShared;
         _memory.OnAllocated(device.MemoryAccount, (long)sizeInBytes);
     }

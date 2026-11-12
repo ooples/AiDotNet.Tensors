@@ -50,6 +50,9 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
     /// <summary>Buffers allocated from WebGPU (pool misses) since the process started.</summary>
     internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
 
+    // The count is process-wide, so it is kept by a static method rather than written from each constructor.
+    private static void CountDriverAllocation() => System.Threading.Interlocked.Increment(ref s_driverAllocations);
+
     private int _bufferId;
     private readonly int _sizeBytes;
     private readonly int _elementCount;
@@ -187,7 +190,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
         {
             throw new InvalidOperationException("Failed to create WebGPU buffer");
         }
-        System.Threading.Interlocked.Increment(ref s_driverAllocations);
+        CountDriverAllocation();
         _pooled = usage == DefaultStorageUsage && WebGpuDevice.Instance.IsInitialized;
         _memory.OnAllocated(Account, alignedSize);
     }
