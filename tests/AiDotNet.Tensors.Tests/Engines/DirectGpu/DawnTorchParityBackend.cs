@@ -88,8 +88,8 @@ internal sealed class DawnTorchParityBackend : DelegatingGpuBackend, ITorchParit
     public void ModelActivationBackward(int op, IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int n, float p0, float p1)
         => PortableTorchModelOps.ActivationBackward(_launch, op, gradOutput, input, gradInput, n, p0, p1);
     public void ModelFakeQuantize(IGpuBuffer input, IGpuBuffer partial, IGpuBuffer minMax, IGpuBuffer output, IGpuBuffer mask, int n,
-        bool derive, bool symmetric, bool hasZeroPoint, float qMin, float qMax, float fixedStep, float zeroPoint)
-        => PortableTorchModelOps.FakeQuantize(_launch, input, partial, minMax, output, mask, n, derive, symmetric, hasZeroPoint, qMin, qMax, fixedStep, zeroPoint);
+        int numBits, bool symmetric, double scale, int? zeroPoint)
+        => PortableTorchModelOps.FakeQuantize(_launch, input, partial, minMax, output, mask, n, numBits, symmetric, scale, zeroPoint);
     public void ModelTopKSoftmax(IGpuBuffer input, IGpuBuffer scratchValues, IGpuBuffer scratchIndices, IGpuBuffer scratchWeights, IGpuBuffer output, int rows, int width, int k)
         => PortableTorchModelOps.TopKSoftmax(_launch, input, scratchValues, scratchIndices, scratchWeights, output, rows, width, k);
     public void ModelTimeEmbedding(IGpuBuffer timesteps, IGpuBuffer frequencies, IGpuBuffer output, int batch, int halfDim, int dim)

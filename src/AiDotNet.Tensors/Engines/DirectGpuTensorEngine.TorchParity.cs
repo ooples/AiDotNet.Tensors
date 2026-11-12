@@ -1149,6 +1149,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorCrfForward<T>(Tensor<T> emissions, Tensor<T> transitions, Tensor<T>? startScores = null, Tensor<T>? endScores = null)
     {
+        // The CPU's checks, size limit included, before anything is recorded, allocated or launched.
+        ValidateCrfForwardArguments(emissions, transitions, startScores, endScores);
         if (TryRecordCompiledOp("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores },
                 e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var compiledNode))
             return compiledNode;

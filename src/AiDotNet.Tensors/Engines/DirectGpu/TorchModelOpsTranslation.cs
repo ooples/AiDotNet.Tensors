@@ -18,9 +18,9 @@ internal static class TorchModelOpsTranslation
     private static readonly Regex KernelHeader = new(
         @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, RegexTimeout);
 
-    // Read after GlslExpressions has renamed float2 / unsigned int.
+    // Read after GlslExpressions has renamed float2 / uint2 / unsigned int.
     private static readonly Regex HelperHeader = new(
-        @"__device__ __forceinline__ (vec2|float|int|uint|bool) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, RegexTimeout);
+        @"__device__ __forceinline__ (vec2|uvec2|float|int|uint|bool) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, RegexTimeout);
 
     private static readonly Lazy<string> OpenClSource = new(() => ToOpenCl(TorchModelOpsKernels.Source));
 
@@ -47,7 +47,8 @@ internal static class TorchModelOpsTranslation
             .Replace("blockDim.x", "(int)get_local_size(0)")
             .Replace("__float_as_uint(", "as_uint(")
             .Replace("__uint_as_float(", "as_float(")
-            .Replace("make_float2(", "(float2)(");
+            .Replace("make_float2(", "(float2)(")
+            .Replace("make_uint2(", "(uint2)(");
         body = Regex.Replace(body, @"(?<![\w*])(const )?(float|int)\* ", "__global $1$2* ", RegexOptions.None, RegexTimeout);
         return Regex.Replace(body, @"\b(sqrt|fmax|fmin|fabs|exp|log|rint|floor)f\(", "$1(", RegexOptions.None, RegexTimeout);
     }
@@ -123,6 +124,8 @@ internal static class TorchModelOpsTranslation
             .Replace("__uint_as_float(", "uintBitsToFloat(")
             .Replace("make_float2(", "vec2(")
             .Replace("float2 ", "vec2 ")
+            .Replace("make_uint2(", "uvec2(")
+            .Replace("uint2 ", "uvec2 ")
             .Replace("unsigned int", "uint");
         s = Regex.Replace(s, @"\b(sqrt|exp|log|floor)f\(", "$1(", RegexOptions.None, RegexTimeout);
         s = Regex.Replace(s, @"\bfabsf\(", "abs(", RegexOptions.None, RegexTimeout);
@@ -141,6 +144,7 @@ internal static class TorchModelOpsTranslation
     private static string GlslType(string c) => c switch
     {
         "float2" or "vec2" => "vec2",
+        "uint2" or "uvec2" => "uvec2",
         "unsigned int" or "uint" => "uint",
         _ => c,
     };
