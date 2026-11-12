@@ -623,6 +623,10 @@ public partial class CpuEngine
         private Tensor<T> _bias;
         private int _biasVersion;
         private int _biasStorageVersion;
+        // Set when a rebase found the readout already mutated: the tape then hands Validate the snapshot, whose counters
+        // say nothing about the original tensor and could coincide with the recorded ones.
+        private bool _weightMutated;
+        private bool _biasMutated;
 
         internal ReadoutMutationGuard(Tensor<T> weight, Tensor<T> bias)
         {
@@ -642,41 +646,49 @@ public partial class CpuEngine
             _bias = bias;
             _biasVersion = bias.Version;
             _biasStorageVersion = bias.StorageMutationVersion;
+            _weightMutated = false;
+            _biasMutated = false;
         }
 
         /// <summary>
         /// Repoints the guard at <paramref name="to"/>, the tape's snapshot of <paramref name="from"/> before an in-place
         /// write, only while <paramref name="from"/> still holds the recorded value. One already mutated since recording
-        /// stays guarded as it is, so the backward still reports that mutation instead of the snapshot hiding it.
+        /// is marked mutated, so the backward reports that mutation whatever counters the snapshot carries.
         /// </summary>
         internal void Rebase(Tensor<T> from, Tensor<T> to)
         {
-            if (ReferenceEquals(_weight, from)
-                && from.Version == _weightVersion && from.StorageMutationVersion == _weightStorageVersion)
+            if (ReferenceEquals(_weight, from))
             {
-                _weight = to;
-                _weightVersion = to.Version;
-                _weightStorageVersion = to.StorageMutationVersion;
+                if (from.Version == _weightVersion && from.StorageMutationVersion == _weightStorageVersion)
+                {
+                    _weight = to;
+                    _weightVersion = to.Version;
+                    _weightStorageVersion = to.StorageMutationVersion;
+                }
+                else _weightMutated = true;
             }
-            if (ReferenceEquals(_bias, from)
-                && from.Version == _biasVersion && from.StorageMutationVersion == _biasStorageVersion)
+            if (ReferenceEquals(_bias, from))
             {
-                _bias = to;
-                _biasVersion = to.Version;
-                _biasStorageVersion = to.StorageMutationVersion;
+                if (from.Version == _biasVersion && from.StorageMutationVersion == _biasStorageVersion)
+                {
+                    _bias = to;
+                    _biasVersion = to.Version;
+                    _biasStorageVersion = to.StorageMutationVersion;
+                }
+                else _biasMutated = true;
             }
         }
 
         internal void Validate(Tensor<T> weight, Tensor<T> bias)
         {
             if (InferenceModeFlag.IsActive) return;
-            if (weight.Version != _weightVersion || weight.StorageMutationVersion != _weightStorageVersion)
+            if (_weightMutated || weight.Version != _weightVersion || weight.StorageMutationVersion != _weightStorageVersion)
             {
                 throw new InvalidOperationException(
                     "Tensor input 1 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +
                     "This produces incorrect gradients. Use non-in-place operations, or ensure in-place mutations happen before recording.");
             }
-            if (bias.Version != _biasVersion || bias.StorageMutationVersion != _biasStorageVersion)
+            if (_biasMutated || bias.Version != _biasVersion || bias.StorageMutationVersion != _biasStorageVersion)
             {
                 throw new InvalidOperationException(
                     "Tensor input 2 of operation 'FusedLinearCrossEntropy' was mutated in-place after being recorded on the gradient tape. " +

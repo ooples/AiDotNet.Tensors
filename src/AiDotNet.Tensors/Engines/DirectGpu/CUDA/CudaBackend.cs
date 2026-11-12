@@ -6148,9 +6148,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (A.Handle == IntPtr.Zero || B.Handle == IntPtr.Zero || C.Handle == IntPtr.Zero)
             throw new InvalidOperationException(
                 $"Elementwise '{kernelName}' operand was DISPOSED (Handle=0): A={(long)A.Handle:X} B={(long)B.Handle:X} C={(long)C.Handle:X} — use-after-free guard.");
-        if (A.Size < size || B.Size < size || C.Size < size)
+        // In bytes: a byte buffer's Size counts bytes, so an element-count compare would pass a quarter-sized one.
+        long requiredBytes = (long)size * sizeof(float);
+        if (A.SizeInBytes < requiredBytes || B.SizeInBytes < requiredBytes || C.SizeInBytes < requiredBytes)
             throw new InvalidOperationException(
-                $"Elementwise '{kernelName}' operand buffer too small for size {size}: A={A.Size} B={B.Size} C={C.Size}.");
+                $"Elementwise '{kernelName}' operand buffer too small for {requiredBytes} bytes ({size} floats): A={A.SizeInBytes} B={B.SizeInBytes} C={C.SizeInBytes}.");
     }
 
     private unsafe void LaunchElementwiseKernel(string kernelName, IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size)
