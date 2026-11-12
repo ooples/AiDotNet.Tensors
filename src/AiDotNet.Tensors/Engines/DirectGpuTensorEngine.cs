@@ -776,14 +776,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Cache the FP16 copy of each conv weight (constant across denoising steps), keyed by its resident FP32
     // buffer handle. Converted ONCE (sync, on the pre-residency pass — not while stream-capturing); reused on
     // every captured replay. The Tensor-Core GemmFp16 conv path needs the weights as FP16.
-    // A released FP32 buffer's handle can come back as another model's weights, so an entry also names the FP32 buffer
-    // object it was converted from (weakly, so the cache never keeps released weights alive) and a hit needs that same
-    // object: a reused handle on a different buffer converts again instead of returning the previous model's weights.
+    // A released FP32 buffer's handle can come back as another model's weights, so an entry also names the buffer that
+    // owns the converted memory (weakly, so the cache never keeps released weights alive) and a hit needs that same owner:
+    // a reused handle on a different buffer converts again instead of returning the previous model's weights. The owner
+    // is the root of a view chain, not the view: a weight resolved as a parameter view gets a new view object on every
+    // call, and the handle (root pointer plus offset) already tells two views of one root apart.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, (WeakReference<IGpuBuffer> Source, IGpuBuffer Half)> _fp16WeightCache = new();
     private IGpuBuffer GetOrCacheFp16Weights(IDirectGpuBackend backend, IGpuBuffer wFp32, int count)
     {
+        var owner = GpuBufferViewRoot.Of(wFp32);
         if (_fp16WeightCache.TryGetValue(wFp32.Handle, out var cached)
-            && cached.Source.TryGetTarget(out var source) && ReferenceEquals(source, wFp32)
+            && cached.Source.TryGetTarget(out var source) && ReferenceEquals(source, owner)
             && cached.Half.Handle != System.IntPtr.Zero && cached.Half.SizeInBytes >= (long)count * 2)
             return cached.Half;
         // #671 review: a miss while the stream is capturing means the pre-residency prewarm was skipped.
@@ -793,7 +796,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 "FP16 conv weight cache miss during CUDA stream capture — convert the weights on the pre-residency pass before cuStreamBeginCapture.");
         var half = backend.AllocateBuffer(count); // count floats ≥ count halfs; sync alloc — only on the pre-residency miss
         backend.ConvertToFp16(wFp32, half, count);
-        _fp16WeightCache[wFp32.Handle] = (new WeakReference<IGpuBuffer>(wFp32), half);
+        _fp16WeightCache[wFp32.Handle] = (new WeakReference<IGpuBuffer>(owner), half);
         return half;
     }
 
