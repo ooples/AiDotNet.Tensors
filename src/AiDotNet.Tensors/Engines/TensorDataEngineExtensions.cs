@@ -22,7 +22,7 @@ public static class TensorDataEngineExtensions
     private static CpuEngine BuiltIn(IEngine engine)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        return engine as CpuEngine ?? HostEngine;
+        return engine.As<CpuEngine>() ?? HostEngine;
     }
 
     /// <summary>
