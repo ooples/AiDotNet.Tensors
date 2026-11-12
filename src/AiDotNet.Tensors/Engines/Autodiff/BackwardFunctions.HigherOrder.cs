@@ -162,14 +162,25 @@ internal static partial class BackwardFunctions<T>
     {
         if (!CreatesGraph) return false;
         var tape = GradientTape<T>.Current;
-        if (tape is null) return false;
+        // A bounded tape with no room left would drop the composite's ops, so walking it could reach no input at all.
+        if (tape is null || tape.IsAtCapacity) return false;
         var sources = new List<Tensor<T>>(inputs.Length);
         foreach (var input in inputs)
             if (input is not null && !sources.Exists(s => ReferenceEquals(s, input))) sources.Add(input);
 
         var entries = tape.Entries;
         int start = entries.Count;
+        long droppedBefore = tape.DroppedEntryCount;
         var result = composite(engine);
+        if (tape.DroppedEntryCount != droppedBefore)
+        {
+            // The bounded tape filled while the composite recorded: some of its ops are missing, so the walk below would
+            // leave inputs it does reach through them with no gradient while reporting success. Take back what it did
+            // record and let the caller's first-order kernel give every input its exact gradient (a constant to a further
+            // derivative, as anything recorded on a full tape is).
+            while (tape.EntryCount > start) tape.RemoveLastEntry();
+            return false;
+        }
         int end = entries.Count;
 
         var local = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance) { [result] = gradOutput };
