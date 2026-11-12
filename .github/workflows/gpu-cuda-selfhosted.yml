@@ -302,7 +302,10 @@ jobs:
         $version = '9.26.1.1'
         $sha256 = 'c826d866641fed2c266ae1c11e679fcc1ef8517801a32a51715843051ce8df52'   # redistrib_9.26.1.json, windows-x86_64 cuda13
         $root = Join-Path $env:GITHUB_WORKSPACE "cudnn-$version"
-        if (-not (Test-Path (Join-Path $root 'ok'))) {
+        # The marker alone is not trusted: the GTX 1660 Ti runner kept an 'ok' directory whose DLLs were gone, and failed
+        # every run with "cudnn64_9.dll is not in the cuDNN archive" without ever fetching it again.
+        $cached = (Test-Path (Join-Path $root 'ok')) -and (Get-ChildItem $root -Recurse -Filter cudnn64_9.dll -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (-not $cached) {
           $zip = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
           Invoke-WebRequest -UseBasicParsing -OutFile $zip `
             "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${version}_cuda13-archive.zip"
