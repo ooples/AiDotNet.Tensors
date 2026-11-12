@@ -116,6 +116,17 @@ public partial class CpuEngine
         return NarrowFromFloat<T>(CompensatedSum(terms) / length);
     }
 
+    /// <summary>
+    /// BatchNorm's [batch, channels, spatial] view of a rank-2 [N, F], rank-3 [C, H, W] or rank-4 [N, C, H, W] input,
+    /// matching the layouts the generic 2D, 3D and 4D paths normalise.
+    /// </summary>
+    internal static void GetLowPrecisionBatchNormDims(int[] shape, out int batch, out int channels, out int spatial)
+    {
+        if (shape.Length == 4) { batch = shape[0]; channels = shape[1]; spatial = shape[2] * shape[3]; }
+        else if (shape.Length == 3) { batch = 1; channels = shape[0]; spatial = shape[1] * shape[2]; }
+        else { batch = shape[0]; channels = shape[1]; spatial = 1; }
+    }
+
     /// <summary>The shape left after reducing <paramref name="normalizedAxes"/>, with or without kept size-1 dims.</summary>
     internal static int[] LowPrecisionReducedShape(int[] shape, int[] normalizedAxes, bool keepDims)
     {

@@ -26658,6 +26658,24 @@ public partial class CpuEngine : ITensorLevelEngine
         bool was1D = input._shape.Length == 1;
         Tensor<T> workingInput = was1D ? input.Reshape([1, input._shape[0]]) : input;
 
+        // Half/BFloat16: statistics and normalisation in float32 (the float kernel), rounded once. The generic paths put
+        // the per-channel count (batch x spatial, easily above 65,504) into T, where it is +Inf in Half.
+        if (IsLowPrecisionFloat<T>() && workingInput._shape.Length >= 2 && workingInput._shape.Length <= 4)
+        {
+            GetLowPrecisionBatchNormDims(workingInput._shape, out int bnBatch, out int bnChannels, out int bnSpatial);
+            int lowLength = workingInput.Length;
+            var lowOut = new float[lowLength];
+            var lowMean = new float[bnChannels];
+            var lowVar = new float[bnChannels];
+            BatchNorm4DFloat(WidenToFloat(workingInput.GetFlattenedData(), lowLength), WidenToFloat(gamma.GetFlattenedData(), bnChannels),
+                WidenToFloat(beta.GetFlattenedData(), bnChannels), (float)epsilon, bnBatch, bnChannels, bnSpatial, lowMean, lowVar, lowOut);
+            mean = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowMean));
+            variance = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowVar));
+            var bnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
+            DifferentiableOps.RecordIfActive("BatchNorm", bnLow, new[] { inputOrig, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+            return bnLow;
+        }
+
         // Handle 2D [batch, features], 3D [channels, height, width], and 4D [batch, channels, height, width] tensors
         if (workingInput._shape.Length == 4)
         {
@@ -27494,6 +27512,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
+
+        // Half/BFloat16: the float kernel on widened operands, each gradient rounded once (the generic paths put the
+        // per-channel count into T, +Inf in Half above 65,504).
+        if (IsLowPrecisionFloat<T>() && input._shape.Length >= 2 && input._shape.Length <= 4)
+        {
+            GetLowPrecisionBatchNormDims(input._shape, out int bnBatch, out int bnChannels, out int bnSpatial);
+            int lowLength = input.Length;
+            var lowGradInput = new float[lowLength];
+            var lowGradGamma = new float[bnChannels];
+            var lowGradBeta = new float[bnChannels];
+            BatchNormBackward4DFloat(WidenToFloat(gradOutput.GetFlattenedData(), lowLength), WidenToFloat(input.GetFlattenedData(), lowLength),
+                WidenToFloat(gamma.GetFlattenedData(), bnChannels), WidenToFloat(mean.GetFlattenedData(), bnChannels),
+                WidenToFloat(variance.GetFlattenedData(), bnChannels), (float)epsilon, bnBatch, bnChannels, bnSpatial,
+                lowGradInput, 0, false, lowGradGamma, 0, false, lowGradBeta, 0, false);
+            gradGamma = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowGradGamma));
+            gradBeta = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowGradBeta));
+            return TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowGradInput));
+        }
 
         // Handle both 2D [batch, features] and 4D [batch, channels, height, width] tensors
         if (input._shape.Length == 4)
@@ -28387,6 +28423,25 @@ public partial class CpuEngine : ITensorLevelEngine
         var gammaData = gamma.GetReadOnlyDataArray();
         var betaData = beta.GetReadOnlyDataArray();
 
+        // Half/BFloat16: statistics and normalisation in float32 (the float kernel below), rounded once. The generic
+        // path put the feature count into T (+Inf in Half above 65,504) and summed in T.
+        if (IsLowPrecisionFloat<T>())
+        {
+            int lowLength = batchSize * featureSize;
+            var lowOut = new float[lowLength];
+            var lowMean = new float[batchSize];
+            var lowVar = new float[batchSize];
+            ProcessBatchesSimd(WidenToFloat(inputData, lowLength), WidenToFloat(gammaData, featureSize),
+                WidenToFloat(betaData, featureSize), lowOut, lowMean, lowVar, batchSize, featureSize, (float)epsilon);
+            mean = TensorAllocator.Rent<T>(batchShape, NarrowFromFloat<T>(lowMean));
+            variance = TensorAllocator.Rent<T>((int[])batchShape.Clone(), NarrowFromFloat<T>(lowVar));
+            var lnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
+            DifferentiableOps.RecordIfActive("LayerNorm", lnLow, new[] { input, gamma, beta },
+                BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("LayerNorm", lnLow, eng => eng.LayerNorm(input, gamma, beta, epsilon, out _, out _));
+            return lnLow;
+        }
+
         // Float fast path: SIMD mean, variance, and normalize via Vector256
         // with FMA — fused into a SINGLE pass over the input using
         // <c>Var[X] = E[(X-K)²] - E[X-K]²</c> with K the row's first element (ShiftedMoments; the
@@ -29223,6 +29278,29 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 System.Buffers.ArrayPool<float>.Shared.Return(lnPartial);
             }
+        }
+        else if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: the float kernel on widened operands, each gradient rounded once.
+            int lowLength = batchSize * featureSize;
+            var lowGradInput = new float[lowLength];
+            var lowGradGamma = new float[featureSize];
+            var lowGradBeta = new float[featureSize];
+            var lowPartial = System.Buffers.ArrayPool<float>.Shared.Rent(LayerNormBackwardFloatScratchLength(batchSize, featureSize));
+            try
+            {
+                LayerNormBackwardFloatFused(WidenToFloat(gradOutputData, lowLength), 0, WidenToFloat(inputData, lowLength), 0,
+                    WidenToFloat(gammaData, featureSize), 0, WidenToFloat(meanData, batchSize), WidenToFloat(varData, batchSize),
+                    batchSize, featureSize, (float)epsilon,
+                    lowGradInput, 0, false, lowGradGamma, 0, false, lowGradBeta, 0, false, lowPartial);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(lowPartial);
+            }
+            Array.Copy(NarrowFromFloat<T>(lowGradInput), gradInputData, lowLength);
+            Array.Copy(NarrowFromFloat<T>(lowGradGamma), gradGammaData, featureSize);
+            Array.Copy(NarrowFromFloat<T>(lowGradBeta), gradBetaData, featureSize);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -30233,6 +30311,32 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
+        // Half/BFloat16: the float kernel above on widened operands, rounded once. The generic path below put the
+        // group size into T (+Inf in Half above 65,504) and summed in T.
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowIn = WidenToFloat(input.GetReadOnlyDataArray(), input.Length);
+            var lowGamma = WidenToFloat(gamma.GetReadOnlyDataArray(), channels);
+            var lowBeta = WidenToFloat(beta.GetReadOnlyDataArray(), channels);
+            var lowOut = new float[input.Length];
+            float[] lowMean, lowVar;
+            unsafe
+            {
+                fixed (float* pIn = lowIn, pOut = lowOut, pGamma = lowGamma, pBeta = lowBeta)
+                {
+                    GroupNormFloatPtr(pIn, pOut, pGamma, pBeta, batch, channels, spatialSize, numGroups, channelsPerGroup,
+                        (float)epsilon, out lowMean, out lowVar);
+                }
+            }
+            mean = TensorAllocator.Rent<T>(new[] { batch, numGroups }, NarrowFromFloat<T>(lowMean));
+            variance = TensorAllocator.Rent<T>(new[] { batch, numGroups }, NarrowFromFloat<T>(lowVar));
+            var gnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
+            DifferentiableOps.RecordIfActive("GroupNorm", gnLow, new[] { inputOrig, gamma, beta },
+                BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("GroupNorm", gnLow, eng => eng.GroupNorm(inputOrig, numGroups, gamma, beta, epsilon, out _, out _));
+            return gnLow;
+        }
+
         // COW Stage 2 (#624): input/gamma/beta are read-only norm operands — non-privatizing read.
         var inputData = input.GetReadOnlyDataArray();
         var gammaData = gamma.GetReadOnlyDataArray();
@@ -30591,6 +30695,20 @@ public partial class CpuEngine : ITensorLevelEngine
 
             GroupNormBackwardFloat(fGradOut, fInput, fGamma, fMean, fVar, fGradGamma, fGradBeta, fGradInput,
                 batch, channels, spatialSize, numGroups, fEps);
+        }
+        else if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: the float kernel on widened operands, each gradient rounded once.
+            int lowLength = input.Length;
+            var lowGradInput = new float[lowLength];
+            var lowGradGamma = new float[channels];
+            var lowGradBeta = new float[channels];
+            GroupNormBackwardFloat(WidenToFloat(gradOutputData, lowLength), WidenToFloat(inputData, lowLength),
+                WidenToFloat(gammaData, channels), WidenToFloat(meanData, batch * numGroups), WidenToFloat(varData, batch * numGroups),
+                lowGradGamma, lowGradBeta, lowGradInput, batch, channels, spatialSize, numGroups, (float)epsilon);
+            Array.Copy(NarrowFromFloat<T>(lowGradInput), gradInputData, lowLength);
+            Array.Copy(NarrowFromFloat<T>(lowGradGamma), gradGammaData, channels);
+            Array.Copy(NarrowFromFloat<T>(lowGradBeta), gradBetaData, channels);
         }
         else if (typeof(T) == typeof(double))
         {
