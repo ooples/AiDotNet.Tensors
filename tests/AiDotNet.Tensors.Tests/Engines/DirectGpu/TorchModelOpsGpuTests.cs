@@ -206,6 +206,59 @@ public abstract class TorchModelOpsGpuTestsBase
         }
     }
 
+    /// <summary>
+    /// Rows of a vocabulary (width 50,000) built to stress a large-k selection: (0) 21 tied levels with signed zeros,
+    /// NaN and -inf sprinkled in, so the k-th key falls inside a tie group and the lower-index rule decides it; (1) almost
+    /// all +0 / -0 (one tie group), a few +-1 and NaN; (2) 3,000 numbers and NaN after them, so k = 8192 reaches the NaN
+    /// entries; (3) continuous values. Values stay within [-5, 5], so every selected exp(x - top) is a normal float and a
+    /// zero output means "not selected" on both engines.
+    /// </summary>
+    internal static Tensor<float> TopKStressRows(int seed, int width)
+    {
+        var rng = new Random(seed);
+        var t = new Tensor<float>(new[] { 4, width });
+        for (int i = 0; i < width; i++)
+        {
+            float level = (rng.Next(21) - 10) * 0.5f;
+            if (level == 0f && rng.Next(2) == 0) level = -0f;
+            if (i % 97 == 5) level = float.NaN;
+            else if (i % 101 == 7) level = float.NegativeInfinity;
+            t[0, i] = level;
+
+            int pick = rng.Next(100);
+            t[1, i] = pick < 3 ? 1f : pick < 6 ? -1f : pick == 6 ? float.NaN : rng.Next(2) == 0 ? -0f : 0f;
+            t[2, i] = i < 3000 ? (i % 50 == 0 ? (i % 100 == 0 ? -0f : 0f) : (float)(rng.NextDouble() * 10 - 5)) : float.NaN;
+            t[3, i] = (float)(rng.NextDouble() * 10 - 5);
+        }
+        return t;
+    }
+
+    /// <summary>
+    /// A large k over vocabulary-sized rows (the one-work-group-per-row path): the forward and gradients against the
+    /// CPU, and the exact selection (which entries are zero, which NaN) entry by entry.
+    /// </summary>
+    [SkippableFact]
+    public void TopKSoftmax_LargeK_VocabularyRows_MatchCpuSelectionExactly()
+    {
+        var gpu = GpuOrSkip();
+        var x = TopKStressRows(31, 50000);
+        foreach (int k in new[] { 1024, 8192 })
+        {
+            CheckForwardAndGradients(gpu, "TensorTopKSoftmax", (e, v) => e.TensorTopKSoftmax(v[0], k), new[] { x }, 2e-6, 1e-5);
+            var cpuY = new CpuEngine().TensorTopKSoftmax(Copy(x), k).ToArray();
+            var gpuY = gpu.TensorTopKSoftmax(gpu.TensorMultiplyScalar(Copy(x), 1f), k).ToArray();
+            int selected = 0;
+            for (int i = 0; i < cpuY.Length; i++)
+            {
+                Assert.True(float.IsNaN(cpuY[i]) == float.IsNaN(gpuY[i]) && (cpuY[i] == 0f) == (gpuY[i] == 0f),
+                    $"k={k} row {i / 50000} index {i % 50000} (x {x[i]:R}): cpu {cpuY[i]:R} gpu {gpuY[i]:R}");
+                if (cpuY[i] != 0f) selected++;
+            }
+            // Every row selects k entries; row 0's -inf entries never reach the top k, so each selected output is nonzero.
+            Assert.Equal(4 * k, selected);
+        }
+    }
+
     [SkippableFact]
     public void SinusoidalTimeEmbedding_MatchesCpu_OnDevice()
     {
