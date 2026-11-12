@@ -496,13 +496,20 @@ public partial class CpuEngine
             var lowMean = TensorAllocator.Rent<T>((int[])varShape.Clone(), LowPrecisionAxisStatistic(data, tensor._shape, distinct, outSize, variance: false, correction: 0, squareRoot: false));
             return (lowVar, lowMean);
         }
+        if (lowPrecision)
+        {
+            // Under a tape, Half/BFloat16 differentiate through the recorded ReduceVariance, whose forward and backward
+            // centre and square in float32 (a Half square of the centred value overflows: [0, 0, 0, 500] centres to 375,
+            // and 375^2 is +Inf in Half), times the O(1) factor count / (count - correction) instead of a Half
+            // 1 / (count - correction) (subnormal or zero in Half).
+            var distinctAxes = reduce.Distinct().ToArray();
+            var lowVariance = TensorMultiplyScalar(ReduceVariance(tensor, distinctAxes, keepDims),
+                ops.FromDouble((double)count / (count - correction)));
+            return (lowVariance, ReduceMean(tensor, reduce, keepDims));
+        }
         var meanKept = ReduceMean(tensor, reduce, keepDims: true);
         var centered = TensorSubtract(tensor, TensorBroadcastTo(meanKept, LikeShape(tensor)));
-        // Under a tape, Half/BFloat16 differentiate through the float32-accumulating ReduceMean and an O(1) factor
-        // instead of a Half sum (overflows) times 1/(count - correction) (subnormal or zero in Half).
-        var variance = lowPrecision
-            ? TensorMultiplyScalar(ReduceMean(TensorSquare(centered), reduce, keepDims), ops.FromDouble((double)count / (count - correction)))
-            : TensorMultiplyScalar(ReduceSum(TensorSquare(centered), reduce, keepDims), ops.FromDouble(1.0 / (count - correction)));
+        var variance = TensorMultiplyScalar(ReduceSum(TensorSquare(centered), reduce, keepDims), ops.FromDouble(1.0 / (count - correction)));
         var mean = keepDims ? meanKept : ReduceMean(tensor, reduce, keepDims: false);
         return (variance, mean);
     }

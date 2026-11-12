@@ -26669,8 +26669,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var lowVar = new float[bnChannels];
             BatchNorm4DFloat(WidenToFloat(workingInput.GetFlattenedData(), lowLength), WidenToFloat(gamma.GetFlattenedData(), bnChannels),
                 WidenToFloat(beta.GetFlattenedData(), bnChannels), (float)epsilon, bnBatch, bnChannels, bnSpatial, lowMean, lowVar, lowOut);
-            mean = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowMean));
-            variance = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowVar));
+            mean = RentLowPrecisionStatistic<T>(new[] { bnChannels }, lowMean);
+            variance = RentLowPrecisionStatistic<T>(new[] { bnChannels }, lowVar);
             var bnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
             DifferentiableOps.RecordIfActive("BatchNorm", bnLow, new[] { inputOrig, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
             return bnLow;
@@ -27523,8 +27523,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var lowGradGamma = new float[bnChannels];
             var lowGradBeta = new float[bnChannels];
             BatchNormBackward4DFloat(WidenToFloat(gradOutput.GetFlattenedData(), lowLength), WidenToFloat(input.GetFlattenedData(), lowLength),
-                WidenToFloat(gamma.GetFlattenedData(), bnChannels), WidenToFloat(mean.GetFlattenedData(), bnChannels),
-                WidenToFloat(variance.GetFlattenedData(), bnChannels), (float)epsilon, bnBatch, bnChannels, bnSpatial,
+                WidenToFloat(gamma.GetFlattenedData(), bnChannels), LowPrecisionStatisticValues(mean, mean.GetFlattenedData(), bnChannels),
+                LowPrecisionStatisticValues(variance, variance.GetFlattenedData(), bnChannels), (float)epsilon, bnBatch, bnChannels, bnSpatial,
                 lowGradInput, 0, false, lowGradGamma, 0, false, lowGradBeta, 0, false);
             gradGamma = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowGradGamma));
             gradBeta = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowGradBeta));
@@ -28433,8 +28433,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var lowVar = new float[batchSize];
             ProcessBatchesSimd(WidenToFloat(inputData, lowLength), WidenToFloat(gammaData, featureSize),
                 WidenToFloat(betaData, featureSize), lowOut, lowMean, lowVar, batchSize, featureSize, (float)epsilon);
-            mean = TensorAllocator.Rent<T>(batchShape, NarrowFromFloat<T>(lowMean));
-            variance = TensorAllocator.Rent<T>((int[])batchShape.Clone(), NarrowFromFloat<T>(lowVar));
+            mean = RentLowPrecisionStatistic<T>(batchShape, lowMean);
+            variance = RentLowPrecisionStatistic<T>((int[])batchShape.Clone(), lowVar);
             var lnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
             DifferentiableOps.RecordIfActive("LayerNorm", lnLow, new[] { input, gamma, beta },
                 BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
@@ -29290,7 +29290,8 @@ public partial class CpuEngine : ITensorLevelEngine
             try
             {
                 LayerNormBackwardFloatFused(WidenToFloat(gradOutputData, lowLength), 0, WidenToFloat(inputData, lowLength), 0,
-                    WidenToFloat(gammaData, featureSize), 0, WidenToFloat(meanData, batchSize), WidenToFloat(varData, batchSize),
+                    WidenToFloat(gammaData, featureSize), 0, LowPrecisionStatisticValues(mean, meanData, batchSize),
+                    LowPrecisionStatisticValues(variance, varData, batchSize),
                     batchSize, featureSize, (float)epsilon,
                     lowGradInput, 0, false, lowGradGamma, 0, false, lowGradBeta, 0, false, lowPartial);
             }
@@ -30328,8 +30329,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         (float)epsilon, out lowMean, out lowVar);
                 }
             }
-            mean = TensorAllocator.Rent<T>(new[] { batch, numGroups }, NarrowFromFloat<T>(lowMean));
-            variance = TensorAllocator.Rent<T>(new[] { batch, numGroups }, NarrowFromFloat<T>(lowVar));
+            mean = RentLowPrecisionStatistic<T>(new[] { batch, numGroups }, lowMean);
+            variance = RentLowPrecisionStatistic<T>(new[] { batch, numGroups }, lowVar);
             var gnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
             DifferentiableOps.RecordIfActive("GroupNorm", gnLow, new[] { inputOrig, gamma, beta },
                 BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
@@ -30704,7 +30705,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var lowGradGamma = new float[channels];
             var lowGradBeta = new float[channels];
             GroupNormBackwardFloat(WidenToFloat(gradOutputData, lowLength), WidenToFloat(inputData, lowLength),
-                WidenToFloat(gammaData, channels), WidenToFloat(meanData, batch * numGroups), WidenToFloat(varData, batch * numGroups),
+                WidenToFloat(gammaData, channels), LowPrecisionStatisticValues(mean, meanData, batch * numGroups),
+                LowPrecisionStatisticValues(variance, varData, batch * numGroups),
                 lowGradGamma, lowGradBeta, lowGradInput, batch, channels, spatialSize, numGroups, (float)epsilon);
             Array.Copy(NarrowFromFloat<T>(lowGradInput), gradInputData, lowLength);
             Array.Copy(NarrowFromFloat<T>(lowGradGamma), gradGammaData, channels);
@@ -36852,9 +36854,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var rvbMeanStrideForDim = BuildReducedOutStrideForDim(inputShape, meanShape, normalizedAxes);
         var rvbCoord = new int[rvbRank];
         int rvbOutFlat = 0, rvbMeanFlat = 0;
-        // Half/BFloat16: 2/N is subnormal or zero in Half; evaluate in float32 and round once.
+        // Half/BFloat16: 2/N is subnormal or zero in Half; evaluate in float32 (centred on the float32 mean the forward
+        // used, not the rounded saved one) and round once.
         if (IsLowPrecisionFloat<T>())
-            return TensorAllocator.Rent<T>(inputShape, LowPrecisionVarianceBackward(inputData, meanData, gradOutputData, inputShape, normalizedAxes));
+            return TensorAllocator.Rent<T>(inputShape, LowPrecisionVarianceBackward(inputData, gradOutputData, inputShape, normalizedAxes));
 
         for (int i = 0; i < inputSize; i++)
         {
@@ -51647,7 +51650,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         float y = lowIn[start + k] - compensation;
                         float t = sum + y;
-                        compensation = (t - sum) - y;
+                        // An infinite element makes (t - sum) - y NaN; the window's sum is then the infinity.
+                        compensation = float.IsInfinity(t) ? 0f : (t - sum) - y;
                         sum = t;
                     }
                     lowOut[p * outW + ow] = sum / kernelSize;

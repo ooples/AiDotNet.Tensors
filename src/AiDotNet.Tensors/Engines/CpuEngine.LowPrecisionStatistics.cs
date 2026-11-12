@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.NumericOperations;
 
@@ -46,6 +47,15 @@ public partial class CpuEngine
         return result;
     }
 
+    /// <summary>Widens element <paramref name="index"/> of a Half or BFloat16 array to float32.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float WidenElement<T>(T[] data, int index)
+    {
+        if (typeof(T) == typeof(Half)) return (float)Unsafe.As<T[], Half[]>(ref data)[index];
+        if (typeof(T) == typeof(BFloat16)) return BFloat16.ToFloat(Unsafe.As<T[], BFloat16[]>(ref data)[index]);
+        throw new NotSupportedException($"{typeof(T).Name} is not a 16-bit floating-point type.");
+    }
+
     /// <summary>Rounds float32 values to Half or BFloat16 (round to nearest even), once each.</summary>
     internal static T[] NarrowFromFloat<T>(float[] values)
     {
@@ -66,6 +76,37 @@ public partial class CpuEngine
 
     /// <summary>Rounds one float32 value to Half or BFloat16.</summary>
     internal static T NarrowFromFloat<T>(float value) => NarrowFromFloat<T>(new[] { value })[0];
+
+    // The float32 statistics a low-precision norm forward computed, keyed by the narrowed mean and variance tensors it
+    // returned. Narrowing loses what the backward needs: a Half variance above 65,504 is +Inf (so 1/sqrt(var + eps) is
+    // 0 and every gradient vanishes), and a rounded mean skews the centring. A backward handed those same tensors
+    // reads the exact values back; any other statistic, or one written since, is widened as given.
+    private static readonly ConditionalWeakTable<object, float[]> s_float32Statistics = new ConditionalWeakTable<object, float[]>();
+
+    /// <summary>Wraps narrowed statistics in a tensor and remembers their float32 values for the backward.</summary>
+    internal static Tensor<T> RentLowPrecisionStatistic<T>(int[] shape, float[] exact)
+    {
+        var statistic = TensorAllocator.Rent<T>(shape, NarrowFromFloat<T>(exact));
+        s_float32Statistics.Add(statistic, exact);
+        return statistic;
+    }
+
+    /// <summary>
+    /// The float32 values of a statistic: the forward's exact values when <paramref name="statistic"/> is the tensor a
+    /// low-precision norm forward returned and each value still rounds to its current element, else its elements widened.
+    /// </summary>
+    internal static float[] LowPrecisionStatisticValues<T>(Tensor<T> statistic, T[] data, int length)
+    {
+        if (s_float32Statistics.TryGetValue(statistic, out var exact) && exact.Length == length)
+        {
+            var narrowed = NarrowFromFloat<T>(exact);
+            var comparer = EqualityComparer<T>.Default;
+            bool current = true;
+            for (int i = 0; i < length && current; i++) current = comparer.Equals(narrowed[i], data[i]);
+            if (current) return exact;
+        }
+        return WidenToFloat(data, length);
+    }
 
     /// <summary>Compensated float32 sum.</summary>
     private static float CompensatedSum(float[] values)
@@ -109,11 +150,19 @@ public partial class CpuEngine
     internal static T LowPrecisionPairMean<T>(Tensor<T> a, Tensor<T> b, Func<float, float, float> term)
     {
         int length = a.Length;
-        var x = WidenToFloat(a.GetFlattenedData(), length);
-        var y = WidenToFloat(b.GetFlattenedData(), length);
-        var terms = new float[length];
-        for (int i = 0; i < length; i++) terms[i] = term(x[i], y[i]);
-        return NarrowFromFloat<T>(CompensatedSum(terms) / length);
+        var x = a.GetFlattenedData();
+        var y = b.GetFlattenedData();
+        // One streaming pass: each pair is widened, its term added to a compensated float32 sum, and nothing of the
+        // input's size is allocated in float32.
+        float sum = 0f, compensation = 0f;
+        for (int i = 0; i < length; i++)
+        {
+            float v = term(WidenElement(x, i), WidenElement(y, i)) - compensation;
+            float t = sum + v;
+            compensation = float.IsInfinity(t) ? 0f : (t - sum) - v;
+            sum = t;
+        }
+        return NarrowFromFloat<T>(sum / length);
     }
 
     /// <summary>
@@ -237,9 +286,11 @@ public partial class CpuEngine
 
     /// <summary>
     /// ReduceVariance (population) backward in float32: <c>2 (x - mean) gradOutput / count</c>, rounded once.
-    /// <paramref name="mean"/> and <paramref name="gradOutput"/> are indexed by reduced slot.
+    /// <paramref name="gradOutput"/> is indexed by reduced slot. The mean is recomputed per slot in float32 from the
+    /// input, as the forward computed it: the saved T-typed mean is rounded (BFloat16 [1, 1.0078125] has float32 mean
+    /// 1.00390625 but a saved mean of 1), and centring on it skews every gradient.
     /// </summary>
-    internal static T[] LowPrecisionVarianceBackward<T>(T[] input, T[] mean, T[] gradOutput, int[] inputShape, int[] normalizedAxes)
+    internal static T[] LowPrecisionVarianceBackward<T>(T[] input, T[] gradOutput, int[] inputShape, int[] normalizedAxes)
     {
         var strideForDim = ReducedSlotStrides(inputShape, normalizedAxes, out int reduceCount);
         int slots = 1;
@@ -247,7 +298,9 @@ public partial class CpuEngine
         int inputSize = 1;
         foreach (int dim in inputShape) inputSize *= dim;
         var x = WidenToFloat(input, inputSize);
-        var m = WidenToFloat(mean, slots);
+        var m = new float[slots];
+        AccumulateSlots(x, inputShape, strideForDim, m, null);
+        for (int s = 0; s < slots; s++) m[s] /= reduceCount;
         var g = WidenToFloat(gradOutput, slots);
         var result = new float[inputSize];
         int rank = inputShape.Length;
