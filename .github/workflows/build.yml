@@ -326,15 +326,32 @@ jobs:
         name: coverage-report
         path: ./coverage/report/
 
+    # One of the seven uploads codecov.yml waits for (after_n_builds: 7): a lost one leaves every PR without a coverage
+    # status, so a transient failure gets one retry and a second failure fails the job visibly where the token exists.
     - name: Upload Coverage to Codecov
+      id: codecov-upload
       uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
       if: always()
+      continue-on-error: true
       with:
         files: ./coverage/**/coverage.cobertura.xml
         disable_search: true
         flags: unittests
         name: codecov-umbrella
-        fail_ci_if_error: false
+        fail_ci_if_error: true
+        verbose: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Retry coverage upload to Codecov
+      if: always() && steps.codecov-upload.outcome == 'failure'
+      uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
+      with:
+        files: ./coverage/**/coverage.cobertura.xml
+        disable_search: true
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
         verbose: true
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

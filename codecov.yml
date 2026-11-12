@@ -29,6 +29,8 @@ coverage:
 # failed. Wait for all seven. Keep this count in step with the uploads: a new coverage shard raises it, a
 # removed one lowers it (missing-kernels and engine-lifecycle were added without raising it, and the project
 # status went red at ~7% again).
+# A failed upload no longer passes silently: each counted upload retries once and then fails its job (see the upload
+# steps), so a missing report shows as a red shard instead of a PR with no coverage status at all.
 codecov:
   notify:
     after_n_builds: 7
