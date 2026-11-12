@@ -82,8 +82,11 @@ internal static class LinearSolvers
         var d = dLease.Array;
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             return DetectStructureGeneric(d, n);
-        const double tol = 1e-8;
 
+        // The structure only selects a faster kernel, and each specialised kernel reads part of the matrix (a triangular
+        // solve one triangle, Cholesky the lower half), so it must be exact: a tolerance let [[1e-9, 1e-9], [1e-9, 2e-9]]
+        // take the upper-triangular solve and drop the lower coefficient. Exact comparison also never subtracts, so a
+        // skew pair [M, -M] near the type's maximum classifies instead of overflowing.
         bool upperTri = true;
         bool lowerTri = true;
         bool symmetric = true;
@@ -92,13 +95,9 @@ internal static class LinearSolvers
             for (int j = 0; j < n; j++)
             {
                 double v = ToDouble(d[i * n + j]);
-                if (i > j && Math.Abs(v) > tol) upperTri = false;
-                if (i < j && Math.Abs(v) > tol) lowerTri = false;
-                if (i != j)
-                {
-                    double vt = ToDouble(d[j * n + i]);
-                    if (Math.Abs(v - vt) > tol) symmetric = false;
-                }
+                if (i > j && v != 0.0) upperTri = false;
+                if (i < j && v != 0.0) lowerTri = false;
+                if (i != j && v != ToDouble(d[j * n + i])) symmetric = false;
             }
         }
 
@@ -115,20 +114,20 @@ internal static class LinearSolvers
         return MatrixStructure.General;
     }
 
-    // Same classification as DetectStructure, evaluated in T for decimal / Half / BFloat16.
+    // Same exact classification as DetectStructure, evaluated in T for decimal / Half / BFloat16 (no subtraction, so
+    // decimal.MaxValue entries cannot overflow it).
     private static MatrixStructure DetectStructureGeneric<T>(T[] d, int n)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
         if (!GenericLinalg<T>.IsSupported) return MatrixStructure.General;
-        Real<T> tol = Real<T>.Ops.FromDouble(1e-8);
         bool upperTri = true, lowerTri = true, symmetric = true;
         for (int i = 0; i < n; i++)
             for (int j = 0; j < n; j++)
             {
                 Real<T> v = d[i * n + j];
-                if (i > j && Real<T>.Abs(v) > tol) upperTri = false;
-                if (i < j && Real<T>.Abs(v) > tol) lowerTri = false;
-                if (i != j && Real<T>.Abs(v - d[j * n + i]) > tol) symmetric = false;
+                if (i > j && v != Real<T>.Zero) upperTri = false;
+                if (i < j && v != Real<T>.Zero) lowerTri = false;
+                if (i != j && v != (Real<T>)d[j * n + i]) symmetric = false;
             }
         if (upperTri) return MatrixStructure.UpperTriangular;
         if (lowerTri) return MatrixStructure.LowerTriangular;
