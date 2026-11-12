@@ -51238,8 +51238,12 @@ public partial class CpuEngine : ITensorLevelEngine
             var src = srcLease.Span;
             using var dstLease = result.LeaseWritable();
             var dst = dstLease.Span;
+            // As the float SIMD kernel: NaN has sign 0 (Math.Sign throws on it).
             for (int i = 0; i < src.Length; i++)
-                dst[i] = numOps.FromDouble(Math.Sign(numOps.ToDouble(src[i])));
+            {
+                double v = numOps.ToDouble(src[i]);
+                dst[i] = numOps.FromDouble(v > 0 ? 1 : (v < 0 ? -1 : 0));
+            }
         }
         DifferentiableOps.RecordUnary("Sign", result, tensorOrig, BackwardFunctions<T>.SignBackward);
         { var c = tensor; AutoTracer.RecordOp("Sign", result, eng => ((CpuEngine)eng).TensorSign(c)); }

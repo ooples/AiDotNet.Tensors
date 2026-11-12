@@ -44,6 +44,9 @@ env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   DOTNET_NOLOGO: true
+  # The runner is persistent: an MSBuild worker left by a cancelled or killed build can be reused by the next job, whose
+  # build then fails in seconds with MSB4166 ("child node exited prematurely"). Each build starts its own workers.
+  MSBUILDDISABLENODEREUSE: 1
 
 jobs:
   gpu-parity-pocl:
