@@ -158,7 +158,8 @@ jobs:
         FullyQualifiedName~.StreamingTensorJournalTests.|
         FullyQualifiedName~.TensorCowInferenceReadPathTests.|
         FullyQualifiedName~.TensorAddActivationTests.|
-        FullyQualifiedName~.TensorGpuCachePhysicalTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL&
+        FullyQualifiedName~.TensorGpuCachePhysicalTests.|
+        FullyQualifiedName~.EngineWrapperExtensionsTests.)&Category!=Benchmark&Category!=Performance&Category!=RequiresOpenCL&
         FullyQualifiedName!~.HeadToHeadGpuNetworkTests.
     defaults:
       run:

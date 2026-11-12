@@ -44,9 +44,19 @@ public class ProgramOperationReplaySweepTests : IDisposable
         {
             double a = expected[i], b = actual[i];
             Assert.True(a == b || (double.IsNaN(a) && double.IsNaN(b)) ||
-                (double.IsFinite(a) && double.IsFinite(b) && Math.Abs(a - b) <= 1e-8 * Math.Max(1, Math.Abs(a))),
+                (IsFinite(a) && IsFinite(b) && Math.Abs(a - b) <= 1e-8 * Math.Max(1, Math.Abs(a))),
                 $"element {i}: eager {a:G17}, replay {b:G17}");
         }
+    }
+
+    // double.IsFinite and ReferenceEqualityComparer are .NET Core only; the test project also builds net471 and net462.
+    private static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
+
+    private sealed class ReferenceEqualityComparerLocal : IEqualityComparer<object>
+    {
+        public static readonly ReferenceEqualityComparerLocal Instance = new();
+        public new bool Equals(object? x, object? y) => ReferenceEquals(x, y);
+        public int GetHashCode(object obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
     }
 
     [Fact]
@@ -60,7 +70,7 @@ public class ProgramOperationReplaySweepTests : IDisposable
         {
             // Random sampling has no deterministic eager oracle. Dedicated dropout/RReLU tests cover seeded capture.
             if (name is "TensorDropout" or "TensorRandomLike" or "TensorRReLU" or "RReLU") continue;
-            var originals = args.SelectMany(Inputs).Distinct(ReferenceEqualityComparer.Instance).Cast<Tensor<double>>().ToArray();
+            var originals = args.SelectMany(Inputs).Distinct(ReferenceEqualityComparerLocal.Instance).Cast<Tensor<double>>().ToArray();
             if (originals.Length == 0) continue;
             Tensor<double>[] Forward(Tensor<double>[] xs)
             {
