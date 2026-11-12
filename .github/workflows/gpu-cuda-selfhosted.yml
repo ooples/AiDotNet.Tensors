@@ -47,9 +47,9 @@ on:
         default: ''
       # Runs one architecture's job alone (for example to exercise a newly registered runner) instead of all of them.
       arch:
-        description: Run only this architecture's job (all runs every architecture the nightly schedule runs)
+        description: Run only this architecture's job (all runs every architecture the nightly schedule runs; pr-models runs only the AiDotNet model families on an RTX 3080)
         type: choice
-        options: [all, sm86, sm75, sm89]
+        options: [all, sm86, sm75, sm89, pr-models]
         default: all
   # Pull requests run this workflow through ci.yml, as one job of the pull request's single CI run, when ci.yml's
   # changes job finds a file matching its path filter (cuda in .github/ci-path-filters.yml). Pushes to main do not
@@ -115,9 +115,13 @@ jobs:
     # requests' GPU suites; a runner registered before the split carries no architecture label and picks up no job until
     # relabelled (see the header for how).
     runs-on: ${{ fromJSON(matrix.arch == 'pr' && '["self-hosted","gpu","cuda","cuda-pr"]' || matrix.arch == 'pr-models' && '["self-hosted","gpu","cuda","sm86"]' || format('["self-hosted","gpu","cuda","{0}"]', matrix.arch)) }}
-    # pr: the suites (78-101 minutes on an RTX 3080) on the slowest cuda-pr runner, plus setup and the interop host.
-    # pr-models: setup and the model families (about 18 minutes, bounded at 22).
-    timeout-minutes: ${{ matrix.arch == 'pr' && 200 || matrix.arch == 'pr-models' && 60 || matrix.arch == 'sm86' && 560 || 240 }}
+    # pr and sm75/sm89: setup (up to 20 minutes), both suite parts at their full watchdogs with the diagnostics between
+    # them (about 5 minutes), and the 30-minute reserve: 20 + 140 + 5 + 90 + 30 = 285 on the slowest cuda-pr runner,
+    # 270 elsewhere. A DirectGpu overrun then still leaves the second part its whole watchdog, so it keeps its TRX.
+    # pr-models: setup and the model families (about 18 minutes, bounded at 26).
+    # sm86: setup (20), the suite parts (115 + 50) with diagnostics (5), torch interop (5), the model families (26) and
+    # the nightly ratchet (360): 581, so 600.
+    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || matrix.arch == 'pr-models' && 60 || 600 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -301,7 +305,10 @@ jobs:
         $version = '9.26.1.1'
         $sha256 = 'c826d866641fed2c266ae1c11e679fcc1ef8517801a32a51715843051ce8df52'   # redistrib_9.26.1.json, windows-x86_64 cuda13
         $root = Join-Path $env:GITHUB_WORKSPACE "cudnn-$version"
-        if (-not (Test-Path (Join-Path $root 'ok'))) {
+        # The marker alone is not trusted: the GTX 1660 Ti runner kept an 'ok' directory whose DLLs were gone, and failed
+        # every run with "cudnn64_9.dll is not in the cuDNN archive" without ever fetching it again.
+        $cached = (Test-Path (Join-Path $root 'ok')) -and (Get-ChildItem $root -Recurse -Filter cudnn64_9.dll -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (-not $cached) {
           $zip = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
           Invoke-WebRequest -UseBasicParsing -OutFile $zip `
             "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-${version}_cuda13-archive.zip"
@@ -328,7 +335,7 @@ jobs:
       if: matrix.arch != 'pr-models'
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
-    - name: GPU suites (DirectGpu, Autodiff, Compilation, Parity)
+    - name: GPU suites (DirectGpu, then Autodiff, Compilation, Parity and the rest)
       if: ${{ !inputs.ratchets_only && matrix.arch != 'pr-models' }}
       env:
         # cuDNN's own error log, uploaded with the TRX. A cuDNN failure such as CUDNN_STATUS_EXECUTION_FAILED_CUDART
@@ -341,32 +348,39 @@ jobs:
         # host's managed stacks and the processes under the runner, then fails the step so the steps below still run.
         # Passing SM86 runs take 78 to 101 minutes here; the SM75 suites take about 3 hours. The reserve also covers the
         # steps after the suites on a pull request: the torch interop step (at most 5 minutes), the model families
-        # (about 18, bounded at 22) and the upload. The deadline counts from
+        # (about 18, bounded at 26) and the upload. The deadline counts from
         # the job's start (the runner worker's), not this step's, and stops DIAGNOSTICS_RESERVE_MINUTES short of the job
         # limit, so slow setup cannot let the job timeout cancel the step before the watchdog fires.
-        # A pull request's suites ("pr") run where they land: 120 minutes on an RTX 3080, 165 on a slower cuda-pr runner
-        # (the job limit, 200 less the reserve, caps it anyway); the model families run in their own job there.
-        SUITE_WATCHDOG_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '120' || matrix.arch == 'pr' && '165' || '215' }}
-        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'pr' && 200 || matrix.arch == 'sm86' && 560 || 240 }}
+        # A pull request's suites ("pr") run where they land; the model families run in their own job there.
+        # The suites run as two test hosts, each with its own watchdog and TRX, so a part that overruns still leaves
+        # the other's per-test results (2026-11-11/12: the single 120-minute run hit its watchdog on main and on #1718
+        # with no other process on the GPU, and left no TRX to say which tests had grown). The last passing SM86 run
+        # (2026-11-08, 78 minutes) spent 70 test-minutes in Engines.DirectGpu and 44 in the rest; split on 2026-11-12 they
+        # took 93 and 34 minutes. On an RTX 3080 the parts get 115 and 50 minutes; on a slower cuda-pr runner 140 and
+        # 90, and elsewhere 130 and 85. The job limit (timeout-minutes above) is sized so both parts fit at their full
+        # watchdogs after setup; the job limit less the reserve still caps each part's deadline.
+        SUITE_WATCHDOG_DIRECTGPU_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '115' || matrix.arch == 'pr' && '140' || '130' }}
+        SUITE_WATCHDOG_REST_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '50' || matrix.arch == 'pr' && '90' || '85' }}
+        # Must equal the job's timeout-minutes.
+        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || 600 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
-        # The embedded-torch class runs in its own test host (the next step).
+        # The embedded-torch class runs in its own test host (the next step). The two parts partition the lane's
+        # filter: & binds tighter than |, and the lane filter is one parenthesized group, so each part is the group
+        # AND its own term.
         $filter = ($env:CUDA_LANE_FILTER -replace "\s", "") + '&FullyQualifiedName!~.DLPackTorchInteropTests.'
-        $testArgs = 'test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj ' +
-          '--configuration Release --no-build --framework net10.0 ' +
-          "--filter `"$filter`" " +
-          "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=cuda.trx`" " +
-          '--blame-hang --blame-hang-timeout 900s --blame-crash'
+        $parts = @(
+          @{ Name = 'Engines.DirectGpu'; Filter = "$filter&FullyQualifiedName~Engines.DirectGpu"; Trx = 'cuda.trx'
+             Minutes = [int]$env:SUITE_WATCHDOG_DIRECTGPU_MINUTES },
+          @{ Name = 'Autodiff, Compilation, Parity and the rest'; Filter = "$filter&FullyQualifiedName!~Engines.DirectGpu"
+             Trx = 'cuda-rest.trx'; Minutes = [int]$env:SUITE_WATCHDOG_REST_MINUTES })
 
         # The worker process starts with the job; fall back to this step's start if the parent is not the worker.
         $self = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
         $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($self.ParentProcessId)"
         $jobStart = if ($parent -and $parent.Name -like 'Runner.Worker*') { $parent.CreationDate } else { $self.CreationDate }
-        $deadline = $jobStart.AddMinutes([int]$env:JOB_LIMIT_MINUTES - [int]$env:DIAGNOSTICS_RESERVE_MINUTES)
-        $watchdog = (Get-Date).AddMinutes([int]$env:SUITE_WATCHDOG_MINUTES)
-        if ($watchdog -lt $deadline) { $deadline = $watchdog }
-        Write-Output "Watchdog deadline: $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
+        $jobDeadline = $jobStart.AddMinutes([int]$env:JOB_LIMIT_MINUTES - [int]$env:DIAGNOSTICS_RESERVE_MINUTES)
 
         # The same suites took 69 to 96 minutes on some nights and passed the 120-minute watchdog on others. On
         # 2026-11-08 the GPU tests ran up to 2.6x slower than on 2026-11-06 for the first 40 minutes only, the CPU-only
@@ -417,9 +431,12 @@ jobs:
             $others = @($apps | ForEach-Object {
               $idColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'pid' } | Select-Object -First 1
               $nameColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'process_name' } | Select-Object -First 1
+              # A short row (nvidia-smi on a WDDM laptop GPU can print one) leaves a column's value null, so each value is
+              # read as a string before trimming.
               $id = [uint32]0
-              if ($idColumn -and [uint32]::TryParse($idColumn.Value.Trim(), [ref]$id) -and -not $ownIds.ContainsKey($id)) {
-                $name = if ($nameColumn) { Split-Path -Leaf $nameColumn.Value.Trim() } else { 'unknown' }
+              if ($idColumn -and [uint32]::TryParse("$($idColumn.Value)".Trim(), [ref]$id) -and -not $ownIds.ContainsKey($id)) {
+                $rawName = if ($nameColumn) { "$($nameColumn.Value)".Trim() } else { '' }
+                $name = if ($rawName) { Split-Path -Leaf $rawName } else { 'unknown' }
                 "$name ($id)"
               } } | Sort-Object -Unique)
             if ($others.Count -gt 0) {
@@ -438,7 +455,8 @@ jobs:
           function Read-Number($row, $prefix) {
             $column = $row.PSObject.Properties | Where-Object { $_.Name.Trim() -like "$prefix*" } | Select-Object -First 1
             $value = 0.0
-            if ($column -and [double]::TryParse(($column.Value.Trim() -split ' ')[0], [ref]$value)) { return $value }
+            # The row nvidia-smi was writing when it was stopped can be cut short, leaving later columns null.
+            if ($column -and $null -ne $column.Value -and [double]::TryParse(($column.Value.Trim() -split ' ')[0], [ref]$value)) { return $value }
             return $null
           }
           $clocks = @($rows | ForEach-Object { Read-Number $_ 'clocks.current.sm' } | Where-Object { $null -ne $_ })
@@ -448,7 +466,7 @@ jobs:
           $limited = @($rows | Where-Object {
             $column = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -like 'clocks_*reasons*' } | Select-Object -First 1
             $bits = [uint64]0
-            $column -and [uint64]::TryParse(($column.Value.Trim() -replace '^0x', ''),
+            $column -and $null -ne $column.Value -and [uint64]::TryParse(($column.Value.Trim() -replace '^0x', ''),
               [Globalization.NumberStyles]::HexNumber, [Globalization.CultureInfo]::InvariantCulture, [ref]$bits) -and
               ($bits -shr 1) -ne 0 }).Count
           $line = "GPU samples: $($rows.Count); SM clock $(($clocks | Measure-Object -Minimum).Minimum)-" +
@@ -457,46 +475,79 @@ jobs:
           $line | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
         }
 
-        $run = Start-Process dotnet -ArgumentList $testArgs -NoNewWindow -PassThru
-        $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
-        # Wait in 30-second slices (the sampling interval), recording the run's processes at each.
-        while ($true) {
-          $null = Update-RunTree
-          $waitMs = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalMilliseconds)
-          if ($run.WaitForExit([Math]::Min($waitMs, 30000))) { Stop-GpuSampling; exit $run.ExitCode }
-          if ($waitMs -le 30000) { break }
-        }
-
-        Write-Output "::error::The GPU suites were still running at the watchdog deadline."
+        $exitCode = 0
+        # Sampling stops however the loop ends, so the summary and the sample files are always written.
         try {
-          # Only this run's processes, so another workload's test host on the runner is never inspected.
-          $mine = Update-RunTree
-          Stop-GpuSampling
-          Write-Output "::group::Processes of this run"
-          $mine | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
-          Write-Output "::endgroup::"
+          foreach ($part in $parts) {
+            $testArgs = 'test AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj ' +
+              '--configuration Release --no-build --framework net10.0 ' +
+              "--filter `"$($part.Filter)`" " +
+              "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=$($part.Trx)`" " +
+              '--blame-hang --blame-hang-timeout 900s --blame-crash'
+            $deadline = (Get-Date).AddMinutes($part.Minutes)
+            if ($jobDeadline -lt $deadline) { $deadline = $jobDeadline }
+            Write-Output "GPU suites, $($part.Name): watchdog deadline $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
 
-          # Each diagnostic is bounded, so a stalled install or attach cannot spend the reserve.
-          $tools = "${{ runner.temp }}/dotnet-stack"
-          $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
-          if (-not $install.WaitForExit(180000)) {
-            Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
-            Write-Output "::warning::dotnet-stack did not install within 3 minutes; no stacks printed."
-          } else {
-            foreach ($testHost in @($mine | Where-Object { $_.Name -like 'testhost*' })) {
-              Write-Output "::group::Managed stacks of testhost $($testHost.ProcessId)"
-              $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($testHost.ProcessId)" -NoNewWindow -PassThru
-              if (-not $report.WaitForExit(120000)) {
-                Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
-                Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($testHost.ProcessId)."
-              }
+            $run = Start-Process dotnet -ArgumentList $testArgs -NoNewWindow -PassThru
+            $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
+            # Wait in 30-second slices (the sampling interval), recording the run's processes at each.
+            $finished = $false
+            while ($true) {
+              $null = Update-RunTree
+              $waitMs = [Math]::Max(0, [int]($deadline - (Get-Date)).TotalMilliseconds)
+              if ($run.WaitForExit([Math]::Min($waitMs, 30000))) { $finished = $true; break }
+              if ($waitMs -le 30000) { break }
+            }
+            if ($finished) {
+              if ($run.ExitCode -ne 0) { $exitCode = $run.ExitCode }
+              continue
+            }
+
+            Write-Output "::error::The GPU suites ($($part.Name)) were still running at the watchdog deadline."
+            $exitCode = 1
+            try {
+              # Only this run's processes, so another workload's test host on the runner is never inspected.
+              $mine = Update-RunTree
+              Write-Output "::group::Processes of this run"
+              $mine | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
               Write-Output "::endgroup::"
+
+              # Each diagnostic is bounded, so a stalled install or attach cannot spend the reserve.
+              $tools = "${{ runner.temp }}/dotnet-stack"
+              if (-not (Test-Path "$tools/dotnet-stack*")) {
+                $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
+                if (-not $install.WaitForExit(180000)) {
+                  Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
+                  Write-Output "::warning::dotnet-stack did not install within 3 minutes; no stacks printed."
+                }
+              }
+              if (Test-Path "$tools/dotnet-stack*") {
+                foreach ($testHost in @($mine | Where-Object { $_.Name -like 'testhost*' })) {
+                  Write-Output "::group::Managed stacks of testhost $($testHost.ProcessId)"
+                  $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($testHost.ProcessId)" -NoNewWindow -PassThru
+                  if (-not $report.WaitForExit(120000)) {
+                    Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
+                    Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($testHost.ProcessId)."
+                  }
+                  Write-Output "::endgroup::"
+                }
+              }
+            } catch {
+              # A diagnostic that cannot start must not end the script: the next part still runs.
+              Write-Output "::warning::GPU suites ($($part.Name)) diagnostics failed: $($_.Exception.Message)"
+            } finally {
+              taskkill /T /F /PID $run.Id | Out-Null
+            }
+            # Past the job's own deadline there is no time left for another part.
+            if ((Get-Date) -ge $jobDeadline) {
+              Write-Output "::error::The job deadline passed; the remaining GPU suite parts did not run."
+              break
             }
           }
         } finally {
-          taskkill /T /F /PID $run.Id | Out-Null
+          Stop-GpuSampling
         }
-        exit 1
+        exit $exitCode
       # With --blame the TRX logger ignores LogFilePath and writes under the project's TestResults; the results
       # directory puts the TRX and any crash or hang dump where the skip check and the upload look.
 
@@ -548,23 +599,29 @@ jobs:
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
+      #   - platform requirements: a Linux-only driver path (the RM ioctl interface), and the no-NVRTC diagnostic,
+      #     which only runs where NVRTC is missing and the lane always installs it;
       #   - architecture requirements (an sm_ level, AVX-512 on the host CPU; off SM86, the specializations validated only
-      #     there: the SM86/GA10x and Ampere reasons, and the declared generated-kernel route, which is released on
-      #     sm_75 and sm_86 only and so skips on the SM89 Ada);
+      #     there: the SM86/GA10x and Ampere reasons, the DirectPtx families' "<family>-architecture-not-implemented"
+      #     (DirectPtxArchitecture admits each on SM 8.6 only) and the experimental generated convolution (SM 8.6 only),
+      #     and the declared generated-kernel route, which is released on sm_75 and sm_86 only and so skips on the SM89
+      #     Ada; there the declared tests' "needs the sm_75+ conveyor" reasons are that release check too, since
+      #     DeclaredKernelsEnabled is false);
       #   - tracked baselines, each a listed gap with its own marker (NEEDS SPEC, TAPE-GRADIENT BASELINE, a forward with
       #     no differentiable leaf, the PTX transfer campaign's progress check);
       #   - opt-in benchmarks and probes, and wall-clock perf gates (they skip under CI=true);
       #   - "Not applicable: CUDA ...", a test of a mechanism CUDA deliberately does not use (it names CUDA's own).
       # Allowed test names: device classes of another backend (TorchParity*HipDeviceTests and the like), whose reasons say
       # only that no backend is available. A CUDA test skipping for any other reason fails the lane.
-      # The main suites and the torch interop host are checked apart, so each must have run tests of its own: a main
-      # filter that selected nothing cannot pass on the interop tests alone.
+      # The two main parts and the torch interop host are checked apart, so each must have run tests of its own: a
+      # filter that selected nothing cannot pass on another part's tests.
       env:
-        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)'' || '''' }}'
+        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|Linux-only|^NVRTC is present|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b|-architecture-not-implemented$|^Experimental generated convolution is unavailable on this GPU architecture'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)|^The declared route needs the sm_75\+ conveyor|^A declared resident program needs the sm_75\+ conveyor'' || '''' }}'
         ALLOWED_SKIP_TEST: '(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\.'
       run: |
         $failed = $false
-        foreach ($part in @(@{ Title = 'CUDA (${{ steps.gpu.outputs.sm }})'; Trx = 'cuda.trx' },
+        foreach ($part in @(@{ Title = 'CUDA (${{ steps.gpu.outputs.sm }}) Engines.DirectGpu'; Trx = 'cuda.trx' },
+                            @{ Title = 'CUDA (${{ steps.gpu.outputs.sm }}) rest'; Trx = 'cuda-rest.trx' },
                             @{ Title = 'CUDA (${{ steps.gpu.outputs.sm }}) torch interop'; Trx = 'cuda-torch-interop.trx' })) {
           python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title $part.Title --fail-on-skip `
             --allowed-skip $env:ALLOWED_SKIP --allowed-skip-test $env:ALLOWED_SKIP_TEST `
@@ -576,8 +633,11 @@ jobs:
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
       if: (matrix.arch == 'sm86' || matrix.arch == 'pr-models') && !inputs.ratchets_only
-      # About 18 minutes in a passing run; bounded so the job budget above holds.
-      timeout-minutes: 22
+      # About 18 minutes in a passing run (6 of them building AiDotNet); bounded so the job budget above holds.
+      # densenet121's training hung on 2026-11-08 (main) and 2026-11-12 (#1724) and passed in 15 s in between; the step
+      # timeout killed it with nothing printed. A watchdog 20 minutes in prints the GPU's processes and the managed
+      # stacks of the benchmark process, then stops it, leaving the rest of the 26 minutes for the diagnostics.
+      timeout-minutes: 26
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
       # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
       run: |
@@ -594,15 +654,85 @@ jobs:
           Write-Output "AiDotNet.Evolution: AiDotNet pins $($pin.Groups[2].Value), this Tensors needs $want; using $want."
           Set-Content $props ($text.Remove($pin.Groups[2].Index, $pin.Groups[2].Length).Insert($pin.Groups[2].Index, $want)) -NoNewline
         }
-        dotnet run -c Release --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- `
-          --models $env:MODEL_FAMILIES --device cuda --epochs 1 --train-batches 2 --batch-size 64 `
-          --inference-iterations 3 --warmup-iterations 1 --output "${{ runner.temp }}/aidotnet-cuda.json"
-        if ($LASTEXITCODE -ne 0) { Write-Output "::error::An AiDotNet model family failed on CUDA."; exit 1 }
+        # A process per family releases the CUDA context and every cached allocation before the next model.
+        # DenseNet inference stalled at 11.8/12 GiB after nine earlier families in run 43219966801.
+        # Keep one overall deadline, including the first host's build, so isolation cannot multiply the job budget.
+        $modelDeadline = (Get-Date).AddMinutes(20)
+        $firstModel = $true
+        foreach ($model in ($env:MODEL_FAMILIES -split ',')) {
+        $buildOption = if ($firstModel) { '' } else { '--no-build ' }
+        $firstModel = $false
+          $runArgs = 'run -c Release ' + $buildOption + '--project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- ' +
+            "--models $model --device cuda --epochs 1 --train-batches 2 --batch-size 64 " +
+            "--inference-iterations 3 --warmup-iterations 1 --output `"${{ runner.temp }}/aidotnet-cuda-$model.json`""
+          $remainingMs = [Math]::Max(0, [int]($modelDeadline - (Get-Date)).TotalMilliseconds)
+          if ($remainingMs -eq 0) { Write-Output "::error::The model-family watchdog expired before $model could run."; exit 1 }
+          Write-Output "CUDA model family: $model (fresh process)."
+          $run = Start-Process dotnet -ArgumentList $runArgs -NoNewWindow -PassThru
+          $null = $run.Handle   # cache the handle so ExitCode is readable after the process exits
+          if ($run.WaitForExit($remainingMs)) {
+            if ($run.ExitCode -ne 0) { Write-Output "::error::AiDotNet model family $model failed on CUDA."; exit 1 }
+            continue
+          }
 
+          Write-Output "::error::AiDotNet model family $model was still running at the overall 20-minute watchdog."
+          try {
+            # This run's processes only: the dotnet host and the benchmark it started (dotnet run builds, then runs it).
+            $all = @(Get-CimInstance Win32_Process)
+            $mine = @{}; $mine[[uint32]$run.Id] = $true
+            do {
+              $grew = $false
+              foreach ($p in $all) {
+                if ($mine.ContainsKey([uint32]$p.ParentProcessId) -and -not $mine.ContainsKey([uint32]$p.ProcessId)) {
+                  $mine[[uint32]$p.ProcessId] = $true; $grew = $true
+                }
+              }
+            } while ($grew)
+            $tree = @($all | Where-Object { $mine.ContainsKey([uint32]$_.ProcessId) })
+            Write-Output "::group::Processes of this run"
+            $tree | Format-Table ProcessId, ParentProcessId, Name, CreationDate -AutoSize | Out-String -Width 200
+            Write-Output "::endgroup::"
+            # Each diagnostic is bounded, so a stalled driver, install or attach cannot outlast the step.
+            Write-Output "::group::nvidia-smi"
+            $smi = Start-Process nvidia-smi -NoNewWindow -PassThru
+            if (-not $smi.WaitForExit(30000)) {
+              Stop-Process -Id $smi.Id -Force -ErrorAction SilentlyContinue
+              Write-Output "::warning::nvidia-smi did not finish within 30 seconds."
+            }
+            Write-Output "::endgroup::"
+
+            $tools = "${{ runner.temp }}/dotnet-stack"
+            if (-not (Test-Path "$tools/dotnet-stack*")) {
+              $install = Start-Process dotnet -ArgumentList "tool install dotnet-stack --tool-path `"$tools`"" -NoNewWindow -PassThru
+              if (-not $install.WaitForExit(120000)) {
+                Stop-Process -Id $install.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "::warning::dotnet-stack did not install within 2 minutes; no stacks printed."
+              }
+            }
+            if (Test-Path "$tools/dotnet-stack*") {
+              foreach ($bench in @($tree | Where-Object { $_.Name -like 'AiDotNet.PyTorchParity*' })) {
+                Write-Output "::group::Managed stacks of AiDotNet.PyTorchParity $($bench.ProcessId)"
+                $report = Start-Process "$tools/dotnet-stack" -ArgumentList "report -p $($bench.ProcessId)" -NoNewWindow -PassThru
+                if (-not $report.WaitForExit(120000)) {
+                  Stop-Process -Id $report.Id -Force -ErrorAction SilentlyContinue
+                  Write-Output "::warning::dotnet-stack did not finish within 2 minutes on $($bench.ProcessId)."
+                }
+                Write-Output "::endgroup::"
+              }
+            }
+          } catch {
+            Write-Output "::warning::Collecting the hang diagnostics failed: $($_.Exception.Message)"
+          } finally {
+            taskkill /T /F /PID $run.Id | Out-Null
+          }
+          exit 1
+
+        }
+        exit 0
     # The CUDA step-time ratchets: each network's ours/PyTorch step ratio on this machine class may not rise above the
     # one recorded in parity/head-to-head-baseline.json. PyTorch compiles each network in every mode for up to an hour
     # (the runner's RunnerTimeout), far past a pull request's budget and the 15-minute hang blame, so they run nightly
-    # and on dispatch on the RTX 3080 only (the SM86 job's limit rises to 560 minutes then: at most about 160 minutes
+    # and on dispatch on the RTX 3080 only (the SM86 job's limit is 600 minutes for it: at most about 217 minutes
     # before this step, 360 in it, and the upload). They run only after every earlier step passed, so a red night does
     # not hold the shared runner for hours more. A deferral (no baseline for the machine class, a torch that cannot reach
     # the device) fails the step, and so does a missing network: each of the nine must report a pass or a failure.
@@ -670,7 +800,7 @@ jobs:
         path: |
           ${{ runner.temp }}/trx/**
           ${{ runner.temp }}/ratchets/**
-          ${{ runner.temp }}/aidotnet-cuda.json
+          ${{ runner.temp }}/aidotnet-cuda-*.json
         if-no-files-found: ignore
         # A crash dump is the full test host (gigabytes); keep it only long enough to analyse.
         retention-days: 5

@@ -8728,7 +8728,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         bool isRecording = Gpu.DeferredScope.Current?.IsRecording == true;
-        if (!isRecording && !tensor.IsGpuResident) return false;
+        if (!isRecording && !tensor.IsGpuResident && !tensor.HasPendingGpuData && !IsDeviceAuthoritative(tensor)) return false;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         // Read the optional backing WITHOUT materializing. Zero-allocation deferred tensors have no
@@ -9529,6 +9529,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (CacheMayFreeReleasedBuffers)
                 foreach (var retired in _retiredWeightBuffers) retired.Dispose();
             _retiredWeightBuffers.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Drops all cached weight buffers WITHOUT materializing pending GPU→CPU downloads.
+    /// Use ONLY between sequential model runs when all previously trained weight tensors are dead
+    /// and will never be read on the host again (mirrors <see cref="DropActivationCache"/>).
+    /// </summary>
+    public void DropAllWeightCaches()
+    {
+        if (System.Threading.Volatile.Read(ref _liveCapturedGraphs) > 0)
+            return;
+
+        List<KeyValuePair<object, GpuBufferCacheEntry>> toDispose;
+        List<IGpuBuffer> retiredToDispose;
+        lock (_persistentBufferLock)
+        {
+            toDispose = new List<KeyValuePair<object, GpuBufferCacheEntry>>(_persistentBufferCache);
+            _persistentBufferCache.Clear();
+            _tensorVersions.Clear();
+            _persistentWeightHostVersion.Clear();
+            retiredToDispose = new List<IGpuBuffer>(_retiredWeightBuffers);
+            _retiredWeightBuffers.Clear();
+        }
+
+        foreach (var pair in toDispose)
+        {
+            Helpers.HostSync.Remove(pair.Key);
+            if (CacheMayFreeReleasedBuffers)
+                pair.Value.Dispose();
+        }
+        if (CacheMayFreeReleasedBuffers)
+        {
+            foreach (var retired in retiredToDispose)
+                retired.Dispose();
         }
     }
 
@@ -15037,6 +15072,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
 
         _pendingPersistentRoles.Remove(key);
+        if (Helpers.HostSync.IsPending(key))
+        {
+            try { Helpers.HostSync.TryMaterialize(key); }
+            catch (Exception) { Helpers.HostSync.Remove(key); }
+        }
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
         lock (_persistentBufferLock)
         {
             if (_persistentBufferCache.TryRemove(key, out var entry))
@@ -29838,7 +29881,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the buffers the backend's pool keeps for reuse. Live tensors and ops running on other threads are untouched.
     /// Returns how many pooled buffers were freed.
     /// </summary>
-    internal int ReleaseUnusedDeviceMemory()
+    public int ReleaseUnusedDeviceMemory()
     {
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || backend is not IDeviceMemoryPressure pressure) return 0;
