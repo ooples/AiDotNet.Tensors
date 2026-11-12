@@ -79,14 +79,23 @@ internal static class NumericRecurrenceKernelTemplate
         }
         else
         {
-            float a = mo[o + i] / d;
-            float c = mo[o + i + 1] / d;
-            float sum = a * a + c * c;
-            if (sum > 9.0f)
+            // Slope space, as CpuEngine.FritschCarlsonHost: no a = m / d or a^2 + b^2 that overflows for finite inputs.
+            float m0 = mo[o + i];
+            float m1 = mo[o + i + 1];
+            float ad = d < 0.0f ? -d : d;
+            float a0 = m0 < 0.0f ? -m0 : m0;
+            float a1 = m1 < 0.0f ? -m1 : m1;
+            float s = a0 > a1 ? a0 : a1;
+            if (s > 0.0f)
             {
-                float tau = 3.0f / SQRTF(sum);
-                mo[o + i] = tau * (a * d);
-                mo[o + i + 1] = tau * (c * d);
+                float u0 = m0 / s;
+                float u1 = m1 / s;
+                float k = 3.0f / SQRTF(u0 * u0 + u1 * u1);
+                if (s / ad > k)
+                {
+                    mo[o + i] = u0 * k * ad;
+                    mo[o + i + 1] = u1 * k * ad;
+                }
             }
         }
     }

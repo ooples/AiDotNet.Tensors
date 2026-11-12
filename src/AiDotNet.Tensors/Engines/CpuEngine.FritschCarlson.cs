@@ -44,6 +44,11 @@ public partial class CpuEngine
     /// The limiter on every series: for i = 0 .. n - 2, a zero secant flattens both end slopes; otherwise, when
     /// <c>a^2 + b^2 &gt; 9</c> (a = m[i] / d[i], b = m[i+1] / d[i]), both are scaled by <c>tau = 3 / sqrt(a^2 + b^2)</c>
     /// as <c>tau * (a * d[i])</c> and <c>tau * (b * d[i])</c>. Step i reads the m[i] step i - 1 wrote.
+    /// <para>Evaluated in slope space without forming a, b or their squares, which overflow for finite inputs (slopes
+    /// 1e200 over a secant 1e-200 made tau 0 and the result 0 * inf = NaN): with s = max(|m[i]|, |m[i+1]|),
+    /// u = m / s and r = sqrt(u0^2 + u1^2) in [1, sqrt 2], the test a^2 + b^2 &gt; 9 is s / |d| &gt; 3 / r and the
+    /// limited slopes are u * (3 / r) * |d|. The device kernels use the same steps, so a NaN slope leaves both unchanged
+    /// on every backend.</para>
     /// </summary>
     internal static double[] FritschCarlsonHost(double[] slopes, double[] secants, int batch, int n)
     {
@@ -60,13 +65,19 @@ public partial class CpuEngine
                     m[o + i + 1] = 0.0;
                     continue;
                 }
-                double a = m[o + i] / d, c = m[o + i + 1] / d;
-                double sum = a * a + c * c;
-                if (sum > 9.0)
+                double m0 = m[o + i], m1 = m[o + i + 1];
+                double ad = d < 0.0 ? -d : d;
+                double a0 = m0 < 0.0 ? -m0 : m0, a1 = m1 < 0.0 ? -m1 : m1;
+                double s = a0 > a1 ? a0 : a1;
+                if (s > 0.0)
                 {
-                    double tau = 3.0 / Math.Sqrt(sum);
-                    m[o + i] = tau * (a * d);
-                    m[o + i + 1] = tau * (c * d);
+                    double u0 = m0 / s, u1 = m1 / s;
+                    double k = 3.0 / Math.Sqrt(u0 * u0 + u1 * u1);
+                    if (s / ad > k)
+                    {
+                        m[o + i] = u0 * k * ad;
+                        m[o + i + 1] = u1 * k * ad;
+                    }
                 }
             }
         }, deterministicSafe: true);

@@ -79,6 +79,10 @@ public partial class CpuEngine
     /// <c>c'[i] = upper[i] / beta[i]</c> and <c>x[i] = (rhs[i] - lower[i-1] x[i-1]) / beta[i]</c> with
     /// <c>beta[i] = diagonal[i] - lower[i-1] c'[i-1]</c>; back substitution then <c>x[i] -= c'[i] x[i+1]</c>. The device
     /// kernels (<see cref="DirectGpu.NumericRecurrenceKernelTemplate"/>) run the same steps in the same order.
+    /// <para>Each equation is first divided by the power of two at or below its largest coefficient. Row scaling leaves
+    /// the solution unchanged, and a power-of-two divide is exact, so the result is bit-identical wherever the unscaled
+    /// elimination stays finite; a near-overflow system (diagonal 1e308, bands 9e307) no longer forms
+    /// <c>rhs[i] - lower x[i-1]</c> past double's range.</para>
     /// </summary>
     internal static double[] TridiagonalSolveHost(double[] lower, double[] diagonal, double[] upper, double[] rhs, int batch, int n)
     {
@@ -87,19 +91,35 @@ public partial class CpuEngine
         {
             int o = b * n, ob = b * (n - 1);
             var cp = new double[Math.Max(1, n - 1)];
-            double beta = diagonal[o];
-            x[o] = rhs[o] / beta;
+            double previousScale = RowScale(0.0, diagonal[o], n > 1 ? upper[ob] : 0.0);
+            double beta = diagonal[o] / previousScale;
+            x[o] = rhs[o] / previousScale / beta;
             for (int i = 1; i < n; i++)
             {
-                double c = upper[ob + i - 1] / beta;
+                double s = RowScale(lower[ob + i - 1], diagonal[o + i], i < n - 1 ? upper[ob + i] : 0.0);
+                double c = upper[ob + i - 1] / previousScale / beta;
+                previousScale = s;
                 cp[i - 1] = c;
-                double a = lower[ob + i - 1];
-                beta = diagonal[o + i] - a * c;
-                x[o + i] = (rhs[o + i] - a * x[o + i - 1]) / beta;
+                double a = lower[ob + i - 1] / s;
+                beta = diagonal[o + i] / s - a * c;
+                x[o + i] = (rhs[o + i] / s - a * x[o + i - 1]) / beta;
             }
             for (int i = n - 2; i >= 0; i--) x[o + i] -= cp[i] * x[o + i + 1];
         }, deterministicSafe: true);
         return x;
+    }
+
+    // The power of two at or below the row's largest coefficient magnitude: 1 for an all-zero, non-finite or subnormal
+    // row, which is left as given.
+    private static double RowScale(double lower, double diagonal, double upper)
+    {
+        double s = Math.Abs(diagonal);
+        double l = Math.Abs(lower), u = Math.Abs(upper);
+        if (l > s) s = l;
+        if (u > s) s = u;
+        if (!(s > 0.0) || double.IsInfinity(s)) return 1.0;
+        long exponentBits = BitConverter.DoubleToInt64Bits(s) & 0x7FF0000000000000L;
+        return exponentBits == 0 ? 1.0 : BitConverter.Int64BitsToDouble(exponentBits);
     }
 
     /// <summary>Records the solve's tape node (four inputs).</summary>

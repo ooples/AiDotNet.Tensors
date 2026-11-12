@@ -66,13 +66,25 @@ fn nrec_fritsch_carlson(@builtin(global_invocation_id) gidv: vec3<u32>) {
             mo[o + i] = 0.0;
             mo[o + i + 1] = 0.0;
         } else {
-            let a = mo[o + i] / d;
-            let c = mo[o + i + 1] / d;
-            let sum = a * a + c * c;
-            if (sum > 9.0) {
-                let tau = 3.0 / sqrt(sum);
-                mo[o + i] = tau * (a * d);
-                mo[o + i + 1] = tau * (c * d);
+            // Slope space, as CpuEngine.FritschCarlsonHost: no a = m / d or a^2 + b^2 that overflows for finite inputs.
+            let m0 = mo[o + i];
+            let m1 = mo[o + i + 1];
+            var ad = d;
+            if (d < 0.0) { ad = -d; }
+            var a0 = m0;
+            if (m0 < 0.0) { a0 = -m0; }
+            var a1 = m1;
+            if (m1 < 0.0) { a1 = -m1; }
+            var s = a1;
+            if (a0 > a1) { s = a0; }
+            if (s > 0.0) {
+                let u0 = m0 / s;
+                let u1 = m1 / s;
+                let k = 3.0 / sqrt(u0 * u0 + u1 * u1);
+                if (s / ad > k) {
+                    mo[o + i] = u0 * k * ad;
+                    mo[o + i + 1] = u1 * k * ad;
+                }
             }
         }
     }
