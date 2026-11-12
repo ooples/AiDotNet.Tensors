@@ -208,6 +208,28 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 ReapCompletedResources();
         }
 
+        /// <summary>
+        /// Waits for every retired memory object's completion marker and releases its allocation. An explicit cache
+        /// release calls this: a buffer the pool drained while queued work still used it is retired behind a marker, and
+        /// without the wait its memory stays reserved after the release reports it freed.
+        /// </summary>
+        internal void WaitAndReleaseRetiredMemory()
+        {
+            lock (_retirementLock)
+            {
+                if (_retiredMemoryObjects.Count == 0) return;
+                var events = new IntPtr[_retiredMemoryObjects.Count];
+                for (int i = 0; i < events.Length; i++) events[i] = _retiredMemoryObjects[i].CompletionEvent;
+                OpenClNativeBindings.WaitForEvents((uint)events.Length, events);
+                foreach (var retired in _retiredMemoryObjects)
+                {
+                    OpenClNativeBindings.ReleaseEvent(retired.CompletionEvent);
+                    ReleaseMemoryObject(retired.MemoryObject, retired.ByteSize);
+                }
+                _retiredMemoryObjects.Clear();
+            }
+        }
+
         /// <summary>Reclaims event-fenced memory and host pins whose commands completed, without blocking.</summary>
         internal void ReapCompletedResources()
         {
