@@ -8731,6 +8731,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!isRecording && !tensor.IsGpuResident && !tensor.HasPendingGpuData && !IsDeviceAuthoritative(tensor)) return false;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
+        // The kernel writes the tensor's device buffer in place, and a copy-on-write peer (CloneShared) shares that
+        // buffer and its pending download: privatize first, as GpuOptimizer does before its in-place device update.
+        // The detach downloads the pending device values before copying, and drops the shared binding. While recording,
+        // the buffer is not computed yet and a detach cannot read it, so a shared tensor takes the eager path.
+        if (tensor.HasPendingCopyOnWritePeer)
+        {
+            if (isRecording) return false;
+            tensor.EnsureOwnedForDeviceWrite();
+        }
         // Read the optional backing WITHOUT materializing. Zero-allocation deferred tensors have no
         // host array yet and are cached by DataVector; rejecting them here would force an in-place
         // activation to read a not-yet-executed result during graph recording.
@@ -15071,15 +15080,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (key is null)
             return;
 
-        _pendingPersistentRoles.Remove(key);
+        // The device copy may be the only current one (an optimizer stepped it on the device): bring it to the host
+        // before any cleanup. A failed download propagates with the pending record, binding and buffer intact, so the
+        // tensor still reports its host values as invalid instead of serving the pre-update ones as current.
         if (Helpers.HostSync.IsPending(key))
-        {
-            try { Helpers.HostSync.TryMaterialize(key); }
-            catch (Exception) { Helpers.HostSync.Remove(key); }
-        }
+            Helpers.HostSync.TryMaterialize(key);
+        _pendingPersistentRoles.Remove(key);
         tensor._gpuBuffer = null;
         tensor._gpuBackend = null;
         tensor._gpuBufferVersion = -1;
+        // The host now holds the only copy: a GPU device with no attached buffer would report IsGpuResident while
+        // Buffer throws (InvalidateResidentWeightBuffer clears the device the same way).
+        tensor.Device = TensorDevice.CPU;
         lock (_persistentBufferLock)
         {
             if (_persistentBufferCache.TryRemove(key, out var entry))
