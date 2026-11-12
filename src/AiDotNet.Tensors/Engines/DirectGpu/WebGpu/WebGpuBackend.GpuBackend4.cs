@@ -675,6 +675,8 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
         int batch, int n, bool inverse)
     {
         if (batch <= 0) return;
+        if (n >= 1)
+            PortableGenericFft.ValidateBatchedExtent(inputReal, inputImag, outputReal, outputImag, batch, n);
 
         // Single-launch on-chip path when a row fits in the guaranteed 16 KB workgroup storage (n <= 2048)
         // and input/output buffers do not alias (WebGPU forbids read + read_write aliasing in one bind group).

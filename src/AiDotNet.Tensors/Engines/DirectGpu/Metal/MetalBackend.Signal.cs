@@ -87,9 +87,21 @@ public sealed partial class MetalBackend
         if (ReferenceEquals(outputReal, outputImag))
             throw new ArgumentException("Real and imaginary FFT outputs must use distinct buffers.");
         if (batch <= 0) return;
+        PortableGenericFft.ValidateBatchedExtent(inputReal, inputImag, outputReal, outputImag, batch, n);
 
         if (n == 1)
         {
+            // A length-1 transform is the identity. When the outputs cross-alias the inputs (real out is imaginary in,
+            // or the reverse), the first copy would overwrite an input the second still reads, so stage one first.
+            bool crossAliased = ReferenceEquals(outputReal, inputImag) || ReferenceEquals(outputImag, inputReal);
+            if (crossAliased)
+            {
+                using var stagedImag = AllocateBuffer(batch);
+                Copy(inputImag, stagedImag, batch);
+                if (!ReferenceEquals(inputReal, outputReal)) Copy(inputReal, outputReal, batch);
+                Copy(stagedImag, outputImag, batch);
+                return;
+            }
             if (!ReferenceEquals(inputReal, outputReal)) Copy(inputReal, outputReal, batch);
             if (!ReferenceEquals(inputImag, outputImag)) Copy(inputImag, outputImag, batch);
             return;
