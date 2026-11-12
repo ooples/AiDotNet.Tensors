@@ -93,6 +93,11 @@ public partial class CpuEngine
         var outputSize = (int[])savedState[3];
         var spatial = (int[])savedState[4];
         var argmax = (int[])savedState[5];
+        if (BackwardFunctions<T>.CreatesGraph)
+        {
+            WindowPoolBackwardRecorded(gradOutput, inputs[0], mode, power, window, outputSize, spatial, argmax, engine, grads);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0].IsContiguous ? inputs[0] : inputs[0].Contiguous();
         var xs = x.AsSpan().ToArray().Select(v => ops.ToDouble(v)).ToArray();
@@ -120,6 +125,53 @@ public partial class CpuEngine
                 }
             }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], FromDoubles<T>((int[])x._shape.Clone(), i => dx[i]), engine);
+    }
+
+    // The create-graph backward of a window pool, differentiable again: a max pool's gradient is the recorded scatter to
+    // its winners (the gather as adjoint), an average pool's the recorded window-average map's adjoint, and an Lp pool's
+    // comes from differentiating (Σ_window xᵖ)^{1/p} built from recorded ops.
+    private static void WindowPoolBackwardRecorded<T>(Tensor<T> gradOutput, Tensor<T> x, WindowReduce mode, double power,
+        Func<int, int, int, PoolWindow> window, int[] outputSize, int[] spatial, int[] argmax, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        int dims = outputSize.Length, planeSize = spatial.Aggregate(1, (a, b) => a * b), outPlane = outputSize.Aggregate(1, (a, b) => a * b);
+        if (mode == WindowReduce.Max)
+        {
+            BackwardFunctions<T>.TrySelectionBackward("WindowPoolBackward", gradOutput, x,
+                BackwardFunctions<T>.PlaneIndicesToGlobal(argmax, outPlane, planeSize), engine, grads);
+            return;
+        }
+        int planes = x.Length / planeSize;
+        var taps = new int[planes * outPlane][];
+        var weight = new double[taps.Length];
+        var list = new List<int>();
+        var position = new int[dims];
+        for (int plane = 0; plane < planes; plane++)
+            for (int o = 0; o < outPlane; o++)
+            {
+                for (int d = dims - 1, rest = o; d >= 0; d--) { position[d] = rest % outputSize[d]; rest /= outputSize[d]; }
+                list.Clear();
+                CollectTaps(plane, 0, 0, position, spatial, window, list);
+                int k = plane * outPlane + o;
+                taps[k] = list.Select(t => plane * planeSize + t).ToArray();
+                weight[k] = mode == WindowReduce.Average ? (list.Count == 0 ? 0 : 1.0 / list.Count) : 1.0;
+            }
+        var outShape = (int[])gradOutput._shape.Clone();
+        if (mode == WindowReduce.Average)
+        {
+            // The average is linear: the gradient is its adjoint applied to the upstream gradient, recorded with the
+            // average itself as that adjoint's adjoint.
+            var inputShape = (int[])x._shape.Clone();
+            var grad = BackwardFunctions<T>.RecordedLinearMap("WindowPoolBackward", gradOutput,
+                g => BackwardFunctions<T>.WindowSumTranspose(g, taps, weight, inputShape),
+                w => BackwardFunctions<T>.WindowSumApply(w, taps, weight, outShape));
+            DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
+            return;
+        }
+        var ops = MathHelper.GetNumericOperations<T>();
+        BackwardFunctions<T>.TryCompositeBackward(gradOutput, new[] { x }, engine, grads, e =>
+            e.TensorPower(BackwardFunctions<T>.RecordedWindowSum("WindowPowerSum", e.TensorPower(x, ops.FromDouble(power)), taps, weight, outShape),
+                ops.FromDouble(1 / power)));
     }
 
     // Adaptive windows: output o covers [⌊o·I/O⌋, ⌈(o+1)·I/O⌉).

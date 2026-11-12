@@ -968,8 +968,15 @@ namespace AiDotNet.Tensors.Engines.Simd
                     Avx.Store(output + i, Avx.Min(vHi, Avx.Max(vLo, Avx.LoadVector256(input + i))));
             }
 #endif
+            // The tail computes exactly what the vector body does: MAXPS(lo, x) is lo > x ? lo : x and MINPS(hi, c) is
+            // hi < c ? hi : c. MathF.Max/Min order -0 below +0, so clamp(-0, 0, 0) gave +0 in the tail but -0 in the
+            // body: the sign of a clamped zero depended on the element's position.
             for (; i < length; i++)
-                output[i] = MathF.Min(MathF.Max(input[i], lo), hi);
+            {
+                float x = input[i];
+                float c = lo > x ? lo : x;
+                output[i] = hi < c ? hi : c;
+            }
         }
 
         /// <summary>
@@ -1386,8 +1393,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             // The vector lanes' comparisons, not MathF.Sign: that throws on NaN, which the lanes map to 0.
             for (; i < length; i++)
             {
-                float v = input[i];
-                output[i] = v > 0f ? 1f : (v < 0f ? -1f : 0f);
+                // What the vector body computes: 1 above zero, -1 below, +0 otherwise. MathF.Sign threw on NaN, so a NaN
+                // in the last (length % 8) elements threw where one in the body gave 0.
+                float x = input[i];
+                output[i] = x > 0f ? 1f : (x < 0f ? -1f : 0f);
             }
         }
 
@@ -4727,11 +4736,13 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             if (Avx.IsSupported && length >= 8)
             {
-                var vzero = Vector256<float>.Zero;
+                // IEEE negate, the sign bit flipped, as the scalar tail does. 0 - x gave +0 for +0, so the sign of a negated
+                // zero depended on whether the element fell in the vector body or the tail.
+                var signMask = Vector256.Create(-0.0f);
                 int simdLength = length & ~7;
                 for (; i < simdLength; i += 8)
                 {
-                    WriteVector256(output, i, Avx.Subtract(vzero, ReadVector256(input, i)));
+                    WriteVector256(output, i, Avx.Xor(ReadVector256(input, i), signMask));
                 }
             }
 
@@ -4757,11 +4768,11 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             if (Avx.IsSupported && length >= 4)
             {
-                var vzero = Vector256<double>.Zero;
+                var signMask = Vector256.Create(-0.0); // IEEE negate, as the float overload
                 int simdLength = length & ~3;
                 for (; i < simdLength; i += 4)
                 {
-                    WriteVector256Double(output, i, Avx.Subtract(vzero, ReadVector256Double(input, i)));
+                    WriteVector256Double(output, i, Avx.Xor(ReadVector256Double(input, i), signMask));
                 }
             }
 

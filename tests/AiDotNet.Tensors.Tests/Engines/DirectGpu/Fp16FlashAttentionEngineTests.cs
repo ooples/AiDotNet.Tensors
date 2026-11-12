@@ -43,6 +43,9 @@ public sealed class Fp16FlashAttentionEngineTests
     public void WithoutTheOptIn_Fp16AutocastTakesTheFlashKernel_AndFp32StaysExact(bool autocast)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        // The engine only picks CudaBackend when the driver AND NVRTC are present (CudaBackend.IsCudaAvailable); with the
+        // driver alone it falls back to OpenCL, which is a missing capability here, not a failure.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         bool? previous = DirectPtxFeatureGate.TestOverride;
         DirectPtxFeatureGate.TestOverride = false;
         try
@@ -97,6 +100,9 @@ public sealed class Fp16FlashAttentionEngineTests
     public void FlashAttention_LongOrWideShapes_RunTheFlashKernel_AndMatchTheCpu(int b, int h, int s, int d, bool causal)
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        // The engine only picks CudaBackend when the driver AND NVRTC are present (CudaBackend.IsCudaAvailable); with the
+        // driver alone it falls back to OpenCL, which is a missing capability here, not a failure.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         bool? previous = DirectPtxFeatureGate.TestOverride;
         DirectPtxFeatureGate.TestOverride = true;
         try

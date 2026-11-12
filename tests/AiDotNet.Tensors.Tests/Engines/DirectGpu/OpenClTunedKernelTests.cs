@@ -330,7 +330,7 @@ public sealed class OpenClTunedKernelTests
     [SkippableFact]
     public void Tuning_ReadbacksAreAttributedToTheRegistry_NotTheOp()
     {
-        var backend = RequireBackend();
+        using var backend = RequireBackend();
         TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
         bool previousPersist = TunedKernelPolicy.PersistDecisions;
         double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
@@ -419,7 +419,7 @@ public sealed class OpenClTunedKernelTests
     [SkippableFact]
     public void Conv2DForward_EveryCandidate_MatchesCpu()
     {
-        var backend = RequireBackend();
+        using var backend = RequireBackend();
         foreach (var (bt, c, h, w, o, k, s, p, d) in ConvShapes)
         {
             int oh = (h + 2 * p - d * (k - 1) - 1) / s + 1, ow = (w + 2 * p - d * (k - 1) - 1) / s + 1;

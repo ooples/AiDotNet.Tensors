@@ -94,7 +94,7 @@ internal static class LinalgBackward
             var X = output;
 
             if (typeof(T) == typeof(float) && B.Rank == A.Rank - 1 &&
-                AiDotNetEngine.Current is DirectGpuTensorEngine directGpu)
+                AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var directGpu))
             {
                 var (directGradA, directGradB) = directGpu.TryGpuSolveBackwardVector(
                     (Tensor<float>)(object)A, (Tensor<float>)(object)X,
@@ -162,7 +162,7 @@ internal static class LinalgBackward
             var gradL = upper ? Transpose(gradOutput) : gradOutput;
 
             if (!upper && typeof(T) == typeof(float) &&
-                AiDotNetEngine.Current is DirectGpuTensorEngine directGpu)
+                AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var directGpu))
             {
                 Tensor<float>? direct = directGpu.TryGpuCholeskyBackwardLower(
                     (Tensor<float>)(object)L, (Tensor<float>)(object)gradL);

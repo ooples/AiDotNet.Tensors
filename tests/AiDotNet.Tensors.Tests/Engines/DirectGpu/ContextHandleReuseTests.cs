@@ -21,7 +21,11 @@ public class ContextHandleReuseTests
     {
         DirectGpuTensorEngine? gpu = null;
         try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.IfNot(gpu is not null && gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "CUDA backend did not resolve.");
+        if (!(gpu is not null && gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend))
+        {
+            gpu?.Dispose();
+            Skip.If(true, "CUDA backend did not resolve.");
+        }
         using (gpu)
         {
             var cuda = (CudaBackend)gpu!.GetBackend()!;

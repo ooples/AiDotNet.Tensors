@@ -454,6 +454,23 @@ public partial class CpuEngine
         var lo = (int[])savedState[0];
         var hi = (int[])savedState[1];
         var weight = (double[])savedState[2];
+        if (BackwardFunctions<T>.CreatesGraph)
+        {
+            // The same blend of the two order statistics as a recorded sparse map (differentiable in the upstream
+            // gradient; the order statistics are fixed, so there is no second derivative in the input).
+            var to = new List<int>(2 * lo.Length);
+            var from = new List<int>(2 * lo.Length);
+            var coef = new List<double>(2 * lo.Length);
+            for (int k = 0; k < lo.Length; k++)
+            {
+                if (lo[k] < 0) continue;
+                to.Add(lo[k]); from.Add(k); coef.Add(1 - weight[k]);
+                to.Add(hi[k]); from.Add(k); coef.Add(weight[k]);
+            }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], BackwardFunctions<T>.SparseMap(gradOutput,
+                (int[])inputs[0]._shape.Clone(), to.ToArray(), from.ToArray(), coef.ToArray()), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var dy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
         using var gLease = dy.Lease();

@@ -18,7 +18,7 @@ public class IGpuMixedPrecisionConvBackendTests
     [Fact]
     public void CudaBackend_ImplementsMixedPrecisionConvInterface_WhenAvailable()
     {
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
         if (backend is null)
             return; // CPU-only host — interface unreachable
@@ -48,7 +48,7 @@ public class IGpuMixedPrecisionConvBackendTests
     [Fact]
     public void Conv2DMixed_NullBuffer_Throws()
     {
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
         if (backend is not IGpuMixedPrecisionConvBackend mp || !mp.SupportsHalfConv)
             return;
@@ -69,7 +69,7 @@ public class IGpuMixedPrecisionConvBackendTests
     [Fact]
     public void BFloat16Conv_OnPreAmpereHost_RejectsWithClearMessage()
     {
-        var engine = new DirectGpuTensorEngine();
+        using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
         if (backend is not IGpuMixedPrecisionConvBackend mp || !mp.SupportsHalfConv)
             return;

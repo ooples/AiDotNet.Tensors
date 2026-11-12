@@ -32,5 +32,19 @@ namespace System.Diagnostics.CodeAnalysis
         /// <summary>Gets the return value condition.</summary>
         public bool ReturnValue { get; }
     }
+
+    /// <summary>
+    /// Specifies that the return value is not null when the named parameter is not null.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Parameter | AttributeTargets.Property | AttributeTargets.ReturnValue,
+        AllowMultiple = true, Inherited = false)]
+    internal sealed class NotNullIfNotNullAttribute : Attribute
+    {
+        /// <summary>Initializes the attribute with the associated parameter name.</summary>
+        public NotNullIfNotNullAttribute(string parameterName) => ParameterName = parameterName;
+
+        /// <summary>Gets the associated parameter name.</summary>
+        public string ParameterName { get; }
+    }
 }
 #endif

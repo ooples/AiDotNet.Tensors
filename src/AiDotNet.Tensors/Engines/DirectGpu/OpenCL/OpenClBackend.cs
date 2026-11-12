@@ -1086,6 +1086,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     System.Diagnostics.Debug.WriteLine($"OpenCL torch parity elementwise compilation failed: {ex.Message}");
                 }
 
+                // Model-level ops (CpuEngine.TorchModelOps), translated from the shared dialect source. Strict math: the
+                // CRF's log-sum-exp meets -inf (masked transitions) and the kernels test NaN, which the relaxed flags
+                // (-cl-finite-math-only) let the compiler assume away. Optional, committed together, like the parity module.
+                try
+                {
+                    var modelOpsProgram = CompileOrLoadCached(TorchModelOpsTranslation.OpenCl, OpenClBuildOptions.StrictMathFlags, "Torch model-op kernels");
+                    var built = new System.Collections.Generic.List<(string, DirectOpenClKernel)>();
+                    foreach (var name in TorchModelOpsKernels.KernelNames)
+                        built.Add((name, new DirectOpenClKernel(_context, modelOpsProgram, name)));
+                    _programs.Add(modelOpsProgram);
+                    foreach (var (name, kernel) in built) _kernelCache[name] = kernel;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"OpenCL torch model-op compilation failed: {ex.Message}");
+                }
+
                 // Compile Vision-Detection kernels (Issue #217). Optional —
                 // same fallback pattern as Parity-210: on compile failure
                 // the kernels are simply absent from _kernelCache, the

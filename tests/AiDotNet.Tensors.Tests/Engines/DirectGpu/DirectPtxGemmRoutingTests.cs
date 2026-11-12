@@ -33,6 +33,12 @@ public sealed class DirectPtxGemmRoutingTests
             backend.Dispose();
             Skip.If(true, "Needs a CUDA device of compute capability 8.0 or newer.");
         }
+        if (!backend.IsCublasAvailable)
+        {
+            // The route is pinned against cuBLAS; without it the dispatcher correctly falls back to generated kernels.
+            backend.Dispose();
+            Skip.If(true, "cuBLAS could not be loaded (cublas64 or its cublasLt dependency is missing).");
+        }
         backend.DeclaredKernelsSwitch = false;
         return backend;
     }

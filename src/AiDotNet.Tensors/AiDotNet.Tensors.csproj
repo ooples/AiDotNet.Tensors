@@ -45,6 +45,12 @@
     <!-- Element-wise gate (TENS0010-TENS0012): ElementWiseRecord=true leaves the inventory out so every occurrence is
          reported; scripts/Update-ElementWiseBaseline.ps1 rewrites it from that build's SARIF log. -->
     <AdditionalFiles Include="ElementWiseBaseline.txt" Condition="'$(ElementWiseRecord)' != 'true' And Exists('ElementWiseBaseline.txt')" />
+    <!-- Engine type-test gate (TENS0020, warning, so an error under TreatWarningsAsErrors): type tests of an IEngine
+         (is/as/casts/patterns/GetType comparisons) go through EngineWrapperExtensions so a wrapper engine such as the
+         tracing engine, installed as AiDotNetEngine.Current, does not take the wrong branch. No baseline. -->
+    <!-- AutogradFunction gate (TENS0030, warning): a concrete AutogradFunction<T> subclass must override one of the two
+         Backward overloads, which default to each other and would otherwise throw NotImplementedException at run time. -->
+
   </ItemGroup>
 
   <!-- Public API contract (#1574): PublicAPI.Shipped.txt is the API of the last release, PublicAPI.Unshipped.txt what

@@ -16,6 +16,9 @@ public sealed partial class MetalBackend
         private readonly byte[] _host;
         private MetalGpuBuffer? _landing;
         private IntPtr _commandBuffer;
+        // The buffer the queued blit reads. Marked as read by the device until the blit completes, so disposing it in the
+        // meantime releases it (the command buffer retains it) instead of pooling memory the next rent would clear.
+        private MetalGpuBuffer? _source;
         private int _bytes;
         private bool _queued;
         private bool _unread;
@@ -55,7 +58,9 @@ public sealed partial class MetalBackend
             MetalCommandQueue.CopyBuffer(blit, buffer.Handle, (ulong)buffer.ByteOffset, landing.Handle,
                 (ulong)landing.ByteOffset, (ulong)byteCount);
             MetalCommandQueue.EndEncoding(blit);
+            buffer.BeginDeviceRead();
             MetalCommandQueue.Commit(commandBuffer);
+            _source = buffer;
             _commandBuffer = commandBuffer;
             _bytes = byteCount;
             _queued = true;
@@ -86,6 +91,8 @@ public sealed partial class MetalBackend
             }
             finally
             {
+                _source?.EndDeviceRead();
+                _source = null;
                 _backend._commandQueue.ReturnCommandBuffer(commandBuffer);
             }
         }

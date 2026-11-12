@@ -694,6 +694,11 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "TensorLinearSumAssignment(Tensor<T>)",
         // Class-index gather (CE/NLL core): GPU-vs-CPU forward + gradient parity and residency in ClassGatherTests.
         "TensorGatherClassValues(Tensor<T>,Tensor<T>)",
+        // Model-level ops with per-argument shapes (CRF emissions [B,S,K] + transitions [K,K] + scores [K]; hyperbolic
+        // linear input [.., in] + weights [out, in] + bias [out]): GPU-vs-CPU forward, every input's tape gradient and
+        // device residency on CUDA, OpenCL and Vulkan in TorchModelOpsGpuTests, plus their OpParityRegistry cases.
+        "TensorCrfForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        "TensorHyperbolicLinear(Tensor<T>,Tensor<T>,Tensor<T>,Double)",
         // Head-interleaved attention core (composed on the GPU): MultiHeadAttentionCoreGpuTests, forward + gradients.
         "MultiHeadAttentionCore(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Nullable<Double>,Boolean)",
         // Deformable / depthwise / locally-connected conv, 3D / transposed fused conv, FlashAttention

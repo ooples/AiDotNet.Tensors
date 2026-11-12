@@ -33,7 +33,7 @@ internal sealed class MseLossFusionPattern : IFusionPattern
     {
         fused = null;
         if (nodes[index] is not LazyNode<float> { OpType: LazyNodeType.Subtract } sub
-            || sub.RecordingEngine is not DirectGpuTensorEngine || sub.Input1 is null
+            || !sub.RecordingEngine.Is<DirectGpuTensorEngine>() || sub.Input1 is null
             || !PatternHelpers.SameShape(sub.Input0, sub.Input1))
             return false;
         // The square: Multiply(d, d), the difference's only consumer (it is listed once per input slot).
@@ -56,7 +56,7 @@ internal sealed class MseLossFusionPattern : IFusionPattern
         var node = new LazyNode<float>(LazyNodeType.Custom, "FusedMseLoss", new[] { predictions, targets }, mean.Output,
             (eng, result) =>
             {
-                Tensor<float>? loss = eng is DirectGpuTensorEngine gpu ? gpu.TryFusedMseLoss(predictions, targets, outputShape) : null;
+                Tensor<float>? loss = eng.TryGet<DirectGpuTensorEngine>(out var gpu) ? gpu.TryFusedMseLoss(predictions, targets, outputShape) : null;
                 if (loss is null)
                 {
                     var diff = eng.TensorSubtract(predictions, targets);

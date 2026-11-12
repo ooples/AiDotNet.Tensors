@@ -210,6 +210,9 @@ public partial class CpuEngine
         Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var xTensor = inputs[0];
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.CreatesGraph && ComplexDiagonalSsmScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads))
+            return;
         int batch = xTensor.Shape[0];
         int time = xTensor.Shape[1];
         int groups = xTensor.Shape[2];
@@ -232,6 +235,50 @@ public partial class CpuEngine
 
         for (int i = 0; i < gradients.Length; i++)
             DifferentiableOps.AccumulateGrad(grads, inputs[i], gradients[i], engine);
+    }
+
+    // The create-graph path of ComplexDiagonalSsmScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ComplexDiagonalSsmScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => ComplexDiagonalSsmComposite(e, inputs));
+
+    // The complex diagonal scan as recorded ops (the create-graph backward differentiates it):
+    // h_t = A ⊙ h_{t-1} + B x_t (complex A, B; real x),  y_t = skip ⊙ x_t + Re(C h_t).
+    private static Tensor<T> ComplexDiagonalSsmComposite<T>(IEngine e, Tensor<T>[] p)
+    {
+        var x = p[0];
+        int batch = x.Shape[0], time = x.Shape[1], groups = x.Shape[2], width = x.Shape[3], state = p[1].Shape[1];
+        var ar = RecordedOps<T>.R(e, p[1], 1, groups, state);
+        var ai = RecordedOps<T>.R(e, p[2], 1, groups, state);
+        var br = RecordedOps<T>.R(e, p[3], 1, groups, state, width);
+        var bi = RecordedOps<T>.R(e, p[4], 1, groups, state, width);
+        var cr = RecordedOps<T>.R(e, p[5], 1, groups, width, state);
+        var ci = RecordedOps<T>.R(e, p[6], 1, groups, width, state);
+        var d = RecordedOps<T>.R(e, p[7], 1, groups, width);
+        Tensor<T> hr = RecordedOps<T>.Zeros(batch, groups, state);
+        Tensor<T> hi = RecordedOps<T>.Zeros(batch, groups, state);
+        var ys = new List<Tensor<T>>(time);
+        for (int t = 0; t < time; t++)
+        {
+            var xt = RecordedOps<T>.At(e, x, 1, t);                                     // [B, G, W]
+            var x4 = RecordedOps<T>.R(e, xt, batch, groups, 1, width);
+            var bxr = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, br, x4), 3, keep: false);
+            var bxi = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, bi, x4), 3, keep: false);
+            var nr = RecordedOps<T>.Add(e, RecordedOps<T>.Sub(e, RecordedOps<T>.Mul(e, ar, hr), RecordedOps<T>.Mul(e, ai, hi)), bxr);
+            var ni = RecordedOps<T>.Add(e, RecordedOps<T>.Add(e, RecordedOps<T>.Mul(e, ar, hi), RecordedOps<T>.Mul(e, ai, hr)), bxi);
+            hr = nr;
+            hi = ni;
+            var hr4 = RecordedOps<T>.R(e, hr, batch, groups, 1, state);
+            var hi4 = RecordedOps<T>.R(e, hi, batch, groups, 1, state);
+            var readout = RecordedOps<T>.Sum(e,
+                RecordedOps<T>.Sub(e, RecordedOps<T>.Mul(e, cr, hr4), RecordedOps<T>.Mul(e, ci, hi4)), 3, keep: false);
+            ys.Add(RecordedOps<T>.Add(e, RecordedOps<T>.Mul(e, d, xt), readout));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 
     private static void ComplexDiagonalSsmScanBackwardCore<T>(

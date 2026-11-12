@@ -111,6 +111,53 @@ internal static class HeadToHeadNetworkHarness
     internal static string PythonExecutable
         => Environment.GetEnvironmentVariable("PARITY_PYTHON") is { Length: > 0 } configured ? configured : "python";
 
+    private static readonly Lazy<string?> TorchProbe = new(ProbeTorch);
+
+    /// <summary>
+    /// Why <see cref="PythonExecutable"/> cannot run the PyTorch references here, or null when it imports torch. Probed
+    /// once per process with <c>python -c "import torch"</c>. Only a missing capability is a reason: no interpreter on
+    /// PATH, the Windows Store app-execution alias standing in for one (it exits 9009 with "Python was not found"),
+    /// or an interpreter without torch. Any other failure of the probe returns null, so the test runs and reports the
+    /// real error instead of skipping it.
+    /// </summary>
+    internal static string? TorchUnavailableReason => TorchProbe.Value;
+
+    private static string? ProbeTorch()
+    {
+        var psi = new ProcessStartInfo(PythonExecutable)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("import torch");
+        Process? process;
+        try { process = Process.Start(psi); }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return $"'{PythonExecutable}' is not on PATH; set PARITY_PYTHON to a Python with torch installed.";
+        }
+        if (process is null) return null;
+        using (process)
+        {
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(120_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+                return null;
+            }
+            string output = stderrTask.GetAwaiter().GetResult() + stdoutTask.GetAwaiter().GetResult();
+            if (process.ExitCode == 0) return null;
+            if (process.ExitCode == 9009 || output.Contains("Python was not found", StringComparison.Ordinal))
+                return $"'{PythonExecutable}' is the Windows Store app-execution alias, not an interpreter; set PARITY_PYTHON to a Python with torch installed.";
+            if (output.Contains("No module named 'torch'", StringComparison.Ordinal))
+                return $"torch is not installed for '{PythonExecutable}'; set PARITY_PYTHON to a Python with torch installed.";
+            return null;
+        }
+    }
+
     /// <summary>A coarse identity for comparing ratios: only numbers from the same machine class compare.</summary>
     /// <summary>
     /// Ratios are only comparable on like hardware, so baselines are keyed by machine class, including the CPU
@@ -191,6 +238,7 @@ internal static class HeadToHeadNetworkHarness
     internal static (CaseResult? Result, Deferral? Deferred) Run(string root, string network, string device)
     {
         if (device != "cpu" && device != "cuda") throw new ArgumentException($"Unknown device '{device}'.", nameof(device));
+        if (TorchUnavailableReason is { } noTorch) return (null, new Deferral(noTorch));
         DirectGpuTensorEngine? gpu = null;
         if (device == "cuda")
         {

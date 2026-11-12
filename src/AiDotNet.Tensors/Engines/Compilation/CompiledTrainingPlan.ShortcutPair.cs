@@ -102,7 +102,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             bool hasMain = gradMap.TryGetValue(main.OutputBuffer, out var gradMain);
             bool hasShortcut = gradMap.TryGetValue(shortcut.OutputBuffer, out var gradShortcut);
             Tensor<float>? gradH = null;
-            if (hasMain && hasShortcut && eng is IConvShortcutPairEngine gpu && (relevance ?? requiresGrad).Contains(h))
+            if (hasMain && hasShortcut && eng.TryGet<IConvShortcutPairEngine>(out var gpu) && (relevance ?? requiresGrad).Contains(h))
                 gradH = gpu.TryConv2DBackwardInputShortcutPair((Tensor<float>)(object)gradMain!, (Tensor<float>)(object)main.Inputs[1],
                     (Tensor<float>)(object)gradShortcut!, (Tensor<float>)(object)shortcut.Inputs[1], h._shape);
             if (gradH is null)

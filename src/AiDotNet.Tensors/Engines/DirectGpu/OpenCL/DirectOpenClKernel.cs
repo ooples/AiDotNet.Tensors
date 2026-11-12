@@ -27,6 +27,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _kernel = OpenClNativeBindings.CreateKernel(program.Handle, kernelName, out int err);
             if (err != OpenClNativeBindings.CL_SUCCESS || _kernel == IntPtr.Zero)
                 throw new InvalidOperationException($"Failed to create OpenCL kernel '{kernelName}': {err}");
+            context.TrackNative(_kernel, OpenClChildKind.Kernel);
         }
 
         // ── Thread-safety: a cl_kernel object is SHARED (cached per name) across all
@@ -774,7 +775,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (_kernel != IntPtr.Zero)
             {
-                OpenClNativeBindings.ReleaseKernel(_kernel);
+                if (_context.ClaimNative(_kernel)) OpenClNativeBindings.ReleaseKernel(_kernel);
                 _kernel = IntPtr.Zero;
             }
 

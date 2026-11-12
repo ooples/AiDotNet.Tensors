@@ -419,6 +419,9 @@ public partial class CpuEngine
         var bias = computeReadout && inputs.Length > 2 ? inputs[2] : (Tensor<T>)savedState[3];
         var ids = (int[])savedState[0];
         int vocab = (int)savedState[1];
+        if (computeReadout && inputs.Length > 2
+            && BackwardFunctions<T>.TrySecondOrderFusedLinearCrossEntropy(gradOutput, inputs, engine, grads, ids)) return;
+
         ValidateDetachedReadoutVersions(weight, bias, savedState);
 
         bool needHidden = DifferentiableOps.IsGradientRequired(hidden);
@@ -427,7 +430,7 @@ public partial class CpuEngine
         if (!needHidden && !needWeight && !needBias)
             return;
 
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
                 gradOutput, hidden, weight, bias, ids, null, needHidden, needWeight, needBias,
                 out var deviceHidden, out var deviceWeight, out var deviceBias))
         {
@@ -1053,6 +1056,7 @@ public partial class CpuEngine
         var weight = inputs[1];
         var bias = inputs[2];
         var target = inputs[3];
+        if (BackwardFunctions<T>.TrySecondOrderFusedLinearCrossEntropy(gradOutput, inputs, engine, grads, null)) return;
 
         bool needHidden = DifferentiableOps.IsGradientRequired(hidden);
         bool needWeight = DifferentiableOps.IsGradientRequired(weight);
@@ -1060,7 +1064,7 @@ public partial class CpuEngine
         if (!needHidden && !needWeight && !needBias)
             return;
 
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
                 gradOutput, hidden, weight, bias, null, target, needHidden, needWeight, needBias,
                 out var deviceHidden, out var deviceWeight, out var deviceBias))
         {
@@ -1204,7 +1208,7 @@ public static class FusedLinearCrossEntropyEngineExtensions
         bool computeReadoutGrads)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads);
         if (computeReadoutGrads)
             return engine.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);

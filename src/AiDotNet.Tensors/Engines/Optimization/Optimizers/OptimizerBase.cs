@@ -131,7 +131,7 @@ public abstract class OptimizerBase : IOptimizer
         if (gradient.Length != tensor.Length)
             throw new ArgumentException(
                 $"A gradient has {gradient.Length} elements but its parameter has {tensor.Length}.", "gradients");
-        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine engine)) return false;
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var engine)) return false;
         // The kernels descend; ascent descends the negated gradient (a new device tensor, the caller's is untouched).
         if (group.GetOption("maximize", 0.0) != 0.0) gradient = engine.TensorNegate(gradient);
         return TryStepOnDevice(gi, pi, tensor, gradient);

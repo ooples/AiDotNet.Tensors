@@ -54,7 +54,6 @@ void main() {
             }
             break;
         }
-        case 1u: y = abs(x); break;
         case 2u: y = exp(x); break;
         case 3u: y = exp2(x); break;
         case 4u: y = pow(10.0, x); break;
@@ -92,7 +91,6 @@ void main() {
             }
             break; }
         case 9u: y = sqrt(x); break;
-        case 10u: y = sign(x); break;
         case 11u: y = 0.5*x*(1.0+tanh(clamp(0.7978845608*(x+0.044715*x*x*x), -10.0, 10.0))); break;
         case 12u: y = sin(x); break;
         case 13u: y = cos(x); break;
@@ -107,7 +105,6 @@ void main() {
         case 22u: y = atanh(x); break;
         case 23u: y = 1.0 / x; break;
         case 24u: y = sign(x) * pow(abs(x), 0.3333333333333333); break;
-        case 26u: y = -x; break;
         case 27u: y = floor(x); break;
         case 28u: y = ceil(x); break;
         case 29u: y = roundEven(x); break;
@@ -120,7 +117,6 @@ void main() {
         case 36u: y = x <= -3.0 ? 0.0 : (x >= 3.0 ? x : x * (x + 3.0) / 6.0); break;
         case 37u: y = v1 * (x >= 0.0 ? x : v0 * (exp(x) - 1.0)); break;
         case 38u: y = clamp(x / 6.0 + 0.5, 0.0, 1.0); break;
-        case 39u: y = ((floatBitsToUint(x) & F32_ABS_MASK) > F32_POS_INF_BITS) ? x : clamp(x, v0, v1); break;   // torch.clamp propagates NaN (bit test: isnan may be folded)
         case 40u: {
             uint xb = floatBitsToUint(x), vb = p0;
             uint xa = xb & 0x7FFFFFFFu, va = vb & 0x7FFFFFFFu;
@@ -167,8 +163,6 @@ void main() {
     float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1);
     float z = 0.0;
     switch (op) {
-        case 0u: z = min(x, y); break;
-        case 1u: z = max(x, y); break;
         case 2u: z = x * (y >= 0.0 ? 1.0 : v0); break;
         case 3u: z = y > 0.0 ? x : 0.0; break;
         case 4u: z = x * y * (1.0 - y); break;
@@ -178,8 +172,6 @@ void main() {
         case 8u: z = x * v1 * (y >= 0.0 ? 1.0 : v0 * exp(y)); break;
         case 9u: z = x * (y > -3.0 && y < 3.0 ? 0.1666666666666667 : 0.0); break;
         case 10u: z = y > v0 && y < v1 ? x : 0.0; break;
-        case 11u: z = x > y ? 1.0 : 0.0; break;
-        case 12u: z = x < y ? 1.0 : 0.0; break;
         case 13u: {
             uint xb = floatBitsToUint(x), yb = floatBitsToUint(y);
             uint xa = xb & 0x7FFFFFFFu, ya = yb & 0x7FFFFFFFu;
@@ -216,6 +208,49 @@ void main() {
     c[idx] = z;
 }";
 
+    /// <summary>
+    /// The exact unary ops (ExactFloatKernels), on the buffers' bit patterns: they are bound as <c>uint</c> arrays, so
+    /// no value is ever held, compared or stored as a float. Vulkan lets the driver flush subnormals in float
+    /// instructions, and NVIDIA's compiler turned a sign-bit XOR between float loads and stores back into a flushing
+    /// negate. Codes are ResidentUnaryOp's: 1 abs, 10 sign, 26 negate, 39 clamp(p0, p1).
+    /// </summary>
+    internal static string ExactUnaryElementwise => Header + ExactFloatKernels.Glsl + @"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) writeonly buffer B { uint b[]; };
+layout(push_constant) uniform Params { uint size; uint op; uint p0; uint p1; uint p2; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    uint x = a[idx];
+    uint y = x;
+    if (op == 1u) y = x & 0x7FFFFFFFu;               // abs: the sign bit cleared
+    else if (op == 10u) y = xf_sign(x);              // 1, -1, or +0 for both zeros and NaN
+    else if (op == 26u) y = x ^ 0x80000000u;         // IEEE negate: the sign bit flipped
+    else if (op == 39u) y = xf_clamp(x, p0, p1);     // x < lo ? lo : x, then above hi -> hi; NaN propagates
+    b[idx] = y;
+}";
+
+    /// <summary>
+    /// The exact binary ops (ExactFloatKernels) on <c>uint</c>-bound buffers, as <see cref="ExactUnaryElementwise"/>.
+    /// Codes are ResidentBinaryOp's: 0 min (x &lt; y ? x : y), 1 max (x &gt; y ? x : y), 11 greater, 12 less.
+    /// </summary>
+    internal static string ExactBinaryElementwise => Header + ExactFloatKernels.Glsl + @"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) readonly buffer B { uint bdata[]; };
+layout(set = 0, binding = 2) writeonly buffer C { uint c[]; };
+layout(push_constant) uniform Params { uint size; uint op; uint p0; uint p1; uint p2; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    uint x = a[idx], y = bdata[idx];
+    uint z = x;
+    if (op == 0u) z = xf_min(x, y);
+    else if (op == 1u) z = xf_max(x, y);
+    else if (op == 11u) z = xf_gt(x, y) ? 0x3F800000u : 0u;
+    else if (op == 12u) z = xf_lt(x, y) ? 0x3F800000u : 0u;
+    c[idx] = z;
+}";
+
     public static string EluBackward => Header + FourBufferLayout + @"
 layout(push_constant) uniform Params { uint size; uint alphaBits; };
 void main() {
@@ -233,12 +268,13 @@ void main() {
     d[idx] = a[idx] * bdata[idx] + c[idx];
 }";
 
-    public static string Where => Header + FourBufferLayout + @"
+    public static string Where => Header + ExactFloatKernels.Glsl + FourBufferLayout + @"
 layout(push_constant) uniform Params { uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= size) return;
-    d[idx] = a[idx] != 0.0 ? bdata[idx] : c[idx];
+    // condition != 0 on the bits (a flushed subnormal condition read as false); the operand passes through bit for bit.
+    d[idx] = uintBitsToFloat(xf_truthy(floatBitsToUint(a[idx])) ? floatBitsToUint(bdata[idx]) : floatBitsToUint(c[idx]));
 }";
 
     public static string SoftmaxRows => Header + TwoBufferLayout + @"
@@ -1024,12 +1060,12 @@ void main() {
     b[idx] = a[idx] + scalar;
 }";
 
-    public static string ClipKernel => Header + TwoBufferLayout + @"
+    public static string ClipKernel => Header + ExactFloatKernels.Glsl + TwoBufferLayout + @"
 layout(push_constant) uniform Params { float minVal; float maxVal; uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= size) return;
-    b[idx] = clamp(a[idx], minVal, maxVal);
+    b[idx] = uintBitsToFloat(xf_clamp(floatBitsToUint(a[idx]), floatBitsToUint(minVal), floatBitsToUint(maxVal)));   // the CPU clamp, exact
 }";
 
     public static string RsqrtKernel => Header + TwoBufferLayout + @"
@@ -1410,7 +1446,7 @@ void main() {
     if (live && lid == 0u) b[group] = scratch[0];
 }";
 
-    public static string ScalarReduce => Header + TwoBufferLayout + @"
+    public static string ScalarReduce => Header + ExactFloatKernels.Glsl + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint size; uint op; };
 void main() {
     if (gl_GlobalInvocationID.x != 0u) return;
@@ -1419,13 +1455,15 @@ void main() {
         for (uint i = 0u; i < size; ++i) value += a[i];
         b[0] = value;
     } else if (op == 1u) {
-        float value = -3.402823466e+38;
-        for (uint i = 0u; i < size; ++i) value = max(value, a[i]);
-        b[0] = value;
+        // The CPU scan, exact on the bits (ExactFloatKernels): from -inf, take a value only when strictly greater, so a
+        // NaN is skipped and an all-NaN input gives -inf. max() flushed subnormals and its seed was -3.4e38, not -inf.
+        uint value = 0xFF800000u;
+        for (uint i = 0u; i < size; ++i) { uint v = floatBitsToUint(a[i]); if (xf_gt(v, value)) value = v; }
+        b[0] = uintBitsToFloat(value);
     } else if (op == 2u) {
-        float value = 3.402823466e+38;
-        for (uint i = 0u; i < size; ++i) value = min(value, a[i]);
-        b[0] = value;
+        uint value = 0x7F800000u;
+        for (uint i = 0u; i < size; ++i) { uint v = floatBitsToUint(a[i]); if (xf_lt(v, value)) value = v; }
+        b[0] = uintBitsToFloat(value);
     } else if (op == 3u) {
         float mean = 0.0;
         for (uint i = 0u; i < size; ++i) mean += a[i];
@@ -1451,31 +1489,35 @@ void main() {
     c[outer] = variance / float(reduceSize);
 }";
 
-    public static string ArgExtremaAxis => Header + TwoBufferLayout + @"
+    public static string ArgExtremaAxis => Header + ExactFloatKernels.Glsl + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint reduceSize; uint findMax; };
 void main() {
     uint outer = gl_GlobalInvocationID.x;
     if (outer >= outerSize) return;
     uint offset = outer * reduceSize;
-    float best = findMax != 0u ? -3.402823466e+38 : 3.402823466e+38;
+    // The CPU scan, exact on the bits (ExactFloatKernels): start at the first element and move only on a strictly
+    // better value, so the first of equal extrema wins, a later NaN is skipped and a leading NaN is kept.
+    uint best = reduceSize > 0u ? floatBitsToUint(a[offset]) : 0u;
     uint bestIndex = 0u;
-    for (uint j = 0u; j < reduceSize; ++j) {
-        float value = a[offset + j];
-        bool better = findMax != 0u ? value > best : value < best;
+    for (uint j = 1u; j < reduceSize; ++j) {
+        uint value = floatBitsToUint(a[offset + j]);
+        bool better = findMax != 0u ? xf_gt(value, best) : xf_lt(value, best);
         if (better) { best = value; bestIndex = j; }
     }
     b[outer] = float(bestIndex);
 }";
 
-    public static string MaxAxis => Header + TwoBufferLayout + @"
+    public static string MaxAxis => Header + ExactFloatKernels.Glsl + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint reduceSize; };
 void main() {
     uint outer = gl_GlobalInvocationID.x;
     if (outer >= outerSize) return;
-    float value = -3.402823466e+38;
+    // The CPU ReduceMax scan, exact on the bits: from -inf (not -3.4e38), take a value only when strictly greater, so
+    // a NaN is skipped, an all-NaN row gives -inf, and the first of equal maxima (-0 before +0) is kept.
+    uint value = 0xFF800000u;
     uint offset = outer * reduceSize;
-    for (uint j = 0u; j < reduceSize; ++j) if (a[offset + j] > value) value = a[offset + j];
-    b[outer] = value;
+    for (uint j = 0u; j < reduceSize; ++j) { uint v = floatBitsToUint(a[offset + j]); if (xf_gt(v, value)) value = v; }
+    b[outer] = uintBitsToFloat(value);
 }";
 
     public static string TopKAxis => Header + @"
@@ -1723,20 +1765,22 @@ void main() {
     c[idx] = a[idx] * bdata[idx / innerSize];
 }";
 
-    public static string EqualsKernel => Header + ThreeBufferLayout + @"
+    // IEEE equality on the bit patterns (ExactFloatKernels): NaN equals nothing, -0 equals +0, and a subnormal is not
+    // flushed into a tie with zero as a float == may do on Vulkan hardware.
+    public static string EqualsKernel => Header + ExactFloatKernels.Glsl + ThreeBufferLayout + @"
 layout(push_constant) uniform Params { uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= size) return;
-    c[idx] = (a[idx] == bdata[idx]) ? 1.0 : 0.0;
+    c[idx] = xf_eq(floatBitsToUint(a[idx]), floatBitsToUint(bdata[idx])) ? 1.0 : 0.0;
 }";
 
-    public static string NotEqualsKernel => Header + ThreeBufferLayout + @"
+    public static string NotEqualsKernel => Header + ExactFloatKernels.Glsl + ThreeBufferLayout + @"
 layout(push_constant) uniform Params { uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= size) return;
-    c[idx] = (a[idx] != bdata[idx]) ? 1.0 : 0.0;
+    c[idx] = xf_eq(floatBitsToUint(a[idx]), floatBitsToUint(bdata[idx])) ? 0.0 : 1.0;
 }";
 
     public static string MaskedFillKernel => Header + ThreeBufferLayout + @"
@@ -2126,13 +2170,15 @@ void main() {
     // Activation kernels (forward + backward)
     // =====================================================================
 
-    public static string Relu6 => Header + TwoBufferLayout + @"
+    // The CPU clamp(x, 0, 6) on uint-bound bit patterns: -0 and NaN pass through, a subnormal is never flushed.
+    public static string Relu6 => Header + ExactFloatKernels.Glsl + @"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) writeonly buffer B { uint b[]; };
 layout(push_constant) uniform Params { uint size; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= size) return;
-    float x = a[idx];
-    b[idx] = min(max(x, 0.0), 6.0);
+    b[idx] = xf_clamp(a[idx], 0u, 0x40C00000u);   // bounds +0 and 6.0
 }";
 
     public static string Relu6Backward => Header + ThreeBufferLayout + @"
@@ -2310,7 +2356,10 @@ void main() {
     b[idx] = cnt > 0 ? sum / float(cnt) : 0.0;
 }";
 
-    public static string MaxPool1DGlsl => Header + TwoBufferLayout + @"
+    // The CPU max-pool rule on uint-bound bit patterns: the window's first cell, then only a strictly greater one.
+    public static string MaxPool1DGlsl => Header + ExactFloatKernels.Glsl + @"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) writeonly buffer B { uint b[]; };
 layout(push_constant) uniform Params { uint batch; uint channels; uint inLength; uint outLength; uint kernelSize; uint stride; };
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -2318,8 +2367,12 @@ void main() {
     if (idx >= total) return;
     uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint batchIndex = idx / (outLength * channels);
     uint inOff = (batchIndex * channels + ch) * inLength;
-    float maxVal = -3.402823466e+38;
-    for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, a[inOff + pos]); }
+    uint maxVal = 0xFF800000u;
+    bool have = false;
+    for (uint k = 0; k < kernelSize; k++) {
+        uint pos = o * stride + k;
+        if (pos < inLength) { uint v = a[inOff + pos]; if (!have || xf_gt(v, maxVal)) { maxVal = v; have = true; } }
+    }
     b[idx] = maxVal;
 }";
 

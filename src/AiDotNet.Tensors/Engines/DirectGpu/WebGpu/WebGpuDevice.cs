@@ -159,6 +159,7 @@ public sealed class WebGpuDevice : IDisposable
             }
         }
         WebGpuNativeBindings.MaxWorkgroupsPerDimension = MaxWorkgroupsPerDimension;
+        WebGpuBuffer.ConfigurePoolBudget(MaxBufferSize);
 
         return true;
     }
@@ -286,6 +287,8 @@ public sealed class WebGpuDevice : IDisposable
         }
 
         _disposed = true;
+
+        WebGpuBuffer.ReleaseAndDrain();
 
         if (_initialized)
         {

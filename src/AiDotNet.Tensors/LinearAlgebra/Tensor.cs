@@ -527,7 +527,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // same Contiguous node) instead of downloading the base to walk it here -- the host walk made every
         // permute's backward (and any other Contiguous caller) a device-to-host-to-device round trip.
         if (!IsContiguous && _storageOffset == 0
-            && Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine gpuEngine
+            && Engines.AiDotNetEngine.Current.TryGet<Engines.DirectGpuTensorEngine>(out var gpuEngine)
             && gpuEngine.TryContiguousOnDevice(this, out var onDevice))
             return FinalizeContiguousCopy(onDevice);
 
@@ -5107,7 +5107,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Place onto the SAME backend the active dispatcher executes on, so placement and execution can't
         // diverge (a tensor moved here is used by ops running on AiDotNetEngine.Current). Fall back to the
         // global per-device backend registry only when the current engine is not a GPU dispatcher.
-        var dispatcher = Engines.AiDotNetEngine.Current as Engines.DirectGpuTensorEngine;
+        var dispatcher = Engines.AiDotNetEngine.Current.As<Engines.DirectGpuTensorEngine>();
         // Leased: the upload below runs on the dispatcher's backend, so a concurrent Dispose waits for it.
         using var __gpuOp = dispatcher?.EnterGpuOp() ?? default;
         Engines.DirectGpu.IDirectGpuBackend? backend = dispatcher?.PlacementBackend;
@@ -5177,7 +5177,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Place onto the SAME backend the active dispatcher executes on, as To() does. Engine.DirectGpu is a
         // separate lazily-created DirectGpuEngine with its own backend (context + stream), so a buffer placed there
         // was not the buffer the dispatcher's kernels and fused optimizers read and wrote.
-        var dispatcher = Engines.AiDotNetEngine.Current as Engines.DirectGpuTensorEngine;
+        var dispatcher = Engines.AiDotNetEngine.Current.As<Engines.DirectGpuTensorEngine>();
         // Leased: the upload below runs on the dispatcher's backend, so a concurrent Dispose waits for it.
         using var __gpuOp = dispatcher?.EnterGpuOp() ?? default;
         Engines.DirectGpu.IDirectGpuBackend? backend = dispatcher?.PlacementBackend;
@@ -5213,7 +5213,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         _gpuBufferVersion = GpuCacheVersion;
         _device = backend.DeviceType;   // the backend's typed device, not a match on its name
         // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight.
-        if (Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine owner
+        if (Engines.AiDotNetEngine.Current.TryGet<Engines.DirectGpuTensorEngine>(out var owner)
             && ReferenceEquals(owner.PlacementBackend, backend))
             owner.DropPersistentCopy(this);
         // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.

@@ -66,7 +66,7 @@ fn silu(x: f32) -> f32 {
     /// <summary>
     /// Element-wise operation kernels.
     /// </summary>
-    public const string ElementWiseSource = @"
+    public const string ElementWiseSource = ExactFloatKernels.Wgsl + @"
 // Element-wise Addition
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
@@ -113,7 +113,8 @@ fn div(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn maximum(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = max(A[idx], B[idx]);
+        // a > b ? a : b (x86 MAXPS, the CPU engine), decided and selected on the bits (ExactFloatKernels).
+        C[idx] = bitcast<f32>(xf_max(bitcast<u32>(A[idx]), bitcast<u32>(B[idx])));
     }
 }
 
@@ -121,7 +122,8 @@ fn maximum(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn minimum(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = min(A[idx], B[idx]);
+        // a < b ? a : b (x86 MINPS, the CPU engine), decided and selected on the bits.
+        C[idx] = bitcast<f32>(xf_min(bitcast<u32>(A[idx]), bitcast<u32>(B[idx])));
     }
 }
 
@@ -287,7 +289,7 @@ fn strided_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Unary math operations.
     /// </summary>
-    public const string UnaryMathSource = @"
+    public const string UnaryMathSource = ExactFloatKernels.Wgsl + @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read_write> B: array<f32>;
 
@@ -324,7 +326,7 @@ fn log_op(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn abs_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = abs(A[idx]);
+        B[idx] = bitcast<f32>(bitcast<u32>(A[idx]) & 0x7FFFFFFFu);   // the sign bit cleared: never flushed
     }
 }
 
@@ -332,7 +334,7 @@ fn abs_op(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn neg_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = -A[idx];
+        B[idx] = bitcast<f32>(bitcast<u32>(A[idx]) ^ 0x80000000u);   // IEEE negate: the sign bit flipped
     }
 }
 
@@ -340,7 +342,7 @@ fn neg_op(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn sign_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = sign(A[idx]);
+        B[idx] = bitcast<f32>(xf_sign(bitcast<u32>(A[idx])));   // 1, -1, or +0 for both zeros and NaN (the CPU engine)
     }
 }
 
@@ -633,7 +635,7 @@ fn threshold_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Reduction operations with workgroup shared memory.
     /// </summary>
-    public const string ReductionSource = @"
+    public const string ReductionSource = ExactFloatKernels.Wgsl + @"
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 
@@ -643,6 +645,8 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 var<workgroup> shared_data: array<f32, 256>;
+// max_reduce / min_reduce reduce bit patterns (ExactFloatKernels), never float values.
+var<workgroup> shared_bits: array<u32, 256>;
 
 @compute @workgroup_size(256)
 fn sum_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
@@ -679,23 +683,27 @@ fn max_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(workgroup_id) wid: vec3<u32>) {
     let idx = gid.x;
     let local_idx = lid.x;
+    let IDENTITY_BITS = 0xFF800000u;   // -inf: what a NaN or an absent element contributes
 
     if (idx < params.size) {
-        shared_data[local_idx] = input[idx];
+        // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the identity (the CPU scan never
+        // takes one), and no float compare can flush a subnormal. Ties keep the left operand.
+        let v = bitcast<u32>(input[idx]);
+        shared_bits[local_idx] = select(v, IDENTITY_BITS, xf_isnan(v));
     } else {
-        shared_data[local_idx] = -3.402823e+38; // NEG_INF
+        shared_bits[local_idx] = IDENTITY_BITS;
     }
     workgroupBarrier();
 
     for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
         if (local_idx < stride) {
-            shared_data[local_idx] = max(shared_data[local_idx], shared_data[local_idx + stride]);
+            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_gt(shared_bits[local_idx + stride], shared_bits[local_idx]));
         }
         workgroupBarrier();
     }
 
     if (local_idx == 0u) {
-        output[wid.x] = shared_data[0];
+        output[wid.x] = bitcast<f32>(shared_bits[0]);
     }
 }
 
@@ -705,23 +713,27 @@ fn min_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(workgroup_id) wid: vec3<u32>) {
     let idx = gid.x;
     let local_idx = lid.x;
+    let IDENTITY_BITS = 0x7F800000u;   // +inf
 
     if (idx < params.size) {
-        shared_data[local_idx] = input[idx];
+        // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the identity (the CPU scan never
+        // takes one), and no float compare can flush a subnormal. Ties keep the left operand.
+        let v = bitcast<u32>(input[idx]);
+        shared_bits[local_idx] = select(v, IDENTITY_BITS, xf_isnan(v));
     } else {
-        shared_data[local_idx] = 3.402823e+38; // POS_INF
+        shared_bits[local_idx] = IDENTITY_BITS;
     }
     workgroupBarrier();
 
     for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
         if (local_idx < stride) {
-            shared_data[local_idx] = min(shared_data[local_idx], shared_data[local_idx + stride]);
+            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_lt(shared_bits[local_idx + stride], shared_bits[local_idx]));
         }
         workgroupBarrier();
     }
 
     if (local_idx == 0u) {
-        output[wid.x] = shared_data[0];
+        output[wid.x] = bitcast<f32>(shared_bits[0]);
     }
 }
 ";
@@ -1130,7 +1142,7 @@ fn batch_norm_inference(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Comparison operations.
     /// </summary>
-    public const string ComparisonSource = @"
+    public const string ComparisonSource = ExactFloatKernels.Wgsl + @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
@@ -1144,7 +1156,7 @@ struct Params {
 fn greater_than(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = select(0.0, 1.0, A[idx] > B[idx]);
+        C[idx] = select(0.0, 1.0, xf_gt(bitcast<u32>(A[idx]), bitcast<u32>(B[idx])));   // exact: a float compare may flush
     }
 }
 
@@ -1152,7 +1164,7 @@ fn greater_than(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn less_than(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        C[idx] = select(0.0, 1.0, A[idx] < B[idx]);
+        C[idx] = select(0.0, 1.0, xf_lt(bitcast<u32>(A[idx]), bitcast<u32>(B[idx])));
     }
 }
 
@@ -1192,7 +1204,8 @@ fn where_op(@builtin(global_invocation_id) gid: vec3<u32>) {
         let condition = A[idx];
         let true_val = B[idx];
         let false_val = C[idx];
-        C[idx] = select(false_val, true_val, condition != 0.0);
+        // condition != 0 on the bits (NaN true, either zero false); the operand passes through bit for bit.
+        C[idx] = bitcast<f32>(select(bitcast<u32>(false_val), bitcast<u32>(true_val), xf_truthy(bitcast<u32>(condition))));
     }
 }
 ";
@@ -1988,7 +2001,7 @@ fn fill_value(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Clamp operation with min and max bounds.
     /// </summary>
-    public const string ClampSource = @"
+    public const string ClampSource = ExactFloatKernels.Wgsl + @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read_write> B: array<f32>;
 
@@ -2003,12 +2016,9 @@ struct ClampParams {
 fn clamp_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        let x = A[idx];
-        // torch.clamp propagates NaN; WGSL clamp may return a bound for it. NaN is tested on the bits (magnitude above
-        // the +Inf pattern): WGSL implementations may assume finite values and fold x != x.
-        let F32_ABS_MASK = 0x7fffffffu;       // IEEE-754 binary32: every bit but the sign
-        let F32_POS_INF_BITS = 0x7f800000u;   // IEEE-754 binary32: +Inf
-        B[idx] = select(clamp(x, params.min_val, params.max_val), x, (bitcast<u32>(x) & F32_ABS_MASK) > F32_POS_INF_BITS);
+        // The CPU clamp (ExactFloatKernels): x < lo ? lo : x, then above hi -> hi, decided and selected on the bits. NaN
+        // propagates (WGSL clamp may return a bound for it), and no float compare can flush a subnormal.
+        B[idx] = bitcast<f32>(xf_clamp(bitcast<u32>(A[idx]), bitcast<u32>(params.min_val), bitcast<u32>(params.max_val)));
     }
 }
 ";
@@ -3498,7 +3508,7 @@ fn sum_axis_rows_split(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invo
 }
 ";
 
-    public const string StatisticsSource = @"
+    public const string StatisticsSource = ExactFloatKernels.Wgsl + @"
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 
@@ -3536,24 +3546,31 @@ fn sum_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn max_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.outer_size) {
-        var max_val: f32 = -3.402823e+38;
+        // The CPU ReduceMax scan, exact on the bits (ExactFloatKernels): from -inf (not -3.4e38), take a value only when
+        // strictly greater, so a NaN is skipped, an all-NaN row gives -inf and the first of equal maxima is kept.
+        var max_bits: u32 = 0xFF800000u;
         for (var j: u32 = 0u; j < params.reduce_size; j = j + 1u) {
-            max_val = max(max_val, input[idx * params.reduce_size + j]);
+            let v = bitcast<u32>(input[idx * params.reduce_size + j]);
+            if (xf_gt(v, max_bits)) {
+                max_bits = v;
+            }
         }
-        output[idx] = max_val;
+        output[idx] = bitcast<f32>(max_bits);
     }
 }
 
+// The CPU arg-extremum scans, exact on the bits: start at the first element and move only on a strictly better value,
+// so the first of equal extrema wins, a later NaN is skipped and a leading NaN is kept.
 @compute @workgroup_size(256)
 fn argmax_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx < params.outer_size) {
-        var max_val: f32 = -3.402823e+38;
+    if (idx < params.outer_size && params.reduce_size > 0u) {
+        var max_bits: u32 = bitcast<u32>(input[idx * params.reduce_size]);
         var max_idx: u32 = 0u;
-        for (var j: u32 = 0u; j < params.reduce_size; j = j + 1u) {
-            let v = input[idx * params.reduce_size + j];
-            if (v > max_val) {
-                max_val = v;
+        for (var j: u32 = 1u; j < params.reduce_size; j = j + 1u) {
+            let v = bitcast<u32>(input[idx * params.reduce_size + j]);
+            if (xf_gt(v, max_bits)) {
+                max_bits = v;
                 max_idx = j;
             }
         }
@@ -3564,13 +3581,13 @@ fn argmax_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn argmin_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx < params.outer_size) {
-        var min_val: f32 = 3.402823e+38;
+    if (idx < params.outer_size && params.reduce_size > 0u) {
+        var min_bits: u32 = bitcast<u32>(input[idx * params.reduce_size]);
         var min_idx: u32 = 0u;
-        for (var j: u32 = 0u; j < params.reduce_size; j = j + 1u) {
-            let v = input[idx * params.reduce_size + j];
-            if (v < min_val) {
-                min_val = v;
+        for (var j: u32 = 1u; j < params.reduce_size; j = j + 1u) {
+            let v = bitcast<u32>(input[idx * params.reduce_size + j]);
+            if (xf_lt(v, min_bits)) {
+                min_bits = v;
                 min_idx = j;
             }
         }
@@ -4324,7 +4341,7 @@ fn embedding_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// <summary>
     /// Where (conditional select), NotEqualScalar, VarAxis kernels.
     /// </summary>
-    public const string ConditionalSource = @"
+    public const string ConditionalSource = ExactFloatKernels.Wgsl + @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;
 @group(0) @binding(2) var<storage, read_write> C: array<f32>;
@@ -4340,7 +4357,9 @@ fn where_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
         // A=condition, B=trueVals, C already has falseVals or we write based on condition
-        C[idx] = select(C[idx], B[idx], A[idx] > 0.5);
+        // The CPU where: the condition is true when it is not +0 or -0 (a negative or NaN condition is true; > 0.5 made a
+        // negative or fractional condition false), tested on the bits; the operand passes through bit for bit.
+        C[idx] = bitcast<f32>(select(bitcast<u32>(C[idx]), bitcast<u32>(B[idx]), xf_truthy(bitcast<u32>(A[idx]))));
     }
 }
 

@@ -451,6 +451,10 @@ public partial class CpuEngine
         var timeDecay = inputs[3];
         var timeFirst = inputs[4];
 
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.CreatesGraph && Rwkv4WkvBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, rProj, kProj, vProj, timeDecay, timeFirst))
+            return;
+
         int batch = rProj.Shape[0];
         int seqLen = rProj.Shape[1];
         int modelDim = rProj.Shape[2];
@@ -494,5 +498,90 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, vProj, dV, engine);
         DifferentiableOps.AccumulateGrad(grads, timeDecay, dTimeDecay, engine);
         DifferentiableOps.AccumulateGrad(grads, timeFirst, dTimeFirst, engine);
+    }
+
+    // The create-graph path of Rwkv4WkvBackward, kept out of it so its first-order path allocates no closure.
+    private static bool Rwkv4WkvBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> rProj,
+            Tensor<T> kProj,
+            Tensor<T> vProj,
+            Tensor<T> timeDecay,
+            Tensor<T> timeFirst)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => Rwkv4WkvComposite(e, rProj, kProj, vProj, timeDecay, timeFirst));
+
+    // The WKV recurrence as recorded ops: a_{t+1} = e^w a_t + e^{k_t} v_t, b_{t+1} = e^w b_t + e^{k_t},
+    // y_t = σ(r_t) (a_t + e^{u+k_t} v_t) / (b_t + e^{u+k_t}), w = -exp(timeDecay), in the kernel's max-subtracted form:
+    // a and b are carried scaled by e^{-p_t}, p_t the running maximum exponent, so no exponential ever sees an argument
+    // above 0 whatever the range of the keys (a single global shift underflowed once keys spanned more than ~700).
+    // Every p is a constant: the value does not depend on it (it cancels between numerator and denominator, and in the
+    // carried state), so neither does any derivative, and treating it as one keeps max's kink out of the graph.
+    private static Tensor<T> Rwkv4WkvComposite<T>(IEngine e, Tensor<T> rProj, Tensor<T> kProj, Tensor<T> vProj,
+        Tensor<T> timeDecay, Tensor<T> timeFirst)
+    {
+        int batch = rProj.Shape[0], seqLen = rProj.Shape[1], modelDim = rProj.Shape[2];
+        var ops = MathHelper.GetNumericOperations<T>();
+        var kValues = RoIAlignPlan.ToDoubles(kProj);
+        var uValues = RoIAlignPlan.ToDoubles(timeFirst);
+        var wValues = RoIAlignPlan.ToDoubles(timeDecay);
+        for (int c = 0; c < wValues.Length; c++) wValues[c] = -Math.Exp(wValues[c]);
+
+        var w = RecordedOps<T>.R(e, e.TensorNegate(e.TensorExp(RecordedOps<T>.R(e, timeDecay, modelDim))), 1, modelDim);
+        var u2 = RecordedOps<T>.R(e, timeFirst, 1, modelDim);
+        Tensor<T> aa = RecordedOps<T>.Zeros(batch, modelDim);
+        Tensor<T> bb = RecordedOps<T>.Zeros(batch, modelDim);
+        // An empty state: e^{pp - p} is exactly 0 for any finite p.
+        var pp = new double[batch * modelDim];
+        for (int i = 0; i < pp.Length; i++) pp[i] = -1e30;
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var kt = RecordedOps<T>.At(e, kProj, 1, t);
+            var vt = RecordedOps<T>.At(e, vProj, 1, t);
+
+            // Output: p = max(pp, u + k_t).
+            var p = new double[pp.Length];
+            var e1Values = new double[pp.Length];
+            for (int b = 0; b < batch; b++)
+                for (int c = 0; c < modelDim; c++)
+                {
+                    int i = b * modelDim + c;
+                    p[i] = Math.Max(pp[i], uValues[c] + kValues[(b * seqLen + t) * modelDim + c]);
+                    e1Values[i] = Math.Exp(pp[i] - p[i]);
+                }
+            var e1 = Rwkv4Constant<T>(e1Values, batch, modelDim, ops);
+            var e2 = e.TensorExp(e.TensorSubtract(RecordedOps<T>.Add(e, kt, u2), Rwkv4Constant<T>(p, batch, modelDim, ops)));
+            var wkv = e.TensorDivide(e.TensorAdd(e.TensorMultiply(e1, aa), e.TensorMultiply(e2, vt)),
+                e.TensorAdd(e.TensorMultiply(e1, bb), e2));
+            ys.Add(e.TensorMultiply(e.TensorSigmoid(RecordedOps<T>.At(e, rProj, 1, t)), wkv));
+
+            // State: p' = max(pp + w, k_t).
+            var next = new double[pp.Length];
+            for (int b = 0; b < batch; b++)
+                for (int c = 0; c < modelDim; c++)
+                {
+                    int i = b * modelDim + c;
+                    next[i] = Math.Max(pp[i] + wValues[c], kValues[(b * seqLen + t) * modelDim + c]);
+                }
+            var nextT = Rwkv4Constant<T>(next, batch, modelDim, ops);
+            var decayFactor = e.TensorExp(e.TensorSubtract(RecordedOps<T>.Add(e, w, Rwkv4Constant<T>(pp, batch, modelDim, ops)), nextT));
+            var keyFactor = e.TensorExp(e.TensorSubtract(kt, nextT));
+            aa = e.TensorAdd(e.TensorMultiply(decayFactor, aa), e.TensorMultiply(keyFactor, vt));
+            bb = e.TensorAdd(e.TensorMultiply(decayFactor, bb), keyFactor);
+            pp = next;
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
+    }
+
+    [ScalarKernel("Converts a few host-computed per-step exponent shifts that seed a recorded composite.")]
+    private static Tensor<T> Rwkv4Constant<T>(double[] values, int batch, int modelDim, INumericOperations<T> ops)
+    {
+        var data = new T[values.Length];
+        for (int i = 0; i < data.Length; i++) data[i] = ops.FromDouble(values[i]);
+        return new Tensor<T>(data, new[] { batch, modelDim });
     }
 }

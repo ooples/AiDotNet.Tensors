@@ -16,3 +16,5 @@ TENS0008 | BackendParity | Error | BackendParityAnalyzer
 TENS0010 | ElementWise | Error | ElementWiseAnalyzer
 TENS0011 | ElementWise | Error | ElementWiseAnalyzer
 TENS0012 | ElementWise | Error | ElementWiseAnalyzer
+TENS0020 | EngineWrapper | Warning | EngineTypeTestAnalyzer
+TENS0030 | Autograd | Warning | AutogradFunctionBackwardAnalyzer

@@ -43,7 +43,7 @@ public static class OpParityRegistry
         .Concat(WithGraphExpectation(TensorPredicatePending(), GraphCaptureExpectation.MixedElementTypes))
         .Concat(WithGraphExpectation(IntegerIndexPending(), GraphCaptureExpectation.MixedElementTypes))
         .Concat(WithGraphExpectation(DeterministicDiscretePending(), GraphCaptureExpectation.MixedElementTypes))
-        .Concat(RandomAndHostContractPending()).Concat(OutputContractCases());
+        .Concat(RandomAndHostContractPending()).Concat(OutputContractCases()).Concat(TorchModelOps());
 
     private static IEnumerable<OpCase> WithGraphExpectation(
         IEnumerable<OpCase> cases,
@@ -1642,6 +1642,100 @@ public static class OpParityRegistry
             return engine.TensorConcatenate(new[] { magnitude, phase }, 0);
     }
 
+    // The model-level ops of CpuEngine.TorchModelOps: the eight activations, fake quantization, top-k softmax and the
+    // time embedding run TorchModelOpsKernels on the device; the CRF log-partition runs its per-step recursion kernels;
+    // log-softmin, the hyperbolic linear layer and the soft tree / instance-based learners compose device ops.
+    public static IEnumerable<OpCase> TorchModelOps()
+    {
+        var x = OpInput.Rand(7000, new[] { 4, 16 }, -4.0, 4.0);
+        yield return new OpCase("TensorLisht[4,16]", "activation", e => e.TensorLisht(x.F()), e => e.TensorLisht(x.D()),
+            ParityTol.Ulp(16, 1e-6), opMethod: "TensorLisht");
+        yield return new OpCase("TensorBentIdentity[4,16]", "activation", e => e.TensorBentIdentity(x.F()), e => e.TensorBentIdentity(x.D()),
+            ParityTol.Ulp(16, 1e-6), opMethod: "TensorBentIdentity");
+        yield return new OpCase("TensorGaussian[4,16]", "activation", e => e.TensorGaussian(x.F()), e => e.TensorGaussian(x.D()),
+            ParityTol.Ulp(16, 1e-6), opMethod: "TensorGaussian");
+        yield return new OpCase("TensorScaledTanh[4,16;a1.7,b0.6]", "activation", e => e.TensorScaledTanh(x.F(), 1.7, 0.6),
+            e => e.TensorScaledTanh(x.D(), 1.7, 0.6), ParityTol.Ulp(16, 1e-6), opMethod: "TensorScaledTanh");
+        yield return new OpCase("TensorThresholdedRelu[4,16;t0.5]", "activation", e => e.TensorThresholdedRelu(x.F(), 0.5),
+            e => e.TensorThresholdedRelu(x.D(), 0.5), ParityTol.Exact, opMethod: "TensorThresholdedRelu");
+        yield return new OpCase("TensorIsru[4,16;a0.8]", "activation", e => e.TensorIsru(x.F(), 0.8), e => e.TensorIsru(x.D(), 0.8),
+            ParityTol.Ulp(16, 1e-6), opMethod: "TensorIsru");
+        yield return new OpCase("TensorSqrbf[4,16;b1.3]", "activation", e => e.TensorSqrbf(x.F(), 1.3), e => e.TensorSqrbf(x.D(), 1.3),
+            ParityTol.Ulp(16, 1e-6), opMethod: "TensorSqrbf");
+        yield return new OpCase("TensorSurrogateSpike[4,16;t0.3,b4]", "activation", e => e.TensorSurrogateSpike(x.F(), 0.3, 4.0),
+            e => e.TensorSurrogateSpike(x.D(), 0.3, 4.0), ParityTol.Exact, opMethod: "TensorSurrogateSpike");
+        yield return new OpCase("TensorLogSoftmin[4,16;-1]", "activation", e => e.TensorLogSoftmin(x.F()), e => e.TensorLogSoftmin(x.D()),
+            ParityTol.Accum(1e-5), opMethod: "TensorLogSoftmin");
+        // A non-last axis: the compiled plans' pinned row kernel once replayed it as the last axis.
+        yield return new OpCase("TensorLogSoftmin[4,16;0]", "activation", e => e.TensorLogSoftmin(x.F(), 0), e => e.TensorLogSoftmin(x.D(), 0),
+            ParityTol.Accum(1e-5), opMethod: "TensorLogSoftmin");
+        yield return new OpCase("TensorLogSoftmax[4,16;0]", "activation", e => e.TensorLogSoftmax(x.F(), 0), e => e.TensorLogSoftmax(x.D(), 0),
+            ParityTol.Accum(1e-5), opMethod: "TensorLogSoftmax");
+
+        var q = OpInput.Rand(7001, new[] { 4, 33 }, -3.0, 3.0);
+        yield return new OpCase("TensorFakeQuantize[4,33;8b]", "quantization", e => e.TensorFakeQuantize(q.F()), e => e.TensorFakeQuantize(q.D()),
+            ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize");
+        yield return new OpCase("TensorFakeQuantize[4,33;4b,asym]", "quantization", e => e.TensorFakeQuantize(q.F(), 4, null, null, symmetric: false),
+            e => e.TensorFakeQuantize(q.D(), 4, null, null, symmetric: false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize");
+        yield return new OpCase("TensorFakeQuantize[4,33;3b,s0.25,z1]", "quantization", e => e.TensorFakeQuantize(q.F(), 3, 0.25, 1, symmetric: false),
+            e => e.TensorFakeQuantize(q.D(), 3, 0.25, 1, symmetric: false), ParityTol.Ulp(4, 1e-6), opMethod: "TensorFakeQuantize");
+
+        var scores = OpInput.Rand(7002, new[] { 4, 16 }, -3.0, 3.0);
+        yield return new OpCase("TensorTopKSoftmax[4,16;k3]", "activation", e => e.TensorTopKSoftmax(scores.F(), 3),
+            e => e.TensorTopKSoftmax(scores.D(), 3), ParityTol.Ulp(16, 1e-6), opMethod: "TensorTopKSoftmax");
+        // A vocabulary-sized row: the device's chunk-selection path.
+        var vocab = OpInput.Rand(7019, new[] { 2, 50000 }, -6.0, 6.0);
+        yield return new OpCase("TensorTopKSoftmax[2,50000;k8]", "activation", e => e.TensorTopKSoftmax(vocab.F(), 8),
+            e => e.TensorTopKSoftmax(vocab.D(), 8), ParityTol.Ulp(16, 1e-6), opMethod: "TensorTopKSoftmax");
+        var longCrf = OpInput.Rand(7020, new[] { 2, 300, 5 }, -2.0, 2.0);
+        var longCrfTransitions = OpInput.Rand(7021, new[] { 5, 5 });
+        yield return new OpCase("TensorCrfForward[2,300,5]", "sequence", e => e.TensorCrfForward(longCrf.F(), longCrfTransitions.F()),
+            e => e.TensorCrfForward(longCrf.D(), longCrfTransitions.D()), ParityTol.Accum(1e-4), opMethod: "TensorCrfForward");
+
+        var timesteps = OpInput.From(new[] { 0.0, 1.0, 7.0, 49.5, 250.0, 999.0 }, new[] { 6 });
+        yield return new OpCase("TensorSinusoidalTimeEmbedding[6;d32]", "embedding", e => e.TensorSinusoidalTimeEmbedding(timesteps.F(), 32),
+            e => e.TensorSinusoidalTimeEmbedding(timesteps.D(), 32), ParityTol.Ulp(16, 2e-6), opMethod: "TensorSinusoidalTimeEmbedding");
+
+        var emissions = OpInput.Rand(7003, new[] { 2, 5, 4 }, -2.0, 2.0);
+        var transitions = OpInput.Rand(7004, new[] { 4, 4 });
+        var startScores = OpInput.Rand(7005, new[] { 4 });
+        var endScores = OpInput.Rand(7006, new[] { 4 });
+        yield return new OpCase("TensorCrfForward[2,5,4;start,end]", "sequence",
+            e => e.TensorCrfForward(emissions.F(), transitions.F(), startScores.F(), endScores.F()),
+            e => e.TensorCrfForward(emissions.D(), transitions.D(), startScores.D(), endScores.D()), ParityTol.Accum(1e-5),
+            opMethod: "TensorCrfForward");
+        var emissions2 = OpInput.Rand(7007, new[] { 6, 3 }, -2.0, 2.0);
+        var transitions2 = OpInput.Rand(7008, new[] { 3, 3 });
+        yield return new OpCase("TensorCrfForward[6,3]", "sequence", e => e.TensorCrfForward(emissions2.F(), transitions2.F()),
+            e => e.TensorCrfForward(emissions2.D(), transitions2.D()), ParityTol.Accum(1e-5), opMethod: "TensorCrfForward");
+
+        var hx = OpInput.Rand(7009, new[] { 5, 6 }, -0.3, 0.3);
+        var hw = OpInput.Rand(7010, new[] { 4, 6 }, -0.5, 0.5);
+        var hb = OpInput.Rand(7011, new[] { 4 }, -0.2, 0.2);
+        yield return new OpCase("TensorHyperbolicLinear[5,6->4;c0.8]", "hyperbolic",
+            e => e.TensorHyperbolicLinear(hx.F(), hw.F(), hb.F(), 0.8), e => e.TensorHyperbolicLinear(hx.D(), hw.D(), hb.D(), 0.8),
+            ParityTol.Accum(1e-4), opMethod: "TensorHyperbolicLinear");
+
+        var splitInput = OpInput.Rand(7012, new[] { 5 });
+        var left = OpInput.Rand(7013, new[] { 3, 2 });
+        var right = OpInput.Rand(7014, new[] { 3, 2 });
+        yield return new OpCase("TensorSoftSplit[5;3,2;f2]", "tree",
+            e => e.TensorSoftSplit(splitInput.F(), left.F(), right.F(), 2, 0.1, 0.7),
+            e => e.TensorSoftSplit(splitInput.D(), left.D(), right.D(), 2, 0.1, 0.7), ParityTol.Accum(1e-5), opMethod: "TensorSoftSplit");
+
+        var queries = OpInput.Rand(7015, new[] { 3, 4 });
+        var support = OpInput.Rand(7016, new[] { 6, 4 });
+        var labels = OpInput.Rand(7017, new[] { 6, 2 });
+        yield return new OpCase("TensorSoftKnn[3,4;6;t0.9]", "instance",
+            e => e.TensorSoftKnn(queries.F(), support.F(), labels.F(), 0.9),
+            e => e.TensorSoftKnn(queries.D(), support.D(), labels.D(), 0.9), ParityTol.Accum(1e-4), opMethod: "TensorSoftKnn");
+        var lwrLabels = OpInput.Rand(7018, new[] { 6 });
+        yield return new OpCase("TensorSoftLocallyWeighted[3,4;6;h1.5]", "instance",
+            e => e.TensorSoftLocallyWeighted(queries.F(), support.F(), lwrLabels.F(), 1.5),
+            e => e.TensorSoftLocallyWeighted(queries.D(), support.D(), lwrLabels.D(), 1.5), ParityTol.Accum(1e-4),
+            opMethod: "TensorSoftLocallyWeighted");
+    }
+
     public static IEnumerable<OpCase> DeterministicPendingAudio()
     {
         const int nFft = 16;
@@ -1670,6 +1764,20 @@ public static class OpParityRegistry
             e => e.TimeStretch(stretchWaveform.F(), 1.5, nFft, hopLength),
             e => e.TimeStretch(stretchWaveform.D(), 1.5, nFft, hopLength),
             ParityTol.Accum(3e-3), opMethod: "TimeStretch");
+
+        // The two stages of PitchShift(3 semitones) at its own parameters: a sub-1 stretch rate and a non-integer
+        // resample ratio. Rate 1.5 and a 2:1 resample (the cases above) do not exercise either.
+        var pitchStageWaveform = OpInput.Rand(6062, new[] { 256 });
+        double pitchRate = 1.0 / System.Math.Pow(2.0, 3.0 / 12.0);
+        yield return new OpCase("TimeStretch[256;r0.84;n16]", "audio",
+            e => e.TimeStretch(pitchStageWaveform.F(), pitchRate, nFft, hopLength),
+            e => e.TimeStretch(pitchStageWaveform.D(), pitchRate, nFft, hopLength),
+            ParityTol.Accum(3e-3), opMethod: "TimeStretch");
+        var resampleStageWaveform = OpInput.Rand(6063, new[] { 304 });
+        yield return new OpCase("Resample[304;19027->16000]", "audio",
+            e => e.Resample(resampleStageWaveform.F(), 19027, 16000),
+            e => e.Resample(resampleStageWaveform.D(), 19027, 16000),
+            ParityTol.Accum(1e-3), opMethod: "Resample");
 
         var pitchWaveform = OpInput.Rand(6061, new[] { 256 });
         yield return new OpCase("PitchShift[256;3st;n16]", "audio",
@@ -2658,6 +2766,18 @@ public static class OpParityRegistry
         yield return new OpCase("TaylorSoftmaxBackward[4,8]", "activation",
             e => e.TaylorSoftmaxBackward(go.F(), sin.F(), e.TaylorSoftmax(sin.F(), 2, -1), 2, -1),
             e => e.TaylorSoftmaxBackward(go.D(), sin.D(), e.TaylorSoftmax(sin.D(), 2, -1), 2, -1),
+            ParityTol.Accum(1e-3), opMethod: "TaylorSoftmaxBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
+        // A non-last axis with tied maxima: the max-shift gradient belongs to the FIRST maximum along the axis only.
+        var tiedIn = OpInput.From(new[]
+        {
+            0.5, -0.2, 0.3, 0.9,
+            0.5, 0.7, 0.3, -0.4,
+            0.1, 0.7, -0.6, 0.9,
+        }, new[] { 3, 4 });
+        var tiedGrad = OpInput.Rand(3922, new[] { 3, 4 });
+        yield return new OpCase("TaylorSoftmaxBackward[3,4;axis0;tied]", "activation",
+            e => e.TaylorSoftmaxBackward(tiedGrad.F(), tiedIn.F(), e.TaylorSoftmax(tiedIn.F(), 2, 0), 2, 0),
+            e => e.TaylorSoftmaxBackward(tiedGrad.D(), tiedIn.D(), e.TaylorSoftmax(tiedIn.D(), 2, 0), 2, 0),
             ParityTol.Accum(1e-3), opMethod: "TaylorSoftmaxBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
         yield return new OpCase("SphericalSoftmaxBackward[4,8]", "activation",
             e => e.SphericalSoftmaxBackward(go.F(), sin.F(), e.SphericalSoftmax(sin.F(), -1), -1),

@@ -14,10 +14,9 @@ public sealed partial class MetalBackend : IGenericFftBackend, IMeshgridBackend,
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
 
     /// <summary>
-    /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
-    /// the undefined-contents contract.
+    /// Rents a pooled Metal buffer without zeroing its contents when available, or allocates a new buffer.
     /// </summary>
-    public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBuffer(size);
+    public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBufferCore(size, zeroInitialize: false);
     /// <summary>
     /// The guarded updates read the guard on the device (optimizer_update_guarded) and write nothing when it is not
     /// finite (#1520); without the resident library they read it on the host.

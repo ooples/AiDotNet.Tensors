@@ -42,7 +42,7 @@ internal sealed class LayerNormStateRef<T>
 /// Each method is a <see cref="BackwardFunction{T}"/> that computes input gradients
 /// and accumulates them into the gradient dictionary.
 /// </summary>
-internal static class BackwardFunctions<T>
+internal static partial class BackwardFunctions<T>
 {
     /// <summary>
     /// A max pool recorded without indices (a compiled plan's lazy node): on a GPU engine in a resident step, the
@@ -54,7 +54,7 @@ internal static class BackwardFunctions<T>
     internal static BackwardFunction<T> MaxPool2DRecomputeOnDeviceOr(int[] poolSize, int[] stride, BackwardFunction<T> fallback) =>
         (gradOutput, inputs, output, savedState, engine, grads) =>
         {
-            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
+            if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
             {
                 var into = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add);
                 if (gpu.TryMaxPool2DBackwardRecomputeResident(gradOutput, inputs[0], poolSize, stride, add ? null : into,
@@ -580,23 +580,33 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // In a resident step a first contribution is written straight into the input's gradient accumulator.
-        if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
             && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out bool add) is { } into && !add
             && gpu.TryReluBackwardInto(gradOutput, inputs[0], into))
         {
             DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], into);
             return;
         }
-        var grad = engine.ReluBackward(gradOutput, inputs[0]);
+        var x = inputs[0];
+        // A fixed mask of the upstream gradient: under create-graph it stays connected to the upstream gradient, and
+        // its derivative in x is zero (away from 0), as torch's threshold_backward.
+        var grad = CreatesGraph ? ReLUBackwardCreateGraph(gradOutput, engine, x) : engine.ReluBackward(gradOutput, x);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ReLUBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> ReLUBackwardCreateGraph(Tensor<T> gradOutput, IEngine engine, Tensor<T> x)
+        => DiagonalLinearGrad("ReluBackward", gradOutput, engine, (e, w) => e.ReluBackward(w, x));
 
     /// <summary>Uses engine.SigmoidBackward(gradOutput, output)</summary>
     internal static void SigmoidBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.SigmoidBackward(gradOutput, output);
+        // Under create-graph: g·y·(1 - y) from recorded ops, differentiable in g and (through y) in x.
+        var grad = CreatesGraph
+            ? engine.TensorMultiply(gradOutput, engine.TensorMultiply(output, OneMinus(engine, output)))
+            : engine.SigmoidBackward(gradOutput, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -605,7 +615,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.TanhBackward(gradOutput, output);
+        // Under create-graph: g·(1 - y²) from recorded ops, differentiable in g and (through y) in x.
+        var grad = CreatesGraph
+            ? engine.TensorMultiply(gradOutput, OneMinus(engine, engine.TensorMultiply(output, output)))
+            : engine.TanhBackward(gradOutput, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -614,7 +627,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.GeluBackward(gradOutput, inputs[0]);
+        var grad = CreatesGraph
+            ? engine.TensorMultiply(gradOutput, GeluTanhDerivativeRecorded(engine, inputs[0]))
+            : engine.GeluBackward(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -624,9 +639,18 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var negativeSlope = (double)savedState[0];
-        var grad = engine.LeakyReluBackward(gradOutput, inputs[0], negativeSlope);
+        var x = inputs[0];
+        var grad = CreatesGraph ? LeakyReLUBackwardCreateGraph(gradOutput, engine, x, negativeSlope) : engine.LeakyReluBackward(gradOutput, x, negativeSlope);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of LeakyReLUBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> LeakyReLUBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            Tensor<T> x,
+            double negativeSlope)
+        => DiagonalLinearGrad("LeakyReluBackward", gradOutput, engine, (e, w) => e.LeakyReluBackward(w, x, negativeSlope));
 
     /// <summary>Swish backward: d(x*sigmoid(x))/dx = sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))</summary>
     internal static void SwishBackward(
@@ -675,7 +699,18 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axis = (int)savedState[0];
-        var grad = engine.SoftmaxBackward(gradOutput, output, axis);
+        Tensor<T> grad;
+        if (CreatesGraph)
+        {
+            // y ⊙ (g - Σ_axis g ⊙ y) from recorded ops, differentiable in g and (through y) in x.
+            var gy = engine.TensorMultiply(gradOutput, output);
+            var s = engine.ReduceSum(gy, new[] { axis < 0 ? axis + output.Rank : axis }, keepDims: true);
+            grad = engine.TensorSubtract(gy, engine.TensorMultiply(output, engine.TensorBroadcastTo(s, output._shape)));
+        }
+        else
+        {
+            grad = engine.SoftmaxBackward(gradOutput, output, axis);
+        }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -688,7 +723,18 @@ internal static class BackwardFunctions<T>
         // (GetFlat on a resident tensor) and re-uploads the derivative for the multiply. All engine kernels now use
         // this function's convention (the alpha branch at exactly x == 0, as PyTorch does). The device kernel
         // is float-only, so every other element type keeps the dtype-generic host path below.
-        if (typeof(T) == typeof(float) && engine is DirectGpuTensorEngine)
+        if (CreatesGraph)
+        {
+            // Under create-graph: g ⊙ (y > 0 ? 1 : y + α), the branch mask constant and y the recorded output, whose own
+            // derivative (α·eˣ = y + α on the negative branch) carries the second order. (The mask reads the output, as
+            // the host path below does: y > 0 exactly when x > 0.)
+            var positive = ConstantMask(output, v => v > 0);
+            var alphaShifted = engine.TensorAddScalar(output, MathHelper.GetNumericOperations<T>().FromDouble((double)savedState[0]));
+            var slope = engine.TensorAdd(positive, engine.TensorMultiply(OneMinus(engine, positive), alphaShifted));
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.TensorMultiply(gradOutput, slope), engine);
+            return;
+        }
+        if (typeof(T) == typeof(float) && engine.Is<DirectGpuTensorEngine>())
         {
             var deviceGrad = engine.EluBackward(gradOutput, inputs[0], output, (double)savedState[0]);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -1085,7 +1131,7 @@ internal static class BackwardFunctions<T>
             // #1804). Only when nothing records these ops (no outer tape, not tracing a graph): the helper writes
             // its outputs directly and does not record a backward of its own.
             if (needsInputGradient && needsWeightGradient
-                && engine is DirectGpuTensorEngine gpuBackward
+                && engine.TryGet<DirectGpuTensorEngine>(out var gpuBackward)
                 && !DifferentiableOps.IsRecording<T>()
                 && !Compilation.GraphMode.IsActive)
             {
@@ -1443,7 +1489,7 @@ internal static class BackwardFunctions<T>
         // safe. CPU-only; the GPU engine keeps the allocating path. DirectGpuTensorEngine derives from
         // CpuEngine, so the type test alone sent GPU training down the host path: the kernel gradient came
         // back as a host tensor and the parameter update had to leave the device (#1058).
-        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        if (engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu)
         {
             if (needsInputGradient)
             {
@@ -1551,8 +1597,15 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         bool relu = (bool)savedState[3];
+        // Under create-graph: differentiate act(conv2d(x, k) + b[c]) as recorded ops (the one-pass epilogue backward
+        // below runs on the host and records nothing).
+        var convIn = inputs[0];
+        var convKernel = inputs[1];
+        var convBias = inputs[2];
+        if (CreatesGraph && FusedConv2DBiasActivationBackwardCreateGraph(gradOutput, inputs, engine, grads, convIn, convKernel, savedState, convBias, relu))
+            return;
         Tensor<T> gradPreActivation;
-        if (typeof(T) == typeof(float) && engine is CpuEngine cpu && !engine.SupportsGpu
+        if (typeof(T) == typeof(float) && engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu
             && gradOutput.IsContiguous && output.IsContiguous)
         {
             gradPreActivation = Helpers.AutoTensorCache.RentOrAllocate<T>(output._shape);
@@ -1572,6 +1625,27 @@ internal static class BackwardFunctions<T>
         Conv2DBackward(gradPreActivation, new[] { inputs[0], inputs[1] }, output, savedState, engine, grads);
     }
 
+    // The create-graph path of FusedConv2DBiasActivationBackward, kept out of it so its first-order path allocates no closure.
+    private static bool FusedConv2DBiasActivationBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> convIn,
+            Tensor<T> convKernel,
+            object[] savedState,
+            Tensor<T> convBias,
+            bool relu)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                var z = e.Conv2D(convIn, convKernel, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2]);
+                var biasShape = new int[z.Rank];
+                for (int i = 0; i < biasShape.Length; i++) biasShape[i] = 1;
+                biasShape[1] = convBias.Length;
+                z = e.TensorAdd(z, e.TensorBroadcastTo(e.Reshape(convBias, biasShape), z._shape));
+                return relu ? e.ReLU(z) : z;
+            });
+
     /// <summary>Conv1D backward: reshapes 3D inputs to 4D, delegates to Conv2DBackward logic, reshapes back</summary>
     internal static void Conv1DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1580,6 +1654,13 @@ internal static class BackwardFunctions<T>
         var stride = (int)savedState[0];
         var padding = (int)savedState[1];
         var dilation = (int)savedState[2];
+
+        // Under create-graph: bilinear in (input, kernel), so each gradient is recorded with the convolution itself
+        // (one operand swapped for the cotangent) as its adjoint, which stays differentiable at every order. The
+        // backward-input/kernel kernels record a node of their own whose backward is not, so a third derivative
+        // through them came out wrong.
+        if (CreatesGraph && Conv1DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding, dilation))
+            return;
 
         var gradInput = engine.Conv1DBackwardInput(
             gradOutput, inputs[1], inputs[0]._shape, stride, padding, dilation);
@@ -1590,6 +1671,20 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
     }
 
+    // The create-graph path of Conv1DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool Conv1DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int stride,
+            int padding,
+            int dilation)
+        => TryMultilinearBackward("Conv1D", Conv1DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.Conv1D(x[0], x[1], stride, padding, dilation));
+
     /// <summary>DepthwiseConv1D backward: uses engine.DepthwiseConv1DBackwardInput and DepthwiseConv1DBackwardKernel</summary>
     internal static void DepthwiseConv1DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1597,6 +1692,9 @@ internal static class BackwardFunctions<T>
     {
         var stride = (int)savedState[0];
         var padding = (int)savedState[1];
+
+        if (CreatesGraph && DepthwiseConv1DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding))
+            return;
 
         var gradInput = engine.DepthwiseConv1DBackwardInput(
             gradOutput, inputs[1], inputs[0]._shape, stride, padding);
@@ -1607,6 +1705,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
     }
 
+    // The create-graph path of DepthwiseConv1DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool DepthwiseConv1DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int stride,
+            int padding)
+        => TryMultilinearBackward("DepthwiseConv1D", DepthwiseConv1DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.DepthwiseConv1D(x[0], x[1], stride, padding));
+
     /// <summary>Conv3D backward: uses engine.Conv3DBackwardInput and Conv3DBackwardKernel</summary>
     internal static void Conv3DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1615,6 +1726,9 @@ internal static class BackwardFunctions<T>
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
+
+        if (CreatesGraph && Conv3DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding, dilation))
+            return;
 
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
         {
@@ -1630,18 +1744,44 @@ internal static class BackwardFunctions<T>
         }
     }
 
+    // The create-graph path of Conv3DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool Conv3DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] stride,
+            int[] padding,
+            int[] dilation)
+        => TryMultilinearBackward("Conv3D", Conv3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.Conv3D(x[0], x[1], stride, padding, dilation));
+
     /// <summary>GridSample backward: uses engine.GridSampleBackwardInput and GridSampleBackwardGrid</summary>
     internal static void GridSampleBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // inputs[0] = input, inputs[1] = grid
+        // Under create-graph: differentiate the bilinear sample (zeros padding, align_corners=false) as recorded ops.
+        if (CreatesGraph && GridSampleBackwardCreateGraph(gradOutput, inputs, engine, grads))
+            return;
         var gradInput = engine.GridSampleBackwardInput(gradOutput, inputs[1], inputs[0]._shape);
         var gradGrid = engine.GridSampleBackwardGrid(gradOutput, inputs[0], inputs[1]);
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGrid, engine);
     }
+
+    // The create-graph path of GridSampleBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GridSampleBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            GridSampleRecorded(e, inputs[0], inputs[1], GridSampleMode.Bilinear, GridSamplePadding.Zeros, alignCorners: false));
 
     /// <summary>
     /// GridSample backward for the (mode, padding, alignCorners) overload.
@@ -1670,6 +1810,15 @@ internal static class BackwardFunctions<T>
         var padding = (GridSamplePadding)SavedInt(nameof(GridSampleModeBackward), savedState, 1, "padding");
         bool alignCorners = SavedBool(nameof(GridSampleModeBackward), savedState, 2, "alignCorners");
 
+        if (mode != GridSampleMode.Bicubic
+            && CreatesGraph && GridSampleModeBackwardCreateGraph(gradOutput, inputs, engine, grads, mode, padding, alignCorners))
+            return;
+        // Bicubic: the same, with the 4x4 Catmull-Rom taps (PyTorch implements no grid_sampler double backward at all;
+        // this one is exact in both the input and the grid).
+        if (mode == GridSampleMode.Bicubic && inputs[0].Rank == 4
+            && CreatesGraph && GridSampleModeBackwardCreateGraph2(gradOutput, inputs, engine, grads, padding, alignCorners))
+            return;
+
         var gradInput = engine.GridSampleBackwardInput(
             gradOutput, inputs[1], inputs[0]._shape, mode, padding, alignCorners);
         var gradGrid = engine.GridSampleBackwardGrid(
@@ -1678,6 +1827,29 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGrid, engine);
     }
+
+    // The create-graph path of GridSampleModeBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GridSampleModeBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            GridSampleMode mode,
+            GridSamplePadding padding,
+            bool alignCorners)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            GridSampleRecorded(e, inputs[0], inputs[1], mode, padding, alignCorners));
+
+    // The create-graph path of GridSampleModeBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GridSampleModeBackwardCreateGraph2(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            GridSamplePadding padding,
+            bool alignCorners)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            GridSampleBicubicRecorded(e, inputs[0], inputs[1], padding, alignCorners));
 
     /// <summary>Unfold backward: fold the gradient back to input shape</summary>
     internal static void UnfoldBackward(
@@ -1715,6 +1887,9 @@ internal static class BackwardFunctions<T>
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
 
+        if (CreatesGraph && TrySelectionBackward("MaxPool2DBackward", gradOutput, inputs[0],
+                MaxPool2DGlobalIndices(maxIndices, inputs[0]._shape), engine, grads))
+            return;
         var grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -1731,7 +1906,7 @@ internal static class BackwardFunctions<T>
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
         Tensor<T> grad;
-        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        if (engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu)
         {
             grad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
             cpu.MaxPool2DBackwardRecomputeInto(grad, gradOutput, inputs[0], poolSize[0], poolSize[1], stride[0], stride[1], accumulate: false);
@@ -1762,7 +1937,7 @@ internal static class BackwardFunctions<T>
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
         int padding = (int)savedState[2];
-        var cpu = engine as CpuEngine ?? new CpuEngine();
+        var cpu = engine.As<CpuEngine>() ?? new CpuEngine();
         Tensor<int> maxIndices;
         using (new NoGradScope<T>())
             cpu.MaxPool2DPaddedWithTensorIndices(inputs[0], poolSize[0], stride[0], padding, out maxIndices);
@@ -1778,6 +1953,9 @@ internal static class BackwardFunctions<T>
         var maxIndices = (Tensor<int>)savedState[0];
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool2DBackward", gradOutput, inputs[0],
+                PlaneTensorIndicesToGlobal(maxIndices, gradOutput._shape, inputs[0]._shape, 2), engine, grads))
+            return;
         var grad = engine.MaxPool2DBackwardWithTensorIndices(
             gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -1795,9 +1973,29 @@ internal static class BackwardFunctions<T>
         var padding = savedState.Length > 2 ? savedState[2] as int[] : null;
         bool countIncludePad = savedState.Length > 3 && savedState[3] is true;
 
+        if (CreatesGraph && AvgPool2DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, padding, poolSize, stride, countIncludePad))
+            return;
+
         var grad = engine.AvgPool2DBackward(gradOutput, inputs[0]._shape, poolSize, stride, padding, countIncludePad);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of AvgPool2DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool AvgPool2DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[]? padding,
+            int[] poolSize,
+            int[] stride,
+            bool countIncludePad)
+        => TryLinearBackward("AvgPool2DBackward", AvgPool2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => padding is null
+                ? e.AvgPool2D(w, poolSize, stride)
+                : e.AvgPool2D(w, poolSize[0], stride[0], padding[0], countIncludePad));
 
     /// <summary>BatchNorm backward: uses engine.BatchNormBackward</summary>
     internal static void BatchNormBackward(
@@ -1808,6 +2006,7 @@ internal static class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[0];
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderBatchNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         var gradInput = engine.BatchNormBackward(
             gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
@@ -1828,7 +2027,7 @@ internal static class BackwardFunctions<T>
     // the only forward whose ReLU mask the backward kernel can rebuild bit for bit from the input.
     // The second gradient contribution a compiled GPU step parked for this output (GradientDeferral), or null.
     private static Tensor<T>? TakeParkedGradient(IEngine engine, Tensor<T> output)
-        => engine is DirectGpuTensorEngine { DeferredGradients: { } deferral } ? deferral.Take(output) : null;
+        => engine.As<DirectGpuTensorEngine>()?.DeferredGradients is { } deferral ? deferral.Take(output) : null;
 
     // The fallback of a backward that could not sum the parked contribution in its kernel: gradOutput + parked, as the
     // accumulation would have added it.
@@ -1850,7 +2049,7 @@ internal static class BackwardFunctions<T>
         var epsilon = (double)savedState[2];
         Tensor<T> gradInput, gradGamma, gradBeta;
         var parked = TakeParkedGradient(engine, output);
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon,
                 out var fusedGamma, out var fusedBeta, MaskFromInput(savedState) ? inputs[2] : null, parked) is { } fusedInput)
         {
@@ -1908,7 +2107,7 @@ internal static class BackwardFunctions<T>
         var epsilon = (double)savedState[2];
         Tensor<T> gradInput, gradGamma, gradBeta, gradResidual;
         var parked = TakeParkedGradient(engine, output);
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon, true,
                 out var fusedGamma, out var fusedBeta, out var fusedResidual, gradOutput2: parked) is { } fusedInput)
         {
@@ -1943,13 +2142,14 @@ internal static class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[0];
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderBatchNormAffine(gradOutput, inputs, engine, grads, mean, variance, epsilon)) return;
 
         Tensor<T> gradInput, gradGamma, gradBeta;
         // DirectGpuTensorEngine inherits CpuEngine, so a bare `is CpuEngine` would silently route
         // a GPU engine into the CPU fused backward (host<->device ping-pong, the worst outcome).
         // Only take the CPU fused kernel for a genuine CPU engine; GPU engines use the
         // engine-generic primitive fallback below, which dispatches each op to the GPU backend.
-        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        if (engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu)
         {
             gradInput = cpu.BatchNormAffineBackward(
                 gradOutput, inputs[0], inputs[1], mean, variance, epsilon, out gradGamma, out gradBeta);
@@ -2000,10 +2200,11 @@ internal static class BackwardFunctions<T>
                 "never populated it before this replay (lazy/compiled-path wiring bug).")
             : (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderLayerNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         // In a resident step the three gradients land in their accumulators directly (the input's added in the same
         // pass when it is not its first contribution, where the backend can).
-        if (engine is DirectGpuTensorEngine gpuNorm
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpuNorm)
             && !DifferentiableOps.IsRecording<T>()
             && !Compilation.GraphMode.IsActive)
         {
@@ -2047,6 +2248,7 @@ internal static class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[1];
         var variance = (Tensor<T>)savedState[2];
         var epsilon = (double)savedState[3];
+        if (TrySecondOrderGroupNorm(gradOutput, inputs, engine, grads, numGroups, epsilon)) return;
 
         var gradInput = engine.GroupNormBackward(
             gradOutput, inputs[0], numGroups, inputs[1], mean, variance, epsilon,
@@ -2064,6 +2266,7 @@ internal static class BackwardFunctions<T>
     {
         var rms = (Tensor<T>)savedState[0];
         var epsilon = (double)savedState[1];
+        if (TrySecondOrderRMSNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         var gradInput = engine.RMSNormBackward(
             gradOutput, inputs[0], inputs[1], rms, epsilon, out var gradGamma);
@@ -2101,6 +2304,7 @@ internal static class BackwardFunctions<T>
         var mean = (Tensor<T>)savedState[0];
         var variance = (Tensor<T>)savedState[1];
         var epsilon = (double)savedState[2];
+        if (TrySecondOrderInstanceNorm(gradOutput, inputs, engine, grads, epsilon)) return;
 
         var gradInput = engine.InstanceNormBackward(
             gradOutput, inputs[0], inputs[1], mean, variance, epsilon,
@@ -2119,9 +2323,17 @@ internal static class BackwardFunctions<T>
         var mask = (Tensor<T>)savedState[0];
         var dropoutRate = (double)savedState[1];
 
-        var grad = engine.DropoutBackward(gradOutput, mask, dropoutRate);
+        var grad = CreatesGraph ? DropoutBackwardCreateGraph(gradOutput, engine, mask, dropoutRate) : engine.DropoutBackward(gradOutput, mask, dropoutRate);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of DropoutBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> DropoutBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            Tensor<T> mask,
+            double dropoutRate)
+        => DiagonalLinearGrad("DropoutBackward", gradOutput, engine, (e, w) => e.DropoutBackward(w, mask, dropoutRate));
 
     /// <summary>Embedding backward: uses engine.EmbeddingBackward</summary>
     internal static void EmbeddingBackward(
@@ -2132,10 +2344,29 @@ internal static class BackwardFunctions<T>
         var vocabSize = (int)savedState[1];
         var embeddingDim = (int)savedState[2];
 
+        // Under create-graph: the scatter-add into the table is linear in the upstream gradient; its adjoint is the
+        // lookup itself.
+        var embeddingGradShape = gradOutput._shape;
+        if (CreatesGraph && EmbeddingBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, indices, embeddingGradShape))
+            return;
+
         var grad = engine.EmbeddingBackward(gradOutput, indices, vocabSize, embeddingDim);
         // Gradient flows to the embedding table (inputs[0])
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of EmbeddingBackward, kept out of it so its first-order path allocates no closure.
+    private static bool EmbeddingBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<int> indices,
+            int[] embeddingGradShape)
+        => TryLinearBackward("EmbeddingBackward", EmbeddingBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => ToShape(e, e.Embedding(indices, w), embeddingGradShape));
 
     /// <summary>
     /// TensorEmbeddingLookup backward: scatter-add gradOutput rows back into
@@ -2178,6 +2409,14 @@ internal static class BackwardFunctions<T>
         var indicesShape = (int[])savedState[1];
         var vocabSize = (int)savedState[2];
         var embeddingDim = (int)savedState[3];
+
+        // Under create-graph: the scatter-add as a recorded sparse map (the sparse-gradient record below is no
+        // tensor of the graph), so the table's gradient stays differentiable.
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], EmbeddingGradRecorded(gradOutput, indicesData, vocabSize, embeddingDim), engine);
+            return;
+        }
 
         var indices = new Tensor<long>(indicesData, indicesShape);
 
@@ -2223,9 +2462,20 @@ internal static class BackwardFunctions<T>
         int vocabSize = (int)savedState[1];
         int embeddingDim = (int)savedState[2];
 
+        // Under create-graph: the table's gradient is a scatter-add of the upstream gradient, as a recorded sparse map
+        // (its own backward is the lookup), so it stays differentiable. The ids get no gradient.
+        if (CreatesGraph)
+        {
+            var ids = RoIAlignPlan.ToDoubles(capturedFloatIdx);
+            var rows = new long[ids.Length];
+            for (int i = 0; i < ids.Length; i++) rows[i] = Convert.ToInt64(ids[i]);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], EmbeddingGradRecorded(gradOutput, rows, vocabSize, embeddingDim), engine);
+            return;
+        }
+
         // PR #638 A1: resident embedding backward — scatter-add into a resident [vocab,dim] table-grad via the
         // forward's stable on-device index buffer, skipping the capturedFloatIdx.GetDataArray() download (CUDA-900).
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deEmb && deEmb.ResidentStepActive)
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deEmb) && deEmb.ResidentStepActive)
         {
             var residentTableGrad = deEmb.TryEmbeddingBackwardResident<T>(
                 gradOutput, capturedFloatIdx.Length, vocabSize, embeddingDim, inputs[0]._shape);
@@ -2239,7 +2489,7 @@ internal static class BackwardFunctions<T>
         // Dense device scatter when no sparse-gradient consumer is wired for this parameter: reads the ids on the
         // device, so neither the ids nor the upstream gradient is downloaded, and the [V, E] result stays resident
         // for accumulation with the other uses of a tied table.
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deFloat
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deFloat)
             && !DifferentiableOps.IsSparseEmbeddingGradWired(inputs[0])
             && deFloat.TryEmbeddingBackwardFromFloatIds(gradOutput, capturedFloatIdx, vocabSize, embeddingDim) is { } deviceTableGrad)
         {
@@ -2330,7 +2580,7 @@ internal static class BackwardFunctions<T>
             return;
         }
 
-        var cpu = engine as CpuEngine ?? new CpuEngine();
+        var cpu = engine.As<CpuEngine>() ?? new CpuEngine();
         var gradValues = cpu.ScatterClassValuesGrad(gradOutput, classIndices, values._shape);
         DifferentiableOps.AccumulateGrad(grads, values, gradValues, engine);
     }
@@ -2365,6 +2615,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var dim = (int)savedState[0];
+        if (TryGatedLinearUnitComposite(gradOutput, inputs, engine, grads, dim, (e, b) => e.GELU(b))) return;
         var grad = engine.GeGLUBackward(gradOutput, inputs[0], dim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -2375,6 +2626,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var dim = (int)savedState[0];
+        if (TryGatedLinearUnitComposite(gradOutput, inputs, engine, grads, dim, (e, b) => e.Swish(b))) return;
         var grad = engine.SwiGLUBackward(gradOutput, inputs[0], dim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -2385,6 +2637,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var dim = (int)savedState[0];
+        if (TryGatedLinearUnitComposite(gradOutput, inputs, engine, grads, dim, (e, b) => e.ReLU(b))) return;
         var grad = engine.ReGLUBackward(gradOutput, inputs[0], dim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -2434,6 +2687,9 @@ internal static class BackwardFunctions<T>
             SoftcappedAttentionBackward(gradOutput, inputs, attentionWeights, scale, softcap, engine, grads);
             return;
         }
+        if (attentionWeights.Length == checked(gradOutput.Length / Math.Max(1, inputs[2]._shape[inputs[2].Rank - 1]) * inputs[1]._shape[inputs[1].Rank - 2])
+            && TrySecondOrderScaledDotProductAttention(gradOutput, inputs, engine, grads, attentionWeights, scale))
+            return;
         engine.ScaledDotProductAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], attentionWeights, scale,
             out var gradQ, out var gradK, out var gradV);
@@ -2488,7 +2744,9 @@ internal static class BackwardFunctions<T>
 
         Tensor<T>? gradFirst = null;
         Tensor<T>? gradSecond = null;
-        using (GradientTape<T>.NoGrad())
+        // Built from engine ops: under create-graph they record (the scope is skipped), so the gradient is itself
+        // differentiable; otherwise recording is suppressed as before.
+        using (CreatesGraph ? null : GradientTape<T>.NoGrad())
         {
             var paddedSecond = engine.Pad(
                 second, radius, radius, radius, radius, numOps.Zero);
@@ -2548,9 +2806,13 @@ internal static class BackwardFunctions<T>
         RequireSavedState(op, savedState, 1);
         bool normalize = SavedBool(op, savedState, 0, "normalize");
 
+        // Under create-graph: differentiate the splat built from recorded ops.
+        if (CreatesGraph && ForwardSplatBackwardCreateGraph(gradOutput, inputs, engine, grads, normalize))
+            return;
+
         Tensor<T> gradInput;
         Tensor<T> gradFlow;
-        if (engine is CpuEngine optimized)
+        if (engine.TryGet<CpuEngine>(out var optimized))
         {
             // The normalization field depends only on flow and is identical for both adjoints.
             // Compute it once instead of launching the full splat-weight pass twice.
@@ -2573,6 +2835,15 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradFlow, engine);
     }
 
+    // The create-graph path of ForwardSplatBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ForwardSplatBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            bool normalize)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e => ForwardSplatRecorded(e, inputs[0], inputs[1], normalize));
+
     /// <summary>
     /// DeformableConv2D backward (DCN v1 / mask=null): routes gradient to
     /// input, kernel, offset. Engine has separate Input/Kernel/Offset
@@ -2588,6 +2859,10 @@ internal static class BackwardFunctions<T>
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (CreatesGraph && DeformableConv2DBackwardCreateGraph(gradOutput, inputs, engine, grads, deformInputs, savedState))
+            return;
 
         var gradInput = engine.DeformableConv2DBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], null, inputs[0]._shape, stride, padding, dilation);
@@ -2599,6 +2874,17 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
     }
+
+    // The create-graph path of DeformableConv2DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool DeformableConv2DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] deformInputs,
+            object[] savedState)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+            deformInputs[2], null, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], 1, 1));
 
     /// <summary>
     /// DeformableConv2D backward WITH modulation mask (DCN v2): routes gradient to input, kernel, offset
@@ -2613,6 +2899,10 @@ internal static class BackwardFunctions<T>
         var padding = (int[])savedState[1];
         var dilation = (int[])savedState[2];
         var mask = inputs[3];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (CreatesGraph && DeformableConv2DBackwardWithMaskCreateGraph(gradOutput, inputs, engine, grads, deformInputs, savedState))
+            return;
 
         var gradInput = engine.DeformableConv2DBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], mask, inputs[0]._shape, stride, padding, dilation);
@@ -2627,6 +2917,17 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[3], gradMask, engine);
     }
+
+    // The create-graph path of DeformableConv2DBackwardWithMask, kept out of it so its first-order path allocates no closure.
+    private static bool DeformableConv2DBackwardWithMaskCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] deformInputs,
+            object[] savedState)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+            deformInputs[2], deformInputs[3], (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], 1, 1));
 
     /// <summary>
     /// Grouped/depthwise DeformableConv2D backward (DCNv3, DCN v1 / mask=null): routes gradient to
@@ -2644,6 +2945,10 @@ internal static class BackwardFunctions<T>
         var dilation = (int[])savedState[2];
         int groups = (int)savedState[3];
         int deformGroups = (int)savedState[4];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (CreatesGraph && DeformableConv2DGroupedBackwardCreateGraph(gradOutput, inputs, engine, grads, deformInputs, savedState))
+            return;
 
         var gradInput = engine.DeformableConv2DGroupedBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], null, inputs[0]._shape, stride, padding, dilation, groups, deformGroups);
@@ -2655,6 +2960,17 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradKernel, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
     }
+
+    // The create-graph path of DeformableConv2DGroupedBackward, kept out of it so its first-order path allocates no closure.
+    private static bool DeformableConv2DGroupedBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] deformInputs,
+            object[] savedState)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+            deformInputs[2], null, (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], (int)savedState[3], (int)savedState[4]));
 
     /// <summary>
     /// Grouped DeformableConv2D backward WITH modulation mask (DCN v2 / v3): routes gradient to
@@ -2671,6 +2987,10 @@ internal static class BackwardFunctions<T>
         int groups = (int)savedState[3];
         int deformGroups = (int)savedState[4];
         var mask = inputs[3];
+        // Under create-graph: differentiate the sampling as recorded ops (the backward kernels record nothing).
+        var deformInputs = inputs;
+        if (CreatesGraph && DeformableConv2DGroupedBackwardWithMaskCreateGraph(gradOutput, inputs, engine, grads, deformInputs, savedState))
+            return;
 
         var gradInput = engine.DeformableConv2DGroupedBackwardInput(
             gradOutput, inputs[0], inputs[1], inputs[2], mask, inputs[0]._shape, stride, padding, dilation, groups, deformGroups);
@@ -2685,6 +3005,17 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradOffset, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[3], gradMask, engine);
     }
+
+    // The create-graph path of DeformableConv2DGroupedBackwardWithMask, kept out of it so its first-order path allocates no closure.
+    private static bool DeformableConv2DGroupedBackwardWithMaskCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] deformInputs,
+            object[] savedState)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e => DeformableConvRecorded(e, deformInputs[0], deformInputs[1],
+            deformInputs[2], deformInputs[3], (int[])savedState[0], (int[])savedState[1], (int[])savedState[2], (int)savedState[3], (int)savedState[4]));
 
     /// <summary>
     /// GraphAttention backward: dL flows to nodeFeatures + the two attention
@@ -2704,6 +3035,10 @@ internal static class BackwardFunctions<T>
         var tgtShape = (int[])savedState[3];
         var attentionCoeffs = (Tensor<T>)savedState[4];
         var leakyReluAlpha = (double)savedState[5];
+        // Under create-graph: differentiate the attention as recorded ops (the backward kernel records nothing).
+        var gatInputs = inputs;
+        if (CreatesGraph && GraphAttentionBackwardCreateGraph(gradOutput, inputs, engine, grads, gatInputs, srcData, tgtData, leakyReluAlpha))
+            return;
         var edgeSrc = new Tensor<int>(srcData, srcShape);
         var edgeTgt = new Tensor<int>(tgtData, tgtShape);
         // inputs[0]=nodeFeatures, inputs[1]=attnWeightSource, inputs[2]=attnWeightTarget
@@ -2715,6 +3050,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradAttnTgt, engine);
     }
 
+    // The create-graph path of GraphAttentionBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GraphAttentionBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] gatInputs,
+            int[] srcData,
+            int[] tgtData,
+            double leakyReluAlpha)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => GraphAttentionRecorded(e, gatInputs[0], srcData, tgtData, gatInputs[1], gatInputs[2], leakyReluAlpha));
+
     /// <summary>GroupedQueryAttention backward.</summary>
     internal static void GroupedQueryAttentionBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -2723,6 +3071,13 @@ internal static class BackwardFunctions<T>
         var attentionWeights = (Tensor<T>)savedState[0];
         var numQueriesPerKV = (int)savedState[1];
         var scale = (double)savedState[2];
+        // Under create-graph: differentiate the attention as recorded ops (the fused backward kernel records nothing).
+        // The forward saves no causal flag; its masked positions are exactly the zero attention weights, which become
+        // a constant additive mask.
+        var gqaInputs = inputs;
+        if (CreatesGraph
+            && CreatesGraph && GroupedQueryAttentionBackwardCreateGraph(gradOutput, inputs, engine, grads, gqaInputs, scale, attentionWeights, numQueriesPerKV))
+            return;
         engine.GroupedQueryAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], attentionWeights, numQueriesPerKV, scale,
             out var gradQ, out var gradK, out var gradV);
@@ -2730,6 +3085,20 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradK, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradV, engine);
     }
+
+    // The create-graph path of GroupedQueryAttentionBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GroupedQueryAttentionBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] gqaInputs,
+            double scale,
+            Tensor<T> attentionWeights,
+            int numQueriesPerKV)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => AttentionRecorded(e, gqaInputs[0], gqaInputs[1], gqaInputs[2], scale, false,
+                MaskFromZeroWeights(attentionWeights), numQueriesPerKV));
 
     /// <summary>
     /// FlashAttention backward: engine kernel uses softmaxStats (LSE per row)
@@ -2748,6 +3117,10 @@ internal static class BackwardFunctions<T>
         var scale = (double)savedState[1];
         var isCausal = (bool)savedState[2];
         Tensor<T>? attentionBias = savedState.Length > 3 && savedState[3] is Tensor<T> b ? b : null;
+        // Under create-graph: differentiate the attention as recorded ops (the fused backward kernel records nothing).
+        var flashInputs = inputs;
+        if (CreatesGraph && FlashAttentionBackwardCreateGraph(gradOutput, inputs, engine, grads, flashInputs, scale, isCausal, attentionBias))
+            return;
         engine.FlashAttentionBackward(
             gradOutput, inputs[0], inputs[1], inputs[2], output, softmaxStats, scale, isCausal,
             out var gradQ, out var gradK, out var gradV, attentionBias);
@@ -2755,6 +3128,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradK, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[2], gradV, engine);
     }
+
+    // The create-graph path of FlashAttentionBackward, kept out of it so its first-order path allocates no closure.
+    private static bool FlashAttentionBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] flashInputs,
+            double scale,
+            bool isCausal,
+            Tensor<T>? attentionBias)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => AttentionRecorded(e, flashInputs[0], flashInputs[1], flashInputs[2], scale, isCausal, attentionBias, 1));
 
     // ──────────────────────────────────────────────────────────────
     // Reduction operations
@@ -2773,13 +3159,42 @@ internal static class BackwardFunctions<T>
         // generic expand-and-tile below took the host path. No axes (a traced full sum records none) means every axis,
         // as the tiling below treats it.
         var reducedAxes = axes.Length == 0 ? Enumerable.Range(0, inputShape.Length).ToArray() : axes;
+        if (CreatesGraph)
+        {
+            // The broadcast of the upstream gradient is linear in it; its adjoint is this same sum. Recorded so a
+            // full sum's gradient (a host fill of one scalar below) stays connected under create-graph.
+            var gradOutputShape = gradOutput._shape;
+            var connected = CreatesGraph ? ReduceSumBackwardCreateGraph(gradOutput, axes, keepDims, inputShape, engine, reducedAxes, gradOutputShape) : BroadcastReducedGradient(gradOutput, axes, keepDims, inputShape, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], connected, engine);
+            return;
+        }
         if (TryReducedGradientInto(gradOutput, inputs[0], reducedAxes, mean: false, engine, grads)) return;
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryBroadcastReducedGradient(gradOutput, inputShape, reducedAxes, 1f) is { } onDevice)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryBroadcastReducedGradient(gradOutput, inputShape, reducedAxes, 1f) is { } onDevice)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], onDevice, engine);
             return;
         }
 
+        var grad = BroadcastReducedGradient(gradOutput, axes, keepDims, inputShape, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    // The create-graph path of ReduceSumBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> ReduceSumBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            int[] axes,
+            bool keepDims,
+            int[] inputShape,
+            IEngine engine,
+            int[] reducedAxes,
+            int[] gradOutputShape)
+        => LinearGrad("ReduceSumBackward", gradOutput,
+            () => BroadcastReducedGradient(gradOutput, axes, keepDims, inputShape, engine),
+            (e, w) => ToShape(e, e.ReduceSum(w, reducedAxes, keepDims: true), gradOutputShape));
+
+    // A sum's upstream gradient broadcast back over the reduced axes.
+    private static Tensor<T> BroadcastReducedGradient(Tensor<T> gradOutput, int[] axes, bool keepDims, int[] inputShape, IEngine engine)
+    {
         // If keepDims was false, we need to reinsert singleton dimensions at the reduced axes
         // so we can broadcast back to the original shape
         var expandedGrad = gradOutput;
@@ -2794,8 +3209,7 @@ internal static class BackwardFunctions<T>
         }
 
         // Now expandedGrad has the same rank as input with size-1 at reduced dims — tile to match
-        var grad = BroadcastGradToShape(expandedGrad, inputShape, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        return BroadcastGradToShape(expandedGrad, inputShape, engine);
     }
 
     /// <summary>
@@ -2805,7 +3219,7 @@ internal static class BackwardFunctions<T>
     private static bool TryReducedGradientInto(Tensor<T> gradOutput, Tensor<T> input, int[] axes, bool mean,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is not DirectGpuTensorEngine gpu || DifferentiableOps.IsRecording<T>() || Compilation.GraphMode.IsActive
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu) || DifferentiableOps.IsRecording<T>() || Compilation.GraphMode.IsActive
             || DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add) is not { } into || add)
             return false;
         float scale = 1f;
@@ -2826,10 +3240,32 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axes = (int[])savedState[0];
+        if (CreatesGraph)
+        {
+            // Linear in the upstream gradient; the adjoint of the scaled broadcast is this same mean.
+            var inputShape = inputs[0]._shape;
+            var meanAxes = axes.Length == 0 ? Enumerable.Range(0, inputShape.Length).ToArray() : axes;
+            var gradOutputShape = gradOutput._shape;
+            var connected = CreatesGraph ? ReduceMeanBackwardCreateGraph(gradOutput, engine, inputShape, axes, meanAxes, gradOutputShape) : engine.ReduceMeanBackward(gradOutput, inputShape, axes);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], connected, engine);
+            return;
+        }
         if (TryReducedGradientInto(gradOutput, inputs[0], axes, mean: true, engine, grads)) return;
         var grad = engine.ReduceMeanBackward(gradOutput, inputs[0]._shape, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ReduceMeanBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> ReduceMeanBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            int[] inputShape,
+            int[] axes,
+            int[] meanAxes,
+            int[] gradOutputShape)
+        => LinearGrad("ReduceMeanBackward", gradOutput,
+            () => engine.ReduceMeanBackward(gradOutput, inputShape, axes),
+            (e, w) => ToShape(e, e.ReduceMean(w, meanAxes, keepDims: true), gradOutputShape));
 
     // ──────────────────────────────────────────────────────────────
     // Shape operations
@@ -2843,6 +3279,11 @@ internal static class BackwardFunctions<T>
         var start = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
 
+        var sliceLength = (int[])gradOutput._shape.Clone();
+        if (gradOutput.Length > 0 && gradOutput.Rank == inputShape.Length
+            && CreatesGraph && SliceBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, start, sliceLength))
+            return;
+
         // An empty slice selected no element, so the input's gradient from it is zero everywhere. Handled here so no
         // device or region path is handed a zero-element gradient.
         if (gradOutput.Length == 0)
@@ -2851,7 +3292,7 @@ internal static class BackwardFunctions<T>
             return;
         }
 
-        if (engine is DirectGpuTensorEngine gpu && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
@@ -2896,6 +3337,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    // The create-graph path of SliceBackward, kept out of it so its first-order path allocates no closure.
+    private static bool SliceBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] start,
+            int[] sliceLength)
+        => TryLinearBackward("SliceBackward", SliceBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorSlice(w, start, sliceLength));
+
     /// <summary>Gather backward: scatter grad to source positions</summary>
     internal static void GatherBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -2903,6 +3357,14 @@ internal static class BackwardFunctions<T>
     {
         var indices = (Tensor<int>)savedState[0];
         var axis = (int)savedState[1];
+
+        // Under create-graph: the scatter-add of the upstream gradient as a recorded sparse map (its own backward is the
+        // gather), so the gradient stays differentiable. The sparse-embedding path below records no dense gradient.
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], GatherGradRecorded(gradOutput, indices, axis, inputs[0]._shape), engine);
+            return;
+        }
 
         // An axis-0 gather with multi-dimensional indices: flatten the indices to [count] and the gradient to
         // [count, source.shape[1..]] before scattering. The forward's own output shape varies by path (the CPU fast
@@ -3021,6 +3483,21 @@ internal static class BackwardFunctions<T>
         // output is a larger scattered buffer (e.g. [4,8] -> [6,8]), so d/d(source) must GATHER the rows
         // back from the scattered positions — passing gradOutput through would have been both the wrong
         // shape and the wrong value.
+        // The UNARY form reads one index per source slice along the axis, index[d % index.Length] (an index shaped like
+        // the source, as torch_scatter callers pass, is read by its leading entries). Gathering with the whole index
+        // gave a gradient of the index's length instead of the source's along that axis.
+        if (inputs.Length == 1)
+        {
+            int ax = axis < 0 ? axis + inputs[0].Rank : axis;
+            int slices = inputs[0]._shape[ax];
+            if (indices.Rank != 1 || indices.Length != slices)
+            {
+                var idx = indices.GetFlattenedData();
+                var perSlice = new int[slices];
+                for (int d = 0; d < slices; d++) perSlice[d] = idx[d % idx.Length];
+                indices = new Tensor<int>(perSlice, new[] { slices });
+            }
+        }
         var gradGathered = engine.TensorGather(gradOutput, indices, axis);
 
         if (inputs.Length > 1)
@@ -3050,7 +3527,7 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradDestination, engine);
         var gradSource = engine.TensorTakeAlongDim(gradOutput, indices, axis);
         // A GPU engine finds the overwritten writes on the device; the host scan is for host engines.
-        var lastWrites = engine is DirectGpuTensorEngine gpu
+        var lastWrites = engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             ? gpu.TryScatterLastWriteMask<T>(indices, axis, output._shape) ?? ScatterLastWriteMask(indices, axis)
             : ScatterLastWriteMask(indices, axis);
         if (lastWrites is not null)
@@ -3263,7 +3740,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.SeluBackward(gradOutput, inputs[0]);
+        // Under create-graph: g ⊙ (x > 0 ? λ : λα·eˣ) with the branch mask constant and eˣ recorded.
+        var grad = CreatesGraph
+            ? engine.TensorMultiply(gradOutput, SeluDerivativeRecorded(engine, inputs[0]))
+            : engine.SeluBackward(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -3272,22 +3752,27 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.HardsigmoidBackward(gradOutput, inputs[0]);
+        // A fixed (x-dependent) mask of the upstream gradient: self-adjoint, recorded under create-graph.
+        var x = inputs[0];
+        var grad = CreatesGraph ? HardSigmoidBackwardCreateGraph(gradOutput, engine, x) : engine.HardsigmoidBackward(gradOutput, x);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
-    /// <summary>d(hardswish(x))/dx</summary>
+    // The create-graph path of HardSigmoidBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> HardSigmoidBackwardCreateGraph(Tensor<T> gradOutput, IEngine engine, Tensor<T> x)
+        => DiagonalLinearGrad("HardsigmoidBackward", gradOutput, engine, (e, w) => e.HardsigmoidBackward(w, x));
+
+    /// <summary>
+    /// d(hardswish(x))/dx = 0 for x &lt; -3, x/3 + 1/2 for -3 ≤ x ≤ 3, 1 for x &gt; 3 (torch's hardswish_backward).
+    /// </summary>
     internal static void HardSwishBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        // derivative = clamp((2x+3)/6, 0, 1) — use engine ops for graph recording
-        var twoX = engine.TensorMultiplyScalar(inputs[0], numOps.FromDouble(2.0));
-        var twoXPlus3 = engine.TensorAddScalar(twoX, numOps.FromDouble(3.0));
-        var scaled = engine.TensorDivideScalar(twoXPlus3, numOps.FromDouble(6.0));
-        var clamped = engine.TensorClamp(scaled, numOps.Zero, numOps.One);
-        var grad = engine.TensorMultiply(gradOutput, clamped);
+        // The derivative used to be clamp((2x+3)/6, 0, 1), which is wrong on [-3, -1.5) (it gave 0 where the slope is
+        // negative) and on (1.5, 3] (1 where it is up to 1.5). Recorded ops with constant region masks, so the
+        // second derivative (1/3 inside the ramp) follows under create-graph.
+        var grad = engine.TensorMultiply(gradOutput, HardSwishDerivativeRecorded(engine, inputs[0]));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -3296,9 +3781,14 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.Relu6Backward(gradOutput, inputs[0]);
+        var x = inputs[0];
+        var grad = CreatesGraph ? ReLU6BackwardCreateGraph(gradOutput, engine, x) : engine.Relu6Backward(gradOutput, x);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ReLU6Backward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> ReLU6BackwardCreateGraph(Tensor<T> gradOutput, IEngine engine, Tensor<T> x)
+        => DiagonalLinearGrad("Relu6Backward", gradOutput, engine, (e, w) => e.Relu6Backward(w, x));
 
     /// <summary>Concatenate backward: split gradient along concat axis</summary>
     internal static void ConcatenateBackward(
@@ -3317,7 +3807,7 @@ internal static class BackwardFunctions<T>
             start[axis] = offset;
             length[axis] = size;
             // In a resident step a first contribution is gathered straight into the input's gradient accumulator.
-            if (engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
+            if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive
                 && DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[i], engine, out bool add) is { } into && !add
                 && gpu.TryRectSliceInto(gradOutput, start, length, into))
             {
@@ -3339,6 +3829,10 @@ internal static class BackwardFunctions<T>
         int[] stride = (int[])savedState[0];
         int[] padding = (int[])savedState[1];
 
+        var outputPadding2D = TransposedConvOutputPadding(gradOutput._shape, inputs[0]._shape, inputs[1]._shape, stride, padding);
+        if (CreatesGraph && ConvTranspose2DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding, outputPadding2D))
+            return;
+
         var inputGrad = engine.ConvTranspose2DBackwardInput(gradOutput, inputs[1],
             inputs[0]._shape, stride, padding);
         var kernelGrad = engine.ConvTranspose2DBackwardKernel(gradOutput, inputs[0],
@@ -3348,13 +3842,32 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], kernelGrad, engine);
     }
 
+    // The create-graph path of ConvTranspose2DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ConvTranspose2DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] stride,
+            int[] padding,
+            int[] outputPadding2D)
+        => TryMultilinearBackward("ConvTranspose2D", ConvTranspose2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.ConvTranspose2D(x[0], x[1], stride, padding, outputPadding2D));
+
     /// <summary>Mean backward (global): gradient is 1/n for all elements</summary>
     internal static void MeanBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Under create-graph: the fill of g/n is linear in g (read on the host below); its adjoint is the mean itself.
+        var meanOutputShape = gradOutput._shape;
+        var meanAxes = Enumerable.Range(0, inputs[0].Rank).ToArray();
+        if (CreatesGraph && MeanBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, meanAxes, meanOutputShape))
+            return;
         // On the GPU engine build gradOutput/n on the device: gradOutput[0] below is a blocking readback.
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryScaleByDeviceScalar<T>(null, inputs[0]._shape, gradOutput, 1f / inputs[0].Length) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -3378,6 +3891,19 @@ internal static class BackwardFunctions<T>
         engine.TensorFill(grad, scale);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of MeanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool MeanBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] meanAxes,
+            int[] meanOutputShape)
+        => TryLinearBackward("MeanBackward", MeanBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => ToShape(e, e.ReduceMean(w, meanAxes, keepDims: false), meanOutputShape));
 
     // ──────────────────────────────────────────────────────────────
     // Batch 2: Bmm, Upsample, AdaptivePool, Tile, PReLU, Threshold
@@ -3424,9 +3950,24 @@ internal static class BackwardFunctions<T>
     {
         int scaleH = (int)savedState[0];
         int scaleW = (int)savedState[1];
+        if (CreatesGraph && UpsampleBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, scaleH, scaleW))
+            return;
         var inputGrad = engine.UpsampleBackward(gradOutput, inputs[0]._shape, scaleH, scaleW);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
+
+    // The create-graph path of UpsampleBackward, kept out of it so its first-order path allocates no closure.
+    private static bool UpsampleBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int scaleH,
+            int scaleW)
+        => TryLinearBackward("UpsampleBackward", UpsampleBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.Upsample(v, scaleH, scaleW));
 
     /// <summary>AdaptiveAvgPool2D backward: distribute gradient evenly over adaptive windows</summary>
     internal static void AdaptiveAvgPool2DBackward(
@@ -3438,7 +3979,10 @@ internal static class BackwardFunctions<T>
         int batch = inShape[0], channels = inShape[1], inH = inShape[2], inW = inShape[3];
         int outH = (int)savedState[0], outW = (int)savedState[1];
 
-        if (engine is DirectGpuTensorEngine gpu
+        if (CreatesGraph && AdaptiveAvgPool2DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, outH, outW))
+            return;
+
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryAdaptiveAvgPool2DBackwardOnDevice(gradOutput, inShape, outH, outW) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -3498,6 +4042,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
+    // The create-graph path of AdaptiveAvgPool2DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool AdaptiveAvgPool2DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int outH,
+            int outW)
+        => TryLinearBackward("AdaptiveAvgPool2DBackward", AdaptiveAvgPool2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.AdaptiveAvgPool2D(v, outH, outW));
+
     /// <summary>Tile backward: sum gradient from all repeated positions back to source</summary>
     internal static void TileBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -3507,6 +4064,14 @@ internal static class BackwardFunctions<T>
         var inShape = inputs[0]._shape;
         var outShape = gradOutput._shape;
         int totalOut = gradOutput.Length;
+
+        if (outShape.Length == inShape.Length)
+        {
+            var multiples = new int[inShape.Length];
+            for (int d = 0; d < multiples.Length; d++) multiples[d] = inShape[d] == 0 ? 1 : outShape[d] / inShape[d];
+            if (CreatesGraph && TileBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, multiples))
+                return;
+        }
 
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int flat = 0; flat < totalOut; flat++)
@@ -3528,15 +4093,43 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
+    // The create-graph path of TileBackward, kept out of it so its first-order path allocates no closure.
+    private static bool TileBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] multiples)
+        => TryLinearBackward("TileBackward", TileBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorTile(w, multiples));
+
     /// <summary>PReLU backward: dx = grad if x >= 0, alpha*grad if x < 0; dalpha = x*grad where x < 0</summary>
     internal static void PReLUBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Under create-graph: differentiate x·[x ≥ 0] + α̃·x·[x < 0] as recorded ops (α̃ the slope routed to each
+        // element's channel, a recorded gather), so both gradients stay connected to g, x and α.
+        var x = inputs[0];
+        var slope = inputs[1];
+        if (CreatesGraph && PReLUBackwardCreateGraph(gradOutput, inputs, engine, grads, x, slope))
+            return;
         var (inputGrad, alphaGrad) = engine.PReLUBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], alphaGrad, engine);
     }
+
+    // The create-graph path of PReLUBackward, kept out of it so its first-order path allocates no closure.
+    private static bool PReLUBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> x,
+            Tensor<T> slope)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e => PReluRecorded(e, x, slope));
 
     /// <summary>Threshold backward: gradient passes through where x > threshold</summary>
     internal static void ThresholdBackward(
@@ -3544,18 +4137,42 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         double threshold = (double)savedState[0];
-        var grad = engine.ThresholdBackward(gradOutput, inputs[0], threshold);
+        var x = inputs[0];
+        var grad = CreatesGraph ? ThresholdBackwardCreateGraph(gradOutput, engine, x, threshold) : engine.ThresholdBackward(gradOutput, x, threshold);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ThresholdBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> ThresholdBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            Tensor<T> x,
+            double threshold)
+        => DiagonalLinearGrad("ThresholdBackward", gradOutput, engine, (e, w) => e.ThresholdBackward(w, x, threshold));
 
     /// <summary>Flatten backward: reshape gradient back to input shape</summary>
     internal static void FlattenBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        var gradOutputShape = gradOutput._shape;
+        if (CreatesGraph && FlattenBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, gradOutputShape))
+            return;
         var grad = engine.Reshape(gradOutput, inputs[0]._shape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of FlattenBackward, kept out of it so its first-order path allocates no closure.
+    private static bool FlattenBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] gradOutputShape)
+        => TryLinearBackward("FlattenBackward", FlattenBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.Reshape(w, gradOutputShape));
 
     /// <summary>Narrow/slice backward: put gradient back at sliced position, zero elsewhere</summary>
     internal static void NarrowBackward(
@@ -3567,9 +4184,12 @@ internal static class BackwardFunctions<T>
         int length = (int)savedState[2];
         var inShape = inputs[0]._shape;
 
+        if (CreatesGraph && NarrowBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, dim, start, length))
+            return;
+
         // On the GPU engine keep the gradient on the device: the host slab copy below reads gradOutput through a
         // span (a download of a resident gradient) and returns a host tensor, per narrow, per backward.
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryNarrowBackwardOnDevice(gradOutput, inShape, dim, start, length) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -3644,17 +4264,32 @@ internal static class BackwardFunctions<T>
         return gradient;
     }
 
+    // The create-graph path of NarrowBackward, kept out of it so its first-order path allocates no closure.
+    private static bool NarrowBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int dim,
+            int start,
+            int length)
+        => TryLinearBackward("NarrowBackward", NarrowBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorNarrow(w, dim, start, length));
+
     /// <summary>MSE loss backward: d(MSE)/d(pred) = 2*(pred-target)/n</summary>
     internal static void MSELossBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderMSELoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var predictions = inputs[0];
         var targets = inputs[1];
         var diff = engine.TensorSubtract(predictions, targets);
         // On the GPU engine scale by the upstream gradient on the device: gradOutput[0] is a blocking readback.
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, predictions, deviceGrad, engine);
@@ -3688,7 +4323,7 @@ internal static class BackwardFunctions<T>
         bool needPredictions = DifferentiableOps.IsGradientRequired(predictions);
         bool needTargets = DifferentiableOps.IsGradientRequired(targets);
         if (!needPredictions && !needTargets) return;
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryFusedMseLossBackward(gradOutput, predictions, targets, needTargets, out var deviceTargetGrad) is { } devicePredGrad)
         {
             if (needPredictions) DifferentiableOps.AccumulateGrad(grads, predictions, devicePredGrad, engine);
@@ -3698,7 +4333,7 @@ internal static class BackwardFunctions<T>
 
         var diff = engine.TensorSubtract(predictions, targets);
         Tensor<T> predGrad;
-        if (engine is DirectGpuTensorEngine scaleGpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var scaleGpu)
             && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
         {
             predGrad = deviceScaled;
@@ -3738,7 +4373,7 @@ internal static class BackwardFunctions<T>
         bool needB = b is not null && DifferentiableOps.IsGradientRequired(b);
         bool needY = DifferentiableOps.IsGradientRequired(y);
         if (!needX && !needW && !needB && !needY) return;
-        if (!needY && engine is DirectGpuTensorEngine gpu && !DifferentiableOps.IsRecording<T>()
+        if (!needY && engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>()
             && gpu.TryFusedLinearMseLossBackward(gradOutput, x, w, b, y, out var gradX, out var gradW, out var gradB))
         {
             if (needX) DifferentiableOps.AccumulateGrad(grads, x, gradX!, engine);
@@ -3750,7 +4385,7 @@ internal static class BackwardFunctions<T>
         var predictions = engine.FusedLinear(x, w, b, FusedActivationType.None);
         var diff = engine.TensorSubtract(predictions, y);
         Tensor<T> predGrad;
-        if (engine is DirectGpuTensorEngine scaleGpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var scaleGpu)
             && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
         {
             predGrad = deviceScaled;
@@ -3777,6 +4412,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBCEWithLogitsLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var logits = inputs[0];
         var targets = inputs[1];
@@ -3803,6 +4439,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderCrossEntropyLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var logits = inputs[0];
         var targets = inputs[1];
@@ -3900,6 +4537,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderL1Loss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
         // One path for every element type, Half and BFloat16 included, through engine ops that stay on the device: the
@@ -3922,6 +4560,7 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
         double delta = (double)savedState[0];
+        if (TrySecondOrderHuberLoss(gradOutput, inputs, engine, grads, delta)) return;
         if (LowPrecisionGradients.Applies<T>())
         {
             // Half/BFloat16: clamp(p - y, -delta, delta) g / n in float32, rounded once.
@@ -3945,6 +4584,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderKLDivLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
         // d(KL)/d(input) = -target / N * gradOutput[0]
@@ -3967,6 +4607,7 @@ internal static class BackwardFunctions<T>
     {
         // NLL backward is inherently index-based (scatter -scale at target class positions).
         // No element-wise engine op can express this — same as PyTorch's implementation.
+        if (TrySecondOrderNLLLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var targetTensor = inputs[1];
         int n = inputs[0].Shape[0];
@@ -3993,6 +4634,8 @@ internal static class BackwardFunctions<T>
         int h = inShape[^2], w = inShape[^1];
         var goShape = gradOutput._shape;
         int outH = goShape[^2], outW = goShape[^1];
+        if (CreatesGraph && UpsampleBilinearBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, outH, outW))
+            return;
         int batchChannels = 1;
         for (int i = 0; i < inShape.Length - 2; i++) batchChannels *= inShape[i];
 
@@ -4022,6 +4665,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
+    // The create-graph path of UpsampleBilinearBackward, kept out of it so its first-order path allocates no closure.
+    private static bool UpsampleBilinearBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int outH,
+            int outW)
+        => TryLinearBackward("UpsampleBilinearBackward", UpsampleBilinearBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.TensorUpsampleBilinear(v, new[] { outH, outW }));
+
     /// <summary>ConstantPad backward: extract unpadded region from gradient</summary>
     internal static void ConstantPadBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -4029,6 +4685,9 @@ internal static class BackwardFunctions<T>
     {
         int[] padding = (int[])savedState[0];
         var inShape = inputs[0]._shape;
+        // The pad's constant only shifts the output; its linear part is a zero pad.
+        if (CreatesGraph && ConstantPadBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, padding))
+            return;
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
         var outShape = gradOutput._shape;
 
@@ -4068,6 +4727,18 @@ internal static class BackwardFunctions<T>
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
+
+    // The create-graph path of ConstantPadBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ConstantPadBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] padding)
+        => TryLinearBackward("ConstantPadBackward", ConstantPadBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorConstantPad(w, padding, MathHelper.GetNumericOperations<T>().Zero));
 
     /// <summary>RReLU backward</summary>
     internal static void RReLUBackward(
@@ -4246,6 +4917,26 @@ internal static class BackwardFunctions<T>
         }
         T scale = numOps.FromDouble(1.0 / kernelSize);
 
+        if (CreatesGraph)
+        {
+            // The same window average as a recorded sparse map (its adjoint, the window gather, is recorded too).
+            var to = new List<int>();
+            var from = new List<int>();
+            var coef = new List<double>();
+            for (int b = 0; b < batch; b++)
+            for (int c = 0; c < channels; c++)
+            for (int o = 0; o < outLength; o++)
+            for (int k = 0; k < kernelSize; k++)
+            {
+                to.Add((b * channels + c) * length + o * stride + k);
+                from.Add((b * channels + c) * outLength + o);
+                coef.Add(1.0 / kernelSize);
+            }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                SparseMap(gradOutput, (int[])inShape.Clone(), to.ToArray(), from.ToArray(), coef.ToArray()), engine);
+            return;
+        }
+
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int b = 0; b < batch; b++)
         for (int c = 0; c < channels; c++)
@@ -4268,7 +4959,15 @@ internal static class BackwardFunctions<T>
         // Argmax indices are flat offsets — scatter gradient to those positions
         // Use engine ops: create zeros, then add gradient at argmax positions
         var numOps = MathHelper.GetNumericOperations<T>();
-        int[] argmax = (int[])savedState[0];
+        // A compiled graph's node saves only (kernelSize, stride): find the winners again from the input.
+        int[] argmax = savedState[0] is int[] saved
+            ? saved
+            : MaxPool1DArgmax(inputs[0], (int)savedState[0], (int)savedState[1]);
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], ArgmaxScatterRecorded(gradOutput, inputs[0]._shape, argmax), engine);
+            return;
+        }
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         using var gradDataLease = gradOutput.Lease();
@@ -4323,6 +5022,11 @@ internal static class BackwardFunctions<T>
         int modeRaw = SavedInt(nameof(ScatterReduceBackward), savedState, 2, "mode");
         bool includeSelf = SavedBool(nameof(ScatterReduceBackward), savedState, 3, "includeSelf");
         var mode = (ScatterReduceMode)modeRaw;
+
+        // Sum and mean are jointly linear in (tensor, source) for fixed indices: the adjoint is the reduce itself.
+        if ((mode == ScatterReduceMode.Sum || mode == ScatterReduceMode.Mean)
+            && CreatesGraph && ScatterReduceBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, dim, idxData, mode, includeSelf))
+            return;
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var tensor = inputs[0];
@@ -4413,6 +5117,59 @@ internal static class BackwardFunctions<T>
             }
         }
 
+        if (CreatesGraph && (isMinMax || mode == ScatterReduceMode.Prod))
+        {
+            // amin/amax: the upstream gradient routed to each slot's winner (fixed by the forward), as recorded sparse
+            // maps. prod: each factor's gradient is g·out/factor as recorded ops; zero factors instead use
+            // prefix/suffix products so mixed derivatives remain connected without division by zero.
+            bool anyZero = false;
+            for (int i = 0; i < dstLen && !anyZero; i++) anyZero = zeroCount[i] > 0;
+            if (!isMinMax && anyZero)
+            {
+                ScatterReduceProdWithZerosRecorded(gradOutput, tensor, source, idxData, includeSelf,
+                    outerSize, innerSize, dstAxis, srcAxis, engine, grads);
+                return;
+            }
+            if (isMinMax || !anyZero)
+            {
+                var keep = new List<int>();
+                for (int i = 0; i < dstLen; i++)
+                    if (selfParticipates[i] && (!isMinMax || winner[i] == -1)) keep.Add(i);
+                var srcTo = new List<int>();
+                var srcFrom = new List<int>();
+                for (int outer = 0; outer < outerSize; outer++)
+                {
+                    int outerBase = outer * dstAxis * innerSize;
+                    for (int i = 0; i < srcAxis; i++)
+                    {
+                        int srcBase = outer * srcAxis * innerSize + i * innerSize;
+                        for (int inner = 0; inner < innerSize; inner++)
+                        {
+                            int flatSrc = srcBase + inner;
+                            int target = idxData[flatSrc];
+                            if (target < 0 || target >= dstAxis) continue;
+                            int dstPos = outerBase + target * innerSize + inner;
+                            if (isMinMax && winner[dstPos] != flatSrc) continue;
+                            srcTo.Add(flatSrc);
+                            srcFrom.Add(dstPos);
+                        }
+                    }
+                }
+                var kept = keep.ToArray();
+                var routed = isMinMax ? gradOutput : engine.TensorMultiply(gradOutput, output);
+                var tensorGrad = SparseMap(routed, (int[])shape.Clone(), kept, kept, null);
+                var sourceGrad = SparseMap(routed, (int[])source._shape.Clone(), srcTo.ToArray(), srcFrom.ToArray(), null);
+                if (!isMinMax)
+                {
+                    tensorGrad = engine.TensorDivide(tensorGrad, tensor);
+                    sourceGrad = engine.TensorDivide(sourceGrad, source);
+                }
+                DifferentiableOps.AccumulateGrad(grads, tensor, tensorGrad, engine);
+                DifferentiableOps.AccumulateGrad(grads, source, sourceGrad, engine);
+                return;
+            }
+        }
+
         var gradTensor = TensorPool<T>.RentZeroed(shape);
         var gradSource = TensorPool<T>.RentZeroed(source._shape);
 
@@ -4463,6 +5220,22 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
     }
 
+    // The create-graph path of ScatterReduceBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ScatterReduceBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int dim,
+            int[] idxData,
+            ScatterReduceMode mode,
+            bool includeSelf)
+        => TryJointlyLinearBackward("ScatterReduceBackward", ScatterReduceBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorScatterReduce(xs[0], dim, new Tensor<int>((int[])idxData.Clone(), (int[])inputs[1]._shape.Clone()),
+                xs[1], mode, includeSelf));
+
     /// <summary>
     /// Product of every factor in a slot EXCEPT <paramref name="factor"/>, derived from the slot's
     /// non-zero product and zero count so that a zero factor never causes a division by zero.
@@ -4490,6 +5263,8 @@ internal static class BackwardFunctions<T>
         RequireSavedState(nameof(SelectScatterBackward), savedState, 2);
         int dim = SavedInt(nameof(SelectScatterBackward), savedState, 0, "dim");
         int index = SavedInt(nameof(SelectScatterBackward), savedState, 1, "index");
+        if (CreatesGraph && SelectScatterBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, dim, index))
+            return;
 
         var tensor = inputs[0];
         var source = inputs[1];
@@ -4518,6 +5293,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
     }
 
+    // The create-graph path of SelectScatterBackward, kept out of it so its first-order path allocates no closure.
+    private static bool SelectScatterBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int dim,
+            int index)
+        => TryJointlyLinearBackward("SelectScatterBackward", SelectScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorSelectScatter(xs[0], xs[1], dim, index));
+
     /// <summary>
     /// SliceScatter backward: as <see cref="SelectScatterBackward"/> but over a
     /// <c>[start, start+length)</c> range along <c>dim</c>.
@@ -4530,6 +5318,8 @@ internal static class BackwardFunctions<T>
         int dim = SavedInt(nameof(SliceScatterBackward), savedState, 0, "dim");
         int start = SavedInt(nameof(SliceScatterBackward), savedState, 1, "start");
         int length = SavedInt(nameof(SliceScatterBackward), savedState, 2, "length");
+        if (CreatesGraph && SliceScatterBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, dim, start, length))
+            return;
 
         var tensor = inputs[0];
         var source = inputs[1];
@@ -4559,6 +5349,20 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
     }
 
+    // The create-graph path of SliceScatterBackward, kept out of it so its first-order path allocates no closure.
+    private static bool SliceScatterBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int dim,
+            int start,
+            int length)
+        => TryJointlyLinearBackward("SliceScatterBackward", SliceScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorSliceScatter(xs[0], xs[1], dim, start, length));
+
     /// <summary>
     /// IndexPut backward: advanced multi-axis indexing, <c>tensor[i0, i1, …] = source</c> (or
     /// <c>+=</c> when accumulating).
@@ -4582,6 +5386,26 @@ internal static class BackwardFunctions<T>
 
         var tensor = inputs[0];
         var source = inputs[1];
+        if (CreatesGraph)
+        {
+            // The same routing as recorded sparse maps: the destination keeps every position (accumulate) or the
+            // unwritten ones (overwrite); each source element reads its written position (the last writer only, on
+            // an overwrite).
+            var lastWriter = new Dictionary<int, int>(positions.Length);
+            for (int i = 0; i < positions.Length; i++) lastWriter[positions[i]] = i;
+            var keep = new List<int>(tensor.Length);
+            for (int i = 0; i < tensor.Length; i++)
+                if (accumulate || !lastWriter.ContainsKey(i)) keep.Add(i);
+            var srcTo = new List<int>(positions.Length);
+            var srcFrom = new List<int>(positions.Length);
+            for (int i = 0; i < positions.Length; i++)
+                if (accumulate || lastWriter[positions[i]] == i) { srcTo.Add(i); srcFrom.Add(positions[i]); }
+            var kept = keep.ToArray();
+            DifferentiableOps.AccumulateGrad(grads, tensor, SparseMap(gradOutput, (int[])tensor._shape.Clone(), kept, kept, null), engine);
+            DifferentiableOps.AccumulateGrad(grads, source,
+                SparseMap(gradOutput, (int[])source._shape.Clone(), srcTo.ToArray(), srcFrom.ToArray(), null), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
 
         var gradTensor = TensorPool<T>.RentZeroed(tensor._shape);
@@ -4627,6 +5451,8 @@ internal static class BackwardFunctions<T>
         var indices = savedState[0] as int[]
             ?? throw new ArgumentException(
                 $"{nameof(PutBackward)}: savedState[0] (indices) must be an int[].", nameof(savedState));
+        if (CreatesGraph && PutBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, indices))
+            return;
 
         var tensor = inputs[0];
         var source = inputs[1];
@@ -4651,6 +5477,18 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, source, gradSource, engine);
     }
 
+    // The create-graph path of PutBackward, kept out of it so its first-order path allocates no closure.
+    private static bool PutBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] indices)
+        => TryJointlyLinearBackward("PutBackward", PutBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorPut(xs[0], new Tensor<int>((int[])indices.Clone(), new[] { indices.Length }), xs[1]));
+
     /// <summary>
     /// BlockDiag backward: each input matrix is copied verbatim into its own diagonal block, so its
     /// gradient is exactly that block of the incoming gradient.
@@ -4663,6 +5501,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryJointlyLinearBackward("BlockDiagBackward", BlockDiagBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorBlockDiag(xs)))
+            return;
         int totalCols = output._shape[1];
         int rowOffset = 0, colOffset = 0;
         foreach (var m in inputs)
@@ -4691,6 +5532,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryJointlyLinearBackward("CartesianProdBackward", CartesianProdBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorCartesianProd(xs)))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         int d = inputs.Length;
         var sizes = new int[d];
@@ -4799,6 +5643,7 @@ internal static class BackwardFunctions<T>
             ? pv
             : throw new ArgumentException(
                 $"{nameof(PDistBackward)}: savedState[0] (p) must be a double.", nameof(savedState));
+        if (TrySecondOrderPDist(gradOutput, inputs, engine, grads, p)) return;
 
         var input = inputs[0];
         int n = input._shape[0], d = input._shape[1];
@@ -4839,6 +5684,7 @@ internal static class BackwardFunctions<T>
             ? pv
             : throw new ArgumentException(
                 $"{nameof(CDistBackward)}: savedState[0] (p) must be a double.", nameof(savedState));
+        if (TrySecondOrderCDist(gradOutput, inputs, output, engine, grads, p)) return;
 
         var x1 = inputs[0];
         var x2 = inputs[1];
@@ -4913,6 +5759,7 @@ internal static class BackwardFunctions<T>
             ? e
             : throw new ArgumentException(
                 $"{nameof(CosineSimilarityDimBackward)}: savedState[1] (eps) must be a double.", nameof(savedState));
+        if (TrySecondOrderCosineSimilarityDim(gradOutput, inputs, engine, grads, dim, eps)) return;
 
         var a = inputs[0];
         var b = inputs[1];
@@ -4976,6 +5823,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderCosineSimilarityLoss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var a = inputs[0];
         var b = inputs[1];
@@ -5009,7 +5857,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var grad = engine.ReciprocalBackward(gradOutput, output);
+        // Under create-graph: -g ⊙ y² from recorded ops.
+        var grad = CreatesGraph
+            ? engine.TensorNegate(engine.TensorMultiply(gradOutput, engine.TensorMultiply(output, output)))
+            : engine.ReciprocalBackward(gradOutput, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -5027,7 +5878,7 @@ internal static class BackwardFunctions<T>
         // it is filled on the device: a host zero tensor had to be uploaded, and inside a captured training step that
         // upload aborted CUDA graph capture (the cross-entropy loss's supervised-row count goes through Sign). It is a
         // fill, not upstream * 0, which is NaN for an infinite or NaN upstream element where the gradient is 0.
-        var zero = engine is DirectGpuTensorEngine gpu && gpu.SupportsGpu
+        var zero = engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.SupportsGpu
             && gpu.TryResidentZeros<T>(inputs[0]._shape, out var resident)
             ? resident
             : TensorPool<T>.RentZeroed(inputs[0]._shape);
@@ -5078,6 +5929,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryFullVarianceComposite(gradOutput, inputs, engine, grads, std: false)) return;
         // Compute mean via engine (GPU-resident)
         var mean = engine.TensorMeanDiff(inputs[0]);
         var grad = engine.VarBackward(gradOutput, inputs[0], mean, Array.Empty<int>());
@@ -5089,6 +5941,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryFullVarianceComposite(gradOutput, inputs, engine, grads, std: true)) return;
         var mean = engine.TensorMeanDiff(inputs[0]);
         var grad = engine.StdBackward(gradOutput, inputs[0], mean, output, Array.Empty<int>());
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -5174,6 +6027,11 @@ internal static class BackwardFunctions<T>
         // Argmax indices are flat offsets — scatter gradient to those positions
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], ArgmaxScatterRecorded(gradOutput, inputs[0]._shape, argmax), engine);
+            return;
+        }
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
         using var gradDataLease = gradOutput.LeaseArray();
         var gradData = gradDataLease.Array;
@@ -5221,6 +6079,13 @@ internal static class BackwardFunctions<T>
         var min = hasMin ? inputs[1] : null;
         var max = hasMax ? inputs[hasMin ? 2 : 1] : null;
 
+        if (CreatesGraph)
+        {
+            ClampTensorBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads,
+                tensor, min, max, hasMin, minStrides, maxStrides, shape);
+            return;
+        }
+
         var gradTensor = TensorPool<T>.RentZeroed(tensor._shape);
         var gradMin = min is not null ? TensorPool<T>.RentZeroed(min._shape) : null;
         var gradMax = max is not null ? TensorPool<T>.RentZeroed(max._shape) : null;
@@ -5261,6 +6126,32 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, tensor, gradTensor, engine);
         if (min is not null) DifferentiableOps.AccumulateGrad(grads, min, gradMin!, engine);
         if (max is not null) DifferentiableOps.AccumulateGrad(grads, max, gradMax!, engine);
+    }
+
+    // The create-graph path of ClampTensorBackward, kept out of it so its first-order path allocates no closure.
+    private static void ClampTensorBackwardCreateGraph(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads,
+        Tensor<T> tensor, Tensor<T>? min, Tensor<T>? max, bool hasMin, int[]? minStrides, int[]? maxStrides, int[] shape)
+    {
+        // Each input's gradient is the upstream gradient routed by a fixed per-element selection (then summed over
+        // a broadcast bound): linear in it, with adjoint "broadcast the cotangent and mask it".
+        var selection = ClampSelection(tensor, min, max, minStrides, maxStrides, shape);
+        Tensor<T>?[] kernelGrads;
+        using (new NoGradScope<T>())   // the host routing below, not this branch again
+            kernelGrads = KernelGrads(ClampTensorBackward, gradOutput, inputs, output, savedState, engine);
+        var fullShape = (int[])tensor._shape.Clone();
+        void Route(Tensor<T>? input, int slot, int target)
+        {
+            if (input is null || kernelGrads[slot] is not { } value) return;
+            var mask = RoIAlignPlan.FromDoubles<T>(selection[target], (int[])fullShape.Clone());
+            var inputShape = (int[])input._shape.Clone();
+            var routed = LinearGrad("ClampTensorBackward", gradOutput, () => value,
+                (e, w) => e.TensorMultiply(ShapesEqual(inputShape, fullShape) ? w : e.TensorBroadcastTo(w, fullShape), mask));
+            DifferentiableOps.AccumulateGrad(grads, input, routed, engine);
+        }
+        Route(tensor, 0, 0);
+        Route(min, 1, 1);
+        Route(max, hasMin ? 2 : 1, 2);
     }
 
     /// <summary>Flat-index lookup into a broadcast-strided bounds tensor (mirrors CpuEngine.BroadcastLookup).</summary>
@@ -5439,6 +6330,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.ReLU)) return;
         var preActivation = (Tensor<T>)savedState[0];
 
         // Fused fast path: ReLU mask + transposed GEMM in minimal allocations.
@@ -5604,6 +6496,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.Sigmoid)) return;
         var maskedGrad = engine.SigmoidBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
@@ -5624,6 +6517,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.Tanh)) return;
         var maskedGrad = engine.TanhBackward(gradOutput, output);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
@@ -5644,6 +6538,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.GELU)) return;
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.GeluBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
@@ -5665,6 +6560,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderFusedLinear(gradOutput, inputs, engine, grads, FusedLinearActivation.Swish)) return;
         var preActivation = (Tensor<T>)savedState[0];
         var maskedGrad = engine.SwishBackward(gradOutput, preActivation);
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
@@ -5799,12 +6695,19 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var predicted = inputs[0];
-        var target = (Tensor<T>)savedState[0];
+        // The target is the node's second input (it was saved state, which left its aspect ratio undifferentiated).
+        bool targetIsInput = inputs.Length > 1 && inputs[1] is not null;
+        var target = targetIsInput ? inputs[1] : (Tensor<T>)savedState[0];
+        // Under create-graph: differentiate v rebuilt from recorded ops (atan included), so its gradient is
+        // differentiable again; the loop below records nothing.
+        if (CreatesGraph && CIoUAspectBackwardCreateGraph(gradOutput, inputs, engine, grads, predicted, target, targetIsInput))
+            return;
         double eps = 1e-7;
         double fourOverPiSq = 4.0 / (Math.PI * Math.PI);
 
         int n = predicted.Shape[0];
         var gradPred = new T[n * 4];
+        var gradTarget = new double[n * 4];
 
         for (int i = 0; i < n; i++)
         {
@@ -5835,10 +6738,35 @@ internal static class BackwardFunctions<T>
             gradPred[o + 1] = numOps.FromDouble(go * dvdPh * -hOn);
             gradPred[o + 2] = numOps.FromDouble(go * dvdPw * wOn);
             gradPred[o + 3] = numOps.FromDouble(go * dvdPh * hOn);
+
+            // The target's side: dv/d(tw) = 2·(4/π²)·atanDiff·th/(tw² + th²), dv/d(th) = -2·(4/π²)·atanDiff·tw/(tw² + th²).
+            double rawTw = tx2 - tx1, rawTh = ty2 - ty1;
+            double trss = tw * tw + th * th;
+            double dvdTw = 2.0 * fourOverPiSq * atanDiff * (th / trss);
+            double dvdTh = 2.0 * fourOverPiSq * atanDiff * -(tw / trss);
+            double twOn = rawTw > 0 ? 1.0 : 0.0;
+            double thOn = rawTh > 0 ? 1.0 : 0.0;
+            gradTarget[o] = go * dvdTw * -twOn;
+            gradTarget[o + 1] = go * dvdTh * -thOn;
+            gradTarget[o + 2] = go * dvdTw * twOn;
+            gradTarget[o + 3] = go * dvdTh * thOn;
         }
 
         DifferentiableOps.AccumulateGrad(grads, predicted, new Tensor<T>(gradPred, new[] { n, 4 }), engine);
+        if (targetIsInput)
+            DifferentiableOps.AccumulateGrad(grads, target, RoIAlignPlan.FromDoubles<T>(gradTarget, new[] { n, 4 }), engine);
     }
+
+    // The create-graph path of CIoUAspectBackward, kept out of it so its first-order path allocates no closure.
+    private static bool CIoUAspectBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> predicted,
+            Tensor<T> target,
+            bool targetIsInput)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e => CIoUAspectRecorded(e, predicted, target, targetIsInput));
 
     /// <summary>GIoU loss backward: IoU gradient + enclosing area penalty gradient.</summary>
     /// <remarks>
@@ -6134,6 +7062,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryMultilinearBackward("ComplexMultiplyBackward", ComplexMultiplyBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorComplexMultiply(xs[0], xs[1])))
+            return;
         var a = inputs[0];
         var b = inputs[1];
         var ops = MathHelper.GetNumericOperations<T>();
@@ -6186,6 +7117,19 @@ internal static class BackwardFunctions<T>
         var a = (Tensor<T>)savedState[0]; // original input
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
+        if (CreatesGraph)
+        {
+            // The kernel's g·z/(|z| + 1e-8) per (re, im) pair as recorded ops, differentiable in g and (through z and
+            // |z|) in the input.
+            var z = inputs[0];
+            var pairShape = new[] { pairs, 2 };
+            var columnShape = new[] { pairs, 1 };
+            var scale = engine.TensorDivide(engine.Reshape(gradOutput, columnShape),
+                engine.TensorAddScalar(engine.Reshape(output, columnShape), ops.FromDouble(1e-8)));
+            var recorded = engine.TensorMultiply(engine.Reshape(z, pairShape), engine.TensorBroadcastTo(scale, pairShape));
+            DifferentiableOps.AccumulateGrad(grads, z, engine.Reshape(recorded, z._shape), engine);
+            return;
+        }
 
         var gradA = new Tensor<T>(a._shape);
         for (int i = 0; i < pairs; i++)
@@ -6215,6 +7159,7 @@ internal static class BackwardFunctions<T>
         var inputLengths = (int[])savedState[2];
         var targetLengths = (int[])savedState[3];
         int blank = (int)savedState[4];
+        if (TrySecondOrderCtcLoss(gradOutput, inputs, engine, grads, targets, inputLengths, targetLengths, blank)) return;
 
         // Gradient with respect to LOG-PROBABILITIES:
         //     d(-logP)/d(logProbs[t,n,k]) = -(1/P) * sum_{s : label_s == k} alpha[t,s]*beta[t,s]
@@ -6245,9 +7190,27 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var dim = (int)savedState[0];
+        // Under create-graph: differentiate a ⊙ sigmoid(b), the two halves along dim, as recorded ops.
+        var glu = inputs[0];
+        if (CreatesGraph && GLUBackwardCreateGraph(gradOutput, inputs, engine, grads, glu, dim))
+            return;
         var grad = engine.GLUBackward(gradOutput, inputs[0], dim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of GLUBackward, kept out of it so its first-order path allocates no closure.
+    private static bool GLUBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> glu,
+            int dim)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                int half = glu._shape[dim] / 2;
+                return e.TensorMultiply(e.TensorNarrow(glu, dim, 0, half), e.TensorSigmoid(e.TensorNarrow(glu, dim, half, half)));
+            });
 
     /// <summary>Sparsemax backward via engine.SparsemaxBackward</summary>
     internal static void SparsemaxBackward(
@@ -6255,9 +7218,19 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axis = (int)savedState[0];
-        var grad = engine.SparsemaxBackward(gradOutput, output, axis);
+        // Projection onto the support with its mean removed: linear in g, symmetric, and fixed while the support is,
+        // so it is its own adjoint and has no second derivative in x (as torch's sparsemax).
+        var grad = CreatesGraph ? SparsemaxBackwardCreateGraph(gradOutput, engine, output, axis) : engine.SparsemaxBackward(gradOutput, output, axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of SparsemaxBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> SparsemaxBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            Tensor<T> output,
+            int axis)
+        => DiagonalLinearGrad("SparsemaxBackward", gradOutput, engine, (e, w) => e.SparsemaxBackward(w, output, axis));
 
     /// <summary>TaylorSoftmax backward via engine.TaylorSoftmaxBackward</summary>
     internal static void TaylorSoftmaxBackward(
@@ -6266,9 +7239,42 @@ internal static class BackwardFunctions<T>
     {
         var order = (int)savedState[0];
         var axis = (int)savedState[1];
+        // Under create-graph: differentiate the forward as recorded ops, f = Σ_{n≤order} (x - max)ⁿ/n!, y = f / Σ f.
+        var taylorInput = inputs[0];
+        if (CreatesGraph && TaylorSoftmaxBackwardCreateGraph(gradOutput, inputs, engine, grads, axis, taylorInput, order))
+            return;
         var grad = engine.TaylorSoftmaxBackward(gradOutput, inputs[0], output, order, axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of TaylorSoftmaxBackward, kept out of it so its first-order path allocates no closure.
+    private static bool TaylorSoftmaxBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int axis,
+            Tensor<T> taylorInput,
+            int order)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                var ops = MathHelper.GetNumericOperations<T>();
+                int ax = axis < 0 ? axis + taylorInput.Rank : axis;
+                var shape = taylorInput._shape;
+                var shifted = e.TensorSubtract(taylorInput, e.TensorBroadcastTo(e.ReduceMax(taylorInput, new[] { ax }, keepDims: true), shape));
+                var f = e.TensorAddScalar(e.TensorMultiplyScalar(shifted, ops.Zero), ops.One);
+                var power = shifted;
+                var inverseFactorials = new double[order + 1];
+                inverseFactorials[0] = 1;
+                for (int n = 1; n <= order; n++) inverseFactorials[n] = inverseFactorials[n - 1] / n;
+                var coefficients = RoIAlignPlan.FromDoubles<T>(inverseFactorials, new[] { order + 1 });
+                for (int n = 1; n <= order; n++)
+                {
+                    if (n > 1) power = e.TensorMultiply(power, shifted);
+                    f = e.TensorAdd(f, e.TensorMultiplyScalar(power, coefficients.GetFlat(n)));
+                }
+                return e.TensorDivide(f, e.TensorBroadcastTo(e.ReduceSum(f, new[] { ax }, keepDims: true), shape));
+            });
 
     /// <summary>SphericalSoftmax backward via engine.SphericalSoftmaxBackward</summary>
     internal static void SphericalSoftmaxBackward(
@@ -6276,9 +7282,28 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var axis = (int)savedState[0];
+        // Under create-graph: differentiate softmax(x / ‖x‖₂) along the axis as recorded ops.
+        var sphericalInput = inputs[0];
+        if (CreatesGraph && SphericalSoftmaxBackwardCreateGraph(gradOutput, inputs, engine, grads, axis, sphericalInput))
+            return;
         var grad = engine.SphericalSoftmaxBackward(gradOutput, inputs[0], output, axis);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of SphericalSoftmaxBackward, kept out of it so its first-order path allocates no closure.
+    private static bool SphericalSoftmaxBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int axis,
+            Tensor<T> sphericalInput)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                int ax = axis < 0 ? axis + sphericalInput.Rank : axis;
+                var norm = e.TensorSqrt(e.ReduceSum(e.TensorMultiply(sphericalInput, sphericalInput), new[] { ax }, keepDims: true));
+                return e.Softmax(e.TensorDivide(sphericalInput, e.TensorBroadcastTo(norm, sphericalInput._shape)), ax);
+            });
 
     // ──────────────────────────────────────────────────────────────
     // Pooling & Convolution backward: delegate to engine methods
@@ -6293,6 +7318,9 @@ internal static class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool2DBackward", gradOutput, inputs[0],
+                MaxPool2DGlobalIndices(maxIndices, inputShape), engine, grads))
+            return;
         var grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputShape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6306,9 +7334,25 @@ internal static class BackwardFunctions<T>
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
         var padding = (int[])savedState[2];
+        if (CreatesGraph && AvgPool3DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, poolSize, stride, padding))
+            return;
         var grad = engine.AvgPool3DBackward(gradOutput, inputShape, poolSize, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of AvgPool3DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool AvgPool3DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] poolSize,
+            int[] stride,
+            int[] padding)
+        => TryLinearBackward("AvgPool3DBackward", AvgPool3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.AvgPool3D(w, poolSize, stride, padding));
 
     /// <summary>MaxPool3D backward via engine</summary>
     internal static void MaxPool3DBackward(
@@ -6319,6 +7363,9 @@ internal static class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool3DBackward", gradOutput, inputs[0],
+                MaxPool3DGlobalIndices(maxIndices, inputShape), engine, grads))
+            return;
         var grad = engine.MaxPool3DBackward(gradOutput, maxIndices, inputShape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6332,6 +7379,9 @@ internal static class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var poolSize = (int[])savedState[1];
         var stride = (int[])savedState[2];
+        if (CreatesGraph && TrySelectionBackward("MaxPool3DBackward", gradOutput, inputs[0],
+                PlaneTensorIndicesToGlobal(maxIndices, gradOutput._shape, inputShape, 3), engine, grads))
+            return;
         var grad = engine.MaxPool3DBackwardWithTensorIndices(
             gradOutput, maxIndices, inputShape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -6344,11 +7394,26 @@ internal static class BackwardFunctions<T>
     {
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
+        if (CreatesGraph && DepthwiseConv2DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding))
+            return;
         var inputGrad = engine.DepthwiseConv2DBackwardInput(gradOutput, inputs[1], inputs[0]._shape, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         var kernelGrad = engine.DepthwiseConv2DBackwardKernel(gradOutput, inputs[0], inputs[1]._shape, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], kernelGrad, engine);
     }
+
+    // The create-graph path of DepthwiseConv2DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool DepthwiseConv2DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] stride,
+            int[] padding)
+        => TryMultilinearBackward("DepthwiseConv2D", DepthwiseConv2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.DepthwiseConv2D(x[0], x[1], stride, padding));
 
     /// <summary>
     /// Backward of a depthwise convolution with its channel bias added (inputs: x, kernel, bias): the bias gradient as
@@ -6370,11 +7435,28 @@ internal static class BackwardFunctions<T>
     {
         var stride = (int[])savedState[0];
         var padding = (int[])savedState[1];
+        var outputPadding3D = TransposedConvOutputPadding(gradOutput._shape, inputs[0]._shape, inputs[1]._shape, stride, padding);
+        if (CreatesGraph && ConvTranspose3DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding, outputPadding3D))
+            return;
         var inputGrad = engine.ConvTranspose3DBackwardInput(gradOutput, inputs[1], inputs[0]._shape, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         var kernelGrad = engine.ConvTranspose3DBackwardKernel(gradOutput, inputs[0], inputs[1]._shape, stride, padding);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], kernelGrad, engine);
     }
+
+    // The create-graph path of ConvTranspose3DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ConvTranspose3DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] stride,
+            int[] padding,
+            int[] outputPadding3D)
+        => TryMultilinearBackward("ConvTranspose3D", ConvTranspose3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.ConvTranspose3D(x[0], x[1], stride, padding, outputPadding3D));
 
     /// <summary>Upsample3D backward via engine</summary>
     internal static void Upsample3DBackward(
@@ -6385,9 +7467,25 @@ internal static class BackwardFunctions<T>
         var scaleD = (int)savedState[0];
         var scaleH = (int)savedState[1];
         var scaleW = (int)savedState[2];
+        if (CreatesGraph && Upsample3DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, scaleD, scaleH, scaleW))
+            return;
         var grad = engine.Upsample3DBackward(gradOutput, inputShape, scaleD, scaleH, scaleW);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of Upsample3DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool Upsample3DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int scaleD,
+            int scaleH,
+            int scaleW)
+        => TryLinearBackward("Upsample3DBackward", Upsample3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.Upsample3D(v, scaleD, scaleH, scaleW));
 
     /// <summary>PixelShuffle backward via engine</summary>
     internal static void PixelShuffleBackward(
@@ -6396,9 +7494,23 @@ internal static class BackwardFunctions<T>
     {
         var inputShape = inputs[0]._shape;
         var upscaleFactor = (int)savedState[0];
+        if (CreatesGraph && PixelShuffleBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, upscaleFactor))
+            return;
         var grad = engine.PixelShuffleBackward(gradOutput, inputShape, upscaleFactor);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of PixelShuffleBackward, kept out of it so its first-order path allocates no closure.
+    private static bool PixelShuffleBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int upscaleFactor)
+        => TryLinearBackward("PixelShuffleBackward", PixelShuffleBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.PixelShuffle(w, upscaleFactor));
 
     /// <summary>Crop backward via engine</summary>
     internal static void CropBackward(
@@ -6408,9 +7520,29 @@ internal static class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var top = (int)savedState[0];
         var left = (int)savedState[1];
+        int cropRank = gradOutput.Rank;
+        int cropHeight = gradOutput._shape[cropRank - 2], cropWidth = gradOutput._shape[cropRank - 1];
+        // Under create-graph: the zero-pad back is linear in the upstream gradient; its adjoint is the crop itself.
+        if (CreatesGraph && CropBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, top, left, cropHeight, cropWidth))
+            return;
         var grad = engine.CropBackward(gradOutput, inputShape, top, left);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of CropBackward, kept out of it so its first-order path allocates no closure.
+    private static bool CropBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int top,
+            int left,
+            int cropHeight,
+            int cropWidth)
+        => TryLinearBackward("CropBackward", CropBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.Crop(w, top, left, cropHeight, cropWidth));
 
     /// <summary>Pad backward via engine</summary>
     internal static void PadBackward(
@@ -6420,9 +7552,30 @@ internal static class BackwardFunctions<T>
         var inputShape = inputs[0]._shape;
         var padTop = (int)savedState[0];
         var padLeft = (int)savedState[1];
+        int rank = inputShape.Length;
+        var gradOutputShape = gradOutput._shape;
+        if (CreatesGraph && PadBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, padTop, gradOutputShape, rank, inputShape, padLeft))
+            return;
         var grad = engine.PadBackward(gradOutput, padTop, padLeft, inputShape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of PadBackward, kept out of it so its first-order path allocates no closure.
+    private static bool PadBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int padTop,
+            int[] gradOutputShape,
+            int rank,
+            int[] inputShape,
+            int padLeft)
+        => TryLinearBackward("PadBackward", PadBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.Pad(w, padTop, gradOutputShape[rank - 2] - inputShape[rank - 2] - padTop,
+                padLeft, gradOutputShape[rank - 1] - inputShape[rank - 1] - padLeft, MathHelper.GetNumericOperations<T>().Zero));
 
     /// <summary>LocallyConnectedConv2D backward via engine backward helpers</summary>
     internal static void LocallyConnectedConv2DBackward(
@@ -6430,11 +7583,25 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var stride = (int[])savedState[0];
+        if (CreatesGraph && LocallyConnectedConv2DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride))
+            return;
         var inputGrad = engine.LocallyConnectedConv2DBackwardInput(gradOutput, inputs[1], inputs[0]._shape, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
         var weightsGrad = engine.LocallyConnectedConv2DBackwardWeights(gradOutput, inputs[0], inputs[1]._shape, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], weightsGrad, engine);
     }
+
+    // The create-graph path of LocallyConnectedConv2DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool LocallyConnectedConv2DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] stride)
+        => TryMultilinearBackward("LocallyConnectedConv2D", LocallyConnectedConv2DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.LocallyConnectedConv2D(x[0], x[1], null, stride));
 
     /// <summary>RBFKernel backward via engine</summary>
     internal static void RBFKernelBackward(
@@ -6443,6 +7610,7 @@ internal static class BackwardFunctions<T>
     {
         // inputs: [0]=input, [1]=centers, [2]=epsilons
         // RBFKernelBackward signature: (gradOutput, input, centers, epsilons, output)
+        if (TrySecondOrderRBFKernel(gradOutput, inputs, engine, grads)) return;
         var (gradX, gradCenters, gradEpsilons) = engine.RBFKernelBackward(gradOutput, inputs[0], inputs[1], inputs[2], output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradCenters, engine);
@@ -6460,6 +7628,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryMultilinearBackward("OctonionMatMulBackward", OctonionMatMulBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.OctonionMatMulTensor(xs[0], xs[1])))
+            return;
         var input = inputs[0];  // [batch, inputFeatures, 8]
         var weight = inputs[1]; // [outputFeatures, inputFeatures, 8]
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6565,6 +7736,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
+        if (TrySecondOrderBinaryCrossEntropy(gradOutput, inputs, engine, grads, (double)savedState[0])) return;
         var epsilon = numOps.FromDouble((double)savedState[0]);
         var grad = engine.TensorBinaryCrossEntropyBackward(inputs[0], inputs[1], epsilon);
         var scaledGrad = engine.TensorMultiply(gradOutput, grad);
@@ -6577,9 +7749,24 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var positions = (Tensor<T>)savedState[0];
+        // Linear in the grid values (the positions are not differentiated).
+        if (CreatesGraph && TrilinearInterpolateBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, positions))
+            return;
         var grad = engine.TensorTrilinearInterpolateBackward(gradOutput, inputs[0], positions);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of TrilinearInterpolateBackward, kept out of it so its first-order path allocates no closure.
+    private static bool TrilinearInterpolateBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> positions)
+        => TryLinearBackward("TrilinearInterpolateBackward", TrilinearInterpolateBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.TensorTrilinearInterpolate(v, positions));
 
     /// <summary>ReduceMax backward: gradient flows only to the max element</summary>
     internal static void ReduceMaxBackward(
@@ -6589,16 +7776,28 @@ internal static class BackwardFunctions<T>
         // A compiled GPU replay keeps the argmax on the device (relative positions along the reduced axes).
         if (savedState[0] is Tensor<int> deviceIndices)
         {
-            var deviceGrad = engine.ReduceMaxBackwardWithTensorIndices(
-                gradOutput, deviceIndices, inputs[0]._shape, (int[])savedState[1]);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            ReduceMaxTensorIndicesBackward(gradOutput, inputs, output, new object[] { deviceIndices, savedState[1] }, engine, grads);
             return;
         }
         var maxIndices = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
-        var grad = engine.ReduceMaxBackward(gradOutput, maxIndices, inputShape);
+        var gradOutputShape = gradOutput._shape;
+        // The gradient is the upstream gradient scattered to each output's argmax (flat input index); its adjoint is
+        // the gather at those indices.
+        var grad = CreatesGraph ? ReduceMaxBackwardCreateGraph(gradOutput, engine, maxIndices, inputShape, gradOutputShape) : engine.ReduceMaxBackward(gradOutput, maxIndices, inputShape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ReduceMaxBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> ReduceMaxBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            int[] maxIndices,
+            int[] inputShape,
+            int[] gradOutputShape)
+        => LinearGrad("ReduceMaxBackward", gradOutput,
+            () => engine.ReduceMaxBackward(gradOutput, maxIndices, inputShape),
+            (e, w) => ToShape(e, e.TensorTake(w, new Tensor<int>((int[])maxIndices.Clone(), new[] { maxIndices.Length })), gradOutputShape));
 
     /// <summary>ReduceMax backward with tensor-resident relative argmax positions.</summary>
     internal static void ReduceMaxTensorIndicesBackward(
@@ -6607,10 +7806,41 @@ internal static class BackwardFunctions<T>
     {
         var maxIndices = (Tensor<int>)savedState[0];
         var axes = (int[])savedState[1];
-        var grad = engine.ReduceMaxBackwardWithTensorIndices(
-            gradOutput, maxIndices, inputs[0]._shape, axes);
+        var inputShape = inputs[0]._shape;
+        var gradOutputShape = gradOutput._shape;
+        Tensor<T> grad;
+        if (CreatesGraph)
+        {
+            // The upstream gradient routed to each output's argmax: broadcast(g) ⊙ M with M = that routing of ones.
+            // Its adjoint sums w ⊙ M over the reduced axes.
+            Tensor<T> selection;
+            using (new NoGradScope<T>())
+            {
+                var ones = new Tensor<T>((int[])gradOutputShape.Clone());
+                ones.Fill(MathHelper.GetNumericOperations<T>().One);
+                selection = engine.ReduceMaxBackwardWithTensorIndices(ones, maxIndices, inputShape, axes);
+            }
+            grad = (CreatesGraph ? ReduceMaxTensorIndicesBackwardCreateGraph(gradOutput, engine, maxIndices, inputShape, axes, selection, gradOutputShape) : engine.ReduceMaxBackwardWithTensorIndices(gradOutput, maxIndices, inputShape, axes));
+        }
+        else
+        {
+            grad = engine.ReduceMaxBackwardWithTensorIndices(gradOutput, maxIndices, inputShape, axes);
+        }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ReduceMaxTensorIndicesBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> ReduceMaxTensorIndicesBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            Tensor<int> maxIndices,
+            int[] inputShape,
+            int[] axes,
+            Tensor<T> selection,
+            int[] gradOutputShape)
+        => LinearGrad("ReduceMaxBackward", gradOutput,
+            () => engine.ReduceMaxBackwardWithTensorIndices(gradOutput, maxIndices, inputShape, axes),
+            (e, w) => ToShape(e, e.ReduceSum(e.TensorMultiply(w, selection), axes, keepDims: true), gradOutputShape));
 
     /// <summary>ReduceVariance backward via engine</summary>
     internal static void ReduceVarianceBackward(
@@ -6619,9 +7849,31 @@ internal static class BackwardFunctions<T>
     {
         var axes = (int[])savedState[0];
         var mean = (Tensor<T>)savedState[1];
+        // Under create-graph: differentiate mean((x - mean(x))²) over the axes as recorded ops (ReduceStd, TensorStd
+        // and TensorVar are built on this op, so they follow).
+        var varianceInput = inputs[0];
+        var varianceShape = output._shape;
+        if (CreatesGraph && ReduceVarianceBackwardCreateGraph(gradOutput, inputs, engine, grads, varianceInput, axes, varianceShape))
+            return;
         var grad = engine.ReduceVarianceBackward(gradOutput, inputs[0], mean, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ReduceVarianceBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ReduceVarianceBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> varianceInput,
+            int[] axes,
+            int[] varianceShape)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                var centered = e.TensorSubtract(varianceInput,
+                    e.TensorBroadcastTo(e.ReduceMean(varianceInput, axes, keepDims: true), varianceInput._shape));
+                return ToShape(e, e.ReduceMean(e.TensorMultiply(centered, centered), axes, keepDims: true), varianceShape);
+            });
 
     /// <summary>ReduceLogVariance backward via engine</summary>
     internal static void ReduceLogVarianceBackward(
@@ -6631,6 +7883,7 @@ internal static class BackwardFunctions<T>
         var axes = (int[])savedState[0];
         var mean = (Tensor<T>)savedState[1];
         var variance = (Tensor<T>)savedState[2];
+        if (TrySecondOrderReduceLogVariance(gradOutput, inputs, engine, grads, axes, variance)) return;
         var grad = engine.ReduceLogVarianceBackward(gradOutput, inputs[0], mean, variance, axes);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -6643,9 +7896,61 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var counts = (Tensor<int>)savedState[1];
         var sourceShape = inputs[0]._shape;
-        var grad = engine.ScatterMeanBackward(gradOutput, indices, counts, sourceShape);
+        int scatterDim = SavedScatterDim(savedState, 2);
+        if (CreatesGraph)
+        {
+            // Each source row reads its group's gradient divided by the group size: a recorded sparse map.
+            var countData = counts.GetFlattenedData();
+            var (to, from, groups) = ScatterRows(indices, sourceShape, gradOutput._shape[scatterDim], scatterDim);
+            var coef = new double[to.Length];
+            for (int k = 0; k < coef.Length; k++)
+            {
+                // counts holds one entry per output element, or one per group along the scatter axis.
+                int count = countData.Length == gradOutput.Length ? countData[from[k]] : countData[groups[k]];
+                coef[k] = count > 0 ? 1.0 / count : 1.0;
+            }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], SparseMap(gradOutput, (int[])sourceShape.Clone(), to, from, coef), engine);
+            return;
+        }
+        var grad = engine.ScatterMeanBackward(gradOutput, indices, counts, sourceShape, scatterDim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The group routing of a scatter along dim: source element (outer, d, inner) and its output element
+    // (outer, indices[d], inner), as (source flat index, output flat index, group = indices[d]) triples for the
+    // in-range indices. The routing used to assume dim 0, so a scatter along any other axis had its gradient sent to
+    // the wrong elements (and out of range).
+    private static (int[] Source, int[] Output, int[] Group) ScatterRows(Tensor<int> indices, int[] sourceShape, int outputDimSize, int dim = 0)
+    {
+        var idx = indices.GetFlattenedData();
+        int rows = sourceShape[dim];
+        int inner = 1;
+        for (int d = dim + 1; d < sourceShape.Length; d++) inner *= sourceShape[d];
+        int outer = 1;
+        for (int d = 0; d < dim; d++) outer *= sourceShape[d];
+        var src = new List<int>(outer * rows * inner);
+        var dst = new List<int>(outer * rows * inner);
+        var group = new List<int>(outer * rows * inner);
+        for (int o = 0; o < outer; o++)
+        {
+            for (int d = 0; d < rows; d++)
+            {
+                int t = idx[d % idx.Length];
+                if (t < 0 || t >= outputDimSize) continue;
+                for (int k = 0; k < inner; k++)
+                {
+                    src.Add((o * rows + d) * inner + k);
+                    dst.Add((o * outputDimSize + t) * inner + k);
+                    group.Add(t);
+                }
+            }
+        }
+        return (src.ToArray(), dst.ToArray(), group.ToArray());
+    }
+
+    // The scatter axis a recorded scatter saved (older recordings saved none: dim 0).
+    private static int SavedScatterDim(object[] savedState, int index) =>
+        savedState.Length > index && savedState[index] is int dim ? dim : 0;
 
     /// <summary>ScatterMax backward via engine</summary>
     internal static void ScatterMaxBackward(
@@ -6655,7 +7960,29 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var argmax = (Tensor<int>)savedState[1];
         var sourceShape = inputs[0]._shape;
-        var grad = engine.ScatterMaxBackward(gradOutput, argmax, sourceShape);
+        int scatterDim = SavedScatterDim(savedState, 2);
+        if (CreatesGraph)
+        {
+            // Each group's gradient goes to its winning source element (fixed by the forward): the kernel's routing of
+            // ones marks the winners, and the same routing of g is a recorded sparse map.
+            Tensor<T> winners;
+            using (new NoGradScope<T>())
+            {
+                var ones = new Tensor<T>((int[])gradOutput._shape.Clone());
+                ones.Fill(MathHelper.GetNumericOperations<T>().One);
+                winners = engine.ScatterMaxBackward(ones, argmax, sourceShape, scatterDim);
+            }
+            var won = RoIAlignPlan.ToDoubles(winners);
+            var (src, dst, _) = ScatterRows(indices, sourceShape, gradOutput._shape[scatterDim], scatterDim);
+            var to = new List<int>(src.Length);
+            var from = new List<int>(src.Length);
+            for (int k = 0; k < src.Length; k++)
+                if (won[src[k]] != 0) { to.Add(src[k]); from.Add(dst[k]); }
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                SparseMap(gradOutput, (int[])sourceShape.Clone(), to.ToArray(), from.ToArray(), null), engine);
+            return;
+        }
+        var grad = engine.ScatterMaxBackward(gradOutput, argmax, sourceShape, scatterDim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -6665,9 +7992,45 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var indices = (Tensor<int>)savedState[0];
-        var grad = engine.ScatterSoftmaxBackward(gradOutput, output, indices);
+        var softmaxSource = inputs[0];
+        int scatterDim = SavedScatterDim(savedState, 1);
+        // Under create-graph: differentiate y = e / (group sum of e gathered back), e = exp(x - c), c each group's
+        // max as a constant shift (it cancels), with the group sum and gather as recorded sparse maps.
+        if (CreatesGraph && ScatterSoftmaxBackwardCreateGraph(gradOutput, inputs, engine, grads, softmaxSource, indices, scatterDim))
+            return;
+        var grad = engine.ScatterSoftmaxBackward(gradOutput, output, indices, scatterDim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of ScatterSoftmaxBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ScatterSoftmaxBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> softmaxSource,
+            Tensor<int> indices,
+            int scatterDim)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads, e =>
+            {
+                var shape = softmaxSource._shape;
+                var idx = indices.GetFlattenedData();
+                int groupCount = 0;
+                for (int i = 0; i < idx.Length; i++) groupCount = Math.Max(groupCount, idx[i] + 1);
+                var (src, dst, _) = ScatterRows(indices, shape, groupCount, scatterDim);
+                var x = RoIAlignPlan.ToDoubles(softmaxSource);
+                var groupShape = (int[])shape.Clone();
+                groupShape[scatterDim] = groupCount;
+                var max = new double[ShapeLength(groupShape)];
+                for (int i = 0; i < max.Length; i++) max[i] = double.NegativeInfinity;
+                for (int k = 0; k < src.Length; k++) max[dst[k]] = Math.Max(max[dst[k]], x[src[k]]);
+                var shiftValues = new double[x.Length];
+                for (int k = 0; k < src.Length; k++) shiftValues[src[k]] = max[dst[k]];
+                var shift = RoIAlignPlan.FromDoubles<T>(shiftValues, (int[])shape.Clone());
+                var exps = e.TensorExp(e.TensorSubtract(softmaxSource, shift));
+                var sums = SparseMap(exps, groupShape, dst, src, null);
+                return e.TensorDivide(exps, SparseMap(sums, (int[])shape.Clone(), src, dst, null));
+            });
 
     // ──────────────────────────────────────────────────────────────
     // Element-wise math: composed from engine ops (GPU-transparent)
@@ -6682,9 +8045,13 @@ internal static class BackwardFunctions<T>
             ? idxTensor.GetFlattenedData()
             : (int[])savedState[0];
         var axis = (int)savedState[1];
+        var scatterIndices = savedState[0] as Tensor<int> ?? new Tensor<int>((int[])indices.Clone(), new[] { indices.Length });
+        if (inputs.Length >= 2
+            && CreatesGraph && ScatterBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, scatterIndices, axis))
+            return;
 
         // Axis scatter with 1-D indices is index_copy, so the device helpers proven there apply unchanged.
-        if (engine is DirectGpuTensorEngine gpu && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
             && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, deviceIndices) is { } deviceInputGrad
             && gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, deviceIndices,
                 OverwrittenIndexPositions(indices)) is { } deviceValuesGrad
@@ -6750,6 +8117,19 @@ internal static class BackwardFunctions<T>
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradValues, engine);
     }
+
+    // The create-graph path of ScatterBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ScatterBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<int> scatterIndices,
+            int axis)
+        => TryJointlyLinearBackward("ScatterBackward", ScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.Scatter(xs[0], scatterIndices, xs[1], axis));
 
     /// <summary>
     /// Positions j whose write an index_copy / scatter overwrites with a LATER duplicate (indices[j'] == indices[j],
@@ -6895,6 +8275,9 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryJointlyLinearBackward("AddManyBackward", AddManyBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorAddMany(xs)))
+            return;
         // Each input gets its own copy of gradOutput to prevent AccumulateGrad
         // from mutating a shared tensor via TensorAddInPlace
         // Every input gets its OWN fresh copy — including the first. Handing gradOutput itself to
@@ -6968,6 +8351,8 @@ internal static class BackwardFunctions<T>
         var repeats = (int)savedState[0];
         var axis = (int)savedState[1];
         var inputShape = inputs[0]._shape;
+        if (CreatesGraph && RepeatElementsBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, repeats, axis))
+            return;
         // Sum every `repeats` consecutive elements along axis
         var grad = new Tensor<T>(inputShape);
         var gradData = gradOutput.GetFlattenedData();
@@ -7000,6 +8385,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    // The create-graph path of RepeatElementsBackward, kept out of it so its first-order path allocates no closure.
+    private static bool RepeatElementsBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int repeats,
+            int axis)
+        => TryLinearBackward("RepeatElementsBackward", RepeatElementsBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorRepeatElements(w, repeats, axis));
+
     /// <summary>SliceAxis backward: scatter gradient back into zero-filled input shape</summary>
     internal static void SliceAxisBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -7008,6 +8406,8 @@ internal static class BackwardFunctions<T>
         var axis = (int)savedState[0];
         var index = (int)savedState[1];
         var inputShape = inputs[0]._shape;
+        if (CreatesGraph && SliceAxisBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, axis, index))
+            return;
         int normalizedAxis = axis < 0 ? axis + inputShape.Length : axis;
         if (normalizedAxis >= 0 && normalizedAxis < inputShape.Length)
         {
@@ -7024,13 +8424,29 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    // The create-graph path of SliceAxisBackward, kept out of it so its first-order path allocates no closure.
+    private static bool SliceAxisBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int axis,
+            int index)
+        => TryLinearBackward("SliceAxisBackward", SliceAxisBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorSliceAxis(w, axis, index));
+
     /// <summary>Diagonal extraction backward: scatter back to zero matrix</summary>
     internal static void DiagonalBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var inputShape = inputs[0]._shape;
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryDiagonalBackwardOnDevice(gradOutput, inputShape) is { } deviceGrad)
+        if (TryLinearBackward("DiagonalBackward", DiagonalBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, w) => e.TensorDiagonal(w)))
+            return;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryDiagonalBackwardOnDevice(gradOutput, inputShape) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
@@ -7094,6 +8510,17 @@ internal static class BackwardFunctions<T>
         // to avoid re-running a full matmul here — re-computation was ~98% of backward
         // time on paper-scale transformers (e.g. 34s / 35s on ChronosBolt paper
         // defaults: 27 calls × 1.27s each).
+        // Under create-graph: differentiate act(x·W + b) as recorded ops. The activation derivative below is the
+        // fused handler's host math, which records nothing, so the second backward of a FusedLinear (a DenseLayer in
+        // eval mode) saw its gradient as a constant and every Hessian through it came out zero.
+        if (CreatesGraph)
+        {
+            var activationKind = savedState is { Length: >= 1 } ? (FusedActivationType)savedState[0] : FusedActivationType.None;
+            var activationSettings = savedState is { Length: >= 3 } ? savedState[2] as FusedActivationParams : null;
+            var linearInputs = inputs;
+            if (CreatesGraph && FusedLinearWithActivationBackwardCreateGraph(gradOutput, inputs, engine, grads, linearInputs, activationKind, activationSettings))
+                return;
+        }
         if (savedState is { Length: >= 1 })
         {
             var activation = (FusedActivationType)savedState[0];
@@ -7129,6 +8556,18 @@ internal static class BackwardFunctions<T>
         FusedLinearBackwardCore(gradOutput, inputs, output, savedState ?? Array.Empty<object>(), engine, grads);
     }
 
+    // The create-graph path of FusedLinearWithActivationBackward, kept out of it so its first-order path allocates no closure.
+    private static bool FusedLinearWithActivationBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T>[] linearInputs,
+            FusedActivationType activationKind,
+            FusedActivationParams? activationSettings)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => ApplyFusedActivationRecorded(e, FusedLinearPreActivationRecorded(e, linearInputs), activationKind, activationSettings));
+
     private static Tensor<T> ApplyActivationDerivative(
         Tensor<T> gradOutput, Tensor<T> preActivation, FusedActivationType activation, IEngine engine,
         FusedActivationParams? activationParams = null)
@@ -7137,7 +8576,7 @@ internal static class BackwardFunctions<T>
 
         // Use CpuEngine.ApplyFusedActivationBackward which dispatches via ActivationRegistry
         // This is OCP-compliant: new activations register themselves, no switch needed here
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.ApplyFusedActivationBackward(gradOutput, preActivation, activation, activationParams);
 
         // Fallback for non-CPU engines
@@ -7329,7 +8768,7 @@ internal static class BackwardFunctions<T>
                 // cost two transpose kernels per linear layer per step -- 16 of a Transformer step's 24 -- and a layer
                 // whose input gradient nothing reads (the first one) computed and discarded that GEMM as well.
                 bool gpuDone = false;
-                if (engine is DirectGpuTensorEngine gpuLinear
+                if (engine.TryGet<DirectGpuTensorEngine>(out var gpuLinear)
                     && !DifferentiableOps.IsRecording<T>()
                     && !Compilation.GraphMode.IsActive)
                 {
@@ -7393,7 +8832,7 @@ internal static class BackwardFunctions<T>
                 {
                     // A bias of N elements (any rank) gets the column sums of [rowsG, N]; in a resident step they are
                     // summed straight into its accumulator.
-                    if (engine is DirectGpuTensorEngine gpuBias
+                    if (engine.TryGet<DirectGpuTensorEngine>(out var gpuBias)
                         && inputs[2].Length == N
                         && !DifferentiableOps.IsRecording<T>()
                         && !Compilation.GraphMode.IsActive
@@ -7462,7 +8901,7 @@ internal static class BackwardFunctions<T>
         IEngine engine,
         Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is not DirectGpuTensorEngine gpu
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             || DifferentiableOps.IsRecording<T>()
             || Compilation.GraphMode.IsActive
             || inputs.Length != 2)
@@ -7713,7 +9152,9 @@ internal static class BackwardFunctions<T>
         int repeats = (int)savedState[0];
         int dim = (int)savedState[1];
         var input = inputs[0];
-        if (engine is DirectGpuTensorEngine)
+        if (CreatesGraph && RepeatInterleaveBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, repeats, dim))
+            return;
+        if (engine.Is<DirectGpuTensorEngine>())
         {
             // Output element [o, i * repeats + r, n] came from input [o, i, n]: viewed as [outer, axis, repeats, inner]
             // the gradient is a sum over the repeats axis, a device reduction instead of a host walk of gradOutput.
@@ -7755,6 +9196,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
+    // The create-graph path of RepeatInterleaveBackward, kept out of it so its first-order path allocates no closure.
+    private static bool RepeatInterleaveBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int repeats,
+            int dim)
+        => TryLinearBackward("RepeatInterleaveBackward", RepeatInterleaveBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorRepeatInterleave(w, repeats, dim));
+
     /// <summary>
     /// CumProd backward. For y_i = ∏_{j≤i} x_j, we have
     ///   dy_i/dx_k = y_i / x_k   (for k ≤ i)  — valid only when x_k ≠ 0.
@@ -7768,6 +9222,14 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int axis = (int)savedState[0];
+        if (CreatesGraph)
+        {
+            // dx_k = Σ_{i≥k} g_i·y_i / x_k as recorded ops (the kernel below's formula), differentiable in g and x.
+            int cumAxis = axis < 0 ? axis + inputs[0].Rank : axis;
+            var recorded = engine.TensorDivide(ReverseCumSum(engine, engine.TensorMultiply(gradOutput, output), cumAxis), inputs[0]);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], recorded, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
@@ -7836,6 +9298,8 @@ internal static class BackwardFunctions<T>
         var dX = dXLease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < dX.Length; i++) dX[i] = zero;
+        var routeTo = CreatesGraph ? new List<int>() : null;
+        var routeFrom = CreatesGraph ? new List<int>() : null;
 
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -7860,9 +9324,15 @@ internal static class BackwardFunctions<T>
                     }
                     int argPos = outer * axisLen * innerSize + argExt * innerSize + inner;
                     dX[argPos] = ops.Add(dX[argPos], dY[pos]);
+                    routeTo?.Add(argPos);
+                    routeFrom?.Add(pos);
                 }
             }
 
+        // Under create-graph the same routing (each output's gradient to the position holding its running extreme)
+        // as a recorded sparse map, connected to the upstream gradient.
+        if (routeTo is not null)
+            grad = SparseMap(gradOutput, (int[])input._shape.Clone(), routeTo.ToArray(), routeFrom!.ToArray(), null);
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
@@ -7877,6 +9347,15 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int axis = (int)savedState[0];
+        if (CreatesGraph)
+        {
+            // dx_k = exp(x_k)·Σ_{i≥k} g_i·exp(-y_i) as recorded ops (the kernel below's Σ g_i·exp(x_k - y_i)).
+            int cumAxis = axis < 0 ? axis + inputs[0].Rank : axis;
+            var weighted = engine.TensorMultiply(gradOutput, engine.TensorExp(engine.TensorNegate(output)));
+            var recorded = engine.TensorMultiply(engine.TensorExp(inputs[0]), ReverseCumSum(engine, weighted, cumAxis));
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], recorded, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
@@ -7918,7 +9397,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var min = (T)savedState[0];
-        if (min is float minBound && engine is DirectGpuTensorEngine gpu
+        if (min is float minBound && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], minBound, lowerBound: true) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -7938,7 +9417,7 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var max = (T)savedState[0];
-        if (max is float maxBound && engine is DirectGpuTensorEngine gpu
+        if (max is float maxBound && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], maxBound, lowerBound: false) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -7961,6 +9440,16 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // a/y and b/y as recorded ops, 0 where y = 0 (as below).
+            var yZero = HostMask(output, v => v == 0);
+            var ys = SafeArgument(engine, output, yZero, 1);
+            var zeros = ConstantLike(output, 0);
+            AccumulateScaled(grads, a, gradOutput, Select(engine, yZero, zeros, engine.TensorDivide(a, ys)), engine);
+            AccumulateScaled(grads, b, gradOutput, Select(engine, yZero, zeros, engine.TensorDivide(b, ys)), engine);
+            return;
+        }
         using var yLease = output.Lease();
         var y = yLease.Span;
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
@@ -7987,6 +9476,12 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0];
         var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // ±1 by whether the signs agree: a constant (piecewise) factor.
+            AccumulateScaled(grads, a, gradOutput, HostMap(a, b, (x, y) => (x >= 0) == (y >= 0) ? 1.0 : -1.0), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8012,6 +9507,13 @@ internal static class BackwardFunctions<T>
         // Use the identity fmod(a, b) = a - trunc(a/b)·b → d/da = 1, d/db = -trunc(a/b).
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // The quotient is piecewise constant: a constant factor (0 where b = 0, as below).
+            DifferentiableOps.AccumulateGrad(grads, a, gradOutput, engine);
+            AccumulateScaled(grads, b, gradOutput, HostMap(a, b, (x, y) => y == 0 ? 0.0 : -Math.Truncate(x / y)), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8038,6 +9540,12 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, a, gradOutput, engine);
+            AccumulateScaled(grads, b, gradOutput, HostMap(a, b, (x, y) => y == 0 ? 0.0 : -Math.Floor(x / y)), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8063,6 +9571,18 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
+        if (CreatesGraph)
+        {
+            // d/da = b·a^(b-1) = b·y/a (0 at a = 0); d/db = y·ln(a) (0 for a ≤ 0), as recorded ops.
+            var aZero = HostMask(a, v => v == 0);
+            var aNonPositive = HostMask(a, v => v <= 0);
+            var zeros = ConstantLike(a, 0);
+            var partialA = engine.TensorDivide(engine.TensorMultiply(b, output), SafeArgument(engine, a, aZero, 1));
+            var partialB = engine.TensorMultiply(output, engine.TensorLog(SafeArgument(engine, a, aNonPositive, 1)));
+            AccumulateScaled(grads, a, gradOutput, Select(engine, aZero, zeros, partialA), engine);
+            AccumulateScaled(grads, b, gradOutput, Select(engine, aNonPositive, zeros, partialB), engine);
+            return;
+        }
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
         using var ySrcLease = output.Lease();
         var ySrc = ySrcLease.Span;
@@ -8095,6 +9615,15 @@ internal static class BackwardFunctions<T>
         var x = inputs[0];
         // exp is stored in savedState as Tensor<int>; non-differentiable.
         var expT = (Tensor<int>)savedState[0];
+        if (CreatesGraph)
+        {
+            // 2^exp is a constant factor.
+            var scales = new double[expT.Length];
+            using (var expLease = expT.Lease())
+                for (int i = 0; i < scales.Length; i++) scales[i] = System.Math.Pow(2.0, expLease.Span[i]);
+            AccumulateScaled(grads, x, gradOutput, RoIAlignPlan.FromDoubles<T>(scales, (int[])x._shape.Clone()), engine);
+            return;
+        }
         using var eSrcLease = expT.Lease();
         var eSrc = eSrcLease.Span;
         using var dYLease = gradOutput.Lease();
@@ -8125,6 +9654,12 @@ internal static class BackwardFunctions<T>
         var gA = new Tensor<T>(a._shape);
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, a, gradOutput, engine.TensorExp(engine.TensorSubtract(a, output)), engine);
+            AccumulateScaled(grads, b, gradOutput, engine.TensorExp(engine.TensorSubtract(b, output)), engine);
+            return;
+        }
         for (int i = 0; i < dA.Length; i++)
         {
             // d/da log(e^a + e^b) = e^a / (e^a + e^b) = e^(a-y).
@@ -8153,6 +9688,12 @@ internal static class BackwardFunctions<T>
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
         var ln2 = ops.FromDouble(System.Math.Log(2.0));
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, a, gradOutput, engine.TensorExp(Scale(engine, engine.TensorSubtract(a, output), System.Math.Log(2.0))), engine);
+            AccumulateScaled(grads, b, gradOutput, engine.TensorExp(Scale(engine, engine.TensorSubtract(b, output), System.Math.Log(2.0))), engine);
+            return;
+        }
         for (int i = 0; i < dA.Length; i++)
         {
             // y = log2(2^a + 2^b); d/da = 2^a / (2^a + 2^b) = 2^(a-y) — unitless because
@@ -8186,6 +9727,12 @@ internal static class BackwardFunctions<T>
         var dX = dXLease.Span;
         // -2/√π
         var c = ops.FromDouble(-2.0 / System.Math.Sqrt(System.Math.PI));
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, x, gradOutput,
+                Scale(engine, engine.TensorExp(engine.TensorNegate(Squared(engine, x))), -2.0 / System.Math.Sqrt(System.Math.PI)), engine);
+            return;
+        }
         for (int i = 0; i < dX.Length; i++)
         {
             var expTerm = ops.Exp(ops.Negate(ops.Multiply(xSrc[i], xSrc[i])));
@@ -8209,6 +9756,13 @@ internal static class BackwardFunctions<T>
         using var dXLease = gX.LeaseWritable();
         var dX = dXLease.Span;
         var c = ops.FromDouble(System.Math.Sqrt(System.Math.PI) / 2.0);
+        if (CreatesGraph)
+        {
+            // √π/2 · exp(erfinv(x)²), through the recorded output.
+            AccumulateScaled(grads, x, gradOutput,
+                Scale(engine, engine.TensorExp(Squared(engine, output)), System.Math.Sqrt(System.Math.PI) / 2.0), engine);
+            return;
+        }
         for (int i = 0; i < dX.Length; i++)
         {
             // d/dy erfinv = (√π / 2) · exp(erfinv(y)²). y is input; output = erfinv(y).
@@ -8225,6 +9779,15 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0]; var y = inputs[1];
+        if (CreatesGraph)
+        {
+            // (x ≠ 0)·log(y) and (x ≠ 0)·x/y, as torch's xlogy backward.
+            var xZero = HostMask(x, v => v == 0);
+            var zeros = ConstantLike(x, 0);
+            AccumulateScaled(grads, x, gradOutput, Select(engine, xZero, zeros, engine.TensorLog(y)), engine);
+            AccumulateScaled(grads, y, gradOutput, Select(engine, xZero, zeros, engine.TensorDivide(x, y)), engine);
+            return;
+        }
         var xSrc = x.AsSpan(); var ySrc = y.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8248,6 +9811,14 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0]; var y = inputs[1];
+        if (CreatesGraph)
+        {
+            var xZero = HostMask(x, v => v == 0);
+            var zeros = ConstantLike(x, 0);
+            AccumulateScaled(grads, x, gradOutput, Select(engine, xZero, zeros, engine.TensorLog1p(y)), engine);
+            AccumulateScaled(grads, y, gradOutput, Select(engine, xZero, zeros, engine.TensorDivide(x, Shift(engine, y, 1))), engine);
+            return;
+        }
         var xSrc = x.AsSpan(); var ySrc = y.AsSpan();
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
@@ -8270,6 +9841,11 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorDigamma(inputs[0]), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -8298,6 +9874,12 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            // trigamma = polygamma(1, x), whose own backward is polygamma(2, x): every order stays recorded.
+            AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorPolygamma(1, inputs[0]), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -8328,6 +9910,11 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorI1(inputs[0]), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -8345,7 +9932,7 @@ internal static class BackwardFunctions<T>
             double term = 1.0, sum = 1.0;
             for (int k = 1; k < 25; k++)
             {
-                term *= halfSq / (k * (k + 1));
+                term *= halfSq / ((double)k * (k + 1));
                 sum += term;
                 if (term < 1e-16 * sum) break;
             }
@@ -8359,6 +9946,15 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (CreatesGraph)
+        {
+            // I₀(x) − I₁(x)/x, with the limit ½ at x = 0.
+            var x0 = inputs[0];
+            var atZero = HostMask(x0, v => v == 0);
+            var d = engine.TensorSubtract(engine.TensorI0(x0), engine.TensorDivide(output, SafeArgument(engine, x0, atZero, 1)));
+            AccumulateScaled(grads, x0, gradOutput, Select(engine, atZero, ConstantLike(x0, 0.5), d), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
         using var xSrcLease = x.Lease();
@@ -8379,7 +9975,7 @@ internal static class BackwardFunctions<T>
             double term = 1.0, sum = 1.0;
             for (int k = 1; k < 25; k++)
             {
-                term *= halfSq / (k * k);
+                term *= halfSq / ((double)k * k);
                 sum += term;
                 if (term < 1e-16 * sum) break;
             }
@@ -8429,6 +10025,9 @@ internal static class BackwardFunctions<T>
         //
         //   dA[i0,..,iN] = Σ_{j0,..,jN} dY[i0*b0+j0, ..., iN*bN+jN] * B[j0,..,jN]
         //   dB[j0,..,jN] = Σ_{i0,..,iN} dY[i0*b0+j0, ..., iN*bN+jN] * A[i0,..,iN]
+        if (TryMultilinearBackward("KronBackward", KronBackward, gradOutput, inputs, output, savedState, engine, grads,
+                (e, xs) => e.TensorKron(xs[0], xs[1])))
+            return;
         var a = inputs[0];
         var b = inputs[1];
         var ops = MathHelper.GetNumericOperations<T>();
@@ -8522,6 +10121,13 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (inputs.Length >= 2)
+        {
+            int addAxis = (int)savedState[0];
+            var addIndices = (Tensor<int>)savedState[1];
+            if (CreatesGraph && IndexAddBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, addAxis, addIndices))
+                return;
+        }
         // dL/d(input) = dL/d(output) — `input` is the zeroth input.
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
 
@@ -8563,6 +10169,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, source, srcGrad, engine);
     }
 
+    // The create-graph path of IndexAddBackward, kept out of it so its first-order path allocates no closure.
+    private static bool IndexAddBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int addAxis,
+            Tensor<int> addIndices)
+        => TryJointlyLinearBackward("IndexAddBackward", IndexAddBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorIndexAdd(xs[0], addAxis, addIndices, xs[1]));
+
     /// <summary>
     /// IndexCopy backward.  Forward is <c>result = input; result[idx] = source</c>.
     ///   dL/d(input)  = gradOutput with zeroed rows at the copied indices
@@ -8577,9 +10196,13 @@ internal static class BackwardFunctions<T>
     {
         int axis = (int)savedState[0];
         var indices = (Tensor<int>)savedState[1];
+        if (inputs.Length >= 2
+                ? (CreatesGraph && IndexCopyBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, axis, indices))
+                : TrySelfAdjointBackward("IndexCopyBackward", IndexCopyBackward, gradOutput, inputs, output, savedState, engine, grads))
+            return;
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceInputGrad)
         {
             if (inputs.Length < 2)
@@ -8660,6 +10283,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, source, srcGrad, engine);
     }
 
+    // The create-graph path of IndexCopyBackward, kept out of it so its first-order path allocates no closure.
+    private static bool IndexCopyBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int axis,
+            Tensor<int> indices)
+        => TryJointlyLinearBackward("IndexCopyBackward", IndexCopyBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorIndexCopy(xs[0], axis, indices, xs[1]));
+
     /// <summary>
     /// IndexFill backward: zero the gradient at filled positions; rest passes
     /// through (gradient w.r.t. the scalar fill-value is not tracked in v1).
@@ -8673,7 +10309,10 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
-        if (engine is DirectGpuTensorEngine gpu
+        // Under create-graph: zeroing the filled positions is a mask of the upstream gradient, its own adjoint.
+        if (TrySelfAdjointBackward("IndexFillBackward", IndexFillBackward, gradOutput, inputs, output, savedState, engine, grads))
+            return;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
@@ -8725,6 +10364,8 @@ internal static class BackwardFunctions<T>
     {
         var indices = (Tensor<int>)savedState[0];
         int dim = (int)savedState[1];
+        if (CreatesGraph && TakeAlongDimBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, indices, dim))
+            return;
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
@@ -8757,6 +10398,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
+    // The create-graph path of TakeAlongDimBackward, kept out of it so its first-order path allocates no closure.
+    private static bool TakeAlongDimBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<int> indices,
+            int dim)
+        => TryLinearBackward("TakeAlongDimBackward", TakeAlongDimBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorTakeAlongDim(w, indices, dim));
+
     /// <summary>
     /// MaskedScatter backward.  Forward is
     ///   <c>result[i] = mask[i] ? source[prefixSum[i]] : input[i]</c>.
@@ -8770,7 +10424,11 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var mask = (Tensor<Bit>)savedState[0];
-        if (inputs.Length >= 2 && engine is DirectGpuTensorEngine gpu
+        if (inputs.Length >= 2
+                ? (CreatesGraph && MaskedScatterBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, mask))
+                : TrySelfAdjointBackward("MaskedScatterBackward", MaskedScatterBackward, gradOutput, inputs, output, savedState, engine, grads))
+            return;
+        if (inputs.Length >= 2 && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryMaskedScatterBackwardOnDevice(gradOutput, mask, inputs[1]._shape) is { } device)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], device.InputGrad, engine);
@@ -8827,6 +10485,18 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, source, srcGrad, engine);
     }
 
+    // The create-graph path of MaskedScatterBackward, kept out of it so its first-order path allocates no closure.
+    private static bool MaskedScatterBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<Bit> mask)
+        => TryJointlyLinearBackward("MaskedScatterBackward", MaskedScatterBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorMaskedScatter(xs[0], mask, xs[1]));
+
     /// <summary>
     /// Take backward: scatter the incoming gradient (same shape as indices)
     /// back to the flattened input shape at each indexed position. Duplicate
@@ -8838,6 +10508,9 @@ internal static class BackwardFunctions<T>
     {
         var indices = (Tensor<int>)savedState[0];
         var inputShape = (int[])savedState[1];
+
+        if (CreatesGraph && TakeBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, indices))
+            return;
 
         var grad = new Tensor<T>(inputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -8858,6 +10531,18 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    // The create-graph path of TakeBackward, kept out of it so its first-order path allocates no closure.
+    private static bool TakeBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<int> indices)
+        => TryLinearBackward("TakeBackward", TakeBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorTake(w, indices));
+
     /// <summary>
     /// MaskedSelect backward: scatter the incoming 1-D gradient back to the
     /// original tensor shape at mask-true positions; zero elsewhere.
@@ -8868,6 +10553,9 @@ internal static class BackwardFunctions<T>
     {
         var mask = (Tensor<Bit>)savedState[0];
         var inputShape = (int[])savedState[1];
+
+        if (CreatesGraph && MaskedSelectBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, mask))
+            return;
 
         var grad = new Tensor<T>(inputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -8887,6 +10575,18 @@ internal static class BackwardFunctions<T>
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of MaskedSelectBackward, kept out of it so its first-order path allocates no closure.
+    private static bool MaskedSelectBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<Bit> mask)
+        => TryLinearBackward("MaskedSelectBackward", MaskedSelectBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorMaskedSelect(w, mask));
 
     /// <summary>
     /// Backward for the general einsum path. For an n-operand forward
@@ -8909,6 +10609,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var equationStr = (string)savedState[0];
+        if (CreatesGraph && EinsumBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, equationStr))
+            return;
         var eq = Engines.Einsum.EinsumEquation.Parse(equationStr);
 
         string outLabels = eq.Output.ToString();
@@ -8931,6 +10633,18 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[i], gradI, engine);
         }
     }
+
+    // The create-graph path of EinsumBackward, kept out of it so its first-order path allocates no closure.
+    private static bool EinsumBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            string equationStr)
+        => TryMultilinearBackward("EinsumBackward", EinsumBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, xs) => e.TensorEinsum(equationStr, xs));
 
     /// <summary>
     /// Triu backward: re-apply the same upper-triangular mask to gradOutput.
@@ -8969,6 +10683,14 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var input = inputs[0];
+        if (CreatesGraph)
+        {
+            // A constant mask of the finite elements (the replaced ones are constants of the output).
+            var finite = HostMask(input, v => !(double.IsNaN(v) || double.IsInfinity(v)));
+            DifferentiableOps.AccumulateGrad(grads, input,
+                CreatesGraph ? NanToNumBackwardCreateGraph(gradOutput, engine, finite) : engine.TensorMultiply(gradOutput, finite), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
         using var srcLease = input.Lease();
@@ -8988,6 +10710,13 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
 
+    // The create-graph path of NanToNumBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> NanToNumBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            IEngine engine,
+            Tensor<T> finite)
+        => DiagonalLinearGrad("NanToNumBackward", gradOutput, engine, (e, w) => e.TensorMultiply(w, finite));
+
     /// <summary>
     /// DiagEmbed backward: extract the diagonal from gradOutput at the given
     /// offset to recover the gradient with the input's original shape.
@@ -8998,6 +10727,8 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int offset = (int)savedState[0];
+        if (CreatesGraph && DiagEmbedBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, offset))
+            return;
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
@@ -9024,6 +10755,18 @@ internal static class BackwardFunctions<T>
             }
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
+
+    // The create-graph path of DiagEmbedBackward, kept out of it so its first-order path allocates no closure.
+    private static bool DiagEmbedBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int offset)
+        => TryLinearBackward("DiagEmbedBackward", DiagEmbedBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorDiagEmbed(w, offset));
 
     /// <summary>
     /// Inner product backward. For inputs with shapes
@@ -9106,6 +10849,9 @@ internal static class BackwardFunctions<T>
         int step = (int)savedState[2];
         int[] inputShape = (int[])savedState[3];
 
+        if (CreatesGraph && UnfoldParity210BackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, dim, size, step))
+            return;
+
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(inputShape);
@@ -9154,6 +10900,20 @@ internal static class BackwardFunctions<T>
 
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
     }
+
+    // The create-graph path of UnfoldParity210Backward, kept out of it so its first-order path allocates no closure.
+    private static bool UnfoldParity210BackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int dim,
+            int size,
+            int step)
+        => TryLinearBackward("UnfoldBackward", UnfoldParity210Backward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.TensorUnfold(w, dim, size, step));
 
     /// <summary>
     /// Hurwitz zeta backward.  ∂ζ(x, q)/∂q = -x · ζ(x+1, q).  The ∂/∂x
@@ -9277,6 +11037,16 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var x = inputs[0];
+        if (CreatesGraph)
+        {
+            // I0e(x) − I1e(x)·(sign(x) + 1/|x|), 0 at x = 0 like the host path (sign is a constant factor).
+            var atZero = HostMask(x, v => v == 0);
+            var safe = SafeArgument(engine, x, atZero, 1);
+            var factor = engine.TensorAdd(HostMap(x, v => System.Math.Sign(v)), engine.TensorReciprocal(engine.TensorAbs(safe)));
+            var d = engine.TensorSubtract(engine.TensorI0e(x), engine.TensorMultiply(output, factor));
+            AccumulateScaled(grads, x, gradOutput, Select(engine, atZero, ConstantLike(x, 0), d), engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var deriv = new Tensor<T>(x._shape);
         using var xsLease = x.Lease();
@@ -9312,6 +11082,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Iou)) return;
         var (gA, gB) = engine.BoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
@@ -9322,6 +11093,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Generalized)) return;
         var (gA, gB) = engine.GeneralizedBoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
@@ -9332,6 +11104,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Distance)) return;
         var (gA, gB) = engine.DistanceBoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
@@ -9342,6 +11115,7 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TrySecondOrderBoxIou(gradOutput, inputs, engine, grads, IouKind.Complete)) return;
         var (gA, gB) = engine.CompleteBoxIouBackward(gradOutput, inputs[0], inputs[1]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gA, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gB, engine);
@@ -9367,14 +11141,35 @@ internal static class BackwardFunctions<T>
         var input = inputs[0];
         var mode = (InterpolateMode)savedState[0];
         bool alignCorners = (bool)savedState[1];
+        // Every mode is linear in the input; the adjoint of its backward is the same interpolation.
+        var sizes = gradOutput._shape.Skip(2).ToArray();
+        if (CreatesGraph && InterpolateBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, sizes, mode, alignCorners))
+            return;
         var gradInput = InterpolateBackwardImpl(gradOutput, input, mode, alignCorners);
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
     }
+
+    // The create-graph path of InterpolateBackward, kept out of it so its first-order path allocates no closure.
+    private static bool InterpolateBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] sizes,
+            InterpolateMode mode,
+            bool alignCorners)
+        => TryLinearBackward("InterpolateBackward", InterpolateBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.Interpolate(v, sizes, mode, alignCorners));
 
     private static Tensor<T> InterpolateBackwardImpl(Tensor<T> gradOutput, Tensor<T> input,
         InterpolateMode mode, bool alignCorners)
     {
         if (InterpolateKernels.Handles(mode) && InterpolateKernels.TryBackward(gradOutput, input, mode, alignCorners) is { } fast) return fast;
+        // Bicubic has its own taps and weights; the generic loop below handled it as area interpolation.
+        if (mode == InterpolateMode.Bicubic && input.Rank == 4)
+            return CpuEngine.InterpolateBicubic2DBackward(gradOutput, input._shape, alignCorners);
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int spatial = input.Rank - 2;
@@ -9502,8 +11297,13 @@ internal static class BackwardFunctions<T>
         var pad = (int[])savedState[0];
         var mode = (PadMode)savedState[1];
 
+        // Every mode (constant, reflect, replicate, circular) is linear with the fill taken as zero; the adjoint of its
+        // gather-back is the same pad.
+        if (CreatesGraph && PadNdBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, pad, mode))
+            return;
+
         var gradOutputShape = gradOutput._shape;
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryPadNdBackwardOnDevice(gradOutput, input._shape, pad, mode) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
@@ -9524,6 +11324,19 @@ internal static class BackwardFunctions<T>
         }
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
     }
+
+    // The create-graph path of PadNdBackward, kept out of it so its first-order path allocates no closure.
+    private static bool PadNdBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] pad,
+            PadMode mode)
+        => TryLinearBackward("PadNdBackward", PadNdBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.PadNd(w, pad, mode, MathHelper.GetNumericOperations<T>().Zero));
 
     /// <summary>
     /// For every element of a PadNd output (row-major over <paramref name="outShape"/>), the flat input offset it
@@ -9603,6 +11416,8 @@ internal static class BackwardFunctions<T>
         int outH = (int)savedState[1];
         int outW = (int)savedState[2];
         bool alignCorners = (bool)savedState[3];
+        if (CreatesGraph && AffineGrid3DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, outD, outH, outW, alignCorners))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         int N = theta._shape[0];
         var gradTheta = new Tensor<T>(theta._shape);
@@ -9640,6 +11455,21 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, theta, gradTheta, engine);
     }
 
+    // The create-graph path of AffineGrid3DBackward, kept out of it so its first-order path allocates no closure.
+    private static bool AffineGrid3DBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int outD,
+            int outH,
+            int outW,
+            bool alignCorners)
+        => TryLinearBackward("AffineGrid3DBackward", AffineGrid3DBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.AffineGrid3D(v, outD, outH, outW, alignCorners));
+
     /// <summary>
     /// AffineGrid (2D) backward — the output grid is linear in theta, so
     /// ∂grid[n,h,w,r] / ∂theta[n,r,k] = coord_k(h,w) for k ∈ {x, y, 1}.
@@ -9653,6 +11483,9 @@ internal static class BackwardFunctions<T>
         var theta = inputs[0];
         int outH = (int)savedState[0];
         int outW = (int)savedState[1];
+        // The grid is linear in theta; the adjoint of its backward is the grid construction itself.
+        if (CreatesGraph && AffineGridBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, outH, outW))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         int N = theta._shape[0];
         var gradTheta = new Tensor<T>(theta._shape);
@@ -9685,6 +11518,19 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, theta, gradTheta, engine);
     }
 
+    // The create-graph path of AffineGridBackward, kept out of it so its first-order path allocates no closure.
+    private static bool AffineGridBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int outH,
+            int outW)
+        => TryLinearBackward("AffineGridBackward", AffineGridBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.AffineGrid(v, outH, outW));
+
     /// <summary>
     /// RoIAlign backward — scatter each output cell's gradient back across
     /// the 4 (or 2^samplingRatio²) bilinear-sampled source positions.
@@ -9700,6 +11546,9 @@ internal static class BackwardFunctions<T>
         float spatialScale = (float)savedState[2];
         int samplingRatio = (int)savedState[3];
         bool aligned = (bool)savedState[4];
+        // Linear in the feature map for fixed boxes; the boxes' gradient is the constant zero below.
+        if (CreatesGraph && RoIAlignBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, boxes, outH, outW, spatialScale, samplingRatio, aligned))
+            return;
         var gradInput = RoIAlignBackwardImpl(gradOutput, input, boxes,
             outH, outW, spatialScale, samplingRatio, aligned);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -9709,6 +11558,23 @@ internal static class BackwardFunctions<T>
         // set zero to keep the tape shape consistent.
         DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
     }
+
+    // The create-graph path of RoIAlignBackward, kept out of it so its first-order path allocates no closure.
+    private static bool RoIAlignBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> boxes,
+            int outH,
+            int outW,
+            float spatialScale,
+            int samplingRatio,
+            bool aligned)
+        => TryMultilinearBackward("RoIAlign", RoIAlignBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.RoIAlign(x[0], boxes, outH, outW, spatialScale, samplingRatio, aligned), new[] { true, false });
 
     private static Tensor<T> RoIAlignBackwardImpl(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> boxes,
         int outH, int outW, float spatialScale, int samplingRatio, bool aligned)
@@ -9747,6 +11613,15 @@ internal static class BackwardFunctions<T>
         int outH = (int)savedState[0];
         int outW = (int)savedState[1];
         float spatialScale = (float)savedState[2];
+        if (CreatesGraph)
+        {
+            // Each bin's max is a selection of one feature-map element: record the scatter with the gather as its
+            // adjoint; the boxes' gradient stays the constant zero.
+            TrySelectionBackward("RoIPoolBackward", gradOutput, input, RoIPoolGlobalIndices(input, boxes, outH, outW, spatialScale),
+                engine, grads);
+            DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
@@ -9802,6 +11677,11 @@ internal static class BackwardFunctions<T>
         // The forward's clamp: max(x, max(AmplitudeToDBFloor, minAmplitude)).
         double minAmp = Math.Max(CpuEngine.AmplitudeToDBFloor, (float)savedState[0]);
         float? topDb = savedState.Length > 1 ? (float?)savedState[1] : null;
+        if (CreatesGraph)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, AmplitudeToDBGradRecorded(gradOutput, input, minAmp, topDb, engine), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input._shape);
         using var srcLease = input.Lease();
@@ -9860,6 +11740,9 @@ internal static class BackwardFunctions<T>
     {
         var input = inputs[0];
         int winLength = (int)savedState[0];
+        // The delta filter is linear in the signal: the adjoint of its backward is the filter itself.
+        if (CreatesGraph && ComputeDeltasBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, winLength))
+            return;
         int n = winLength / 2;
         double denom = 0.0;
         for (int i = 1; i <= n; i++) denom += 2.0 * i * i;
@@ -9901,6 +11784,18 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, input, result, engine);
     }
 
+    // The create-graph path of ComputeDeltasBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ComputeDeltasBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int winLength)
+        => TryLinearBackward("ComputeDeltasBackward", ComputeDeltasBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => e.ComputeDeltas(w, winLength));
+
     /// <summary>
     /// Resample backward — the polyphase Hann-sinc filter is linear, so
     /// backward redistributes each output gradient across the taps it
@@ -9913,6 +11808,8 @@ internal static class BackwardFunctions<T>
         var input = inputs[0];
         int origRate = (int)savedState[0];
         int newRate = (int)savedState[1];
+        if (CreatesGraph && ResampleBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, origRate, newRate))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input._shape);
         if (origRate == newRate)
@@ -9943,8 +11840,10 @@ internal static class BackwardFunctions<T>
             int sBase = r * tIn, dBase = r * tOut;
             for (int ot = 0; ot < tOut; ot++)
             {
-                double srcIdx = (double)ot * down / up;
-                int centre = (int)Math.Floor(srcIdx);
+                // Same exact placement as the forward (integer centre + fraction).
+                long num = (long)ot * down;
+                int centre = (int)(num / up);
+                double frac = (double)(num % up) / up;
                 // Forward per-output normalisation sums the weights; replay
                 // the same to get the denominator for this output element.
                 double wSum = 0.0;
@@ -9952,7 +11851,7 @@ internal static class BackwardFunctions<T>
                 {
                     int idx = centre + k;
                     if (idx < 0 || idx >= tIn) continue;
-                    double t = (idx - srcIdx) * cutoff;
+                    double t = (k - frac) * cutoff;
                     double sinc = Math.Abs(t) < 1e-12 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
                     double hann = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * (k + halfWidth) / (2.0 * halfWidth));
                     wSum += sinc * hann;
@@ -9964,7 +11863,7 @@ internal static class BackwardFunctions<T>
                 {
                     int idx = centre + k;
                     if (idx < 0 || idx >= tIn) continue;
-                    double t = (idx - srcIdx) * cutoff;
+                    double t = (k - frac) * cutoff;
                     double sinc = Math.Abs(t) < 1e-12 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
                     double hann = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * (k + halfWidth) / (2.0 * halfWidth));
                     double w = sinc * hann / wSum;
@@ -9974,6 +11873,19 @@ internal static class BackwardFunctions<T>
         }
         DifferentiableOps.AccumulateGrad(grads, input, result, engine);
     }
+
+    // The create-graph path of ResampleBackward, kept out of it so its first-order path allocates no closure.
+    private static bool ResampleBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int origRate,
+            int newRate)
+        => TryLinearBackward("ResampleBackward", ResampleBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, v) => e.Resample(v, origRate, newRate));
 
     private static int GcdLocal(int a, int b) { while (b != 0) { int t = b; b = a % b; a = t; } return a; }
 
@@ -9993,6 +11905,8 @@ internal static class BackwardFunctions<T>
         int outChans = (int)savedState[2];
         float spatialScale = (float)savedState[3];
         int samplingRatio = (int)savedState[4];
+        if (CreatesGraph && PsRoIAlignBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, boxes, outH, outW, outChans, spatialScale, samplingRatio))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
@@ -10019,7 +11933,7 @@ internal static class BackwardFunctions<T>
             int ry = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiH / outH);
             int rx = samplingRatio > 0 ? samplingRatio : (int)Math.Ceiling(roiW / outW);
             if (ry < 1) ry = 1; if (rx < 1) rx = 1;
-            double gridArea = ry * rx;
+            double gridArea = (double)ry * rx;
 
             for (int co = 0; co < outChans; co++)
             for (int ph = 0; ph < outH; ph++)
@@ -10045,6 +11959,23 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
     }
 
+    // The create-graph path of PsRoIAlignBackward, kept out of it so its first-order path allocates no closure.
+    private static bool PsRoIAlignBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> boxes,
+            int outH,
+            int outW,
+            int outChans,
+            float spatialScale,
+            int samplingRatio)
+        => TryMultilinearBackward("PsRoIAlign", PsRoIAlignBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.PsRoIAlign(x[0], boxes, outH, outW, outChans, spatialScale, samplingRatio), new[] { true, false });
+
     /// <summary>
     /// PsRoIPool backward — distribute each output gradient uniformly
     /// across its bin (the forward is an average). No argmax to recover.
@@ -10059,6 +11990,9 @@ internal static class BackwardFunctions<T>
         int outW = (int)savedState[1];
         int outChans = (int)savedState[2];
         float spatialScale = (float)savedState[3];
+        // Bin averages: linear in the feature map for fixed boxes.
+        if (CreatesGraph && PsRoIPoolBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, boxes, outH, outW, outChans, spatialScale))
+            return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
@@ -10104,6 +12038,22 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
         DifferentiableOps.AccumulateGrad(grads, boxes, new Tensor<T>(boxes._shape), engine);
     }
+
+    // The create-graph path of PsRoIPoolBackward, kept out of it so its first-order path allocates no closure.
+    private static bool PsRoIPoolBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> boxes,
+            int outH,
+            int outW,
+            int outChans,
+            float spatialScale)
+        => TryMultilinearBackward("PsRoIPool", PsRoIPoolBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, x) => e.PsRoIPool(x[0], boxes, outH, outW, outChans, spatialScale), new[] { true, false });
 
     /// <summary>
     /// Spectrogram backward — the true adjoint of <c>mag = |STFT(x)|</c>.
@@ -10152,9 +12102,30 @@ internal static class BackwardFunctions<T>
         var phase = SavedTensor(nameof(SpectrogramBackward), savedState, 3, "phase");
         int origLength = SavedInt(nameof(SpectrogramBackward), savedState, 4, "origLength");
 
+        // Under create-graph: differentiate |STFT(x)| = sqrt(Re² + Im²) over the recorded linear analysis.
+        if (CreatesGraph && SpectrogramBackwardCreateGraph(gradOutput, waveform, engine, grads, nFft, hopLength, window, origLength))
+            return;
+
         var result = MagnitudeStftAdjoint(gradOutput, phase, nFft, hopLength, window, origLength, waveform._shape);
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
+
+    // The create-graph path of SpectrogramBackward, kept out of it so its first-order path allocates no closure.
+    private static bool SpectrogramBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T> waveform,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int nFft,
+            int hopLength,
+            Tensor<T> window,
+            int origLength)
+        => TryCompositeBackward(gradOutput, new[] { waveform }, engine, grads, e =>
+            {
+                var re = RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength);
+                var im = RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength);
+                return e.TensorSqrt(e.TensorAdd(e.TensorMultiply(re, re), e.TensorMultiply(im, im)));
+            });
 
     /// <summary>
     /// Adjoint of <c>StftPhase</c>: maps a gradient shaped like the one-sided phase spectrogram
@@ -10177,11 +12148,30 @@ internal static class BackwardFunctions<T>
         var magnitude = SavedTensor(nameof(StftPhaseBackward), savedState, 3, "magnitude");
         int origLength = SavedInt(nameof(StftPhaseBackward), savedState, 4, "origLength");
 
+        // Under create-graph: differentiate atan2(Im, Re) over the recorded linear analysis.
+        if (CreatesGraph && StftPhaseBackwardCreateGraph(gradOutput, waveform, engine, grads, nFft, hopLength, window, origLength))
+            return;
+
         var result = StftAnalysisAdjoint(
             gradOutput, magnitude, output, StftAdjointTarget.Phase,
             nFft, hopLength, window, origLength, waveform._shape);
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
+
+    // The create-graph path of StftPhaseBackward, kept out of it so its first-order path allocates no closure.
+    private static bool StftPhaseBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T> waveform,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int nFft,
+            int hopLength,
+            Tensor<T> window,
+            int origLength)
+        => TryCompositeBackward(gradOutput, new[] { waveform }, engine, grads, e =>
+            e.TensorAtan2(
+                RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength),
+                RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength)));
 
     /// <summary>
     /// Adjoint of <c>RFFT</c>: maps a gradient shaped like the interleaved one-sided spectrum back
@@ -10213,10 +12203,15 @@ internal static class BackwardFunctions<T>
         int nFft = SavedInt(nameof(RFFTAdjointBackward), savedState, 1, "nFft");
         int numFreqs = nFft / 2 + 1;
 
+        // Under create-graph: the transform is linear, so the adjoint of this adjoint is the transform itself.
+        var rfftOutputShape = (int[])gradOutput._shape.Clone();
+        if (CreatesGraph && RFFTAdjointBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, rfftOutputShape))
+            return;
+
         // Device adjoint when the backward runs on the GPU engine. A compiled plan records this function from the
         // CPU base (GraphMode), so without this every compiled GPU step ran the transform on the host: a download,
         // a managed FFT per row, an upload (measured: ~26% of an LM's compiled step).
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuRfft
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var gpuRfft)
             && gpuRfft.RfftAdjointGpu(gradOutput, n, nFft, input._shape) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
@@ -10263,6 +12258,18 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, input, result, engine);
     }
 
+    // The create-graph path of RFFTAdjointBackward, kept out of it so its first-order path allocates no closure.
+    private static bool RFFTAdjointBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int[] rfftOutputShape)
+        => TryLinearBackward("RFFTAdjointBackward", RFFTAdjointBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => ToShape(e, e.RFFT(w), rfftOutputShape));
+
     /// <summary>
     /// Adjoint of <c>IRFFT</c>: maps a gradient shaped like the reconstructed real signal back onto
     /// the interleaved one-sided spectrum.
@@ -10293,9 +12300,14 @@ internal static class BackwardFunctions<T>
         int nFft = SavedInt(nameof(IRFFTAdjointBackward), savedState, 1, "nFft");
         int outputLength = SavedInt(nameof(IRFFTAdjointBackward), savedState, 2, "outputLength");
 
+        // Under create-graph: the inverse transform is linear, so the adjoint of this adjoint is the transform itself.
+        var irfftOutputShape = (int[])gradOutput._shape.Clone();
+        if (CreatesGraph && IRFFTAdjointBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, outputLength, irfftOutputShape))
+            return;
+
         // Device adjoint on the GPU engine (see RFFTAdjointBackward: the compiled plan records this CPU-path
         // function and replays it on the GPU engine).
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuIrfft
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var gpuIrfft)
             && gpuIrfft.IrfftAdjointGpu(gradOutput, numFreqs, nFft, outputLength, input._shape) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
@@ -10354,6 +12366,19 @@ internal static class BackwardFunctions<T>
 
         DifferentiableOps.AccumulateGrad(grads, input, result, engine);
     }
+
+    // The create-graph path of IRFFTAdjointBackward, kept out of it so its first-order path allocates no closure.
+    private static bool IRFFTAdjointBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int outputLength,
+            int[] irfftOutputShape)
+        => TryLinearBackward("IRFFTAdjointBackward", IRFFTAdjointBackward, gradOutput, inputs, output, savedState, engine, grads,
+            (e, w) => ToShape(e, e.IRFFT(w, outputLength), irfftOutputShape));
 
     [ThreadStatic] private static Complex<float>[]? t_fftAdjointRow;
 
@@ -10545,6 +12570,21 @@ internal static class BackwardFunctions<T>
         bool center = SavedBool(nameof(IstftBackward), savedState, 3, "center");
         int outputLength = SavedInt(nameof(IstftBackward), savedState, 4, "outputLength");
 
+        if (CreatesGraph)
+        {
+            if (IsConstantSynthesisPhase(phase))
+            {
+                // A call IstftComposite made with a constant phase: linear in the magnitude, so its gradient is the
+                // kernel's magnitude gradient recorded with the synthesis itself as the adjoint; the phase has none.
+                var connected = CreatesGraph ? IstftBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, phase, nFft, hopLength, window, center, outputLength) : KernelGrads(IstftBackward, gradOutput, inputs, output, savedState, engine)[0]
+                          ?? throw new InvalidOperationException("IstftBackward gave the magnitude no gradient.");
+                DifferentiableOps.AccumulateGrad(grads, magnitude, connected, engine);
+                return;
+            }
+            if (CreatesGraph && IstftBackwardCreateGraph2(gradOutput, inputs, engine, grads, magnitude, phase, nFft, hopLength, window, center, outputLength))
+                return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = magnitude._shape[^2];
         int numFrames = magnitude._shape[^1];
@@ -10648,6 +12688,40 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, magnitude, gradMagnitude, engine);
         DifferentiableOps.AccumulateGrad(grads, phase, gradPhase, engine);
     }
+
+    // The create-graph path of IstftBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> IstftBackwardCreateGraph(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            Tensor<T> output,
+            object[] savedState,
+            IEngine engine,
+            Tensor<T> phase,
+            int nFft,
+            int hopLength,
+            Tensor<T> window,
+            bool center,
+            int outputLength)
+        => LinearGrad("IstftBackward", gradOutput,
+            () => KernelGrads(IstftBackward, gradOutput, inputs, output, savedState, engine)[0]
+                  ?? throw new InvalidOperationException("IstftBackward gave the magnitude no gradient."),
+            (e, w) => e.ISTFT(w, phase, nFft, hopLength, window, center, outputLength));
+
+    // The create-graph path of IstftBackward, kept out of it so its first-order path allocates no closure.
+    private static bool IstftBackwardCreateGraph2(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> magnitude,
+            Tensor<T> phase,
+            int nFft,
+            int hopLength,
+            Tensor<T> window,
+            bool center,
+            int outputLength)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => IstftComposite(e, magnitude, phase, nFft, hopLength, window, center, outputLength));
 
     /// <summary>
     /// Adjoint of <c>mag = |STFT(x)|</c> with <c>center: true</c>: maps a gradient shaped like

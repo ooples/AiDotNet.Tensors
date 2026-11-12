@@ -141,7 +141,7 @@ public partial class DirectGpuTensorEngine
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         DirectGpuTensorEngine? forwardEngine = null;
-        var gpu = engine as DirectGpuTensorEngine
+        var gpu = engine.As<DirectGpuTensorEngine>()
             ?? (((WeakReference<DirectGpuTensorEngine>)savedState[0]).TryGetTarget(out forwardEngine) ? forwardEngine : null)
             ?? throw new InvalidOperationException(
                 "TensorRrelu's device backward has no GPU engine: the engine that ran its forward was released.");

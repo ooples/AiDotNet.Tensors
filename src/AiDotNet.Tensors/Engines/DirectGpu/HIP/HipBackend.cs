@@ -280,8 +280,41 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private readonly DeviceMemoryAccount _memoryAccount;
     DeviceMemoryAccount IDeviceMemoryAccounted.MemoryAccount => _memoryAccount;
 
+    // A backend collected without Dispose: its modules, hipBLAS handle, stream and pinned host blocks were never released
+    // (there was no finalizer), so every abandoned backend kept them for the life of the process. It is queued for
+    // DrainPendingAbandonedBackends, which runs on an ordinary thread (the next allocation, after that allocation's
+    // buffer frees, or the next HipBackend constructor) and never concurrently with a release of one of its own buffers
+    // - the pattern the OpenCL backend's context and CudaBackend.DrainPendingAbandonedBackends follow. The deferred
+    // teardown binds this backend's device and restores the draining thread's device (TryDisposeAbandoned).
+    ~HipBackend()
+    {
+        if (_disposed || !IsAvailable || DeviceMemoryReclaim.ProcessExiting || RuntimeShutdown.IsTearingDown) return;
+        PendingAbandonedBackends.Enqueue(this);
+    }
+
+    // Every module this backend loaded and has not unloaded: unloads claim theirs (UnloadModule), and Dispose unloads
+    // the rest, so a module no field kept (replaced, or built lazily without its own unload) is not left loaded.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, byte> _loadedModules = new();
+
+    private HipError UnloadModule(IntPtr module)
+    {
+        if (module == IntPtr.Zero) return HipError.Success;
+        _loadedModules.TryRemove(module, out _);
+        return HipNativeBindings.hipModuleUnload(module);
+    }
+
+    private void UnloadRemainingModules()
+    {
+        foreach (var module in _loadedModules.Keys)
+            if (_loadedModules.TryRemove(module, out _))
+                HipNativeBindings.hipModuleUnload(module);
+    }
+
     public HipBackend(int deviceIndex)
     {
+        // Backends collected without Dispose release their resources before this one takes more.
+        if (!HipGpuBuffer.PendingFrees.IsEmpty) HipGpuBuffer.PendingFrees.Drain();
+        DrainPendingAbandonedBackends();
         _memoryAccount = DeviceMemoryAccount.For("hip", deviceIndex);
         _kernelCache = new Dictionary<string, IntPtr>();
         DeviceName = "None";
@@ -636,6 +669,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             const string hipMathMacros = "#ifndef NAN\n#define NAN __builtin_nanf(\"\")\n#endif\n#ifndef INFINITY\n#define INFINITY __builtin_inff()\n#endif\n";
             CompileKernelModule(hipMathMacros + CUDA.Kernels.CudaTorchParityElementwiseKernels.GetSource(), "torch_parity", ref _torchParityModule,
                 CUDA.Kernels.CudaTorchParityElementwiseKernels.GetKernelNames(), useFastMath: false);
+
+            // Model-level ops (CpuEngine.TorchModelOps): the shared dialect source, precise math.
+            CompileKernelModule(TorchModelOpsKernels.CudaPrelude + TorchModelOpsKernels.Source, "torch_model_ops", ref _torchModelOpsModule,
+                TorchModelOpsKernels.KernelNames, useFastMath: false);
 
             // Categorical sampling: its own module, and NOT fast-math. Sharing the neural-net
             // module would make every kernel in it hostage to this one compiling, and fast math
@@ -1037,6 +1074,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 $"hipModuleLoadData failed with {hipResult}.",
                 hipError: hipResult));
         }
+        _loadedModules[module] = 0;
 
         // Load all kernel functions
         int loadedKernelCount = 0;
@@ -1076,7 +1114,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
             if (module != IntPtr.Zero)
             {
-                var unload = HipNativeBindings.hipModuleUnload(module);
+                var unload = UnloadModule(module);
                 if (unload != HipError.Success)
                     System.Diagnostics.Debug.WriteLine($"HIP module {moduleName}: hipModuleUnload after a partial load returned {unload}.");
                 module = IntPtr.Zero;
@@ -1574,13 +1612,17 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         // Imported DLPack memory whose tensor was finalized: the producer gets it back behind our queued work.
         if (!PendingExternalReleases.IsEmpty) DrainPendingExternalReleases();
-        if (HipGpuBuffer.PendingFrees.IsEmpty) return;
-        // A collected buffer re-enters the pool without the implicit device synchronization hipFree performed. On one
-        // in-order stream the next use is ordered after every earlier one; once a caller has its own streams, queued work
-        // there may still be reading it, so wait for the device before anything can rent it again.
-        if (HipGpuBuffer.SecondaryStreamsInUse)
-            HipNativeBindings.CheckError(HipNativeBindings.hipDeviceSynchronize(), "hipDeviceSynchronize");
-        HipGpuBuffer.PendingFrees.Drain();
+        if (!HipGpuBuffer.PendingFrees.IsEmpty)
+        {
+            // A collected buffer re-enters the pool without the implicit device synchronization hipFree performed. On
+            // one in-order stream the next use is ordered after every earlier one; once a caller has its own streams,
+            // queued work there may still be reading it, so wait for the device before anything can rent it again.
+            if (HipGpuBuffer.SecondaryStreamsInUse)
+                HipNativeBindings.CheckError(HipNativeBindings.hipDeviceSynchronize(), "hipDeviceSynchronize");
+            HipGpuBuffer.PendingFrees.Drain();
+        }
+        // After the buffer frees, so an abandoned backend's own buffers are back before its pool is torn down.
+        DrainPendingAbandonedBackends();
     }
 
     // reclaimEpoch: the epoch the allocation's charge is counted in (DeviceMemoryReclaim.OnDeviceRelease).
@@ -11516,11 +11558,19 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public void Dispose()
     {
         if (_disposed) return;
-        // Finish the device's queued work before anything is torn down: once _disposed is set, the release of an
-        // imported DLPack buffer no longer waits (SynchronizeDeviceForRelease), so its producer's deleter must not be
-        // able to run while one of our kernels still reads the memory.
-        if (IsAvailable && !DeviceMemoryReclaim.ProcessExiting)
+        GC.SuppressFinalize(this);
+        if (!IsAvailable || DeviceMemoryReclaim.ProcessExiting)
         {
+            DisposeResources();
+            return;
+        }
+        // hipSetDevice is per thread: the teardown binds this backend's device, and the caller's device comes back
+        // afterwards, so disposing a backend of another device does not move the caller's later work.
+        RunBoundToDevice(_hipDeviceIndex, CurrentDeviceOfThisThread, BindDeviceToThisThread, () =>
+        {
+            // Finish the device's queued work before anything is torn down: once _disposed is set, the release of an
+            // imported DLPack buffer no longer waits (SynchronizeDeviceForRelease), so its producer's deleter must not
+            // be able to run while one of our kernels still reads the memory.
             try
             {
                 ((IThreadContextBackend)this).EnsureContextCurrent();
@@ -11531,7 +11581,96 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                 // A faulted device has no work left running; tear down regardless.
                 System.Diagnostics.Debug.WriteLine($"HIP device synchronize before Dispose failed: {ex}");
             }
+            DisposeResources();
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> with <paramref name="device"/> bound to the calling thread and binds the thread's
+    /// previous device again afterwards (also when <paramref name="body"/> throws) — the HIP counterpart of CUDA's
+    /// cuCtxPushCurrent/cuCtxPopCurrent around a teardown. The device query and bind are parameters so the
+    /// save/restore contract is testable without a HIP device.
+    /// </summary>
+    internal static bool RunBoundToDevice(int device, Func<int> currentDevice, Action<int> bindDevice, Func<bool> body)
+    {
+        int previous = currentDevice();
+        bool rebind = previous != device;
+        if (rebind) bindDevice(device);
+        try
+        {
+            return body();
         }
+        finally
+        {
+            if (rebind) bindDevice(previous);
+        }
+    }
+
+    private static int CurrentDeviceOfThisThread() => HipNativeBindings.GetCurrentDevice("hipGetDevice(Dispose)");
+
+    private static void BindDeviceToThisThread(int device) =>
+        HipNativeBindings.SetCurrentDevice(device, "hipSetDevice(Dispose)");
+
+    // Backends collected without Dispose (queued by the finalizer). Each is disposed on an ordinary thread - the next
+    // allocation's drain, or the next HipBackend constructor - after the buffer frees queued before it.
+    internal static readonly System.Collections.Concurrent.ConcurrentQueue<HipBackend> PendingAbandonedBackends = new();
+
+    [ThreadStatic] private static bool t_drainingAbandonedBackends;
+
+    /// <summary>
+    /// Disposes the backends collected without Dispose whose work has finished. One still running is put back for a
+    /// later drain rather than waited for: the draining thread belongs to an unrelated operation, possibly on another
+    /// device, and must not stall on (or synchronize) that device.
+    /// </summary>
+    internal static void DrainPendingAbandonedBackends()
+    {
+        if (PendingAbandonedBackends.IsEmpty || t_drainingAbandonedBackends) return;
+        t_drainingAbandonedBackends = true;
+        try
+        {
+            // Only the backends queued when the drain began: one put back is retried at a later drain, not spun on.
+            for (int pending = PendingAbandonedBackends.Count; pending > 0; pending--)
+            {
+                if (!PendingAbandonedBackends.TryDequeue(out var backend)) break;
+                bool done;
+                try { done = backend.TryDisposeAbandoned(); }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    // A device gone or faulted: the driver reclaims what is left with the process.
+                    System.Diagnostics.Debug.WriteLine($"Deferred HIP backend dispose failed: {ex}");
+                    done = true;
+                }
+                if (!done) PendingAbandonedBackends.Enqueue(backend);
+            }
+        }
+        finally
+        {
+            t_drainingAbandonedBackends = false;
+        }
+    }
+
+    /// <summary>
+    /// The deferred Dispose of a backend collected without Dispose. Its device is bound for the teardown (module
+    /// unloads, frees and handle destroys act on the current device) and the draining thread's device is bound again
+    /// afterwards. There is no device-wide synchronize: nothing can queue new work on an unreachable backend, so its
+    /// own stream finishing is all the teardown needs, and that is polled (hipStreamQuery) rather than waited for.
+    /// Returns false, changing nothing, while that stream still has work.
+    /// </summary>
+    private bool TryDisposeAbandoned()
+    {
+        if (_disposed || !IsAvailable || DeviceMemoryReclaim.ProcessExiting || RuntimeShutdown.IsTearingDown) return true;
+        return RunBoundToDevice(_hipDeviceIndex, CurrentDeviceOfThisThread, BindDeviceToThisThread, () =>
+        {
+            if (_stream != IntPtr.Zero && HipNativeBindings.hipStreamQuery(_stream) == HipError.ErrorNotReady)
+                return false;
+            DisposeResources();
+            return true;
+        });
+    }
+
+    private void DisposeResources()
+    {
         _disposed = true;
 
         DisposeCompiledCodegenKernels();
@@ -11539,7 +11678,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (_normModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_normModule);
+            UnloadModule(_normModule);
             _normModule = IntPtr.Zero;
         }
 
@@ -11552,145 +11691,150 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // Unload all kernel modules
         if (_mfmaModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_mfmaModule);
+            UnloadModule(_mfmaModule);
             _mfmaModule = IntPtr.Zero;
         }
         if (_activationModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_activationModule);
+            UnloadModule(_activationModule);
             _activationModule = IntPtr.Zero;
         }
         if (_categoricalModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_categoricalModule);
+            UnloadModule(_categoricalModule);
             _categoricalModule = IntPtr.Zero;
         }
 
         if (_batchExecutionModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_batchExecutionModule);
+            UnloadModule(_batchExecutionModule);
             _batchExecutionModule = IntPtr.Zero;
         }
         if (_torchParityModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_torchParityModule);
+            UnloadModule(_torchParityModule);
             _torchParityModule = IntPtr.Zero;
+        }
+        if (_torchModelOpsModule != IntPtr.Zero)
+        {
+            UnloadModule(_torchModelOpsModule);
+            _torchModelOpsModule = IntPtr.Zero;
         }
         if (_neuralNetModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_neuralNetModule);
+            UnloadModule(_neuralNetModule);
             _neuralNetModule = IntPtr.Zero;
         }
         if (_convolutionModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_convolutionModule);
+            UnloadModule(_convolutionModule);
             _convolutionModule = IntPtr.Zero;
         }
         if (_poolingModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_poolingModule);
+            UnloadModule(_poolingModule);
             _poolingModule = IntPtr.Zero;
         }
         if (_normalizationModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_normalizationModule);
+            UnloadModule(_normalizationModule);
             _normalizationModule = IntPtr.Zero;
         }
         if (_fusedModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_fusedModule);
+            UnloadModule(_fusedModule);
             _fusedModule = IntPtr.Zero;
         }
 
         if (_quantGemmModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_quantGemmModule);
+            UnloadModule(_quantGemmModule);
             _quantGemmModule = IntPtr.Zero;
         }
 
         if (_pagedAttnModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_pagedAttnModule);
+            UnloadModule(_pagedAttnModule);
             _pagedAttnModule = IntPtr.Zero;
         }
 
         if (_flashDecodeModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_flashDecodeModule);
+            UnloadModule(_flashDecodeModule);
             _flashDecodeModule = IntPtr.Zero;
         }
         if (_attentionModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_attentionModule);
+            UnloadModule(_attentionModule);
             _attentionModule = IntPtr.Zero;
         }
         if (_fftModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_fftModule);
+            UnloadModule(_fftModule);
             _fftModule = IntPtr.Zero;
         }
         DisposeClBlastGemm();
         if (_spectralPerfModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_spectralPerfModule);
+            UnloadModule(_spectralPerfModule);
             _spectralPerfModule = IntPtr.Zero;
         }
         if (_missingLookupModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_missingLookupModule);
+            UnloadModule(_missingLookupModule);
             _missingLookupModule = IntPtr.Zero;
         }
         if (_octonionModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_octonionModule);
+            UnloadModule(_octonionModule);
             _octonionModule = IntPtr.Zero;
         }
         if (_locallyConnectedModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_locallyConnectedModule);
+            UnloadModule(_locallyConnectedModule);
             _locallyConnectedModule = IntPtr.Zero;
         }
         if (_deformableConvModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_deformableConvModule);
+            UnloadModule(_deformableConvModule);
             _deformableConvModule = IntPtr.Zero;
         }
         if (_optimizerModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_optimizerModule);
+            UnloadModule(_optimizerModule);
             _optimizerModule = IntPtr.Zero;
         }
         if (_fusedConvolutionModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_fusedConvolutionModule);
+            UnloadModule(_fusedConvolutionModule);
             _fusedConvolutionModule = IntPtr.Zero;
         }
         if (_sparseModule != IntPtr.Zero)
         {
             // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
-            HipNativeBindings.hipModuleUnload(_sparseModule);
+            UnloadModule(_sparseModule);
             _sparseModule = IntPtr.Zero;
         }
         if (_specializedModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_specializedModule);
+            UnloadModule(_specializedModule);
             _specializedModule = IntPtr.Zero;
         }
         if (_fp16Module != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_fp16Module);
+            UnloadModule(_fp16Module);
             _fp16Module = IntPtr.Zero;
         }
 
         if (_lstmModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_lstmModule);
+            UnloadModule(_lstmModule);
             _lstmModule = IntPtr.Zero;
         }
 
         if (_gruModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_gruModule);
+            UnloadModule(_gruModule);
             _gruModule = IntPtr.Zero;
         }
 
@@ -11698,60 +11842,60 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // backend create/dispose cycles don't leak HIP module handles.
         if (_glaModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_glaModule);
+            UnloadModule(_glaModule);
             _glaModule = IntPtr.Zero;
         }
         if (_xlstmModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_xlstmModule);
+            UnloadModule(_xlstmModule);
             _xlstmModule = IntPtr.Zero;
         }
         if (_gatedDeltaNetModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_gatedDeltaNetModule);
+            UnloadModule(_gatedDeltaNetModule);
             _gatedDeltaNetModule = IntPtr.Zero;
         }
         if (_rgLruModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_rgLruModule);
+            UnloadModule(_rgLruModule);
             _rgLruModule = IntPtr.Zero;
         }
         if (_rwkv4Module != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_rwkv4Module);
+            UnloadModule(_rwkv4Module);
             _rwkv4Module = IntPtr.Zero;
         }
         if (_mambaModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_mambaModule);
+            UnloadModule(_mambaModule);
             _mambaModule = IntPtr.Zero;
         }
         if (_mamba2Module != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_mamba2Module);
+            UnloadModule(_mamba2Module);
             _mamba2Module = IntPtr.Zero;
         }
         if (_fusedCeModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_fusedCeModule);
+            UnloadModule(_fusedCeModule);
             _fusedCeModule = IntPtr.Zero;
         }
 
         if (_capsuleModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_capsuleModule);
+            UnloadModule(_capsuleModule);
             _capsuleModule = IntPtr.Zero;
         }
 
         if (_snnModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_snnModule);
+            UnloadModule(_snnModule);
             _snnModule = IntPtr.Zero;
         }
 
         if (_linalgModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_linalgModule);
+            UnloadModule(_linalgModule);
             _linalgModule = IntPtr.Zero;
         }
 
@@ -11759,14 +11903,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         foreach (var modRef in new[] { _detectionModule, _geometryModule, _roiModule, _audioModule })
         {
             if (modRef != IntPtr.Zero)
-                HipNativeBindings.hipModuleUnload(modRef);
+                UnloadModule(modRef);
         }
         _detectionModule = _geometryModule = _roiModule = _audioModule = IntPtr.Zero;
 
         // Unload the fused ANN kernel module (IAnnBackend).
         if (_annModule != IntPtr.Zero)
         {
-            HipNativeBindings.hipModuleUnload(_annModule);
+            UnloadModule(_annModule);
             _annModule = IntPtr.Zero;
         }
 
@@ -11774,7 +11918,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         foreach (var modField in new[] { _dotProductModule, _reductionModule2, _broadcastModule, _gatedModule, _shapeModule, _lossModule, _softmaxVarModule, _tunedRowModule, _winogradModule, _winogradFusedModule, _fusedLinearModule, _fusedAdvancedModule, _iouModule, _complexModule, _residentProgramModule })
         {
             if (modField != IntPtr.Zero)
-                HipNativeBindings.hipModuleUnload(modField);
+                UnloadModule(modField);
         }
         _dotProductModule = _reductionModule2 = _broadcastModule = _gatedModule = _shapeModule = _lossModule = _softmaxVarModule = _tunedRowModule = _winogradModule = _winogradFusedModule = _fusedLinearModule = _fusedAdvancedModule = _iouModule = _complexModule = _residentProgramModule = IntPtr.Zero;
 
@@ -11786,6 +11930,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _hipblasHandle = IntPtr.Zero;
         }
         _hipblasAvailable = false;
+
+        UnloadRemainingModules();
 
         if (_stream != IntPtr.Zero)
         {

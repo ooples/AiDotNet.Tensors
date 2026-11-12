@@ -195,14 +195,24 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.WebGpu);
     }
 
+    /// <summary>Allocates a zero-initialized device buffer of float elements.</summary>
     /// <param name="elementCount">Number of float elements.</param>
-    /// <returns>A new GPU buffer.</returns>
-    public IGpuBuffer AllocateBuffer(int elementCount)
+    /// <returns>A new zero-initialized GPU buffer.</returns>
+    public IGpuBuffer AllocateBuffer(int elementCount) => AllocateBufferCore(elementCount, zeroInitialize: true);
+
+    internal IGpuBuffer AllocateBufferCore(int elementCount, bool zeroInitialize)
     {
         ThrowIfNotInitialized();
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)elementCount * sizeof(float), MaxBufferAllocBytes, DeviceName);
-        return new WebGpuBuffer(elementCount);
+        var buffer = WebGpuBuffer.Rent(elementCount, out bool fromPool);
+        if (fromPool && zeroInitialize)
+        {
+            // A queued device clear, not Fill: Fill waits for its dispatch, and a browser's single .NET thread cannot
+            // block on the JavaScript promise that wait depends on (SharedDummyBuffer reaches this through AllocateBuffer(1)).
+            buffer.ClearOnDevice(elementCount);
+        }
+        return buffer;
     }
 
     /// <summary>
@@ -213,9 +223,11 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     public IGpuBuffer AllocateBuffer(float[] data)
     {
         ThrowIfNotInitialized();
+        if (data is null) throw new ArgumentNullException(nameof(data));
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
-        var buffer = new WebGpuBuffer(data);
+        var buffer = WebGpuBuffer.Rent(data.Length, out _);
+        buffer.CopyFrom(data);
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.WebGpu);
         return buffer;
     }

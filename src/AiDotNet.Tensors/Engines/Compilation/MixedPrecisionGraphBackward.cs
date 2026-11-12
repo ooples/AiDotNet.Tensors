@@ -93,13 +93,13 @@ internal static class MixedPrecisionGraphBackward
                     // Debug.WriteLineIf (not Console.WriteLine): compiles out in Release
                     // and never pollutes stdout if the diag flag is set in production.
                     System.Diagnostics.Debug.WriteLineIf(s_fusedDiag,
-                        $"[FP16-FUSED-DIAG] LazyNode<Half> OpName='{lh.OpName}' inputs={lh.GetInputsArray().Length} hasGrad={fp16.ContainsKey(lh.Output)} engineGpu={engine is DirectGpuTensorEngine}");
+                        $"[FP16-FUSED-DIAG] LazyNode<Half> OpName='{lh.OpName}' inputs={lh.GetInputsArray().Length} hasGrad={fp16.ContainsKey(lh.Output)} engineGpu={engine.Is<DirectGpuTensorEngine>()}");
                     // FP16 fused-backward fast path: for a 2D matmul on a CUDA Tensor-Core engine, compute both
                     // grads via the transpose-free fused kernel (no FP32 transpose/up-cast scratch — the
                     // measured dominant cost) instead of the generic MatMulBackward<Half>. Falls through to the
                     // generic path on any non-matmul node, non-GPU engine, or unsupported shape.
                     if ((lh.OpName == "TensorMatMul" || lh.OpName == "TensorMatMul.fp16")
-                        && engine is DirectGpuTensorEngine gpuEng
+                        && engine.TryGet<DirectGpuTensorEngine>(out var gpuEng)
                         && fp16.TryGetValue(lh.Output, out var gradCTensor))
                     {
                         var mmInputs = lh.GetInputsArray();

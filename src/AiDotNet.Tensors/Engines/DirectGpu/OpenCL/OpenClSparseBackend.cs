@@ -35,6 +35,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (_cached is not null && _cached.IsAvailable)
                     return _cached;
 
+                // Share the process-wide GPU engine's backend when it is OpenCL: a second backend is a second context
+                // with its own copy of every compiled program (~110 MB of driver host memory) for the same device.
+                if (Engine.DirectGpuIfCreated is { IsAvailable: true, Backend: OpenClBackend { IsAvailable: true } shared })
+                {
+                    _cached = shared;
+                    return shared;
+                }
+
                 var backend = new OpenClBackend(0);
                 if (!backend.IsAvailable)
                 {

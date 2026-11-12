@@ -271,6 +271,10 @@ public partial class CpuEngine
         var c = (GruSequenceCache)savedState[0];
         var present = (GruOptionalInputs)savedState[1];
         var (input, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, present);
+        // Under create-graph the gradient must itself be differentiable: differentiate the recurrence written as
+        // recorded ops.
+        if (BackwardFunctions<T>.CreatesGraph && GruSequenceBackwardOnHostCreateGraph<T>(gradOutput, inputs, engine, grads, input, h0, wIh, wHh, bIh, bHh, c))
+            return;
         int batch = c.Batch, seqLen = c.SeqLen, hidden = c.Hidden, inFeatures = c.Input, g3 = 3 * hidden;
         var gy = ToDoubles(gradOutput);
         var x = ToDoubles(input);
@@ -368,6 +372,22 @@ public partial class CpuEngine
         if (bIh is not null) DifferentiableOps.AccumulateGrad(grads, bIh, FromDoubles<T>(gbi, new[] { g3 }), engine);
         if (bHh is not null) DifferentiableOps.AccumulateGrad(grads, bHh, FromDoubles<T>(gbh, new[] { g3 }), engine);
     }
+
+    // The create-graph path of GruSequenceBackwardOnHost, kept out of it so its first-order path allocates no closure.
+    private static bool GruSequenceBackwardOnHostCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> input,
+            Tensor<T>? h0,
+            Tensor<T> wIh,
+            Tensor<T> wHh,
+            Tensor<T>? bIh,
+            Tensor<T>? bHh,
+            GruSequenceCache c)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => GruSequenceComposite(e, input, h0, wIh, wHh, bIh, bHh, c.ResetAfter));
 
     // ── The float path: SIMD GEMMs over time-major caches, batch chunks in parallel ────────────────────────────────
 
@@ -577,6 +597,8 @@ public partial class CpuEngine
         var cache = (GruSequenceCacheFloat)savedState[0];
         var present = (GruOptionalInputs)savedState[1];
         var (input, h0, wIh, wHh, bIh, bHh) = UnpackGruSequenceInputs(inputs, present);
+        if (BackwardFunctions<T>.CreatesGraph && GruSequenceBackwardFloatCreateGraph<T>(gradOutput, inputs, engine, grads, input, h0, wIh, wHh, bIh, bHh, cache))
+            return;
         int batch = cache.Batch, seqLen = cache.SeqLen, hidden = cache.Hidden, inFeatures = cache.Input;
         int g3 = 3 * hidden, rows = seqLen * batch;
         bool resetAfter = cache.ResetAfter;
@@ -672,6 +694,22 @@ public partial class CpuEngine
         }
     }
 
+    // The create-graph path of GruSequenceBackwardFloat, kept out of it so its first-order path allocates no closure.
+    private static bool GruSequenceBackwardFloatCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> input,
+            Tensor<T>? h0,
+            Tensor<T> wIh,
+            Tensor<T> wHh,
+            Tensor<T>? bIh,
+            Tensor<T>? bHh,
+            GruSequenceCacheFloat cache)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => GruSequenceComposite(e, input, h0, wIh, wHh, bIh, bHh, cache.ResetAfter));
+
     /// <summary>
     /// One row of the GRU backward's gate gradients (see <see cref="GruSequenceBackwardFloat{T}"/>), SIMD-wide: each
     /// element's arithmetic is the scalar form's, in the same order, so the results are unchanged. dh enters as the
@@ -761,5 +799,40 @@ public partial class CpuEngine
             int b0 = w * size, b1 = Math.Min(batch, b0 + size);
             if (b0 < b1) body(b0, b1);
         });
+    }
+
+    // The GRU recurrence as recorded ops (the create-graph backward differentiates it), gates in order r, z, n:
+    // r = σ(Wir x + bir + Whr h + bhr), z = σ(Wiz x + biz + Whz h + bhz),
+    // n = tanh(Win x + bin + r ⊙ (Whn h + bhn)) [reset after] or tanh(Win x + bin + Whn (r ⊙ h) + bhn),
+    // h' = (1 - z) ⊙ n + z ⊙ h.
+    private static Tensor<T> GruSequenceComposite<T>(IEngine e, Tensor<T> input, Tensor<T>? h0, Tensor<T> wIh,
+        Tensor<T> wHh, Tensor<T>? bIh, Tensor<T>? bHh, bool resetAfter)
+    {
+        int batch = input.Shape[0], seqLen = input.Shape[1], hidden = wHh.Shape[1];
+        var wiT = e.TensorTranspose(wIh);                                             // [in, 3H]
+        var whRZT = e.TensorTranspose(e.TensorNarrow(wHh, 0, 0, 2 * hidden));         // [H, 2H]
+        var whNT = e.TensorTranspose(e.TensorNarrow(wHh, 0, 2 * hidden, hidden));     // [H, H]
+        var bi = bIh is null ? null : RecordedOps<T>.R(e, bIh, 1, 3 * hidden);
+        var bhRZ = bHh is null ? null : RecordedOps<T>.R(e, e.TensorNarrow(bHh, 0, 0, 2 * hidden), 1, 2 * hidden);
+        var bhN = bHh is null ? null : RecordedOps<T>.R(e, e.TensorNarrow(bHh, 0, 2 * hidden, hidden), 1, hidden);
+        Tensor<T> h = h0 ?? RecordedOps<T>.Zeros(batch, hidden);
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var gi = e.TensorMatMul(RecordedOps<T>.At(e, input, 1, t), wiT);           // [B, 3H]
+            if (bi is not null) gi = RecordedOps<T>.Add(e, gi, bi);
+            var ghRZ = e.TensorMatMul(h, whRZT);                                       // [B, 2H]
+            if (bhRZ is not null) ghRZ = RecordedOps<T>.Add(e, ghRZ, bhRZ);
+            var rz = e.TensorSigmoid(e.TensorAdd(e.TensorNarrow(gi, 1, 0, 2 * hidden), ghRZ));
+            var r = e.TensorNarrow(rz, 1, 0, hidden);
+            var z = e.TensorNarrow(rz, 1, hidden, hidden);
+            Tensor<T> hn = e.TensorMatMul(resetAfter ? h : e.TensorMultiply(r, h), whNT);
+            if (bhN is not null) hn = RecordedOps<T>.Add(e, hn, bhN);
+            var candidate = e.TensorNarrow(gi, 1, 2 * hidden, hidden);
+            var n = e.Tanh(e.TensorAdd(candidate, resetAfter ? e.TensorMultiply(r, hn) : hn));
+            h = e.TensorAdd(e.TensorMultiply(BackwardFunctions<T>.OneMinus(e, z), n), e.TensorMultiply(z, h));
+            ys.Add(h);
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 }

@@ -158,6 +158,17 @@ public sealed class GradientTape<T> : IDisposable
     /// <summary>Internal access to tape entries for compiled backward hash validation.</summary>
     internal TapeEntryArena<T> Entries => _entries;
 
+    // How many records a bounded tape (MaxEntries) has dropped since it was created. A caller that walks a span of
+    // entries it just recorded (BackwardFunctions.TryCompositeBackward) compares it before and after: a drop means the
+    // span is missing ops, and walking it would leave some inputs without a gradient.
+    private long _droppedEntryCount;
+
+    /// <summary>How many records this bounded tape has dropped at capacity (see <see cref="GradientTapeOptions.MaxEntries"/>).</summary>
+    internal long DroppedEntryCount => _droppedEntryCount;
+
+    /// <summary>True when a bounded tape has no room for another entry.</summary>
+    internal bool IsAtCapacity => _options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries;
+
     /// <summary>
     /// Removes the last entry from the tape. Used by fused operations to replace
     /// individual entries with a single fused entry.
@@ -243,15 +254,15 @@ public sealed class GradientTape<T> : IDisposable
             // had left AiDotNetEngine.Current as a CpuEngine ("dA was computed on the host"). Prefer the tape's own
             // default when it drives that backend (several engines can share one); otherwise the registry's newest
             // live owner. Never a disposed engine.
-            var engine = _defaultEngine is DirectGpuTensorEngine own && !own.IsDisposed
+            var engine = _defaultEngine.TryGet<DirectGpuTensorEngine>(out var own) && !own.IsDisposed
                          && ReferenceEquals(own.QueryBackend, _dataBackend)
                 ? own
                 : DirectGpuTensorEngine.EngineOwning(_dataBackend);
             if (engine is not null) _engine = engine;
-            else if (_engine is DirectGpuTensorEngine { IsDisposed: true }) _engine = CpuFallbackEngine;
+            else if (_engine.As<DirectGpuTensorEngine>() is { IsDisposed: true }) _engine = CpuFallbackEngine;
             return;
         }
-        if (_engine is DirectGpuTensorEngine) _engine = CpuFallbackEngine;
+        if (_engine.Is<DirectGpuTensorEngine>()) _engine = CpuFallbackEngine;
     }
 
     /// <summary>
@@ -360,7 +371,7 @@ public sealed class GradientTape<T> : IDisposable
         // this forward+backward) is released deterministically — see _snapshotEngine.
         // Captured from the construction-time engine; only used at Dispose if the tape
         // still bound to that same instance (guards the rare CPU<->GPU rebind, #350).
-        if (_parent is null && _engine is Engines.DirectGpuTensorEngine snapEngine)
+        if (_parent is null && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var snapEngine))
         {
             _snapshotEngine = snapEngine;
             _activationSnapshot = snapEngine.ActivationCacheTimestampSnapshot();
@@ -437,6 +448,7 @@ public sealed class GradientTape<T> : IDisposable
         // the checkpoint segments are replayed with fresh tapes.
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
+            _droppedEntryCount++;
             return; // Drop new entries when at capacity
         }
 
@@ -479,6 +491,40 @@ public sealed class GradientTape<T> : IDisposable
     // Sentinel slot used when MaxEntries is reached — writes are discarded
     private TapeEntry<T> _discardSlot;
 
+    /// <summary>
+    /// Moves every entry this (nested) tape recorded onto <paramref name="target"/>, in order, handing it their
+    /// gradient nodes and saved-state pins, and leaves this tape empty.
+    /// </summary>
+    /// <remarks>
+    /// A create-graph backward that differentiates a composite under a nested tape
+    /// (<see cref="BackwardFunctions{T}.TryCompositeBackward"/>) records the composite's forward and its backward on
+    /// the nested tape. The gradient's graph reaches the outer tape's tensors through those nodes, but a later
+    /// create-graph backward on the outer tape walks only the OUTER tape's entries, so it lost every path through the
+    /// composite: a third derivative (or a second one taken with create-graph) through LayerNorm, GLU, a fused
+    /// convolution's batch norm, came out zero. Moved here, they are walked like any other recorded op.
+    /// </remarks>
+    internal void TransferEntriesTo(GradientTape<T> target)
+    {
+        if (target is null) throw new ArgumentNullException(nameof(target));
+        if (ReferenceEquals(target, this)) return;
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            ref var source = ref _entries[i];
+            if (source.Output is null) continue;
+            ref var slot = ref target.RecordSlot(out bool accepted);
+            if (!accepted)
+            {
+                // A bounded target drops it, as it would have dropped the op had it recorded there; its pins go.
+                DifferentiableOps.UnpinSavedStateTensors<T>(ref source);
+                continue;
+            }
+            slot = source;
+            if (source.Output.GradFn is { } node && ReferenceEquals(node.OwningTape, this)) node.OwningTape = target;
+        }
+        // The entries (and their pins) now belong to the target: clear without releasing anything.
+        _entries.Reset();
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal ref TapeEntry<T> RecordSlot(out bool accepted)
     {
@@ -490,6 +536,7 @@ public sealed class GradientTape<T> : IDisposable
         // Drop new entries when at capacity (bounded tape)
         if (_options.MaxEntries > 0 && _entries.Count >= _options.MaxEntries)
         {
+            _droppedEntryCount++;
             accepted = false;
             _discardSlot = default;
             return ref _discardSlot;
@@ -1249,6 +1296,35 @@ public sealed class GradientTape<T> : IDisposable
         var engine = _engine;
         var numOps = MathHelper.GetNumericOperations<T>();
 
+        // A walk nested inside another pass's backward (a backward differentiating a composite of recorded ops under a
+        // nested tape, as create-graph backwards do) shares tensors with the outer pass, which has already indexed them
+        // into ITS array. Those indices mean nothing here - read as this walk's slots they alias other tensors (a
+        // gradient was added to one of a different shape) - so they are set aside for this walk and restored after it,
+        // along with the outer pass's arrays.
+        var outerIndexedGrads = DifferentiableOps._indexedGrads;
+        var outerIndexedSparseGrads = DifferentiableOps._indexedSparseGrads;
+        List<KeyValuePair<Tensor<T>, int>>? displacedGradIndices = null;
+        if (outerIndexedGrads is not null)
+        {
+            displacedGradIndices = new List<KeyValuePair<Tensor<T>, int>>();
+            void Displace(Tensor<T>? t)
+            {
+                if (t is null || t._gradIndex < 0) return;
+                displacedGradIndices.Add(new KeyValuePair<Tensor<T>, int>(t, t._gradIndex));
+                t._gradIndex = -1;
+            }
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                ref var e = ref _entries[i];
+                Displace(e.Output);
+                Displace(e.Input0);
+                if (e.InputCount >= 2) Displace(e.Input1);
+                if (e.InputCount >= 3) Displace(e.Input2);
+                if (e.InputsOverflow != null)
+                    foreach (var inp in e.InputsOverflow) Displace(inp);
+            }
+        }
+
         // Assign gradient indices to all tensors that appear in the tape.
         // This enables O(1) array access in AccumulateGrad instead of dictionary hash lookup.
         int gradIndexCount = 0;
@@ -1526,6 +1602,13 @@ public sealed class GradientTape<T> : IDisposable
                 if (e.InputsOverflow != null)
                     foreach (var inp in e.InputsOverflow) inp._gradIndex = -1;
             }
+            // A nested walk hands the outer pass back its arrays and indices (see where they were set aside).
+            if (outerIndexedGrads is not null)
+            {
+                DifferentiableOps.SetIndexedGrads(outerIndexedGrads);
+                if (outerIndexedSparseGrads is not null) DifferentiableOps.SetIndexedSparseGrads(outerIndexedSparseGrads);
+                foreach (var displaced in displacedGradIndices!) displaced.Key._gradIndex = displaced.Value;
+            }
             // The slow tape walk may skip pruned or gradient-dead entries, but all
             // entries acquired saved-state pins at record time. Release the original
             // forward range exactly once; createGraph entries appended by backward
@@ -1625,7 +1708,7 @@ public sealed class GradientTape<T> : IDisposable
             // The gradients the filter dropped reach no caller: return their device buffers to the pool now (the
             // loss's seed included, which is made fresh each backward). Not under create-graph, where they are part
             // of the higher-order graph.
-            if (!createGraph && _engine is DirectGpuTensorEngine)
+            if (!createGraph && _engine.Is<DirectGpuTensorEngine>())
             {
                 var dropped = new List<Tensor<T>>();
                 foreach (var pair in grads)
@@ -1927,7 +2010,7 @@ public sealed class GradientTape<T> : IDisposable
     private void ReleaseDroppedGradients(List<Tensor<T>> dropped, HashSet<object> forwardStorage,
         Dictionary<Tensor<T>, Tensor<T>> result, Tensor<T> loss)
     {
-                if (dropped.Count == 0 || _engine is not DirectGpuTensorEngine gpu) return;
+                if (dropped.Count == 0 || !_engine.TryGet<DirectGpuTensorEngine>(out var gpu)) return;
         var kept = forwardStorage;
         kept.Add(loss.DataVector);
         foreach (var gradient in result.Values)
@@ -2326,7 +2409,7 @@ public sealed class GradientTape<T> : IDisposable
 
                 // Gradients this cleanup drops belong to no caller: once backward is done they are dead, and their device
                 // buffers go back to the pool now rather than when the GC finds them (see ReleaseDroppedGradients).
-                List<Tensor<T>>? droppedGrads = _engine is DirectGpuTensorEngine && !DifferentiableOps._isBackwardCreateGraph
+                List<Tensor<T>>? droppedGrads = _engine.Is<DirectGpuTensorEngine>() && !DifferentiableOps._isBackwardCreateGraph
                     ? (droppedByChain ??= new List<Tensor<T>>()) : null;
                 if (droppedGrads is not null) forwardStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
                 void DropGrad(Tensor<T> t)
@@ -2555,7 +2638,7 @@ public sealed class GradientTape<T> : IDisposable
                 BackwardScratch<T>.ClearStepsRange(stepCount);
             }
 
-            if (droppedByChain is { Count: > 0 } && _engine is DirectGpuTensorEngine)
+            if (droppedByChain is { Count: > 0 } && _engine.Is<DirectGpuTensorEngine>())
             {
                 var keptForward = ForwardStorageOfEntries();
                 if (forwardStorage is not null) keptForward.UnionWith(forwardStorage);
@@ -2616,7 +2699,7 @@ public sealed class GradientTape<T> : IDisposable
         // As in the graph walk: the gradients the replay did not return, and those dropped below, go back to the pool
         // once they are proven unshared. Always take the replay's slot, so a CPU run leaves nothing behind in it.
         var fromReplay = DroppedGradients<T>.Take();
-        List<Tensor<T>>? replayDropped = _engine is DirectGpuTensorEngine ? (fromReplay ?? new List<Tensor<T>>()) : null;
+        List<Tensor<T>>? replayDropped = _engine.Is<DirectGpuTensorEngine>() ? (fromReplay ?? new List<Tensor<T>>()) : null;
 
         for (int i = 0; i < _entries.Count; i++)
         {

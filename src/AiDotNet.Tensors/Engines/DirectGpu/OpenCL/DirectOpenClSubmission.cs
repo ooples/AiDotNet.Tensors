@@ -33,7 +33,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     {
         internal static readonly object Gate = new object();
 
-        private static readonly ConcurrentDictionary<IntPtr, IDirectOpenClMemoryObject> MemoryObjects = new();
+        // Weak: a strong entry rooted every buffer wrapper ever registered and, through it, its context, so a backend
+        // that was dropped without Dispose could never be collected (and its native context never released).
+        private static readonly ConcurrentDictionary<IntPtr, WeakReference<IDirectOpenClMemoryObject>> MemoryObjects = new();
 
         [ThreadStatic]
         private static List<IDirectOpenClMemoryObject>? _directSubmissionMemories;
@@ -43,19 +45,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr handle = memory.NativeHandle;
             if (handle == IntPtr.Zero)
                 throw new ArgumentException("Cannot register a null OpenCL memory-object handle.", nameof(memory));
-            if (!MemoryObjects.TryAdd(handle, memory))
+            var entry = new WeakReference<IDirectOpenClMemoryObject>(memory);
+            if (MemoryObjects.TryAdd(handle, entry)) return;
+            // An entry whose wrapper was collected (its native object released with its context) may be replaced.
+            if (MemoryObjects.TryGetValue(handle, out var existing) && existing.TryGetTarget(out _))
                 throw new InvalidOperationException("An OpenCL memory-object handle is already registered.");
+            MemoryObjects[handle] = entry;
         }
 
         internal static IDirectOpenClMemoryObject? Resolve(IntPtr handle)
-            => handle != IntPtr.Zero && MemoryObjects.TryGetValue(handle, out var memory) ? memory : null;
+            => handle != IntPtr.Zero && MemoryObjects.TryGetValue(handle, out var entry) && entry.TryGetTarget(out var memory)
+                ? memory
+                : null;
 
         internal static void Unregister(IntPtr handle, IDirectOpenClMemoryObject memory)
         {
             if (handle == IntPtr.Zero) return;
-            if (MemoryObjects.TryGetValue(handle, out var registered) && ReferenceEquals(registered, memory))
+            if (MemoryObjects.TryGetValue(handle, out var registered) && registered.TryGetTarget(out var target)
+                && ReferenceEquals(target, memory))
                 MemoryObjects.TryRemove(handle, out _);
         }
+
+        /// <summary>Drops the entry of a memory object released with its collected context.</summary>
+        internal static void Forget(IntPtr handle) => MemoryObjects.TryRemove(handle, out _);
 
         internal static List<IDirectOpenClMemoryObject> GetDirectSubmissionMemories(
             IDirectOpenClMemoryObject first,

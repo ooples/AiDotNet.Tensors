@@ -179,8 +179,7 @@ public class Issue318CloneDriftDiagnosticTests
         // to also touch the flag.
         lock (_forceFreshGate)
         {
-            bool savedFlag = TensorPool.ForceFreshAllocations;
-            TensorPool.ForceFreshAllocations = true;
+            var freshScope = TensorPool.ForceFreshAllocationsScope(true);
             try
             {
                 var zero = new Tensor<float>(new[] { Rows, Cols });
@@ -208,7 +207,7 @@ public class Issue318CloneDriftDiagnosticTests
             }
             finally
             {
-                TensorPool.ForceFreshAllocations = savedFlag;
+                freshScope.Dispose();
             }
         }
     }

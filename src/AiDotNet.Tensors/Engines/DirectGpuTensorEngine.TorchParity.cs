@@ -1139,4 +1139,163 @@ public partial class DirectGpuTensorEngine
         GpuLaunchProbe.OnFallback("TensorLegendrePolynomialP: no device kernel", null);
         return base.TensorLegendrePolynomialP<T>(x, n);
     }
+
+    // ---- CpuEngine.TorchModelOps.cs ----
+    // The host-computed ops run their TorchModelOpsKernels kernels (DirectGpuTensorEngine.TorchModelOps.cs) and record a
+    // backward that runs on the device too. Graph recording goes through the CPU op (its compiled / lazy node), whose
+    // replay re-enters these overrides. The composed ops (hyperbolic linear, soft split, soft k-NN, soft locally-weighted
+    // regression, log-softmin) pass straight to the composition, whose primitives and their backwards run on the device.
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorCrfForward<T>(Tensor<T> emissions, Tensor<T> transitions, Tensor<T>? startScores = null, Tensor<T>? endScores = null)
+    {
+        // The CPU's checks, size limit included, before anything is recorded, allocated or launched.
+        ValidateCrfForwardArguments(emissions, transitions, startScores, endScores);
+        if (TryRecordCompiledOp("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores },
+                e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var compiledNode))
+            return compiledNode;
+        // An inference trace records one opaque node whose replay re-enters this override (the device kernels).
+        if (TryCaptureModelOpInference("TensorCrfForward", new Tensor<T>?[] { emissions, transitions, startScores, endScores },
+                e => e.TensorCrfForward(emissions, transitions, startScores, endScores), out var captured))
+            return captured;
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryCrfForwardOnDevice(emissions, transitions, startScores, endScores) is { } onDevice) return onDevice;
+        GpuLaunchProbe.OnFallback("TensorCrfForward: no device kernel", null);
+        return base.TensorCrfForward<T>(emissions, transitions, startScores, endScores);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorFakeQuantize<T>(Tensor<T> tensor, int numBits = 8, double? scale = null, int? zeroPoint = null, bool symmetric = true)
+    {
+        if (TryRecordCompiledOp("TensorFakeQuantize", new Tensor<T>?[] { tensor },
+                e => e.TensorFakeQuantize(tensor, numBits, scale, zeroPoint, symmetric), out var compiledNode))
+            return compiledNode;
+        if (TryCaptureModelOpInference("TensorFakeQuantize", new Tensor<T>?[] { tensor },
+                e => e.TensorFakeQuantize(tensor, numBits, scale, zeroPoint, symmetric), out var captured))
+            return captured;
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryFakeQuantizeOnDevice(tensor, numBits, scale, zeroPoint, symmetric) is { } onDevice) return onDevice;
+        if (tensor is not null && tensor.Length > 0) GpuLaunchProbe.OnFallback("TensorFakeQuantize: no device kernel", null);
+        return base.TensorFakeQuantize<T>(tensor!, numBits, scale, zeroPoint, symmetric);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorTopKSoftmax<T>(Tensor<T> scores, int k)
+    {
+        if (TryRecordCompiledOp("TensorTopKSoftmax", new Tensor<T>?[] { scores }, e => e.TensorTopKSoftmax(scores, k), out var compiledNode))
+            return compiledNode;
+        if (TryCaptureModelOpInference("TensorTopKSoftmax", new Tensor<T>?[] { scores }, e => e.TensorTopKSoftmax(scores, k), out var captured))
+            return captured;
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryTopKSoftmaxOnDevice(scores, k) is { } onDevice) return onDevice;
+        if (scores is not null && scores.Length > 0) GpuLaunchProbe.OnFallback("TensorTopKSoftmax: no device kernel", null);
+        return base.TensorTopKSoftmax<T>(scores!, k);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSinusoidalTimeEmbedding<T>(Tensor<T> timesteps, int embeddingDim)
+    {
+        if (TryRecordCompiledOp("TensorSinusoidalTimeEmbedding", new Tensor<T>?[] { timesteps },
+                e => e.TensorSinusoidalTimeEmbedding(timesteps, embeddingDim), out var compiledNode))
+            return compiledNode;
+        if (TryCaptureModelOpInference("TensorSinusoidalTimeEmbedding", new Tensor<T>?[] { timesteps },
+                e => e.TensorSinusoidalTimeEmbedding(timesteps, embeddingDim), out var captured))
+            return captured;
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TrySinusoidalTimeEmbeddingOnDevice(timesteps, embeddingDim) is { } onDevice) return onDevice;
+        if (timesteps is not null && timesteps.Length > 0) GpuLaunchProbe.OnFallback("TensorSinusoidalTimeEmbedding: no device kernel", null);
+        return base.TensorSinusoidalTimeEmbedding<T>(timesteps!, embeddingDim);
+    }
+
+    // A model activation: the CPU op under graph recording (its lazy node replays through here), else the device kernel
+    // with a device backward, else the CPU op.
+    private Tensor<T> ModelActivation<T>(Tensor<T> tensor, TorchParityUnaryOp op, float p0, float p1, Func<double, double> derivative,
+        string opName, Func<Tensor<T>> cpu)
+    {
+        if (GraphMode.IsActive) return cpu();
+        if (TryModelActivationOnDevice(tensor, op, p0, p1, derivative, opName) is { } onDevice) return onDevice;
+        if (tensor is not null && tensor.Length > 0) GpuLaunchProbe.OnFallback(opName + ": no device kernel", null);
+        return cpu();
+    }
+
+    private static Func<double, double> FusedDerivative(FusedActivationType type, FusedActivationParams? parameters = null)
+        => CpuFusedOperations.GetDoubleActivationDerivative(type, parameters);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSurrogateSpike<T>(Tensor<T> membranePotential, double threshold = 1.0, double surrogateBeta = 1.0)
+    {
+        // The CPU rejects a NaN beta; so does its path here.
+        if (double.IsNaN(surrogateBeta)) return base.TensorSurrogateSpike<T>(membranePotential, threshold, surrogateBeta);
+        return ModelActivation(membranePotential, TorchParityUnaryOp.SurrogateSpike, TorchModelOpsCodes.FloatThresholdBelow(threshold),
+            (float)surrogateBeta,
+            v =>
+            {
+                double sigmoid = 1.0 / (1.0 + Math.Exp(-surrogateBeta * (v - threshold)));
+                return surrogateBeta * sigmoid * (1.0 - sigmoid);
+            },
+            "TensorSurrogateSpike", () => base.TensorSurrogateSpike<T>(membranePotential, threshold, surrogateBeta));
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorLisht<T>(Tensor<T> tensor)
+        => ModelActivation(tensor, TorchParityUnaryOp.Lisht, 0f, 0f, FusedDerivative(FusedActivationType.LiSHT),
+            "TensorLisht", () => base.TensorLisht<T>(tensor));
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorBentIdentity<T>(Tensor<T> tensor)
+        => ModelActivation(tensor, TorchParityUnaryOp.BentIdentity, 0f, 0f, FusedDerivative(FusedActivationType.BentIdentity),
+            "TensorBentIdentity", () => base.TensorBentIdentity<T>(tensor));
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorGaussian<T>(Tensor<T> tensor)
+        => ModelActivation(tensor, TorchParityUnaryOp.Gaussian, 0f, 0f, FusedDerivative(FusedActivationType.Gaussian),
+            "TensorGaussian", () => base.TensorGaussian<T>(tensor));
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorScaledTanh<T>(Tensor<T> tensor, double alpha = 1.0, double beta = 1.0)
+        => ModelActivation(tensor, TorchParityUnaryOp.ScaledTanh, (float)alpha, (float)beta,
+            FusedDerivative(FusedActivationType.ScaledTanh, new FusedActivationParams { Alpha = (float)alpha, Beta = (float)beta }),
+            "TensorScaledTanh", () => base.TensorScaledTanh<T>(tensor, alpha, beta));
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorThresholdedRelu<T>(Tensor<T> tensor, double threshold = 1.0)
+        => ModelActivation(tensor, TorchParityUnaryOp.ThresholdedRelu, (float)threshold, 0f,
+            FusedDerivative(FusedActivationType.ThresholdedReLU, new FusedActivationParams { Theta = (float)threshold }),
+            "TensorThresholdedRelu", () => base.TensorThresholdedRelu<T>(tensor, threshold));
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorIsru<T>(Tensor<T> tensor, double alpha = 1.0)
+    {
+        // The CPU rejects a negative or NaN alpha; so does its path here.
+        if (alpha < 0 || double.IsNaN(alpha)) return base.TensorIsru<T>(tensor, alpha);
+        return ModelActivation(tensor, TorchParityUnaryOp.Isru, (float)alpha, 0f,
+            FusedDerivative(FusedActivationType.ISRU, new FusedActivationParams { Alpha = (float)alpha }),
+            "TensorIsru", () => base.TensorIsru<T>(tensor, alpha));
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSqrbf<T>(Tensor<T> tensor, double beta = 1.0)
+        => ModelActivation(tensor, TorchParityUnaryOp.Sqrbf, (float)beta, 0f,
+            FusedDerivative(FusedActivationType.SQRBF, new FusedActivationParams { Beta = (float)beta }),
+            "TensorSqrbf", () => base.TensorSqrbf<T>(tensor, beta));
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorLogSoftmin<T>(Tensor<T> tensor, int axis = -1)
+        => base.TensorLogSoftmin<T>(tensor, axis);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorHyperbolicLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias = null, double curvature = 1.0)
+        => base.TensorHyperbolicLinear<T>(input, weights, bias, curvature);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSoftSplit<T>(Tensor<T> input, Tensor<T> leftValue, Tensor<T> rightValue, int featureIndex, double threshold, double temperature = 1.0)
+        => base.TensorSoftSplit<T>(input, leftValue, rightValue, featureIndex, threshold, temperature);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSoftKnn<T>(Tensor<T> input, Tensor<T> supportVectors, Tensor<T> labels, double temperature = 1.0)
+        => base.TensorSoftKnn<T>(input, supportVectors, labels, temperature);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSoftLocallyWeighted<T>(Tensor<T> input, Tensor<T> xTrain, Tensor<T> yTrain, double bandwidth = 1.0)
+        => base.TensorSoftLocallyWeighted<T>(input, xTrain, yTrain, bandwidth);
 }

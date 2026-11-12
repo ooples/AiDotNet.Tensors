@@ -245,6 +245,19 @@ public static partial class WebGpuNativeBindings
     [JSImport("copyBufferToBuffer", ModuleName)]
     private static partial void JsCopyBufferToBuffer(int srcBufferId, int srcOffset, int dstBufferId, int dstOffset, int sizeBytes);
 
+    /// <summary>
+    /// Zeroes <paramref name="sizeBytes"/> bytes of a buffer on the device, ordered before every later submission and
+    /// without waiting for it.
+    /// </summary>
+    internal static void ClearBuffer(int bufferId, int offsetBytes, int sizeBytes)
+    {
+        if (Host is { } host) host.Invoke("clearBuffer", Args(bufferId, offsetBytes, sizeBytes));
+        else JsClearBuffer(bufferId, offsetBytes, sizeBytes);
+    }
+
+    [JSImport("clearBuffer", ModuleName)]
+    private static partial void JsClearBuffer(int bufferId, int offsetBytes, int sizeBytes);
+
     #endregion
 
     #region Shader Operations

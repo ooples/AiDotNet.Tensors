@@ -1273,7 +1273,7 @@ public partial class DirectGpuTensorEngine
             {
                 int n = (int)savedState[0];
                 int nf = (int)savedState[1];
-                if (engine is DirectGpuTensorEngine gpu)
+                if (engine.TryGet<DirectGpuTensorEngine>(out var gpu))
                 {
                     var gpuGrad = gpu.RfftAdjointGpu(gradOutput, n, nf, inputs[0]._shape);
                     if (gpuGrad is not null)
@@ -1377,7 +1377,7 @@ public partial class DirectGpuTensorEngine
                 int nf = (int)savedState[0];
                 int n = (int)savedState[1];
                 int outLen = (int)savedState[2];
-                if (engine is DirectGpuTensorEngine gpu)
+                if (engine.TryGet<DirectGpuTensorEngine>(out var gpu))
                 {
                     var gpuGrad = gpu.IrfftAdjointGpu(gradOutput, nf, n, outLen, inputs[0]._shape);
                     if (gpuGrad is not null)
@@ -2886,7 +2886,7 @@ public partial class DirectGpuTensorEngine
             using var twiceDotLease = AllocateTransientScratch(backend, outputLength);
             var twiceDot = twiceDotLease.Buffer;
 
-            return DispatchDeferredGpuOp<T>(backend, outputLength, new[] { rowsX, rowsY }, output =>
+            var distances = DispatchDeferredGpuOp<T>(backend, outputLength, new[] { rowsX, rowsY }, output =>
             {
                 backend.Multiply(inputX.Buffer, inputX.Buffer, squareX, x.Length);
                 backend.Multiply(inputY.Buffer, inputY.Buffer, squareY, y.Length);
@@ -2901,6 +2901,10 @@ public partial class DirectGpuTensorEngine
                 backend.Scale(dot, twiceDot, 2f, outputLength);
                 backend.Subtract(normSum, twiceDot, output, outputLength);
             });
+            // The same node CpuEngine records (its backward is built from engine ops, which run on this engine).
+            Autodiff.DifferentiableOps.RecordBinary("PairwiseDistanceSquared", distances, x, y,
+                Autodiff.BackwardFunctions<T>.PairwiseDistanceSquaredTwoSetBackward);
+            return distances;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ValidateHostFloatIds", capabilityGap); return base.PairwiseDistanceSquared(x, y); }
     }
@@ -8148,8 +8152,10 @@ public partial class DirectGpuTensorEngine
         try
         {
             var cur = tensor;
-            if (min is not null) cur = TensorMax(cur, min);   // lower bound: max(x, min)
-            if (max is not null) cur = TensorMin(cur, max);   // upper bound: min(x, max)
+            // The bound goes FIRST: Max(lo, x) is lo > x ? lo : x, which is the CPU clamp's x < lo ? lo : x exactly (a NaN x
+            // stays NaN, a zero x keeps its sign). Max(x, lo) returned the bound for a NaN x and for a zero tie.
+            if (min is not null) cur = TensorMax(min, cur);   // lower bound
+            if (max is not null) cur = TensorMin(max, cur);   // upper bound: max < c ? max : c, the CPU's c > max ? max : c
             return cur;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorClampTensor", capabilityGap); return base.TensorClampTensor(tensor, min, max); }
@@ -8684,7 +8690,7 @@ public partial class DirectGpuTensorEngine
         int idxBIh = meta[5], idxBHh = meta[6], idxH0 = meta[7], idxC0 = meta[8];
         int G = 4 * Hd;
 
-        if (engine is not DirectGpuTensorEngine gpu || !gpu.TryGetBackend(out var backend))
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu) || !gpu.TryGetBackend(out var backend))
             throw new InvalidOperationException("GPU LSTM backward requires the DirectGpu backend.");
 
         static Tensor<float> Dense(Tensor<float> t) => t.IsContiguous ? t : (Tensor<float>)t.Contiguous();
@@ -10342,20 +10348,53 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TaylorSoftmaxBackward<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, int order, int axis)
     {
+        using var __gpuOp = EnterGpuOp();
         int ax = axis < 0 ? input.Rank + axis : axis;
-        if (order != 2 || IsTapeActive<T>() || Compilation.GraphMode.IsActive
-            || ax < 0 || ax >= input.Rank)
+        // Order 2 only, as the forward: g(z) = 1 + z + z^2/2 >= 1/2 never vanishes, so g'/g is finite everywhere.
+        if (order != 2 || IsTapeActive<T>() || Compilation.GraphMode.IsActive || ax < 0 || ax >= input.Rank
+            || typeof(T) != typeof(float) || input.Shape._dims[ax] == 0 || !TryGetBackend(out _))
             return base.TaylorSoftmaxBackward(gradOutput, input, output, order, axis);
 
-        var axes = new[] { ax };
+        // The CPU backward's exact formula, on the device. The forward evaluates g at z = x - max(x) (the FIRST maximum
+        // along the axis) and normalises, y = g(z) / sum g(z), so
+        //   dL/dz_i = y_i (dL/dy_i - sum_j dL/dy_j y_j) g'(z_i) / g(z_i),   dL/dx_k = dL/dz_k - [k = argmax] sum_i dL/dz_i.
+        // g is not shift-invariant the way exp is: evaluating it at x and dropping the argmax term (as this path did)
+        // is the gradient of a different function. The row ops work on the last axis; another axis is moved there and
+        // back, on the device.
+        int last = input.Rank - 1;
+        if (ax != last)
+        {
+            var perm = AxisLastPermutation(input.Rank, ax);
+            var moved = TaylorSoftmaxBackwardLastAxis(
+                PermutedContiguous(gradOutput, perm), PermutedContiguous(input, perm), PermutedContiguous(output, perm));
+            return PermutedContiguous(moved, InversePermutation(perm));
+        }
+        return TaylorSoftmaxBackwardLastAxis(gradOutput, input, output);
+    }
+
+    /// <summary>The order-2 Taylor-softmax backward along the last axis, every step a GPU-resident primitive.</summary>
+    private Tensor<T> TaylorSoftmaxBackwardLastAxis<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output)
+    {
+        var engine = (IEngine)this;
         var numOps = MathHelper.GetNumericOperations<T>();
+        int last = input.Rank - 1;
+        int axisSize = input.Shape._dims[last];
+        var axes = new[] { last };
+
+        var max = ReduceMax(input, axes, keepDims: true);
+        var z = TensorBroadcastSubtract(input, max);
+        var g = TensorAddScalar(TensorAdd(z, TensorMultiplyScalar(TensorMultiply(z, z), numOps.FromDouble(0.5))), numOps.One);
+        var gPrime = TensorAddScalar(z, numOps.One);
+
         var dot = ReduceSum(TensorMultiply(gradOutput, output), axes, keepDims: true);
-        var softmaxGrad = TensorMultiply(output, TensorBroadcastSubtract(gradOutput, dot));
-        var inputSquared = TensorMultiply(input, input);
-        var g = TensorAddScalar(
-            TensorAdd(input, TensorMultiplyScalar(inputSquared, numOps.FromDouble(0.5))), numOps.One);
-        var gPrime = TensorAddScalar(input, numOps.One);
-        return TensorMultiply(softmaxGrad, TensorDivide(gPrime, g));
+        var dz = TensorMultiply(TensorMultiply(output, TensorBroadcastSubtract(gradOutput, dot)), TensorDivide(gPrime, g));
+
+        // The shift's gradient goes to the first argmax, the element the forward subtracted (TensorArgMax keeps the
+        // first of equal maxima, as the CPU scan does).
+        var shiftGrad = ReduceSum(dz, axes, keepDims: true);
+        var firstMax = engine.TensorOneHot<T>(engine.TensorArgMax(input, last), axisSize);
+        var correction = TensorBroadcastMultiply(Reshape(firstMax, input.Shape.ToArray()), shiftGrad);
+        return TensorSubtract(dz, correction);
     }
 
     // #775: spherical softmax = Softmax(x / ||x||_2) along `axis`. L2-normalize on-device (square ->
@@ -10437,10 +10476,13 @@ public partial class DirectGpuTensorEngine
             backend.Multiply(inputBuffer.Buffer, softmaxGradient, products, input.Length);
             backend.SumAxis(products, dot, outerSize, innerSize);
             backend.OuterProduct(dot, ones, expandedDot, outerSize, innerSize);
+            // grad_x = (grad_u - u·⟨x, grad_u⟩/‖x‖) / ‖x‖ with u = x/‖x‖: the projection term carries one more 1/‖x‖
+            // (dropping it was the CPU kernel's bug too).
             backend.Multiply(normalized, expandedDot, projection, input.Length);
-            backend.Subtract(softmaxGradient, projection, numerator, input.Length);
+            backend.Divide(projection, expandedNorm, numerator, input.Length);
+            backend.Subtract(softmaxGradient, numerator, projection, input.Length);
             return DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), result =>
-                backend.Divide(numerator, expandedNorm, result, input.Length));
+                backend.Divide(projection, expandedNorm, result, input.Length));
         }
         catch
         {
