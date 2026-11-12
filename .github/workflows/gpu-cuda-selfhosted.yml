@@ -115,9 +115,11 @@ jobs:
     # requests' GPU suites; a runner registered before the split carries no architecture label and picks up no job until
     # relabelled (see the header for how).
     runs-on: ${{ fromJSON(matrix.arch == 'pr' && '["self-hosted","gpu","cuda","cuda-pr"]' || matrix.arch == 'pr-models' && '["self-hosted","gpu","cuda","sm86"]' || format('["self-hosted","gpu","cuda","{0}"]', matrix.arch)) }}
-    # pr: the suites (78-101 minutes on an RTX 3080) on the slowest cuda-pr runner, plus setup and the interop host.
+    # pr and sm75/sm89: setup (up to 20 minutes), both suite parts at their full watchdogs with the diagnostics between
+    # them (about 5 minutes), and the 30-minute reserve: 20 + 140 + 5 + 90 + 30 = 285 on the slowest cuda-pr runner,
+    # 270 elsewhere. A DirectGpu overrun then still leaves the second part its whole watchdog, so it keeps its TRX.
     # pr-models: setup and the model families (about 18 minutes, bounded at 22).
-    timeout-minutes: ${{ matrix.arch == 'pr' && 200 || matrix.arch == 'pr-models' && 60 || matrix.arch == 'sm86' && 560 || 240 }}
+    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || matrix.arch == 'pr-models' && 60 || 560 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -346,11 +348,13 @@ jobs:
         # the other's per-test results (2026-11-11/12: the single 120-minute run hit its watchdog on main and on #1718
         # with no other process on the GPU, and left no TRX to say which tests had grown). The last passing SM86 run
         # (2026-11-08, 78 minutes) spent 70 test-minutes in Engines.DirectGpu and 44 in the rest; split on 2026-11-12 they
-        # took 93 and 34 minutes. On an RTX 3080 the parts get 115 and 50 minutes; on a slower cuda-pr runner 140 and 90, and elsewhere 130 and 85. The job
-        # limit less the reserve caps each part's deadline anyway.
+        # took 93 and 34 minutes. On an RTX 3080 the parts get 115 and 50 minutes; on a slower cuda-pr runner 140 and
+        # 90, and elsewhere 130 and 85. The job limit (timeout-minutes above) is sized so both parts fit at their full
+        # watchdogs after setup; the job limit less the reserve still caps each part's deadline.
         SUITE_WATCHDOG_DIRECTGPU_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '115' || matrix.arch == 'pr' && '140' || '130' }}
         SUITE_WATCHDOG_REST_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '50' || matrix.arch == 'pr' && '90' || '85' }}
-        JOB_LIMIT_MINUTES: ${{ matrix.arch == 'pr' && 200 || matrix.arch == 'sm86' && 560 || 240 }}
+        # Must equal the job's timeout-minutes.
+        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || 560 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
