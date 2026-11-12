@@ -42,6 +42,15 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     /// <summary>Buffers allocated from the Metal driver (pool misses) since the process started.</summary>
     internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
 
+    // MetalDevice reports a failed allocation by throwing rather than returning zero. The first attempt's failure becomes
+    // the zero that starts the reclaim-and-retry (ReclaimForRetry drains the pool and collects unreachable buffers); the
+    // retry calls the device directly, so a second failure reaches the caller with the device's own exception.
+    private static IntPtr FirstAttempt(Func<IntPtr> allocate)
+    {
+        try { return allocate(); }
+        catch (InvalidOperationException ex) when (ex is not ObjectDisposedException) { return IntPtr.Zero; }
+    }
+
     // The count is process-wide, so it is kept by a static method rather than written from each constructor.
     private static void CountDriverAllocation() => System.Threading.Interlocked.Increment(ref s_driverAllocations);
 
@@ -53,6 +62,23 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     private readonly long _byteOffset;
     // A view keeps its parent reachable, so the parent's finalizer cannot release memory the view still addresses.
     private readonly MetalGpuBuffer? _viewParent;
+    // The buffer that owns the MTLBuffer: this one, or the root of a view chain.
+    private MetalGpuBuffer Owner => _viewParent is null ? this : _viewParent.Owner;
+    // Live views of this owner's MTLBuffer, and device copies queued to read it and not yet completed. While either is
+    // non-zero the allocation is still addressed after the owner is disposed, so it must not go back to the pool, where
+    // the next rent would clear or overwrite it. Released instead, it stays alive through the view's own retain or the
+    // command buffer's retained reference until that last use ends.
+    private int _liveViews;
+    private int _deviceReadsInFlight;
+
+    private bool IsSharedWithDevice =>
+        System.Threading.Volatile.Read(ref _liveViews) != 0 || System.Threading.Volatile.Read(ref _deviceReadsInFlight) != 0;
+
+    /// <summary>Marks a queued device copy that reads this buffer; pair with <see cref="EndDeviceRead"/>.</summary>
+    internal void BeginDeviceRead() => System.Threading.Interlocked.Increment(ref Owner._deviceReadsInFlight);
+
+    /// <summary>Marks a device copy from <see cref="BeginDeviceRead"/> as completed.</summary>
+    internal void EndDeviceRead() => System.Threading.Interlocked.Decrement(ref Owner._deviceReadsInFlight);
     private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory (nothing for a view)
     private long _reclaimCharge;
     private long _reclaimEpoch = -1;
@@ -159,7 +185,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
         var sizeInBytes = (ulong)elementCount * sizeof(float);
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
-        _buffer = device.CreateBuffer(sizeInBytes, options);
+        _buffer = FirstAttempt(() => device.CreateBuffer(sizeInBytes, options));
         if (_buffer == IntPtr.Zero)
         {
             // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
@@ -302,7 +328,8 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
         try
         {
-            _buffer = device.CreateBufferWithData(handle.AddrOfPinnedObject(), sizeInBytes, options);
+            IntPtr source = handle.AddrOfPinnedObject();
+            _buffer = FirstAttempt(() => device.CreateBufferWithData(source, sizeInBytes, options));
             if (_buffer == IntPtr.Zero)
             {
                 // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
@@ -342,6 +369,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         Size = elementCount;
         StorageMode = parent.StorageMode;
         Retain(_buffer);
+        System.Threading.Interlocked.Increment(ref Owner._liveViews);
     }
     /// <summary>
     /// Creates a wrapper around an existing Metal buffer handle.
@@ -709,10 +737,11 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
             }
 
             _disposed = true;
+            if (_viewParent is not null) System.Threading.Interlocked.Decrement(ref Owner._liveViews);
             long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
             if (charge > 0) DeviceMemoryReclaim.OnDeviceRelease(charge, _reclaimEpoch);
 
-            if (_pooled && PoolingEnabled && _viewParent is null && _buffer != IntPtr.Zero &&
+            if (_pooled && PoolingEnabled && _viewParent is null && _buffer != IntPtr.Zero && !IsSharedWithDevice &&
                 _device is { IsDisposed: false } dev)
             {
                 _memory.OnReturned();
@@ -769,12 +798,13 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         {
             if (_disposed) return;
             _disposed = true;
+            if (_viewParent is not null) System.Threading.Interlocked.Decrement(ref Owner._liveViews);
             long charge = System.Threading.Interlocked.Exchange(ref _reclaimCharge, 0);
             DeviceMemoryReclaim.OnDeviceFinalized(charge, _reclaimEpoch);
             buffer = _buffer;
             _buffer = IntPtr.Zero;
 
-            if (_pooled && PoolingEnabled && _viewParent is null && buffer != IntPtr.Zero &&
+            if (_pooled && PoolingEnabled && _viewParent is null && buffer != IntPtr.Zero && !IsSharedWithDevice &&
                 _device is { IsDisposed: false } dev)
             {
                 memoryLease = _memory.TransferToLease();
