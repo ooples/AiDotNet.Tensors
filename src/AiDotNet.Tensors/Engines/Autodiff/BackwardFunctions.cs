@@ -3902,14 +3902,10 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
-        if (LowPrecisionGradients.Applies<T>())
-        {
-            // Half/BFloat16: sign(p - y) g / n in float32, rounded once.
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionGradients.Pairwise(inputs[0], target,
-                LowPrecisionGradients.Upstream(gradOutput) / inputs[0].Length, (p, y) => p > y ? 1.0 : p < y ? -1.0 : 0.0), engine);
-            return;
-        }
-
+        // One path for every element type, Half and BFloat16 included, through engine ops that stay on the device: the
+        // difference of two distinct Half or BFloat16 values rounds to a nonzero value of the right sign (both keep
+        // subnormals), so sign(p - y) is exact, and +-1 times g / n (computed in double, rounded to T once) is exactly
+        // that rounded scale: the single rounding the float32 host map gave, without its download and re-upload.
         double scale = numOps.ToDouble(gradOutput[0]) / inputs[0].Length;
         var diff = engine.TensorSubtract(inputs[0], target);
         var signDiff = engine.TensorSign(diff);
