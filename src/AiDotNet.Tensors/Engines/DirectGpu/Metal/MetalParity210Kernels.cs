@@ -35,6 +35,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
 #include <metal_stdlib>
 #include <metal_math>
 using namespace metal;
+" + ExactFloatKernels.Msl + @"
 
 constant float PARITY210_PI = 3.14159265358979323846f;
 
@@ -271,14 +272,16 @@ kernel void parity210_cummax_axis(
     int outer = (int)gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
     if (axisSize <= 0) return;
-    // Bootstrap from input[0] so a leading NaN propagates (NaN > -INF is
-    // false, which would otherwise silently shadow it with the sentinel).
-    float acc = input[base_];
-    output[base_] = acc;
+    // input[0], then only a strictly greater element (ScanKernels.RunningMaxFloat), decided on the bits: the GPU
+    // may flush subnormals in a float compare.
+    device const uint* in_ = (device const uint*)input;
+    device uint* out_ = (device uint*)output;
+    uint acc = in_[base_];
+    out_[base_] = acc;
     for (int a = 1; a < axisSize; ++a) {
-        float v = input[base_ + a * innerSize];
-        if (v > acc) acc = v;
-        output[base_ + a * innerSize] = acc;
+        uint v = in_[base_ + a * innerSize];
+        if (xf_gt(v, acc)) acc = v;
+        out_[base_ + a * innerSize] = acc;
     }
 }
 
@@ -296,14 +299,15 @@ kernel void parity210_cummin_axis(
     int outer = (int)gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
     if (axisSize <= 0) return;
-    // Bootstrap from input[0] so a leading NaN propagates (NaN < +INF is
-    // false, which would otherwise silently shadow it with the sentinel).
-    float acc = input[base_];
-    output[base_] = acc;
+    // input[0], then only a strictly smaller element (ScanKernels.RunningMinFloat), on the bits.
+    device const uint* in_ = (device const uint*)input;
+    device uint* out_ = (device uint*)output;
+    uint acc = in_[base_];
+    out_[base_] = acc;
     for (int a = 1; a < axisSize; ++a) {
-        float v = input[base_ + a * innerSize];
-        if (v < acc) acc = v;
-        output[base_ + a * innerSize] = acc;
+        uint v = in_[base_ + a * innerSize];
+        if (xf_lt(v, acc)) acc = v;
+        out_[base_ + a * innerSize] = acc;
     }
 }
 
@@ -905,10 +909,11 @@ kernel void parity210_clamp_min_max(
     uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= size) return;
-    float x = input[gid];
-    if (hasLo != 0) { float l = lo[gid]; if (x < l) x = l; }
-    if (hasHi != 0) { float h = hi[gid]; if (x > h) x = h; }
-    output[gid] = x;
+    // x < lo ? lo : x, then c > hi ? hi : c (the CPU clamp), on the bits.
+    uint x = as_type<uint>(input[gid]);
+    if (hasLo != 0) { uint l = as_type<uint>(lo[gid]); if (xf_lt(x, l)) x = l; }
+    if (hasHi != 0) { uint h = as_type<uint>(hi[gid]); if (xf_gt(x, h)) x = h; }
+    output[gid] = as_type<float>(x);
 }
 
 // ===== Missing-kernels audit (MSL, translated from verified CUDA-C) =====

@@ -58,7 +58,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             "parity210_polygamma","parity210_rwkv7_forward",
         };
 
-        public static string GetSource() => @"
+        public static string GetSource() => ExactFloatKernels.Cuda + @"
 #include <math.h>
 
 // Small utility: 1/Pi, sqrt(2/Pi), etc.
@@ -278,7 +278,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_cummax_axis(
     output[base_] = acc;
     for (int a = 1; a < axisSize; ++a) {
         float v = input[base_ + a * innerSize];
-        if (v > acc) acc = v;
+        if (xf_gt(__float_as_uint(v), __float_as_uint(acc))) acc = v;   // strictly greater, on the bits (CPU RunningMaxFloat)
         output[base_ + a * innerSize] = acc;
     }
 }
@@ -301,7 +301,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_cummin_axis(
     output[base_] = acc;
     for (int a = 1; a < axisSize; ++a) {
         float v = input[base_ + a * innerSize];
-        if (v < acc) acc = v;
+        if (xf_lt(__float_as_uint(v), __float_as_uint(acc))) acc = v;   // strictly smaller, on the bits (CPU RunningMinFloat)
         output[base_ + a * innerSize] = acc;
     }
 }
@@ -883,8 +883,9 @@ extern ""C"" __global__ __launch_bounds__(256) void parity210_clamp_min_max(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    if (hasLo) { float l = lo[idx]; if (x < l) x = l; }
-    if (hasHi) { float h = hi[idx]; if (x > h) x = h; }
+    // The CPU clamp (x < lo ? lo : x, then c > hi ? hi : c), decided on the bits: flag-independent and exact.
+    if (hasLo) { float l = lo[idx]; if (xf_lt(__float_as_uint(x), __float_as_uint(l))) x = l; }
+    if (hasHi) { float h = hi[idx]; if (xf_gt(__float_as_uint(x), __float_as_uint(h))) x = h; }
     output[idx] = x;
 }
 

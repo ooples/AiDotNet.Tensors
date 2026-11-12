@@ -146,7 +146,16 @@ void main() {
     }
 }";
 
-    public static string CumMaxAxis => Header + TwoBuf + @"
+    // Two buffers bound as uint: the exact ops (ExactFloatKernels) never hold a value as a float, which the driver
+    // may flush (subnormals) in a compare or a move.
+    private const string TwoBufBits = @"
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { uint o[]; };
+";
+
+    // input[0], then only a strictly greater element (the CPU's ScanKernels.RunningMaxFloat), on the bits: a leading
+    // NaN stays and ties keep the earlier element.
+    public static string CumMaxAxis => Header + ExactFloatKernels.Glsl + TwoBufBits + @"
 layout(push_constant) uniform P { int outerSize; int axisSize; int innerSize; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
@@ -156,18 +165,17 @@ void main() {
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
     if (axisSize <= 0) return;
-    // Bootstrap from input[0] so leading -Inf stays -Inf and leading NaN
-    // propagates; the finite sentinel -1.0e38 would shadow both.
-    float acc = a[base_];
+    uint acc = a[base_];
     o[base_] = acc;
     for (int k = 1; k < axisSize; ++k) {
-        float v = a[base_ + k * innerSize];
-        if (v > acc) acc = v;
+        uint v = a[base_ + k * innerSize];
+        if (xf_gt(v, acc)) acc = v;
         o[base_ + k * innerSize] = acc;
     }
 }";
 
-    public static string CumMinAxis => Header + TwoBuf + @"
+    // input[0], then only a strictly smaller element (ScanKernels.RunningMinFloat), on the bits.
+    public static string CumMinAxis => Header + ExactFloatKernels.Glsl + TwoBufBits + @"
 layout(push_constant) uniform P { int outerSize; int axisSize; int innerSize; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
@@ -177,13 +185,11 @@ void main() {
     int outer = gid / innerSize;
     int base_ = outer * axisSize * innerSize + inner;
     if (axisSize <= 0) return;
-    // Bootstrap from input[0] so leading +Inf stays +Inf and leading NaN
-    // propagates; the finite sentinel 1.0e38 would shadow both.
-    float acc = a[base_];
+    uint acc = a[base_];
     o[base_] = acc;
     for (int k = 1; k < axisSize; ++k) {
-        float v = a[base_ + k * innerSize];
-        if (v < acc) acc = v;
+        uint v = a[base_ + k * innerSize];
+        if (xf_lt(v, acc)) acc = v;
         o[base_ + k * innerSize] = acc;
     }
 }";
@@ -770,18 +776,19 @@ void main() {
     // Clamp
     // =====================================================================
 
-    public static string ClampMinMax => Header + @"
-layout(set = 0, binding = 0) readonly buffer Src { float s[]; };
-layout(set = 0, binding = 1) readonly buffer Lo { float lo[]; };
-layout(set = 0, binding = 2) readonly buffer Hi { float hi[]; };
-layout(set = 0, binding = 3) writeonly buffer Out { float o[]; };
+    // x < lo ? lo : x, then c > hi ? hi : c (the CPU clamp), on uint-bound bit patterns.
+    public static string ClampMinMax => Header + ExactFloatKernels.Glsl + @"
+layout(set = 0, binding = 0) readonly buffer Src { uint s[]; };
+layout(set = 0, binding = 1) readonly buffer Lo { uint lo[]; };
+layout(set = 0, binding = 2) readonly buffer Hi { uint hi[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { uint o[]; };
 layout(push_constant) uniform P { int size; int hasLo; int hasHi; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= size) return;
-    float x = s[gid];
-    if (hasLo != 0) { float l = lo[gid]; if (x < l) x = l; }
-    if (hasHi != 0) { float h = hi[gid]; if (x > h) x = h; }
+    uint x = s[gid];
+    if (hasLo != 0) { uint l = lo[gid]; if (xf_lt(x, l)) x = l; }
+    if (hasHi != 0) { uint h = hi[gid]; if (xf_gt(x, h)) x = h; }
     o[gid] = x;
 }";
 }

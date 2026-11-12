@@ -155,7 +155,7 @@ extern ""C"" __global__ __launch_bounds__(256) void hardtanh(const float* __rest
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = fminf(fmaxf(x, minVal), maxVal);
+    output[idx] = xf_clampf(x, minVal, maxVal);   // the CPU clamp, exact: NaN stays NaN, -0 keeps its sign
 }
 
 // Leaky ReLU: x > 0 ? x : alpha * x
@@ -345,8 +345,8 @@ extern ""C"" __global__ __launch_bounds__(256) void relu6(const float* __restric
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    float x = input[idx];
-    output[idx] = fminf(fmaxf(x, 0.0f), 6.0f);
+    // The CPU clamp(x, 0, 6), exact: -0 stays -0 and NaN stays NaN.
+    output[idx] = xf_clampf(input[idx], 0.0f, 6.0f);
 }
 
 // ReLU6 backward: grad * (0 < x < 6 ? 1 : 0)
@@ -577,12 +577,18 @@ extern ""C"" __global__ __launch_bounds__(256) void max_pool1d(const float* __re
     int c = (idx / outLength) % channels;
     int b = idx / (outLength * channels);
     int inOffset = (b * channels + c) * inLength;
-    float maxVal = -3.402823466e+38f;
+    // The CPU max-pool rule on bit patterns: the window's first cell, then only a strictly greater one. The
+    // -FLT_MAX seed answered -FLT_MAX for a -inf window, and fmaxf dropped NaN and flushed subnormals.
+    unsigned int maxBits = 0xFF800000u;
+    bool have = false;
     for (int k = 0; k < kernelSize; k++) {
         int pos = o * stride + k;
-        if (pos < inLength) { maxVal = fmaxf(maxVal, input[inOffset + pos]); }
+        if (pos < inLength) {
+            unsigned int v = __float_as_uint(input[inOffset + pos]);
+            if (!have || xf_gt(v, maxBits)) { maxBits = v; have = true; }
+        }
     }
-    output[idx] = maxVal;
+    output[idx] = __uint_as_float(maxBits);
 }
 
 // ===========================================================================

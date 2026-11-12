@@ -54,43 +54,38 @@ internal static class ScanKernels
     /// In-place running-max of a contiguous <see cref="float"/> span.
     /// Output[i] = max_{j ≤ i} input[j].
     /// </summary>
+    /// <remarks>
+    /// The running value starts at the first element and moves only to a strictly greater one: the first of equal
+    /// maxima (and of +0 / -0) is kept, a NaN first element stays, and a later NaN never replaces the running value.
+    /// That is the rule of the max pools and of the GPU cummax kernels; a -inf seed skipped a leading NaN.
+    /// </remarks>
     [MethodImpl(Hot)]
     public static void RunningMaxFloat(ReadOnlySpan<float> input, Span<float> output)
     {
         int n = input.Length;
         if (output.Length < n) throw new ArgumentException("output too small");
+        if (n == 0) return;
 
-#if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && n >= 8)
-        {
-            RunningMaxFloatAvx2(input, output);
-            return;
-        }
-#endif
-        float acc = float.NegativeInfinity;
-        for (int i = 0; i < n; i++)
+        float acc = input[0];
+        output[0] = acc;
+        for (int i = 1; i < n; i++)
         {
             if (input[i] > acc) acc = input[i];
             output[i] = acc;
         }
     }
 
-    /// <summary>Running-min (symmetric to RunningMax).</summary>
+    /// <summary>Running-min (symmetric to RunningMax: the first element, then only a strictly smaller one).</summary>
     [MethodImpl(Hot)]
     public static void RunningMinFloat(ReadOnlySpan<float> input, Span<float> output)
     {
         int n = input.Length;
         if (output.Length < n) throw new ArgumentException("output too small");
+        if (n == 0) return;
 
-#if NET5_0_OR_GREATER
-        if (Avx2.IsSupported && n >= 8)
-        {
-            RunningMinFloatAvx2(input, output);
-            return;
-        }
-#endif
-        float acc = float.PositiveInfinity;
-        for (int i = 0; i < n; i++)
+        float acc = input[0];
+        output[0] = acc;
+        for (int i = 1; i < n; i++)
         {
             if (input[i] < acc) acc = input[i];
             output[i] = acc;
@@ -168,32 +163,6 @@ internal static class ScanKernels
                 carry += src[i];
                 dst[i] = carry;
             }
-        }
-    }
-
-    // For max / min we fall back to the scalar loop inside AVX2 — the
-    // Sklansky trick works for any associative op, but we keep the
-    // implementation small for the first landing and revisit if benchmarks
-    // flag running-max as a hot path.
-    [MethodImpl(Hot)]
-    private static void RunningMaxFloatAvx2(ReadOnlySpan<float> input, Span<float> output)
-    {
-        float acc = float.NegativeInfinity;
-        for (int i = 0; i < input.Length; i++)
-        {
-            if (input[i] > acc) acc = input[i];
-            output[i] = acc;
-        }
-    }
-
-    [MethodImpl(Hot)]
-    private static void RunningMinFloatAvx2(ReadOnlySpan<float> input, Span<float> output)
-    {
-        float acc = float.PositiveInfinity;
-        for (int i = 0; i < input.Length; i++)
-        {
-            if (input[i] < acc) acc = input[i];
-            output[i] = acc;
         }
     }
 #endif

@@ -9391,11 +9391,13 @@ public partial class CpuEngine : ITensorLevelEngine
     [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe float MaxPool3x3Padded(float* data, int h, int w, int ihStart, int iwStart)
     {
-        float m = float.NegativeInfinity;
         int khStart = ihStart < 0 ? -ihStart : 0;
         int kwStart = iwStart < 0 ? -iwStart : 0;
         int khEnd = 3 < (h - ihStart) ? 3 : (h - ihStart);
         int kwEnd = 3 < (w - iwStart) ? 3 : (w - iwStart);
+        // The interior kernel's rule: start at the window's first in-bounds cell and move only to a strictly greater
+        // one, so a NaN first cell stays NaN here too (a -inf seed skipped it, so the border answered differently).
+        float m = data[(ihStart + khStart) * w + iwStart + kwStart];
 
         for (int kh = khStart; kh < khEnd; kh++)
         {
@@ -9676,13 +9678,14 @@ public partial class CpuEngine : ITensorLevelEngine
                     float* dst = outBase + oh * oW;
                     for (int ow = 0; ow < oW; ow++)
                     {
-                        float maxVal = float.NegativeInfinity;
                         int ihStart = oh * st - pd;
                         int iwStart = ow * st - pd;
                         int khStart = ihStart < 0 ? -ihStart : 0;
                         int kwStart = iwStart < 0 ? -iwStart : 0;
                         int khEnd = ps < (h - ihStart) ? ps : (h - ihStart);
                         int kwEnd = ps < (w - iwStart) ? ps : (w - iwStart);
+                        // First in-bounds cell, then strictly greater: the rule of the 2x2/3x3 kernels.
+                        float maxVal = inBase[(ihStart + khStart) * w + iwStart + kwStart];
 
                         for (int kh = khStart; kh < khEnd; kh++)
                         {
@@ -9891,7 +9894,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     for (int ow = 0; ow < oWD; ow++)
                     {
-                        double maxVal = double.NegativeInfinity;
+                        double maxVal = 0; bool seeded = false;   // first in-bounds cell, then strictly greater (the float kernels' rule)
                         int ihStart = oh * stD - pdD;
                         int iwStart = ow * stD - pdD;
                         int khStart = ihStart < 0 ? -ihStart : 0;
@@ -9905,7 +9908,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             for (int kw = kwStart; kw < kwEnd; kw++)
                             {
                                 double v = inArrD[rowOff + kw];
-                                if (v > maxVal) maxVal = v;
+                                if (!seeded || v > maxVal) { maxVal = v; seeded = true; }
                             }
                         }
                         outArrD[outBase + oh * oWD + ow] = maxVal;
@@ -9932,7 +9935,10 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
+                    // First in-bounds cell, then strictly greater (the float kernels' rule): a MinValue seed answered
+                    // MinValue for an all -inf window of a type with infinities.
                     T maxValue = numOps.MinValue;
+                    bool seeded = false;
 
                     for (int kh = 0; kh < poolSize; kh++)
                     {
@@ -9945,8 +9951,11 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (iw < 0 || iw >= width) continue;
 
                             T value = inputData[inputBaseOffset + ih * width + iw];
-                            if (numOps.GreaterThan(value, maxValue))
+                            if (!seeded || numOps.GreaterThan(value, maxValue))
+                            {
                                 maxValue = value;
+                                seeded = true;
+                            }
                         }
                     }
 
@@ -10026,7 +10035,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     for (int ow = 0; ow < oWD; ow++)
                     {
-                        double maxVal = double.NegativeInfinity;
+                        double maxVal = 0; bool seeded = false;   // first in-bounds cell, then strictly greater (the float kernels' rule)
                         int ihStart = oh * stD - pdD;
                         int iwStart = ow * stD - pdD;
                         int khStart = ihStart < 0 ? -ihStart : 0;
@@ -10039,7 +10048,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             for (int kw = kwStart; kw < kwEnd; kw++)
                             {
                                 double v = inArrD[rowOff + kw];
-                                if (v > maxVal) maxVal = v;
+                                if (!seeded || v > maxVal) { maxVal = v; seeded = true; }
                             }
                         }
                         outArrD[outBase + oh * oWD + ow] = maxVal;
@@ -10063,6 +10072,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
                     T maxValue = numOps.MinValue;
+                    bool seeded = false;   // first in-bounds cell, then strictly greater, as MaxPool2D
                     for (int kh = 0; kh < poolSize; kh++)
                     {
                         int ih = oh * stride + kh - padding;
@@ -10072,7 +10082,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             int iw = ow * stride + kw - padding;
                             if (iw < 0 || iw >= width) continue;
                             T value = inputData[inputBaseOffset + ih * width + iw];
-                            if (numOps.GreaterThan(value, maxValue)) maxValue = value;
+                            if (!seeded || numOps.GreaterThan(value, maxValue)) { maxValue = value; seeded = true; }
                         }
                     }
                     outputData[outputBaseOffset + oh * outputWidth + ow] = maxValue;
@@ -18437,8 +18447,10 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    T maxVal = numOps.MinValue;
-                    int maxH = 0, maxW = 0;
+                    // The max-pool rule: start at the window's first cell, move only to a strictly greater one (a NaN
+                    // first cell stays; a later NaN never wins). A MinValue seed returned MinValue for -inf windows.
+                    int maxH = oh * strideH, maxW = ow * strideW;
+                    T maxVal = inputData[((b * channels + c) * height + maxH) * width + maxW];
 
                     for (int kh = 0; kh < poolH; kh++)
                     {
@@ -18573,10 +18585,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int oh = 0; oh < outputHeight; oh++)
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    float maxVal = float.MinValue;
-                    // Seeded inside the window: if nothing beats MinValue (all NaN or -inf), the backward must still
-                    // route this window's gradient to one of its own elements, not to plane position 0.
+                    // The max-pool rule: start at the window's first cell, move only to a strictly greater one. A
+                    // float.MinValue seed returned MinValue for an all -inf window and skipped a NaN first cell.
                     int maxIdx = oh * strideH * width + ow * strideW;
+                    float maxVal = src[inBase + maxIdx];
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -18602,8 +18614,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int oh = 0; oh < outputHeight; oh++)
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    T maxVal = numOps.MinValue;
                     int maxIdx = oh * strideH * width + ow * strideW;
+                    T maxVal = inputData[inBase + maxIdx];
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -18781,8 +18793,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// One plane of the float max-pool backward that re-scans the forward input for each window's winner (first
-    /// maximum, starting from float.MinValue with a strict greater-than, so NaN never wins and a window with no winner
-    /// sends its gradient to plane cell 0) and writes <c>0 + g</c> there. With <paramref name="tiles"/> (stride equal
+    /// cell, then only a strictly greater one -- the forward pools' rule, so a NaN first cell wins and a later NaN never
+    /// does) and writes <c>0 + g</c> there. With <paramref name="tiles"/> (stride equal
     /// to the pool, not accumulating) each window owns its cells and writes them in one pass, and only the uncovered
     /// remainder rows/columns are cleared; otherwise the whole plane is cleared first and the gradients are added.
     /// </summary>
@@ -18812,8 +18824,9 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int ow = 0; ow < outW; ow++)
             {
                 int iw0 = ow * strideW;
-                float maxVal = float.MinValue;
-                int maxIdx = ih0 * width + iw0;   // a winnerless window routes to its own first cell
+                // The forward's rule: the window's first cell, then only a strictly greater one.
+                int maxIdx = ih0 * width + iw0;
+                float maxVal = x[xBase + maxIdx];
                 for (int kh = 0; kh < poolH; kh++)
                 {
                     int row = (ih0 + kh) * width;
@@ -18839,8 +18852,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Unpadded MaxPool2D backward that finds each window's winner by re-scanning the forward INPUT, then writes the
     /// input gradient straight into <paramref name="gradInput"/>. The winner rule is exactly the one
-    /// <c>MaxPool2DWithTensorIndices</c> records (start below every finite value, strict greater-than in row-major
-    /// window order, so the first maximum wins and NaN never does; a window with no winner routes to its first cell),
+    /// <c>MaxPool2DWithTensorIndices</c> records (start at the window's first cell, strict greater-than in row-major
+    /// window order, so the first maximum wins, a NaN first cell wins and a later NaN never does),
     /// so the gradient is the one the tape would produce from saved indices -- without saving them, without a
     /// replayed forward, and without a temporary gradient tensor.
     /// </summary>
@@ -18916,8 +18929,9 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int oh = 0; oh < outH; oh++)
             for (int ow = 0; ow < outW; ow++)
             {
-                T maxVal = numOps.MinValue;
-                int maxIdx = oh * strideH * width + ow * strideW;   // a winnerless window routes to its first cell
+                // The forward's rule: the window's first cell, then only a strictly greater one.
+                int maxIdx = oh * strideH * width + ow * strideW;
+                T maxVal = xData[xBase + maxIdx];
                 for (int kh = 0; kh < poolH; kh++)
                 for (int kw = 0; kw < poolW; kw++)
                 {
@@ -51809,14 +51823,17 @@ public partial class CpuEngine : ITensorLevelEngine
                         int hStart = (int)((long)oh * h / outH), hEnd = (int)(((long)(oh + 1) * h + outH - 1) / outH);
                         int wStart = (int)((long)ow * w / outW), wEnd = (int)(((long)(ow + 1) * w + outW - 1) / outW);
                         int baseIdx = (batch * c + ch) * h * w;
-                        double maxV = double.NegativeInfinity;
+                        // The max-pool rule (MaxPool2D, GlobalMaxPool2D): the bin's first cell, then only a strictly
+                        // greater one. A -inf seed skipped a NaN first cell, which every other max pool keeps.
                         int maxI = baseIdx + hStart * w + wStart;
+                        double maxV = 0;
+                        bool seeded = false;
                         for (int ih = hStart; ih < hEnd; ih++)
                             for (int iw = wStart; iw < wEnd; iw++)
                             {
                                 int idx = baseIdx + ih * w + iw;
                                 double v = numOps.ToDouble(inData[idx]);
-                                if (v > maxV) { maxV = v; maxI = idx; }
+                                if (!seeded || v > maxV) { maxV = v; maxI = idx; seeded = true; }
                             }
                         int outIdx = (batch * c + ch) * outH * outW + oh * outW + ow;
                         outData[outOff + outIdx] = numOps.FromDouble(maxV);

@@ -236,15 +236,15 @@ struct P { outerSize: i32, axisSize: i32, innerSize: i32 };
 
     public static string CumSumAxis => CumulativeScan("cumsum", "0.0", "acc = acc + v;", "acc");
     public static string CumProdAxis => CumulativeScan("cumprod", "1.0", "acc = acc * v;", "acc");
-    // cummax / cummin cannot use the finite-sentinel template: -f32::MAX /
-    // +f32::MAX would shadow a leading +/-Inf and suppress leading NaN.
-    // Bootstrap from input[0] so every ieee value propagates correctly.
-    public static string CumMaxAxis => CumulativeScanFromFirst("cummax", "if (v > acc) { acc = v; }");
-    public static string CumMinAxis => CumulativeScanFromFirst("cummin", "if (v < acc) { acc = v; }");
+    // cummax / cummin start at input[0] and move only to a strictly greater (smaller) element, the CPU's
+    // ScanKernels.RunningMaxFloat rule: a leading NaN stays and ties keep the earlier element. Decided on the bits
+    // (ExactFloatKernels) over u32-bound buffers: WGSL may flush subnormals and assume no NaN in a float compare.
+    public static string CumMaxAxis => CumulativeScanFromFirst("cummax", "if (xf_gt(v, acc)) { acc = v; }");
+    public static string CumMinAxis => CumulativeScanFromFirst("cummin", "if (xf_lt(v, acc)) { acc = v; }");
 
-    private static string CumulativeScanFromFirst(string opName, string update) => @"
-@group(0) @binding(0) var<storage, read> a : array<f32>;
-@group(0) @binding(1) var<storage, read_write> o : array<f32>;
+    private static string CumulativeScanFromFirst(string opName, string update) => ExactFloatKernels.Wgsl + @"
+@group(0) @binding(0) var<storage, read> a : array<u32>;
+@group(0) @binding(1) var<storage, read_write> o : array<u32>;
 struct P { outerSize: i32, axisSize: i32, innerSize: i32 };
 @group(0) @binding(2) var<uniform> p : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
@@ -255,7 +255,7 @@ struct P { outerSize: i32, axisSize: i32, innerSize: i32 };
     let outer = gid / p.innerSize;
     let base_ = outer * p.axisSize * p.innerSize + inner;
     if (p.axisSize <= 0) { return; }
-    var acc : f32 = a[base_];
+    var acc : u32 = a[base_];
     o[base_] = acc;
     for (var k : i32 = 1; k < p.axisSize; k = k + 1) {
         let v = a[base_ + k * p.innerSize];
@@ -703,65 +703,58 @@ struct P { size: i32 };
 }
 ";
 
-    // WGSL lacks isFinite/isInf/isNan; emulate via IEEE identities.
+    // Classified on the bit pattern: WGSL lets an implementation assume NaN and infinity never occur, so x == x and
+    // x - x == 0 may fold to true.
     public static string IsFinite => @"
-@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(0) var<storage, read> a : array<u32>;
 @group(0) @binding(1) var<storage, read_write> o : array<f32>;
 struct P { size: i32 };
 @group(0) @binding(2) var<uniform> p : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
-    let x = a[gid];
-    let eqSelf = (x == x);        // false for NaN
-    let sub = x - x;               // 0 for finite, NaN for ±Inf
-    let subEq = (sub == 0.0);      // false for NaN / ±Inf
-    if (eqSelf && subEq) { o[gid] = 1.0; } else { o[gid] = 0.0; }
+    if ((a[gid] & 0x7F800000u) != 0x7F800000u) { o[gid] = 1.0; } else { o[gid] = 0.0; }
 }
 ";
 
     public static string IsNan => @"
-@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(0) var<storage, read> a : array<u32>;
 @group(0) @binding(1) var<storage, read_write> o : array<f32>;
 struct P { size: i32 };
 @group(0) @binding(2) var<uniform> p : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
-    let x = a[gid];
-    if (x == x) { o[gid] = 0.0; } else { o[gid] = 1.0; }
+    if ((a[gid] & 0x7FFFFFFFu) > 0x7F800000u) { o[gid] = 1.0; } else { o[gid] = 0.0; }
 }
 ";
 
     public static string IsInf => @"
-@group(0) @binding(0) var<storage, read> a : array<f32>;
+@group(0) @binding(0) var<storage, read> a : array<u32>;
 @group(0) @binding(1) var<storage, read_write> o : array<f32>;
 struct P { size: i32 };
 @group(0) @binding(2) var<uniform> p : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
-    let x = a[gid];
-    let eqSelf = (x == x);         // true for finite and ±Inf; false for NaN
-    let sub = x - x;                // NaN for ±Inf; 0 for finite
-    if (eqSelf && !(sub == 0.0)) { o[gid] = 1.0; } else { o[gid] = 0.0; }
+    if ((a[gid] & 0x7FFFFFFFu) == 0x7F800000u) { o[gid] = 1.0; } else { o[gid] = 0.0; }
 }
 ";
 
+    // The replacements are written as bit patterns too, and a finite input passes through bit for bit.
     public static string NanToNum => @"
-@group(0) @binding(0) var<storage, read> a : array<f32>;
-@group(0) @binding(1) var<storage, read_write> o : array<f32>;
+@group(0) @binding(0) var<storage, read> a : array<u32>;
+@group(0) @binding(1) var<storage, read_write> o : array<u32>;
 struct P { size: i32, nanVal: f32, posInfVal: f32, negInfVal: f32 };
 @group(0) @binding(2) var<uniform> p : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     let x = a[gid];
-    let isNaN_ = !(x == x);
-    let isInf_ = (x == x) && !((x - x) == 0.0);
-    if (isNaN_) { o[gid] = p.nanVal; }
-    else if (isInf_) {
-        if (x > 0.0) { o[gid] = p.posInfVal; } else { o[gid] = p.negInfVal; }
+    let mag = x & 0x7FFFFFFFu;
+    if (mag > 0x7F800000u) { o[gid] = bitcast<u32>(p.nanVal); }
+    else if (mag == 0x7F800000u) {
+        if ((x & 0x80000000u) == 0u) { o[gid] = bitcast<u32>(p.posInfVal); } else { o[gid] = bitcast<u32>(p.negInfVal); }
     }
     else { o[gid] = x; }
 }
@@ -855,19 +848,20 @@ struct P { m: i32, n: i32, dim: i32 };
 }
 ";
 
-    public static string ClampMinMax => @"
-@group(0) @binding(0) var<storage, read> a : array<f32>;
-@group(0) @binding(1) var<storage, read> lo : array<f32>;
-@group(0) @binding(2) var<storage, read> hi : array<f32>;
-@group(0) @binding(3) var<storage, read_write> o : array<f32>;
+    // x < lo ? lo : x, then c > hi ? hi : c (the CPU clamp), on u32-bound bit patterns (ExactFloatKernels).
+    public static string ClampMinMax => ExactFloatKernels.Wgsl + @"
+@group(0) @binding(0) var<storage, read> a : array<u32>;
+@group(0) @binding(1) var<storage, read> lo : array<u32>;
+@group(0) @binding(2) var<storage, read> hi : array<u32>;
+@group(0) @binding(3) var<storage, read_write> o : array<u32>;
 struct P { size: i32, hasLo: i32, hasHi: i32 };
 @group(0) @binding(4) var<uniform> p : P;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.size) { return; }
     var x = a[gid];
-    if (p.hasLo != 0) { let l = lo[gid]; if (x < l) { x = l; } }
-    if (p.hasHi != 0) { let h = hi[gid]; if (x > h) { x = h; } }
+    if (p.hasLo != 0) { let l = lo[gid]; if (xf_lt(x, l)) { x = l; } }
+    if (p.hasHi != 0) { let h = hi[gid]; if (xf_gt(x, h)) { x = h; } }
     o[gid] = x;
 }
 ";

@@ -408,12 +408,12 @@ public sealed partial class WebGpuBackend
         if (indices is not null)
         {
             // PoolExtendedSource: binding(0)=input, binding(1)=output, binding(2)=indices_out
-            Dispatch3Buffer3DAsync("PoolExtended", WebGpuKernels.PoolExtendedSource, "max_pool2d_with_indices",
+            Dispatch3Buffer3DAsync("ExactMaxPool2DIndices", WebGpuExactPoolKernels.MaxPool2DWithIndices, "max_pool2d_with_indices",
                 input, output, indices, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
         }
         else
         {
-            Dispatch2Buffer3DAsync("Pooling", WebGpuKernels.PoolingSource, "max_pool2d",
+            Dispatch2Buffer3DAsync("ExactMaxPool2D", WebGpuExactPoolKernels.MaxPool2D, "max_pool2d",
                 input, output, uniforms, wgX, wgY, wgZ).GetAwaiter().GetResult();
         }
     }
@@ -491,7 +491,7 @@ public sealed partial class WebGpuBackend
         // Max across spatial dimensions for each (batch, channel) pair
         int spatial = height * width;
         var uniforms = MakeUniformInts2(batch * channels, spatial);
-        Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "max_axis",
+        Dispatch2BufferAsync("ExactGlobalMaxPool", WebGpuExactPoolKernels.GlobalMaxPool, "global_max_pool",
             input, output, uniforms, batch * channels).GetAwaiter().GetResult();
     }
 
@@ -502,7 +502,7 @@ public sealed partial class WebGpuBackend
         int spatial = height * width;
         using var tempOutput = (WebGpuBuffer)AllocateBuffer(outerSize * 2);
         var uniforms = MakeUniformInts2(outerSize, spatial);
-        Dispatch2BufferAsync("GlobalPool", WebGpuKernels.GlobalPoolSource, "global_max_pool_with_indices",
+        Dispatch2BufferAsync("ExactGlobalMaxPool", WebGpuExactPoolKernels.GlobalMaxPool, "global_max_pool_with_indices",
             input, tempOutput, uniforms, outerSize).GetAwaiter().GetResult();
         // GPU deinterleave: extract values (even indices) and indices (odd indices)
         using var dummyB = (WebGpuBuffer)AllocateBuffer(1);
@@ -598,13 +598,13 @@ public sealed partial class WebGpuBackend
         {
             // Pool3DWithIndicesSource: binding(0)=input, binding(1)=output, binding(2)=indices_out
             // Tracks the flat spatial index of the max element per output position
-            Dispatch3BufferAsync("Pool3DWithIndices", WebGpuKernels.Pool3DWithIndicesSource,
+            Dispatch3BufferAsync("ExactMaxPool3DIndices", WebGpuExactPoolKernels.MaxPool3DWithIndices,
                 "max_pool3d_with_indices",
                 input, output, indices, uniforms, total).GetAwaiter().GetResult();
         }
         else
         {
-            Dispatch2BufferAsync("Pool3D", WebGpuKernels.Pool3DSource, "max_pool3d",
+            Dispatch2BufferAsync("ExactMaxPool3D", WebGpuExactPoolKernels.MaxPool3D, "max_pool3d",
                 input, output, uniforms, total).GetAwaiter().GetResult();
         }
     }

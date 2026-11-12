@@ -85,9 +85,12 @@ void main() {
 }";
 
     // ---- Max pooling 2D (forward, gather; writes argmax indices as raw int bits) ----
-    public const string MaxPool2D = Header + @"
-layout(set=0, binding=0) buffer B0 { float inp[]; };
-layout(set=0, binding=1) buffer B1 { float outp[]; };
+    // The max pools decide on bit patterns (ExactFloatKernels) over uint-bound buffers, as the CPU engine does: the
+    // window's first in-bounds cell, replaced only by a strictly greater one. Vulkan lets the driver flush
+    // subnormals in float compares and moves, and a -FLT_MAX seed answered -FLT_MAX for a -inf window.
+    public const string MaxPool2D = Header + ExactFloatKernels.Glsl + @"
+layout(set=0, binding=0) buffer B0 { uint inp[]; };
+layout(set=0, binding=1) buffer B1 { uint outp[]; };
 layout(set=0, binding=2) buffer B2 { int indices[]; };
 layout(push_constant) uniform PC {
     int batch; int channels; int inHeight; int inWidth;
@@ -102,15 +105,16 @@ void main() {
     int ow = idx % outWidth; int t = idx / outWidth;
     int oh = t % outHeight; t = t / outHeight;
     int c = t % channels; int b = t / channels;
-    float maxVal = -3.402823466e+38;
+    uint maxVal = 0xFF800000u;
+    bool have = false;
     int maxIdx = 0;
     for (int kh = 0; kh < kernelH; kh++) {
         for (int kw = 0; kw < kernelW; kw++) {
             int ih = oh * strideH - padH + kh;
             int iw = ow * strideW - padW + kw;
             if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
-                float v = inp[((b * channels + c) * inHeight + ih) * inWidth + iw];
-                if (v > maxVal) { maxVal = v; maxIdx = ih * inWidth + iw; }
+                uint v = inp[((b * channels + c) * inHeight + ih) * inWidth + iw];
+                if (!have || xf_gt(v, maxVal)) { maxVal = v; maxIdx = ih * inWidth + iw; have = true; }
             }
         }
     }
@@ -182,9 +186,9 @@ void main() {
 }";
 
     // ---- Global max pooling 2D (forward, no indices): one thread per (b,c) ----
-    public const string GlobalMaxPool2DNoIndices = Header + @"
-layout(set=0, binding=0) buffer B0 { float inp[]; };
-layout(set=0, binding=1) buffer B1 { float outp[]; };
+    public const string GlobalMaxPool2DNoIndices = Header + ExactFloatKernels.Glsl + @"
+layout(set=0, binding=0) buffer B0 { uint inp[]; };
+layout(set=0, binding=1) buffer B1 { uint outp[]; };
 layout(push_constant) uniform PC { int batch; int channels; int height; int width; };
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -192,17 +196,20 @@ void main() {
     if (gid >= uint(total)) return;
     int idx = int(gid);
     int c = idx % channels; int b = idx / channels;
-    float maxVal = -3.402823466e+38;
+    uint maxVal = 0xFF800000u;
+    bool have = false;
     for (int h = 0; h < height; h++)
-        for (int w = 0; w < width; w++)
-            maxVal = max(maxVal, inp[((b * channels + c) * height + h) * width + w]);
+        for (int w = 0; w < width; w++) {
+            uint v = inp[((b * channels + c) * height + h) * width + w];
+            if (!have || xf_gt(v, maxVal)) { maxVal = v; have = true; }
+        }
     outp[b * channels + c] = maxVal;
 }";
 
     // ---- Global max pooling 2D (forward, with argmax indices): one thread per (b,c) ----
-    public const string GlobalMaxPool2D = Header + @"
-layout(set=0, binding=0) buffer B0 { float inp[]; };
-layout(set=0, binding=1) buffer B1 { float outp[]; };
+    public const string GlobalMaxPool2D = Header + ExactFloatKernels.Glsl + @"
+layout(set=0, binding=0) buffer B0 { uint inp[]; };
+layout(set=0, binding=1) buffer B1 { uint outp[]; };
 layout(set=0, binding=2) buffer B2 { int indices[]; };
 layout(push_constant) uniform PC { int batch; int channels; int height; int width; };
 void main() {
@@ -211,11 +218,11 @@ void main() {
     if (gid >= uint(total)) return;
     int idx = int(gid);
     int c = idx % channels; int b = idx / channels;
-    float maxVal = -3.402823466e+38; int maxIdx = 0;
+    uint maxVal = 0xFF800000u; bool have = false; int maxIdx = 0;
     for (int h = 0; h < height; h++)
         for (int w = 0; w < width; w++) {
-            float v = inp[((b * channels + c) * height + h) * width + w];
-            if (v > maxVal) { maxVal = v; maxIdx = h * width + w; }
+            uint v = inp[((b * channels + c) * height + h) * width + w];
+            if (!have || xf_gt(v, maxVal)) { maxVal = v; maxIdx = h * width + w; have = true; }
         }
     outp[b * channels + c] = maxVal;
     indices[b * channels + c] = maxIdx;
@@ -266,9 +273,9 @@ void main() {
 }";
 
     // ---- Max pooling 3D (forward, NCDHW, with argmax indices): one thread per output element ----
-    public const string MaxPool3D = Header + @"
-layout(set=0, binding=0) buffer B0 { float inp[]; };
-layout(set=0, binding=1) buffer B1 { float outp[]; };
+    public const string MaxPool3D = Header + ExactFloatKernels.Glsl + @"
+layout(set=0, binding=0) buffer B0 { uint inp[]; };
+layout(set=0, binding=1) buffer B1 { uint outp[]; };
 layout(set=0, binding=2) buffer B2 { int indices[]; };
 layout(push_constant) uniform PC {
     int batch; int channels; int inDepth; int inHeight; int inWidth;
@@ -284,15 +291,15 @@ void main() {
     int oh = t % outHeight; t = t / outHeight;
     int od = t % outDepth; t = t / outDepth;
     int c = t % channels; int b = t / channels;
-    float maxVal = -3.402823466e+38; int maxIdx = 0;
+    uint maxVal = 0xFF800000u; bool have = false; int maxIdx = 0;
     for (int kd = 0; kd < kernelD; kd++) {
         int id = od * strideD + kd; if (id >= inDepth) continue;
         for (int kh = 0; kh < kernelH; kh++) {
             int ih = oh * strideH + kh; if (ih >= inHeight) continue;
             for (int kw = 0; kw < kernelW; kw++) {
                 int iw = ow * strideW + kw; if (iw >= inWidth) continue;
-                float v = inp[((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw];
-                if (v > maxVal) { maxVal = v; maxIdx = id * inHeight * inWidth + ih * inWidth + iw; }
+                uint v = inp[((b * channels + c) * inDepth + id) * inHeight * inWidth + ih * inWidth + iw];
+                if (!have || xf_gt(v, maxVal)) { maxVal = v; maxIdx = id * inHeight * inWidth + ih * inWidth + iw; have = true; }
             }
         }
     }

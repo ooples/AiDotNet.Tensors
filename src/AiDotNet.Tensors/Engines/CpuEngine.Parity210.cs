@@ -1559,9 +1559,11 @@ public partial class CpuEngine
         }
         return CumulativeAlongAxis(tensor, axis,
             CumulativeInitial<T>(max: true),
-            (a, b) => {
+            // The running value moves only to a strictly greater element (ScanKernels.RunningMaxFloat's rule): taking
+            // the new element unless the running value was greater let a NaN in and handed +0 / -0 ties to the later one.
+            (acc, x) => {
                 var ops = MathHelper.GetNumericOperations<T>();
-                return ops.GreaterThan(a, b) ? a : b;
+                return ops.GreaterThan(x, acc) ? x : acc;
             },
             "TensorCumMax", BackwardFunctions<T>.CumMaxBackward);
     }
@@ -1606,9 +1608,10 @@ public partial class CpuEngine
         }
         return CumulativeAlongAxis(tensor, axis,
             CumulativeInitial<T>(max: false),
-            (a, b) => {
+            // Only a strictly smaller element replaces the running value (ScanKernels.RunningMinFloat's rule).
+            (acc, x) => {
                 var ops = MathHelper.GetNumericOperations<T>();
-                return ops.LessThan(a, b) ? a : b;
+                return ops.LessThan(x, acc) ? x : acc;
             },
             "TensorCumMin", BackwardFunctions<T>.CumMinBackward);
     }

@@ -13,10 +13,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         public static string GetSource()
         {
-            return @"
+            return ExactFloatKernels.OpenCl + @"
 // ===========================================================================
 // POOLING KERNELS
 // ===========================================================================
+
+// The max-pool rule of the CPU engine, decided on bit patterns (ExactFloatKernels) because this program is built
+// with fast/finite-math flags: a window's maximum is its first in-bounds cell, replaced only by a strictly greater
+// one. The first of equal maxima (and of +0 / -0) wins, a NaN first cell stays, a later NaN never wins, and
+// subnormals compare as themselves. 'have' is false before the first cell.
+inline int pool_take(int have, uint v, uint m) { return !have || xf_gt(v, m); }
 
 // Float add that is atomic on OpenCL 1.x, which has no native float atomics: retry a compare-exchange on the
 // value's bit pattern until no other work-item changed it in between. The backward scatters below need it
@@ -64,8 +70,8 @@ __kernel void maxpool2d(
 
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
-    float maxVal = -INFINITY;
-    int maxIdx = 0;
+    uint maxBits = 0xFF800000u;   // -inf, kept only by a window with no in-bounds cell
+    int maxIdx = 0, have = 0;
 
     for (int kh = 0; kh < kernelH; kh++) {
         for (int kw = 0; kw < kernelW; kw++) {
@@ -74,17 +80,18 @@ __kernel void maxpool2d(
 
             if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
                 int inputIdx = ((b * channels + c) * inHeight + ih) * inWidth + iw;
-                float val = input[inputIdx];
-                if (val > maxVal) {
-                    maxVal = val;
+                uint val = as_uint(input[inputIdx]);
+                if (pool_take(have, val, maxBits)) {
+                    maxBits = val;
                     maxIdx = ih * inWidth + iw;
+                    have = 1;
                 }
             }
         }
     }
 
     int outIdx = ((b * channels + c) * outHeight + oh) * outWidth + ow;
-    output[outIdx] = maxVal;
+    output[outIdx] = as_float(maxBits);
     if (saveIndices) {
         indices[outIdx] = maxIdx;
     }
@@ -113,20 +120,20 @@ __kernel void maxpool2d_2x2s2(
     const long plane = t / outHeight;
     const int ih = 2 * oh, iw = 4 * pr;
     __global const float* row = input + (plane * inHeight + ih) * inWidth + iw;
-    const float4 a = vload4(0, row), b = vload4(0, row + inWidth);
-    float m0 = -INFINITY, m1 = -INFINITY;
-    int i0 = 0, i1 = 0;
+    // Loaded as bit patterns: the window's first cell, then a strictly greater one (pool_take's rule).
+    __global const uint* rowBits = (__global const uint*)row;
+    const uint4 a = vload4(0, rowBits), b = vload4(0, rowBits + inWidth);
     const int top = ih * inWidth + iw, bottom = top + inWidth;
-    if (a.x > m0) { m0 = a.x; i0 = top; }
-    if (a.y > m0) { m0 = a.y; i0 = top + 1; }
-    if (b.x > m0) { m0 = b.x; i0 = bottom; }
-    if (b.y > m0) { m0 = b.y; i0 = bottom + 1; }
-    if (a.z > m1) { m1 = a.z; i1 = top + 2; }
-    if (a.w > m1) { m1 = a.w; i1 = top + 3; }
-    if (b.z > m1) { m1 = b.z; i1 = bottom + 2; }
-    if (b.w > m1) { m1 = b.w; i1 = bottom + 3; }
+    uint m0 = a.x, m1 = a.z;
+    int i0 = top, i1 = top + 2;
+    if (xf_gt(a.y, m0)) { m0 = a.y; i0 = top + 1; }
+    if (xf_gt(b.x, m0)) { m0 = b.x; i0 = bottom; }
+    if (xf_gt(b.y, m0)) { m0 = b.y; i0 = bottom + 1; }
+    if (xf_gt(a.w, m1)) { m1 = a.w; i1 = top + 3; }
+    if (xf_gt(b.z, m1)) { m1 = b.z; i1 = bottom + 2; }
+    if (xf_gt(b.w, m1)) { m1 = b.w; i1 = bottom + 3; }
     const long o = (plane * outHeight + oh) * outWidth + 2 * pr;
-    vstore2((float2)(m0, m1), 0, output + o);
+    vstore2((uint2)(m0, m1), 0, (__global uint*)(output + o));
     if (saveIndices) vstore2((int2)(i0, i1), 0, indices + o);
 }
 
@@ -306,16 +313,18 @@ __kernel void global_maxpool2d(
 
     if (b >= batch) return;
 
-    float maxVal = -INFINITY;
+    // fmax under fast math flushed subnormals, dropped NaN first cells and took +0 over a leading -0.
+    uint maxBits = 0xFF800000u;
+    int have = 0;
 
     for (int h = 0; h < height; h++) {
         for (int w = 0; w < width; w++) {
-            float val = input[((b * channels + c) * height + h) * width + w];
-            maxVal = fmax(maxVal, val);
+            uint val = as_uint(input[((b * channels + c) * height + h) * width + w]);
+            if (pool_take(have, val, maxBits)) { maxBits = val; have = 1; }
         }
     }
 
-    output[b * channels + c] = maxVal;
+    output[b * channels + c] = as_float(maxBits);
 }
 
 // Global Max Pooling 2D with indices output for backward pass
@@ -334,20 +343,21 @@ __kernel void global_maxpool2d_with_indices(
 
     if (b >= batch) return;
 
-    float maxVal = -INFINITY;
-    int maxIdx = 0;
+    uint maxBits = 0xFF800000u;
+    int maxIdx = 0, have = 0;
 
     for (int h = 0; h < height; h++) {
         for (int w = 0; w < width; w++) {
-            float val = input[((b * channels + c) * height + h) * width + w];
-            if (val > maxVal) {
-                maxVal = val;
+            uint val = as_uint(input[((b * channels + c) * height + h) * width + w]);
+            if (pool_take(have, val, maxBits)) {
+                maxBits = val;
                 maxIdx = h * width + w;  // Flattened spatial index
+                have = 1;
             }
         }
     }
 
-    output[b * channels + c] = maxVal;
+    output[b * channels + c] = as_float(maxBits);
     indices[b * channels + c] = maxIdx;
 }
 
@@ -484,8 +494,8 @@ __kernel void maxpool3d(
 
     if (ow >= outWidth || oh >= outHeight || od >= outDepth || b >= batch) return;
 
-    float maxVal = -INFINITY;
-    int maxIdx = 0;
+    uint maxBits = 0xFF800000u;
+    int maxIdx = 0, have = 0;
 
     // Iterate over 3D kernel window
     for (int kd = 0; kd < kernelD; kd++) {
@@ -503,11 +513,12 @@ __kernel void maxpool3d(
                 // NCDHW layout
                 int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth
                              + ih * inWidth + iw;
-                float val = input[inputIdx];
+                uint val = as_uint(input[inputIdx]);
 
-                if (val > maxVal) {
-                    maxVal = val;
+                if (pool_take(have, val, maxBits)) {
+                    maxBits = val;
                     maxIdx = id * inHeight * inWidth + ih * inWidth + iw;
+                    have = 1;
                 }
             }
         }
@@ -516,7 +527,7 @@ __kernel void maxpool3d(
     // Output index: NCDHW layout
     int outIdx = ((b * channels + c) * outDepth + od) * outHeight * outWidth
                + oh * outWidth + ow;
-    output[outIdx] = maxVal;
+    output[outIdx] = as_float(maxBits);
 
     if (saveIndices) {
         indices[outIdx] = maxIdx;
@@ -879,15 +890,16 @@ __kernel void adaptive_max_pool2d(
     int wStart = (ow * inWidth) / outWidth;
     int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
 
-    float maxV = -INFINITY;
+    uint maxBits = 0xFF800000u;
+    int have = 0;
     for (int ih = hStart; ih < hEnd; ih++) {
         for (int iw = wStart; iw < wEnd; iw++) {
-            float v = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
-            if (v > maxV) maxV = v;
+            uint v = as_uint(input[((b * channels + c) * inHeight + ih) * inWidth + iw]);
+            if (pool_take(have, v, maxBits)) { maxBits = v; have = 1; }
         }
     }
 
-    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = maxV;
+    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = as_float(maxBits);
 }
 ";
         }

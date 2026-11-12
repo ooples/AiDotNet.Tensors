@@ -690,7 +690,7 @@ kernel void reduce_mean_full(
     /// <summary>
     /// Neural network activation function kernels.
     /// </summary>
-    public const string ActivationKernels = CommonHeader + @"
+    public const string ActivationKernels = CommonHeader + ExactFloatKernels.Msl + @"
 
 // ReLU activation: B = max(0, A)
 kernel void relu(
@@ -990,8 +990,7 @@ kernel void relu6(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        float x = A[gid];
-        B[gid] = min(max(x, 0.0f), 6.0f);
+        B[gid] = xf_clampf(A[gid], 0.0f, 6.0f);   // the CPU clamp(x, 0, 6) on the bits: -0 and NaN pass through
     }
 }
 
@@ -1218,9 +1217,13 @@ kernel void max_pool1d(
     if (gid < total) {
         uint o = gid % outLength; uint c = (gid / outLength) % channels; uint b = gid / (outLength * channels);
         uint inOff = (b * channels + c) * inLength;
-        float maxVal = -3.402823466e+38f;
-        for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, input[inOff + pos]); }
-        output[gid] = maxVal;
+        // The CPU max-pool rule on the bits: the window's first cell, then only a strictly greater one.
+        uint maxBits = 0xFF800000u; bool have = false;
+        for (uint k = 0; k < kernelSize; k++) {
+            uint pos = o * stride + k;
+            if (pos < inLength) { uint v = as_type<uint>(input[inOff + pos]); if (!have || xf_gt(v, maxBits)) { maxBits = v; have = true; } }
+        }
+        output[gid] = as_type<float>(maxBits);
     }
 }
 
@@ -2820,7 +2823,7 @@ kernel void embedding_forward(
     /// <summary>
     /// Convolution and pooling operation kernels.
     /// </summary>
-    public const string ConvolutionKernels = CommonHeader + @"
+    public const string ConvolutionKernels = CommonHeader + ExactFloatKernels.Msl + @"
 
 // Im2col transformation for efficient convolution
 kernel void im2col(
@@ -2956,22 +2959,25 @@ kernel void maxpool2d_forward(
     h_start = max(h_start, 0);
     w_start = max(w_start, 0);
 
-    float max_val = -INFINITY;
+    // The CPU max-pool rule on the bits: the first in-bounds cell, then only a strictly greater one.
+    uint max_bits = 0xFF800000u;
+    bool have = false;
     int max_idx = 0;
     uint input_offset = b * channels * in_h * in_w + c * in_h * in_w;
 
     for (int h = h_start; h < h_end; h++) {
         for (int w = w_start; w < w_end; w++) {
-            float val = input[input_offset + h * in_w + w];
-            if (val > max_val) {
-                max_val = val;
+            uint val = as_type<uint>(input[input_offset + h * in_w + w]);
+            if (!have || xf_gt(val, max_bits)) {
+                max_bits = val;
                 max_idx = h * in_w + w;
+                have = true;
             }
         }
     }
 
     uint out_idx = b * channels * out_h * out_w + c * out_h * out_w + oh * out_w + ow;
-    output[out_idx] = max_val;
+    output[out_idx] = as_type<float>(max_bits);
     indices[out_idx] = max_idx;
 }
 
@@ -3179,16 +3185,18 @@ kernel void maxpool2d(
     int ow = idx % int(outWidth); int t = idx / int(outWidth);
     int oh = t % int(outHeight); t = t / int(outHeight);
     int c = t % int(channels); int b = t / int(channels);
-    float maxVal = -3.402823466e+38f; int maxIdx = 0;
+    // The CPU max-pool rule on the bits: the first in-bounds cell, then only a strictly greater one (-FLT_MAX seed
+    // answered -FLT_MAX for a -inf window; float compares flush subnormals under fast math).
+    uint maxBits = 0xFF800000u; bool have = false; int maxIdx = 0;
     for (int kh = 0; kh < int(kernelH); kh++) for (int kw = 0; kw < int(kernelW); kw++) {
         int ih = oh * int(strideH) - int(padH) + kh; int iw = ow * int(strideW) - int(padW) + kw;
         if (ih >= 0 && ih < int(inHeight) && iw >= 0 && iw < int(inWidth)) {
-            float v = inp[((b * int(channels) + c) * int(inHeight) + ih) * int(inWidth) + iw];
-            if (v > maxVal) { maxVal = v; maxIdx = ih * int(inWidth) + iw; }
+            uint v = as_type<uint>(inp[((b * int(channels) + c) * int(inHeight) + ih) * int(inWidth) + iw]);
+            if (!have || xf_gt(v, maxBits)) { maxBits = v; maxIdx = ih * int(inWidth) + iw; have = true; }
         }
     }
     int oIdx = ((b * int(channels) + c) * int(outHeight) + oh) * int(outWidth) + ow;
-    outp[oIdx] = maxVal; indices[oIdx] = maxIdx;
+    outp[oIdx] = as_type<float>(maxBits); indices[oIdx] = maxIdx;
 }
 
 kernel void maxpool2d_backward(
@@ -3254,9 +3262,11 @@ kernel void global_maxpool2d_noidx(
     uint total = batch * channels;
     if (gid >= total) return;
     int idx = int(gid); int c = idx % int(channels); int b = idx / int(channels);
-    float m = -3.402823466e+38f; int sp = int(height * width);
-    for (int i = 0; i < sp; i++) m = max(m, inp[(b * int(channels) + c) * sp + i]);
-    outp[b * int(channels) + c] = m;
+    // The first cell, then only a strictly greater one, on the bits (the CPU GlobalMaxPool2D).
+    int sp = int(height * width);
+    uint m = sp > 0 ? as_type<uint>(inp[(b * int(channels) + c) * sp]) : 0xFF800000u;
+    for (int i = 1; i < sp; i++) { uint v = as_type<uint>(inp[(b * int(channels) + c) * sp + i]); if (xf_gt(v, m)) m = v; }
+    outp[b * int(channels) + c] = as_type<float>(m);
 }
 
 kernel void global_maxpool2d(
@@ -3268,9 +3278,10 @@ kernel void global_maxpool2d(
     uint total = batch * channels;
     if (gid >= total) return;
     int idx = int(gid); int c = idx % int(channels); int b = idx / int(channels);
-    float m = -3.402823466e+38f; int mi = 0; int sp = int(height * width);
-    for (int i = 0; i < sp; i++) { float v = inp[(b * int(channels) + c) * sp + i]; if (v > m) { m = v; mi = i; } }
-    outp[b * int(channels) + c] = m; indices[b * int(channels) + c] = mi;
+    int mi = 0; int sp = int(height * width);
+    uint m = sp > 0 ? as_type<uint>(inp[(b * int(channels) + c) * sp]) : 0xFF800000u;
+    for (int i = 1; i < sp; i++) { uint v = as_type<uint>(inp[(b * int(channels) + c) * sp + i]); if (xf_gt(v, m)) { m = v; mi = i; } }
+    outp[b * int(channels) + c] = as_type<float>(m); indices[b * int(channels) + c] = mi;
 }
 
 kernel void global_maxpool2d_backward(
@@ -3321,15 +3332,15 @@ kernel void maxpool3d(
     int oh = t % int(outHeight); t = t / int(outHeight);
     int od = t % int(outDepth); t = t / int(outDepth);
     int c = t % int(channels); int b = t / int(channels);
-    float m = -3.402823466e+38f; int mi = 0;
+    uint m = 0xFF800000u; bool have = false; int mi = 0;   // first in-bounds cell, then strictly greater, on the bits
     for (int kd = 0; kd < int(kernelD); kd++) { int id = od * int(strideD) + kd; if (id >= int(inDepth)) continue;
       for (int kh = 0; kh < int(kernelH); kh++) { int ih = oh * int(strideH) + kh; if (ih >= int(inHeight)) continue;
         for (int kw = 0; kw < int(kernelW); kw++) { int iw = ow * int(strideW) + kw; if (iw >= int(inWidth)) continue;
-            float v = inp[((b * int(channels) + c) * int(inDepth) + id) * int(inHeight) * int(inWidth) + ih * int(inWidth) + iw];
-            if (v > m) { m = v; mi = id * int(inHeight) * int(inWidth) + ih * int(inWidth) + iw; }
+            uint v = as_type<uint>(inp[((b * int(channels) + c) * int(inDepth) + id) * int(inHeight) * int(inWidth) + ih * int(inWidth) + iw]);
+            if (!have || xf_gt(v, m)) { m = v; mi = id * int(inHeight) * int(inWidth) + ih * int(inWidth) + iw; have = true; }
         } } }
     int oIdx = ((b * int(channels) + c) * int(outDepth) + od) * int(outHeight) * int(outWidth) + oh * int(outWidth) + ow;
-    outp[oIdx] = m; indices[oIdx] = mi;
+    outp[oIdx] = as_type<float>(m); indices[oIdx] = mi;
 }
 
 kernel void maxpool3d_backward(
