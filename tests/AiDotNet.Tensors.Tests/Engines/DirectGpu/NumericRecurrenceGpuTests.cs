@@ -114,6 +114,42 @@ public sealed class NumericRecurrenceGpuTests : IClassFixture<GpuCpuCorrectnessF
         AssertNoHostFallback("LinearSumAssignment");
     }
 
+    // The limiter and the CTC posteriors on random batched inputs (ragged lengths, repeated labels) against the CPU
+    // engine itself, not only the scalar / PyTorch references above.
+    [SkippableFact]
+    public void FritschCarlsonLimit_AndCtcPosteriors_MatchTheCpuEngine()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
+        int batch = 4, rows = 3, n = 67;
+        var m = Ref.Random(61, 3, 0, batch, rows, n);
+        var d = Ref.Random(62, 1, 0, batch, rows, n - 1);
+        GpuLaunchProbe.Reset();
+        var gpuLimit = _fixture.Gpu.TensorFritschCarlsonLimit(m, d);
+        AssertNoHostFallback("FritschCarlsonLimit");
+        Ref.AssertClose(D(_fixture.Cpu.TensorFritschCarlsonLimit(m, d)), gpuLimit, 1e-5, "limited slopes");
+
+        int T = 23, N = 3, C = 5;
+        var raw = Ref.Random(63, 2, 0, T, N, C).ToArray();
+        var lp = new float[raw.Length];
+        for (int row = 0; row < T * N; row++)
+        {
+            double sum = 0;
+            for (int c = 0; c < C; c++) sum += System.Math.Exp(raw[row * C + c]);
+            for (int c = 0; c < C; c++) lp[row * C + c] = (float)(raw[row * C + c] - System.Math.Log(sum));
+        }
+        var logProbs = new Tensor<float>(lp, new[] { T, N, C });
+        // Concatenated targets (the PyTorch 1-D layout): 6, 4 and 5 labels, with repeats that force a blank between.
+        var targets = new Tensor<int>(new[] { 1, 2, 2, 3, 4, 1, 3, 3, 3, 1, 4, 2, 1, 2, 4 }, new[] { 15 });
+        var inputLengths = new[] { 23, 17, 20 };
+        var targetLengths = new[] { 6, 4, 5 };
+        GpuLaunchProbe.Reset();
+        var gpuGamma = _fixture.Gpu.TensorCTCLabelPosteriors(logProbs, targets, inputLengths, targetLengths, 0);
+        AssertNoHostFallback("CTCLabelPosteriors");
+        var cpuGamma = _fixture.Cpu.TensorCTCLabelPosteriors(logProbs, targets, inputLengths, targetLengths, 0);
+        Assert.Equal(cpuGamma.Shape.ToArray(), gpuGamma.Shape.ToArray());
+        Ref.AssertClose(D(cpuGamma), gpuGamma, 1e-4, "posteriors");
+    }
+
     // Sizes past what shared memory holds (1024 lattice positions, 400 assignment rows) still run on the device.
     [SkippableFact]
     public void LargeProblems_StayOnTheDevice()

@@ -96,6 +96,22 @@ public sealed class DataOpsGpuParityTests : IClassFixture<GpuCpuCorrectnessFixtu
     }
 
     [SkippableFact]
+    public void Parse_Tokens_MatchesTheCpu_IncludingNullAndUndecidedTokens()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
+        var corpus = DataOpsTests.NumericCorpus(9_000, seed: 43);
+        var tokens = corpus.Select((s, i) => i % 97 == 13 ? null : s).ToList();
+        GpuLaunchProbe.Reset();
+        var gpu = _fixture.Gpu.TensorParse<float>(tokens, new[] { 90, 100 }, NumberStyles.Float,
+            CultureInfo.InvariantCulture, -3f);
+        AssertNoFallback("TensorParse");
+        Assert.Equal(new[] { 90, 100 }, gpu.Shape.ToArray());
+        var cpu = _fixture.Cpu.TensorParse<float>(tokens, new[] { 90, 100 }, NumberStyles.Float,
+            CultureInfo.InvariantCulture, -3f);
+        AssertBitsEqual(cpu.ToArray(), gpu.ToArray(), "tokens");
+    }
+
+    [SkippableFact]
     public void RandomUniform_WithTheCallersRandom_MatchesTheCpuAndTheStream()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
