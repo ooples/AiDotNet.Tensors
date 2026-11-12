@@ -1,6 +1,26 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
+/// A view that names the buffer it addresses. A backend may build a new view object for every request, so a cache that
+/// must recognize the same memory again keys on the root buffer (see <see cref="GpuBufferViewRoot"/>), not the view.
+/// </summary>
+internal interface IGpuBufferViewSource
+{
+    /// <summary>The buffer this view addresses (itself possibly a view).</summary>
+    IGpuBuffer ViewParent { get; }
+}
+
+internal static class GpuBufferViewRoot
+{
+    /// <summary>The buffer that owns <paramref name="buffer"/>'s memory: itself, or the root of its view chain.</summary>
+    public static IGpuBuffer Of(IGpuBuffer buffer)
+    {
+        while (buffer is IGpuBufferViewSource view) buffer = view.ViewParent;
+        return buffer;
+    }
+}
+
+/// <summary>
 /// Optional backend capability: a non-owning view of a contiguous sub-range of a device buffer.
 /// </summary>
 /// <remarks>
