@@ -24,7 +24,7 @@ public partial class CpuEngine
                 u2 = generator.NextDouble();
                 break;
             case BoxMullerFirstUniform.RedrawWhileZero:
-                do { u1 = generator.NextDouble(); } while (u1 == 0.0);
+                do { u1 = generator.NextDouble(); } while (u1 <= 0.0);
                 u2 = generator.NextDouble();
                 break;
             case BoxMullerFirstUniform.RedrawPairWhileZero:
@@ -64,6 +64,10 @@ public partial class CpuEngine
             throw new ArgumentOutOfRangeException(nameof(variant), variant.SecondUniform, "Unknown Box-Muller second-uniform rule.");
         if (variant.Branch != BoxMullerBranch.Cosine && variant.Branch != BoxMullerBranch.Sine)
             throw new ArgumentOutOfRangeException(nameof(variant), variant.Branch, "Unknown Box-Muller branch.");
+        // The constructor already rejects this; default(BoxMullerVariant) cannot reach it, but a radius of
+        // sqrt(-2 ln u1) with u1 > 1 is NaN and would spin the gamma sampler's rejection loop forever.
+        if (double.IsNaN(variant.FirstUniformFloor) || variant.FirstUniformFloor < 0.0 || variant.FirstUniformFloor > 1.0)
+            throw new ArgumentOutOfRangeException(nameof(variant), variant.FirstUniformFloor, "The first-uniform floor must lie in [0, 1].");
     }
 
     /// <summary>
@@ -186,6 +190,7 @@ public partial class CpuEngine
         ValidateGammaShape(shape);
         ValidateVariant(normal);
         var scales = RoIAlignPlan.ToDoubles(scale);
+        ValidateGammaScales(scales);
         var values = DrawGammas(generator, null, shape, scales, normal);
         var result = new Tensor<T>((int[])scale._shape.Clone());
         StoreDoubles(values, result.GetDataArray());
@@ -204,7 +209,9 @@ public partial class CpuEngine
         ValidateVariant(normal);
         var shapes = RoIAlignPlan.ToDoubles(shape);
         foreach (double s in shapes) ValidateGammaShape(s);
-        var values = DrawGammas(generator, shapes, 0.0, RoIAlignPlan.ToDoubles(scale), normal);
+        var scales = RoIAlignPlan.ToDoubles(scale);
+        ValidateGammaScales(scales);
+        var values = DrawGammas(generator, shapes, 0.0, scales, normal);
         var result = new Tensor<T>((int[])scale._shape.Clone());
         StoreDoubles(values, result.GetDataArray());
         return result;
@@ -212,8 +219,19 @@ public partial class CpuEngine
 
     private static void ValidateGammaShape(double shape)
     {
-        if (!(shape > 0.0) || double.IsInfinity(shape))
+        if (double.IsNaN(shape) || shape <= 0.0 || double.IsInfinity(shape))
             throw new ArgumentOutOfRangeException(nameof(shape), shape, "A gamma shape must be finite and positive.");
+    }
+
+    // Every scale, before the first draw, so an invalid one late in the tensor leaves the caller's Random untouched.
+    // Zero is allowed (numpy.random.gamma's scale "must be non-negative"; the draw is exactly 0).
+    internal static void ValidateGammaScales(double[] scales)
+    {
+        foreach (double s in scales)
+        {
+            if (double.IsNaN(s) || s < 0.0 || double.IsInfinity(s))
+                throw new ArgumentOutOfRangeException("scale", s, "A gamma scale must be finite and non-negative.");
+        }
     }
 
     [ScalarKernel("Marsaglia-Tsang is a rejection sampler on one sequential System.Random stream: how many draws an element takes depends on the draws.")]

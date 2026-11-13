@@ -47,6 +47,9 @@ public partial class CpuEngine
         if (table.IsSparse) throw new InvalidOperationException("Row scatter into a SparseTensor is not supported.");
         var ids = ReadAll(rows);
         if (ids.Length == 0 || rowSize == 0) return;
+        // A source sharing the table's storage (the table itself, or a view of it) would read rows this scatter has
+        // already overwritten: copy it first, so every row written is the source's value before the call.
+        source = SnapshotIfAliased(table, source);
         using var sourceLease = source.Lease();
         var src = sourceLease.Span;
         if (table.IsContiguous)
@@ -75,6 +78,10 @@ public partial class CpuEngine
         }
         table.IncrementVersion();
     }
+
+    /// <summary><paramref name="source"/>, or a private copy of it when it shares <paramref name="table"/>'s storage.</summary>
+    private protected static Tensor<T> SnapshotIfAliased<T>(Tensor<T> table, Tensor<T> source) =>
+        ReferenceEquals(source.StorageIdentity, table.StorageIdentity) ? source.Clone() : source;
 
     /// <summary>(vocabulary, elements per row, gathered shape = rows' shape then the table's row shape).</summary>
     internal static (int Vocab, int RowSize, int[] GatheredShape) GatherRowsShape<T>(Tensor<T> table, Tensor<long> rows)

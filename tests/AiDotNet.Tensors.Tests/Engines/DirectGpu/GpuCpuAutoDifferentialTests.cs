@@ -694,7 +694,8 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "TensorLinearSumAssignment(Tensor<T>)",
         // Caller-Random draws (the Random is the caller's, its stream must end where the scalar loop's does), the row
         // gather with long ids and the lfilter recursion with coupled coefficient / state shapes: DataOps2GpuParityTests,
-        // GPU vs CPU with no recorded fallback, and DataTransformPortTests per backend.
+        // GPU vs CPU with no recorded fallback (NormalFromRng_AndBothGammaOverloads_MatchTheCpu_AndTheStream for the
+        // host-drawn normal and gamma overloads, bit for bit), and DataTransformPortTests per backend.
         "TensorNormalFromRng(Random,Int32[],Func<Random,Double>)",
         "TensorTruncatedNormalFromRng(Random,Int32[],BoxMullerVariant,Double,Double,Double,Double)",
         "TensorGammaFromRng(Random,Double,Tensor<T>,BoxMullerVariant)",

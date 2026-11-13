@@ -32,6 +32,8 @@ public partial class CpuEngine
             EncodeSingleBits(ReadAll(floats), bytes, littleEndian);
         else if (input is Tensor<long> longs) EncodeIntegers(ReadAll(longs), bytes, targetType, littleEndian);
         else if (input is Tensor<int> ints) EncodeIntegers(Widen(ReadAll(ints)), bytes, targetType, littleEndian);
+        else if (input is Tensor<ulong> ulongs) EncodeUnsigned(ReadAll(ulongs), bytes, targetType, littleEndian);
+        else if (IsIntegral(typeof(T))) EncodeIntegers(WidenIntegral(ReadAll(input)), bytes, targetType, littleEndian);
         else EncodeDoubles(RoIAlignPlan.ToDoubles(input), bytes, targetType, littleEndian);
         return bytes;
     }
@@ -60,6 +62,36 @@ public partial class CpuEngine
         var result = new long[values.Length];
         for (int i = 0; i < values.Length; i++) result[i] = values[i];
         return result;
+    }
+
+    // short / sbyte / byte / ushort / uint widened exactly (each fits a long); ulong takes EncodeUnsigned.
+    private static long[] WidenIntegral<TValue>(TValue[] values)
+    {
+        var result = new long[values.Length];
+        for (int i = 0; i < values.Length; i++) result[i] = (long)IntegerValue(values[i]);
+        return result;
+    }
+
+    // ulong values: those within long's range take the exact integer encoding; larger ones saturate every integer
+    // target (each maximum is at most long.MaxValue) and round once from the exact value to a floating target.
+    private static void EncodeUnsigned(ulong[] values, byte[] bytes, NumericStorageType type, bool littleEndian)
+    {
+        int width = type.GetByteWidth();
+        bool floating = type == NumericStorageType.Float64 || type == NumericStorageType.Float32
+            || type == NumericStorageType.Float16;
+        int chunks = (values.Length + DataOpChunk - 1) / DataOpChunk;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)values.Length * width, chunk =>
+        {
+            int from = chunk * DataOpChunk, to = Math.Min(values.Length, from + DataOpChunk);
+            for (int i = from; i < to; i++)
+            {
+                ulong v = values[i];
+                ulong raw = v <= long.MaxValue ? EncodeInteger((long)v, type)
+                    : floating ? EncodeDouble(v, type)
+                    : EncodeInteger(long.MaxValue, type);
+                WriteRaw(bytes, i * width, width, raw, littleEndian);
+            }
+        }, deterministicSafe: true);
     }
 
     /// <summary>Each value encoded as <paramref name="type"/> into its slot of <paramref name="bytes"/>, chunks in
@@ -154,27 +186,48 @@ public partial class CpuEngine
     internal static ulong DoubleToHalfBits(double value)
     {
         ulong bits = unchecked((ulong)BitConverter.DoubleToInt64Bits(value));
-        ulong sign = (bits >> 48) & 0x8000UL;
-        int e = (int)((bits >> 52) & 0x7FF);
-        ulong m = bits & 0xFFFFFFFFFFFFFUL;
-        if (e == 0x7FF) return m != 0 ? sign | 0x7E00UL | ((m >> 42) & 0x3FFUL) : sign | 0x7C00UL;
+        ulong sign = (bits >> (DoubleBits - HalfBits)) & HalfSignMask;
+        int e = (int)((bits >> DoubleMantissaBits) & DoubleExponentMask);
+        ulong m = bits & DoubleMantissaMask;
+        if (e == DoubleExponentMask)
+            return m != 0 ? sign | HalfQuietNaN | ((m >> MantissaShift) & HalfMantissaMask) : sign | HalfInfinity;
         if (e == 0) return sign;
-        int ue = e - 1023;
-        if (ue > 15) return sign | 0x7C00UL;
-        if (ue >= -14)
+        int ue = e - DoubleExponentBias;
+        if (ue > HalfMaxExponent) return sign | HalfInfinity;
+        if (ue >= HalfMinExponent)
         {
-            ulong hm = RoundShiftRight(m, 42);
-            if (hm == 1024UL)
+            ulong hm = RoundShiftRight(m, MantissaShift);
+            if (hm == HalfMantissaCarry)
             {
                 hm = 0;
                 ue++;
-                if (ue > 15) return sign | 0x7C00UL;
+                if (ue > HalfMaxExponent) return sign | HalfInfinity;
             }
-            return sign | ((ulong)(ue + 15) << 10) | hm;
+            return sign | ((ulong)(ue + HalfExponentBias) << HalfMantissaBits) | hm;
         }
-        // A subnormal (or zero) result in units of 2^-24; a carry into 2^10 is exactly the smallest normal's bits.
-        return sign | RoundShiftRight(m | (1UL << 52), 28 - ue);
+        // A subnormal (or zero) result in units of 2^(HalfMinExponent - HalfMantissaBits) = 2^-24, from the full
+        // significand (implicit 1 included); a carry into 2^HalfMantissaBits is exactly the smallest normal's bits.
+        int subnormalShift = DoubleMantissaBits + HalfMinExponent - HalfMantissaBits - ue;
+        return sign | RoundShiftRight(m | (1UL << DoubleMantissaBits), subnormalShift);
     }
+
+    // IEEE-754 binary64 and binary16 field layouts.
+    private const int DoubleBits = 64;
+    private const int DoubleMantissaBits = 52;
+    private const int DoubleExponentMask = 0x7FF;
+    private const ulong DoubleMantissaMask = (1UL << DoubleMantissaBits) - 1;
+    private const int DoubleExponentBias = 1023;
+    private const int HalfBits = 16;
+    private const int HalfMantissaBits = 10;
+    private const int HalfExponentBias = 15;
+    private const int HalfMaxExponent = 15;    // the largest unbiased exponent of a finite half
+    private const int HalfMinExponent = -14;   // the smallest unbiased exponent of a normal half
+    private const int MantissaShift = DoubleMantissaBits - HalfMantissaBits;
+    private const ulong HalfSignMask = 1UL << (HalfBits - 1);
+    private const ulong HalfMantissaMask = (1UL << HalfMantissaBits) - 1;
+    private const ulong HalfMantissaCarry = 1UL << HalfMantissaBits;
+    private const ulong HalfInfinity = 0x1FUL << HalfMantissaBits;
+    private const ulong HalfQuietNaN = HalfInfinity | (1UL << (HalfMantissaBits - 1));
 
     // x >> s rounded to nearest, ties to even (s >= 1).
     private static ulong RoundShiftRight(ulong x, int s)
@@ -209,11 +262,25 @@ public partial class CpuEngine
                 var source = ReadAll(input);
                 for (int i = 0; i < count; i++) StoreInteger(destination, i, IntegerValue(source[i]), overflow);
             }
+            else if (input is Tensor<decimal> decimals)
+            {
+                // Rounded in decimal, then stored exactly: through double, 9007199254740993m would become ...992 and
+                // (decimal)long.MaxValue would round up to 2^63 and read as an overflow.
+                var source = ReadAll(decimals);
+                for (int i = 0; i < count; i++) StoreInteger(destination, i, RoundDecimal(source[i], mode), overflow);
+            }
             else
             {
                 var source = RoIAlignPlan.ToDoubles(input);
                 CastDoublesToIntegers(source, destination, mode, overflow);
             }
+            return result;
+        }
+        if (destination is decimal[] decimalDestination && IsIntegral(typeof(TIn)))
+        {
+            // Every 64-bit integer is exact in decimal; FromDouble would round to 15 significant digits.
+            var source = ReadAll(input);
+            for (int i = 0; i < count; i++) decimalDestination[i] = IntegerValue(source[i]);
             return result;
         }
         if (typeof(TIn) == typeof(TOut))
@@ -250,6 +317,16 @@ public partial class CpuEngine
         uint v => v,
         ulong v => v,
         _ => throw new NotSupportedException($"{typeof(TValue).Name} is not an integral element type."),
+    };
+
+    /// <summary><paramref name="value"/> rounded to an integer under <paramref name="mode"/>, in decimal arithmetic.</summary>
+    internal static decimal RoundDecimal(decimal value, RoundingMode mode) => mode switch
+    {
+        RoundingMode.TowardZero => decimal.Truncate(value),
+        RoundingMode.ToNearestEven => Math.Round(value, MidpointRounding.ToEven),
+        RoundingMode.ToNearestAwayFromZero => Math.Round(value, MidpointRounding.AwayFromZero),
+        RoundingMode.TowardNegativeInfinity => decimal.Floor(value),
+        _ => decimal.Ceiling(value),
     };
 
     /// <summary><paramref name="value"/> rounded to an integer under <paramref name="mode"/> (NaN and infinities pass
@@ -397,6 +474,10 @@ public partial class CpuEngine
 
     /// <summary>Each element's double value as text; see
     /// <see cref="TensorDataEngineExtensions.TensorFormat{T}(IEngine, Tensor{T}, IFormatProvider, string)"/>.</summary>
+    /// <remarks>Intentionally host-only on every engine, the GPU engines included (they inherit this method): the
+    /// result is a managed <see cref="string"/> array built by .NET's culture-aware formatting, which no device kernel
+    /// can produce, so a device-resident input is read back once and formatted here. There is no device follow-up to
+    /// track: a GPU override could only perform the same download.</remarks>
     public virtual string[] TensorFormat<T>(Tensor<T> input, IFormatProvider provider, string? format = null)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));

@@ -48,6 +48,60 @@ public sealed class DataOps2GpuParityTests : IClassFixture<GpuCpuCorrectnessFixt
         return new Tensor<float>(Enumerable.Range(0, n).Select(_ => (float)(scale * (rng.NextDouble() * 2 - 1))).ToArray(), shape);
     }
 
+    // A copy of the host tensor produced by a device op, asserted resident: the row ops send host tables to the CPU, so
+    // only a resident table reaches their kernels.
+    private Tensor<float> DeviceTensor(Tensor<float> host)
+    {
+        var shape = host.Shape.ToArray();
+        var resident = _fixture.Gpu.TensorAdd(host, new Tensor<float>(shape));
+        Assert.True(resident.IsGpuResident || resident.HasPendingGpuData, "the device copy of the table is not resident");
+        return resident;
+    }
+
+    [SkippableFact]
+    public void NormalFromRng_AndBothGammaOverloads_MatchTheCpu_AndTheStream()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
+        var variant = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine);
+        Func<Random, double> sampler = r => 2.0 * r.NextDouble() - 1.0;
+        var scale = new Tensor<float>(Enumerable.Range(0, 96).Select(i => 0.25f + 0.05f * i).ToArray(), new[] { 8, 12 });
+        var shape = new Tensor<float>(Enumerable.Range(0, 96).Select(i => 0.3f + 0.1f * i).ToArray(), new[] { 8, 12 });
+
+        var a = RandomHelper.CreateSeededRandom(41);
+        var b = RandomHelper.CreateSeededRandom(41);
+        var gpuNormal = _fixture.Gpu.TensorNormalFromRng<float>(a, new[] { 5, 77 }, sampler);
+        var gpuGamma = _fixture.Gpu.TensorGammaFromRng(a, 0.7, scale, variant);
+        var gpuGammaPer = _fixture.Gpu.TensorGammaFromRng(a, shape, scale, variant);
+        var cpuNormal = _fixture.Cpu.TensorNormalFromRng<float>(b, new[] { 5, 77 }, sampler);
+        var cpuGamma = _fixture.Cpu.TensorGammaFromRng(b, 0.7, scale, variant);
+        var cpuGammaPer = _fixture.Cpu.TensorGammaFromRng(b, shape, scale, variant);
+
+        Assert.Equal(b.NextDouble(), a.NextDouble());
+        Assert.Equal(cpuNormal.Shape.ToArray(), gpuNormal.Shape.ToArray());
+        Assert.Equal(cpuGamma.Shape.ToArray(), gpuGamma.Shape.ToArray());
+        Assert.Equal(cpuGammaPer.Shape.ToArray(), gpuGammaPer.Shape.ToArray());
+        // Drawn on the host from one sequential stream and uploaded once: bit-identical, not merely close.
+        AssertBitsEqual(cpuNormal.ToArray(), gpuNormal.ToArray(), "normal from sampler");
+        AssertBitsEqual(cpuGamma.ToArray(), gpuGamma.ToArray(), "gamma, shared shape");
+        AssertBitsEqual(cpuGammaPer.ToArray(), gpuGammaPer.ToArray(), "gamma, per-element shape");
+    }
+
+    [SkippableFact]
+    public void TruncatedNormal_MeanPastFloatRange_MatchesTheHostDouble()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
+        var variant = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine);
+        var a = RandomHelper.CreateSeededRandom(43);
+        var b = RandomHelper.CreateSeededRandom(43);
+        var gpu = _fixture.Gpu.TensorTruncatedNormalFromRng<float>(a, new[] { 64 }, variant, 1e40, 1e40,
+            double.NegativeInfinity, double.PositiveInfinity).ToArray();
+        var cpu = _fixture.Cpu.TensorTruncatedNormalFromRng<float>(b, new[] { 64 }, variant, 1e40, 1e40,
+            double.NegativeInfinity, double.PositiveInfinity).ToArray();
+        Assert.Equal(b.NextDouble(), a.NextDouble());
+        Assert.DoesNotContain(gpu, float.IsNaN);
+        AssertBitsEqual(cpu, gpu, "truncated normal at 1e40");
+    }
+
     [SkippableFact]
     public void BoxMuller_AndTruncatedNormal_MatchTheCpu_AndTheStream()
     {
@@ -166,7 +220,57 @@ public sealed class DataOps2GpuParityTests : IClassFixture<GpuCpuCorrectnessFixt
     }
 
     [SkippableFact]
-    public void GatherRows_ScatterRows_AndTheGatherGradient_MatchTheCpu()
+    public void GatherRows_ScatterRows_AndTheGatherGradient_OnAResidentTable_MatchTheCpu()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
+        var table = HostTensor(31, 5, 64, 24);
+        var rng = RandomHelper.CreateSeededRandom(32);
+        var ids = new Tensor<long>(Enumerable.Range(0, 120).Select(i => i % 13 == 5 ? 64L + i : i % 17 == 2 ? -1L : rng.Next(64))
+            .ToArray(), new[] { 8, 15 });
+        var resident = DeviceTensor(table);
+        GpuLaunchProbe.Reset();
+        var gpu = _fixture.Gpu.TensorGatherRows(resident, ids);
+        AssertNoFallback("GatherRows");
+        Assert.True(gpu.IsGpuResident || gpu.HasPendingGpuData, "the gather of a resident table ran on the host");
+        var cpu = _fixture.Cpu.TensorGatherRows(table, ids);
+        Assert.Equal(cpu.Shape.ToArray(), gpu.Shape.ToArray());
+        AssertBitsEqual(cpu.ToArray(), gpu.ToArray(), "resident gather");
+
+        var w = HostTensor(33, 1, 8, 15, 24);
+        float[] Grad(IEngine engine, bool onDevice)
+        {
+            var host = new Tensor<float>(table.ToArray(), new[] { 64, 24 });
+            var t = onDevice ? DeviceTensor(host) : host;
+            using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+            var g = engine.TensorGatherRows(t, ids);
+            var grads = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(g, w), null), new[] { t });
+            return grads[t].ToArray();
+        }
+        AssertClose(Grad(_fixture.Cpu, false), Grad(_fixture.Gpu, true), 1e-5, "resident gather gradient");
+
+        var scatterIds = new Tensor<long>(new[] { 3L, 70L, 3L, 9L, -4L, 63L }, new[] { 6 });
+        var source = HostTensor(34, 9, 6, 24);
+        var gpuTable = DeviceTensor(new Tensor<float>(table.ToArray(), new[] { 64, 24 }));
+        var cpuTable = new Tensor<float>(table.ToArray(), new[] { 64, 24 });
+        GpuLaunchProbe.Reset();
+        _fixture.Gpu.TensorScatterRowsInPlace(gpuTable, scatterIds, source);
+        AssertNoFallback("ScatterRows");
+        _fixture.Cpu.TensorScatterRowsInPlace(cpuTable, scatterIds, source);
+        AssertBitsEqual(cpuTable.ToArray(), gpuTable.ToArray(), "resident scatter");
+    }
+
+    [SkippableFact]
+    public void ScatterRows_SourceAliasingTheTable_PermutesTheOriginalRows()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
+        var rows = new Tensor<long>(new[] { 1L, 0L }, new[] { 2 });
+        var resident = DeviceTensor(new Tensor<float>(new[] { 10f, 11f, 20f, 21f }, new[] { 2, 2 }));
+        _fixture.Gpu.TensorScatterRowsInPlace(resident, rows, resident);
+        Assert.Equal(new[] { 20f, 21f, 10f, 11f }, resident.ToArray());
+    }
+
+    [SkippableFact]
+    public void GatherRows_ScatterRows_AndTheGatherGradient_OnAHostTable_MatchTheCpu()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
         var table = HostTensor(31, 5, 64, 24);

@@ -58,15 +58,15 @@ public readonly struct BoxMullerVariant
     /// <summary>Creates a convention.</summary>
     /// <param name="firstUniform">How <c>u1</c> is drawn.</param>
     /// <param name="firstUniformFloor">The lower bound <c>u1</c> is raised to (<c>Math.Max(u1, floor)</c>); 0 leaves it
-    /// unchanged. Must be finite and non-negative.</param>
+    /// unchanged. Must lie in [0, 1]: above 1, <c>ln u1</c> is positive and the radius <c>sqrt(-2 ln u1)</c> is NaN.</param>
     /// <param name="secondUniform">How <c>u2</c> is drawn.</param>
     /// <param name="branch">The branch kept.</param>
     public BoxMullerVariant(BoxMullerFirstUniform firstUniform, double firstUniformFloor, BoxMullerSecondUniform secondUniform,
         BoxMullerBranch branch)
     {
-        if (!(firstUniformFloor >= 0.0) || double.IsInfinity(firstUniformFloor))
+        if (double.IsNaN(firstUniformFloor) || firstUniformFloor < 0.0 || firstUniformFloor > 1.0)
             throw new System.ArgumentOutOfRangeException(nameof(firstUniformFloor), firstUniformFloor,
-                "The floor must be finite and non-negative.");
+                "The floor must lie in [0, 1].");
         FirstUniform = firstUniform;
         FirstUniformFloor = firstUniformFloor;
         SecondUniform = secondUniform;
