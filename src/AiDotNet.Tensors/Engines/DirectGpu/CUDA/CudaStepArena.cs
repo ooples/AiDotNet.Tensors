@@ -33,6 +33,7 @@ internal sealed class CudaStepArena
 
     private enum Mode { WarmUp, Recording, Replaying, Off }
     private Mode _mode = Mode.WarmUp;
+    private bool _warmUpSeen;
     private int _thread = -1;
     private int _step = -1;
 
@@ -185,7 +186,9 @@ internal sealed class CudaStepArena
         switch (_mode)
         {
             case Mode.WarmUp:
-                StartRecording();
+                // The first step this arena sees allocates one-time state; the second is recorded.
+                if (_warmUpSeen) StartRecording();
+                else _warmUpSeen = true;
                 break;
             case Mode.Recording:
                 BuildPlan();
