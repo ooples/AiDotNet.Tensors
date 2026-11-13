@@ -206,12 +206,20 @@ public sealed class FusedAttentionBackendParityTests
     /// [B * S, 3W] projection (row stride 3W), and dQ, dK, dV as views of a second such buffer (dQSpan) pre-filled with a
     /// pattern. Every element of that gradient buffer must come out equal to the dense interleaved run's gradients, which
     /// the reference check above already holds the backend to.
+    /// <para>
+    /// Without <paramref name="throughViews"/> each block is its own buffer holding exactly what its view would expose
+    /// (the projection from the block's offset on), and each gradient its own pattern-filled buffer: the kernels see the
+    /// same strided addresses and values, and a write outside a block's own columns shows as a changed pattern. OpenCL
+    /// needs this: the three views of one buffer overlap, and OpenCL 1.2 (5.2.1) leaves concurrent reading and writing
+    /// through overlapping sub-buffers of one buffer undefined. NVIDIA's runtime then faulted (0xC0000005) releasing one
+    /// of them, in clReleaseMemObject walking its sub-buffer list.
+    /// </para>
     /// </summary>
-    private static void CheckPacked(IDirectGpuBackend backend)
+    private static void CheckPacked(IDirectGpuBackend backend, bool throughViews)
     {
         var fused = Assert.IsAssignableFrom<IFusedAttentionBackend>(backend);
         var views = Assert.IsAssignableFrom<IGpuBufferViews>(backend);
-        int offsetStride = ViewOffsetStride(backend, views);
+        int offsetStride = throughViews ? ViewOffsetStride(backend, views) : 1;
         foreach (var (b, headCount, s, d, causal) in new[] { (2, 2, 9, 16, false), (1, 3, 6, 32, true) })
         {
             Assert.True(fused.SupportsFusedAttention(d));
@@ -260,12 +268,16 @@ public sealed class FusedAttentionBackendParityTests
             IGpuBuffer View(IGpuBuffer whole, int start) => views.TryCreateView(whole, start, whole.Size - start)
                 ?? throw new InvalidOperationException(
                     $"view refused at element offset {start} (stride {offsetStride}, H {h}, D {d})");
-            using var qv = View(xBuf, 0);
-            using var kv = View(xBuf, w);
-            using var vv = View(xBuf, 2 * w);
-            using var dqv = View(gBuf, 0);
-            using var dkv = View(gBuf, w);
-            using var dvv = View(gBuf, 2 * w);
+            IGpuBuffer Block(IGpuBuffer whole, float[] wholeValues, int start) => throughViews
+                ? View(whole, start)
+                : backend.AllocateBuffer(wholeValues.AsSpan(start).ToArray());
+            float[] pattern = Filled(rows * rowWidth);
+            using var qv = Block(xBuf, x, 0);
+            using var kv = Block(xBuf, x, w);
+            using var vv = Block(xBuf, x, 2 * w);
+            using var dqv = Block(gBuf, pattern, 0);
+            using var dkv = Block(gBuf, pattern, w);
+            using var dvv = Block(gBuf, pattern, 2 * w);
             fused.FusedAttentionForward(qv, kv, vv, oPacked, lsePacked, null, packed, d);
             fused.FusedAttentionBackward(qv, kv, vv, oPacked, dOBuf, lsePacked, null, dqv, dkv, dvv, packed, d, gBuf);
 
@@ -273,14 +285,30 @@ public sealed class FusedAttentionBackendParityTests
             float[] o = backend.DownloadBuffer(oDense), oP = backend.DownloadBuffer(oPacked);
             for (int i = 0; i < o.Length; i++) AssertClose(o[i], oP[i], $"{what} o[{i}]");
             float[] dq = backend.DownloadBuffer(dqDense), dk = backend.DownloadBuffer(dkDense), dv = backend.DownloadBuffer(dvDense);
-            float[] g = backend.DownloadBuffer(gBuf);
-            for (int r = 0; r < rows; r++)
-                for (int c = 0; c < w; c++)
+            if (throughViews)
+            {
+                float[] g = backend.DownloadBuffer(gBuf);
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < w; c++)
+                    {
+                        AssertClose(dq[r * w + c], g[r * rowWidth + c], $"{what} dq[{r},{c}]");
+                        AssertClose(dk[r * w + c], g[r * rowWidth + w + c], $"{what} dk[{r},{c}]");
+                        AssertClose(dv[r * w + c], g[r * rowWidth + 2 * w + c], $"{what} dv[{r},{c}]");
+                    }
+            }
+            else
+            {
+                foreach (var (name, expected, block) in new[] { ("dq", dq, dqv), ("dk", dk, dkv), ("dv", dv, dvv) })
                 {
-                    AssertClose(dq[r * w + c], g[r * rowWidth + c], $"{what} dq[{r},{c}]");
-                    AssertClose(dk[r * w + c], g[r * rowWidth + w + c], $"{what} dk[{r},{c}]");
-                    AssertClose(dv[r * w + c], g[r * rowWidth + 2 * w + c], $"{what} dv[{r},{c}]");
+                    float[] got = backend.DownloadBuffer(block);
+                    for (int i = 0; i < got.Length; i++)
+                    {
+                        int r = i / rowWidth, c = i % rowWidth;
+                        if (c < w) AssertClose(expected[r * w + c], got[i], $"{what} {name}[{r},{c}]");
+                        else Assert.True(got[i] == pattern[0], $"{what} {name}: wrote outside its columns at element {i}");
+                    }
                 }
+            }
         }
     }
 
@@ -295,7 +323,7 @@ public sealed class FusedAttentionBackendParityTests
         try
         {
             CpuParallelSettings.DeterministicReductions = deterministic;
-            CheckPacked(backend);
+            CheckPacked(backend, throughViews: true);
         }
         finally
         {
@@ -304,13 +332,14 @@ public sealed class FusedAttentionBackendParityTests
     }
 
     // The packed node runs on CUDA and HIP only (pointer-offset views); HIP runs the shared portable kernels, which this
-    // checks on OpenCL, whose sub-buffers take these offsets.
+    // checks on OpenCL. Not through sub-buffers: the three views of one buffer overlap, which OpenCL leaves undefined
+    // (see CheckPacked), so each block is a buffer of its own at the same strides.
     [SkippableFact]
     public void OpenCl_PackedAttention_MatchesTheDenseLayout()
     {
         using var backend = new OpenClBackend();
         Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
-        CheckPacked(backend);
+        CheckPacked(backend, throughViews: false);
     }
 
     [SkippableFact]
