@@ -363,6 +363,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (buffer.DetachForPool() is { } lease) _bufferPool.Return(lease);
     }
 
+    private static readonly bool s_memsetTrace = Environment.GetEnvironmentVariable("AIDN_MEMSET_TRACE") == "1"; // TEMP DIAG
+    private static readonly Dictionary<string, int> s_memsetSites = new(); // TEMP DIAG
+    private static void MemsetTraceNote() // TEMP DIAG
+    {
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var parts = new List<string>();
+        foreach (var f in frames)
+        {
+            var m = f.GetMethod();
+            if (m?.DeclaringType is not { } t) continue;
+            string n = t.FullName ?? t.Name;
+            if (n.Contains("CudaBackend") || n.StartsWith("System.") || m.Name.Contains("Allocat")) continue;
+            parts.Add(t.Name + "." + m.Name);
+            if (parts.Count == 4) break;
+        }
+        var key = string.Join(" < ", parts);
+        lock (s_memsetSites)
+        {
+            if (s_memsetSites.Count == 0)
+                AppDomain.CurrentDomain.ProcessExit += (_, _) => { foreach (var kv in s_memsetSites.OrderByDescending(e => e.Value).Take(30)) Console.Error.WriteLine($"[memset] {kv.Value,5} {kv.Key}"); };
+            s_memsetSites[key] = s_memsetSites.TryGetValue(key, out var c) ? c + 1 : 1;
+        }
+    }
+
     // The training-step arena (CudaStepArena), created on first use. Null outside a step, during a capture, and for
     // allocations a captured graph or another stream owns.
     private CudaStepArena? _stepArena;
@@ -1902,6 +1926,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public void FreeBufferDeferred(IGpuBuffer? buffer)
     {
         if (buffer == null) return;
+        if (buffer is CudaGpuBuffer released)
+        {
+            // A step arena slot is reused only by later work on this same stream: its lifetime ends here, in stream
+            // order, not when an event says the GPU has caught up (that would make the plan depend on GPU progress).
+            if (released.IsArenaSlot)
+            {
+                released.Dispose();
+                return;
+            }
+            // Recording: the logical end of this buffer's lifetime, for the same reason.
+            _stepArena?.OnReturned(released);
+        }
         // Stream-ordered buffers (#558 layer 6): cuMemFreeAsync is already ordered after prior stream
         // work, so free immediately — deferring via an event would delay pool reclamation and erase the
         // mid-step reuse that bounds peak. Disposing routes to cuMemFreeAsync (see CudaGpuBuffer.Release).
@@ -2144,6 +2180,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        if (s_memsetTrace && TrainingStep.Current == 4) MemsetTraceNote(); // TEMP DIAG
         var arena = StepArenaForThisAllocation();
         if (arena?.TryRent(size) is { } slot)
         {
@@ -14100,11 +14137,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
             return;
-        if (!_kernelCache.TryGetValue("max_axis", out var kernel))
+        // Long rows: a block per row (a thread per row read each row serially, uncoalesced: 7 ms for 600 rows of 49k).
+        bool rows = reduceSize >= 256 && _kernelCache.ContainsKey("max_axis_rows");
+        if (!_kernelCache.TryGetValue(rows ? "max_axis_rows" : "max_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: max_axis");
 
         using var _ = PushContext();
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = rows ? (uint)outerSize : (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
         void** args = stackalloc void*[4];
@@ -20639,6 +20678,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // the buffer only marks the slot dead; it never goes to the pool or the driver.
         private CudaStepArena.Block? _arenaBlock;
         private int _arenaSlot;
+
+        internal bool IsArenaSlot => _arenaBlock is not null;
 
         internal static CudaGpuBuffer ForArenaSlot(IntPtr context, IntPtr devicePtr, int size, CudaStepArena.Block block, int slot)
         {

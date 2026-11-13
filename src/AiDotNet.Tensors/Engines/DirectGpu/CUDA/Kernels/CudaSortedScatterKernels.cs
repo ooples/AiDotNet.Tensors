@@ -105,15 +105,20 @@ extern ""C"" __global__ __launch_bounds__(256) void sorted_scatter_place(
 }
 
 // starts[d] = the first sorted position whose key is >= d, for d in [0, destinations]: run d is
-// [starts[d], starts[d + 1]).
+// [starts[d], starts[d + 1]). One thread per destination, a binary search each: a thread per item filling the
+// destinations up to its key serialized every empty run on one thread (14 ms for ~600 items into 49k rows).
 extern ""C"" __global__ __launch_bounds__(256) void sorted_scatter_starts(
     const int* __restrict__ keys, int* __restrict__ starts, int count, int destinations)
 {
-    int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p > count) return;
-    int previous = p == 0 ? -1 : keys[p - 1];
-    int current = p == count ? destinations + 1 : keys[p];
-    for (int d = previous + 1; d <= current && d <= destinations; d++) starts[d] = p;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d > destinations) return;
+    int lo = 0, hi = count;
+    while (lo < hi)
+    {
+        int mid = (lo + hi) >> 1;
+        if (keys[mid] < d) lo = mid + 1; else hi = mid;
+    }
+    starts[d] = lo;
 }
 
 // out[d, f] = (accumulate ? out[d, f] : 0) + the sum of source rows sorted into run d, in increasing source order.

@@ -233,6 +233,10 @@ internal sealed class CompiledDelegateChain<T>
 
         // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
+        // On the GPU, the same for gradients: with sources named, an intermediate's gradient is dead once the step that
+        // consumes it returns, as PyTorch frees it when its refcount drops.
+        var gradientReleaser = gpuEngine is not null && sources is not null && !DifferentiableOps._isBackwardCreateGraph
+            ? new DeviceGradientReleaser<T>(_steps, _count, protectedStorages!, loss, sources, retainedTensors) : null;
         try
         {
             // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
@@ -291,6 +295,7 @@ internal sealed class CompiledDelegateChain<T>
                 }
 
                 recycler?.AfterStep(grads, step.Output, i);
+                gradientReleaser?.AfterStep(grads, step.Output, gpuEngine!);
                 if (gpuEngine is not null)
                     _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
             }
@@ -321,6 +326,56 @@ internal sealed class CompiledDelegateChain<T>
         }
 
         return grads;
+    }
+}
+
+/// <summary>
+/// Frees an intermediate's device gradient right after the backward step that consumes it, unless something else still
+/// holds its storage: another gradient (pass-through backwards and views alias), a forward value any step reads, the
+/// loss, a source or a retained tensor.
+/// </summary>
+internal sealed class DeviceGradientReleaser<T>
+{
+    private readonly HashSet<object> _kept;
+    private readonly HashSet<Tensor<T>> _repeated = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+    private readonly HashSet<object> _live = new(ReferenceEqualityComparer<object>.Instance);
+    private readonly HashSet<Tensor<T>> _keepKeys = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+    internal DeviceGradientReleaser(BackwardStep<T>[] steps, int count, HashSet<object> protectedStorages, Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources, IReadOnlyCollection<Tensor<T>>? retained)
+    {
+        _kept = new HashSet<object>(protectedStorages, ReferenceEqualityComparer<object>.Instance);
+        _keepKeys.Add(loss);
+        foreach (var source in sources) if (source is not null) _keepKeys.Add(source);
+        if (retained is not null) foreach (var tensor in retained) _keepKeys.Add(tensor);
+        var seen = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < count; i++)
+        {
+            ref var step = ref steps[i];
+            if (step.Output is { } output)
+            {
+                _kept.Add(output.StorageIdentity);
+                if (!seen.Add(output)) _repeated.Add(output);   // an in-place op recorded twice: an earlier step needs it
+            }
+            if (step.Inputs is { } inputs)
+                foreach (var input in inputs)
+                    if (input is not null) _kept.Add(input.StorageIdentity);
+            if (step.SavedState is { } saved)
+                foreach (var item in saved)
+                    if (item is Tensor<T> tensor) _kept.Add(tensor.StorageIdentity);
+        }
+    }
+
+    internal void AfterStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> consumed, DirectGpuTensorEngine engine)
+    {
+        if (_keepKeys.Contains(consumed) || _repeated.Contains(consumed) || !grads.TryGetValue(consumed, out var gradient) || gradient is null) return;
+        if (gradient.LazySource is not null || _kept.Contains(gradient.StorageIdentity)) return;
+        _live.Clear();
+        foreach (var pair in grads)
+            if (!ReferenceEquals(pair.Key, consumed) && pair.Value is not null) _live.Add(pair.Value.StorageIdentity);
+        if (_live.Contains(gradient.StorageIdentity)) return;
+        grads.Remove(consumed);
+        engine.ReleaseDeadDeviceStorage(gradient, afterQueuedWork: true);
     }
 }
 

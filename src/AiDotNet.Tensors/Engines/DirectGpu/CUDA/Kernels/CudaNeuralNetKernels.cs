@@ -994,6 +994,31 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     output[outer] = maxVal;
 }
 
+// max_axis for long rows: one block per row, coalesced strided reads and a shared-memory reduction. Same result as
+// max_axis: the row's first element if it is NaN, else the maximum of its non-NaN elements.
+extern ""C"" __global__ __launch_bounds__(256) void max_axis_rows(
+    const float* __restrict__ input, float* __restrict__ output, int outerSize, int axisSize)
+{
+    __shared__ float partial[256];
+    int outer = blockIdx.x;
+    if (outer >= outerSize) return;
+    const float* row = input + (long long)outer * axisSize;
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < axisSize; i += blockDim.x) m = fmaxf(m, row[i]);
+    partial[threadIdx.x] = m;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        float first = row[0];
+        output[outer] = isnan(first) ? first : partial[0];
+    }
+}
+
 // ===========================================================================
 // OPTIMIZER KERNELS
 // ===========================================================================
@@ -2931,6 +2956,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "argmax_axis",
                 "argmin_axis",
                 "max_axis",
+                "max_axis_rows",
                 // Optimizers
                 "sgd_step",
                 "adam_step",

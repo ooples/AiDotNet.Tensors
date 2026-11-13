@@ -13284,9 +13284,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var aB = GetOrAllocateBuffer(backend, inputs[3]);
             using var bB = GetOrAllocateBuffer(backend, inputs[4]);
             for (; allocated < 5; allocated++)
-                gradBuffers[allocated] = AllocateOutputBuffer(backend, allocated < 3 ? n : ng);
-            for (int i = 0; i < 5; i++)
-                backend.Fill(gradBuffers[i].Buffer, 0f, i < 3 ? n : ng);
+                gradBuffers[allocated] = AllocateFullyWrittenOutputBuffer(backend, allocated < 3 ? n : ng);
+            // No fill: the backend zeroes the gradients its atomic path accumulates into, and the deterministic path writes
+            // every element (poison-mode HreLm runs give the same loss with and without these fills).
             gdnBackend.GatedDeltaNetScanBackward(
                 dOut.Buffer, qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer,
                 gradBuffers[0].Buffer, gradBuffers[1].Buffer, gradBuffers[2].Buffer,
@@ -17102,8 +17102,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var gammaBuffer = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
-            using var outputBuffer = AllocateOutputBuffer(backend, input.Length);
-            using var saveRmsBuffer = AllocateOutputBuffer(backend, batchSize);
+            using var outputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            using var saveRmsBuffer = AllocateFullyWrittenOutputBuffer(backend, batchSize);
 
             backend.RmsNorm(inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, saveRmsBuffer.Buffer,
                 batchSize, normalizedSize, (float)epsilon);
@@ -17148,8 +17148,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var gammaBuffer = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
             using var saveRmsBuffer = GetOrAllocateBuffer(backend, rms);
-            var gradInputBuffer = AllocateOutputBuffer(backend, input.Length);
-            var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
+            var gradInputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            var gradGammaBuffer = AllocateFullyWrittenOutputBuffer(backend, normalizedSize);
             bool handedOff = false;
             try
             {
@@ -19803,8 +19803,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         bool sumTrailing = trailing > 1;
-        OwnedBuffer rowSums = sumTrailing ? AllocateOutputBuffer(backend, leading * kept) : default;
-        var output = AllocateOutputBuffer(backend, kept);
+        OwnedBuffer rowSums = sumTrailing ? AllocateFullyWrittenOutputBuffer(backend, leading * kept) : default;
+        var output = AllocateFullyWrittenOutputBuffer(backend, kept);
         bool handedOff = false;
         try
         {
@@ -22577,11 +22577,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var ownedG = GetOrAllocateBuffer(backend, gradOutput);
             using var ownedA = GetOrAllocateBuffer(backend, a);
             using var ownedB = GetOrAllocateBuffer(backend, b);
-            var bufOutA = AllocateOutputBuffer(backend, M * K);
+            var bufOutA = AllocateFullyWrittenOutputBuffer(backend, M * K);
             OwnedBuffer bufOutB;
             try
             {
-                bufOutB = AllocateOutputBuffer(backend, K * N);
+                bufOutB = AllocateFullyWrittenOutputBuffer(backend, K * N);
             }
             catch
             {
@@ -25397,8 +25397,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int outerSize = input.Length / normSize;
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
-            bufOut = AllocateOutputBuffer(backend, input.Length);
-            bufRms = AllocateOutputBuffer(backend, outerSize);
+            bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            bufRms = AllocateFullyWrittenOutputBuffer(backend, outerSize);
             backend.RmsNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufRms.Buffer,
                 outerSize, normSize, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
