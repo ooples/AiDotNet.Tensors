@@ -161,7 +161,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // DataVector is intentionally available to trusted engine code, but the returned
             // Vector is mutable. Attach the tensor owner's guard before exposing it so a direct
             // AsWritableSpan/indexer/in-place call cannot bypass streaming or COW safety.
-            _data.SetBeforeWriteGuard(EnsureDataVectorWriteAllowed);
+            _data.SetBeforeWriteGuard(this);
             // A traced value not yet computed: the raw vector would be uninitialized memory. Realize it as every
             // other host read does (and, in an inference trace, record that the forward escaped the graph).
             if (LazySource is ILazyNode node && !node.IsRealized)
@@ -3968,7 +3968,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>Validates mutations attempted through the trusted backing-vector accessor.</summary>
-    private void EnsureDataVectorWriteAllowed()
+    internal void EnsureDataVectorWriteAllowed()
     {
         EnsureStreamingStoreWritable();
         if (_cowFamily?.RequiresDetach == true)

@@ -455,8 +455,8 @@ public sealed unsafe partial class VulkanBackend
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Vulkan);
         var floatData = new float[data.Length];
-        for (int i = 0; i < data.Length; i++)
-            floatData[i] = Int32BitsToSingleCompat(data[i]);
+        if (data.Length > 0)
+            Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && floatData.Length > 0)

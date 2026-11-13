@@ -503,6 +503,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe bool TryStageUpload(IntPtr destination, float[] data, ulong byteSize)
     {
+        fixed (float* src = data)
+            return TryStageUploadBytes(destination, src, byteSize);
+    }
+
+    private unsafe bool TryStageUpload(IntPtr destination, int[] data, ulong byteSize)
+    {
+        fixed (int* src = data)
+            return TryStageUploadBytes(destination, src, byteSize);
+    }
+
+    private unsafe bool TryStageUploadBytes(IntPtr destination, void* src, ulong byteSize)
+    {
         if (_backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
             return false;
         int bytes = checked((int)byteSize);
@@ -524,8 +536,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var pinned = _pinnedPool.Rent(bytes);
         try
         {
-            fixed (float* src = data)
-                Buffer.MemoryCopy(src, (void*)pinned, bytes, bytes);
+            Buffer.MemoryCopy(src, (void*)pinned, bytes, bytes);
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemcpyHtoDAsync(destination, pinned, byteSize, _stream),
                 "cuMemcpyHtoDAsync(staged upload)");
@@ -1984,7 +1995,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
         // An event recorded on the capturing stream becomes a captured event that cuEventQuery rejects later. (Only
         // synchronously allocated buffers get here, and those cannot have been allocated inside a capture.)
-        if (TryDeferReleaseUntilCaptureEnds(allocatedDuringCapture: false, () => FreeBufferDeferred(buffer))) return;
+        if (IsCapturingOnThisThread && TryDeferReleaseUntilCaptureEnds(allocatedDuringCapture: false, () => FreeBufferDeferred(buffer))) return;
         CudaEvent evt;
         using (PushContext())
             evt = new CudaEvent(this, _defaultStream, enableTiming: false); // creates + records on the compute stream
@@ -2242,8 +2253,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             CuBlasNative.CheckCudaResult(
-                CuBlasNative.cuMemsetD32(pooled.Handle, 0, (ulong)size), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
-                "cuMemsetD32");
+                CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                "cuMemsetD32Async");
             return pooled;
         }
 
@@ -9921,8 +9932,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Cuda);
+        AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(int));
+        LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(int));
 
-        using var _ = PushContext();
         int size = data.Length;
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(data), "Buffer size must be positive.");
@@ -9931,6 +9943,61 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
         DrainFinalizedFreesBeforeAllocation();
+
+        using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var target = TryRentAsyncBuffer(size)
+                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            try
+            {
+                if (TryStageUpload(target.Handle, data, byteSize))
+                    return target;
+            }
+            catch
+            {
+                target.Dispose();
+                throw;
+            }
+
+            var pAsync = target.Handle;
+            try
+            {
+                unsafe
+                {
+                    fixed (int* src = data)
+                    {
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuMemcpyHtoDAsync(pAsync, (IntPtr)src, byteSize, _stream),
+                            "cuMemcpyHtoDAsync(int upload)");
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuStreamSynchronize(_stream),
+                            "cuStreamSynchronize(int upload)");
+                    }
+                }
+            }
+            catch
+            {
+                target.Dispose();
+                throw;
+            }
+            return target;
+        }
+
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null)
+        {
+            unsafe
+            {
+                fixed (int* src = data)
+                {
+                    CuBlasNative.CheckCudaResult(
+                        CuBlasNative.cuMemcpyHtoD(pooled.Handle, (IntPtr)src, byteSize),
+                        "cuMemcpyHtoD(int)");
+                }
+            }
+            return pooled;
+        }
 
         // The shared allocator reclaims and retries once on out-of-memory, then raises GpuOutOfMemoryException.
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
@@ -9953,7 +10020,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw;
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
     }
 
     #endregion
@@ -20689,6 +20756,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
     }
 
+    private static bool MayNeedCudaBufferDeferral(CaptureMemoryPool[]? pins, bool allocatedDuringCapture)
+        => (pins is { Length: > 0 })
+            || AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.IsActive
+            || (IsCapturingOnThisThread && !allocatedDuringCapture);
+
     private static bool TryDeferCudaBufferAction(
         CaptureMemoryPool[]? pins, bool allocatedDuringCapture, Action outerAction, Action coreAction)
     {
@@ -20818,13 +20890,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // #642: while a deferred-execution scope is recording/replaying, queue the free
             // until after the graph runs — the recorded op graph still references this buffer.
             // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
-            if (TryDeferCudaBufferAction(Volatile.Read(ref _capturePins), _allocatedDuringCapture, Release, ReleaseCore))
+            var pins = Volatile.Read(ref _capturePins);
+            if (MayNeedCudaBufferDeferral(pins, _allocatedDuringCapture)
+                && TryDeferCudaBufferAction(pins, _allocatedDuringCapture, Release, ReleaseCore))
                 return;
             ReleaseCore();
         }
 
         private void ReleaseCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, ReleaseCore)) return;
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
@@ -20890,13 +20968,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // scope finishes — returning to the pool mid-record could re-rent + overwrite a
             // buffer the recorded graph still reads. Runs normally once the gate is cleared.
             // A captured graph's memory goes back to no pool while the graph can replay (CaptureMemoryPool).
-            if (TryDeferCudaBufferAction(Volatile.Read(ref _capturePins), _allocatedDuringCapture, Dispose, DisposeCore))
+            var pins = Volatile.Read(ref _capturePins);
+            if (MayNeedCudaBufferDeferral(pins, _allocatedDuringCapture)
+                && TryDeferCudaBufferAction(pins, _allocatedDuringCapture, Dispose, DisposeCore))
                 return;
             DisposeCore();
         }
 
         private void DisposeCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
             if (_returnToPool == null || _capturedAllocation)
             {
                 ReleaseCore();
@@ -20986,14 +21070,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         public void Dispose()
         {
-            if (CaptureMemoryPool.TryDeferRelease(Volatile.Read(ref _capturePins), Dispose)) return;
+            var pins = Volatile.Read(ref _capturePins);
+            if (pins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(pins, Dispose)) return;
             // Then memory allocated before an open capture: its free must wait for the capture to end.
-            if (TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, DisposeCore)) return;
+            if (IsCapturingOnThisThread && !_allocatedDuringCapture && TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, DisposeCore)) return;
             DisposeCore();
         }
 
         private void DisposeCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
             // Atomically CLAIM the device pointer so a concurrent finalizer can't enqueue the SAME pointer
             // for a deferred free (double-free → uncatchable 0xC0000005 in DrainPendingFinalizerFrees).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);

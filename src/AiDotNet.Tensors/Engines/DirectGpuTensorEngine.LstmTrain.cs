@@ -219,7 +219,7 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         var backend = GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
-        var inputC = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+        var inputC = input.IsContiguous ? input : input.Contiguous();
         using var bufInput = GetOrAllocateBuffer(backend, inputC);
         using var bufWih = GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = GetOrAllocateBuffer(backend, wHh);
@@ -261,9 +261,9 @@ public partial class DirectGpuTensorEngine
         var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var input = inputs[0]; var wIh = inputs[1]; var wHh = inputs[2];
 
-        var gradOutC = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+        var gradOutC = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
         using var bufGradOut = gpu.GetOrAllocateBuffer(backend, gradOutC);
-        var inputC = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+        var inputC = input.IsContiguous ? input : input.Contiguous();
         using var bufInput = gpu.GetOrAllocateBuffer(backend, inputC);
         using var bufWih = gpu.GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = gpu.GetOrAllocateBuffer(backend, wHh);

@@ -227,7 +227,8 @@ public static class GradientCheckpointing<T>
                         // whose gradient w.r.t. reInput is, by the chain rule, exactly the VJP
                         //     d(pseudoLoss)/d(reInput) = (d(reOutput)/d(reInput))^T @ gradOutput
                         // needed even when the segment changes shape (AiDotNet#1341) or uses non-elementwise ops.
-                        var weighted = eng.TensorMultiply(reOutput, gradOutput);
+                        var gradOutputDetached = eng.StopGradient(gradOutput);
+                        var weighted = eng.TensorMultiply(reOutput, gradOutputDetached);
                         var pseudoLoss = eng.ReduceSum(weighted);
 
                         // Differentiate the recomputed segment w.r.t. the detached segment input and the
@@ -276,7 +277,10 @@ public static class GradientCheckpointing<T>
                         bool hasInputGrad = false;
                         foreach (var kvp in segGrads)
                         {
-                            if (ReferenceEquals(kvp.Key, gradOutput) || kvp.Value is null) continue;
+                            // The seed and its detached copy are leaves the unfiltered (sources: null) backward also reaches;
+                            // neither is a segment input or parameter, so their activation-sized gradients are dropped here.
+                            if (ReferenceEquals(kvp.Key, gradOutput) || ReferenceEquals(kvp.Key, gradOutputDetached)
+                                || kvp.Value is null) continue;
                             bool isSegmentInput = ReferenceEquals(kvp.Key, reInputDetached);
                             if (isSegmentInput)
                             {

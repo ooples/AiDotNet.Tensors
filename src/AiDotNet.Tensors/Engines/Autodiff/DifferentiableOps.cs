@@ -161,9 +161,11 @@ internal static class DifferentiableOps
     /// materialization — but the canonical path is sparse-only.
     /// </para>
     /// </remarks>
-    /// <summary>True when the current backward pass collects sparse embedding gradients for <paramref name="param"/>.</summary>
+    /// <summary>True when the current backward pass collects sparse embedding gradients for leaf <paramref name="param"/>.</summary>
     internal static bool IsSparseEmbeddingGradWired<T>(Tensor<T> param)
     {
+        if (param.GradFn is not null)
+            return false;
         int idx = param._gradIndex;
         return idx >= 0 && _indexedSparseGrads is not null && idx < _indexedSparseGrads.Length;
     }
@@ -171,6 +173,8 @@ internal static class DifferentiableOps
     internal static void AccumulateSparseEmbeddingGrad<T>(Tensor<T> param, SparseEmbeddingGradient<T> grad)
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
+        if (param.GradFn is not null)
+            return; // Non-leaf composed embedding tables propagate dense upstream gradients through the tape.
         int idx = param._gradIndex;
         if (idx < 0 || _indexedSparseGrads is null || idx >= _indexedSparseGrads.Length)
             return; // No sparse-grads array wired in — the dense fallback path is the caller's responsibility.
@@ -910,7 +914,7 @@ internal static class DifferentiableOps
         // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
         // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
         // in-place ops on aliased activations (that hijack threw CUDA-700). No-op for non-DirectGpu engines.
-        using var _gradAccumScope = (engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>())?.EnterGradAccumulation();
+        using var _gradAccumScope = AiDotNet.Tensors.Engines.DirectGpuTensorEngine.EnterGradAccumulation(engine);
         // FP32 accumulation is narrower than FP32 backward: only the addition which combines
         // fan-out contributions overrides autocast. The backward kernels that produced each
         // contribution retain their configured FP16/BF16/FP8 precision.
