@@ -41566,8 +41566,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 return TensorOuterProduct(tensors[0], tensors[1]);
             }
-            // Batched dot: bi,bi->b
-            if (normalized == "bi,bi->b")
+            // Batched dot: bi,bi->b. Half/BFloat16 take the generic path, which contracts in float32: this loop
+            // accumulates in T, where a Half running sum stops growing at 2048.
+            if (normalized == "bi,bi->b" && !IsLowPrecisionFloat<T>())
             {
                 int batch = tensors[0]._shape[0];
                 int n = tensors[0]._shape[1];

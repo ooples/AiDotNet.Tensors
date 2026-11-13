@@ -313,6 +313,14 @@ public class LowPrecisionAccumulationTests
         AssertAllHalf(K, _engine.TensorDot(HalfOnes(2, K), HalfOnes(K, 3), new[] { 1 }, new[] { 0 }).ToArray(), "TensorDot");
     }
 
+    [Fact]
+    public void Einsum_Half_BatchedDot_And_GeneralPath_InnerDim4096OfOnes_Are4096()
+    {
+        // "bi,bi->b" has its own fast path ahead of the generic contraction; both must accumulate in float32.
+        AssertAllHalf(K, _engine.TensorEinsum("bi,bi->b", HalfOnes(3, K), HalfOnes(3, K)).ToArray(), "einsum bi,bi->b");
+        AssertAllHalf(K, _engine.TensorEinsum("bi,bj->b", HalfOnes(2, 64), HalfOnes(2, 64)).ToArray(), "einsum bi,bj->b");
+    }
+
     // ---- Softmax and log-sum-exp denominators ----
 
     [Fact]
