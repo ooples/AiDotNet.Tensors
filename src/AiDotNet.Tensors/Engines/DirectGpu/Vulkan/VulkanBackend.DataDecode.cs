@@ -80,4 +80,8 @@ public sealed unsafe partial class VulkanBackend : IDataDecodeBackend
         int fields, int styleMask, float missingValue)
         => DataDecodeReady && PortableDataDecode.TryParse(LaunchDataDecode, words, bounds, output, status, fields, styleMask,
             missingValue);
+
+    bool IDataDecodeBackend.TryEncodeBytes(IGpuBuffer input, IGpuBuffer words, int count, NumericStorageType targetType,
+        bool littleEndian)
+        => DataDecodeReady && PortableDataDecode.TryEncode(LaunchDataDecode, input, words, count, targetType, littleEndian);
 }

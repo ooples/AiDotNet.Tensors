@@ -89,6 +89,19 @@ internal static class PortableDataDecode
         return true;
     }
 
+    internal static bool TryEncode(Launcher launch, IGpuBuffer input, IGpuBuffer words, int count,
+        NumericStorageType targetType, bool littleEndian)
+    {
+        int width;
+        try { width = targetType.GetByteWidth(); }
+        catch (ArgumentOutOfRangeException) { return false; }
+        if (count <= 0 || (long)count * width > int.MaxValue - 3) return false;
+        int nWords = (count * width + 3) / 4;
+        LaunchItems(launch, DataDecodeKernelTemplate.EncodeBytes, nWords, new[] { input, words },
+            new[] { nWords, count, (int)targetType, width, littleEndian ? 1 : 0, 0 });
+        return true;
+    }
+
     /// <summary>The bits of a float, net471-safe.</summary>
     internal static int SingleBits(float value)
     {

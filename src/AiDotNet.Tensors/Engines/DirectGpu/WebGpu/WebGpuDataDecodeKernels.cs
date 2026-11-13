@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // kernel is its own module whose entry point is named after the template's kernel.
 internal static class WebGpuDataDecodeKernels
 {
-    /// <summary>Words of every uniform struct (the largest kernel's five ints, padded to a 16-byte multiple).</summary>
+    /// <summary>Words of every uniform struct (the largest kernel's six ints, padded to a 16-byte multiple).</summary>
     internal const int UniformWords = 8;
 
     private const string Helpers = @"
@@ -481,6 +481,39 @@ fn dd_parse_fields(@builtin(global_invocation_id) gidv: vec3<u32>) {
 }
 ";
 
+    // The encode helpers (DataDecodeKernelTemplate's dd_f32_to_f16, dd_f32_to_f64_hi / _lo, dd_f32_to_int, dd_encode_lo /
+    // _hi), restated.
+    private static readonly string EncodeHelpers = KernelSourceResources.Read("DataDecode.encode_helpers.wgsl");
+
+    internal static readonly string EncodeBytes = TemplateConstants + @"
+struct Params { nWords: i32, nItems: i32, typeCode: i32, elemSize: i32, littleEndian: i32, firstItem: i32, pad0: i32, pad1: i32, }
+@group(0) @binding(0) var<storage, read> inBits: array<u32>;
+@group(0) @binding(1) var<storage, read_write> words: array<u32>;
+@group(0) @binding(2) var<uniform> pm: Params;
+" + Helpers + EncodeHelpers + @"
+@compute @workgroup_size(DD_GROUP)
+fn dd_encode_bytes(@builtin(global_invocation_id) gidv: vec3<u32>) {
+    let w = i32(gidv.x) + pm.firstItem;
+    if (w >= pm.nWords) { return; }
+    let total = pm.nItems * pm.elemSize;
+    var word = 0u;
+    for (var k = 0; k < 4; k = k + 1) {
+        let q = w * 4 + k;
+        if (q < total) {
+            let el = q / pm.elemSize;
+            var j = q - el * pm.elemSize;
+            if (pm.littleEndian == 0) { j = pm.elemSize - 1 - j; }
+            let f = inBits[el];
+            var b = 0u;
+            if (j < 4) { b = (dd_encode_lo(f, pm.typeCode) >> u32(j * 8)) & 255u; }
+            else { b = (dd_encode_hi(f, pm.typeCode) >> u32((j - 4) * 8)) & 255u; }
+            word = word | (b << u32(k * 8));
+        }
+    }
+    words[w] = word;
+}
+";
+
     private static readonly System.Collections.Generic.Dictionary<string, string> Sources = new()
     {
         [DataDecodeKernelTemplate.Decode] = Decode,
@@ -488,6 +521,7 @@ fn dd_parse_fields(@builtin(global_invocation_id) gidv: vec3<u32>) {
         [DataDecodeKernelTemplate.Scan] = Scan,
         [DataDecodeKernelTemplate.ScatterBounds] = ScatterBounds,
         [DataDecodeKernelTemplate.ParseFields] = ParseFields,
+        [DataDecodeKernelTemplate.EncodeBytes] = EncodeBytes,
     };
 
     /// <summary>The WGSL module for one kernel name, its entry point named after the kernel.</summary>
