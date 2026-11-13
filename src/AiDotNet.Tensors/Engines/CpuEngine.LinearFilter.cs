@@ -41,7 +41,7 @@ public partial class CpuEngine
 
     internal static void ValidateGuard(double maxAbs)
     {
-        if (!(maxAbs >= 0.0))
+        if (double.IsNaN(maxAbs) || maxAbs < 0.0)
             throw new ArgumentOutOfRangeException(nameof(maxAbs), maxAbs, "The guard bound must be non-negative (positive infinity: no clamp).");
     }
 
@@ -146,7 +146,8 @@ public partial class CpuEngine
         if (DifferentiableOps.IsGradientRequired(x))
             DifferentiableOps.AccumulateGrad(grads, x, engine.TensorFlip(engine.TensorLinearFilter(b, a, flipped), time), engine);
         bool needB = DifferentiableOps.IsGradientRequired(b), needA = DifferentiableOps.IsGradientRequired(a);
-        bool needZi = zi is not null && DifferentiableOps.IsGradientRequired(zi);
+        var ziNeedingGrad = zi is not null && DifferentiableOps.IsGradientRequired(zi) ? zi : null;
+        bool needZi = ziNeedingGrad is not null;
         if (!needB && !needA && !needZi) return;
         var ops = MathHelper.GetNumericOperations<T>();
         var one = new Tensor<T>(new[] { ops.One }, new[] { 1 });
@@ -168,21 +169,21 @@ public partial class CpuEngine
             }
             DifferentiableOps.AccumulateGrad(grads, a, da, engine);
         }
-        if (needZi && zi is not null)
+        if (ziNeedingGrad is not null)
         {
-            int states = zi._shape[axis];
+            int states = ziNeedingGrad._shape[axis];
             int m = Math.Min(states, length);
             var q = engine.TensorFlip(engine.TensorLinearFilter(engine.TensorNarrow(a, 0, 0, 1), a, flipped), time);
             Tensor<T> dzi;
             if (m == states) dzi = engine.TensorNarrow(q, axis, 0, m);
             else
             {
-                var padShape = (int[])zi._shape.Clone();
+                var padShape = (int[])ziNeedingGrad._shape.Clone();
                 padShape[axis] = states - m;
                 var pad = new Tensor<T>(padShape);
                 dzi = m == 0 ? pad : engine.TensorConcatenate(new[] { engine.TensorNarrow(q, axis, 0, m), pad }, axis);
             }
-            DifferentiableOps.AccumulateGrad(grads, zi, dzi, engine);
+            DifferentiableOps.AccumulateGrad(grads, ziNeedingGrad, dzi, engine);
         }
     }
 

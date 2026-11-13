@@ -96,6 +96,7 @@ public partial class DirectGpuTensorEngine
         ValidateVariant(variant);
         ValidateClampBounds(low, high);
         if (typeof(T) != typeof(float) || count == 0 || (long)count * 2 > int.MaxValue / 2
+            || !AffineFitsInFloat(mean, stdDev)
             || !TryGetTransformBackend("TruncatedNormalFromRng", out var backend, out var transforms))
             return base.TensorTruncatedNormalFromRng<T>(generator, shape, variant, mean, stdDev, low, high);
 
@@ -120,6 +121,15 @@ public partial class DirectGpuTensorEngine
             uv.DisposeAfterQueuedUse(backend);
         }
     }
+
+    // The largest Box-Muller radius any positive double u1 can give: sqrt(-2 ln 2^-1074) = 38.6...
+    private const double MaxBoxMullerRadius = 38.7;
+
+    // Whether the kernel's float mean + stdDev * z stays finite for every finite z the host could produce. A mean or
+    // stdDev past float range (1e40 casts to +inf, and +inf + -inf is NaN) would leave the double host result behind,
+    // so those draw on the host, before any uniform is consumed.
+    private static bool AffineFitsInFloat(double mean, double stdDev) =>
+        Math.Abs(mean) + Math.Abs(stdDev) * MaxBoxMullerRadius <= float.MaxValue;
 
     /// <inheritdoc/>
     public override Tensor<T> TensorGammaFromRng<T>(Random generator, double shape, Tensor<T> scale, BoxMullerVariant normal)
@@ -364,6 +374,8 @@ public partial class DirectGpuTensorEngine
         }
 
         int k = deviceIds.Length;
+        // A source sharing the table's storage would hand the kernel the buffer it writes: parallel row copies race.
+        source = SnapshotIfAliased(table, source);
         using var sourceBuffer = GetOrAllocateBuffer(backend, source);
         var idBuffer = new OwnedBuffer(backend.AllocateBuffer(deviceIds), ownsBuffer: true);
         try
@@ -433,6 +445,13 @@ public partial class DirectGpuTensorEngine
         }
         var result = DeferTensorResult<T>(backend, yB.Buffer, signals * length, (int[])x._shape.Clone());
         yB.RelinquishOwnership();
+        // The queued filter still reads the scratch and the uploaded inputs: release them in queue order (each
+        // `using` above then finds nothing left to own). A refused launch queued nothing, so it disposes at once.
+        work.DisposeAfterQueuedUse(backend);
+        xB.DisposeAfterQueuedUse(backend);
+        bB.DisposeAfterQueuedUse(backend);
+        aB.DisposeAfterQueuedUse(backend);
+        ziB?.DisposeAfterQueuedUse(backend);
         return result;
     }
 }

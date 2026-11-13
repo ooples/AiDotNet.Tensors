@@ -121,6 +121,7 @@ public sealed class SweepDataOpsTests
         var a = RandomHelper.CreateSeededRandom(5);
         var b = RandomHelper.CreateSeededRandom(5);
         var f = Cpu.TensorNormalBoxMullerFromRng<float>(a, new[] { 100 }, MetaLearner, -1.0, 0.5).ToArray();
+        Assert.Equal(100, f.Length);
         for (int i = 0; i < f.Length; i++) Assert.Equal((float)MetaLearnerSampleNormal(b, -1.0, 0.5), f[i]);
     }
 
@@ -337,6 +338,101 @@ public sealed class SweepDataOpsTests
                 NumericStorageType.Float32, new[] { 257 }, le).ToArray());
         Assert.Equal(values, Cpu.TensorFromBytes<float>(Cpu.TensorToBytes(t, NumericStorageType.Float64),
             NumericStorageType.Float64, new[] { 257 }).ToArray());
+    }
+
+    [Fact]
+    public void ToBytes_ULong_KeepsEveryBitBelow2To63_AndSaturatesAbove_InBothByteOrders()
+    {
+        var t = new Tensor<ulong>(new[] { 9007199254740993UL, ulong.MaxValue, 5UL }, new[] { 3 });
+        foreach (bool le in new[] { true, false })
+        {
+            var bytes = Cpu.TensorToBytes(t, NumericStorageType.Int64, le);
+            var decoded = Enumerable.Range(0, 3).Select(i =>
+            {
+                var slot = bytes.Skip(8 * i).Take(8).ToArray();
+                if (le != BitConverter.IsLittleEndian) Array.Reverse(slot);
+                return BitConverter.ToInt64(slot, 0);
+            }).ToArray();
+            Assert.Equal(new[] { 9007199254740993L, long.MaxValue, 5L }, decoded);
+        }
+        // Above long's range a floating target rounds once from the exact value: 2^64 - 1 -> 2^64.
+        var f64 = Cpu.TensorToBytes(t, NumericStorageType.Float64);
+        Assert.Equal(18446744073709551616.0, BitConverter.ToDouble(f64, 8));
+    }
+
+    [Fact]
+    public void ToBytes_NarrowIntegers_AreExact()
+    {
+        var shorts = new Tensor<short>(new short[] { short.MinValue, -1, short.MaxValue }, new[] { 3 });
+        var bytes = Cpu.TensorToBytes(shorts, NumericStorageType.Int32);
+        Assert.Equal(new[] { (int)short.MinValue, -1, (int)short.MaxValue },
+            Enumerable.Range(0, 3).Select(i => BitConverter.ToInt32(bytes, 4 * i)).ToArray());
+        var uints = new Tensor<uint>(new[] { uint.MaxValue, 0u }, new[] { 2 });
+        var wide = Cpu.TensorToBytes(uints, NumericStorageType.Int64);
+        Assert.Equal(new[] { (long)uint.MaxValue, 0L }, Enumerable.Range(0, 2).Select(i => BitConverter.ToInt64(wide, 8 * i)).ToArray());
+    }
+
+    [Fact]
+    public void Cast_DecimalToLong_RoundsInDecimal_AndStoresExactly()
+    {
+        var x = new Tensor<decimal>(new[] { 9007199254740993m, (decimal)long.MaxValue, 2.5m, -2.5m }, new[] { 4 });
+        Assert.Equal(new[] { 9007199254740993L, long.MaxValue, 2L, -2L },
+            Cpu.TensorCast<decimal, long>(x, RoundingMode.TowardZero, CastOverflowBehavior.Throw).ToArray());
+        Assert.Equal(new[] { 9007199254740993L, long.MaxValue, 2L, -2L },
+            Cpu.TensorCast<decimal, long>(x, RoundingMode.ToNearestEven, CastOverflowBehavior.Throw).ToArray());
+        Assert.Equal(new[] { 9007199254740993L, long.MaxValue, 3L, -3L },
+            Cpu.TensorCast<decimal, long>(x, RoundingMode.ToNearestAwayFromZero, CastOverflowBehavior.Throw).ToArray());
+        Assert.Equal(new[] { 9007199254740993L, long.MaxValue, 2L, -3L },
+            Cpu.TensorCast<decimal, long>(x, RoundingMode.TowardNegativeInfinity, CastOverflowBehavior.Throw).ToArray());
+        Assert.Equal(new[] { 9007199254740993L, long.MaxValue, 3L, -2L },
+            Cpu.TensorCast<decimal, long>(x, RoundingMode.TowardPositiveInfinity, CastOverflowBehavior.Throw).ToArray());
+    }
+
+    [Fact]
+    public void Cast_LongToDecimal_IsExact()
+    {
+        var x = new Tensor<long>(new[] { 1000000000000001L, long.MaxValue, long.MinValue }, new[] { 3 });
+        Assert.Equal(new[] { 1000000000000001m, (decimal)long.MaxValue, (decimal)long.MinValue },
+            Cpu.TensorCast<long, decimal>(x).ToArray());
+    }
+
+    [Theory]
+    [InlineData(-1.0)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    public void Gamma_InvalidScale_ThrowsBeforeAnyDraw(double bad)
+    {
+        var scales = new[] { 1.0, 2.0, bad };
+        var a = RandomHelper.CreateSeededRandom(8);
+        var b = RandomHelper.CreateSeededRandom(8);
+        Assert.Throws<ArgumentOutOfRangeException>(() => Cpu.TensorGammaFromRng(a, 2.0, D(scales, 3), Horseshoe));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            Cpu.TensorGammaFromRng(a, D(new[] { 2.0, 2.0, 2.0 }, 3), D(scales, 3), Horseshoe));
+        Assert.Equal(b.NextDouble(), a.NextDouble());
+    }
+
+    [Fact]
+    public void Gamma_ZeroScale_DrawsZero()
+    {
+        var drawn = Cpu.TensorGammaFromRng(RandomHelper.CreateSeededRandom(9), 2.0, D(new[] { 0.0, 0.0 }, 2), Horseshoe).ToArray();
+        Assert.Equal(new[] { 0.0, 0.0 }, drawn);
+    }
+
+    [Theory]
+    [InlineData(2.0)]
+    [InlineData(1.0000001)]
+    public void BoxMullerVariant_FloorAboveOne_IsRejected(double floor)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new BoxMullerVariant(BoxMullerFirstUniform.Raw, floor, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine));
+    }
+
+    [Fact]
+    public void ScatterRows_SourceAliasingTheTable_PermutesTheOriginalRows()
+    {
+        var table = new Tensor<double>(new[] { 10.0, 11.0, 20.0, 21.0 }, new[] { 2, 2 });
+        Cpu.TensorScatterRowsInPlace(table, new Tensor<long>(new[] { 1L, 0L }, new[] { 2 }), table);
+        Assert.Equal(new[] { 20.0, 21.0, 10.0, 11.0 }, table.ToArray());
     }
 
     // ------------------------------------------------------------------ TensorCast
