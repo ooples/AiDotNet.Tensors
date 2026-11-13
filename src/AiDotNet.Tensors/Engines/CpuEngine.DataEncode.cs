@@ -305,32 +305,32 @@ public partial class CpuEngine
                 return;
             }
         }
-        switch (destination)
-        {
-            case int[] a: a[i] = (int)rounded; break;
-            case long[] a: a[i] = (long)rounded; break;
-            case short[] a: a[i] = (short)rounded; break;
-            case sbyte[] a: a[i] = (sbyte)rounded; break;
-            case byte[] a: a[i] = (byte)rounded; break;
-            case ushort[] a: a[i] = (ushort)rounded; break;
-            case uint[] a: a[i] = (uint)rounded; break;
-            case ulong[] a: a[i] = (ulong)rounded; break;
-        }
+        // Dispatch on TOut itself, not on the array: the CLR lets a byte[] pass as sbyte[] (and ushort[] as short[],
+        // uint[] as int[], ulong[] as long[]), so an array type pattern can pick the wrong conversion.
+        object array = destination;
+        if (typeof(TOut) == typeof(int)) ((int[])array)[i] = (int)rounded;
+        else if (typeof(TOut) == typeof(long)) ((long[])array)[i] = (long)rounded;
+        else if (typeof(TOut) == typeof(short)) ((short[])array)[i] = (short)rounded;
+        else if (typeof(TOut) == typeof(sbyte)) ((sbyte[])array)[i] = (sbyte)rounded;
+        else if (typeof(TOut) == typeof(byte)) ((byte[])array)[i] = (byte)rounded;
+        else if (typeof(TOut) == typeof(ushort)) ((ushort[])array)[i] = (ushort)rounded;
+        else if (typeof(TOut) == typeof(uint)) ((uint[])array)[i] = (uint)rounded;
+        else if (typeof(TOut) == typeof(ulong)) ((ulong[])array)[i] = (ulong)rounded;
     }
 
     private static void StoreMax<TOut>(TOut[] destination, int i)
     {
-        switch (destination)
-        {
-            case int[] a: a[i] = int.MaxValue; break;
-            case long[] a: a[i] = long.MaxValue; break;
-            case short[] a: a[i] = short.MaxValue; break;
-            case sbyte[] a: a[i] = sbyte.MaxValue; break;
-            case byte[] a: a[i] = byte.MaxValue; break;
-            case ushort[] a: a[i] = ushort.MaxValue; break;
-            case uint[] a: a[i] = uint.MaxValue; break;
-            case ulong[] a: a[i] = ulong.MaxValue; break;
-        }
+        // Dispatch on TOut itself, not on the array: the CLR lets a byte[] pass as sbyte[] (and ushort[] as short[],
+        // uint[] as int[], ulong[] as long[]), so an array type pattern can pick the wrong conversion.
+        object array = destination;
+        if (typeof(TOut) == typeof(int)) ((int[])array)[i] = int.MaxValue;
+        else if (typeof(TOut) == typeof(long)) ((long[])array)[i] = long.MaxValue;
+        else if (typeof(TOut) == typeof(short)) ((short[])array)[i] = short.MaxValue;
+        else if (typeof(TOut) == typeof(sbyte)) ((sbyte[])array)[i] = sbyte.MaxValue;
+        else if (typeof(TOut) == typeof(byte)) ((byte[])array)[i] = byte.MaxValue;
+        else if (typeof(TOut) == typeof(ushort)) ((ushort[])array)[i] = ushort.MaxValue;
+        else if (typeof(TOut) == typeof(uint)) ((uint[])array)[i] = uint.MaxValue;
+        else if (typeof(TOut) == typeof(ulong)) ((ulong[])array)[i] = ulong.MaxValue;
     }
 
     private static void StoreInteger<TOut>(TOut[] destination, int i, decimal value, CastOverflowBehavior overflow)
@@ -345,17 +345,17 @@ public partial class CpuEngine
                 throw new OverflowException($"{value.ToString(CultureInfo.InvariantCulture)} is outside the range of {typeof(TOut).Name}.");
             value = value < min ? min : max;
         }
-        switch (destination)
-        {
-            case int[] a: a[i] = (int)value; break;
-            case long[] a: a[i] = (long)value; break;
-            case short[] a: a[i] = (short)value; break;
-            case sbyte[] a: a[i] = (sbyte)value; break;
-            case byte[] a: a[i] = (byte)value; break;
-            case ushort[] a: a[i] = (ushort)value; break;
-            case uint[] a: a[i] = (uint)value; break;
-            case ulong[] a: a[i] = (ulong)value; break;
-        }
+        // Dispatch on TOut itself, not on the array: the CLR lets a byte[] pass as sbyte[] (and ushort[] as short[],
+        // uint[] as int[], ulong[] as long[]), so an array type pattern can pick the wrong conversion.
+        object array = destination;
+        if (typeof(TOut) == typeof(int)) ((int[])array)[i] = (int)value;
+        else if (typeof(TOut) == typeof(long)) ((long[])array)[i] = (long)value;
+        else if (typeof(TOut) == typeof(short)) ((short[])array)[i] = (short)value;
+        else if (typeof(TOut) == typeof(sbyte)) ((sbyte[])array)[i] = (sbyte)value;
+        else if (typeof(TOut) == typeof(byte)) ((byte[])array)[i] = (byte)value;
+        else if (typeof(TOut) == typeof(ushort)) ((ushort[])array)[i] = (ushort)value;
+        else if (typeof(TOut) == typeof(uint)) ((uint[])array)[i] = (uint)value;
+        else if (typeof(TOut) == typeof(ulong)) ((ulong[])array)[i] = (ulong)value;
     }
 
     /// <summary>A conversion into a non-integral type: the source type's own float / Half / double conversion, otherwise
