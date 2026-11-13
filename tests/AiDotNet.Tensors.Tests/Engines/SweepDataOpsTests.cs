@@ -276,7 +276,7 @@ public sealed class SweepDataOpsTests
             var bytes = BitConverter.GetBytes(values[i]);
             if (!BitConverter.IsLittleEndian) Array.Reverse(bytes);
             Assert.Equal(bytes, le.Skip(8 * i).Take(8).ToArray());
-            Assert.Equal(bytes.Reverse().ToArray(), be.Skip(8 * i).Take(8).ToArray());
+            Assert.Equal(Enumerable.Reverse(bytes).ToArray(), be.Skip(8 * i).Take(8).ToArray());
         }
     }
 
