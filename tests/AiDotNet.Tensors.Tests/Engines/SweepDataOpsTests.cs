@@ -435,6 +435,56 @@ public sealed class SweepDataOpsTests
         Assert.Equal(new[] { 20.0, 21.0, 10.0, 11.0 }, table.ToArray());
     }
 
+    [Fact]
+    public void ToBytes_Decimal_TruncatesInDecimal()
+    {
+        var x = new Tensor<decimal>(new[] { 1.9999999999999999m, -1.9999999999999999m, 9007199254740993m }, new[] { 3 });
+        Assert.Equal(new[] { (sbyte)1, (sbyte)-1, sbyte.MaxValue },
+            Cpu.TensorToBytes(x, NumericStorageType.Int8).Select(b => (sbyte)b).ToArray());
+        var i64 = Cpu.TensorToBytes(x, NumericStorageType.Int64);
+        Assert.Equal(9007199254740993L, BitConverter.ToInt64(i64, 16));
+    }
+
+    [Fact]
+    public void ToBytes_ULongToFloat32_RoundsOnce()
+    {
+        // 2^63 + 2^39 + 1 is just above the float32 midpoint 2^63 + 2^39: nearest is 0x5F000001, not 0x5F000000.
+        ulong v = (1UL << 63) + (1UL << 39) + 1;
+        var bytes = Cpu.TensorToBytes(new Tensor<ulong>(new[] { v }, new[] { 1 }), NumericStorageType.Float32);
+        Assert.Equal(0x5F000001u, BitConverter.ToUInt32(bytes, 0));
+    }
+
+    [Fact]
+    public void Cast_FloatingIdentity_PassesTheGradient()
+    {
+        var x = new Tensor<float>(new[] { 1.5f, -2f, 3f }, new[] { 3 });
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+        var y = Cpu.TensorCast<float, float>(x);
+        var loss = Cpu.ReduceSum(Cpu.TensorMultiply(x, y), null);
+        var grads = tape.ComputeGradients(loss, new[] { x });
+        // d/dx sum(x * x) = 2x: both paths, the direct one and the one through the cast.
+        Assert.Equal(new[] { 3f, -4f, 6f }, grads[x].ToArray());
+    }
+
+    [Fact]
+    public void Gamma_ShapeBelowOne_HugeScale_AppliesTheBoostBeforeOverflowing()
+    {
+        var variant = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine);
+        var draws = new[] { 0.1, 0.5, 0.0, 0.1 };
+        double unit = Cpu.TensorGammaFromRng(new SequenceRandom(draws), 0.5, D(new[] { 1.0 }, 1), variant).ToArray()[0];
+        double huge = Cpu.TensorGammaFromRng(new SequenceRandom(draws), 0.5, D(new[] { 1e308 }, 1), variant).ToArray()[0];
+        Assert.False(double.IsInfinity(huge));
+        Assert.Equal(unit * 1e308, huge);
+    }
+
+    [Fact]
+    public void ScatterRows_IntoABroadcastView_IsRejected()
+    {
+        var expanded = new Tensor<double>(new[] { 1.0 }, new[] { 1, 1 }).ExpandTo(new[] { 2, 1 });
+        Assert.Throws<InvalidOperationException>(() => Cpu.TensorScatterRowsInPlace(expanded,
+            new Tensor<long>(new[] { 0L }, new[] { 1 }), new Tensor<double>(new[] { 7.0 }, new[] { 1, 1 })));
+    }
+
     // ------------------------------------------------------------------ TensorCast
 
     [Fact]

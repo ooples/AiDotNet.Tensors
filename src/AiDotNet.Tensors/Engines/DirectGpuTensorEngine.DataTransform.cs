@@ -167,7 +167,7 @@ public partial class DirectGpuTensorEngine
             return base.TensorBernoulliFromRng(generator, probabilities, successWhen);
 
         var draws = DrawUniforms(generator, count);
-        using var thresholds = GetOrAllocateBuffer(backend, probabilities);
+        using var thresholds = new QueuedLease(backend, GetOrAllocateBuffer(backend, probabilities));
         var result = ThresholdOnDevice<T>(backend, transforms, draws, thresholds.Buffer, 0f,
             successWhen == UniformDrawComparison.DrawAboveThreshold, 1f, 0f, probabilities._shape);
         if (result is not null) return result;
@@ -221,6 +221,25 @@ public partial class DirectGpuTensorEngine
 
     // Whether the tensor's values are already on the device: a host tensor is encoded / cast on the host, where an
     // upload would only be read back.
+    // An owned input lease or scratch buffer that queued kernels read: released only after that queued work, since
+    // CUDA's legacy allocator frees at once and a pooled buffer is reissued at once. (Deferring a release when the
+    // launch was refused and nothing was queued is harmless.)
+    private readonly struct QueuedLease : IDisposable
+    {
+        private readonly IDirectGpuBackend _backend;
+        private readonly OwnedBuffer _owned;
+
+        public QueuedLease(IDirectGpuBackend backend, OwnedBuffer owned)
+        {
+            _backend = backend;
+            _owned = owned;
+        }
+
+        public IGpuBuffer Buffer => _owned.Buffer;
+
+        public void Dispose() => _owned.DisposeAfterQueuedUse(_backend);
+    }
+
     private static bool IsOnDevice<T>(Tensor<T> tensor) => tensor.IsGpuResident || tensor.HasPendingGpuData;
 
     /// <inheritdoc/>
@@ -243,7 +262,7 @@ public partial class DirectGpuTensorEngine
 
         int byteCount = count * width;
         int nWords = (byteCount + 3) / 4;
-        using var source = GetOrAllocateBuffer(backend, input);
+        using var source = new QueuedLease(backend, GetOrAllocateBuffer(backend, input));
         var words = new OwnedBuffer(backend.AllocateIntBuffer(nWords), ownsBuffer: true);
         try
         {
@@ -278,8 +297,8 @@ public partial class DirectGpuTensorEngine
             return base.TensorCast<TIn, TOut>(input, mode, overflow);
 
         var (min, maxExclusive) = IntegralRange(typeof(TOut));
-        using var source = GetOrAllocateBuffer(backend, input);
-        using var rounded = AllocateTransientScratch(backend, count, fullyWritten: true);
+        using var source = new QueuedLease(backend, GetOrAllocateBuffer(backend, input));
+        using var rounded = new QueuedLease(backend, AllocateTransientScratch(backend, count, fullyWritten: true));
         if (!transforms.TryRoundIntegral(source.Buffer, rounded.Buffer, count, mode, (float)min, (float)maxExclusive))
         {
             GpuLaunchProbe.OnFallback("TensorCast", null);
@@ -330,7 +349,7 @@ public partial class DirectGpuTensorEngine
         }
 
         int count = ids.Length * rowSize;
-        using var tableBuffer = GetOrAllocateBuffer(backend, table);
+        using var tableBuffer = new QueuedLease(backend, GetOrAllocateBuffer(backend, table));
         var idBuffer = new OwnedBuffer(backend.AllocateBuffer(deviceIds), ownsBuffer: true);
         try
         {
@@ -376,7 +395,7 @@ public partial class DirectGpuTensorEngine
         int k = deviceIds.Length;
         // A source sharing the table's storage would hand the kernel the buffer it writes: parallel row copies race.
         source = SnapshotIfAliased(table, source);
-        using var sourceBuffer = GetOrAllocateBuffer(backend, source);
+        using var sourceBuffer = new QueuedLease(backend, GetOrAllocateBuffer(backend, source));
         var idBuffer = new OwnedBuffer(backend.AllocateBuffer(deviceIds), ownsBuffer: true);
         try
         {
@@ -430,11 +449,11 @@ public partial class DirectGpuTensorEngine
         if (a0 == 0.0 || double.IsNaN(a0)) return null;
         if (!TryGetTransformBackend("LinearFilter", out var backend, out var transforms)) return null;
 
-        using var xB = GetOrAllocateBuffer(backend, x);
-        using var bB = GetOrAllocateBuffer(backend, b);
-        using var aB = GetOrAllocateBuffer(backend, a);
+        using var xB = new QueuedLease(backend, GetOrAllocateBuffer(backend, x));
+        using var bB = new QueuedLease(backend, GetOrAllocateBuffer(backend, b));
+        using var aB = new QueuedLease(backend, GetOrAllocateBuffer(backend, a));
         using var ziB = zi is not null && order > 1 ? GetOrAllocateBuffer(backend, zi) : (OwnedBuffer?)null;
-        using var work = AllocateTransientScratch(backend, Math.Max(1, signals * (order - 1)), fullyWritten: true);
+        using var work = new QueuedLease(backend, AllocateTransientScratch(backend, Math.Max(1, signals * (order - 1)), fullyWritten: true));
         using var yB = AllocateFullyWrittenOutputBuffer(backend, signals * length);
         float bound = double.IsPositiveInfinity(maxAbs) ? float.PositiveInfinity : (float)maxAbs;
         if (!transforms.TryLinearFilter(xB.Buffer, bB.Buffer, aB.Buffer, ziB?.Buffer, yB.Buffer, work.Buffer, signals, length,
@@ -445,12 +464,7 @@ public partial class DirectGpuTensorEngine
         }
         var result = DeferTensorResult<T>(backend, yB.Buffer, signals * length, (int[])x._shape.Clone());
         yB.RelinquishOwnership();
-        // The queued filter still reads the scratch and the uploaded inputs: release them in queue order (each
-        // `using` above then finds nothing left to own). A refused launch queued nothing, so it disposes at once.
-        work.DisposeAfterQueuedUse(backend);
-        xB.DisposeAfterQueuedUse(backend);
-        bB.DisposeAfterQueuedUse(backend);
-        aB.DisposeAfterQueuedUse(backend);
+        // The optional zi upload is read by the queued filter too: released in queue order.
         ziB?.DisposeAfterQueuedUse(backend);
         return result;
     }

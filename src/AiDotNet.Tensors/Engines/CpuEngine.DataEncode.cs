@@ -1,6 +1,7 @@
 using System;
 using System.Buffers.Binary;
 using System.Globalization;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -33,6 +34,8 @@ public partial class CpuEngine
         else if (input is Tensor<long> longs) EncodeIntegers(ReadAll(longs), bytes, targetType, littleEndian);
         else if (input is Tensor<int> ints) EncodeIntegers(Widen(ReadAll(ints)), bytes, targetType, littleEndian);
         else if (input is Tensor<ulong> ulongs) EncodeUnsigned(ReadAll(ulongs), bytes, targetType, littleEndian);
+        else if (input is Tensor<decimal> decimals && !IsFloatingStorage(targetType))
+            EncodeIntegers(TruncateDecimals(ReadAll(decimals)), bytes, targetType, littleEndian);
         else if (IsIntegral(typeof(T))) EncodeIntegers(WidenIntegral(ReadAll(input)), bytes, targetType, littleEndian);
         else EncodeDoubles(RoIAlignPlan.ToDoubles(input), bytes, targetType, littleEndian);
         return bytes;
@@ -64,6 +67,22 @@ public partial class CpuEngine
         return result;
     }
 
+    private static bool IsFloatingStorage(NumericStorageType type) =>
+        type == NumericStorageType.Float64 || type == NumericStorageType.Float32 || type == NumericStorageType.Float16;
+
+    // Decimal values truncated toward zero in decimal arithmetic (1.9999999999999999m is 1, where a double would read
+    // 2.0), then clamped to long's range; EncodeInteger saturates each to the narrower target.
+    private static long[] TruncateDecimals(decimal[] values)
+    {
+        var result = new long[values.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            decimal t = decimal.Truncate(values[i]);
+            result[i] = t <= long.MinValue ? long.MinValue : t >= long.MaxValue ? long.MaxValue : (long)t;
+        }
+        return result;
+    }
+
     // short / sbyte / byte / ushort / uint widened exactly (each fits a long); ulong takes EncodeUnsigned.
     private static long[] WidenIntegral<TValue>(TValue[] values)
     {
@@ -77,8 +96,7 @@ public partial class CpuEngine
     private static void EncodeUnsigned(ulong[] values, byte[] bytes, NumericStorageType type, bool littleEndian)
     {
         int width = type.GetByteWidth();
-        bool floating = type == NumericStorageType.Float64 || type == NumericStorageType.Float32
-            || type == NumericStorageType.Float16;
+        bool floating = IsFloatingStorage(type);
         int chunks = (values.Length + DataOpChunk - 1) / DataOpChunk;
         CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)values.Length * width, chunk =>
         {
@@ -87,12 +105,25 @@ public partial class CpuEngine
             {
                 ulong v = values[i];
                 ulong raw = v <= long.MaxValue ? EncodeInteger((long)v, type)
-                    : floating ? EncodeDouble(v, type)
+                    : floating ? EncodeDouble(RoundUnsignedToSignificand(v, type), type)
                     : EncodeInteger(long.MaxValue, type);
                 WriteRaw(bytes, i * width, width, raw, littleEndian);
             }
         }, deterministicSafe: true);
     }
+
+    // v (at least 2^63) rounded once, to nearest even, to the target's significand width, as an exact double: going
+    // through (double)v first would round twice (2^63 + 2^39 + 1 becomes a float32 midpoint and then rounds down).
+    // Every such value is far past binary16's range, so Float16 takes the binary64 width and overflows to infinity.
+    private static double RoundUnsignedToSignificand(ulong v, NumericStorageType type)
+    {
+        int significandBits = type == NumericStorageType.Float32 ? SingleSignificandBits : DoubleMantissaBits + 1;
+        int shift = DoubleBits - significandBits;
+        ulong q = RoundShiftRight(v, shift);
+        return q * Math.Pow(2.0, shift);
+    }
+
+    private const int SingleSignificandBits = 24;
 
     /// <summary>Each value encoded as <paramref name="type"/> into its slot of <paramref name="bytes"/>, chunks in
     /// parallel.</summary>
@@ -286,10 +317,22 @@ public partial class CpuEngine
         if (typeof(TIn) == typeof(TOut))
         {
             Array.Copy(ReadAll(input), destination, count);
+            // A floating identity cast is a copy, and a copy is differentiable: record it, or a tape would lose every
+            // path through it. (Casts between different element types cannot share a typed tape.)
+            DifferentiableOps.RecordIfActive("TensorCast", result, new[] { (Tensor<TOut>)(object)input },
+                IdentityCastBackward<TOut>, Array.Empty<object>());
             return result;
         }
         ConvertNonIntegral(ReadAll(input), destination);
         return result;
+    }
+
+    // d(identity)/dx = 1: the output gradient passes straight to the input.
+    internal static void IdentityCastBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (DifferentiableOps.IsGradientRequired(inputs[0]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
     }
 
     internal static void ValidateRounding(RoundingMode mode, CastOverflowBehavior overflow)

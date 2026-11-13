@@ -45,6 +45,8 @@ public partial class CpuEngine
         if (!SameShape(source._shape, expected))
             throw new ArgumentException($"source must have shape [{string.Join(", ", expected)}] (rows' shape, then the table's row shape); got [{string.Join(", ", source._shape)}].", nameof(source));
         if (table.IsSparse) throw new InvalidOperationException("Row scatter into a SparseTensor is not supported.");
+        // A broadcast (zero-stride) or otherwise self-overlapping view would write unselected rows too.
+        table.EnsureNonOverlappingWritableLayout();
         var ids = ReadAll(rows);
         if (ids.Length == 0 || rowSize == 0) return;
         // A source sharing the table's storage (the table itself, or a view of it) would read rows this scatter has
