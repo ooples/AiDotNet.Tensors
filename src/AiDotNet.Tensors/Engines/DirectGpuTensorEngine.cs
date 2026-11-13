@@ -12818,7 +12818,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int allocated = 0;
         try
         {
-            var g = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             using var dOut = GetOrAllocateBuffer(backend, g);
             using var qB = GetOrAllocateBuffer(backend, inputs[0]);
             using var kB = GetOrAllocateBuffer(backend, inputs[1]);
@@ -14566,9 +14566,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // The kernel indexes Q/K/V as flat row-major [batch, heads, seq, headDim]; a permuted view (e.g. the
         // [0,2,1,3] transpose that produced the per-head layout) must be materialized contiguous first, and a
         // host tensor uploaded. GetOrAllocateBuffer does both; contiguous-resident inputs pass straight through.
-        using var qBuf = GetOrAllocateBuffer(backend, query.IsContiguous ? query : (Tensor<T>)query.Contiguous());
-        using var kBuf = GetOrAllocateBuffer(backend, key.IsContiguous ? key : (Tensor<T>)key.Contiguous());
-        using var vBuf = GetOrAllocateBuffer(backend, value.IsContiguous ? value : (Tensor<T>)value.Contiguous());
+        using var qBuf = GetOrAllocateBuffer(backend, query.IsContiguous ? query : query.Contiguous());
+        using var kBuf = GetOrAllocateBuffer(backend, key.IsContiguous ? key : key.Contiguous());
+        using var vBuf = GetOrAllocateBuffer(backend, value.IsContiguous ? value : value.Contiguous());
 
         // Allocate output and attention weights buffers
         var outputBuffer = backend.AllocateBuffer(batch * heads * seqQ * headDim);
@@ -17251,22 +17251,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var gammaBuffer = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
             using var saveRmsBuffer = GetOrAllocateBuffer(backend, rms);
-            var gradInputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
-            var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
-            bool handedOff = false;
-            try
-            {
-                backend.RmsNormBackward(gradOutBuffer.Buffer, inputBuffer.Buffer, gammaBuffer.Buffer, saveRmsBuffer.Buffer,
-                    gradInputBuffer.Buffer, gradGammaBuffer.Buffer, batchSize, normalizedSize, (float)epsilon);
-                var gradInput = DeferTensorResult<T>(backend, gradInputBuffer.Buffer, input.Length, input.Shape.ToArray());
-                gradGamma = DeferTensorResult<T>(backend, gradGammaBuffer.Buffer, normalizedSize, gamma.Shape.ToArray());
-                handedOff = true;
-                return gradInput;
-            }
-            finally
-            {
-                if (!handedOff) { gradInputBuffer.Dispose(); gradGammaBuffer.Dispose(); }
-            }
+            // Disposed on failure; once a deferred result owns each, RelinquishOwnership turns the using into a no-op.
+            using var gradInputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            using var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
+            backend.RmsNormBackward(gradOutBuffer.Buffer, inputBuffer.Buffer, gammaBuffer.Buffer, saveRmsBuffer.Buffer,
+                gradInputBuffer.Buffer, gradGammaBuffer.Buffer, batchSize, normalizedSize, (float)epsilon);
+            var gradInput = DeferTensorResult<T>(backend, gradInputBuffer.Buffer, input.Length, input.Shape.ToArray());
+            gradInputBuffer.RelinquishOwnership();
+            gradGamma = DeferTensorResult<T>(backend, gradGammaBuffer.Buffer, normalizedSize, gamma.Shape.ToArray());
+            gradGammaBuffer.RelinquishOwnership();
+            return gradInput;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("RMSNormBackward", capabilityGap);
             return base.RMSNormBackward(gradOutput, input, gamma, rms, epsilon, out gradGamma);
@@ -25821,7 +25815,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int numIndices = indices.Length;
             int featureSize = source.Rank >= 2 ? source.Length / source.Shape._dims[0] : 1;
             int sourceRows = source.Shape._dims[0];
-            var contiguousSource = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            var contiguousSource = source.IsContiguous ? source : source.Contiguous();
             var contiguousIndices = indices.IsContiguous
                 ? indices
                 : (Tensor<int>)indices.Contiguous();
@@ -27718,8 +27712,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int innerSize = 1;
             for (int dimension = normalizedAxis + 1; dimension < tensor.Rank; dimension++)
                 innerSize *= tensor.Shape._dims[dimension];
-            var contiguousTensor = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
-            var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var contiguousTensor = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 using var indexDataLease = contiguousIndices.LeaseArray();
@@ -28478,6 +28472,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     [ThreadStatic]
     private static float[]? s_scalarReadbackBuffer;
 
+    // This thread's reusable scalar-readback array, grown to at least length elements.
+    private static float[] RentScalarReadbackBuffer(int length)
+    {
+        var buffer = s_scalarReadbackBuffer;
+        if (buffer is null || buffer.Length < length)
+            s_scalarReadbackBuffer = buffer = new float[length];
+        return buffer;
+    }
+
     /// <summary>
     /// Accumulates <c>sum_i tensor[i]^2</c> onto <paramref name="scalarAccumulator"/> entirely on the active GPU
     /// backend using <see cref="IDirectGpuBackend.DotProduct"/> and <see cref="IDirectGpuBackend.Add"/> without
@@ -28501,7 +28504,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var suspendScope = TensorScope.Suspend();
-            var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+            var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
             // Every lease below is read by queued kernels: an owned upload or scratch is released only after that work.
             using var input = new QueuedLease(backend, GetOrAllocateBuffer(backend, source));
 
@@ -28579,14 +28582,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             try
             {
-                var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
                 using var input = GetOrAllocateBuffer(backend, source);
                 using var scalarOut = AllocateFullyWrittenOutputBuffer(backend, 1);
                 backend.DotProduct(input.Buffer, input.Buffer, scalarOut.Buffer, source.Length);
                 int readLen = Math.Max(1, scalarOut.Buffer.Size);
-                var dst = s_scalarReadbackBuffer;
-                if (dst is null || dst.Length < readLen)
-                    s_scalarReadbackBuffer = dst = new float[readLen];
+                var dst = RentScalarReadbackBuffer(readLen);
                 backend.DownloadBuffer(scalarOut.Buffer, dst);
                 return (T)(object)dst[0];
             }
@@ -29881,7 +29882,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            var contiguousSource = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
+            var contiguousSource = source.IsContiguous ? source : source.Contiguous();
             int rank = destination.Rank;
             int rowSize = source.Shape._dims[rank - 1];
             int rowCount = source.Length / rowSize;
@@ -30187,7 +30188,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 int rows = indices.Length;
                 int elementCount = checked(rows * depth);
-                var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+                var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
                 using var indicesBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
                 return DispatchDeferredGpuOp<T>(backend, elementCount, new[] { rows, depth },
                     output => oneHotBackend.OneHotInt32(indicesBuffer.Buffer, output, rows, depth));
@@ -30866,7 +30867,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     int features = tensor.Shape._dims[normalizedAxis];
                     int outerSize = tensor.Length / features;
-                    var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                    var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
                     using var input = GetOrAllocateBuffer(backend, source);
                     var output = AllocateOutputBuffer(backend, tensor.Length);
                     bool handedOff = false;
