@@ -86,6 +86,34 @@ public sealed class AsyncGpuBackendParityTests
         Check(backend);
     }
 
+    /// <summary>
+    /// A stream drained by <see cref="IAsyncGpuBackend.SynchronizeStream"/> reports complete from the drain itself, not
+    /// from a fresh marker: NVIDIA's OpenCL reports a marker on a drained queue through its event thread, and under load
+    /// on the RTX 3090 runner that took longer than the marker's poll window, so a finished stream read as busy. Work
+    /// enqueued after the drain makes the record stale again.
+    /// </summary>
+    [SkippableFact]
+    public void OpenCl_DrainedStream_IsCompleteWithoutEnqueueingAMarker()
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        var async = Assert.IsAssignableFrom<IAsyncGpuBackend>(backend);
+        var stream = async.CreateStream(GpuStreamType.Compute);
+        var a = Values(M * K, 1);
+        using var buffer = backend.AllocateBuffer(M * K);
+        async.UploadBufferAsync(a, buffer, stream);
+        async.SynchronizeStream(stream);
+
+        long before = OpenClNativeBindings.EnqueuedSinceFirstDrain(stream.Handle);
+        Assert.True(async.QueryStreamComplete(stream));
+        Assert.Equal(before, OpenClNativeBindings.EnqueuedSinceFirstDrain(stream.Handle));
+
+        async.UploadBufferAsync(a, buffer, stream);
+        Assert.False(OpenClNativeBindings.IsKnownDrained(stream.Handle));
+        async.SynchronizeStream(stream);
+        Assert.True(OpenClNativeBindings.IsKnownDrained(stream.Handle));
+    }
+
     [SkippableFact]
     public void Vulkan_AsyncGpu_MatchesCpu()
     {

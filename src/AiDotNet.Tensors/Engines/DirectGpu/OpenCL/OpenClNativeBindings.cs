@@ -5,6 +5,7 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
@@ -199,7 +200,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         [DllImport(OpenClLibrary, EntryPoint = "clReleaseCommandQueue")]
-        public static extern int ReleaseCommandQueue(IntPtr commandQueue);
+        private static extern int ReleaseCommandQueueNative(IntPtr commandQueue);
+
+        // A released handle value can be reused by a later queue; drop its drained record first.
+        public static int ReleaseCommandQueue(IntPtr commandQueue)
+        {
+            ForgetQueue(commandQueue);
+            return ReleaseCommandQueueNative(commandQueue);
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clFinish")]
         private static extern int FinishNative(IntPtr commandQueue);
@@ -208,10 +216,47 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // here, after CL_SUCCESS, instead of only the ones a Synchronize() wrapper makes.
         public static int Finish(IntPtr commandQueue)
         {
+            var state = s_queueStates.GetOrAdd(commandQueue, _ => new QueueDrainState());
+            long enqueued = Volatile.Read(ref state.Enqueued);
             int result = FinishNative(commandQueue);
-            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) { GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl); DirectOpenClFlushPolicy.OnHostWaited(); }
+            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success)
+            {
+                GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
+                DirectOpenClFlushPolicy.OnHostWaited();
+                Volatile.Write(ref state.DrainedAt, enqueued);
+            }
             return result;
         }
+
+        // Whether a queue has nothing pending, known without asking the driver. Every clEnqueue* binding counts its
+        // queue's enqueues after the call returns, and a successful clFinish records the count it read before draining:
+        // while no enqueue on that queue has returned since, the queue is still drained. (An enqueue that returned
+        // before the count was read was drained by the clFinish; one that returned later has bumped the count.) A marker
+        // cannot answer this reliably: NVIDIA's OpenCL reports even a drained queue's marker through its event thread,
+        // which under load (the RTX 3090 runner sharing the GPU with another process) took longer than any poll window.
+        private sealed class QueueDrainState
+        {
+            public long Enqueued;
+            public long DrainedAt = -1;
+        }
+
+        // Only queues that have been drained at least once get an entry; an enqueue on any other queue costs one lookup.
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, QueueDrainState> s_queueStates = new();
+
+        private static void NoteEnqueued(IntPtr commandQueue)
+        {
+            if (s_queueStates.TryGetValue(commandQueue, out var state)) Interlocked.Increment(ref state.Enqueued);
+        }
+
+        internal static bool IsKnownDrained(IntPtr commandQueue) =>
+            s_queueStates.TryGetValue(commandQueue, out var state)
+            && Volatile.Read(ref state.DrainedAt) == Volatile.Read(ref state.Enqueued);
+
+        /// <summary>Enqueues on <paramref name="commandQueue"/> since it was first drained (tests: proves an answer did not enqueue).</summary>
+        internal static long EnqueuedSinceFirstDrain(IntPtr commandQueue) =>
+            s_queueStates.TryGetValue(commandQueue, out var state) ? Volatile.Read(ref state.Enqueued) : 0;
+
+        internal static void ForgetQueue(IntPtr commandQueue) => s_queueStates.TryRemove(commandQueue, out _);
 
         [DllImport(OpenClLibrary, EntryPoint = "clFlush")]
         public static extern int Flush(IntPtr commandQueue);
@@ -256,11 +301,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             out UIntPtr paramValueSizeRet);
 
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueMarkerWithWaitList")]
-        public static extern int EnqueueMarkerWithWaitList(
+        private static extern int EnqueueMarkerWithWaitListNative(
             IntPtr commandQueue,
             uint numEventsInWaitList,
             [In] IntPtr[]? eventWaitList,
             out IntPtr eventOut);
+
+        public static int EnqueueMarkerWithWaitList(
+            IntPtr commandQueue,
+            uint numEventsInWaitList,
+            [In] IntPtr[]? eventWaitList,
+            out IntPtr eventOut)
+        {
+            int result = EnqueueMarkerWithWaitListNative(commandQueue, numEventsInWaitList, eventWaitList, out eventOut);
+            NoteEnqueued(commandQueue);
+            return result;
+        }
 
         // Event info constants
         public const uint CL_EVENT_COMMAND_EXECUTION_STATUS = 0x11D3;
@@ -290,7 +346,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public static extern int RetainMemObject(IntPtr memObj);
 
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueReadBuffer")]
-        public static extern int EnqueueReadBuffer(
+        private static extern int EnqueueReadBufferNative(
             IntPtr commandQueue,
             IntPtr buffer,
             uint blockingRead,
@@ -300,9 +356,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             uint numEventsInWaitList,
             IntPtr eventWaitList,
             IntPtr eventOut);
+
+        public static int EnqueueReadBuffer(
+            IntPtr commandQueue,
+            IntPtr buffer,
+            uint blockingRead,
+            UIntPtr offset,
+            UIntPtr size,
+            IntPtr ptr,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            IntPtr eventOut)
+        {
+            int result = EnqueueReadBufferNative(commandQueue, buffer, blockingRead, offset, size, ptr, numEventsInWaitList, eventWaitList, eventOut);
+            NoteEnqueued(commandQueue);
+            return result;
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueReadBuffer")]
-        public static extern int EnqueueReadBufferWithEvent(
+        private static extern int EnqueueReadBufferWithEventNative(
             IntPtr commandQueue,
             IntPtr buffer,
             uint blockingRead,
@@ -313,8 +385,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventWaitList,
             out IntPtr eventOut);
 
+        public static int EnqueueReadBufferWithEvent(
+            IntPtr commandQueue,
+            IntPtr buffer,
+            uint blockingRead,
+            UIntPtr offset,
+            UIntPtr size,
+            IntPtr ptr,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            out IntPtr eventOut)
+        {
+            int result = EnqueueReadBufferWithEventNative(commandQueue, buffer, blockingRead, offset, size, ptr, numEventsInWaitList, eventWaitList, out eventOut);
+            NoteEnqueued(commandQueue);
+            return result;
+        }
+
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueWriteBuffer")]
-        public static extern int EnqueueWriteBuffer(
+        private static extern int EnqueueWriteBufferNative(
             IntPtr commandQueue,
             IntPtr buffer,
             uint blockingWrite,
@@ -325,8 +413,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventWaitList,
             IntPtr eventOut);
 
+        public static int EnqueueWriteBuffer(
+            IntPtr commandQueue,
+            IntPtr buffer,
+            uint blockingWrite,
+            UIntPtr offset,
+            UIntPtr size,
+            IntPtr ptr,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            IntPtr eventOut)
+        {
+            int result = EnqueueWriteBufferNative(commandQueue, buffer, blockingWrite, offset, size, ptr, numEventsInWaitList, eventWaitList, eventOut);
+            NoteEnqueued(commandQueue);
+            return result;
+        }
+
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueWriteBuffer")]
-        public static extern int EnqueueWriteBufferWithEvent(
+        private static extern int EnqueueWriteBufferWithEventNative(
             IntPtr commandQueue,
             IntPtr buffer,
             uint blockingWrite,
@@ -336,6 +440,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             uint numEventsInWaitList,
             IntPtr eventWaitList,
             out IntPtr eventOut);
+
+        public static int EnqueueWriteBufferWithEvent(
+            IntPtr commandQueue,
+            IntPtr buffer,
+            uint blockingWrite,
+            UIntPtr offset,
+            UIntPtr size,
+            IntPtr ptr,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            out IntPtr eventOut)
+        {
+            int result = EnqueueWriteBufferWithEventNative(commandQueue, buffer, blockingWrite, offset, size, ptr, numEventsInWaitList, eventWaitList, out eventOut);
+            NoteEnqueued(commandQueue);
+            return result;
+        }
 
         // clCreateSubBuffer - creates a buffer object from a region of an existing buffer. The error code reaches the
         // caller: a region the device refuses (CL_MISALIGNED_SUB_BUFFER_OFFSET most often) is indistinguishable from
@@ -357,7 +477,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             ref BufferRegion bufferCreateInfo, out int errCode);
 
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueCopyBuffer")]
-        public static extern int EnqueueCopyBuffer(
+        private static extern int EnqueueCopyBufferNative(
             IntPtr commandQueue,
             IntPtr srcBuffer,
             IntPtr dstBuffer,
@@ -367,6 +487,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             uint numEventsInWaitList,
             IntPtr eventWaitList,
             IntPtr eventOut);
+
+        public static int EnqueueCopyBuffer(
+            IntPtr commandQueue,
+            IntPtr srcBuffer,
+            IntPtr dstBuffer,
+            UIntPtr srcOffset,
+            UIntPtr dstOffset,
+            UIntPtr size,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            IntPtr eventOut)
+        {
+            int result = EnqueueCopyBufferNative(commandQueue, srcBuffer, dstBuffer, srcOffset, dstOffset, size, numEventsInWaitList, eventWaitList, eventOut);
+            NoteEnqueued(commandQueue);
+            return result;
+        }
 
         #endregion
 
@@ -447,7 +583,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr argValue);
 
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueNDRangeKernel")]
-        public static extern int EnqueueNDRangeKernel(
+        private static extern int EnqueueNDRangeKernelNative(
             IntPtr commandQueue,
             IntPtr kernel,
             uint workDim,
@@ -457,6 +593,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             uint numEventsInWaitList,
             IntPtr eventWaitList,
             IntPtr eventOut);
+
+        public static int EnqueueNDRangeKernel(
+            IntPtr commandQueue,
+            IntPtr kernel,
+            uint workDim,
+            [In] UIntPtr[]? globalWorkOffset,
+            [In] UIntPtr[] globalWorkSize,
+            [In] UIntPtr[] localWorkSize,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            IntPtr eventOut)
+        {
+            int result = EnqueueNDRangeKernelNative(commandQueue, kernel, workDim, globalWorkOffset, globalWorkSize, localWorkSize, numEventsInWaitList, eventWaitList, eventOut);
+            NoteEnqueued(commandQueue);
+            return result;
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clGetKernelInfo")]
         public static extern int GetKernelInfo(
