@@ -254,7 +254,14 @@ public partial class CpuEngine
         if (shape < 1.0)
         {
             double u = generator.NextDouble();
-            return SampleGamma(generator, shape + 1.0, scale, normal) * Math.Pow(u, 1.0 / shape);
+            double unscaled = SampleGamma(generator, shape + 1.0, 1.0, normal);
+            double boost = Math.Pow(u, 1.0 / shape);
+            // (sample * scale) * boost is the scalar samplers' order and reproduces them bit for bit; only when that
+            // product overflows or underflows, though the true value is representable, is the boost applied first.
+            double ordered = unscaled * scale * boost;
+            if (double.IsInfinity(ordered) || (ordered <= 0.0 && unscaled > 0.0 && boost > 0.0 && scale > 0.0))
+                return unscaled * boost * scale;
+            return ordered;
         }
         double d = shape - 1.0 / 3.0;
         double c = 1.0 / Math.Sqrt(9.0 * d);
