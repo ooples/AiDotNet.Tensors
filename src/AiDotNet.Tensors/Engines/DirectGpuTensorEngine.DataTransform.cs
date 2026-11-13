@@ -306,7 +306,10 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         var (vocab, rowSize, outShape) = GatherRowsShape(table, rows);
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || rows.Length == 0 || rowSize == 0)
+        // A host table is gathered on the host: uploading it would move all vocab * rowSize values to read k rows, the
+        // O(vocab * rowSize) cost the row gather exists to avoid (the scatter takes the same rule).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || rows.Length == 0 || rowSize == 0
+            || !IsOnDevice(table))
             return base.TensorGatherRows(table, rows);
         var ids = ReadAll(rows);
         var deviceIds = DeviceRowIds(ids, vocab, lastWins: false);
