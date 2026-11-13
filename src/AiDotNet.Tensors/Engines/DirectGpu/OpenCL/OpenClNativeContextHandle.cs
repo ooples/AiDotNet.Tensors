@@ -38,6 +38,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     internal sealed class OpenClNativeContextHandle
     {
         private readonly ConcurrentDictionary<IntPtr, OpenClChildKind> _children = new();
+        private readonly ConcurrentDictionary<IntPtr, IntPtr> _viewParents = new();
         private readonly Action<IntPtr>? _onReleased;
         private IntPtr _context;
 
@@ -65,6 +66,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         internal bool TryClaim(IntPtr child) => child != IntPtr.Zero && _children.TryRemove(child, out _);
 
+        /// <summary>
+        /// Takes a reference on a sub-buffer's parent for as long as the sub-buffer lives. Releases run in no fixed order
+        /// (the retirement reap goes newest first, <see cref="ReleaseAll"/> in dictionary order), and NVIDIA's runtime
+        /// faults (0xC0000005 in clReleaseMemObject) releasing a sub-buffer whose parent was already deleted.
+        /// </summary>
+        internal bool RetainViewParent(IntPtr view, IntPtr parent)
+        {
+            if (OpenClNativeBindings.RetainMemObject(parent) != OpenClNativeBindings.CL_SUCCESS) return false;
+            _viewParents[view] = parent;
+            return true;
+        }
+
+        /// <summary>
+        /// Removes the parent reference <paramref name="view"/> holds, to be released once the view itself is: taken
+        /// before the view's release, so a handle the driver reuses for a new view never has its entry taken.
+        /// </summary>
+        internal IntPtr TakeViewParent(IntPtr view)
+            => _viewParents.TryRemove(view, out IntPtr parent) ? parent : IntPtr.Zero;
+
         /// <summary>Releases every child still owned, in dependency order, then the context. Idempotent.</summary>
         internal void ReleaseAll()
         {
@@ -84,7 +104,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             case OpenClChildKind.Program: OpenClNativeBindings.ReleaseProgram(pair.Key); break;
                             case OpenClChildKind.MemObject:
                                 DirectOpenClSubmission.Forget(pair.Key);
+                                IntPtr viewParent = TakeViewParent(pair.Key);
                                 OpenClNativeBindings.ReleaseMemObject(pair.Key);
+                                if (viewParent != IntPtr.Zero) OpenClNativeBindings.ReleaseMemObject(viewParent);
                                 break;
                             case OpenClChildKind.CommandQueue:
                                 DirectOpenClContext.LiveQueues.TryRemove(pair.Key, out _);

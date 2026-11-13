@@ -338,8 +338,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private void ReleaseMemoryObject(IntPtr memoryObject, long byteSize)
         {
-            // The caller claimed it (RetireMemoryObject), so it is ours to release.
+            // The caller claimed it (RetireMemoryObject), so it is ours to release. A sub-buffer's reference on its parent
+            // goes only after the sub-buffer itself (see OpenClNativeContextHandle.RetainViewParent).
+            IntPtr viewParent = _native?.TakeViewParent(memoryObject) ?? IntPtr.Zero;
             OpenClNativeBindings.ReleaseMemObject(memoryObject);
+            if (viewParent != IntPtr.Zero) OpenClNativeBindings.ReleaseMemObject(viewParent);
             GpuKernelDiagnostics.RecordBufferReleased(byteSize);
         }
 
@@ -879,6 +882,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         /// <summary>Claims a native object for release by its wrapper: false when the context already released it.</summary>
         internal bool ClaimNative(IntPtr child) => _native is null || _native.TryClaim(child);
+
+        /// <summary>Keeps a sub-buffer's parent alive until the sub-buffer is released: false when the retain failed.</summary>
+        internal bool RetainViewParent(IntPtr view, IntPtr parent) => _native is null || _native.RetainViewParent(view, parent);
 
         // The first frames outside the OpenCL backend: the code that asked for this context.
         private static string CreationSite()
