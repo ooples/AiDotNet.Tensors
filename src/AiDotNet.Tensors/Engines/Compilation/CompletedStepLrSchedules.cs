@@ -70,6 +70,7 @@ internal abstract class CompletedStepLr : LrSchedule
                 FusedLrScheduleKind.OneCycleWithAnneal => new OneCycleWithAnnealLr(d[0], i[0], d[1], d[2], d[3], (OneCycleAnneal)i[1]),
                 FusedLrScheduleKind.CyclicRange => new CyclicRangeLr(d[0], d[1], i[0], i[1], (CyclicLrMode)i[2], d[2]),
                 FusedLrScheduleKind.Sequential => SequentialLr.FromCheckpoint(d, i),
+                FusedLrScheduleKind.CosineAnnealingHold => new CosineAnnealingHoldLr(d[0], i[0], d[1]),
                 _ => throw new System.IO.InvalidDataException($"Serialized LR schedule kind {kind} is not a completed-step schedule."),
             };
         }
@@ -362,6 +363,32 @@ internal sealed class CyclicRangeLr : CompletedStepLr
 
     internal override FusedLrScheduleCheckpoint Checkpoint()
         => new(FusedLrScheduleKind.CyclicRange, new[] { _base, _max, _gamma }, new[] { _up, _down, (int)_mode });
+}
+
+internal sealed class CosineAnnealingHoldLr : CompletedStepLr
+{
+    private readonly double _lr0, _etaMin;
+    private readonly int _tMax;
+
+    public CosineAnnealingHoldLr(double lr0, int tMax, double etaMin)
+    {
+        RequireRate(lr0, nameof(lr0));
+        RequireRate(etaMin, nameof(etaMin));
+        Require(tMax > 0, nameof(tMax), "T_max must be positive.");
+        _lr0 = lr0; _tMax = tMax; _etaMin = etaMin;
+    }
+
+    protected override double Initial => _lr0;
+
+    internal override double RateAfter(int t)
+    {
+        int effective = System.Math.Min(t, _tMax);
+        double cosine = System.Math.Cos(System.Math.PI * effective / _tMax);
+        return _etaMin + 0.5 * (_lr0 - _etaMin) * (1 + cosine);
+    }
+
+    internal override FusedLrScheduleCheckpoint Checkpoint()
+        => new(FusedLrScheduleKind.CosineAnnealingHold, new[] { _lr0, _etaMin }, new[] { _tMax });
 }
 
 /// <summary>

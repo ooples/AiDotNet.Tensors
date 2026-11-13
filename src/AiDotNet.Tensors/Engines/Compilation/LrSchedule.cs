@@ -154,6 +154,15 @@ public abstract class LrSchedule
         => new WarmupStableDecayLr(lrMax, warmupSteps, decayStartStep, decaySteps, shape, endLr);
 
     /// <summary>
+    /// Cosine annealing from <paramref name="lr0"/> to <paramref name="etaMin"/> over <paramref name="tMax"/> completed
+    /// steps, then held at <paramref name="etaMin"/>. Image of
+    /// <c>AiDotNet.LearningRateSchedulers.CosineAnnealingLRScheduler</c> stepped per batch, operation for operation
+    /// (<see cref="Cosine"/> is PyTorch's shape over the step index and can differ from it in the last bit).
+    /// </summary>
+    public static LrSchedule CosineAnnealing(double lr0, int tMax, double etaMin = 0.0)
+        => new CosineAnnealingHoldLr(lr0, tMax, etaMin);
+
+    /// <summary>
     /// Polynomial decay from <paramref name="lr0"/> to <paramref name="endLr"/> over <paramref name="totalSteps"/>
     /// steps: <c>(lr0 - endLr) * (1 - t / totalSteps)^power + endLr</c> after t completed steps, then held. Image of
     /// <c>AiDotNet.LearningRateSchedulers.PolynomialLRScheduler</c> stepped per batch.

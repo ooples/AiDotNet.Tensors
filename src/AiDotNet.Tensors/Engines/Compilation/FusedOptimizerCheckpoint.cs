@@ -23,7 +23,8 @@ internal enum FusedLrScheduleKind
     CosineWarmRestarts = 18,
     OneCycleWithAnneal = 19,
     CyclicRange = 20,
-    Sequential = 21
+    Sequential = 21,
+    CosineAnnealingHold = 22
 }
 
 internal sealed class FusedLrScheduleCheckpoint
@@ -84,6 +85,7 @@ internal sealed class FusedLrScheduleCheckpoint
             FusedLrScheduleKind.OneCycleWithAnneal => (4, 2),
             FusedLrScheduleKind.CyclicRange => (3, 3),
             FusedLrScheduleKind.Sequential => (0, 1),
+            FusedLrScheduleKind.CosineAnnealingHold => (2, 1),
             _ => throw new System.IO.InvalidDataException(
                 $"Unknown serialized LR schedule kind {(int)Kind}."),
         };

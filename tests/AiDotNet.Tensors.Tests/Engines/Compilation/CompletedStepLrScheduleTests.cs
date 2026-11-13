@@ -22,6 +22,7 @@ public class CompletedStepLrScheduleTests
         yield return new object[] { "tristage", LrSchedule.TriStage(0.1, 8, 10, 60, 1e-4, 2.0) };
         yield return new object[] { "noamhold", LrSchedule.NoamHoldAnnealing(1e-3, 10, 5, 0.5) };
         yield return new object[] { "sgdr", LrSchedule.CosineWarmRestarts(0.1, 7, 2, 1e-4) };
+        yield return new object[] { "cosine-hold", LrSchedule.CosineAnnealing(0.1, 40, 1e-4) };
         yield return new object[] { "onecycle-lin", LrSchedule.OneCycleWithAnneal(0.1, 50, 0.3, 25, 1e4, OneCycleAnneal.Linear) };
         yield return new object[] { "cyclic-exp", LrSchedule.Cyclic(1e-3, 1e-2, 6, 9, CyclicLrMode.ExponentialRange, 0.97) };
         yield return new object[] { "cyclic-tri2", LrSchedule.Cyclic(1e-3, 1e-2, 4, 4, CyclicLrMode.Triangular2) };
