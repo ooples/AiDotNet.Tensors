@@ -23,6 +23,17 @@ internal sealed class DirectPtxRuntime : IDisposable
     private readonly bool _ownsContext;
     // The device whose primary context a standalone runtime retained (released on Dispose), or -1 when borrowed.
     private readonly int _retainedPrimaryDevice = -1;
+    // A standalone runtime's live buffers and modules. Its private context used to free whatever a caller never
+    // disposed; the shared primary context it now retains outlives it, so Dispose frees the leftovers itself.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<IDisposable, byte> _live =
+        new System.Collections.Concurrent.ConcurrentDictionary<IDisposable, byte>();
+
+    internal void TrackResource(IDisposable resource)
+    {
+        if (_retainedPrimaryDevice >= 0) _live.TryAdd(resource, 0);
+    }
+
+    internal void UntrackResource(IDisposable resource) => _live.TryRemove(resource, out _);
     private readonly bool _ownsStream;
     private bool _disposed;
 
@@ -633,6 +644,22 @@ internal sealed class DirectPtxRuntime : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+        if (_retainedPrimaryDevice >= 0 && _context != IntPtr.Zero)
+        {
+            foreach (var resource in new List<IDisposable>(_live.Keys))
+            {
+                try
+                {
+                    resource.Dispose();
+                }
+                catch (InvalidOperationException ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"DirectPtxRuntime: releasing an undisposed {resource.GetType().Name} failed: {ex.Message}");
+                }
+            }
+            _live.Clear();
+        }
         if (_ownsStream && _stream != IntPtr.Zero && _context != IntPtr.Zero)
         {
             using var _ = Enter();
@@ -739,6 +766,7 @@ internal sealed class DirectPtxBuffer : IDisposable
         _runtime = runtime;
         _pointer = pointer;
         ByteLength = byteLength;
+        runtime.TrackResource(this);
     }
 
     internal unsafe void Upload<T>(ReadOnlySpan<T> source) where T : unmanaged
@@ -804,6 +832,7 @@ internal sealed class DirectPtxBuffer : IDisposable
         using var _ = _runtime.Enter();
         DirectPtxRuntime.Check(CudaNativeBindings.cuMemFree(_pointer), "cuMemFree");
         _pointer = IntPtr.Zero;
+        _runtime.UntrackResource(this);
     }
 }
 
@@ -851,6 +880,7 @@ internal sealed class DirectPtxModule : IDisposable
         CubinSha256 = artifact.CubinSha256;
         CubinSourceKey = artifact.SourceKey;
         CubinPath = artifact.Path;
+        runtime.TrackResource(this);
     }
 
     internal DirectPtxModule(
@@ -863,6 +893,7 @@ internal sealed class DirectPtxModule : IDisposable
         CubinSha256 = string.Empty;
         CubinSourceKey = string.Empty;
         CubinPath = null;
+        runtime.TrackResource(this);
     }
 
     internal IntPtr GetFunction(string name)
@@ -1008,6 +1039,7 @@ internal sealed class DirectPtxModule : IDisposable
             _registeredFunctions.Clear();
             DirectPtxRuntime.Check(CudaNativeBindings.cuModuleUnload(_module), "cuModuleUnload");
             _module = IntPtr.Zero;
+            _runtime.UntrackResource(this);
         }
     }
 }

@@ -243,7 +243,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // Only queues that have been drained at least once get an entry; an enqueue on any other queue costs one lookup.
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, QueueDrainState> s_queueStates = new();
 
-        private static void NoteEnqueued(IntPtr commandQueue)
+        // Also called by the OpenClNative and ClBlastNative enqueue wrappers, which share these queues.
+        internal static void NoteEnqueued(IntPtr commandQueue)
         {
             if (s_queueStates.TryGetValue(commandQueue, out var state)) Interlocked.Increment(ref state.Enqueued);
         }

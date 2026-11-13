@@ -84,6 +84,22 @@ public sealed class DirectPtxRuntimeTransferOrderingTests
         }
     }
 
+    /// <summary>
+    /// The primary context a standalone runtime retains outlives the runtime, so destroying a private context no longer
+    /// frees whatever a caller forgot to dispose: the runtime's Dispose must free its own leftover buffers.
+    /// </summary>
+    [SkippableFact]
+    public void StandaloneRuntime_Dispose_FreesUndisposedBuffers()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        var runtime = new DirectPtxRuntime();
+        var leftover = runtime.AllocateBytes((nuint)(1024 * sizeof(float)));
+        Assert.NotEqual(IntPtr.Zero, leftover.Pointer);
+        runtime.Dispose();
+        Assert.Equal(IntPtr.Zero, leftover.Pointer);
+        leftover.Dispose();   // already freed by the runtime: a no-op, not a double free
+    }
+
     private static string EmitCopyPtx(int elements) =>
         ".version 7.1\n" +
         // This kernel uses only baseline instructions. A conservative virtual
