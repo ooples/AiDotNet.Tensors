@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
+using System.Linq;
 using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
@@ -33,15 +34,15 @@ public sealed unsafe partial class VulkanBackend : IDataTransformBackend
                     bool ok = true;
                     try
                     {
-                        foreach (var spec in DataTransformKernelTemplate.Kernels)
-                            if (GetOrCreateGlslPipeline(s_dataTransformShaders[spec.Name], spec.Buffers.Length,
-                                    (uint)(spec.Ints.Length * sizeof(uint))) is null)
-                            {
-                                System.Diagnostics.Trace.TraceWarning(
-                                    $"Vulkan data transform kernels unavailable: '{spec.Name}' did not build.");
-                                ok = false;
-                                break;
-                            }
+                        var failed = DataTransformKernelTemplate.Kernels.FirstOrDefault(spec =>
+                            GetOrCreateGlslPipeline(s_dataTransformShaders[spec.Name], spec.Buffers.Length,
+                                (uint)(spec.Ints.Length * sizeof(uint))) is null);
+                        if (failed is not null)
+                        {
+                            System.Diagnostics.Trace.TraceWarning(
+                                $"Vulkan data transform kernels unavailable: '{failed.Name}' did not build.");
+                            ok = false;
+                        }
                     }
                     catch (Exception ex) when (PortableDataTransform.IsBuildFailure(ex))
                     {
