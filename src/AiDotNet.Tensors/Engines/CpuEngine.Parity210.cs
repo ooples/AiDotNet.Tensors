@@ -4682,7 +4682,7 @@ public partial class CpuEngine
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = ToDoubleSafe(x);
             double acc = 0;
-            while (xd < 6.0)
+            while (xd < 10.0)
             {
                 acc -= 1.0 / xd;
                 xd += 1.0;
