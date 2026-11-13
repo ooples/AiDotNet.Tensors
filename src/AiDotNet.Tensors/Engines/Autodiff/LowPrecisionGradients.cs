@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
@@ -77,5 +78,21 @@ internal static class LowPrecisionGradients
         var result = new float[planes * inH * inW];
         CpuEngine.AdaptiveAvgPool2DBackwardFloat(g, 0, result, 0, planes, inH, inW, outH, outW, accumulate: false);
         return Narrow<T>(result, inShape);
+    }
+
+    /// <summary>
+    /// Backward of the Half/BFloat16 <c>TensorNanMean</c>: upstream gradient over the slot's int count of non-NaN
+    /// elements, 0 at NaN positions, in float32 and rounded once. savedState: normalized axes, keepDims.
+    /// </summary>
+    internal static void NanMeanBackward<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var axes = (int[])savedState[0];
+        var input = inputs[0].IsContiguous ? inputs[0] : inputs[0].Contiguous();
+        var upstream = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        var grad = new Tensor<T>(CpuEngine.LowPrecisionNanMeanBackward(input.GetFlattenedData(),
+            upstream.GetFlattenedData(), input._shape, axes), (int[])input._shape.Clone());
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 }

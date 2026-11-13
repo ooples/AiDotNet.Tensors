@@ -153,7 +153,10 @@ public sealed class OpenClCommandQueue : IGpuStream
     {
         ThrowIfDisposed();
 
-        // Create a marker and query its status
+        // Drained by a clFinish with no enqueue anywhere since: complete, without waiting on the driver's event thread.
+        if (OpenClNativeBindings.IsKnownDrained(_handle)) return true;
+
+        // Otherwise create a marker and query its status
         int err = OpenClNativeBindings.EnqueueMarkerWithWaitList(_handle, 0, null, out IntPtr eventHandle);
         if (err != OpenClNativeBindings.CL_SUCCESS)
         {

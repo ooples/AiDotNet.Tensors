@@ -1242,7 +1242,12 @@ public class DirectPtxScientificTests
         float[] positions = new float[numPoints * 3];
         for (int i = 0; i < positions.Length; i++) positions[i] = (float)random.NextDouble();
         float[] table = Values(random, tableSize * fpl, 1.0f);
+        // The kernel writes only its level's fpl slots of each point's outputStride-wide row; the other slots belong to
+        // other levels and must keep whatever is there. Device allocations are not zeroed (cuMemAlloc, like
+        // torch.empty), so the output starts as a sentinel and every slot outside the level must still hold it.
+        const float untouched = -7.25f;
         var expected = new float[numPoints * outputStride];
+        for (int i = 0; i < expected.Length; i++) expected[i] = untouched;
         for (int n = 0; n < numPoints; n++)
             for (int f = 0; f < fpl; f++)
                 expected[n * outputStride + levelOffset + f] = NgpEncodeOracle(positions, table, n, f, resolution, tableSize, fpl);
@@ -1252,6 +1257,9 @@ public class DirectPtxScientificTests
         using var outBuf = runtime.AllocateBytes((nuint)(expected.Length * sizeof(float)));
         pos.Upload<float>(positions);
         tbl.Upload<float>(table);
+        var initial = new float[expected.Length];
+        for (int i = 0; i < initial.Length; i++) initial[i] = untouched;
+        outBuf.Upload<float>(initial);
         kernel.Launch(
             DirectPtxTensorView.CreateOwned(pos, kernel.Blueprint.Tensors[0]),
             DirectPtxTensorView.CreateOwned(tbl, kernel.Blueprint.Tensors[1]),
