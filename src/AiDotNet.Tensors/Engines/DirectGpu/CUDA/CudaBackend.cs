@@ -60,6 +60,47 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // holds it; this counts the holders. Both are changed only under ContextLifecycleLock.
     private static readonly Dictionary<IntPtr, int> PrimaryContextHolders = new();
 
+    // Every live backend, so an out-of-memory retry can reach the buffers its peers on the same primary context have
+    // parked: each backend's reuse pool may hold up to 1/PooledMemoryDivisor of the device, and draining only the
+    // failing backend's pool left an allocation failing while another engine on the device held reclaimable memory.
+    // Weak, so a registry entry never keeps an engine alive; its own lock, taken only to snapshot, so draining a peer
+    // never holds it (or orders it against ContextLifecycleLock).
+    private static readonly object s_devicePeersLock = new();
+    private static readonly List<WeakReference<CudaBackend>> s_devicePeers = new();
+
+    private void RegisterDevicePeer()
+    {
+        lock (s_devicePeersLock)
+        {
+            s_devicePeers.RemoveAll(peer => !peer.TryGetTarget(out _));
+            s_devicePeers.Add(new WeakReference<CudaBackend>(this));
+        }
+    }
+
+    private void UnregisterDevicePeer()
+    {
+        lock (s_devicePeersLock)
+            s_devicePeers.RemoveAll(peer => !peer.TryGetTarget(out var backend) || ReferenceEquals(backend, this));
+    }
+
+    /// <summary>Releases the reuse-pool buffers of every other live backend on this primary context.</summary>
+    private int DrainPeerPools()
+    {
+        var peers = new List<CudaBackend>();
+        lock (s_devicePeersLock)
+        {
+            foreach (var peer in s_devicePeers)
+            {
+                if (peer.TryGetTarget(out var backend) && !ReferenceEquals(backend, this) && !backend._disposed
+                    && backend._cudaContext == _cudaContext)
+                    peers.Add(backend);
+            }
+        }
+        int drained = 0;
+        foreach (var peer in peers) drained += peer._bufferPool.DrainAll();
+        return drained;
+    }
+
     /// <summary>Backends currently holding a primary context, over all devices (diagnostics and tests).</summary>
     internal static int PrimaryContextHolderCount
     {
@@ -707,6 +748,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(_cudaContext), "cuCtxPushCurrent(primary)");
             // A buffer may only free against a live context, and only against the lifetime it was allocated in.
             lock (ContextLifecycleLock) _contextGeneration = AddContextHolder(_cudaContext);
+            RegisterDevicePeer();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _mainStream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
             _defaultStream = new CudaStream(this, _mainStream, GpuStreamType.Default, ownsHandle: false);
@@ -2123,7 +2165,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Reclaim event-deferred frees first (#555) — under genuine pressure block on
             // their events so their device memory returns to the pool — then drain the pool.
             DrainDeferredFrees(blockOldest: true);
-            int drained = _bufferPool.DrainAll();
+            int drained = _bufferPool.DrainAll() + DrainPeerPools();
             // When _asyncAlloc is on, freed stream-ordered allocations are RETAINED in the default mem
             // pool (release threshold maxed for caching), so they show as device free=0 and the legacy
             // cuMemAlloc here can't reach them. Sync the context so pending cuMemFreeAsync reclamations
@@ -2312,8 +2354,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // with its real name rather than let it masquerade as the cuMemAllocAsync OOM below.
             // Trim is best-effort.
             // Buffers parked in the host-side reuse pool are still allocated as far as the driver knows; release
-            // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request.
+            // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request, and those
+            // of every other backend on this context, which the same sync and trim then return.
             _bufferPool.DrainAll();
+            DrainPeerPools();
             // GPU results are owned by their tensors and freed by the buffer finalizer once unreachable; the GC cannot see
             // device memory, so collect, run those finalizers and free what they queued. Then synchronize the context -
             // every backend shares it, so frees other backends queued into the same pool complete too - through the
@@ -19183,6 +19227,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
 
         _disposed = true;
+        UnregisterDevicePeer();
 
         // The multi-tensor tables hold device buffers: free them only on an explicit dispose, never from the
         // finalizer (the context may already be gone).

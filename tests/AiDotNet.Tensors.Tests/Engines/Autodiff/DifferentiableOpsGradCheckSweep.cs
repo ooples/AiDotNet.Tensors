@@ -180,6 +180,9 @@ public partial class DifferentiableOpsGradCheckSweep
         // CTC needs real log-probabilities and NON-BLANK targets (0 is the blank label).
         ["CTCLoss"] = r => [LogProbs(4, 1, 3, r), CtcTargets(2, 3, r), new[] { 4 }, new[] { 2 }, 0],
         ["TensorCTCLoss"] = r => [LogProbs(4, 1, 3, r), CtcTargets(2, 3, r), new[] { 4 }, new[] { 2 }, 0],
+        // Tridiagonal solve: bands [2, 2], diagonal and rhs [2, 3]; the diagonal is shifted to dominate the bands.
+        ["TensorTridiagonalSolve"] = r => [SafeTensor([2, 2], r), Shifted(SafeTensor([2, 3], r), 2.0), SafeTensor([2, 2], r),
+                                           SafeTensor([2, 3], r)],
 
         // --- fused GRU sequence: input [B, T, in], h0 [B, H], stacked gate weights [3H, in] / [3H, H], biases [3H] ---
         // Each form once: the reset-before form GRULayer uses, and PyTorch's reset-after form through the overload that
@@ -508,18 +511,18 @@ public partial class DifferentiableOpsGradCheckSweep
         return w;
     }
 
+    private static Tensor<double> Shifted(Tensor<double> t, double by)
+    {
+        for (int i = 0; i < t.Length; i++) t[i] += by;
+        return t;
+    }
+
     private static Tensor<double> SafeTensor(int[] shape, Random rng)
     {
         // Values in [0.35, 0.95]: away from 0 (log/sqrt/reciprocal domains, |.| kink) and away
         // from 1 (acos/atanh edges), all strictly positive so domain-restricted ops are valid.
         var t = new Tensor<double>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = 0.35 + rng.NextDouble() * 0.6;
-        return t;
-    }
-
-    private static Tensor<double> Shifted(Tensor<double> t, double offset)
-    {
-        for (int i = 0; i < t.Length; i++) t[i] += offset;
         return t;
     }
 

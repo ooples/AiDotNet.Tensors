@@ -498,8 +498,46 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
-        var reduce = (axes ?? AllAxes(tensor.Rank)).Select(a => NormalizeDim(a, tensor.Rank)).ToArray();
+        // Null or empty means every axis, as ReduceVariance (the taped path) and torch.var_mean(dim=None) read it.
+        var reduce = (axes is null || axes.Length == 0 ? AllAxes(tensor.Rank) : axes).Select(a => NormalizeDim(a, tensor.Rank)).ToArray();
         int count = reduce.Aggregate(1, (a, k) => a * tensor._shape[k]);
+        bool lowPrecision = IsLowPrecisionFloat<T>();
+        if (lowPrecision && !DifferentiableOps.IsTapeActiveForThread<T>() && !GraphMode.IsActive)
+        {
+            // Half/BFloat16: mean and variance accumulated and divided in float32, rounded once. The count and
+            // 1/(count - correction) do not survive conversion to Half above 65,504 elements.
+            var distinct = reduce.Distinct().ToArray();
+            var data = tensor.GetFlattenedData();
+            var varShape = LowPrecisionReducedShape(tensor._shape, distinct, keepDims);
+            int outSize = varShape.Aggregate(1, (a, k) => a * k);
+            var lowVar = TensorAllocator.Rent<T>(varShape, LowPrecisionAxisStatistic(data, tensor._shape, distinct, outSize, variance: true, correction: correction, squareRoot: false));
+            var lowMean = TensorAllocator.Rent<T>((int[])varShape.Clone(), LowPrecisionAxisStatistic(data, tensor._shape, distinct, outSize, variance: false, correction: 0, squareRoot: false));
+            return (lowVar, lowMean);
+        }
+        if (lowPrecision)
+        {
+            // Under a tape, Half/BFloat16 differentiate through the recorded ReduceVariance, whose forward and backward
+            // centre and square in float32 (a Half square of the centred value overflows: [0, 0, 0, 500] centres to 375,
+            // and 375^2 is +Inf in Half), times the O(1) factor count / (count - correction) instead of a Half
+            // 1 / (count - correction) (subnormal or zero in Half).
+            var distinctAxes = reduce.Distinct().ToArray();
+            var lowVariance = ReduceVariance(tensor, distinctAxes, keepDims);
+            double factor = (double)count / (count - correction);
+            T factorT = ops.FromDouble(factor);
+            if (double.IsInfinity(ops.ToDouble(factorT)))
+            {
+                // The factor itself overflows Half (count 65,536 with correction 65,535 gives 65,536 > 65,504), which
+                // would turn any positive variance into +Inf. It is at most int.MaxValue, so its square root (at most
+                // 46,341) is finite in Half: apply it as two recorded multiplies.
+                T rootT = ops.FromDouble(Math.Sqrt(factor));
+                lowVariance = TensorMultiplyScalar(TensorMultiplyScalar(lowVariance, rootT), rootT);
+            }
+            else
+            {
+                lowVariance = TensorMultiplyScalar(lowVariance, factorT);
+            }
+            return (lowVariance, ReduceMean(tensor, reduce, keepDims));
+        }
         var meanKept = ReduceMean(tensor, reduce, keepDims: true);
         var centered = TensorSubtract(tensor, TensorBroadcastTo(meanKept, LikeShape(tensor)));
         var variance = TensorMultiplyScalar(ReduceSum(TensorSquare(centered), reduce, keepDims), ops.FromDouble(1.0 / (count - correction)));

@@ -98,6 +98,8 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         ["TensorLcm"] = "an integer-only op; the CPU rejects float",
         ["TensorDiagonalScatter"] = "its source is a diagonal, not the input's shape",
         ["TensorGatherClassValues"] = "gathers with class indices of another shape",
+        // Compared GPU vs the scalar recurrence in NumericRecurrenceGpuTests.FritschCarlsonLimit_MatchesScalarRecurrence.
+        ["TensorFritschCarlsonLimit"] = "its secants are [..., n - 1] against slopes [..., n]",
     };
 
     private static readonly int[][] Shapes =

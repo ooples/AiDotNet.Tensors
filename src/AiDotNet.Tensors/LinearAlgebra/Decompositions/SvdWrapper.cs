@@ -138,6 +138,14 @@ internal static class SvdWrapper
     {
         // Compute Aᵀ·A (right Gram), eigendecompose for V and Σ², then U = A·V·Σ⁻¹.
         // For m < n we transpose (compute A·Aᵀ instead) to keep the Gram dimension small.
+        // decimal / Half / BFloat16: one-sided Jacobi SVD carried out in T (no Gram matrix, so the
+        // condition number is not squared).
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        {
+            GenericLinalg<T>.Svd(src, offSrc, u, offU, s, offS, vh, offVh, m, n, uCols, vRows);
+            return;
+        }
+
         bool tall = m >= n;
         int k = Math.Min(m, n);
 

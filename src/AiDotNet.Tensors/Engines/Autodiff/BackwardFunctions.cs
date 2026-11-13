@@ -3874,6 +3874,14 @@ internal static partial class BackwardFunctions<T>
             return;
         }
 
+        if (LowPrecisionGradients.Applies<T>())
+        {
+            // Half/BFloat16: g/N in float32, rounded once (N is +Inf in Half above 65,504).
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                LowPrecisionGradients.Filled<T>(inputs[0]._shape, LowPrecisionGradients.Upstream(gradOutput) / inputs[0].Length), engine);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T scale = numOps.Divide(gradOutput[0], numOps.FromDouble(inputs[0].Length));
         // Use RentUninitialized to go through TensorArena (cache-hot reuse)
@@ -3978,6 +3986,14 @@ internal static partial class BackwardFunctions<T>
             && gpu.TryAdaptiveAvgPool2DBackwardOnDevice(gradOutput, inShape, outH, outW) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
+
+        if (LowPrecisionGradients.Applies<T>())
+        {
+            // Half/BFloat16: the float32 kernel on the widened gradient, rounded once (1/count is subnormal in Half).
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                LowPrecisionGradients.AdaptiveAvgPool2DBackward(gradOutput, inShape, outH, outW), engine);
             return;
         }
 
@@ -4206,6 +4222,48 @@ internal static partial class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 
+    /// <summary>
+    /// The Half/BFloat16 gradient of a mean-reduced pairwise loss, <c>term(a[i], b[i]) * g / n</c>, evaluated in float32
+    /// and rounded once (2/n is subnormal in Half, and a Half product chain overflows). Under a createGraph backward it
+    /// is also recorded as an op of a, b and the upstream gradient g, whose backward is that map's exact float32
+    /// derivative: <c>u * g / n * dTermDa</c> for a, <c>u * g / n * dTermDb</c> for b and <c>sum(u * term) / n</c> for g.
+    /// The float32 helper alone returned an unrecorded tensor, so a second derivative through it was zero.
+    /// </summary>
+    private static Tensor<T> LowPrecisionLossGradient(Tensor<T> a, Tensor<T> b, Tensor<T> gradOutput,
+        Func<double, double, double> term, Func<double, double, double> dTermDa, Func<double, double, double> dTermDb)
+    {
+        int n = a.Length;
+        var gradient = LowPrecisionGradients.Pairwise(a, b, LowPrecisionGradients.Upstream(gradOutput) / n, term);
+        if (!DifferentiableOps._isBackwardCreateGraph) return gradient;
+        BackwardFunction<T> secondOrder = (upstream, ins, _, _, eng, secondGrads) =>
+        {
+            var u = LowPrecisionGradients.Widen(upstream);
+            var x = LowPrecisionGradients.Widen(ins[0]);
+            var y = LowPrecisionGradients.Widen(ins[1]);
+            double scale = LowPrecisionGradients.Upstream(ins[2]) / n;
+            if (DifferentiableOps.IsGradientRequired(ins[0]))
+            {
+                var da = new float[x.Length];
+                for (int i = 0; i < da.Length; i++) da[i] = (float)(u[i] * scale * dTermDa(x[i], y[i]));
+                DifferentiableOps.AccumulateGrad(secondGrads, ins[0], LowPrecisionGradients.Narrow<T>(da, ins[0]._shape), eng);
+            }
+            if (DifferentiableOps.IsGradientRequired(ins[1]))
+            {
+                var db = new float[x.Length];
+                for (int i = 0; i < db.Length; i++) db[i] = (float)(u[i] * scale * dTermDb(x[i], y[i]));
+                DifferentiableOps.AccumulateGrad(secondGrads, ins[1], LowPrecisionGradients.Narrow<T>(db, ins[1]._shape), eng);
+            }
+            if (DifferentiableOps.IsGradientRequired(ins[2]))
+            {
+                double sum = 0;
+                for (int i = 0; i < x.Length; i++) sum += u[i] * term(x[i], y[i]);
+                DifferentiableOps.AccumulateGrad(secondGrads, ins[2], LowPrecisionGradients.Filled<T>(ins[2]._shape, sum / n), eng);
+            }
+        };
+        DifferentiableOps.RecordIfActive("LowPrecisionLossGradient", gradient, new[] { a, b, gradOutput }, secondOrder);
+        return gradient;
+    }
+
     // The create-graph path of NarrowBackward, kept out of it so its first-order path allocates no closure.
     private static bool NarrowBackwardCreateGraph(
             Tensor<T> gradOutput,
@@ -4235,6 +4293,14 @@ internal static partial class BackwardFunctions<T>
             && gpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, predictions, deviceGrad, engine);
+            return;
+        }
+
+        if (LowPrecisionGradients.Applies<T>())
+        {
+            // Half/BFloat16: 2 (p - y) g / n in float32, rounded once (2/n is subnormal in Half).
+            DifferentiableOps.AccumulateGrad(grads, predictions, LowPrecisionLossGradient(predictions, targets, gradOutput,
+                (p, y) => 2.0 * (p - y), (_, _) => 2.0, (_, _) => -2.0), engine);
             return;
         }
 
@@ -4271,6 +4337,12 @@ internal static partial class BackwardFunctions<T>
             && scaleGpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceScaled)
         {
             predGrad = deviceScaled;
+        }
+        else if (LowPrecisionGradients.Applies<T>())
+        {
+            // Half/BFloat16: 2 (p - y) g / n in float32, rounded once.
+            predGrad = LowPrecisionLossGradient(predictions, targets, gradOutput,
+                (p, t) => 2.0 * (p - t), (_, _) => 2.0, (_, _) => -2.0);
         }
         else
         {
@@ -4318,6 +4390,12 @@ internal static partial class BackwardFunctions<T>
         {
             predGrad = deviceScaled;
         }
+        else if (LowPrecisionGradients.Applies<T>())
+        {
+            // Half/BFloat16: 2 (p - y) g / n in float32, rounded once.
+            predGrad = LowPrecisionLossGradient(predictions, y, gradOutput,
+                (p, t) => 2.0 * (p - t), (_, _) => 2.0, (_, _) => -2.0);
+        }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
@@ -4338,6 +4416,16 @@ internal static partial class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var logits = inputs[0];
         var targets = inputs[1];
+        if (LowPrecisionGradients.Applies<T>())
+        {
+            // Half/BFloat16: (sigmoid(x) - t) g / n in float32, rounded once.
+            DifferentiableOps.AccumulateGrad(grads, logits, LowPrecisionLossGradient(logits, targets, gradOutput,
+                (x, t) => 1.0 / (1.0 + Math.Exp(-x)) - t,
+                (x, _) => { double s = 1.0 / (1.0 + Math.Exp(-x)); return s * (1.0 - s); },
+                (_, _) => -1.0), engine);
+            return;
+        }
+
         // sigmoid(logits) - targets, scaled by gradOutput[0] / n
         var sig = engine.TensorSigmoid(logits);
         var diff = engine.TensorSubtract(sig, targets);
@@ -4452,6 +4540,10 @@ internal static partial class BackwardFunctions<T>
         if (TrySecondOrderL1Loss(gradOutput, inputs, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
+        // One path for every element type, Half and BFloat16 included, through engine ops that stay on the device: the
+        // difference of two distinct Half or BFloat16 values rounds to a nonzero value of the right sign (both keep
+        // subnormals), so sign(p - y) is exact, and +-1 times g / n (computed in double, rounded to T once) is exactly
+        // that rounded scale: the single rounding the float32 host map gave, without its download and re-upload.
         double scale = numOps.ToDouble(gradOutput[0]) / inputs[0].Length;
         var diff = engine.TensorSubtract(inputs[0], target);
         var signDiff = engine.TensorSign(diff);
@@ -4469,6 +4561,11 @@ internal static partial class BackwardFunctions<T>
         var target = inputs[1];
         double delta = (double)savedState[0];
         if (TrySecondOrderHuberLoss(gradOutput, inputs, engine, grads, delta)) return;
+        if (LowPrecisionGradients.Applies<T>())
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionHuberGradient(inputs[0], target, gradOutput, delta), engine);
+            return;
+        }
         T scaleT = numOps.FromDouble(numOps.ToDouble(gradOutput[0]) / inputs[0].Length);
         // Huber gradient = clamp(diff, -delta, delta) * scale
         // clamp gives diff when |d|<=delta, delta*sign(d) when |d|>delta — exactly the Huber derivative
@@ -4477,6 +4574,14 @@ internal static partial class BackwardFunctions<T>
         var grad = engine.TensorMultiplyScalar(clamped, scaleT);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // Half/BFloat16: clamp(p - y, -delta, delta) g / n in float32, rounded once. Its own method: the lambdas capture
+    // delta, and a capture inside HuberLossBackward allocated a closure on every call, first-order float ones too.
+    private static Tensor<T> LowPrecisionHuberGradient(Tensor<T> predictions, Tensor<T> target, Tensor<T> gradOutput, double delta) =>
+        LowPrecisionLossGradient(predictions, target, gradOutput,
+            (p, y) => Math.Max(-delta, Math.Min(delta, p - y)),
+            (p, y) => Math.Abs(p - y) <= delta ? 1.0 : 0.0,
+            (p, y) => Math.Abs(p - y) <= delta ? -1.0 : 0.0);
 
     /// <summary>KL divergence loss backward</summary>
     internal static void KLDivLossBackward(
@@ -4487,6 +4592,13 @@ internal static partial class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var target = inputs[1];
         // d(KL)/d(input) = -target / N * gradOutput[0]
+        if (LowPrecisionGradients.Applies<T>())
+        {
+            // Half/BFloat16: evaluated in float32, rounded once (1/N is subnormal in Half).
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], LowPrecisionGradients.Pairwise(inputs[0], target,
+                -LowPrecisionGradients.Upstream(gradOutput) / inputs[0].Length, (x, t) => t), engine);
+            return;
+        }
         T scaleT = numOps.FromDouble(-numOps.ToDouble(gradOutput[0]) / inputs[0].Length);
         var grad = engine.TensorMultiplyScalar(target, scaleT);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -4800,6 +4912,15 @@ internal static partial class BackwardFunctions<T>
         var inShape = inputs[0]._shape;
         int batch = inShape[0], channels = inShape[1], length = inShape[2];
         int outLength = (length - kernelSize) / stride + 1;
+        if (LowPrecisionGradients.Applies<T>() && !CreatesGraph)
+        {
+            // Half/BFloat16: g / kernelSize in float32, rounded once (1/kernelSize is subnormal in Half). Not under
+            // createGraph: that array-built tensor is unrecorded, so a second backward through the pool would see no
+            // dependency on gradOutput; the recorded sparse map below keeps it, as MeanBackward's create-graph path does.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0],
+                LowPrecisionGradients.AvgPool1DBackward(gradOutput, inShape, kernelSize, stride), engine);
+            return;
+        }
         T scale = numOps.FromDouble(1.0 / kernelSize);
 
         if (CreatesGraph)
@@ -7046,116 +7167,23 @@ internal static partial class BackwardFunctions<T>
         int blank = (int)savedState[4];
         if (TrySecondOrderCtcLoss(gradOutput, inputs, engine, grads, targets, inputLengths, targetLengths, blank)) return;
 
-        var ops = MathHelper.GetNumericOperations<T>();
-        int maxT = logProbs._shape[0];
-        int batchSize = logProbs._shape[1];
-        int numClasses = logProbs._shape[2];
-
-        var grad = new Tensor<T>(logProbs._shape);
-
-        int targetOffset = 0;
-        for (int n = 0; n < batchSize; n++)
-        {
-            int T_n = inputLengths[n];
-            int U_n = targetLengths[n];
-            int S = 2 * U_n + 1;
-
-            var expandedLabels = new int[S];
-            for (int s = 0; s < S; s++)
-                expandedLabels[s] = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
-
-            double negInf = double.NegativeInfinity;
-
-            // Alpha (forward) pass
-            var alpha = new double[T_n, S];
-            for (int t = 0; t < T_n; t++)
-                for (int s = 0; s < S; s++)
-                    alpha[t, s] = negInf;
-            alpha[0, 0] = ops.ToDouble(logProbs[0, n, expandedLabels[0]]);
-            if (S > 1) alpha[0, 1] = ops.ToDouble(logProbs[0, n, expandedLabels[1]]);
-            for (int t = 1; t < T_n; t++)
-            {
-                for (int s = 0; s < S; s++)
-                {
-                    double lp = ops.ToDouble(logProbs[t, n, expandedLabels[s]]);
-                    double prev = alpha[t - 1, s];
-                    if (s >= 1) prev = LogSumExpHelper(prev, alpha[t - 1, s - 1]);
-                    if (s >= 2 && expandedLabels[s] != blank && expandedLabels[s] != expandedLabels[s - 2])
-                        prev = LogSumExpHelper(prev, alpha[t - 1, s - 2]);
-                    alpha[t, s] = prev + lp;
-                }
-            }
-
-            // Beta (backward) pass
-            var beta = new double[T_n, S];
-            for (int t = 0; t < T_n; t++)
-                for (int s = 0; s < S; s++)
-                    beta[t, s] = negInf;
-            beta[T_n - 1, S - 1] = 0;
-            if (S >= 2) beta[T_n - 1, S - 2] = 0;
-            for (int t = T_n - 2; t >= 0; t--)
-            {
-                for (int s = S - 1; s >= 0; s--)
-                {
-                    double next = beta[t + 1, s] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s]]);
-                    if (s + 1 < S)
-                        next = LogSumExpHelper(next, beta[t + 1, s + 1] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 1]]));
-                    if (s + 2 < S && expandedLabels[s + 2] != blank && expandedLabels[s + 2] != expandedLabels[s])
-                        next = LogSumExpHelper(next, beta[t + 1, s + 2] + ops.ToDouble(logProbs[t + 1, n, expandedLabels[s + 2]]));
-                    beta[t, s] = next;
-                }
-            }
-
-            // Total log prob
-            double logProbTotal = alpha[T_n - 1, S - 1];
-            if (S >= 2) logProbTotal = LogSumExpHelper(logProbTotal, alpha[T_n - 1, S - 2]);
-
-            // Gradient with respect to LOG-PROBABILITIES:
-            //     d(-logP)/d(logProbs[t,n,k]) = -(1/P) * sum_{s : label_s == k} alpha[t,s]*beta[t,s]
-            //                                 = -posterior[t,k]
-            //
-            // This previously computed `prob[t,k] - posterior[t,k]`, which is the gradient with
-            // respect to the pre-softmax LOGITS — the familiar Graves-2006 form, correct only when
-            // you additionally chain through logProbs = log_softmax(logits), where
-            // d logProbs[t,j]/d logits[t,k] = delta_jk - prob[t,k] and sum_j posterior[t,j] = 1
-            // together contribute the extra prob[t,k] term.
-            //
-            // CpuEngine.TensorCTCLoss consumes logProbs DIRECTLY — it runs the forward-backward
-            // recursion in the log domain and never applies a log_softmax — so that extra term does
-            // not belong here. It made the reported gradient wrong by exactly prob[t,k] for every
-            // element, including a spurious NON-ZERO gradient for classes absent from the target
-            // (whose true posterior, and therefore true gradient, is 0).
-            double gOut = ops.ToDouble(gradOutput.GetFlat(n));
-            for (int t = 0; t < T_n; t++)
-            {
-                // Accumulate alpha*beta per class
-                var abSum = new double[numClasses];
-                for (int i = 0; i < numClasses; i++) abSum[i] = negInf;
-                for (int s = 0; s < S; s++)
-                {
-                    int k = expandedLabels[s];
-                    abSum[k] = LogSumExpHelper(abSum[k], alpha[t, s] + beta[t, s]);
-                }
-
-                for (int k = 0; k < numClasses; k++)
-                {
-                    double gradVal = -Math.Exp(abSum[k] - logProbTotal);
-                    grad[t, n, k] = ops.FromDouble(gOut * gradVal);
-                }
-            }
-
-            targetOffset += U_n;
-        }
+        // Gradient with respect to LOG-PROBABILITIES:
+        //     d(-logP)/d(logProbs[t,n,k]) = -(1/P) * sum_{s : label_s == k} alpha[t,s]*beta[t,s]
+        //                                 = -posterior[t,n,k]
+        //
+        // Not prob[t,k] - posterior[t,k]: that is the gradient with respect to the pre-softmax LOGITS (the
+        // Graves-2006 form), correct only when chaining through logProbs = log_softmax(logits). TensorCTCLoss
+        // consumes logProbs DIRECTLY, so the extra prob term does not belong here (it gave classes absent from
+        // the target a spurious non-zero gradient).
+        //
+        // The posteriors come from the engine op that shares the loss's lattice (CtcLattice), so they run on the
+        // device on a GPU engine; times past an item's input length get zero.
+        var gamma = engine.TensorCTCLabelPosteriors(logProbs, targets, inputLengths, targetLengths, blank);
+        // Broadcast explicitly: the [1, N, 1] scale against [T, N, C] would throw under a caller's ShapePolicy.Strict().
+        var scale = engine.Reshape(engine.TensorNegate(gradOutput), new[] { 1, logProbs._shape[1], 1 });
+        var grad = engine.TensorMultiply(gamma, engine.TensorBroadcastTo(scale, gamma._shape));
 
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
-    }
-
-    private static double LogSumExpHelper(double a, double b)
-    {
-        if (double.IsNegativeInfinity(a)) return b;
-        if (double.IsNegativeInfinity(b)) return a;
-        double max = Math.Max(a, b);
-        return max + Math.Log(Math.Exp(a - max) + Math.Exp(b - max));
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -9839,10 +9867,11 @@ internal static partial class BackwardFunctions<T>
             double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
             // Use the same asymptotic digamma formula as TensorDigamma.
             double shift = 0;
-            while (xd < 6.0) { shift -= 1.0 / xd; xd += 1.0; }
+            while (xd < 10.0) { shift -= 1.0 / xd; xd += 1.0; }
             double inv = 1.0 / xd; double inv2 = inv * inv;
             double series = System.Math.Log(xd) - 0.5 * inv
-                - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 / 252.0));
+                - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0
+                    - inv2 * (1.0 / 132.0 - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))));
             dX[i] = ops.Multiply(dY[i], ops.FromDouble(shift + series));
         }
         DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
