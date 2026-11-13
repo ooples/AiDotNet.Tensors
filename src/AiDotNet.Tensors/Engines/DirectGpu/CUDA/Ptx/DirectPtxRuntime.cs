@@ -104,9 +104,13 @@ internal sealed class DirectPtxRuntime : IDisposable
         _ = CuBlasNative.cuDevicePrimaryCtxSetFlags(device, contextScheduling);
         Check(CuBlasNative.cuDevicePrimaryCtxRetain(out _context, device), "cuDevicePrimaryCtxRetain");
         _retainedPrimaryDevice = device;
-        Check(CuBlasNative.cuCtxPushCurrent(_context), "cuCtxPushCurrent(primary)");
+        // Every step after the retain is covered: a constructor that throws returns nothing a caller could dispose, so
+        // the stream it created, the context it pushed and the reference it retained are all given back here.
+        bool pushed = false;
         try
         {
+            Check(CuBlasNative.cuCtxPushCurrent(_context), "cuCtxPushCurrent(primary)");
+            pushed = true;
             // Standalone buffers use the synchronous Driver-API copy calls, which execute
             // in the legacy default-stream ordering domain. A blocking stream preserves
             // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
@@ -114,17 +118,16 @@ internal sealed class DirectPtxRuntime : IDisposable
             Check(CudaNativeBindings.cuStreamCreate(out _ownStream, CudaNativeBindings.CU_STREAM_DEFAULT),
                 "cuStreamCreate(blocking)");
             _ownsStream = true;
+            Check(CuBlasNative.cuCtxPopCurrent(out IntPtr popped), "cuCtxPopCurrent");
+            pushed = false;
+            if (popped != _context)
+                throw new InvalidOperationException("CUDA returned a different context from cuCtxPopCurrent.");
         }
         catch
         {
-            CuBlasNative.cuCtxPopCurrent(out _);
-            CuBlasNative.cuDevicePrimaryCtxRelease(device);
-            _context = IntPtr.Zero;
+            ReleaseFailedConstruction(device, pushed);
             throw;
         }
-        Check(CuBlasNative.cuCtxPopCurrent(out IntPtr popped), "cuCtxPopCurrent");
-        if (popped != _context)
-            throw new InvalidOperationException("CUDA returned a different context from cuCtxPopCurrent.");
 
         _ownsContext = false;
         DeviceOrdinal = deviceOrdinal;
@@ -142,6 +145,25 @@ internal sealed class DirectPtxRuntime : IDisposable
         // Byte-identical to the legacy fingerprint string, so existing on-disk
         // autotune caches keyed by DeviceFingerprint remain valid.
         DeviceFingerprint = Fingerprint.ToCacheToken();
+    }
+
+    // Undoes a standalone constructor that failed after retaining the primary context: destroys the stream (with the
+    // context current), pops the context if it is still pushed, and releases the retained reference exactly once.
+    private void ReleaseFailedConstruction(int device, bool pushed)
+    {
+        if (_ownStream != IntPtr.Zero)
+        {
+            bool current = pushed || CuBlasNative.cuCtxPushCurrent(_context) == CudaResult.Success;
+            CudaNativeBindings.cuStreamDestroy(_ownStream);
+            _ownStream = IntPtr.Zero;
+            if (current) CuBlasNative.cuCtxPopCurrent(out _);
+        }
+        else if (pushed)
+        {
+            CuBlasNative.cuCtxPopCurrent(out _);
+        }
+        CuBlasNative.cuDevicePrimaryCtxRelease(device);
+        _context = IntPtr.Zero;
     }
 
     /// <summary>
@@ -646,7 +668,10 @@ internal sealed class DirectPtxRuntime : IDisposable
         if (_disposed) return;
         if (_retainedPrimaryDevice >= 0 && _context != IntPtr.Zero)
         {
-            foreach (var resource in new List<IDisposable>(_live.Keys))
+            // Executable graphs first: they launch kernels from the modules and read the buffers released after them.
+            var leftovers = new List<IDisposable>(_live.Keys);
+            leftovers.Sort((a, b) => (b is DirectPtxGraph).CompareTo(a is DirectPtxGraph));
+            foreach (var resource in leftovers)
             {
                 try
                 {
@@ -736,6 +761,7 @@ internal sealed class DirectPtxGraph : IDisposable
     {
         _runtime = runtime;
         _graphExec = graphExec;
+        runtime.TrackResource(this);
     }
 
     internal void Launch()
@@ -750,6 +776,7 @@ internal sealed class DirectPtxGraph : IDisposable
         if (_graphExec == IntPtr.Zero) return;
         _runtime.DestroyGraph(_graphExec);
         _graphExec = IntPtr.Zero;
+        _runtime.UntrackResource(this);
     }
 }
 
@@ -778,6 +805,10 @@ internal sealed class DirectPtxBuffer : IDisposable
         // A stream-local barrier preserves ordering without stalling unrelated
         // streams or other contexts on the device.
         _runtime.Synchronize();
+        // The copy and the null-stream synchronize below use the legacy default stream, which CUDA forbids while any
+        // blocking stream of the same context is capturing. The primary context is shared with every backend and
+        // standalone runtime on the device, so the whole transfer waits for an open capture to end.
+        lock (CudaBackend.CaptureGateFor(_runtime.Context))
         fixed (T* pSource = source)
         {
             DirectPtxRuntime.Check(
@@ -820,6 +851,8 @@ internal sealed class DirectPtxBuffer : IDisposable
         // Make Download independently correct when the caller omits an explicit
         // barrier, while waiting only for the stream that produces this buffer.
         _runtime.Synchronize();
+        // A legacy default-stream copy, so it waits for an open capture on the shared context to end (see Upload).
+        lock (CudaBackend.CaptureGateFor(_runtime.Context))
         fixed (T* pDestination = destination)
             DirectPtxRuntime.Check(
                 CudaNativeBindings.cuMemcpyDtoH((IntPtr)pDestination, _pointer, checked((ulong)bytes)),
