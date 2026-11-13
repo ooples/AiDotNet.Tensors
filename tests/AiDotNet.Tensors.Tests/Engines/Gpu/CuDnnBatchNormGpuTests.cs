@@ -85,9 +85,7 @@ public class CuDnnBatchNormGpuTests
                     epsilon: 1e-5,
                     dataType: CuDnnNative.CudnnDataType.Half));
 
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
             Assert.Null(ex);
         }

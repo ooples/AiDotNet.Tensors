@@ -80,9 +80,7 @@ public class CuDnnSoftmaxGpuTests
                 softmax.ForwardGpu(input.DevicePtr, output.DevicePtr,
                     n, c, h, w, CuDnnNative.CudnnDataType.Half));
 
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
             Assert.Null(ex);
         }

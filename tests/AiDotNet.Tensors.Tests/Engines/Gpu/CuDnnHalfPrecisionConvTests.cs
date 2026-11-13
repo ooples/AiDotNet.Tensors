@@ -74,16 +74,14 @@ public class CuDnnHalfPrecisionConvTests
             // CudnnStatus.NotSupported, which our CheckStatus converts
             // into InvalidOperationException. We treat that as a skip
             // (algorithm unavailable, not a correctness regression).
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
 
             Assert.Null(ex);
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Conv2DForwardGpu_AcceptsBFloat16Dtype_WithoutThrowing()
     {
         if (!CuDnnAvailable) return;
@@ -120,12 +118,10 @@ public class CuDnnHalfPrecisionConvTests
                     dilationH: 1, dilationW: 1,
                     dataType: CuDnnNative.CudnnDataType.BFloat16));
 
-            // BF16 requires Ampere+ (compute capability >= 8.0). Pre-Ampere
-            // cuDNN versions return NotSupported / ArchMismatch — treat as skip.
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
-                return;
+            // BF16 convolution requires Ampere+ (compute capability >= 8.0); before it cuDNN reports
+            // CUDNN_STATUS_NOT_SUPPORTED_ARCH_MISMATCH. Reported as a skip, not a pass, so the lane's skip summary shows
+            // the BF16 path was not exercised on this device (CudaBackend itself refuses BF16 conv below sm_80).
+            Skip.If(CuDnnUnsupported.Is(ex), "BFloat16 cuDNN convolution requires sm_80+ (Ampere): " + ex?.Message);
 
             Assert.Null(ex);
         }
@@ -165,9 +161,7 @@ public class CuDnnHalfPrecisionConvTests
                     n, c, h, w, k, fh, fw, outH, outW,
                     dataType: CuDnnNative.CudnnDataType.Half));
 
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
             Assert.Null(ex);
         }
@@ -207,9 +201,7 @@ public class CuDnnHalfPrecisionConvTests
                     n, c, h, w, k, fh, fw, outH, outW,
                     dataType: CuDnnNative.CudnnDataType.Half));
 
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
             Assert.Null(ex);
         }
@@ -239,9 +231,7 @@ public class CuDnnHalfPrecisionConvTests
                     gpuIn.DevicePtr, gpuOut.DevicePtr, n, c, h, w,
                     dataType: CuDnnNative.CudnnDataType.Half));
 
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
             Assert.Null(ex);
         }
