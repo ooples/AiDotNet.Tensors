@@ -373,6 +373,13 @@ jobs:
       if: matrix.arch != 'pr-models'
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
+    # The card is shared with research runs on the same machine; see the script. The cap keeps the wait inside each
+    # lane's budget: the suites' watchdog counts from the job start on a pull request.
+    - name: Wait for a quiet GPU
+      run: >-
+        ./AiDotNet.Tensors/scripts/ci/wait-for-quiet-gpu.ps1 -Label 'the GPU suites'
+        -MaxWaitMinutes ${{ matrix.arch == 'sm86' && 60 || (matrix.arch == 'pr' || matrix.arch == 'pr-models') && 15 || 30 }}
+
     - name: GPU suites (DirectGpu, Autodiff, Compilation, Parity)
       if: ${{ !inputs.ratchets_only && matrix.arch != 'pr-models' }}
       env:
@@ -657,6 +664,10 @@ jobs:
     # before this step, 360 in it, and the upload). They run only after every earlier step passed, so a red night does
     # not hold the shared runner for hours more. A deferral (no baseline for the machine class, a torch that cannot reach
     # the device) fails the step, and so does a missing network: each of the nine must report a pass or a failure.
+    - name: Wait for a quiet GPU before the timings
+      if: ${{ success() && matrix.arch == 'sm86' && github.event_name != 'pull_request' }}
+      run: ./AiDotNet.Tensors/scripts/ci/wait-for-quiet-gpu.ps1 -Label 'the step-time ratchets' -MaxWaitMinutes 60
+
     - name: CUDA step-time ratchets (nightly)
       if: ${{ success() && matrix.arch == 'sm86' && github.event_name != 'pull_request' }}
       timeout-minutes: 360
