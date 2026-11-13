@@ -29,10 +29,10 @@ public class VulkanBufferPoolTests
         }
         Skip.If(backend is null, "No Vulkan device.");
         Skip.IfNot(VulkanGpuBuffer.PoolingEnabled, "Vulkan buffer pooling is disabled by the environment.");
-        // Every test here needs a pool with room: at its budget (a quarter of device memory) the pool frees a returned
-        // buffer instead of parking it, so nothing is reused. The tests that ran earlier in this process leave it as
-        // full as they made it: on a 6 GB RTX 1000 Ada the DirectGpu suites left about 1,500 buffers parked, and five
-        // tests here saw no reuse at all (2026-11-12). Parked buffers are idle, so releasing them changes nothing else.
+        // The pool is process-wide and capped at a quarter of device memory. By the time this collection runs, the
+        // suites before it can have parked buffers up to that cap (1,240 of them on a 6 GB laptop GPU), and a full
+        // pool frees every return instead of parking it, so no reuse these tests assert could happen. Each test
+        // starts from an empty pool.
         VulkanGpuBuffer.Pool.DrainAll();
         return backend!;
     }

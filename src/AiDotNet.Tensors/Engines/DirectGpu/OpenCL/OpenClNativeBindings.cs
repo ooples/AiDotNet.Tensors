@@ -286,6 +286,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         [DllImport(OpenClLibrary, EntryPoint = "clReleaseMemObject")]
         public static extern int ReleaseMemObject(IntPtr memObj);
 
+        [DllImport(OpenClLibrary, EntryPoint = "clRetainMemObject")]
+        public static extern int RetainMemObject(IntPtr memObj);
+
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueReadBuffer")]
         public static extern int EnqueueReadBuffer(
             IntPtr commandQueue,
