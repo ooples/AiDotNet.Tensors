@@ -54,8 +54,14 @@ public partial class CpuEngine
         return branch == BoxMullerBranch.Sine ? r * Math.Sin(2.0 * Math.PI * u2) : r * Math.Cos(2.0 * Math.PI * u2);
     }
 
-    private static void ValidateBranch(BoxMullerVariant variant)
+    /// <summary>Every rule of <paramref name="variant"/> is a defined value: checked before the first draw, so an invalid
+    /// convention throws with the caller's Random untouched (and even when there is nothing to draw).</summary>
+    internal static void ValidateVariant(BoxMullerVariant variant)
     {
+        if (variant.FirstUniform < BoxMullerFirstUniform.Raw || variant.FirstUniform > BoxMullerFirstUniform.RedrawPairWhileZero)
+            throw new ArgumentOutOfRangeException(nameof(variant), variant.FirstUniform, "Unknown Box-Muller first-uniform rule.");
+        if (variant.SecondUniform != BoxMullerSecondUniform.Raw && variant.SecondUniform != BoxMullerSecondUniform.OneMinus)
+            throw new ArgumentOutOfRangeException(nameof(variant), variant.SecondUniform, "Unknown Box-Muller second-uniform rule.");
         if (variant.Branch != BoxMullerBranch.Cosine && variant.Branch != BoxMullerBranch.Sine)
             throw new ArgumentOutOfRangeException(nameof(variant), variant.Branch, "Unknown Box-Muller branch.");
     }
@@ -135,7 +141,7 @@ public partial class CpuEngine
     {
         if (generator is null) throw new ArgumentNullException(nameof(generator));
         int count = (int)ElementCountOf(shape ?? throw new ArgumentNullException(nameof(shape)));
-        ValidateBranch(variant);
+        ValidateVariant(variant);
         ValidateClampBounds(low, high);
         var result = new Tensor<T>((int[])shape.Clone());
         if (count == 0) return result;
@@ -178,7 +184,7 @@ public partial class CpuEngine
         if (generator is null) throw new ArgumentNullException(nameof(generator));
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         ValidateGammaShape(shape);
-        ValidateBranch(normal);
+        ValidateVariant(normal);
         var scales = RoIAlignPlan.ToDoubles(scale);
         var values = DrawGammas(generator, null, shape, scales, normal);
         var result = new Tensor<T>((int[])scale._shape.Clone());
@@ -195,7 +201,7 @@ public partial class CpuEngine
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         if (!SameShape(shape._shape, scale._shape))
             throw new ArgumentException($"shape and scale must have the same shape; got [{string.Join(", ", shape._shape)}] and [{string.Join(", ", scale._shape)}].", nameof(scale));
-        ValidateBranch(normal);
+        ValidateVariant(normal);
         var shapes = RoIAlignPlan.ToDoubles(shape);
         foreach (double s in shapes) ValidateGammaShape(s);
         var values = DrawGammas(generator, shapes, 0.0, RoIAlignPlan.ToDoubles(scale), normal);

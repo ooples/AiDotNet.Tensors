@@ -59,6 +59,9 @@ public partial class CpuEngine
                 if (row < 0 || row >= vocab) continue;
                 src.Slice(k * rowSize, rowSize).CopyTo(dst.Slice((int)row * rowSize, rowSize));
             }
+            // The lease does not bump the version: an in-place write must, or a cached device copy (and a tape's
+            // saved-tensor check) would keep the old rows.
+            table.IncrementVersion();
             return;
         }
         // A strided view: each element goes to its storage slot.

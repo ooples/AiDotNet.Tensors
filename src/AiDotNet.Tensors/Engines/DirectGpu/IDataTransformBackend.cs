@@ -17,8 +17,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </remarks>
 internal interface IDataTransformBackend
 {
-    /// <summary><c>output[i] = mean + std * sqrt(-2 ln uv[2i]) cos(2 pi uv[2i+1])</c> (sin for
-    /// <see cref="BoxMullerBranch.Sine"/>), clamped to [low, high] when <paramref name="clamp"/>.</summary>
+    /// <summary><c>output[i] = mean + std * uv[2i] cos(2 pi uv[2i+1])</c> (sin for <see cref="BoxMullerBranch.Sine"/>),
+    /// clamped to [low, high] when <paramref name="clamp"/>; <c>uv[2i]</c> is the radius <c>sqrt(-2 ln u1)</c>, taken on
+    /// the host in double.</summary>
     bool TryBoxMuller(IGpuBuffer uniforms, IGpuBuffer output, int count, BoxMullerBranch branch, float mean, float std,
         bool clamp, float low, float high);
 
