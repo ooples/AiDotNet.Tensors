@@ -165,6 +165,50 @@ jobs:
       run:
         shell: pwsh
     steps:
+    # First, before anything writes: these runners keep caches between jobs, and a full drive failed later steps in ways
+    # that hid the cause (gtx1660ti-cuda, 11-12/13: cuDNN's DLL vanished from its cache, then its re-download hit "not
+    # enough space on the disk" and the test build output was missing). Report the free space and every cache this job
+    # keeps, drop what is stale or regenerable when space is short, and stop with the measurements if it is still short.
+    - name: Runner disk
+      run: |
+        $minFreeGb = 20
+        $drive = Split-Path -Qualifier $env:GITHUB_WORKSPACE
+        function Free-Gb { [math]::Round((Get-PSDrive ($drive.TrimEnd(':'))).Free / 1GB, 1) }
+        function Size-Gb([string] $path) {
+          if (-not (Test-Path -LiteralPath $path)) { return 0 }
+          $sum = (Get-ChildItem -LiteralPath $path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+          [math]::Round([double]$sum / 1GB, 2)
+        }
+        $caches = [ordered]@{
+          'torch compile cache' = "$drive\ti"
+          'NuGet packages' = Join-Path $env:USERPROFILE '.nuget\packages'
+          'NuGet http-cache' = Join-Path $env:LOCALAPPDATA 'NuGet\v3-cache'
+          'runner temp' = $env:RUNNER_TEMP
+        }
+        Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Directory -Force -ErrorAction SilentlyContinue |
+          ForEach-Object { $caches["workspace\$($_.Name)"] = $_.FullName }
+        $report = { "Free on ${drive}: $(Free-Gb) GB"; foreach ($k in $caches.Keys) { "  ${k}: $(Size-Gb $caches[$k]) GB" } }
+        & $report | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+        # Always stale: cuDNN trees of versions this workflow no longer pins (the cuDNN step names the current one).
+        $current = 'cudnn-9.26.1.1'
+        Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Directory -Filter 'cudnn-*' -ErrorAction SilentlyContinue |
+          Where-Object Name -ne $current | ForEach-Object { Write-Output "Removing stale $($_.Name)"; Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+
+        if ((Free-Gb) -lt $minFreeGb) {
+          # Regenerable, in order of cost to rebuild: the torch compile cache and NuGet's HTTP cache.
+          foreach ($path in @("$drive\ti", (Join-Path $env:LOCALAPPDATA 'NuGet\v3-cache'))) {
+            if (Test-Path -LiteralPath $path) { Write-Output "Low on space: clearing $path"; Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+        }
+        $free = Free-Gb
+        if ($free -lt $minFreeGb) {
+          & $report
+          Write-Output "::error::Only $free GB free on $drive (this job needs $minFreeGb GB). The sizes above are what this runner keeps; free space on this machine."
+          exit 1
+        }
+        "Free on ${drive} after cleanup: $free GB" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       with:
         path: AiDotNet.Tensors
