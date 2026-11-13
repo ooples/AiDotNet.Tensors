@@ -5,7 +5,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
-namespace AiDotNet.Tensors.Tests.Engines;
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// Half sums, matmuls, cumulative sums, norms, dot products and softmax denominators on
