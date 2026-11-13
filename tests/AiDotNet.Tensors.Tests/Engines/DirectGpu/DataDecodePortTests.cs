@@ -131,6 +131,48 @@ internal static class DataDecodeChecks
         CheckScan(backend, decode);
         CheckSplit(backend, decode);
         CheckParse(backend, decode);
+        CheckEncode(backend, decode);
+    }
+
+    // The encode kernel against CpuEngine.TensorToBytes on a float tensor: every target type, both byte orders, an odd
+    // count (the last word partial for narrow types), random floats over the whole exponent range plus the edge values
+    // (signed zeros, infinities, a quiet NaN, half's overflow and subnormal boundaries, integer range edges).
+    private static void CheckEncode(IDirectGpuBackend backend, IDataDecodeBackend decode)
+    {
+        var rng = RandomHelper.CreateSeededRandom(14);
+        var values = new List<float>
+        {
+            0f, -0f, float.PositiveInfinity, float.NegativeInfinity, float.NaN, 65504f, 65519.99f, 65520f, 5.96e-8f,
+            2.98e-8f, 6.1035156e-5f, 1.0009766f, 1.0004883f, 127.5f, -128.5f, 255.9f, 2147483520f, -2147483648f,
+            3e9f, -3e9f, 9.3e18f, -9.3e18f, 1e30f, float.Epsilon, -float.Epsilon, float.MaxValue,
+        };
+        var bits = new byte[4];
+        while (values.Count < 20001)
+        {
+            rng.NextBytes(bits);
+            float f = BitConverter.ToSingle(bits, 0);
+            if (!float.IsNaN(f)) values.Add(rng.Next(3) == 0 ? (float)Math.Round(f % 70000f, 1) : f);
+        }
+        var input = values.ToArray();
+        var tensor = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(input, new[] { input.Length });
+        using var inputBuffer = backend.AllocateBuffer(input);
+        foreach (NumericStorageType type in Enum.GetValues(typeof(NumericStorageType)))
+        {
+            int width = type.GetByteWidth();
+            int wordCount = (input.Length * width + 3) / 4;
+            foreach (bool littleEndian in new[] { true, false })
+            {
+                var expected = Cpu.TensorToBytes(tensor, type, littleEndian);
+                using var words = backend.AllocateIntBuffer(wordCount);
+                Assert.True(decode.TryEncodeBytes(inputBuffer, words, input.Length, type, littleEndian), $"encode {type} refused");
+                var actual = new byte[wordCount * 4];
+                Buffer.BlockCopy(DownloadInts(backend, words, wordCount), 0, actual, 0, actual.Length);
+                for (int i = 0; i < expected.Length; i++)
+                    Assert.True(expected[i] == actual[i],
+                        $"encode {type} le={littleEndian} byte {i} (element {i / width} = {input[i / width]:R}): " +
+                        $"expected {expected[i]:X2}, got {actual[i]:X2}");
+            }
+        }
     }
 
     private static int[] Pack(byte[] bytes)
