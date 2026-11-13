@@ -44,5 +44,6 @@ public sealed partial class HipBackend : IDeviceMemoryPressure
     }
 
     /// <inheritdoc/>
-    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => false;
+    /// <remarks>HipMallocReclaiming collects unreachable buffers, drains the pool and retries once on out-of-memory.</remarks>
+    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => true;
 }

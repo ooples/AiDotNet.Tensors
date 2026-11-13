@@ -34,13 +34,7 @@ internal static class PortableGenericFft
         if (launch is null) throw new ArgumentNullException(nameof(launch));
         if (batch < 1) throw new ArgumentOutOfRangeException(nameof(batch));
         if (n < 1 || (n & (n - 1)) != 0 || n > MaximumLength) throw new ArgumentOutOfRangeException(nameof(n), "n must be a power of two.");
-        int count = checked(batch * n);
-        foreach (var (buffer, name) in new[] { (inputReal, nameof(inputReal)), (inputImag, nameof(inputImag)),
-                     (outputReal, nameof(outputReal)), (outputImag, nameof(outputImag)) })
-        {
-            if (buffer is null) throw new ArgumentNullException(name);
-            if (buffer.Size < count) throw new ArgumentException($"{name} holds {buffer.Size} values, fewer than {batch} x {n}.", name);
-        }
+        int count = ValidateBatchedExtent(inputReal, inputImag, outputReal, outputImag, batch, n);
         // The permute reads every input before any output position is final, so it cannot run in place.
         if (ReferenceEquals(inputReal, outputReal) || ReferenceEquals(inputImag, outputImag)
             || ReferenceEquals(inputReal, outputImag) || ReferenceEquals(inputImag, outputReal))
@@ -58,6 +52,24 @@ internal static class PortableGenericFft
         for (int span = 1; span < n; span <<= 1)
             launch("bx_fft_butterfly", count / 2, outputReal, outputImag, batch, n, span, inverse ? 1 : 0);
     }
+    /// <summary>
+    /// Checks that each of a batched FFT's four buffers holds <paramref name="batch"/> x <paramref name="n"/> values (the
+    /// product checked, so it cannot wrap), and returns that count. Every backend's batched path runs this before its
+    /// dispatch: the kernels read and write the whole extent, and a short buffer is an out-of-bounds device access.
+    /// </summary>
+    internal static int ValidateBatchedExtent(IGpuBuffer inputReal, IGpuBuffer inputImag, IGpuBuffer outputReal,
+        IGpuBuffer outputImag, int batch, int n)
+    {
+        int count = checked(batch * n);
+        foreach (var (buffer, name) in new[] { (inputReal, nameof(inputReal)), (inputImag, nameof(inputImag)),
+                     (outputReal, nameof(outputReal)), (outputImag, nameof(outputImag)) })
+        {
+            if (buffer is null) throw new ArgumentNullException(name);
+            if (buffer.Size < count) throw new ArgumentException($"{name} holds {buffer.Size} values, fewer than {batch} x {n}.", name);
+        }
+        return count;
+    }
+
     public static bool Supports(FftElementType type)
     {
         _ = type.ByteSize();

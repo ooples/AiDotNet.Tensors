@@ -92,9 +92,16 @@ internal static class TensorTableWriter
         TensorIdMap<T> map,
         CompiledStep<T>[] steps,
         Tensor<T>[] compiledInputTensors,
-        Tensor<T>[]? parameterTensors)
+        Tensor<T>[]? parameterTensors,
+        IReadOnlyList<Tensor<T>?>? externals = null)
     {
         var tensors = map.Ordered;
+
+        // Tensors the loader will supply (by index into its own list) are written as references, not data.
+        var externalIds = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        if (externals is not null)
+            for (int e = 0; e < externals.Count; e++)
+                if (externals[e] is { } ext && !externalIds.ContainsKey(ext)) externalIds[ext] = e;
         writer.Write(tensors.Count);
 
         // Build sets for flag assignment. Reference-equality everywhere —
@@ -143,6 +150,14 @@ internal static class TensorTableWriter
             //   3. Appears as a step input (it was captured at compile time)
             // OR is explicitly in the parameter set.
             bool isFrozenWeight = isExplicitParam || (!isLeaf && !isOutputBuffer);
+
+            if (!isLeaf && externalIds.TryGetValue(tensor, out int externalIndex))
+            {
+                writer.Write((byte)(PlanFormatConstants.TensorFlagWeight | PlanFormatConstants.TensorFlagExternal));
+                writer.Write(tensor.Length);
+                writer.Write(externalIndex);
+                continue;
+            }
 
             byte flags;
             if (isLeaf)        flags = PlanFormatConstants.TensorFlagLeafInput;

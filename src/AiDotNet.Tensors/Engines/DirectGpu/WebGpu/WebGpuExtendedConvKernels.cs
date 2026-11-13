@@ -174,9 +174,11 @@ struct Params{D:i32,H:i32,W:i32,C:i32,P:i32,upperEps:f32,pad0:i32,pad1:i32};
     gradWeights[idx]=sum;
 }";
 
-    public const string AdaptiveMaxPool2D = @"
-@group(0) @binding(0) var<storage,read> input_:array<f32>;
-@group(0) @binding(1) var<storage,read_write> output_:array<f32>;
+    // The CPU max-pool rule on u32-bound bit patterns (ExactFloatKernels): the bin's first cell, then only a strictly
+    // greater one.
+    public const string AdaptiveMaxPool2D = ExactFloatKernels.Wgsl + @"
+@group(0) @binding(0) var<storage,read> input_:array<u32>;
+@group(0) @binding(1) var<storage,read_write> output_:array<u32>;
 struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth:i32,pad0:i32,pad1:i32};
 @group(0) @binding(2) var<uniform> pm:PA;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid_:vec3<u32>){
@@ -190,11 +192,12 @@ struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth
     let hEnd=((oh+1)*pm.inHeight+pm.outHeight-1)/pm.outHeight;
     let wStart=(ow*pm.inWidth)/pm.outWidth;
     let wEnd=((ow+1)*pm.inWidth+pm.outWidth-1)/pm.outWidth;
-    var maxV=-3.402823466e38;
+    var maxV:u32=0xFF800000u;
+    var have=false;
     for(var ih=hStart;ih<hEnd;ih=ih+1){
         for(var iw=wStart;iw<wEnd;iw=iw+1){
             let v=input_[((b*pm.channels+c)*pm.inHeight+ih)*pm.inWidth+iw];
-            if(v>maxV){maxV=v;}
+            if(!have||xf_gt(v,maxV)){maxV=v;have=true;}
         }
     }
     output_[((b*pm.channels+c)*pm.outHeight+oh)*pm.outWidth+ow]=maxV;

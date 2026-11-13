@@ -107,16 +107,24 @@ extern ""C"" __global__ __launch_bounds__(256) void audio_resample(
     int sBase = row * inLen;
 
     float cutoff = 1.0f / (float)(up > down ? up : down);
-    float srcIdx = (float)ot * down / up;
-    int centre = (int)floorf(srcIdx);
+    // Exact source position: ot*down/up as an integer centre plus a fraction, computed in 32-bit integers as
+    // ot = q*up + r (the host guarantees up*down < 2^31). A float division here rounds positions just below an
+    // integer up on relaxed-math devices, moving the whole 513-tap window by one sample.
+    int q = ot / up, r = ot - q * up;
+    int rd = r * down;
+    int centre = q * down + rd / up;
+    float frac = (float)(rd - (rd / up) * up) / (float)up;
 
     float acc = 0.0f, wSum = 0.0f;
     const float PI = 3.14159265358979323846f;
     for (int k = -halfWidth; k <= halfWidth; k++) {
         int idx = centre + k;
         if (idx < 0 || idx >= inLen) continue;
-        float t = (idx - srcIdx) * cutoff;
-        float sinc = (fabsf(t) < 1e-12f) ? 1.0f : sinf(PI * t) / (PI * t);
+        float t = ((float)k - frac) * cutoff;
+        // Near zero, sin(x)/x by its Taylor series: a fast or relaxed sin has ~1e-7 absolute error, which turns
+        // sin(x)/x for x ~ 1e-8 (a tap almost exactly on the source position) into garbage. Error below 1e-14.
+        float px = PI * t;
+        float sinc = (fabsf(px) < 1e-3f) ? 1.0f - px * px * (1.0f / 6.0f) : sinf(px) / px;
         float hann = 0.5f - 0.5f * cosf(2.0f * PI * (k + halfWidth) / (2.0f * halfWidth));
         float w = sinc * hann;
         acc += w * input[sBase + idx];

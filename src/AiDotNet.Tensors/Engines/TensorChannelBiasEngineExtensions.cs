@@ -43,7 +43,7 @@ public static class TensorChannelBiasEngineExtensions
         // Every built-in engine derives from CpuEngine; virtual dispatch reaches the resident GPU
         // implementation where available. Keeping the primitive off IEngine avoids an ABI break for
         // external engines compiled against an earlier package.
-        if (engine is CpuEngine builtIn)
+        if (engine.TryGet<CpuEngine>(out var builtIn))
             return builtIn.TensorChannelBiasAdd(input, bias);
 
         // A third-party engine can express the same differentiable operation using only the existing

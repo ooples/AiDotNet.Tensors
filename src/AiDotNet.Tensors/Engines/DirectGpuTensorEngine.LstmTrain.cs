@@ -181,7 +181,7 @@ public partial class DirectGpuTensorEngine
             lastStepOnly ? new[] { b, h } : new[] { b, t, h },
             (eng, output) =>
             {
-                var gpu = (DirectGpuTensorEngine)eng;
+                var gpu = eng.Cast<DirectGpuTensorEngine>();
                 using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 // The cache is resolved when the node runs, with the backend live; it is per layer (keyed by the
@@ -246,7 +246,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var gpu = (DirectGpuTensorEngine)engine;
+        var gpu = engine.Cast<DirectGpuTensorEngine>();
         var c = (LstmTrainCache)savedState[0];
         var stamp = (LstmForwardStamp)savedState[1];
         bool lastStepOnly = savedState.Length > 2 && savedState[2] is true;

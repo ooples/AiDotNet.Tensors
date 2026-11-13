@@ -15,10 +15,9 @@ public sealed partial class WebGpuBackend : IFftBackend, IGenericFftBackend, IMe
     bool IGenericFftBackend.PrefersGenericFftForPowerOfTwo => false;
 
     /// <summary>
-    /// This backend's allocation does no separate fill that could be skipped, so the plain allocation already meets
-    /// the undefined-contents contract.
+    /// Rents a pooled WebGPU storage buffer without zeroing its contents when available, or allocates a new buffer.
     /// </summary>
-    public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBuffer(size);
+    public IGpuBuffer AllocateBufferUninitialized(int size) => AllocateBufferCore(size, zeroInitialize: false);
     /// <summary>
     /// The guarded updates read the guard on the device and write nothing when it is not finite
     /// (WebGpuFiniteGuardKernels, #1522).

@@ -139,7 +139,9 @@ public sealed partial class MetalBackend
     public void Negate(IGpuBuffer A, IGpuBuffer B, int size)
     {
         ThrowIfDisposed();
-        Scale(A, B, -1.0f, size);
+        // The IEEE negate on the bits (negate_kernel): a multiply by -1 may flush a subnormal, and amin = -max(-x) relies
+        // on the negate being exact.
+        ExecuteUnaryOp("negate_kernel", A, B, size, _elementWiseLibrary);
     }
 
     /// <summary>

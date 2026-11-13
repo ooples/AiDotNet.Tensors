@@ -42,6 +42,37 @@ public static class AiDotNetEngine
     private static DirectGpuTensorEngine? _adoptedGpu;
     private static readonly object _adoptionLock = new object();
 
+    // An AsyncLocal, not a thread-static: the override flows into work the calling code starts (Task.Run, Parallel.For
+    // workers, awaits), so a program trace sees engine calls made on worker threads instead of silently missing them.
+    private static readonly AsyncLocal<IEngine?> _threadEngine = new();
+    private static int _threadOverrides;
+
+    /// <summary>
+    /// Makes <see cref="Current"/> return <paramref name="engine"/> in the calling execution context (the calling thread
+    /// and work it starts), until the returned scope is disposed. Other threads keep seeing the process-wide engine. Scopes nest.
+    /// </summary>
+    internal static System.IDisposable PushThreadEngine(IEngine engine)
+    {
+        if (engine is null) throw new System.ArgumentNullException(nameof(engine));
+        var previous = _threadEngine.Value;
+        _threadEngine.Value = engine;
+        Interlocked.Increment(ref _threadOverrides);
+        return new ThreadEngineScope(previous);
+    }
+
+    private sealed class ThreadEngineScope : System.IDisposable
+    {
+        private readonly IEngine? _previous;
+        private int _disposed;
+        public ThreadEngineScope(IEngine? previous) => _previous = previous;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            _threadEngine.Value = _previous;
+            Interlocked.Decrement(ref _threadOverrides);
+        }
+    }
+
     // True while Current holds an engine the caller assigned through the setter, as opposed to the startup CPU engine,
     // one auto-detection adopted, or one a reset/release installed. Written under _adoptionLock with every write of Current.
     private static bool _callerAssigned;
@@ -83,6 +114,9 @@ public static class AiDotNetEngine
     {
         get
         {
+            // A thread override (a program trace) is visible only to the thread that installed it. The counter keeps
+            // the thread-static read off the hot path while no override exists anywhere.
+            if (Volatile.Read(ref _threadOverrides) != 0 && _threadEngine.Value is { } local) return local;
             return Volatile.Read(ref _current);
         }
         set
@@ -219,7 +253,7 @@ public static class AiDotNetEngine
         // re-adopting the GPU engine (the "GPU acceleration enabled" churn seen in CPU-only runs).
         if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU")))
         {
-            if (Current is DirectGpuTensorEngine)
+            if (Current.Is<DirectGpuTensorEngine>())
             {
                 SwitchToCpuEngine();
             }
@@ -243,7 +277,7 @@ public static class AiDotNetEngine
         // success path below overwrites Current without disposing it. A whole tournament of small models
         // therefore spent most of its time rebuilding (and leaking) GPU contexts. The circuit-breaker and
         // disable checks above already cover the cases where the current engine must NOT be reused.
-        if (Current is DirectGpuTensorEngine adopted && adopted.SupportsGpu)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var adopted) && adopted.SupportsGpu)
         {
             return true;
         }
@@ -443,9 +477,9 @@ public static class AiDotNetEngine
             var observed = Volatile.Read(ref _current);
             // A reset hands the choice back to the library either way, also when it keeps a plain CPU engine.
             Volatile.Write(ref _callerAssigned, false);
-            if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
+            if (observed is not null && observed.Unwrap().GetType() == typeof(CpuEngine)) return;
             Volatile.Write(ref _current, new CpuEngine());
-            if (observed is DirectGpuTensorEngine gpu && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
+            if (observed.TryGet<DirectGpuTensorEngine>(out var gpu) && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
         }
 
         // The parked engine keeps its context for the next adoption, but not memory nothing uses: free the device
@@ -578,7 +612,7 @@ public static class AiDotNetEngine
         {
             lock (_adoptionLock)
             {
-                if (Volatile.Read(ref _current) is DirectGpuTensorEngine)
+                if (Volatile.Read(ref _current).Is<DirectGpuTensorEngine>())
                 {
                     // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
                     // This runs from inside a CUDA fault handler on an already-corrupted context; calling
@@ -608,7 +642,7 @@ public static class AiDotNetEngine
     /// <returns>A GPU execution context, or null if GPU is not available.</returns>
     public static GpuExecutionContext? BeginGpuContext(GpuExecutionOptions? options = null)
     {
-        if (Current is DirectGpuTensorEngine gpuEngine)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
             return gpuEngine.BeginGpuContext(options);
         }
@@ -626,7 +660,7 @@ public static class AiDotNetEngine
     {
         if (action == null) throw new ArgumentNullException(nameof(action));
 
-        if (Current is DirectGpuTensorEngine gpuEngine)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
             return gpuEngine.WithGpuContext(action, options);
         }
@@ -649,7 +683,7 @@ public static class AiDotNetEngine
         if (fallback is null)
             throw new ArgumentNullException(nameof(fallback));
 
-        if (Current is DirectGpuTensorEngine gpuEngine)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
             return gpuEngine.WithGpuContext(func, fallback, options);
         }

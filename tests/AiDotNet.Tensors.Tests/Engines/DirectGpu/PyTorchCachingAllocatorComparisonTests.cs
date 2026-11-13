@@ -143,7 +143,9 @@ public class PyTorchCachingAllocatorComparisonTests
 
     private static TorchResult? Torch(out string? unavailable)
     {
-        unavailable = null;
+        // No interpreter, the Windows Store alias, or no torch: a missing capability (see HeadToHeadNetworkHarness).
+        unavailable = HeadToHeadNetworkHarness.TorchUnavailableReason;
+        if (unavailable is not null) return null;
         string? root = PyTorchParityInventory.FindRepositoryRoot();
         if (root is null) { unavailable = "tools/parity is missing from this checkout."; return null; }
         string script = Path.Combine(root, "tools", "parity", "torch_cuda_allocator_reference.py");

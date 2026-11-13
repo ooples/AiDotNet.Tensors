@@ -125,7 +125,7 @@ internal sealed class LoRAFusionPattern : IFusionPattern
             finalOutput,
             (eng, output) =>
             {
-                if (eng is DirectGpuTensorEngine gpu)
+                if (eng.TryGet<DirectGpuTensorEngine>(out var gpu))
                 {
                     // Destination-aware overload skips the alloc + CopyTo
                     // round-trip the eager wrapper would otherwise force.

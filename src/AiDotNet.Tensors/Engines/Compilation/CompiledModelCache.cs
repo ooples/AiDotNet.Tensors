@@ -65,6 +65,22 @@ public sealed class CompiledModelCache<T> : IDisposable
         }
     }
 
+    // Feeds a cached plan this call's inputs. A plan whose input slot can no longer be written in place (the caller
+    // cloned the slot tensor after compiling, so it now shares storage copy-on-write) refuses rather than replaying the
+    // first input's data; the caller then recompiles on the miss path, which replaces the cached plan.
+    private static bool TryRebind(ICompiledPlan<T> plan, Tensor<T>[] inputs)
+    {
+        try
+        {
+            plan.SetInputs(inputs);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>
     /// Gets a cached inference plan, rebinding the input tensor on cache hit.
     /// On cache miss, the forward function is traced and the input tensor is captured.
@@ -81,20 +97,14 @@ public sealed class CompiledModelCache<T> : IDisposable
     public ICompiledPlan<T> GetOrCompileInference(Tensor<T> input, Func<Tensor<T>> forward)
     {
         long key = ComputeShapeKey(input._shape);
-        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(input._shape))
-        {
-            cached.SetInputs(new[] { input });
+        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(input._shape) && TryRebind(cached, new[] { input }))
             return cached;
-        }
 
         lock (_compileLock)
         {
             // Double-check after acquiring lock
-            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(input._shape))
-            {
-                cached.SetInputs(new[] { input });
+            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(input._shape) && TryRebind(cached, new[] { input }))
                 return cached;
-            }
 
             using var scope = GraphMode.EnableInference();
             var explicitOutput = forward();
@@ -131,19 +141,13 @@ public sealed class CompiledModelCache<T> : IDisposable
 
         long key = ComputeShapeKey(inputs);
         var primaryShape = inputs[0]._shape;
-        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(primaryShape))
-        {
-            cached.SetInputs(inputs);
+        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
             return cached;
-        }
 
         lock (_compileLock)
         {
-            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(primaryShape))
-            {
-                cached.SetInputs(inputs);
+            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
                 return cached;
-            }
 
             // The trace runs the forward against the CURRENT input data, so the freshly
             // compiled plan already reflects this call — no SetInputs needed on the miss path

@@ -9,7 +9,7 @@ public static class CudaBroadcastKernels
 {
     public static string GetSource()
     {
-        return @"
+        return ExactFloatKernels.Cuda + @"
 // ============================================================================
 // Broadcast binary ops: a[outer, inner] op b[1, inner] → output[outer, inner]
 // Last-axis broadcast (most common: bias add, channel scale, etc.)
@@ -189,7 +189,8 @@ extern ""C"" __global__ __launch_bounds__(256) void clip_kernel(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    output[idx] = fminf(fmaxf(input[idx], minVal), maxVal);
+    // The clamp contract (ExactFloatKernels): x < lo ? lo : x, then above hi -> hi, on the bit patterns.
+    output[idx] = xf_clampf(input[idx], minVal, maxVal);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void rsqrt_kernel(
@@ -234,9 +235,9 @@ extern ""C"" __global__ __launch_bounds__(256) void where_select(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    // The condition buffer is produced by this file's comparison kernels, which emit exactly 1.0f or 0.0f
-    // (see equals_kernel). Test against zero rather than == 1.0f so any non-zero truthy encoding also works.
-    output[idx] = condition[idx] != 0.0f ? a[idx] : b[idx];
+    // The CPU where: the condition is true when it is not +0 or -0 (NaN is true), tested on the bits so a subnormal condition
+    // is not flushed to false, and the chosen operand passes through bit for bit.
+    output[idx] = xf_selectf(condition[idx], a[idx], b[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void not_equals_kernel(

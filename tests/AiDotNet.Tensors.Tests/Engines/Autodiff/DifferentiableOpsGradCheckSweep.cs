@@ -31,7 +31,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// disagreements fail the test.
 /// </para>
 /// </remarks>
-public class DifferentiableOpsGradCheckSweep
+public partial class DifferentiableOpsGradCheckSweep
 {
     private readonly ITestOutputHelper _out;
     private readonly CpuEngine _engine = new();
@@ -42,7 +42,7 @@ public class DifferentiableOpsGradCheckSweep
     /// Ops excluded from the numeric check, with the reason. Anything here is a deliberate,
     /// documented exclusion — not a silent gap.
     /// </summary>
-    private static readonly Dictionary<string, string> Exempt = new(StringComparer.Ordinal)
+    internal static readonly Dictionary<string, string> Exempt = new(StringComparer.Ordinal)
     {
         // Non-smooth at points a random probe can land on. Finite differences straddle the kink
         // and disagree with any one-sided subgradient choice.
@@ -72,6 +72,11 @@ public class DifferentiableOpsGradCheckSweep
 
         // Iterative algorithms rather than single ops.
         ["GriffinLim"] = "iterative phase reconstruction, not a single op",
+
+        // Designed gradients that are not the forward's derivative (each is pinned against its formula in
+        // TorchModelOpsTests instead).
+        ["TensorSurrogateSpike"] = "surrogate gradient: a sigmoid derivative stands in for the step's zero derivative",
+        ["TensorFakeQuantize"] = "straight-through estimator: the forward is piecewise constant",
     };
 
     /// <summary>
@@ -93,7 +98,7 @@ public class DifferentiableOpsGradCheckSweep
     /// explicit, shrinkable list rather than a silent skip count.
     /// </para>
     /// </remarks>
-    private static readonly Dictionary<string, Func<Random, object[]>> OpCases = new(StringComparer.Ordinal)
+    private static readonly Dictionary<string, Func<Random, object[]>> BaseOpCases = new(StringComparer.Ordinal)
     {
         // --- matmul family: inner dimensions must agree ---
         ["TensorMatMul"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 2], r)],
@@ -114,6 +119,17 @@ public class DifferentiableOpsGradCheckSweep
         ["TensorAdaptiveMaxPool3D"] = r => [SafeTensor([1, 3, 4, 5], r), new[] { 2, 3, 2 }],
         ["TensorGridSample3D"] = r => [SafeTensor([1, 2, 3, 4, 3], r), SafeTensor([1, 2, 2, 2, 3], r), GridSampleMode.Bilinear, GridSamplePadding.Reflection, false],
         ["TensorMaxUnpool"] = r => [SafeTensor([2, 3], r), new Tensor<int>(new[] { 0, 2, 4, 1, 3, 0 }, new[] { 2, 3 }), new[] { 5 }],
+
+        // --- model-level ops (CpuEngine.TorchModelOps) ---
+        // CRF: batched emissions [batch, seqLen, numTags], transitions [numTags, numTags], start/end [numTags].
+        ["TensorCrfForward"] = r => [SafeTensor([2, 3, 3], r), SafeTensor([3, 3], r), SafeTensor([3], r), SafeTensor([3], r)],
+        // Top-2 of 6 distinct scores: a probe of 1e-6 cannot change the selection.
+        ["TensorTopKSoftmax"] = r => [SafeTensor([2, 6], r), 2],
+        ["TensorSinusoidalTimeEmbedding"] = r => [SafeTensor([3], r), 6],
+
+        // acosh is defined from 1: SafeTensor's [0.35, 0.95] gives NaN on both sides, which the old inline harness let
+        // through (NaN never compares greater than a tolerance) and the GradCheck criterion reports, as torch's does.
+        ["TensorAcosh"] = r => [Shifted(SafeTensor([6], r), 1.0)],
 
         // --- elementwise binaries needing matched shapes ---
         ["TensorAddMany"] = r => [new[] { SafeTensor([4], r), SafeTensor([4], r), SafeTensor([4], r) }],
@@ -136,6 +152,8 @@ public class DifferentiableOpsGradCheckSweep
         ["PsRoIPool"] = r => [SafeTensor([1, 8, 4, 4], r), RoiBoxes(2), 2, 2, 2, 1.0f],
 
         // --- fused linear: out = act(input @ weight + bias), so weight is [in, out] ---
+        // The generic fused linear: its activation is enumerated over every FusedActivationType by the gradgrad sweep.
+        ["FusedLinear"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r), FusedActivationType.Tanh, null!],
         ["FusedLinearGELU"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
         ["FusedLinearReLU"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
         ["FusedLinearSigmoid"] = r => [SafeTensor([2, 3], r), SafeTensor([3, 4], r), SafeTensor([4], r)],
@@ -397,6 +415,41 @@ public class DifferentiableOpsGradCheckSweep
     };
 
     /// <summary>
+    /// <see cref="BaseOpCases"/> plus the entries the per-area partial files add (DifferentiableOpsGradCheckSweep.Cases*.cs),
+    /// so areas can grow the table without editing one shared initializer.
+    /// </summary>
+    private static readonly Dictionary<string, Func<Random, object[]>> OpCases = BuildOpCases();
+
+    private static Dictionary<string, Func<Random, object[]>> BuildOpCases()
+    {
+        var all = new Dictionary<string, Func<Random, object[]>>(BaseOpCases, StringComparer.Ordinal);
+        AddCasesFusedActivations(all);
+        AddCasesReductionsAndIndexing(all);
+        AddCasesSpatialAndAttention(all);
+        AddCasesLinearAlgebraAndLosses(all);
+        AddCasesVariants(all);
+        return all;
+    }
+
+    /// <summary>
+    /// The argument factory of a parameter variant, keyed "<c>Op|Fingerprint|param=Value</c>" (one overload) or
+    /// "<c>Op|param=Value</c>": arguments valid for that value when the base ones are not.
+    /// </summary>
+    internal static bool TryGetVariantCase(MethodInfo m, string variantLabel, out Func<Random, object[]> factory)
+    {
+        var name = m.Name.Contains('`') ? m.Name.Substring(0, m.Name.IndexOf('`')) : m.Name;
+        return OpCases.TryGetValue($"{name}|{ParamFingerprint(m)}|{variantLabel}", out factory!)
+            || OpCases.TryGetValue($"{name}|{variantLabel}", out factory!);
+    }
+
+    static partial void AddCasesVariants(Dictionary<string, Func<Random, object[]>> cases);
+
+    static partial void AddCasesFusedActivations(Dictionary<string, Func<Random, object[]>> cases);
+    static partial void AddCasesReductionsAndIndexing(Dictionary<string, Func<Random, object[]>> cases);
+    static partial void AddCasesSpatialAndAttention(Dictionary<string, Func<Random, object[]>> cases);
+    static partial void AddCasesLinearAlgebraAndLosses(Dictionary<string, Func<Random, object[]>> cases);
+
+    /// <summary>
     /// Compact parameter-type fingerprint used to key table entries to a SPECIFIC overload,
     /// e.g. <c>T,T,int[],int[],int[]</c>. <c>T</c> denotes <c>Tensor&lt;double&gt;</c>.
     /// </summary>
@@ -461,6 +514,12 @@ public class DifferentiableOpsGradCheckSweep
         // from 1 (acos/atanh edges), all strictly positive so domain-restricted ops are valid.
         var t = new Tensor<double>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = 0.35 + rng.NextDouble() * 0.6;
+        return t;
+    }
+
+    private static Tensor<double> Shifted(Tensor<double> t, double offset)
+    {
+        for (int i = 0; i < t.Length; i++) t[i] += offset;
         return t;
     }
 
@@ -813,29 +872,23 @@ public class DifferentiableOpsGradCheckSweep
                     break;
                 }
 
-                // Central finite differences on a few elements.
-                const double eps = 1e-6;
-                var bad = new List<string>();
-                int probes = Math.Min(4, input.Length);
-                for (int k = 0; k < probes; k++)
-                {
-                    double orig = input[k];
-                    double lp, lm;
-                    try
+                // Central finite differences on a few elements of that input, through the library's public checker
+                // (GradCheck): the gradient of the plain sum, |analytical - numerical| <= 1e-4 + 1e-4·|numerical|.
+                // The op reads its tensors from args, which the checker perturbs in place.
+                var check = GradCheck.CheckMany<double>(_ => (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!, tensorInputs,
+                    new GradCheckOptions
                     {
-                        input[k] = orig + eps;
-                        lp = _engine.TensorSum((Tensor<double>)m.Invoke(_engine, CopyArgs(args))!);
-                        input[k] = orig - eps;
-                        lm = _engine.TensorSum((Tensor<double>)m.Invoke(_engine, CopyArgs(args))!);
-                    }
-                    finally { input[k] = orig; }
-
-                    double numerical = (lp - lm) / (2 * eps);
-                    double a = analytical[k];
-                    double denom = Math.Max(1.0, Math.Max(Math.Abs(a), Math.Abs(numerical)));
-                    if (Math.Abs(a - numerical) / denom > 1e-4)
-                        bad.Add($"[{k}] analytical {a:G6} vs numerical {numerical:G6}");
-                }
+                        Engine = _engine,
+                        Epsilon = 1e-6,
+                        AbsoluteTolerance = 1e-4,
+                        RelativeTolerance = 1e-4,
+                        RandomOutputGradient = false,
+                        InputsToCheck = new[] { Array.IndexOf(tensorInputs, input) },
+                        MaxElementsPerInput = 4,
+                    });
+                var bad = check.WorstMismatches
+                    .Select(x => $"[{x.ElementIndex}] analytical {x.Analytical:G6} vs numerical {x.Numerical:G6}")
+                    .ToList();
 
                 if (bad.Count > 0)
                     mismatches.Add($"{name} on {shape.Length}D: " + string.Join("; ", bad.Take(3)));
@@ -899,7 +952,7 @@ public class DifferentiableOpsGradCheckSweep
     /// <summary>
     /// Every op the sweep above can drive, with arguments that run: (name, bound method, arguments).
     /// </summary>
-    internal IEnumerable<(string Name, MethodInfo Method, object[] Args)> DrivableOps(List<string> skipped)
+    internal IEnumerable<(string Name, MethodInfo Method, object[] Args)> DrivableOps(List<string> skipped, bool includeDelegators = false)
     {
         var candidates = typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Where(m => !m.IsSpecialName && m.IsGenericMethodDefinition)
@@ -911,7 +964,9 @@ public class DifferentiableOpsGradCheckSweep
         {
             var name = def.Name;
             if (name.Contains('`')) name = name.Substring(0, name.IndexOf('`'));
-            if (!OpRegistry.DifferentiableOps.Contains(name)) continue;
+            // Delegators (FusedLinear, fused convolutions, norms composed of recorded ops) are differentiable too; they
+            // record through other ops or their own entry, and their backward has to be just as correct.
+            if (!OpRegistry.DifferentiableOps.Contains(name) && !(includeDelegators && OpRegistry.DelegatorOps.Contains(name))) continue;
             MethodInfo m;
             try { m = def.MakeGenericMethod(typeof(double)); }
             catch { skipped.Add($"{name}: cannot bind <double>"); continue; }

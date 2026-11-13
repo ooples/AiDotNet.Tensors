@@ -219,7 +219,7 @@ public partial class DirectGpuTensorEngine
     private static void GridSample3DDeviceBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (engine is DirectGpuTensorEngine gpu
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryGridSample3DAdjointsOnDevice(gradOutput, inputs[0], inputs[1], (GridSampleMode)savedState[0],
                 (GridSamplePadding)savedState[1], (bool)savedState[2]) is { } adjoints)
         {
@@ -227,7 +227,7 @@ public partial class DirectGpuTensorEngine
             Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[1], adjoints.Grid, engine);
             return;
         }
-        if (engine is DirectGpuTensorEngine) GpuLaunchProbe.OnFallback("TensorGridSample3D backward: host adjoint", null);
+        if (engine.Is<DirectGpuTensorEngine>()) GpuLaunchProbe.OnFallback("TensorGridSample3D backward: host adjoint", null);
         GridSample3DBackward(gradOutput, inputs, output, savedState, engine, grads);
     }
 

@@ -687,7 +687,7 @@ internal static class DifferentiableOps
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                     $"[ALIAS] firstwrite-copy op={AiDotNet.Tensors.Engines.DirectGpuTensorEngine.s_currentBackwardOp} len={contribution.Length} sharesStorage={contribution.SharesStorageWith(buffer)}" + System.Environment.NewLine); } catch { }
             }
-            var gpuEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+            var gpuEngine = engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
             var contributionDevice = gpuEngine?.FirstWriteRedirects is not null ? contribution.TryGetGpuBuffer() : null;
             engine.TensorCopy(contribution, buffer);
             // The next run's op writes this accumulator directly (DirectGpuTensorEngine.FirstWriteRedirects). Only a
@@ -774,7 +774,7 @@ internal static class DifferentiableOps
         Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, Tensor<T> contribution,
         int[] regionStart, int[] regionShape, IEngine engine)
     {
-        if (_isBackwardCreateGraph || engine.SupportsGpu || engine is not CpuEngine) return false;
+        if (_isBackwardCreateGraph || engine.SupportsGpu || !engine.Is<CpuEngine>()) return false;
         int idx = tensor._gradIndex;
         bool indexed = idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length;
         Tensor<T>? existing = indexed
@@ -831,7 +831,7 @@ internal static class DifferentiableOps
         Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool overwrite)
     {
         overwrite = false;
-        if (_isBackwardCreateGraph || engine.SupportsGpu || engine is not CpuEngine) return null;
+        if (_isBackwardCreateGraph || engine.SupportsGpu || !engine.Is<CpuEngine>()) return null;
         int idx = tensor._gradIndex;
         bool indexed = idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length;
         Tensor<T>? existing = indexed
@@ -859,7 +859,7 @@ internal static class DifferentiableOps
         Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool accumulate)
     {
         accumulate = false;
-        if (_isBackwardCreateGraph || engine is not DirectGpuTensorEngine gpu || !gpu.ResidentStepActive) return null;
+        if (_isBackwardCreateGraph || !engine.TryGet<DirectGpuTensorEngine>(out var gpu) || !gpu.ResidentStepActive) return null;
         int idx = tensor._gradIndex;
         var indexedGrads = _indexedGrads;
         Tensor<T>? existing = indexedGrads is not null && idx >= 0 && idx < indexedGrads.Length
@@ -910,7 +910,7 @@ internal static class DifferentiableOps
         // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
         // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
         // in-place ops on aliased activations (that hijack threw CUDA-700). No-op for non-DirectGpu engines.
-        using var _gradAccumScope = (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.EnterGradAccumulation();
+        using var _gradAccumScope = (engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>())?.EnterGradAccumulation();
         // FP32 accumulation is narrower than FP32 backward: only the addition which combines
         // fan-out contributions overrides autocast. The backward kernels that produced each
         // contribution retain their configured FP16/BF16/FP8 precision.
@@ -945,7 +945,7 @@ internal static class DifferentiableOps
         // reference. Keep the original `grad` for the out-of-place
         // path; only materialize for in-place add storage.
         if (_graphCaptureDebug
-            && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gde && gde.ResidentStepActive)
+            && engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var gde) && gde.ResidentStepActive)
         {
             Tensor<T>? exi = grads.TryGetValue(tensor, out var ed) ? ed : null;
             try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
@@ -959,7 +959,7 @@ internal static class DifferentiableOps
         // to carry a full parameter-sized gradient.
         // First-write redirection (DirectGpuTensorEngine.FirstWriteRedirects) needs to know every buffer a contribution
         // reaches: one consumed twice must stay a separate buffer.
-        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { FirstWriteRedirects: { } redirectTable } redirectEngine)
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var redirectEngine) && redirectEngine.FirstWriteRedirects is { } redirectTable)
             redirectTable.NoteContribution(grad.TryGetGpuBuffer(), redirectEngine.CurrentScratchAction);
         Tensor<T>? gradForInPlaceCache = null;
         Tensor<T> GradForInPlace() =>
@@ -968,7 +968,7 @@ internal static class DifferentiableOps
         // A compiled GPU step's deferrable gradient (GradientDeferral): when this step already holds a contribution, park
         // this one for the consuming backward to sum as it loads, instead of an in-place add pass.
         if (!needsOutOfPlace && GradientDeferral.Enabled
-            && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { DeferredGradients: { } deferral }
+            && engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>()?.DeferredGradients is { } deferral
             && deferral.Accepts(tensor) && grad.IsContiguous && grad.Length == tensor.Length)
         {
             int slot = tensor._gradIndex;

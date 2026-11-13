@@ -82,7 +82,8 @@ public sealed class PyTorchGridSampleParityTests
 
     private static Dictionary<string, Dictionary<string, double[]>>? Torch(Case c, out string? skipReason)
     {
-        skipReason = null;
+        skipReason = HeadToHeadNetworkHarness.TorchUnavailableReason;
+        if (skipReason is not null) return null;
         string? root = PyTorchParityInventory.FindRepositoryRoot();
         if (root is null) { skipReason = "tools/parity is missing from this checkout."; return null; }
         string script = Path.Combine(root, "tools", "parity", "torch_grid_sample_reference.py");

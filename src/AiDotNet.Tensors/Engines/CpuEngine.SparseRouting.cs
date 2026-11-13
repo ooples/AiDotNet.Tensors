@@ -45,7 +45,7 @@ public partial class CpuEngine
                 (eng, result) =>
                 {
                     compiledSavedState[0] = CloneIndicesHost(capturedIndices);
-                    var sr = eng as CpuEngine ?? new CpuEngine();
+                    var sr = eng.As<CpuEngine>() ?? new CpuEngine();
                     DirectGpuTensorEngine.CopyResultInto(eng, sr.TensorGatherRowValues(capturedValues, capturedIndices), result);
                 },
                 TensorGatherRowValuesAutoBackward<T>,
@@ -134,7 +134,7 @@ public partial class CpuEngine
                 (eng, result) =>
                 {
                     compiledSavedState[0] = CloneIndicesHost(capturedIndices);
-                    var sr = eng as CpuEngine ?? new CpuEngine();
+                    var sr = eng.As<CpuEngine>() ?? new CpuEngine();
                     DirectGpuTensorEngine.CopyResultInto(
                         eng, sr.TopKWeightedRowMix(capturedTable, capturedIndices, capturedWeights), result);
                 },
@@ -266,7 +266,7 @@ public partial class CpuEngine
                 new[] { numBins },
                 (eng, result) =>
                 {
-                    var sr = eng as CpuEngine ?? new CpuEngine();
+                    var sr = eng.As<CpuEngine>() ?? new CpuEngine();
                     DirectGpuTensorEngine.CopyResultInto(eng, sr.TensorCountIndices<T>(capturedIndices, numBins), result);
                 },
                 savedState: new object[] { indices });
@@ -322,7 +322,7 @@ public partial class CpuEngine
             return;
         var savedIndices = (Tensor<int>)savedState[0];
         int numCols = (int)savedState[1];
-        var sr = engine as CpuEngine ?? new CpuEngine();
+        var sr = engine.As<CpuEngine>() ?? new CpuEngine();
         DifferentiableOps.AccumulateGrad(
             grads, inputs[0], sr.TensorGatherRowValuesBackward(gradOutput, savedIndices, numCols), engine);
     }
@@ -334,7 +334,7 @@ public partial class CpuEngine
         var table = inputs[0];
         var weights = inputs[1];
         var savedIndices = (Tensor<int>)savedState[0];
-        var sr = engine as CpuEngine ?? new CpuEngine();
+        var sr = engine.As<CpuEngine>() ?? new CpuEngine();
         if (DifferentiableOps.IsGradientRequired(table))
         {
             DifferentiableOps.AccumulateGrad(
@@ -744,7 +744,7 @@ public static class SparseRoutingEngineExtensions
     public static Tensor<T> TensorGatherRowValues<T>(this IEngine engine, Tensor<T> values, Tensor<int> indices)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.TensorGatherRowValues(values, indices);
         return new CpuEngine().TensorGatherRowValues(values, indices);
     }
@@ -754,7 +754,7 @@ public static class SparseRoutingEngineExtensions
         this IEngine engine, Tensor<T> gradOutput, Tensor<int> indices, int numCols)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.TensorGatherRowValuesBackward(gradOutput, indices, numCols);
         return new CpuEngine().TensorGatherRowValuesBackward(gradOutput, indices, numCols);
     }
@@ -764,7 +764,7 @@ public static class SparseRoutingEngineExtensions
         this IEngine engine, Tensor<T> table, Tensor<int> indices, Tensor<T> weights)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.TopKWeightedRowMix(table, indices, weights);
         return new CpuEngine().TopKWeightedRowMix(table, indices, weights);
     }
@@ -774,7 +774,7 @@ public static class SparseRoutingEngineExtensions
         this IEngine engine, Tensor<T> gradOutput, Tensor<T> table, Tensor<int> indices)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.TopKWeightedRowMixBackwardWeights(gradOutput, table, indices);
         return new CpuEngine().TopKWeightedRowMixBackwardWeights(gradOutput, table, indices);
     }
@@ -784,7 +784,7 @@ public static class SparseRoutingEngineExtensions
         this IEngine engine, Tensor<T> gradOutput, Tensor<int> indices, Tensor<T> weights, int numEntries)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.TopKWeightedRowMixBackwardTable(gradOutput, indices, weights, numEntries);
         return new CpuEngine().TopKWeightedRowMixBackwardTable(gradOutput, indices, weights, numEntries);
     }
@@ -793,7 +793,7 @@ public static class SparseRoutingEngineExtensions
     public static Tensor<T> TensorCountIndices<T>(this IEngine engine, Tensor<int> indices, int numBins)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        if (engine is CpuEngine cpuEngine)
+        if (engine.TryGet<CpuEngine>(out var cpuEngine))
             return cpuEngine.TensorCountIndices<T>(indices, numBins);
         return new CpuEngine().TensorCountIndices<T>(indices, numBins);
     }

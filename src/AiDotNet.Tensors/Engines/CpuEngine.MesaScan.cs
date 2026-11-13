@@ -217,6 +217,10 @@ public partial class CpuEngine
         int heads = (int)savedState[1];
         int batch = q.Shape[0], time = q.Shape[1], model = q.Shape[2], dim = model / heads;
 
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.CreatesGraph && MesaScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, q, k, v, w0, regularization, heads))
+            return;
+
         var dq = new Tensor<T>(q.Shape.ToArray());
         var dk = new Tensor<T>(k.Shape.ToArray());
         var dv = new Tensor<T>(v.Shape.ToArray());
@@ -243,6 +247,54 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, k, dk, engine);
         DifferentiableOps.AccumulateGrad(grads, v, dv, engine);
         DifferentiableOps.AccumulateGrad(grads, w0, dw0, engine);
+    }
+
+    // The create-graph path of MesaScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool MesaScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> q,
+            Tensor<T> k,
+            Tensor<T> v,
+            Tensor<T> w0,
+            T regularization,
+            int heads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => MesaScanComposite(e, q, k, v, w0, MathHelper.GetNumericOperations<T>().ToDouble(regularization), heads));
+
+    // The recursive-least-squares scan as recorded ops, per head (P_0 = I/λ, W_0 = initialWeights[h]):
+    // p = P k, P ← P - p pᵀ / (1 + kᵀ p), W ← W - (W k - v)(kᵀ P), y = W q.
+    private static Tensor<T> MesaScanComposite<T>(IEngine e, Tensor<T> q, Tensor<T> k, Tensor<T> v, Tensor<T> w0,
+        double regularization, int heads)
+    {
+        int batch = q.Shape[0], time = q.Shape[1], model = q.Shape[2], dim = model / heads;
+        var identity = new T[dim * dim];
+        var invLambda = RecordedOps<T>.S(1.0 / regularization);
+        for (int i = 0; i < dim; i++) identity[i * dim + i] = invLambda;
+        Tensor<T> p = new Tensor<T>(identity, new[] { 1, 1, dim, dim });
+        Tensor<T> w = RecordedOps<T>.R(e, w0, 1, heads, dim, dim);
+        var ys = new List<Tensor<T>>(time);
+        for (int t = 0; t < time; t++)
+        {
+            var kt = RecordedOps<T>.R(e, RecordedOps<T>.At(e, k, 1, t), batch, heads, dim);
+            var kRow = RecordedOps<T>.R(e, kt, batch, heads, 1, dim);
+            var kCol = RecordedOps<T>.R(e, kt, batch, heads, dim, 1);
+            var pk = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, p, kRow), 3, keep: false);                 // [B, H, D]
+            var den = RecordedOps<T>.Shift(e, RecordedOps<T>.Sum(e, e.TensorMultiply(kt, pk), 2, keep: true), 1.0); // [B, H, 1]
+            var outer = RecordedOps<T>.Mul(e,
+                RecordedOps<T>.R(e, pk, batch, heads, dim, 1), RecordedOps<T>.R(e, pk, batch, heads, 1, dim));
+            p = RecordedOps<T>.Sub(e, p, RecordedOps<T>.Div(e, outer, RecordedOps<T>.R(e, den, batch, heads, 1, 1)));
+            var err = e.TensorSubtract(RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, w, kRow), 3, keep: false),
+                RecordedOps<T>.R(e, RecordedOps<T>.At(e, v, 1, t), batch, heads, dim));
+            var row = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, p, kCol), 2, keep: false);                // [B, H, D]
+            w = RecordedOps<T>.Sub(e, w, RecordedOps<T>.Mul(e,
+                RecordedOps<T>.R(e, err, batch, heads, dim, 1), RecordedOps<T>.R(e, row, batch, heads, 1, dim)));
+            var qRow = RecordedOps<T>.R(e, RecordedOps<T>.At(e, q, 1, t), batch, heads, 1, dim);
+            ys.Add(RecordedOps<T>.R(e, RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, w, qRow), 3, keep: false), batch, model));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 
     private static void MesaBackwardCore<T>(

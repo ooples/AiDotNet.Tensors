@@ -30,7 +30,9 @@ internal static class MetalBatchExecutionKernels
             .Replace("unsigned long long", "ulong")
             .Replace("(long long)", "(long)")
             .Replace("__shared__ float", "threadgroup float")
-            .Replace("__syncthreads()", "threadgroup_barrier(mem_flags::mem_threadgroup)")
+            // The barrier orders device memory too: the model-op CRF kernels read their group's previous step from it.
+            .Replace("__syncthreads()", "threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup)")
+            .Replace("blockIdx.x", "((int)bx_tid / (int)bx_bdim)")
             .Replace("bx_gid()", "(int)bx_tid")
             .Replace("threadIdx.x", "(int)bx_lid")
             .Replace("blockDim.x", "(int)bx_bdim")

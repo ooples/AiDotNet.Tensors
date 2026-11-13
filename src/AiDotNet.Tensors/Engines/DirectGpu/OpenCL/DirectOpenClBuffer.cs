@@ -151,6 +151,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return null;
             }
 
+            if (!parent._context.RetainViewParent(view, parent.Handle))
+            {
+                OpenClNativeBindings.ReleaseMemObject(view);
+                System.Diagnostics.Trace.TraceWarning(
+                    $"OpenCL could not retain the parent of a view at byte offset {byteOffset}.");
+                return null;
+            }
+
             return new DirectOpenClBuffer(parent._context, view, elementCount);
         }
 

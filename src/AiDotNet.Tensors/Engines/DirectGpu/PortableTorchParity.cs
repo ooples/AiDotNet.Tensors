@@ -40,6 +40,7 @@ internal static class PortableTorchParity
         TorchParityUnaryOp.Mvlgamma => "tp_mvlgamma",
         TorchParityUnaryOp.Angle => "tp_angle",
         TorchParityUnaryOp.NonZero => "tp_nonzero",
+        _ when TorchModelOpsCodes.ActivationKernel(op) is { } modelKernel => modelKernel,
         _ => throw new System.ArgumentOutOfRangeException(nameof(op)),
     };
 

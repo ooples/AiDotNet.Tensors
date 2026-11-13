@@ -158,7 +158,7 @@ public sealed partial class HipBackend
         if (CompileKernelModule(HipClBlastGemmKernels.BuildIndirectSource(config, kernelName), kernelName, ref module,
             new[] { kernelName }, useFastMath: false) is not null || !_kernelCache.TryGetValue(kernelName, out IntPtr kernel))
         {
-            if (module != IntPtr.Zero) HipNativeBindings.hipModuleUnload(module);
+            if (module != IntPtr.Zero) UnloadModule(module);
             return null;
         }
         return new ClBlastXgemmVariant(config, module, kernel);
@@ -317,12 +317,12 @@ public sealed partial class HipBackend
     {
         lock (_clblastLock)
         {
-            foreach (var variant in _clblastVariants.Values) HipNativeBindings.hipModuleUnload(variant.Module);
+            foreach (var variant in _clblastVariants.Values) UnloadModule(variant.Module);
             _clblastVariants.Clear();
             _clblastDeployments.Clear();
-            if (_clblastDefault is not null) HipNativeBindings.hipModuleUnload(_clblastDefault.Module);
+            if (_clblastDefault is not null) UnloadModule(_clblastDefault.Module);
             _clblastDefault = null;
-            if (_clblastPackingModule != IntPtr.Zero) { HipNativeBindings.hipModuleUnload(_clblastPackingModule); _clblastPackingModule = IntPtr.Zero; }
+            if (_clblastPackingModule != IntPtr.Zero) { UnloadModule(_clblastPackingModule); _clblastPackingModule = IntPtr.Zero; }
             _clblastScratchA?.Dispose(); _clblastScratchA = null;
             _clblastScratchB?.Dispose(); _clblastScratchB = null;
             _clblastScratchC?.Dispose(); _clblastScratchC = null;

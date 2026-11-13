@@ -11,7 +11,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 internal sealed class CudaPinnedBufferPool : IDisposable
 {
-    private readonly ConcurrentDictionary<int, ConcurrentBag<IntPtr>> _buckets = new();
+    // Stacks, not ConcurrentBags: a bag's per-thread lists live in a ThreadLocal, which the GC finalizes with an abandoned
+    // backend, and the deferred Dispose of that backend then threw ObjectDisposedException instead of freeing the blocks.
+    private readonly ConcurrentDictionary<int, ConcurrentStack<IntPtr>> _buckets = new();
     private bool _disposed;
 
     /// <summary>
@@ -23,7 +25,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(CudaPinnedBufferPool));
         int bucketSize = NextPowerOfTwo(sizeInBytes);
 
-        if (_buckets.TryGetValue(bucketSize, out var bag) && bag.TryTake(out var ptr))
+        if (_buckets.TryGetValue(bucketSize, out var bag) && bag.TryPop(out var ptr))
             return ptr;
 
         var result = CuBlasNative.cuMemAllocHost(out ptr, (ulong)bucketSize);
@@ -44,7 +46,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
             return;
 
         int bucketSize = NextPowerOfTwo(sizeInBytes);
-        var bag = _buckets.GetOrAdd(bucketSize, _ => new ConcurrentBag<IntPtr>());
+        var bag = _buckets.GetOrAdd(bucketSize, _ => new ConcurrentStack<IntPtr>());
 
         // Limit pool size to prevent unbounded growth.
         // Either the buffer goes back to the bucket (still resident, still
@@ -52,7 +54,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         // what actually decrements the live byte count for memory_stats.
         if (bag.Count < 8)
         {
-            bag.Add(ptr);
+            bag.Push(ptr);
         }
         else
         {
@@ -80,7 +82,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
 
         foreach (var kvp in _buckets)
         {
-            while (kvp.Value.TryTake(out var ptr))
+            while (kvp.Value.TryPop(out var ptr))
             {
                 CuBlasNative.cuMemFreeHost(ptr);
                 GpuMemoryStats.RecordFree("cuda_pinned_host", kvp.Key);

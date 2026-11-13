@@ -843,11 +843,13 @@ public static class MeshConvolutionOperations
         // Normalize if requested
         if (laplacianType == LaplacianType.Normalized)
         {
-            // Compute D^(-1/2) * L * D^(-1/2) where D is diagonal of -L
+            // Compute D^(-1/2) * L * D^(-1/2) where D is the diagonal of L (each vertex's total weight; the off-diagonal
+            // entries are the negated weights, so the diagonal is positive). Taking it from -L made D negative, every
+            // scale 0, and the normalized Laplacian identically zero.
             var diagInvSqrt = new double[numVertices];
             for (int v = 0; v < numVertices; v++)
             {
-                double d = -laplacian[v * numVertices + v];
+                double d = laplacian[v * numVertices + v];
                 diagInvSqrt[v] = d > 1e-10 ? 1.0 / Math.Sqrt(d) : 0.0;
             }
 
