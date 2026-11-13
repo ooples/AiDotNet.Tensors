@@ -204,7 +204,12 @@ internal static class DeviceMemoryReclaim
             Volatile.Write(ref s_collectionDue, 1);
             return epoch;
         }
-        bool gen2 = sinceGen2 >= CollectGen2AfterDeviceBytes;
+        // Inside a tape, a Gen-1 collection: a full Gen-2 one marks the whole managed heap (tens of GB in a large training
+        // process) for garbage that is already there at the step boundary. Measured on a 74M-parameter MoE LM (RTX 3090,
+        // batch 8 x 256, with the backward-step and last-use releases): the step's in-tape Gen-2 collections were ~23% of
+        // its training thread; a Gen-1 one costs a fraction of that, and the boundary's Gen-2 collection (due because
+        // this one promoted what the tape held) returns everything that died meanwhile.
+        bool gen2 = !tapeOpen && sinceGen2 >= CollectGen2AfterDeviceBytes;
         ResetDeviceBytes(resetGen2: gen2);
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         if (tapeOpen)

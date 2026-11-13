@@ -264,6 +264,10 @@ internal sealed class CompiledDelegateChain<T>
 
                 long start = timing ? Stopwatch.GetTimestamp() : 0;
                 var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
+                // The device results this step's backward creates and does not leave in grads (its temporaries, and the
+                // contributions it summed into an input's gradient) are dead once it returns: free them now, stream
+                // ordered, as PyTorch's refcount frees them, instead of leaving them to the GC.
+                var stepScope = gpuEngine is not null && !DifferentiableOps._isBackwardCreateGraph ? TensorScope.Begin() : null;
                 try
                 {
                     step.Backward(gradOutput, step.Inputs, step.Output,
@@ -272,6 +276,13 @@ internal sealed class CompiledDelegateChain<T>
                 finally
                 {
                     DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
+                    if (stepScope is not null)
+                    {
+                        foreach (var input in step.Inputs)
+                            if (input is not null && grads.TryGetValue(input, out var inputGrad) && inputGrad is not null)
+                                stepScope.Keep(inputGrad);
+                        stepScope.Dispose();
+                    }
                 }
                 if (timing)
                 {

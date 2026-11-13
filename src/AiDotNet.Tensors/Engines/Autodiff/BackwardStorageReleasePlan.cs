@@ -3,6 +3,51 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
+/// The error a read of a tensor freed at its last backward use throws: which forward op made it, which backward step
+/// freed it, and how to keep it. Built once per plan candidate and formatted only if something reads the tensor.
+/// </summary>
+internal sealed class LastUseReleaseNote : Helpers.ReleaseNote
+{
+    private readonly int[] _shape;
+    private readonly System.Reflection.MethodInfo? _producer;
+    private readonly int _producerStep;
+    private readonly System.Reflection.MethodInfo? _freer;
+    private readonly int _freeingStep;
+    private readonly long _key;
+
+    internal LastUseReleaseNote(int[] shape, System.Reflection.MethodInfo? producer, int producerStep,
+        System.Reflection.MethodInfo? freer, int freeingStep, long key)
+    {
+        _key = key;
+        _shape = shape;   // a tensor's shape array is never mutated in place
+        _producer = producer;
+        _producerStep = producerStep;
+        _freer = freer;
+        _freeingStep = freeingStep;
+    }
+
+    // "MatMulBackward" -> "MatMul": the forward op a backward function belongs to.
+    internal static string OpName(System.Reflection.MethodInfo? method)
+    {
+        string name = method?.Name ?? "?";
+        int lambda = name.IndexOf('>');   // a lambda's compiler name: <Outer>b__12_0
+        if (name.StartsWith("<", StringComparison.Ordinal) && lambda > 1) name = name.Substring(1, lambda - 1);
+        return name.EndsWith("Backward", StringComparison.Ordinal) ? name.Substring(0, name.Length - "Backward".Length) : name;
+    }
+
+    // A failed read still teaches the probe: the next run of this graph keeps this output.
+    internal override void OnRead() => AutoRetainProbe.Retain(_key);
+
+    internal override string Describe() =>
+        $"This tensor [{string.Join(", ", _shape)}] is the output of forward op '{OpName(_producer)}' (backward step " +
+        $"#{_producerStep}). Its GPU memory was freed, without a host copy, right after backward step #{_freeingStep} " +
+        $"('{OpName(_freer)}'), its last use in the backward graph, as PyTorch frees a graph's saved tensors during backward. " +
+        "To read it after backward, call GradientTape.Retain(tensor) on it before backward runs " +
+        "(or TensorScope.Keep(tensor) inside a TensorScope). This read was recorded: later backward runs of this graph " +
+        "keep this op's output (AutoRetainProbe), as they keep anything read within one step of the graph's first run.";
+}
+
+/// <summary>
 /// Precomputed, storage-aware release schedule for progressive GPU activation reclamation.
 /// Tensor objects are not allocation identities: reshape/transpose/slice views can all share
 /// one storage, and a saved tensor can outlive an earlier alias's backward step. The schedule
@@ -14,11 +59,15 @@ internal sealed class BackwardStorageReleasePlan<T>
     {
         internal readonly object StorageIdentity;
         internal readonly Tensor<T> Tensor;
+        internal readonly LastUseReleaseNote Note;
+        internal readonly long Key;   // the producer's structural identity (AutoRetainProbe)
 
-        internal ReleaseCandidate(object storageIdentity, Tensor<T> tensor)
+        internal ReleaseCandidate(object storageIdentity, Tensor<T> tensor, LastUseReleaseNote note, long key)
         {
             StorageIdentity = storageIdentity;
             Tensor = tensor;
+            Note = note;
+            Key = key;
         }
     }
 
@@ -26,6 +75,7 @@ internal sealed class BackwardStorageReleasePlan<T>
     {
         internal readonly object Identity;
         internal Tensor<T>? ReleaseCandidate;
+        internal int ProducerStep = -1;
         internal int LastUse;
 
         internal StorageUsage(object identity, int lastUse)
@@ -40,9 +90,17 @@ internal sealed class BackwardStorageReleasePlan<T>
         private readonly Dictionary<object, StorageUsage> _usage =
             new(ReferenceEqualityComparer<object>.Instance);
 
-        internal void Observe(Tensor<T>? tensor, int step, bool canRelease)
+        // Tensor objects some step produced, and the tensors steps take as inputs. An input no step produced is a
+        // leaf (a parameter, a caller's input); a recorded op's output can alias its storage (a reshape view of a
+        // weight), and that storage belongs to the leaf, never to the graph, so it is never released. Saved state is
+        // not an input: a forward op may save its own intermediate's base tensor next to a view it outputs.
+        private readonly HashSet<Tensor<T>> _outputs = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        private readonly List<Tensor<T>> _reads = new();
+
+        internal void Observe(Tensor<T>? tensor, int step, bool canRelease, bool savedState = false)
         {
             if (tensor is null) return;
+            if (canRelease) _outputs.Add(tensor); else if (!savedState) _reads.Add(tensor);
             object identity = tensor.StorageIdentity;
             if (!_usage.TryGetValue(identity, out var usage))
             {
@@ -57,11 +115,17 @@ internal sealed class BackwardStorageReleasePlan<T>
             // Only graph-produced outputs are owned by progressive activation reclamation.
             // Inputs that are leaves must never become releasable merely because they were read.
             if (canRelease && usage.ReleaseCandidate is null)
+            {
                 usage.ReleaseCandidate = tensor;
+                usage.ProducerStep = step;
+            }
         }
 
-        internal BackwardStorageReleasePlan<T> Build(int stepCount)
+        internal BackwardStorageReleasePlan<T> Build(int stepCount, Func<int, System.Reflection.MethodInfo?> method)
         {
+            foreach (var read in _reads)
+                if (!_outputs.Contains(read) && _usage.TryGetValue(read.StorageIdentity, out var leafOwned))
+                    leafOwned.ReleaseCandidate = null;
             var counts = new int[stepCount];
             foreach (var usage in _usage.Values)
             {
@@ -77,15 +141,30 @@ internal sealed class BackwardStorageReleasePlan<T>
             }
 
             Array.Clear(counts, 0, counts.Length);
+            // A producer's structural key: its backward function, output shape and ordinal among same-keyed outputs,
+            // stable across the per-step rebuilds of the same graph. The graph signature combines them all.
+            var ordinals = new Dictionary<long, int>();
+            long signature = stepCount;
             foreach (var usage in _usage.Values)
             {
                 if (usage.ReleaseCandidate is null) continue;
                 int step = usage.LastUse;
-                releases[step]![counts[step]++] =
-                    new ReleaseCandidate(usage.Identity, usage.ReleaseCandidate);
+                var producer = method(usage.ProducerStep);
+                long key;
+                unchecked
+                {
+                    long shapeKey = (producer?.MetadataToken ?? 0) * 1_000_003L + (producer?.Module.GetHashCode() ?? 0);
+                    foreach (int d in usage.ReleaseCandidate._shape) shapeKey = shapeKey * 31 + d;
+                    ordinals.TryGetValue(shapeKey, out int ordinal);
+                    ordinals[shapeKey] = ordinal + 1;
+                    key = shapeKey * 1_000_033L + ordinal;
+                    signature = (signature * 1_099_511_628_211L) ^ key;
+                }
+                releases[step]![counts[step]++] = new ReleaseCandidate(usage.Identity, usage.ReleaseCandidate,
+                    new LastUseReleaseNote(usage.ReleaseCandidate._shape, producer, usage.ProducerStep, method(step), step, key), key);
             }
 
-            return new BackwardStorageReleasePlan<T>(releases);
+            return new BackwardStorageReleasePlan<T>(releases, signature);
         }
     }
 
@@ -103,14 +182,20 @@ internal sealed class BackwardStorageReleasePlan<T>
         public void Visit(ITensorStorageLeaseSource tensor)
         {
             if (tensor is Tensor<T> typed)
-                _builder.Observe(typed, _step, canRelease: false);
+                _builder.Observe(typed, _step, canRelease: false, savedState: true);
         }
     }
 
     private readonly ReleaseCandidate[]?[] _releasesAfterStep;
+    private readonly long _signature;
+    private int _lastStep = int.MaxValue;   // a step index not above the last one starts a new backward run
+    private bool _probing;
 
-    private BackwardStorageReleasePlan(ReleaseCandidate[]?[] releasesAfterStep)
-        => _releasesAfterStep = releasesAfterStep;
+    private BackwardStorageReleasePlan(ReleaseCandidate[]?[] releasesAfterStep, long signature)
+    {
+        _releasesAfterStep = releasesAfterStep;
+        _signature = signature;
+    }
 
     internal static BackwardStorageReleasePlan<T> Create(BackwardStep<T>[] steps, int count)
     {
@@ -128,7 +213,7 @@ internal sealed class BackwardStorageReleasePlan<T>
             var visitor = new SavedUseVisitor(builder, i);
             SavedStateTensorTraversal.Visit(step.SavedState, ref visitor);
         }
-        return builder.Build(count);
+        return builder.Build(count, i => steps[i].Backward?.Method);
     }
 
     internal static BackwardStorageReleasePlan<T> Create(
@@ -157,7 +242,7 @@ internal sealed class BackwardStorageReleasePlan<T>
             var visitor = new SavedUseVisitor(builder, step);
             SavedStateTensorTraversal.Visit(entry.SavedState, ref visitor);
         }
-        return builder.Build(executionOrder.Length);
+        return builder.Build(executionOrder.Length, i => entries[executionOrder[i]].Backward?.Method);
     }
 
     /// <summary>
@@ -170,6 +255,13 @@ internal sealed class BackwardStorageReleasePlan<T>
         DirectGpuTensorEngine engine,
         HashSet<object> protectedStorages)
     {
+        if (step <= _lastStep)
+        {
+            // A new backward run: the previous probe window ends, and this graph's first run probes.
+            AutoRetainProbe.EndWindow();
+            _probing = AutoRetainProbe.TryBeginProbe(_signature);
+        }
+        _lastStep = step;
         var candidates = _releasesAfterStep[step];
         if (candidates is null) return;
         for (int i = 0; i < candidates.Length; i++)
@@ -177,9 +269,18 @@ internal sealed class BackwardStorageReleasePlan<T>
             var candidate = candidates[i];
             if (protectedStorages.Contains(candidate.StorageIdentity)) continue;
             if (!ReferenceEquals(candidate.Tensor.StorageIdentity, candidate.StorageIdentity)) continue;
+            if (AutoRetainProbe.IsRetained(candidate.Key)) continue;   // read after backward on a probe run: kept
             // Dead after this step: never download it (materializing moved ~0.6 GB device-to-host per training step
-            // on a 26.8M-parameter LM). Device-only data waits for the tape's dispose-time release.
-            engine.ReleaseDeadActivation(candidate.Tensor);
+            // on a 26.8M-parameter LM).
+            if (_probing)
+            {
+                var tensor = candidate.Tensor;
+                var note = candidate.Note;
+                AutoRetainProbe.Quarantine(tensor.DataVector, tensor.GetBackingArrayForCacheLookupUnsafe(), candidate.Key,
+                    () => engine.ReleaseDeadActivation(tensor, note));
+                continue;
+            }
+            engine.ReleaseDeadActivation(candidate.Tensor, candidate.Note);
         }
     }
 

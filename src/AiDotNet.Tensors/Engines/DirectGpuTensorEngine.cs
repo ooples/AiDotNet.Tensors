@@ -2006,7 +2006,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
         if ((array is not null && Helpers.HostSync.IsReleased(array))
             || Helpers.HostSync.IsReleased(tensor.DataVector))
+        {
+            // The release's own message: a last-use release names the producing op and the Retain call to add.
+            if (array is not null) Helpers.HostSync.ThrowIfReleased(array);
+            Helpers.HostSync.ThrowIfReleased(tensor.DataVector);
             throw new InvalidOperationException(ReleasedIntermediateMessage);
+        }
     }
 
     private static readonly bool s_staleDropTrace = System.Environment.GetEnvironmentVariable("AIDOTNET_STALE_DROP_TRACE") == "1";
@@ -2014,6 +2019,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
         ThrowIfReleased(tensor);
+        // A device read of an intermediate a probe run quarantined: retain its producer (AutoRetainProbe).
+        if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
@@ -2304,7 +2311,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// a later backward step (it did, in the HRE LM's specialized backwards). The old materialize-then-free contract
     /// hid that by downloading and re-uploading. A tensor with a valid host copy is simply uncached, as before.
     /// </summary>
-    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor)
+    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor, Helpers.ReleaseNote? note = null)
     {
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if ((backingArray is not null && Helpers.HostSync.IsRetained(backingArray))
@@ -2312,7 +2319,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;   // kept past the tape by the caller
         if ((backingArray is not null && Helpers.HostSync.IsPending(backingArray))
             || Helpers.HostSync.IsPending(tensor.DataVector))
-            return;   // device-only: released (no download) when the tape is disposed
+        {
+            // Device-only, and its last declared backward use just ran (BackwardStorageReleasePlan proved no later step
+            // reads it, and a leaf's storage is never scheduled): free it now, stream ordered, with no download. It used
+            // to wait for the GC, as tape dispose no longer releases results the tensors own: 30-40% of a GPU MoE LM
+            // step's dead device memory, recovered by blocking collections.
+            ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true, note);
+            return;
+        }
         if (backingArray is not null) InvalidateActivationCacheEntry(backingArray);
         InvalidateActivationCacheEntry(tensor.DataVector);
     }
@@ -2997,7 +3011,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// pool at once. Only a tensor covering its whole vector qualifies, so the buffer is the vector's own. Its pending
     /// download is replaced by the released-intermediate error, so a read that should not happen fails loudly.
     /// </summary>
-    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor, bool afterQueuedWork = false)
+    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor, bool afterQueuedWork = false, Helpers.ReleaseNote? note = null)
     {
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
@@ -3005,8 +3019,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
         if (s_staleDropTrace)
             StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
-        Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
-        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
+        if (note is not null)
+        {
+            Helpers.HostSync.Release(vector, note);
+            if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } noted) Helpers.HostSync.Release(noted, note);
+        }
+        else
+        {
+            Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
+            if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
+        }
         state.Buffer = null;
         state.DeviceValid = false;
         if (afterQueuedWork && tensor._gpuBackend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);

@@ -633,6 +633,13 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps._isBackwardCreateGraph)
+        {
+            // One fused kernel (IEngine.SwishBackward) instead of 6 element-wise ops and their temporaries. A create-graph
+            // backward keeps the composite below: its ops are recorded so the gradient can be differentiated again.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.SwishBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         var sig = engine.Sigmoid(inputs[0]);
         // 1 - sig as device ops: a host tensor of ones (CreateOnes) forced an upload per step - illegal inside a
@@ -650,6 +657,13 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps._isBackwardCreateGraph)
+        {
+            // One fused kernel (IEngine.MishBackward) instead of 11 element-wise ops and their temporaries. A create-graph
+            // backward keeps the composite below: its ops are recorded so the gradient can be differentiated again.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.MishBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         // softplus = log(1 + exp(x))
         var expX = engine.TensorExp(inputs[0]);
@@ -3251,6 +3265,12 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         double beta = savedState.Length > 0 ? (double)savedState[0] : 1.0;
+        if (beta == 1.0 && !DifferentiableOps._isBackwardCreateGraph)
+        {
+            // softplus'(x) = sigmoid(x): one fused kernel instead of a scale, a sigmoid and a multiply.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.SoftplusBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         // d(softplus(x))/dx = sigmoid(beta*x)
         var scaled = engine.TensorMultiplyScalar(inputs[0], numOps.FromDouble(beta));
         var sig = engine.TensorSigmoid(scaled);
@@ -3281,6 +3301,13 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps._isBackwardCreateGraph)
+        {
+            // One fused kernel (IEngine.HardswishBackward) instead of 5 element-wise ops and their temporaries. A create-graph
+            // backward keeps the composite below: its ops are recorded so the gradient can be differentiated again.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.HardswishBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         // derivative = clamp((2x+3)/6, 0, 1) — use engine ops for graph recording
         var twoX = engine.TensorMultiplyScalar(inputs[0], numOps.FromDouble(2.0));

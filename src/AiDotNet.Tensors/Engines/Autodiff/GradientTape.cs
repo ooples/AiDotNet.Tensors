@@ -387,6 +387,10 @@ public sealed class GradientTape<T> : IDisposable
             _retainGrad = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         }
 
+        // An outermost tape is a training step: a backend's step arena records one and replays the rest.
+        _beganTrainingStep = _parent is null && !_options.SuppressArenaScope;
+        if (_beganTrainingStep) Engines.DirectGpu.TrainingStep.Begin();
+
         SetCurrentTape(this);
         _lifecycleCounterRegistered = true;
         System.Threading.Interlocked.Increment(ref DifferentiableOps._anyTapeActive);
@@ -3272,7 +3276,10 @@ public sealed class GradientTape<T> : IDisposable
         {
             Engines.DirectGpu.DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
         }
+        if (_beganTrainingStep) Engines.DirectGpu.TrainingStep.End();
     }
+
+    private bool _beganTrainingStep;
 
     // ──────────────────────────────────────────────────────────────
     // NoGradScope: suppress tape recording during inference

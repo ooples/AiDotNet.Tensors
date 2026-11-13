@@ -346,6 +346,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private void ReturnAsyncBuffer(CudaGpuBuffer buffer)
     {
+        _stepArena?.OnReturned(buffer);
         if (_backendStreamCaptureActive)
             buffer.Release();
         else if (buffer.DetachForPool() is { } lease)
@@ -358,8 +359,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// </summary>
     private void ReturnPooledBuffer(CudaGpuBuffer buffer)
     {
+        _stepArena?.OnReturned(buffer);
         if (buffer.DetachForPool() is { } lease) _bufferPool.Return(lease);
     }
+
+    // The training-step arena (CudaStepArena), created on first use. Null outside a step, during a capture, and for
+    // allocations a captured graph or another stream owns.
+    private CudaStepArena? _stepArena;
+
+    private CudaStepArena? StepArenaForThisAllocation()
+    {
+        if (!CudaStepArena.Enabled || !TrainingStep.InStep || CaptureMemoryPool.Current is not null
+            || IsCapturingOnThisThread || _backendStreamCaptureActive)
+            return null;
+        return _stepArena ??= new CudaStepArena(_cudaContext,
+            bytes => AllocDeviceMemoryWithRetry(bytes),
+            ptr =>
+            {
+                using var _ = PushContext();
+                CuBlasNative.cuMemFree(ptr);
+            });
+    }
+
+    /// <summary>Test hook: this backend's step arena, if one was created.</summary>
+    internal CudaStepArena? StepArenaForTests => _stepArena;
 
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
     {
@@ -2121,6 +2144,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        var arena = StepArenaForThisAllocation();
+        if (arena?.TryRent(size) is { } slot)
+        {
+            // Same zero-initialised contract as the pool, ordered on _stream after the slot's previous user.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(slot.Handle, 0, (ulong)size * sizeof(float), _stream), "cuMemsetD8Async(arena)");
+            return slot;
+        }
+        var allocated = AllocateBufferFromPool(size);
+        if (arena is not null && allocated is CudaGpuBuffer tracked) arena.Track(tracked);
+        return allocated;
+    }
+
+    private IGpuBuffer AllocateBufferFromPool(int size)
+    {
         if (_asyncAlloc)
         {
             if (TryRentAsyncBuffer(size) is { } reused)
@@ -2175,9 +2213,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!_asyncAlloc)
             return AllocateBuffer(size);
         using var _ = PushContext();
-        var buffer = TryRentAsyncBuffer(size)
-            ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
-                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+        var arena = StepArenaForThisAllocation();
+        var buffer = arena?.TryRent(size);
+        if (buffer is null)
+        {
+            buffer = TryRentAsyncBuffer(size)
+                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            arena?.Track(buffer);
+        }
         if (PoisonUninitializedBuffers)
         {
             try
@@ -20590,6 +20634,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         /// <summary>Pins this buffer to <paramref name="pool"/>: its releases are parked until the pool retires.</summary>
         internal void PinTo(CaptureMemoryPool pool) => pool.Pin(ref _capturePins, this);
+
+        // A slot of a step arena's block (CudaStepArena): the memory is the arena's. Disposing, releasing or finalizing
+        // the buffer only marks the slot dead; it never goes to the pool or the driver.
+        private CudaStepArena.Block? _arenaBlock;
+        private int _arenaSlot;
+
+        internal static CudaGpuBuffer ForArenaSlot(IntPtr context, IntPtr devicePtr, int size, CudaStepArena.Block block, int slot)
+        {
+            var buffer = new CudaGpuBuffer(context, devicePtr, size);
+            buffer._arenaBlock = block;
+            buffer._arenaSlot = slot;
+            return buffer;
+        }
+
+        // Ends an arena slot's lease: Handle reads 0 for every binding that still holds this object.
+        private bool TryEndArenaLease()
+        {
+            if (_arenaBlock is not { } block) return false;
+            if (Interlocked.Exchange(ref _devicePtr, IntPtr.Zero) != IntPtr.Zero)
+                CudaStepArena.OnSlotDead(block, _arenaSlot);
+            _context = IntPtr.Zero;
+            GC.SuppressFinalize(this);
+            return true;
+        }
         internal IntPtr OwningContext => _context;
 
         /// <param name="account">The device's memory counters, for a fresh allocation; null for a pool's new wrapper of
@@ -20660,6 +20728,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void ReleaseCore()
         {
+            if (TryEndArenaLease()) return;
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
@@ -20732,6 +20801,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void DisposeCore()
         {
+            if (TryEndArenaLease()) return;
             if (_returnToPool == null || _capturedAllocation)
             {
                 ReleaseCore();
@@ -20759,6 +20829,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // 0xC0000005). Defer the device free to a real op thread via the pending-free queue.
             // Atomically CLAIM the pointer: if a concurrent ReleaseCore already took it we get Zero and
             // enqueue nothing, so the pointer is never freed twice (the double-free that crashed the host).
+            if (_arenaBlock is { } block)
+            {
+                // Only marks the slot dead (safe on the finalizer thread): the arena owns the memory.
+                if (Interlocked.Exchange(ref _devicePtr, IntPtr.Zero) != IntPtr.Zero) CudaStepArena.OnSlotDead(block, _arenaSlot);
+                return;
+            }
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
             if (ptr != IntPtr.Zero) _memory.OnFreed();
             CompleteCudaBufferReclaimOrFinalizer(0, -1, ptr, _context, _contextGeneration, _asyncFreeStream);
