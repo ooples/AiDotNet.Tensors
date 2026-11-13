@@ -264,6 +264,28 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorNanMean<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        // Half/BFloat16: the composition below holds the sum and the count in T, both +Inf past 65,504 (70,000 Half
+        // ones gave NaN). Sum in float32, count in an int, divide in float32 and round once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            int[] lowAxes;
+            if (axes is null || axes.Length == 0)
+            {
+                lowAxes = new int[tensor.Rank];
+                for (int d = 0; d < tensor.Rank; d++) lowAxes[d] = d;
+            }
+            else
+            {
+                lowAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
+            }
+            var lowShape = LowPrecisionReducedShape(tensor._shape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            var lowResult = new Tensor<T>(LowPrecisionNanMean(tensor.GetFlattenedData(), tensor._shape, lowAxes, lowSize), lowShape);
+            DifferentiableOps.RecordUnary("TensorNanMean", lowResult, tensor, LowPrecisionGradients.NanMeanBackward,
+                new object[] { lowAxes, keepDims });
+            return lowResult;
+        }
         var (kept, present) = NonNanParts(tensor);
         Tensor<T> count;
         using (new NoGradScope<T>()) count = ReduceSum(present, axes, keepDims);

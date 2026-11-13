@@ -166,6 +166,77 @@ public partial class CpuEngine
         return result;
     }
 
+    // One odometer pass over a logical row-major array: visit(i, slot) for every element, slot being its reduced output.
+    private static void ForEachSlot(int[] shape, int[] strideForDim, int length, Action<int, int> visit)
+    {
+        int rank = shape.Length;
+        var coord = new int[rank];
+        int o = 0;
+        for (int i = 0; i < length; i++)
+        {
+            visit(i, o);
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                coord[d]++; o += strideForDim[d];
+                if (coord[d] < shape[d]) break;
+                coord[d] = 0; o -= strideForDim[d] * shape[d];
+            }
+        }
+    }
+
+    /// <summary>
+    /// <c>torch.nanmean</c> over <paramref name="normalizedAxes"/> for Half/BFloat16: the non-NaN elements are summed in
+    /// float32 (compensated per slot), counted in an int, divided in float32 and rounded to T once. Holding the sum or
+    /// the count in Half overflows past 65,504 (70,000 Half ones gave +Inf / +Inf = NaN). A slot with no non-NaN
+    /// element is 0 / 0 = NaN, as in PyTorch.
+    /// </summary>
+    internal static T[] LowPrecisionNanMean<T>(T[] data, int[] shape, int[] normalizedAxes, int outputSize)
+    {
+        int length = 1;
+        foreach (int dim in shape) length *= dim;
+        var x = WidenRun(data, 0, length);
+        var strideForDim = ReducedSlotStrides(shape, normalizedAxes, out _);
+        var sum = new float[outputSize];
+        var compensation = new float[outputSize];
+        var count = new int[outputSize];
+        ForEachSlot(shape, strideForDim, length, (i, o) =>
+        {
+            float v = x[i];
+            if (float.IsNaN(v)) return;
+            count[o]++;
+            float y = v - compensation[o];
+            float t = sum[o] + y;
+            compensation[o] = float.IsInfinity(t) ? 0f : (t - sum[o]) - y;
+            sum[o] = t;
+        });
+        for (int o = 0; o < outputSize; o++) sum[o] /= count[o];
+        var result = new T[outputSize];
+        NarrowInto(sum, 0, result, 0, outputSize);
+        return result;
+    }
+
+    /// <summary>
+    /// The nanmean backward for Half/BFloat16: each non-NaN input receives its slot's upstream gradient divided by the
+    /// slot's int count in float32, NaN inputs receive 0, and each gradient is rounded once.
+    /// </summary>
+    internal static T[] LowPrecisionNanMeanBackward<T>(T[] input, T[] gradOutput, int[] shape, int[] normalizedAxes)
+    {
+        int length = 1;
+        foreach (int dim in shape) length *= dim;
+        var x = WidenRun(input, 0, length);
+        var strideForDim = ReducedSlotStrides(shape, normalizedAxes, out _);
+        int slots = 1;
+        foreach (int dim in LowPrecisionReducedShape(shape, normalizedAxes, keepDims: true)) slots *= dim;
+        var g = WidenRun(gradOutput, 0, slots);
+        var count = new int[slots];
+        ForEachSlot(shape, strideForDim, length, (i, o) => { if (!float.IsNaN(x[i])) count[o]++; });
+        var result = new float[length];
+        ForEachSlot(shape, strideForDim, length, (i, o) => result[i] = float.IsNaN(x[i]) ? 0f : g[o] / count[o]);
+        var narrowed = new T[length];
+        NarrowInto(result, 0, narrowed, 0, length);
+        return narrowed;
+    }
+
     /// <summary>
     /// Softmax or log-softmax along the middle axis of an <c>[outer, axisSize, inner]</c> contiguous layout: the max,
     /// the exponentials, their sum and the normalisation all run in float32, and each output is rounded once.
