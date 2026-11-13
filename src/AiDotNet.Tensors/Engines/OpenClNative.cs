@@ -436,7 +436,7 @@ public static class OpenClNative
 
     /// <summary>Enqueues a command to read from a buffer to host memory.</summary>
     [DllImport(OpenClLibrary, EntryPoint = "clEnqueueReadBuffer")]
-    public static extern ClError clEnqueueReadBuffer(
+    private static extern ClError clEnqueueReadBufferNative(
         IntPtr commandQueue,
         IntPtr buffer,
         uint blockingRead,  // CL_TRUE = 1, CL_FALSE = 0
@@ -447,9 +447,27 @@ public static class OpenClNative
         IntPtr[] eventWaitList,
         out IntPtr evt);
 
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static ClError clEnqueueReadBuffer(
+        IntPtr commandQueue,
+        IntPtr buffer,
+        uint blockingRead,  // CL_TRUE = 1, CL_FALSE = 0
+        UIntPtr offset,
+        UIntPtr size,
+        IntPtr ptr,
+        uint numEventsInWaitList,
+        IntPtr[] eventWaitList,
+        out IntPtr evt)
+    {
+        var result = clEnqueueReadBufferNative(commandQueue, buffer, blockingRead, offset, size, ptr, numEventsInWaitList, eventWaitList, out evt);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(commandQueue);
+        return result;
+    }
+
     /// <summary>Enqueues a command to write from host memory to a buffer.</summary>
     [DllImport(OpenClLibrary, EntryPoint = "clEnqueueWriteBuffer")]
-    public static extern ClError clEnqueueWriteBuffer(
+    private static extern ClError clEnqueueWriteBufferNative(
         IntPtr commandQueue,
         IntPtr buffer,
         uint blockingWrite,
@@ -460,9 +478,27 @@ public static class OpenClNative
         IntPtr[] eventWaitList,
         out IntPtr evt);
 
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static ClError clEnqueueWriteBuffer(
+        IntPtr commandQueue,
+        IntPtr buffer,
+        uint blockingWrite,
+        UIntPtr offset,
+        UIntPtr size,
+        IntPtr ptr,
+        uint numEventsInWaitList,
+        IntPtr[] eventWaitList,
+        out IntPtr evt)
+    {
+        var result = clEnqueueWriteBufferNative(commandQueue, buffer, blockingWrite, offset, size, ptr, numEventsInWaitList, eventWaitList, out evt);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(commandQueue);
+        return result;
+    }
+
     /// <summary>Enqueues a command to fill a buffer with a pattern.</summary>
     [DllImport(OpenClLibrary, EntryPoint = "clEnqueueFillBuffer")]
-    public static extern ClError clEnqueueFillBuffer(
+    private static extern ClError clEnqueueFillBufferNative(
         IntPtr commandQueue,
         IntPtr buffer,
         IntPtr pattern,
@@ -473,9 +509,27 @@ public static class OpenClNative
         IntPtr[] eventWaitList,
         out IntPtr evt);
 
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static ClError clEnqueueFillBuffer(
+        IntPtr commandQueue,
+        IntPtr buffer,
+        IntPtr pattern,
+        UIntPtr patternSize,
+        UIntPtr offset,
+        UIntPtr size,
+        uint numEventsInWaitList,
+        IntPtr[] eventWaitList,
+        out IntPtr evt)
+    {
+        var result = clEnqueueFillBufferNative(commandQueue, buffer, pattern, patternSize, offset, size, numEventsInWaitList, eventWaitList, out evt);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(commandQueue);
+        return result;
+    }
+
     /// <summary>Enqueues a command to copy from one buffer to another.</summary>
     [DllImport(OpenClLibrary, EntryPoint = "clEnqueueCopyBuffer")]
-    public static extern ClError clEnqueueCopyBuffer(
+    private static extern ClError clEnqueueCopyBufferNative(
         IntPtr commandQueue,
         IntPtr srcBuffer,
         IntPtr dstBuffer,
@@ -485,6 +539,24 @@ public static class OpenClNative
         uint numEventsInWaitList,
         IntPtr[] eventWaitList,
         out IntPtr evt);
+
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static ClError clEnqueueCopyBuffer(
+        IntPtr commandQueue,
+        IntPtr srcBuffer,
+        IntPtr dstBuffer,
+        UIntPtr srcOffset,
+        UIntPtr dstOffset,
+        UIntPtr size,
+        uint numEventsInWaitList,
+        IntPtr[] eventWaitList,
+        out IntPtr evt)
+    {
+        var result = clEnqueueCopyBufferNative(commandQueue, srcBuffer, dstBuffer, srcOffset, dstOffset, size, numEventsInWaitList, eventWaitList, out evt);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(commandQueue);
+        return result;
+    }
 
     #endregion
 
@@ -609,7 +681,7 @@ public static class OpenClNative
 
     /// <summary>Enqueues a command to execute a kernel on a device.</summary>
     [DllImport(OpenClLibrary, EntryPoint = "clEnqueueNDRangeKernel")]
-    public static extern ClError clEnqueueNDRangeKernel(
+    private static extern ClError clEnqueueNDRangeKernelNative(
         IntPtr commandQueue,
         IntPtr kernel,
         uint workDim,
@@ -619,6 +691,24 @@ public static class OpenClNative
         uint numEventsInWaitList,
         IntPtr[] eventWaitList,
         out IntPtr evt);
+
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static ClError clEnqueueNDRangeKernel(
+        IntPtr commandQueue,
+        IntPtr kernel,
+        uint workDim,
+        UIntPtr[] globalWorkOffset,
+        UIntPtr[] globalWorkSize,
+        UIntPtr[] localWorkSize,
+        uint numEventsInWaitList,
+        IntPtr[] eventWaitList,
+        out IntPtr evt)
+    {
+        var result = clEnqueueNDRangeKernelNative(commandQueue, kernel, workDim, globalWorkOffset, globalWorkSize, localWorkSize, numEventsInWaitList, eventWaitList, out evt);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(commandQueue);
+        return result;
+    }
 
     #endregion
 
@@ -803,7 +893,7 @@ public static class ClBlastNative
     /// Single-precision general matrix multiplication: C = alpha*A*B + beta*C
     /// </summary>
     [DllImport(ClBlastLibrary, EntryPoint = "CLBlastSgemm", CallingConvention = CallingConvention.Cdecl)]
-    public static extern StatusCode Sgemm(
+    private static extern StatusCode SgemmNative(
         Layout layout,
         Transpose transA,
         Transpose transB,
@@ -816,12 +906,32 @@ public static class ClBlastNative
         ref IntPtr queue,
         IntPtr eventPtr);
 
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static StatusCode Sgemm(
+        Layout layout,
+        Transpose transA,
+        Transpose transB,
+        UIntPtr m, UIntPtr n, UIntPtr k,
+        float alpha,
+        IntPtr aBuffer, UIntPtr aOffset, UIntPtr aLd,
+        IntPtr bBuffer, UIntPtr bOffset, UIntPtr bLd,
+        float beta,
+        IntPtr cBuffer, UIntPtr cOffset, UIntPtr cLd,
+        ref IntPtr queue,
+        IntPtr eventPtr)
+    {
+        var result = SgemmNative(layout, transA, transB, m, n, k, alpha, aBuffer, aOffset, aLd, bBuffer, bOffset, bLd, beta, cBuffer, cOffset, cLd, ref queue, eventPtr);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(queue);
+        return result;
+    }
+
     /// <summary>
     /// Single-precision strided batched GEMM in one launch: C[i] = alpha*A[i]*B[i] + beta*C[i] for i in [0, batchCount),
     /// item i at offset + i * stride of each buffer.
     /// </summary>
     [DllImport(ClBlastLibrary, EntryPoint = "CLBlastSgemmStridedBatched", CallingConvention = CallingConvention.Cdecl)]
-    public static extern StatusCode SgemmStridedBatched(
+    private static extern StatusCode SgemmStridedBatchedNative(
         Layout layout,
         Transpose transA,
         Transpose transB,
@@ -835,11 +945,32 @@ public static class ClBlastNative
         ref IntPtr queue,
         IntPtr eventPtr);
 
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static StatusCode SgemmStridedBatched(
+        Layout layout,
+        Transpose transA,
+        Transpose transB,
+        UIntPtr m, UIntPtr n, UIntPtr k,
+        float alpha,
+        IntPtr aBuffer, UIntPtr aOffset, UIntPtr aLd, UIntPtr aStride,
+        IntPtr bBuffer, UIntPtr bOffset, UIntPtr bLd, UIntPtr bStride,
+        float beta,
+        IntPtr cBuffer, UIntPtr cOffset, UIntPtr cLd, UIntPtr cStride,
+        UIntPtr batchCount,
+        ref IntPtr queue,
+        IntPtr eventPtr)
+    {
+        var result = SgemmStridedBatchedNative(layout, transA, transB, m, n, k, alpha, aBuffer, aOffset, aLd, aStride, bBuffer, bOffset, bLd, bStride, beta, cBuffer, cOffset, cLd, cStride, batchCount, ref queue, eventPtr);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(queue);
+        return result;
+    }
+
     /// <summary>
     /// Double-precision general matrix multiplication: C = alpha*A*B + beta*C
     /// </summary>
     [DllImport(ClBlastLibrary, EntryPoint = "CLBlastDgemm", CallingConvention = CallingConvention.Cdecl)]
-    public static extern StatusCode Dgemm(
+    private static extern StatusCode DgemmNative(
         Layout layout,
         Transpose transA,
         Transpose transB,
@@ -851,6 +982,26 @@ public static class ClBlastNative
         IntPtr cBuffer, UIntPtr cOffset, UIntPtr cLd,
         ref IntPtr queue,
         IntPtr eventPtr);
+
+    // Counted for OpenClNativeBindings.IsKnownDrained: an enqueue it did not see would leave a queue that
+    // clFinish drained reading as drained while this work is still pending.
+    public static StatusCode Dgemm(
+        Layout layout,
+        Transpose transA,
+        Transpose transB,
+        UIntPtr m, UIntPtr n, UIntPtr k,
+        double alpha,
+        IntPtr aBuffer, UIntPtr aOffset, UIntPtr aLd,
+        IntPtr bBuffer, UIntPtr bOffset, UIntPtr bLd,
+        double beta,
+        IntPtr cBuffer, UIntPtr cOffset, UIntPtr cLd,
+        ref IntPtr queue,
+        IntPtr eventPtr)
+    {
+        var result = DgemmNative(layout, transA, transB, m, n, k, alpha, aBuffer, aOffset, aLd, bBuffer, bOffset, bLd, beta, cBuffer, cOffset, cLd, ref queue, eventPtr);
+        AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClNativeBindings.NoteEnqueued(queue);
+        return result;
+    }
 }
 
 /// <summary>

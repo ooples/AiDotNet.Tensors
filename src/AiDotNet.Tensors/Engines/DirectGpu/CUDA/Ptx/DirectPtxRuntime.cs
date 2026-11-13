@@ -21,6 +21,19 @@ internal sealed class DirectPtxRuntime : IDisposable
     private readonly Func<IntPtr>? _borrowedStream;
     private IntPtr _stream => _borrowedStream is null ? _ownStream : _borrowedStream();
     private readonly bool _ownsContext;
+    // The device whose primary context a standalone runtime retained (released on Dispose), or -1 when borrowed.
+    private readonly int _retainedPrimaryDevice = -1;
+    // A standalone runtime's live buffers and modules. Its private context used to free whatever a caller never
+    // disposed; the shared primary context it now retains outlives it, so Dispose frees the leftovers itself.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<IDisposable, byte> _live =
+        new System.Collections.Concurrent.ConcurrentDictionary<IDisposable, byte>();
+
+    internal void TrackResource(IDisposable resource)
+    {
+        if (_retainedPrimaryDevice >= 0) _live.TryAdd(resource, 0);
+    }
+
+    internal void UntrackResource(IDisposable resource) => _live.TryRemove(resource, out _);
     private readonly bool _ownsStream;
     private bool _disposed;
 
@@ -41,8 +54,9 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal IntPtr Context => _context;
 
     /// <summary>
-    /// True for a standalone runtime with its own context. A borrowed runtime shares the device's primary context with
-    /// every backend, where a context-wide synchronize would wait on -- and invalidate -- another thread's capture.
+    /// True only for a runtime with a private context. Every runtime now shares the device's primary context (a
+    /// standalone one retains it, a borrowed one uses its backend's), where a context-wide synchronize would wait on --
+    /// and invalidate -- another thread's capture.
     /// </summary>
     internal bool OwnsContext => _ownsContext;
     internal uint StreamFlags
@@ -81,25 +95,38 @@ internal sealed class DirectPtxRuntime : IDisposable
         int maxRegistersPerBlock = QueryRegisterCapacity(
             device, CudaDeviceAttribute.MaxRegistersPerBlock);
 
-        Check(CuBlasNative.cuCtxCreate(out _context, 0, device), "cuCtxCreate");
-        // Standalone buffers use the synchronous Driver-API copy calls, which execute
-        // in the legacy default-stream ordering domain. A blocking stream preserves
-        // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
-        // and can let a freshly launched block observe pre-upload allocation contents.
-        Check(CudaNativeBindings.cuStreamCreate(out _ownStream, CudaNativeBindings.CU_STREAM_DEFAULT),
-            "cuStreamCreate(blocking)");
-        _ownsStream = true;
-        // cuCtxCreate makes the context current. Detach it so every operation
-        // below has an explicit, balanced push/pop boundary.
+        // The device's primary context, retained as every backend retains it (and as PyTorch does), not a private one.
+        // A private context per runtime cost a context's device memory each and a cuCtxDestroy on Dispose; tests build
+        // and dispose one per case while other test threads run, and on the RTX 3090 runner a cuCtxDestroy stalled
+        // every other thread's cuMemAllocHost and cublasCreate until the 15-minute hang blame killed the host (run
+        // 43363422022). Releasing a retained primary context destroys nothing while any backend or runtime holds it.
+        // Same scheduling flags as CudaBackend, so whichever creates the primary context first creates it alike.
+        _ = CuBlasNative.cuDevicePrimaryCtxSetFlags(device, contextScheduling);
+        Check(CuBlasNative.cuDevicePrimaryCtxRetain(out _context, device), "cuDevicePrimaryCtxRetain");
+        _retainedPrimaryDevice = device;
+        Check(CuBlasNative.cuCtxPushCurrent(_context), "cuCtxPushCurrent(primary)");
+        try
+        {
+            // Standalone buffers use the synchronous Driver-API copy calls, which execute
+            // in the legacy default-stream ordering domain. A blocking stream preserves
+            // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
+            // and can let a freshly launched block observe pre-upload allocation contents.
+            Check(CudaNativeBindings.cuStreamCreate(out _ownStream, CudaNativeBindings.CU_STREAM_DEFAULT),
+                "cuStreamCreate(blocking)");
+            _ownsStream = true;
+        }
+        catch
+        {
+            CuBlasNative.cuCtxPopCurrent(out _);
+            CuBlasNative.cuDevicePrimaryCtxRelease(device);
+            _context = IntPtr.Zero;
+            throw;
+        }
         Check(CuBlasNative.cuCtxPopCurrent(out IntPtr popped), "cuCtxPopCurrent");
         if (popped != _context)
-        {
-            CuBlasNative.cuCtxDestroy(_context);
-            _context = IntPtr.Zero;
             throw new InvalidOperationException("CUDA returned a different context from cuCtxPopCurrent.");
-        }
 
-        _ownsContext = true;
+        _ownsContext = false;
         DeviceOrdinal = deviceOrdinal;
         DeviceName = name.ToString();
         ComputeCapabilityMajor = major;
@@ -617,6 +644,22 @@ internal sealed class DirectPtxRuntime : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+        if (_retainedPrimaryDevice >= 0 && _context != IntPtr.Zero)
+        {
+            foreach (var resource in new List<IDisposable>(_live.Keys))
+            {
+                try
+                {
+                    resource.Dispose();
+                }
+                catch (InvalidOperationException ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"DirectPtxRuntime: releasing an undisposed {resource.GetType().Name} failed: {ex.Message}");
+                }
+            }
+            _live.Clear();
+        }
         if (_ownsStream && _stream != IntPtr.Zero && _context != IntPtr.Zero)
         {
             using var _ = Enter();
@@ -625,6 +668,10 @@ internal sealed class DirectPtxRuntime : IDisposable
         if (_ownsContext && _context != IntPtr.Zero)
         {
             CuBlasNative.cuCtxDestroy(_context);
+        }
+        else if (_retainedPrimaryDevice >= 0 && _context != IntPtr.Zero)
+        {
+            CuBlasNative.cuDevicePrimaryCtxRelease(_retainedPrimaryDevice);
         }
         _context = IntPtr.Zero;
         _disposed = true;
@@ -719,6 +766,7 @@ internal sealed class DirectPtxBuffer : IDisposable
         _runtime = runtime;
         _pointer = pointer;
         ByteLength = byteLength;
+        runtime.TrackResource(this);
     }
 
     internal unsafe void Upload<T>(ReadOnlySpan<T> source) where T : unmanaged
@@ -784,6 +832,7 @@ internal sealed class DirectPtxBuffer : IDisposable
         using var _ = _runtime.Enter();
         DirectPtxRuntime.Check(CudaNativeBindings.cuMemFree(_pointer), "cuMemFree");
         _pointer = IntPtr.Zero;
+        _runtime.UntrackResource(this);
     }
 }
 
@@ -831,6 +880,7 @@ internal sealed class DirectPtxModule : IDisposable
         CubinSha256 = artifact.CubinSha256;
         CubinSourceKey = artifact.SourceKey;
         CubinPath = artifact.Path;
+        runtime.TrackResource(this);
     }
 
     internal DirectPtxModule(
@@ -843,6 +893,7 @@ internal sealed class DirectPtxModule : IDisposable
         CubinSha256 = string.Empty;
         CubinSourceKey = string.Empty;
         CubinPath = null;
+        runtime.TrackResource(this);
     }
 
     internal IntPtr GetFunction(string name)
@@ -988,6 +1039,7 @@ internal sealed class DirectPtxModule : IDisposable
             _registeredFunctions.Clear();
             DirectPtxRuntime.Check(CudaNativeBindings.cuModuleUnload(_module), "cuModuleUnload");
             _module = IntPtr.Zero;
+            _runtime.UntrackResource(this);
         }
     }
 }
