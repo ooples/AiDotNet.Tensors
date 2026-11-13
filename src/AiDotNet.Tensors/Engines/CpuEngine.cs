@@ -38550,7 +38550,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
             var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
             var s128 = System.Runtime.Intrinsics.X86.Sse2.Add(lo, hi);
-            var shuf = System.Runtime.Intrinsics.X86.Sse2.Shuffle(s128, s128, 0b_01_00_11_10);
+            // shufpd reads two control bits, one per lane: 1 puts lane 1 of the first operand in lane 0. The 0b_01_00_11_10
+            // mask written for shufps selected lanes 0 and 1 again, so the sum doubled lane 0 and dropped lane 1.
+            var shuf = System.Runtime.Intrinsics.X86.Sse2.Shuffle(s128, s128, 0b_01);
             s128 = System.Runtime.Intrinsics.X86.Sse2.Add(s128, shuf);
             double tmp;
             System.Runtime.Intrinsics.X86.Sse2.StoreScalar(&tmp, s128);
