@@ -34,13 +34,12 @@ fn dt_linear_filter(@builtin(global_invocation_id) gidv: vec3<u32>) {
             else if (yn < -g) { yn = -g; }
         }
         for (var k = 1; k < K; k = k + 1) {
-            var bk = 0.0;
-            if (k < pm.NB) { bk = bc[k] / a0; }
-            var ak = 0.0;
-            if (k < pm.NA) { ak = ac[k] / a0; }
+            var t = 0.0;
+            if (k < pm.NB) { t = (bc[k] / a0) * xn; }
+            if (k < pm.NA) { t = t - (ac[k] / a0) * yn; }
             var zk = 0.0;
             if (k < K - 1) { zk = zs[zo + k]; }
-            zs[zo + k - 1] = bk * xn - ak * yn + zk;
+            zs[zo + k - 1] = t + zk;
         }
         ys[o + n] = yn;
     }

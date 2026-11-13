@@ -27,13 +27,12 @@
         }
         for (int k = 1; k < K; k++)
         {
-            float bk = 0.0f;
-            if (k < NB) bk = bc[k] / a0;
-            float ak = 0.0f;
-            if (k < NA) ak = ac[k] / a0;
+            float t = 0.0f;
+            if (k < NB) t = (bc[k] / a0) * xn;
+            if (k < NA) t = t - (ac[k] / a0) * yn;
             float zk = 0.0f;
             if (k < K - 1) zk = zs[zo + k];
-            zs[zo + k - 1] = bk * xn - ak * yn + zk;
+            zs[zo + k - 1] = t + zk;
         }
         ys[o + n] = yn;
     }

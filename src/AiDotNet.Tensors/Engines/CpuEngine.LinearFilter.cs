@@ -94,6 +94,7 @@ public partial class CpuEngine
         for (int k = 0; k < b.Length; k++) bn[k] = b[k] / a0;
         for (int k = 0; k < a.Length; k++) an[k] = a[k] / a0;
         bool guarded = !double.IsNaN(guard);
+        int nb = b.Length, na = a.Length;
         var y = new double[x.Length];
         CpuParallelSettings.ParallelForOrSerial(0, signals, (long)signals * length * order * 2, s =>
         {
@@ -105,7 +106,15 @@ public partial class CpuEngine
                 double xn = x[o + n];
                 double yn = bn[0] * xn + z[0];
                 if (guarded) yn = double.IsNaN(yn) ? 0.0 : yn > guard ? guard : yn < -guard ? -guard : yn;
-                for (int k = 1; k < order; k++) z[k - 1] = bn[k] * xn - an[k] * yn + z[k];
+                // Only the coefficients the caller gave contribute: a shorter b or a must not turn a NaN input (or a
+                // guarded-away NaN output) into a NaN state through 0 * NaN.
+                for (int k = 1; k < order; k++)
+                {
+                    double t = 0.0;
+                    if (k < nb) t = bn[k] * xn;
+                    if (k < na) t -= an[k] * yn;
+                    z[k - 1] = t + z[k];
+                }
                 y[o + n] = yn;
             }
         }, deterministicSafe: true);
