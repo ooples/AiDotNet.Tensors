@@ -44,6 +44,9 @@ env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   DOTNET_NOLOGO: true
+  # The runner is persistent: an MSBuild worker left by a cancelled or killed build can be reused by the next job, whose
+  # build then fails in seconds with MSB4166 ("child node exited prematurely"). Each build starts its own workers.
+  MSBUILDDISABLENODEREUSE: 1
 
 jobs:
   gpu-parity-pocl:
@@ -197,15 +200,32 @@ jobs:
       if: always()
       run: python3 scripts/ci/summarize-test-skips.py --title "POCL ${{ matrix.name }}" "${{ runner.temp }}/trx/*.trx"
 
+    # codecov.yml waits for all seven uploads (after_n_builds: 7), so a lost one leaves every PR without a coverage
+    # status or comment. A transient failure gets one retry; a second failure fails this shard visibly (only where the
+    # token exists: a run without secrets, such as Dependabot's, cannot upload at all).
     - name: Upload device-path coverage to Codecov
+      id: codecov-upload
       if: always() && matrix.coverage
+      continue-on-error: true
       uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
       with:
         files: ./coverage/**/coverage.cobertura.xml
         disable_search: true
         flags: gpu-pocl
         name: gpu-pocl-${{ matrix.name }}
-        fail_ci_if_error: false
+        fail_ci_if_error: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Retry device-path coverage upload
+      if: always() && matrix.coverage && steps.codecov-upload.outcome == 'failure'
+      uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
+      with:
+        files: ./coverage/**/coverage.cobertura.xml
+        disable_search: true
+        flags: gpu-pocl
+        name: gpu-pocl-${{ matrix.name }}
+        fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 

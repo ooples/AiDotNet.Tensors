@@ -91,6 +91,10 @@ internal static class CholeskyDecomposition
             }
         }
 
+        // decimal / Half / BFloat16: the same right-looking algorithm carried out in T.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            return GenericLinalg<T>.CholeskyFactor(a, off, n, upper);
+
         // Managed right-looking Cholesky. Fails gracefully: returns k+1 when the
         // leading minor of order k+1 is not positive definite.
         if (upper)

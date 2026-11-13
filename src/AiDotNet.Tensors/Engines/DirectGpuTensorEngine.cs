@@ -8738,6 +8738,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!isRecording && !tensor.IsGpuResident && !tensor.HasPendingGpuData && !IsDeviceAuthoritative(tensor)) return false;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
+        // The kernel writes the tensor's device buffer in place, and a copy-on-write peer (CloneShared) shares that
+        // buffer and its pending download: privatize first, as GpuOptimizer does before its in-place device update.
+        // The detach downloads the pending device values before copying, and drops the shared binding. While recording,
+        // a shared tensor whose values are still on the device (not computed yet) cannot be detached, so it takes the
+        // eager path; one whose values are on the host (a Clone() of a host tensor) detaches by a plain host copy, and
+        // must: sending it to the eager path during recording read the not-yet-computed buffer this method exists for.
+        if (tensor.HasPendingCopyOnWritePeer)
+        {
+            if (isRecording && (tensor.HasPendingGpuData || IsDeviceAuthoritative(tensor))) return false;
+            tensor.EnsureOwnedForDeviceWrite();
+        }
         // Read the optional backing WITHOUT materializing. Zero-allocation deferred tensors have no
         // host array yet and are cached by DataVector; rejecting them here would force an in-place
         // activation to read a not-yet-executed result during graph recording.
@@ -23096,7 +23107,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // GPU-RESIDENT compiled-step path: negate into a stable resident buffer, no download (the host TryRunUnary
         // download aborted capture at the cross-entropy -log(p)). Records the backward exactly as the eager path.
-        if (typeof(T) == typeof(float))
+        // Only inside a resident step, as TensorMultiplyScalar's: eagerly, the resident output's host array was a
+        // fresh allocation on every call (SwishBackward negates once per SiLU per step), where the deferred result
+        // below allocates nothing on the host.
+        if (ResidentStepActive && typeof(T) == typeof(float))
         {
             using var __gpuOp = EnterGpuOp();
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1"

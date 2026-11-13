@@ -362,26 +362,42 @@ internal static class MoeKernelTemplate
 ";
 
     // d gates[t, j] = o[pos(t, j)] . dy[t]; gates = sel / sum(sel), so d sel_j = (d gate_j - sum_i d gate_i gate_i) / sum.
+    // One workgroup per token: each slot's <o, dy> is a coalesced strided sum and a tree reduction (sm[256 + j] keeps
+    // it), then the [G] row is written in parallel, zero where the token did not route. GROUP_SIZE and GROUP_HALF are
+    // replaced with GroupSize and GroupSize / 2 (DScoresSource), the width every kernel of this template is built with.
     private const string DScoresBody = @"
-    if (gid < N - baseOffset)
+    int tid = lid;
+    int t = grp + baseOffset;
+    for (int j = 0; j < TOPK; j++)
     {
-        int t = baseOffset + gid;
-        float dg[16];
-        float dot = 0.0f;
-        for (int j = 0; j < TOPK; j++)
+        int p = TOINT(pos[t * TOPK + j]);
+        float a = 0.0f;
+        for (int c = tid; c < D; c += GROUP_SIZE) a = FMA(o[p * D + c], dy[t * D + c], a);
+        sm[tid] = a;
+        BARRIER();
+        for (int h = GROUP_HALF; h > 0; h = h / 2)
         {
-            int sl = t * TOPK + j;
-            int p = TOINT(pos[sl]);
-            float a = 0.0f;
-            for (int c = 0; c < D; c++) a = FMA(o[p * D + c], dy[t * D + c], a);
-            dg[j] = a;
-            dot = FMA(a, gates[sl], dot);
+            if (tid < h) sm[tid] += sm[tid + h];
+            BARRIER();
         }
-        for (int e = 0; e < G; e++) ds[t * G + e] = 0.0f;
+        if (tid == 0) sm[GROUP_SIZE + j] = sm[0];
+        BARRIER();
+    }
+    float dot = 0.0f;
+    for (int j = 0; j < TOPK; j++) dot = FMA(sm[GROUP_SIZE + j], gates[t * TOPK + j], dot);
+    for (int e = tid; e < G; e += GROUP_SIZE)
+    {
+        float v = 0.0f;
         for (int j = 0; j < TOPK; j++)
-            ds[t * G + TOINT(ids[t * TOPK + j])] = (dg[j] - dot) / ssum[t];
+            if (TOINT(ids[t * TOPK + j]) == e) v = (sm[GROUP_SIZE + j] - dot) / ssum[t];
+        ds[t * G + e] = v;
     }
 ";
+
+    /// <summary>The routing-score gradient body with its work-group width filled in from <see cref="GroupSize"/>.</summary>
+    internal static string DScoresSource(string body) => body
+        .Replace("GROUP_SIZE", GroupSize.ToString(System.Globalization.CultureInfo.InvariantCulture))
+        .Replace("GROUP_HALF", (GroupSize / 2).ToString(System.Globalization.CultureInfo.InvariantCulture));
 
     private static readonly string[] GemmInts = { "M", "N", "Kd", "G", "tilesN", "tileBase", "TOPK", "F" };
     private static readonly string[] WgradInts = { "P", "Nn", "G", "tilesP", "tilesN", "tileBase", "TOPK", "F" };
@@ -405,7 +421,7 @@ internal static class MoeKernelTemplate
         new(Combine, new[] { "src", "pos", "gates", "y" }, new[] { "N", "D", "TOPK", "useGates", "baseOffset" },
             CombineBody, 0, new[] { 3 }),
         new(DScores, new[] { "o", "dy", "pos", "gates", "ssum", "ids", "ds" }, new[] { "N", "D", "G", "TOPK", "baseOffset" },
-            DScoresBody, 0, new[] { 6 }),
+            DScoresSource(DScoresBody), GroupSize + MaxTopK, new[] { 6 }),
         new(DAct, new[] { "dy", "perm", "gates", "w2", "ends", "h13", "dh13" }, GemmInts, WithF2(GroupedRowsBody(
             "gates[TOINT(perm[arow])] * dy[(TOINT(perm[arow]) / TOPK) * Kd + acol]",
             "w2[(g * N + bcol) * Kd + brow]",
