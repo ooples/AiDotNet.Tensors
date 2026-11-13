@@ -4528,6 +4528,14 @@ internal static partial class BackwardFunctions<T>
         // on device-resident operands; the forward validated the indices.
         var index1D = indicesTensor.Rank == 1 ? indicesTensor : indicesTensor.Reshape(indicesTensor.Length);
         var g = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine)
+            && !DifferentiableOps.IsRecording<T>()
+            && !Compilation.GraphMode.IsActive
+            && gpuEngine.TryIndexSelectBackwardOnDevice(inShape, dim, index1D, g) is { } gpuGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gpuGrad, engine);
+            return;
+        }
         var gradInput = engine.ScatterAdd(new Tensor<T>((int[])inShape.Clone()), index1D, g, dim);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
     }

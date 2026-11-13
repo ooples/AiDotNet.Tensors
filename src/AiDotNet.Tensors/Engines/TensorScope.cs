@@ -35,6 +35,9 @@ public sealed class TensorScope : IDisposable
     [ThreadStatic]
     private static TensorScope? s_current;
 
+    [ThreadStatic]
+    private static int s_suspendedDepth;
+
     private readonly TensorScope? _outer;
     private readonly int _threadId;
     // Keyed by storage (the vector), so a kept view keeps the result it views.
@@ -52,6 +55,7 @@ public sealed class TensorScope : IDisposable
     // Declared before s_mark: static fields initialize in order, and the callback returns it.
     private static readonly object s_marker = new();
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object>.CreateValueCallback s_mark = _ => s_marker;
+    private Func<object, bool>? _isReleasablePredicate;
     private bool _disposed;
 
     private TensorScope(TensorScope? outer)
@@ -70,6 +74,9 @@ public sealed class TensorScope : IDisposable
 
     /// <summary>The innermost scope open on the calling thread, or null.</summary>
     internal static TensorScope? Current => s_current;
+
+    /// <summary>Whether the calling thread currently has an open or temporarily suspended <see cref="TensorScope"/>.</summary>
+    internal static bool HasActiveOrSuspendedScope => s_current is not null || s_suspendedDepth > 0;
 
     /// <summary>
     /// Keeps <paramref name="tensor"/> (and every view of its storage) past this scope: to the enclosing scope when one
@@ -102,12 +109,16 @@ public sealed class TensorScope : IDisposable
         object storage = tensor.DataVector;
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
         // A result kept in a nested scope was adopted by the enclosing one, and each scope's activation release spares
-        // only the storages kept in it or around it: every open scope forgets the result and spares it.
         for (var scope = s_current; scope is not null; scope = scope._outer)
         {
-            scope._results.Remove(storage);
-            scope._kept.Add(storage);
-            if (array is not null) scope._kept.Add(array);
+            bool removed = scope._results.Remove(storage);
+            // The array is checked too: a scope-created alias of a pre-existing tensor wraps the same array in a new
+            // vector, registering the array (not this tensor's vector) with the scope.
+            if (removed || scope.Created(storage) || (array is not null && scope.Created(array)))
+            {
+                scope._kept.Add(storage);
+                if (array is not null) scope._kept.Add(array);
+            }
         }
         return tensor;
     }
@@ -122,7 +133,11 @@ public sealed class TensorScope : IDisposable
     internal static SuspendHandle Suspend()
     {
         var suspended = s_current;
-        s_current = null;
+        if (suspended is not null)
+        {
+            s_current = null;
+            s_suspendedDepth++;
+        }
         return new SuspendHandle(suspended);
     }
 
@@ -130,7 +145,14 @@ public sealed class TensorScope : IDisposable
     {
         private readonly TensorScope? _suspended;
         internal SuspendHandle(TensorScope? suspended) => _suspended = suspended;
-        public void Dispose() => s_current = _suspended;
+        public void Dispose()
+        {
+            if (_suspended is not null && s_current is null)
+            {
+                if (s_suspendedDepth > 0) s_suspendedDepth--;
+                s_current = _suspended;
+            }
+        }
     }
     /// <summary>
     /// Records a tensor storage created on this thread (its vector, and its host array when it has one) with the innermost
@@ -191,7 +213,17 @@ public sealed class TensorScope : IDisposable
         s_current = _outer;
         // Inside a deferred-execution scope the recorded graph still references these buffers until it executes, and not every
         // backend's buffers consult the deferral gate on disposal (HIP's do not): queue the whole release behind the graph.
-        if (!Gpu.GpuBufferReleaseDeferral.TryDefer(Release)) Release();
+        if (!(Gpu.GpuBufferReleaseDeferral.IsActive && Gpu.GpuBufferReleaseDeferral.TryDefer(Release))) Release();
+    }
+
+    private bool IsReleasable(object key)
+    {
+        if (!Created(key)) return false;
+        for (var scope = this; scope is not null; scope = scope._outer)
+        {
+            if (scope._kept.Contains(key)) return false;
+        }
+        return true;
     }
 
     private void Release()
@@ -200,12 +232,10 @@ public sealed class TensorScope : IDisposable
         _results.Clear();
         if (_activationOwners is not null)
         {
-            // The kept results of enclosing scopes are this scope's results too until they end: spare them all.
-            var spared = new HashSet<object>(_kept, Autodiff.ReferenceEqualityComparer<object>.Instance);
-            for (var outer = _outer; outer is not null; outer = outer._outer) spared.UnionWith(outer._kept);
+            var releasable = _isReleasablePredicate ??= IsReleasable;
             foreach (var owner in _activationOwners)
-                owner.Key.EvictActivationsCreatedAfter(owner.Value, spared, ActivationReleaseMode.Release,
-                    releasableOnly: Created, afterQueuedWork: true);
+                owner.Key.EvictActivationsCreatedAfter(owner.Value, protect: null, ActivationReleaseMode.Release,
+                    releasableOnly: releasable, afterQueuedWork: true);
         }
         _activationOwners = null;
     }

@@ -772,12 +772,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Metal);
 
-        // Convert int array to float array for buffer allocation
         var floatData = new float[data.Length];
-        for (int i = 0; i < data.Length; i++)
-        {
-            floatData[i] = Int32BitsToSingleCompat(data[i]);
-        }
+        Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
 
         return MetalGpuBuffer.Create(_device, floatData);
     }

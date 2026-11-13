@@ -164,7 +164,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 }
 
                 RestoreUndersizedCandidates(undersized, affinity);
-                _measurementParked.TryRemove(candidate, out _);
+                if (!_measurementParked.IsEmpty) _measurementParked.TryRemove(candidate, out _);
                 candidate.MarkRented(size);
                 buffer = candidate;
                 return true;
@@ -197,7 +197,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
     {
         if (Volatile.Read(ref _disposed) != 0 || buffer.Capacity > _maxSize)
         {
-            _measurementParked.TryRemove(buffer, out _);
+            if (!_measurementParked.IsEmpty) _measurementParked.TryRemove(buffer, out _);
             buffer.Release();
             return;
         }
@@ -206,7 +206,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         {
             if (Volatile.Read(ref _disposed) != 0)
             {
-                _measurementParked.TryRemove(buffer, out _);
+                if (!_measurementParked.IsEmpty) _measurementParked.TryRemove(buffer, out _);
                 buffer.Release();
                 return;
             }
@@ -221,7 +221,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             {
                 Interlocked.Decrement(ref bucket.Count);
                 if (count <= _maxPerSize) Interlocked.Add(ref _pooledElements, -buffer.Capacity);
-                _measurementParked.TryRemove(buffer, out _);
+                if (!_measurementParked.IsEmpty) _measurementParked.TryRemove(buffer, out _);
                 buffer.Release();
                 return;
             }
@@ -293,7 +293,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 {
                     Interlocked.Decrement(ref bucket.Count);
                     Interlocked.Add(ref _pooledElements, -buffer.Capacity);
-                    _measurementParked.TryRemove(buffer, out _);
+                    if (!_measurementParked.IsEmpty) _measurementParked.TryRemove(buffer, out _);
                     buffer.Release();
                     released++;
                 }

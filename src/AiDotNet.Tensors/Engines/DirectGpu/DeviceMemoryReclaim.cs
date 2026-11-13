@@ -109,6 +109,13 @@ internal static class DeviceMemoryReclaim
     /// </summary>
     internal const long CollectGen2AfterDeviceBytes = 4 * CollectAfterDeviceBytes;
 
+    /// <summary>
+    /// Emergency ceiling inside an open or suspended <see cref="TensorScope"/>. Below it, device allocations stay in the
+    /// current epoch so <see cref="TensorScope.Dispose"/> can return and credit the scope's intermediates back to the
+    /// pool without mid-scope forced blocking Gen-2 collections (which scan multi-GB live weights and reset the epoch).
+    /// </summary>
+    internal const long CollectInsideScopeAfterDeviceBytes = 16 * CollectNowAfterDeviceBytes;
+
     private static int s_collectionDue;
 
     // Set by a collection that ran inside an open tape. What the tape still held survived it and was promoted, so the
@@ -173,8 +180,12 @@ internal static class DeviceMemoryReclaim
         long sinceGen2 = Interlocked.Add(ref s_driverBytesSinceGen2Collection, bytes);
         if (since < CollectAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes) return epoch;
         bool tapeOpen = TapeOpen();
-        bool waitForBoundary = tapeOpen ? since < CollectInsideTapeAfterDeviceBytes
-            : since < CollectNowAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes;
+        bool scopeOpen = TensorScope.HasActiveOrSuspendedScope;
+        bool waitForBoundary = scopeOpen
+            ? since < CollectInsideScopeAfterDeviceBytes
+            : (tapeOpen
+                ? since < CollectInsideTapeAfterDeviceBytes
+                : since < CollectNowAfterDeviceBytes && sinceGen2 < CollectGen2AfterDeviceBytes);
         if (waitForBoundary)
         {
             Volatile.Write(ref s_collectionDue, 1);
@@ -276,7 +287,7 @@ internal static class DeviceMemoryReclaim
     internal static bool CollectOnPoolMiss()
     {
         if (Volatile.Read(ref s_allocationsSinceCollection) < CollectOnMissAfterAllocations) return false;
-        if (TapeOpen()) return false;
+        if (TapeOpen() || TensorScope.HasActiveOrSuspendedScope) return false;
         bool gen2 = Volatile.Read(ref s_driverBytesSinceGen2Collection) >= CollectGen2AfterDeviceBytes;
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         ResetDeviceBytes(resetGen2: gen2);
