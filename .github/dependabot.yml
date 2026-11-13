@@ -1,0 +1,61 @@
+version: 2
+updates:
+  # One pull request per kind of update, not one per package. Every PR runs the
+  # full pipeline on the shared runner pool (including the self-hosted CUDA
+  # runner), and separate bumps of csproj ItemGroups conflict with each other:
+  # each merge leaves the remaining branches dirty.
+  - package-ecosystem: nuget
+    # "/" alone reaches only projects the solution lists; the globs reach every
+    # project under src, tests, tools and build.
+    directories:
+      - /
+      - /src/*
+      - /tests/*
+      - /tools/*
+      - /build/*
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - nuget
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      # The AiDotNet family versions together: bumped one at a time it leaves
+      # half-upgraded trees that cannot restore.
+      aidotnet:
+        patterns: ["AiDotNet.*"]
+      nuget-minor-and-patch:
+        patterns: ["*"]
+        exclude-patterns: ["AiDotNet.*"]
+        # Majors arrive on their own, so a breaking bump that has to be held
+        # does not hold the week's patches with it.
+        update-types: ["minor", "patch"]
+      # Security updates ignore groups unless a group applies to them.
+      nuget-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      github-actions:
+        patterns: ["*"]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
