@@ -7891,6 +7891,12 @@ public partial interface IEngine
     /// indices (torch.sort). Ascending by default, descending when
     /// <paramref name="descending"/> is true.
     /// </summary>
+    /// <remarks>
+    /// The sort is stable in both directions: equal values keep their original index order, ascending and descending
+    /// alike (torch.sort / torch.argsort with <c>stable=True</c>, numpy <c>kind='stable'</c>, LINQ OrderBy /
+    /// OrderByDescending), on the host and on every DirectGpu backend. The order is PyTorch's: -0 equals +0, and NaN
+    /// sorts after +inf ascending and first descending (LINQ's comparer instead puts NaN first ascending).
+    /// </remarks>
     (Tensor<T> Values, Tensor<int> Indices) TensorSort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>
@@ -7898,6 +7904,12 @@ public partial interface IEngine
     /// (torch.argsort). Ascending by default, descending when
     /// <paramref name="descending"/> is true.
     /// </summary>
+    /// <remarks>
+    /// The sort is stable in both directions: equal values keep their original index order, ascending and descending
+    /// alike (torch.sort / torch.argsort with <c>stable=True</c>, numpy <c>kind='stable'</c>, LINQ OrderBy /
+    /// OrderByDescending), on the host and on every DirectGpu backend. The order is PyTorch's: -0 equals +0, and NaN
+    /// sorts after +inf ascending and first descending (LINQ's comparer instead puts NaN first ascending).
+    /// </remarks>
     Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>
@@ -8751,6 +8763,8 @@ public partial interface IEngine
     /// <param name="axis">Axis along which to sort. Default -1 means last axis.</param>
     /// <param name="descending">If true, sort in descending order.</param>
     /// <returns>Tensor of indices that would sort the input.</returns>
+    /// <remarks>The same stable permutation as <see cref="TensorArgsort{T}"/>: equal values keep their original index
+    /// order in both directions; NaN sorts last ascending and first descending.</remarks>
     Tensor<int> ArgSort<T>(Tensor<T> input, int axis = -1, bool descending = false);
 
     /// <summary>
@@ -9894,6 +9908,115 @@ public partial interface IEngine
     /// <param name="blank">Index of the blank label (default 0).</param>
     /// <returns>Per-batch CTC loss tensor [N].</returns>
     Tensor<T> TensorCTCLoss<T>(Tensor<T> logProbs, Tensor<int> targets, int[] inputLengths, int[] targetLengths, int blank = 0);
+
+    /// <summary>
+    /// The log-space CTC forward and backward variables over the blank-extended label lattice, the same lattice
+    /// <see cref="TensorCTCLoss{T}"/> runs.
+    /// </summary>
+    /// <param name="logProbs">Log probabilities [T, N, C] (time-major, log-softmax output).</param>
+    /// <param name="targets">Target labels, concatenated without blanks [sum(targetLengths)].</param>
+    /// <param name="inputLengths">Valid time steps of each item [N].</param>
+    /// <param name="targetLengths">Target length of each item [N].</param>
+    /// <param name="blank">Index of the blank label.</param>
+    /// <returns>
+    /// LogAlpha and LogBeta, each [N, T, 2 * max(targetLengths) + 1]. Lattice position s holds the blank for even s
+    /// and target label s / 2 for odd s. <c>LogAlpha[n, t, s]</c> is the log probability of every path prefix that
+    /// ends at s at time t, the emission at t included; <c>LogBeta[n, t, s]</c> is the log probability of every
+    /// completion from s at t to the end of the item, counting only the emissions after t (so
+    /// <c>LogBeta[n, T_n - 1, S_n - 1] = LogBeta[n, T_n - 1, S_n - 2] = 0</c>). Unreachable positions, positions past
+    /// the item's lattice and times at or past <c>inputLengths[n]</c> are negative infinity.
+    /// </returns>
+    /// <remarks>
+    /// <para>PyTorch equivalent: <c>torch.ops.aten._ctc_loss</c> returns <c>(neg_log_likelihood, log_alpha)</c>;
+    /// log_beta is the variable <c>aten._ctc_loss_backward</c> computes internally. Not recorded for autograd.</para>
+    /// <para><b>For Beginners:</b> alpha says how likely it is to have produced the start of the target by time t,
+    /// beta how likely it is to produce the rest of it afterwards. Their sum at any time is the log probability of
+    /// the whole target.</para>
+    /// </remarks>
+    (Tensor<T> LogAlpha, Tensor<T> LogBeta) TensorCTCForwardBackward<T>(Tensor<T> logProbs, Tensor<int> targets,
+        int[] inputLengths, int[] targetLengths, int blank = 0);
+
+    /// <summary>
+    /// The CTC label posteriors (occupancies): <c>gamma[t, n, c] = sum over lattice positions s labelled c of
+    /// exp(logAlpha[n, t, s] + logBeta[n, t, s] - log P(target_n))</c>, zero for <c>t &gt;= inputLengths[n]</c>.
+    /// </summary>
+    /// <param name="logProbs">Log probabilities [T, N, C] (time-major, log-softmax output).</param>
+    /// <param name="targets">Target labels, concatenated without blanks [sum(targetLengths)].</param>
+    /// <param name="inputLengths">Valid time steps of each item [N].</param>
+    /// <param name="targetLengths">Target length of each item [N].</param>
+    /// <param name="blank">Index of the blank label.</param>
+    /// <returns>gamma [T, N, C]; each valid (t, n) row sums to one. An item whose target cannot be aligned
+    /// (log P = negative infinity, an infinite <see cref="TensorCTCLoss{T}"/>) has NaN rows, as its loss gradient
+    /// does.</returns>
+    /// <remarks>
+    /// <para>The gradient of <see cref="TensorCTCLoss{T}"/> with respect to <paramref name="logProbs"/> is exactly
+    /// <c>-gamma</c> (scaled per item by the upstream gradient); the loss's backward is computed from this op.</para>
+    /// <para>PyTorch equivalent: the occupancy term <c>exp(log_alpha + log_beta + nll)</c> aggregated per class inside
+    /// <c>aten._ctc_loss_backward</c>. Not recorded for autograd.</para>
+    /// </remarks>
+    Tensor<T> TensorCTCLabelPosteriors<T>(Tensor<T> logProbs, Tensor<int> targets, int[] inputLengths,
+        int[] targetLengths, int blank = 0);
+
+    #endregion
+
+    #region Batched numeric recurrences (tridiagonal solve, Fritsch-Carlson limiter, linear sum assignment)
+
+    /// <summary>
+    /// Solves a batch of tridiagonal systems <c>A x = rhs</c> with the Thomas algorithm (O(n) per system).
+    /// </summary>
+    /// <param name="lower">Sub-diagonal [..., n - 1]: <c>A[i + 1, i] = lower[i]</c>.</param>
+    /// <param name="diagonal">Main diagonal [..., n]: <c>A[i, i] = diagonal[i]</c>.</param>
+    /// <param name="upper">Super-diagonal [..., n - 1]: <c>A[i, i + 1] = upper[i]</c>.</param>
+    /// <param name="rhs">Right-hand sides [..., n], the same leading (batch) dimensions as <paramref name="diagonal"/>.</param>
+    /// <returns>x [..., n].</returns>
+    /// <remarks>
+    /// <para>SciPy equivalent: <c>scipy.linalg.solve_banded((1, 1), ab, b)</c> per system; LAPACK <c>?gtsv</c>; cuSPARSE
+    /// <c>gtsv2</c>. The elimination does not pivot, so it is exact for the diagonally dominant and symmetric positive
+    /// definite systems splines and implicit schemes produce; a zero pivot yields non-finite values rather than an
+    /// exception.</para>
+    /// <para>Differentiable in all four inputs: with <c>g = A^-T dx</c> (the transposed system, also tridiagonal),
+    /// <c>d rhs = g</c>, <c>d diagonal[i] = -g[i] x[i]</c>, <c>d upper[i] = -g[i] x[i + 1]</c> and
+    /// <c>d lower[i] = -g[i + 1] x[i]</c>.</para>
+    /// </remarks>
+    Tensor<T> TensorTridiagonalSolve<T>(Tensor<T> lower, Tensor<T> diagonal, Tensor<T> upper, Tensor<T> rhs);
+
+    /// <summary>
+    /// The sequential Fritsch-Carlson (1980) step-2 monotonicity limiter on Hermite slopes, batched over the leading
+    /// dimensions.
+    /// </summary>
+    /// <param name="slopes">Initial slopes m [..., n].</param>
+    /// <param name="secants">Secant slopes d [..., n - 1] (<c>d[i] = (y[i + 1] - y[i]) / (x[i + 1] - x[i])</c>).</param>
+    /// <returns>The limited slopes [..., n].</returns>
+    /// <remarks>
+    /// <para>In index order i = 0 .. n - 2: if <c>d[i] == 0</c>, <c>m[i] = m[i + 1] = 0</c>; otherwise with
+    /// <c>a = m[i] / d[i]</c> and <c>b = m[i + 1] / d[i]</c>, if <c>a^2 + b^2 &gt; 9</c> then with
+    /// <c>tau = 3 / sqrt(a^2 + b^2)</c>, <c>m[i] = tau a d[i]</c> and <c>m[i + 1] = tau b d[i]</c>. Each step reads the
+    /// m[i] the previous step wrote, so the recurrence runs in order inside each series.</para>
+    /// <para>No direct NumPy/SciPy equivalent: <c>scipy.interpolate.PchipInterpolator</c> uses the non-sequential
+    /// Fritsch-Butland harmonic mean instead. Not recorded for autograd (a piecewise, branch-selected map).</para>
+    /// </remarks>
+    Tensor<T> TensorFritschCarlsonLimit<T>(Tensor<T> slopes, Tensor<T> secants);
+
+    /// <summary>
+    /// Batched minimum-cost one-to-one assignment of square cost matrices.
+    /// </summary>
+    /// <param name="cost">Costs [B, S, S] (or [S, S], treated as one batch item).</param>
+    /// <returns>[B, S] (or [S]): the column assigned to each row, a permutation of 0 .. S - 1 minimising the sum of
+    /// <c>cost[b, i, result[b, i]]</c>.</returns>
+    /// <remarks>
+    /// <para>SciPy equivalent: <c>scipy.optimize.linear_sum_assignment(cost[b])</c> per batch item, returning its
+    /// <c>col_ind</c>; PyTorch has no native equivalent. The solver is the Jonker-Volgenant style shortest augmenting
+    /// path (Crouse 2016) SciPy uses, one row at a time. Among equally short augmenting steps the lowest unassigned
+    /// column wins, then the lowest column, so the result is deterministic; with a unique optimum it is SciPy's.</para>
+    /// <para>A NaN (or infinite) cost is a last resort: it is replaced by a value larger than the cost of any
+    /// assignment that avoids it, so it is used only where no assignment can avoid it (negative infinity becomes the
+    /// most preferred value instead). Not differentiable.</para>
+    /// <para>Costs of every real element type compare exactly: long, ulong and decimal solve in decimal arithmetic (a
+    /// long such as 2^53 + 1 is not a double), with <c>max|cost| * 4 (S + 1) &lt;= decimal.MaxValue</c> required (any
+    /// long or ulong cost for S below 10^9) and <see cref="System.ArgumentOutOfRangeException"/> otherwise; the other types
+    /// convert to double exactly.</para>
+    /// </remarks>
+    Tensor<int> TensorLinearSumAssignment<T>(Tensor<T> cost);
 
     #endregion
 

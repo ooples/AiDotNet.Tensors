@@ -1390,6 +1390,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 }
             }
 #endif
+            // The vector lanes' comparisons, not MathF.Sign: that throws on NaN, which the lanes map to 0.
             for (; i < length; i++)
             {
                 // What the vector body computes: 1 above zero, -1 below, +0 otherwise. MathF.Sign threw on NaN, so a NaN

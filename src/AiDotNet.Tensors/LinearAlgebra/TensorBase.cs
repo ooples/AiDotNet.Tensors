@@ -3986,6 +3986,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal void EnsureOwnedForDeviceWrite() => EnsureOwnedForWrite();
 
+    /// <summary>True while a copy-on-write peer still shares this tensor's storage (a write must detach first).</summary>
+    internal bool HasPendingCopyOnWritePeer => _cowFamily?.RequiresDetach == true;
+
     protected void EnsureOwnedForWrite()
     {
         EnsureStreamingStoreWritable();
@@ -4096,6 +4099,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     return;
                 }
 
+                // The shared storage's device copy may be the current one (a device-authoritative source whose
+                // download is still pending): bring it to the host first, or the clone below copies stale host
+                // values into both sides of the detach.
+                if (requester.GetBackingArrayForCacheLookupUnsafe() is { } sharedArray)
+                    Helpers.HostSync.TryMaterialize(sharedArray);
                 var fresh = requester._data.Clone();
                 var privateStorage = new TensorStorage<T>(fresh);
                 privateStorage.CopyGpuCacheTrackingFrom(requester._storage);

@@ -54,6 +54,13 @@ internal static class EighDecomposition
         T[] src, int offSrc, T[] w, int offW, T[] v, int offV, int n, bool upper)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
+        // decimal / Half / BFloat16: cyclic Jacobi carried out in T with an epsilon-relative stop.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        {
+            GenericLinalg<T>.Eigh(src, offSrc, w, offW, v, offV, n, upper);
+            return;
+        }
+
         // Copy symmetric input to scratch A (working matrix), init V = I.
         var a = new double[n * n];
         var vmat = new double[n * n];
