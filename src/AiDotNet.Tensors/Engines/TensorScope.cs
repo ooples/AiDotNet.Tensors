@@ -112,7 +112,9 @@ public sealed class TensorScope : IDisposable
         for (var scope = s_current; scope is not null; scope = scope._outer)
         {
             bool removed = scope._results.Remove(storage);
-            if (removed || scope.Created(storage))
+            // The array is checked too: a scope-created alias of a pre-existing tensor wraps the same array in a new
+            // vector, registering the array (not this tensor's vector) with the scope.
+            if (removed || scope.Created(storage) || (array is not null && scope.Created(array)))
             {
                 scope._kept.Add(storage);
                 if (array is not null) scope._kept.Add(array);

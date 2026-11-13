@@ -28486,6 +28486,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public bool TryAccumulateSumOfSquares<T>(Tensor<T> tensor, ref Tensor<T>? scalarAccumulator)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        // A one-element running sum: an empty accumulator has nothing to add to, and a longer one would contribute only
+        // its first element before being replaced, silently dropping the rest.
+        if (scalarAccumulator is not null && scalarAccumulator.Length != 1)
+            throw new ArgumentException(
+                $"The accumulator must hold exactly one element; it holds {scalarAccumulator.Length}.",
+                nameof(scalarAccumulator));
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend))
             return false;
@@ -28496,7 +28502,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             using var suspendScope = TensorScope.Suspend();
             var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
-            using var input = GetOrAllocateBuffer(backend, source);
+            // Every lease below is read by queued kernels: an owned upload or scratch is released only after that work.
+            using var input = new QueuedLease(backend, GetOrAllocateBuffer(backend, source));
 
             if (scalarAccumulator is null)
             {
@@ -28514,27 +28521,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
 
-            if (scalarAccumulator.Length >= 1 && IsDeviceAuthoritative(scalarAccumulator))
+            if (IsDeviceAuthoritative(scalarAccumulator))
             {
                 var existingAcc = ResolveResidentBufferNoUpload(backend, scalarAccumulator, 1, includePersistentWeightCache: false);
                 if (existingAcc is not null)
                 {
-                    using var tmpLease = AllocateTransientScratch(backend, 1, fullyWritten: true);
+                    using var tmpLease = new QueuedLease(backend, AllocateTransientScratch(backend, 1, fullyWritten: true));
                     backend.DotProduct(input.Buffer, input.Buffer, tmpLease.Buffer, source.Length);
                     backend.Add(existingAcc, tmpLease.Buffer, existingAcc, 1);
                     return true;
                 }
             }
 
-            using var prevAccBuf = GetOrAllocateBuffer(backend, scalarAccumulator);
-            using var tmpScratch = AllocateTransientScratch(backend, 1, fullyWritten: true);
+            using var prevAccBuf = new QueuedLease(backend, GetOrAllocateBuffer(backend, scalarAccumulator));
+            using var tmpScratch = new QueuedLease(backend, AllocateTransientScratch(backend, 1, fullyWritten: true));
             var nextAccOut = AllocateFullyWrittenOutputBuffer(backend, 1);
             try
             {
                 backend.DotProduct(input.Buffer, input.Buffer, tmpScratch.Buffer, source.Length);
                 backend.Add(prevAccBuf.Buffer, tmpScratch.Buffer, nextAccOut.Buffer, 1);
                 var nextTensor = DeferTensorResult<T>(backend, nextAccOut.Buffer, 1, new[] { 1 });
-                scalarAccumulator.Dispose();
+                DisposeAfterQueuedRead(scalarAccumulator);
                 scalarAccumulator = nextTensor;
                 return true;
             }
@@ -28549,6 +28556,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             GpuLaunchProbe.OnFallback("TryAccumulateSumOfSquares", ex);
             return false;
         }
+    }
+
+    // Disposes a tensor whose device storage the queued Add above still reads. Tensor.Dispose frees an owned buffer at
+    // once (CUDA's pool can reissue it to an unordered stream), so a sole owner's device storage is handed to the
+    // queued-release path first and Dispose then finds none. Storage another view still holds is left to Dispose,
+    // which keeps it alive for that view.
+    private void DisposeAfterQueuedRead<T>(Tensor<T> tensor)
+    {
+        if (tensor._storage.RefCount == 1)
+            ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true);
+        tensor.Dispose();
     }
 
     T IEngine.TensorSumOfSquares<T>(Tensor<T> tensor)

@@ -277,7 +277,10 @@ public static class GradientCheckpointing<T>
                         bool hasInputGrad = false;
                         foreach (var kvp in segGrads)
                         {
-                            if (ReferenceEquals(kvp.Key, gradOutput) || kvp.Value is null) continue;
+                            // The seed and its detached copy are leaves the unfiltered (sources: null) backward also reaches;
+                            // neither is a segment input or parameter, so their activation-sized gradients are dropped here.
+                            if (ReferenceEquals(kvp.Key, gradOutput) || ReferenceEquals(kvp.Key, gradOutputDetached)
+                                || kvp.Value is null) continue;
                             bool isSegmentInput = ReferenceEquals(kvp.Key, reInputDetached);
                             if (isSegmentInput)
                             {

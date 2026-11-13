@@ -20899,6 +20899,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void ReleaseCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, ReleaseCore)) return;
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
@@ -20973,6 +20977,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void DisposeCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
             if (_returnToPool == null || _capturedAllocation)
             {
                 ReleaseCore();
@@ -21071,6 +21079,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void DisposeCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
             // Atomically CLAIM the device pointer so a concurrent finalizer can't enqueue the SAME pointer
             // for a deferred free (double-free → uncatchable 0xC0000005 in DrainPendingFinalizerFrees).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
