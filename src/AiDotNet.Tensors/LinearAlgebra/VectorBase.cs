@@ -44,13 +44,13 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     /// owners use it to enforce streaming-store and copy-on-write invariants even when trusted
     /// engine code reaches the backing vector directly.
     /// </summary>
-    private System.Action? _beforeWrite;
+    private TensorBase<T>? _beforeWriteOwner;
 
     /// <summary>
     /// Optional notification that this vector's elements were written (or handed out writable), installed by an
     /// owner that caches a copy of the elements elsewhere -- a <see cref="Engines.Autodiff.ParameterBuffer{T}"/>
     /// advances its GPU-cache version with it, so a device copy uploaded before the write is not reused after it.
-    /// Separate from <see cref="_beforeWrite"/>, which a tensor sharing the vector replaces with its own guard.
+    /// Separate from <see cref="_beforeWriteOwner"/>, which a tensor sharing the vector replaces with its own guard.
     /// </summary>
     private System.Action? _onWrite;
 
@@ -143,9 +143,9 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     }
 
     /// <summary>Installs the owner validation that must run before mutable storage is exposed.</summary>
-    internal void SetBeforeWriteGuard(System.Action? beforeWrite)
+    internal void SetBeforeWriteGuard(TensorBase<T>? owner)
     {
-        _beforeWrite = beforeWrite;
+        _beforeWriteOwner = owner;
     }
 
     /// <summary>Installs the notification run on every write through this vector; see <see cref="_onWrite"/>.</summary>
@@ -423,7 +423,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
         set
         {
             ValidateIndex(index);
-            _beforeWrite?.Invoke();
+            _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
             EnsureMaterialized();
             _memory.Span[index] = value;
             _onWrite?.Invoke();
@@ -560,7 +560,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     internal Span<T> AsWritableSpanUnmarked()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         _onWrite?.Invoke();
         EnsureMaterialized();
         return _memory.Span;
@@ -599,7 +599,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     internal T[]? GetBackingArrayUnsafe()
     {
         ResultOwner?.MarkEscaped(); // raw access: see AsSpan
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         return TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int offset) && offset == 0
             ? array
             : null;
@@ -635,7 +635,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     internal bool TryGetBackingArraySegment(out T[]? array, out int offset)
     {
         ResultOwner?.MarkEscaped(); // raw access: see AsSpan
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         return TryGetBackingArraySegmentForReadOnlyAccess(out array, out offset);
     }
 
@@ -709,7 +709,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     internal T[] GetDataArrayUnmarked()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         EnsureMaterialized();
 
         // One sync for every shape of backing (whole array, offset-0 segment, or an offset segment copied below).
@@ -775,7 +775,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     internal Memory<T> AsWritableMemoryUnmarked()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         _onWrite?.Invoke();
         EnsureMaterialized();
         return _memory;
@@ -787,7 +787,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
         // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
         // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
         ResultOwner?.MarkEscaped();
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         _onWrite?.Invoke();
         EnsureMaterialized();
         return _memory;
@@ -1162,7 +1162,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
         using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
@@ -1282,7 +1282,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
         using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
@@ -1392,7 +1392,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     {
         using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
 #if NET5_0_OR_GREATER
         var arr = _cachedArray;
         if (arr is not null)
@@ -1492,7 +1492,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     {
         using var written = new WriteNotice(this);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        _beforeWrite?.Invoke();
+        _beforeWriteOwner?.EnsureDataVectorWriteAllowed();
         EnsureMaterialized();
         _numOps.DivideScalar(_memory.Span, scalar, _memory.Span);
     }

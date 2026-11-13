@@ -227,7 +227,8 @@ public static class GradientCheckpointing<T>
                         // whose gradient w.r.t. reInput is, by the chain rule, exactly the VJP
                         //     d(pseudoLoss)/d(reInput) = (d(reOutput)/d(reInput))^T @ gradOutput
                         // needed even when the segment changes shape (AiDotNet#1341) or uses non-elementwise ops.
-                        var weighted = eng.TensorMultiply(reOutput, gradOutput);
+                        var gradOutputDetached = eng.StopGradient(gradOutput);
+                        var weighted = eng.TensorMultiply(reOutput, gradOutputDetached);
                         var pseudoLoss = eng.ReduceSum(weighted);
 
                         // Differentiate the recomputed segment w.r.t. the detached segment input and the

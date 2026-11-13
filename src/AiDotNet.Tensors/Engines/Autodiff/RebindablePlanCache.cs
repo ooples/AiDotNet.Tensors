@@ -154,11 +154,13 @@ internal static class RebindablePlanCache<T>
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         // Seed gradient — fresh per call, sized to the current iteration's
-        // loss shape. The cached plan never holds the recording-time seed
-        // (different tensor object per call), so this is always a new
-        // allocation. Sub-microsecond cost; not pool-worthy.
+        // loss shape. Prefer a device-resident seed when running on DirectGpu.
         Tensor<T> seedGrad;
-        if (loss.Length == 1)
+        if (DeviceLossSeed.TryCreate(engine, loss, out var deviceSeed))
+        {
+            seedGrad = deviceSeed;
+        }
+        else if (loss.Length == 1)
         {
             seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
         }
@@ -170,6 +172,33 @@ internal static class RebindablePlanCache<T>
             seedGrad = new Tensor<T>(onesData, loss._shape);
         }
         grads[loss] = seedGrad;
+
+        var indices = _cachedReverseTopoIndices;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            int checkIdx = indices[i];
+            if ((uint)checkIdx >= (uint)currentEntries.Count)
+                return null;
+        }
+
+        // Progressive GPU activation release for rebound replay (e.g., GradientCheckpointing segment recompute):
+        // BackwardRecycler<T>.Begin returns null when engine.SupportsGpu is true, so without a storage release
+        // plan every recomputed forward activation across all layers in the segment stays pinned until tape dispose.
+        var gpuEngine = engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
+        BackwardStorageReleasePlan<T>? storageReleasePlan = null;
+        HashSet<object>? protectedStorages = null;
+        if (gpuEngine is not null)
+        {
+            storageReleasePlan = BackwardStorageReleasePlan<T>.Create(currentEntries, indices);
+            protectedStorages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance)
+            {
+                loss.StorageIdentity
+            };
+            if (sources is not null)
+                foreach (var source in sources) protectedStorages.Add(source.StorageIdentity);
+            if (retainedTensors is not null)
+                foreach (var retained in retainedTensors) protectedStorages.Add(retained.StorageIdentity);
+        }
 
         // Walk the cached reverse-topo indices, reading entries from the
         // CURRENT arena. entry.Output is this iteration's tensor, not the
@@ -189,7 +218,6 @@ internal static class RebindablePlanCache<T>
         var inputsBuffer2 = s_inputsBuffer2 ??= new Tensor<T>[2];
         var inputsBuffer3 = s_inputsBuffer3 ??= new Tensor<T>[3];
         bool timing = BackwardTiming.Enabled;
-        var indices = _cachedReverseTopoIndices;
         // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
         try
@@ -209,23 +237,20 @@ internal static class RebindablePlanCache<T>
             for (int i = 0; i < indices.Length; i++)
             {
                 int idx = indices[i];
-                // Out-of-range index signals a stale cache — entry count
-                // dropped between Store and TryExecute. The pre-loop
-                // signature check should have caught this; if we reach
-                // here, the cache key is no longer valid and silent skip
-                // would produce wrong gradients. Bail out so the caller
-                // falls back to the fresh-walk path.
-                if (idx < 0 || idx >= currentEntries.Count) return null;
                 ref var entry = ref currentEntries[idx];
 
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
                 {
                     recycler?.AfterStep(grads, entry.Output, i);
+                    if (gpuEngine is not null)
+                        storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                     continue;
                 }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 {
                     recycler?.AfterStep(grads, entry.Output, i);
+                    if (gpuEngine is not null)
+                        storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                     continue;
                 }
 
@@ -251,6 +276,8 @@ internal static class RebindablePlanCache<T>
                     BackwardTiming.Record(entry.Backward.Method.Name, ticks);
                 }
                 recycler?.AfterStep(grads, entry.Output, i);
+                if (gpuEngine is not null)
+                    storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
             }
         }
         finally

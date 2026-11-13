@@ -9182,15 +9182,7 @@ KERNEL VARIANTS (A/B testing):
             k.Execute2D(embeddingDim, numIndices, localX, localY);
         }
 
-        public IGpuBuffer AllocateIntBuffer(int size)
-        {
-            if (_context == null)
-                throw new GpuCapabilityUnavailableException("OpenCL context not available");
-
-            var context = _context;
-            var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
-            return new DirectOpenClGpuBuffer(buffer, account: _memoryAccount);
-        }
+        public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
 
         /// <inheritdoc/>
         public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
@@ -9254,16 +9246,38 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            if (data is null)
+                throw new ArgumentNullException(nameof(data));
             GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.OpenCl);
+            DrainCollectedBuffers();
 
             // Convert int array to float array for storage (net471 compatible)
             var floatData = new float[data.Length];
             if (data.Length > 0)
                 Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
 
+            var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
+            if (_bufferPool.TryRent(floatData.Length, affinity, out var pooled) && pooled != null)
+            {
+                pooled.Buffer.CopyFromHost(floatData);
+                pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)floatData.Length * sizeof(int));
+                return pooled;
+            }
+            if (DeviceMemoryReclaim.CollectOnPoolMiss())
+            {
+                DirectOpenClGpuBuffer.PendingFrees.Drain();
+                if (_bufferPool.TryRent(floatData.Length, affinity, out pooled) && pooled != null)
+                {
+                    pooled.Buffer.CopyFromHost(floatData);
+                    pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)floatData.Length * sizeof(int));
+                    return pooled;
+                }
+            }
+
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, floatData));
-            return new DirectOpenClGpuBuffer(buffer, account: _memoryAccount);
+            long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)floatData.Length * sizeof(int));
+            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount) { ReclaimEpoch = reclaimEpoch };
         }
 
         #endregion
@@ -14841,7 +14855,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Release()
         {
-            if (GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
+            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
             ReleaseCore();
         }
 
@@ -14852,7 +14866,7 @@ KERNEL VARIANTS (A/B testing):
             GC.SuppressFinalize(this);
             _memory.OnFreed();
 
-            if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
+            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
                 return;
 
             Buffer.Dispose();
@@ -14873,7 +14887,7 @@ KERNEL VARIANTS (A/B testing):
             DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float), ReclaimEpoch);
             _memory.OnReturned();
 
-            if (GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))
+            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))
                 return;
 
             _returnToPool(this);
@@ -15034,7 +15048,7 @@ KERNEL VARIANTS (A/B testing):
             GC.SuppressFinalize(this);
             _memory.OnFreed();
 
-            if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
+            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
                 return;
 
             Buffer.Dispose();

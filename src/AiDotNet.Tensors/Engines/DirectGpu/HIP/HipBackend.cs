@@ -5896,21 +5896,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Synchronize();
     }
 
-    public IGpuBuffer AllocateIntBuffer(int size)
-    {
-        IntPtr devicePtr = IntPtr.Zero;
-        var sizeBytes = (UIntPtr)((ulong)size * sizeof(int));
-        // Issue #285: per-allocation cap check before hipMalloc.
-        GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
-
-        var result = HipMallocReclaiming(ref devicePtr, sizeBytes, out long reclaimEpoch);
-        HipNativeBindings.CheckError(result, "hipMalloc(int)");
-
-        result = HipNativeBindings.hipMemset(devicePtr, 0, sizeBytes);
-        HipNativeBindings.CheckError(result, "hipMemset(int)");
-
-        return new HipGpuBuffer(devicePtr, size, this, account: _memoryAccount) { ReclaimEpoch = reclaimEpoch };
-    }
+    public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
 
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
@@ -5950,34 +5936,47 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         UploadIntBufferInPlace(bits, buffer);
     }
 
-    public IGpuBuffer AllocateIntBuffer(int[] data)
+    public unsafe IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (data is null) throw new ArgumentNullException(nameof(data));
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
-        var sizeBytes = (UIntPtr)((ulong)size * sizeof(int));
+        long sizeInBytes = (long)size * sizeof(int);
+        var sizeBytes = (UIntPtr)((ulong)sizeInBytes);
         // Issue #285: per-allocation cap check before hipMalloc.
-        GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
+        GpuBufferSizeGuard.EnsureFits("HIP", sizeInBytes, MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Hip);
+
+        DrainCollectedBuffers();
+        if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+        {
+            pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(sizeInBytes);
+            fixed (int* dataPtr = data)
+            {
+                var copyPooled = HipNativeBindings.hipMemcpy(
+                    pooled.Handle,
+                    (IntPtr)dataPtr,
+                    sizeBytes,
+                    HipMemcpyKind.HostToDevice);
+                HipNativeBindings.CheckError(copyPooled, "hipMemcpy H2D (int)");
+            }
+            return pooled;
+        }
 
         var result = HipMallocReclaiming(ref devicePtr, sizeBytes, out long reclaimEpoch);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
 
-        GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
-        try
+        fixed (int* dataPtr = data)
         {
             result = HipNativeBindings.hipMemcpy(
                 devicePtr,
-                handle.AddrOfPinnedObject(),
+                (IntPtr)dataPtr,
                 sizeBytes,
                 HipMemcpyKind.HostToDevice);
             HipNativeBindings.CheckError(result, "hipMemcpy H2D (int)");
         }
-        finally
-        {
-            handle.Free();
-        }
 
-        return new HipGpuBuffer(devicePtr, size, this, account: _memoryAccount) { ReclaimEpoch = reclaimEpoch };
+        return new HipGpuBuffer(devicePtr, size, this, ReturnBufferToPool, _memoryAccount) { ReclaimEpoch = reclaimEpoch };
     }
 
     #region Locally Connected Convolution Operations

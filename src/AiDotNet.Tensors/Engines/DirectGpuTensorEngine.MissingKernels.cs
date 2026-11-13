@@ -2183,9 +2183,12 @@ public partial class DirectGpuTensorEngine
             // clamp(x, min, +inf) == max(x, min) exactly (no MaxValue capping of large/inf inputs).
             float minF = ToFloatScalar(min);
             using var bufA = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
-            backend.Clamp(bufA.Buffer, bufOut.Buffer, minF, float.PositiveInfinity, tensor.Length);
-            var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
+            var result = DispatchDeferredGpuOp<T>(
+                backend,
+                tensor.Length,
+                (int[])tensor._shape.Clone(),
+                outBuf => backend.Clamp(bufA.Buffer, outBuf, minF, float.PositiveInfinity, tensor.Length),
+                fullyWritten: true);
             // Same node and boxed bound CpuEngine records, so the backward sees an identical saved state.
             Autodiff.DifferentiableOps.RecordUnary("TensorClampMin", result, tensor,
                 Autodiff.BackwardFunctions<T>.ClampMinBackward, savedState: new[] { (object?)min ?? throw new InvalidOperationException("Clamp min must not be null") });
@@ -2207,9 +2210,12 @@ public partial class DirectGpuTensorEngine
             // clamp(x, -inf, max) == min(x, max) exactly.
             float maxF = ToFloatScalar(max);
             using var bufA = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
-            backend.Clamp(bufA.Buffer, bufOut.Buffer, float.NegativeInfinity, maxF, tensor.Length);
-            var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
+            var result = DispatchDeferredGpuOp<T>(
+                backend,
+                tensor.Length,
+                (int[])tensor._shape.Clone(),
+                outBuf => backend.Clamp(bufA.Buffer, outBuf, float.NegativeInfinity, maxF, tensor.Length),
+                fullyWritten: true);
             Autodiff.DifferentiableOps.RecordUnary("TensorClampMax", result, tensor,
                 Autodiff.BackwardFunctions<T>.ClampMaxBackward, savedState: new[] { (object?)max ?? throw new InvalidOperationException("Clamp max must not be null") });
             return result;
@@ -2371,6 +2377,70 @@ public partial class DirectGpuTensorEngine
             (int[])destination._shape.Clone(), output =>
                 indexBackend.IndexAdd(destinationBuffer.Buffer, indexBuffer.Buffer,
                     sourceBuffer.Buffer, output, outerSize, sourceAxis, destinationAxis, innerSize));
+    }
+
+    internal Tensor<T>? TryIndexSelectBackwardOnDevice<T>(
+        int[] inShape, int axis, Tensor<int> indices, Tensor<T> source)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
+            || axis < 0 || axis >= inShape.Length
+            || indices.Rank != 1 || source.Rank != inShape.Length
+            || source._shape[axis] != indices.Length
+            || !source.IsContiguous || !TryGetBackend(out var backend)
+            || backend is not IResidentIndexBackend indexBackend)
+            return null;
+
+        for (int d = 0; d < inShape.Length; d++)
+            if (d != axis && source._shape[d] != inShape[d])
+                return null;
+
+        int outerSize = 1;
+        for (int d = 0; d < axis; d++) outerSize = checked(outerSize * inShape[d]);
+        int innerSize = 1;
+        for (int d = axis + 1; d < inShape.Length; d++) innerSize = checked(innerSize * inShape[d]);
+        int destinationAxis = inShape[axis];
+        int sourceAxis = source._shape[axis];
+        int total = checked(outerSize * destinationAxis * innerSize);
+        if (total == 0)
+            return new Tensor<T>((int[])inShape.Clone());
+
+        var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+        if (!HasResidentIndexStorage(contiguousIndices))
+        {
+            using var indexDataLease = contiguousIndices.LeaseArray();
+            var indexData = indexDataLease.Array;
+            for (int i = 0; i < contiguousIndices.Length; i++)
+                if ((uint)indexData[i] >= (uint)destinationAxis)
+                    throw new ArgumentOutOfRangeException(nameof(indices),
+                        $"indices[{i}]={indexData[i]} is out of range for axis length {destinationAxis}.");
+        }
+
+        using var sourceBuffer = GetOrAllocateBuffer(backend, source);
+        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+        if (outerSize == 1)
+        {
+            return DispatchDeferredGpuOp<T>(backend, total, (int[])inShape.Clone(), output =>
+                indexBackend.ScatterAddRows(
+                    sourceBuffer.Buffer, indexBuffer.Buffer, output,
+                    sourceAxis, innerSize, destinationAxis),
+                fullyWritten: true);
+        }
+
+        var zeroDestination = AllocateFullyWrittenOutputBuffer(backend, total);
+        try
+        {
+            backend.Fill(zeroDestination.Buffer, 0f, total);
+            return DispatchDeferredGpuOp<T>(backend, total, (int[])inShape.Clone(), output =>
+                indexBackend.IndexAdd(
+                    zeroDestination.Buffer, indexBuffer.Buffer, sourceBuffer.Buffer, output,
+                    outerSize, sourceAxis, destinationAxis, innerSize),
+                fullyWritten: true);
+        }
+        finally
+        {
+            zeroDestination.DisposeAfterQueuedUse(backend);
+        }
     }
 
     // ----- Category F: repeat -----
@@ -4655,7 +4725,7 @@ public partial class DirectGpuTensorEngine
             using var raw = GetOrAllocateInt32IndexBuffer(backend, indices);
             // Until the snapshot owns it, a failed copy must not leave the buffer held; disposal after
             // RelinquishOwnership is a no-op.
-            using var rawCopy = AllocateOutputBuffer(backend, indices.Length);
+            using var rawCopy = AllocateFullyWrittenOutputBuffer(backend, indices.Length);
             backend.Copy(raw.Buffer, rawCopy.Buffer, indices.Length);
             var rawSnapshot = Tensor<int>.FromGpuBuffer(backend, rawCopy.Buffer, shape, Gpu.GpuTensorRole.Intermediate,
                 ownsBuffer: true, bufferContainsRawInt32: true);
@@ -4665,7 +4735,7 @@ public partial class DirectGpuTensorEngine
         using var numeric = GetOrAllocateNumericIndexBuffer(backend, indices);
         // Until the snapshot owns it, a failed copy must not leave the buffer held; disposal after
         // RelinquishOwnership is a no-op.
-        using var copy = AllocateOutputBuffer(backend, indices.Length);
+        using var copy = AllocateFullyWrittenOutputBuffer(backend, indices.Length);
         backend.Copy(numeric.Buffer, copy.Buffer, indices.Length);
         var snapshot = DeferTensorResult<int>(backend, copy.Buffer, indices.Length, shape);
         copy.RelinquishOwnership();
@@ -4918,8 +4988,8 @@ public partial class DirectGpuTensorEngine
             using (sortedValues)
             using (sortedIndices)
             {
-                var valueOutput = AllocateOutputBuffer(backend, rows * selected);
-                var indexOutput = AllocateOutputBuffer(backend, rows * selected);
+                var valueOutput = AllocateFullyWrittenOutputBuffer(backend, rows * selected);
+                var indexOutput = AllocateFullyWrittenOutputBuffer(backend, rows * selected);
                 bool valuesHandedOff = false;
                 bool indicesHandedOff = false;
                 try
@@ -4928,15 +4998,19 @@ public partial class DirectGpuTensorEngine
                         sortedStride, selected, rows, selected);
                     backend.CopyRows(sortedIndices.Buffer, indexOutput.Buffer,
                         sortedStride, selected, rows, selected);
-                    var valueData = FinishGpuOp<T>(backend, valueOutput, rows * selected);
+                    var topValues = DeferTensorResult<T>(backend, valueOutput.Buffer, rows * selected, new[] { rows, selected });
+                    valueOutput.RelinquishOwnership();
                     valuesHandedOff = true;
-                    var indexData = FinishGpuOp<int>(backend, indexOutput, rows * selected);
+                    indices = DeferTensorResult<int>(backend, indexOutput.Buffer, rows * selected, new[] { rows, selected });
+                    indexOutput.RelinquishOwnership();
                     indicesHandedOff = true;
                     if (tournament) Interlocked.Increment(ref _topKTournamentsCompleted);
-                    indices = new Tensor<int>(indexData, new[] { rows, selected });
-                    var topValues = new Tensor<T>(valueData, new[] { rows, selected });
-                    Autodiff.DifferentiableOps.RecordUnary("TopK", topValues, tensor,
-                        Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { TapeIndexCopy<T>(indices), 1 });
+                    if (Autodiff.DifferentiableOps.IsRecording<T>())
+                    {
+                        var savedIndices = SnapshotIndices(backend, indices);
+                        Autodiff.DifferentiableOps.RecordUnary("TopK", topValues, tensor,
+                            Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { savedIndices, 1 });
+                    }
                     return topValues;
                 }
                 finally
@@ -5917,12 +5991,35 @@ public partial class DirectGpuTensorEngine
             int copyLength = checked(length * innerSize);
             if (gradOutput.Length != checked(outerSize * copyLength)) return null;
             using var bufSrc = GetOrAllocateBuffer(backend, gradOutput);
+            var rect = backend as IRectSliceKernels;
+            int dstRowCols = checked(dimSize * innerSize);
+            int dstColStart = checked(start * innerSize);
             // Pools on OpenCL and other backends may return arbitrary old values.
             // Clear on device before the partial scatter; request uninitialized
             // storage so capture-aware allocators do not clear the output twice.
             return DispatchDeferredGpuOp<T>(backend, n, (int[])inputShape.Clone(), output =>
             {
                 backend.Fill(output, 0f, n);
+                if (copyLength == 0 || outerSize == 0)
+                    return;
+                if (outerSize == 1)
+                {
+                    backend.Copy(bufSrc.Buffer, 0, output, dstColStart, copyLength);
+                    return;
+                }
+                if (rect is not null)
+                {
+                    // Collapse arbitrary rank into 2D [outerSize, dimSize * innerSize] so one RectSlice scatter
+                    // kernel handles all outer slabs across all 6 backends instead of outerSize DtoD copy launches.
+                    rect.RectSlice(
+                        output,
+                        bufSrc.Buffer,
+                        new[] { outerSize, dstRowCols },
+                        new[] { 0, dstColStart },
+                        new[] { outerSize, copyLength },
+                        scatter: true);
+                    return;
+                }
                 for (int outer = 0; outer < outerSize; outer++)
                     backend.Copy(bufSrc.Buffer, outer * copyLength,
                         output, checked((outer * dimSize + start) * innerSize), copyLength);
@@ -6285,7 +6382,7 @@ public partial class DirectGpuTensorEngine
                 backend.Add(pass, equal, pass, n);
                 backend.Fill(bounds, 0f, n);
                 backend.Where(pass, bufG.Buffer, bounds, output, n);
-            });
+            }, fullyWritten: true);
         }
         catch (Exception)
         {

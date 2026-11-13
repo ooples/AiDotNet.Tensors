@@ -144,8 +144,8 @@ public sealed partial class WebGpuBackend
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.WebGpu);
         var floatData = new float[data.Length];
-        for (int i = 0; i < data.Length; i++)
-            floatData[i] = BitConverter.Int32BitsToSingle(data[i]);
+        if (data.Length > 0)
+            Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
         var buffer = WebGpuBuffer.Rent(floatData.Length, out _);
         buffer.CopyFrom(floatData);
         return buffer;
