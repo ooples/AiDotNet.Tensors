@@ -3710,7 +3710,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// storage repeatedly and make the result traversal-order dependent.
     /// </summary>
     [MethodImpl(Hot)]
-    private void EnsureNonOverlappingWritableLayout()
+    internal void EnsureNonOverlappingWritableLayout()
     {
         if (IsContiguous || Length <= 1 || Rank == 0)
             return;

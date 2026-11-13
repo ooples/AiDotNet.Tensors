@@ -4,7 +4,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <summary>
 /// Capability: raw data straight into a float32 device tensor, behind <see cref="CpuEngine.TensorFromBytes{T}"/>
 /// (torch.frombuffer + .to(float32)) and <see cref="CpuEngine.TensorParse{T}(System.ReadOnlySpan{byte}, byte, int[], System.Globalization.NumberStyles, System.IFormatProvider, T)"/>
-/// (numeric text): the bytes upload once and every conversion runs on the device.
+/// (numeric text): the bytes upload once and every conversion runs on the device; and back,
+/// <see cref="CpuEngine.TensorToBytes{T}"/> encodes a float32 device tensor into packed bytes on the device.
 /// </summary>
 /// <remarks>
 /// Every backend runs <see cref="DataDecodeKernelTemplate"/>'s kernels (WGSL: WebGpu/WebGpuDataDecodeKernels) through
@@ -41,4 +42,11 @@ internal interface IDataDecodeBackend
     /// </summary>
     bool TryParseFields(IGpuBuffer words, IGpuBuffer bounds, IGpuBuffer output, IGpuBuffer status, int fields,
         int styleMask, float missingValue);
+
+    /// <summary>
+    /// The inverse of <see cref="TryDecodeBytes"/>: the first <paramref name="count"/> elements of the float32 buffer
+    /// <paramref name="input"/> stored as <paramref name="targetType"/> in the given byte order, packed four bytes per
+    /// word into <paramref name="words"/> (at least <c>ceil(count * width / 4)</c> words, every one written).
+    /// </summary>
+    bool TryEncodeBytes(IGpuBuffer input, IGpuBuffer words, int count, NumericStorageType targetType, bool littleEndian);
 }

@@ -1459,7 +1459,9 @@ public partial class DirectGpuTensorEngine
         // The CPU base downloads BOTH whole vectors to multiply-accumulate on the host; instead
         // do the elementwise multiply + full reduction on the GPU (the expensive O(n) part) and
         // download only the single scalar result. Defer non-conforming shapes / no-GPU to base.
-        if (a.Rank != 1 || b.Rank != 1 || a.Length != b.Length || !TryGetBackend(out _))
+        // Half/BFloat16: the composition below would round every product to T before the sum (a product above 65,504
+        // is +Inf in Half); the CPU engine multiplies and accumulates in float32 and rounds once.
+        if (a.Rank != 1 || b.Rank != 1 || a.Length != b.Length || CpuEngine.IsLowPrecisionFloat<T>() || !TryGetBackend(out _))
             return base.TensorVecDot(a, b);
 
         try
