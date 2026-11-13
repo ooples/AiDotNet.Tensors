@@ -75,6 +75,17 @@ public sealed class LowPrecisionAccumulationGpuTests
     }
 
     [SkippableFact]
+    public void VecDot_Half_LargeProducts_AreNotRoundedToHalf()
+    {
+        using var gpu = CreateGpu();
+        Skip.If(gpu is null, "No GPU available");
+        // 300 * 300 = 90,000 is +Inf in Half: rounding each product to Half gave +Inf + -Inf = NaN; in float32 it is 0.
+        var a = new Tensor<Half>(new[] { (Half)300, (Half)300 }, new[] { 2 });
+        var b = new Tensor<Half>(new[] { (Half)300, (Half)(-300) }, new[] { 2 });
+        Assert.Equal(0.0, (double)((IEngine)gpu).TensorVecDot(a, b));
+    }
+
+    [SkippableFact]
     public void Means_Half_70000Ones_AreExactlyOne()
     {
         using var gpu = CreateGpu();
@@ -83,6 +94,7 @@ public sealed class LowPrecisionAccumulationGpuTests
         var ones = Fill(1, 70_000);
         Assert.Equal(1.0, (double)g.TensorMean(ones));
         AssertAll(1, g.ReduceMean(ones, new[] { 0 }, false).ToArray(), "ReduceMean");
+        AssertAll(1, g.TensorNanMean(ones).ToArray(), "TensorNanMean");
     }
 
     [SkippableFact]

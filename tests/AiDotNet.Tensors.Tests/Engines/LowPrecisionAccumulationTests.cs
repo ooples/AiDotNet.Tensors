@@ -143,6 +143,35 @@ public class LowPrecisionAccumulationTests
     }
 
     [Fact]
+    public void TensorNanMean_Half_70000Ones_IsOne()
+    {
+        // The sum and the count were both held in Half, +Inf past 65,504: +Inf / +Inf = NaN.
+        AssertAllHalf(1.0, _engine.TensorNanMean(HalfOnes(N)).ToArray(), "TensorNanMean all");
+        AssertAllHalf(1.0, _engine.TensorNanMean(HalfOnes(2, N), new[] { 1 }).ToArray(), "TensorNanMean rows");
+    }
+
+    [Fact]
+    public void TensorNanMean_Half_SkipsNaNs_AndRoutesGradientByCount()
+    {
+        var data = HalfFill(N, 2.0);
+        data[0] = Half.NaN;
+        data[1] = Half.NaN;
+        var x = new Tensor<Half>(data, new[] { N });
+        AssertAllHalf(2.0, _engine.TensorNanMean(x).ToArray(), "TensorNanMean with NaNs");
+
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<Half>();
+        var y = _engine.TensorNanMean(x);
+        var grads = tape.ComputeGradients(y, new[] { x });
+        var g = grads[x].ToArray();
+        Assert.Equal(0.0, (double)g[0]);
+        Assert.Equal(0.0, (double)g[1]);
+        // 1 / 69,998 in float32, rounded to Half once (a Half 1/count is subnormal here and the count is +Inf).
+        double expected = (double)(Half)(1.0f / (N - 2));
+        for (int i = 2; i < N; i++)
+            Assert.True((double)g[i] == expected, $"grad[{i}]: got {(double)g[i]}, expected {expected}");
+    }
+
+    [Fact]
     public void TensorVarAndStd_Half_Over70000Elements_MatchDoubleReference()
     {
         var data = HalfData(N, Signal);
@@ -215,6 +244,18 @@ public class LowPrecisionAccumulationTests
         // m*k*n = 3000 is under the BLAS work threshold, so this takes the blocked fallback (and on net471 every
         // Half matmul does). 3000 is exact in Half (spacing 2 in [2048, 4096)).
         AssertAllHalf(3000, _engine.TensorMatMul(HalfOnes(1, 3000), HalfOnes(3000, 1)).ToArray(), "TensorMatMul small");
+    }
+
+    [Fact]
+    public void MatrixMultiply_And_MatMulInto_Half_BelowGemmThreshold_Are3000()
+    {
+        var a = new Matrix<Half>(1, 3000);
+        var b = new Matrix<Half>(3000, 1);
+        for (int k = 0; k < 3000; k++) { a[0, k] = (Half)1; b[k, 0] = (Half)1; }
+        Assert.Equal(3000.0, (double)_engine.MatrixMultiply(a, b)[0, 0]);
+        var destination = new Tensor<Half>(new[] { 1, 1 });
+        _engine.MatMulInto(destination, HalfOnes(1, 3000), HalfOnes(3000, 1));
+        AssertAllHalf(3000, destination.ToArray(), "MatMulInto small");
     }
 
     [Fact]
