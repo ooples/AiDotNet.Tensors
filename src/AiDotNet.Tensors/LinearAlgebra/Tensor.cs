@@ -1188,6 +1188,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     public Tensor<TOut> Cast<TOut>()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
+
+        // The loop below reads _data[0..Length), which is this tensor's elements only for a realized, dense,
+        // zero-offset row-major layout. A pending lazy result is realized first, and a narrowed, sliced or permuted
+        // view is cast through its contiguous copy: reading the backing storage from index 0 converted the wrong
+        // elements while every shape still matched.
+        EnsureMaterialized();
+        if (!IsSparse && (!IsContiguous || _storageOffset != 0))
+            return Contiguous().Cast<TOut>();
+
         var sourceOps = MathHelper.GetNumericOperations<T>();
         var targetOps = MathHelper.GetNumericOperations<TOut>();
 
