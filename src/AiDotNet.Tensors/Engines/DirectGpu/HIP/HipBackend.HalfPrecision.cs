@@ -114,22 +114,24 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend, IFp16ConvBatc
             return;
         }
 
-        // alpha = 1.0, beta = 0.0 as IEEE-754 binary16 bit patterns.
-        ushort alpha = 0x3C00;
-        ushort beta = 0x0000;
+        // FP16 operands and output with an FP32 compute type (PyTorch's half matmul accumulates in FP32). hipblasHgemm
+        // computes in FP16, where a partial sum stops growing at 2048 + 1.
+        float alpha = 1.0f, beta = 0.0f;
 
-        var status = HipBlasNative.hipblasHgemm(
+        var status = HipBlasNative.hipblasGemmEx(
             _hipblasHandle,
             HipBlasNative.HipBlasOperation.None,
             HipBlasNative.HipBlasOperation.None,
             n, m, k,
             ref alpha,
-            ((HipGpuBuffer)bFp16).Handle, n,
-            ((HipGpuBuffer)aFp16).Handle, k,
+            ((HipGpuBuffer)bFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, n,
+            ((HipGpuBuffer)aFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, k,
             ref beta,
-            ((HipGpuBuffer)cFp16).Handle, n);
+            ((HipGpuBuffer)cFp16).Handle, HipBlasNative.HipBlasDatatype.R_16F, n,
+            HipBlasNative.HipBlasDatatype.R_32F,
+            HipBlasNative.HipBlasGemmAlgo.Default);
         if (status != HipBlasNative.HipBlasStatus.Success)
-            throw new InvalidOperationException($"hipblasHgemm failed: {status}");
+            throw new InvalidOperationException($"hipblasGemmEx(FP16 in / FP16 out, FP32 compute) failed: {status}");
 
         SyncHalfGemm();
     }
