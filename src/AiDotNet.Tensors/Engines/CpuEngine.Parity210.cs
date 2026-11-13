@@ -1485,6 +1485,11 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Float32 products and sums, rounded once (a Half running sum stops growing at 2048).
+            return LowPrecisionFromFloat<T>(LowPrecisionDot(a.GetFlattenedData(), 0, b.GetFlattenedData(), 0, a.Length));
+        }
         using var avLease = a.Lease();
         var av = avLease.Span;
         using var bvLease = b.Lease();

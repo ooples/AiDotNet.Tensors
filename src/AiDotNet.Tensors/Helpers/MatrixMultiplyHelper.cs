@@ -34,12 +34,10 @@ internal static class MatrixMultiplyHelper
         // #378: FP16 (System.Half) and BF16 route to their SIMD GEMM microkernels
         // (HalfKernels / BFloat16Kernels — float-accumulated upcast emulation) on net5.0+;
         // net471 has no Vector256 intrinsics so they stay on the generic blocked path.
-        bool isSupportedType = typeof(T) == typeof(float) || typeof(T) == typeof(double);
-#if NET5_0_OR_GREATER
-        isSupportedType = isSupportedType
-            || typeof(T) == typeof(Half)
-            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16);
-#endif
+        // Half and BFloat16 are always taken here, on every target and at every size: the generic blocked
+        // fallback would accumulate in the element type, where a Half sum stops growing at 2048.
+        bool lowPrecision = IsLowPrecision<T>();
+        bool isSupportedType = typeof(T) == typeof(float) || typeof(T) == typeof(double) || lowPrecision;
         if (!isSupportedType)
         {
             if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] Type check failed - not a SIMD-GEMM type");
@@ -52,7 +50,7 @@ internal static class MatrixMultiplyHelper
         {
             Console.WriteLine($"[MATMUL-TRACE] work={work:N0}, threshold={threshold:N0}");
         }
-        if (work < threshold)
+        if (work < threshold && !lowPrecision)
         {
             if (TraceEnabled) Console.WriteLine("[MATMUL-TRACE] Below threshold - using non-BLAS path");
             return false;
@@ -167,6 +165,13 @@ internal static class MatrixMultiplyHelper
         int cOffset = 0,
         bool allowParallel = true)
     {
+        // Half/BFloat16: accumulate in float32 (MultiplyAdd in T would round every partial sum).
+        if (IsLowPrecision<T>())
+        {
+            MultiplyBlockedLowPrecision(a, b, c, m, k, n, aStride, bStride, cStride, aOffset, bOffset, cOffset);
+            return;
+        }
+
         int block = GetBlockSize<T>();
         int numRowBlocks = (m + block - 1) / block;
         int numColBlocks = (n + block - 1) / block;
@@ -298,9 +303,73 @@ internal static class MatrixMultiplyHelper
                 m, k, n);
             return true;
         }
+#else
+        else if (IsLowPrecision<T>())
+        {
+            // No Vector256 on this target: widen, multiply in float32, round each output once.
+            LowPrecisionGemm(a, aOffset, k, b, bOffset, n, c, cOffset, n, m, k, n, accumulate: false);
+            return true;
+        }
 #endif
 
         return false;
+    }
+
+    /// <summary>True for the 16-bit floating-point element types whose matmul accumulates in float32.</summary>
+    internal static bool IsLowPrecision<T>()
+        => typeof(T) == typeof(Half) || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16);
+
+    /// <summary>
+    /// <c>C = A·B</c> (or <c>C += A·B</c> when <paramref name="accumulate"/>) for Half or BFloat16 row-major operands
+    /// with the given row strides. A and B are widened to float32 once, multiplied by the float32 GEMM, and each output
+    /// (plus its previous value when accumulating) is rounded to the element type once, as PyTorch's half matmul does
+    /// with float32 accumulation (cuBLAS <c>CUBLAS_COMPUTE_32F</c>, the CPU <c>opmath_type</c> GEMM).
+    /// </summary>
+    internal static void LowPrecisionGemm<T>(
+        T[] a, int aOffset, int aStride,
+        T[] b, int bOffset, int bStride,
+        T[] c, int cOffset, int cStride,
+        int m, int k, int n, bool accumulate)
+    {
+        if (m <= 0 || n <= 0) return;
+        var cf = new float[m * n];
+        if (k > 0)
+        {
+            var af = new float[m * k];
+            for (int i = 0; i < m; i++) CpuEngine.WidenInto(a, aOffset + i * aStride, af, i * k, k);
+            var bf = new float[k * n];
+            for (int p = 0; p < k; p++) CpuEngine.WidenInto(b, bOffset + p * bStride, bf, p * n, n);
+            Engines.BlasManaged.BlasManaged.Gemm<float>(af, k, false, bf, n, false, cf, n, m, n, k);
+        }
+        var previous = accumulate ? new float[n] : null;
+        for (int i = 0; i < m; i++)
+        {
+            if (previous is not null)
+            {
+                CpuEngine.WidenInto(c, cOffset + i * cStride, previous, 0, n);
+                for (int j = 0; j < n; j++) cf[i * n + j] += previous[j];
+            }
+            CpuEngine.NarrowInto(cf, i * n, c, cOffset + i * cStride, n);
+        }
+    }
+
+    // MultiplyBlocked's low-precision route: unwrap the memories to arrays (copying only when one is not array-backed).
+    private static void MultiplyBlockedLowPrecision<T>(
+        ReadOnlyMemory<T> a, ReadOnlyMemory<T> b, Memory<T> c,
+        int m, int k, int n, int aStride, int bStride, int cStride, int aOffset, int bOffset, int cOffset)
+    {
+        T[] aArray = TryGetArraySegment(a, out var aSeg, out var aBase) ? aSeg : a.ToArray();
+        int aStart = ReferenceEquals(aArray, aSeg) ? aBase + aOffset : aOffset;
+        T[] bArray = TryGetArraySegment(b, out var bSeg, out var bBase) ? bSeg : b.ToArray();
+        int bStart = ReferenceEquals(bArray, bSeg) ? bBase + bOffset : bOffset;
+        if (TryGetArraySegment(c, out var cSeg, out var cBase))
+        {
+            LowPrecisionGemm(aArray, aStart, aStride, bArray, bStart, bStride, cSeg, cBase + cOffset, cStride, m, k, n, accumulate: true);
+            return;
+        }
+        var cCopy = c.ToArray();
+        LowPrecisionGemm(aArray, aStart, aStride, bArray, bStart, bStride, cCopy, cOffset, cStride, m, k, n, accumulate: true);
+        cCopy.AsSpan().CopyTo(c.Span);
     }
 
     private static int GetBlockSize<T>()

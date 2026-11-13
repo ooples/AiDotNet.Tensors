@@ -102,23 +102,6 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>
-    /// <c>cublasHgemm</c> with alpha = 1 and beta = 0, or, without cuBLAS, the generated FP16-in / FP16-out GEMM (which
-    /// accumulates in FP32, more accurately than cuBLAS's FP16 accumulation).
-    /// </summary>
-    private void BlasHgemmUnit(CublasOperation opA, CublasOperation opB, int m, int n, int k,
-        IntPtr a, int lda, IntPtr b, int ldb, IntPtr c, int ldc, string what)
-    {
-        if (UsesCublas)
-        {
-            ushort one = 0x3C00, zero = 0x0000;  // FP16 bit patterns of 1 and 0
-            CuBlasNative.CheckCublasStatus(
-                CuBlasNative.cublasHgemm(_cublasHandle, opA, opB, m, n, k, ref one, a, lda, b, ldb, ref zero, c, ldc), what);
-            return;
-        }
-        FallbackGemm(PtxGemmPrecision.Fp16InFp16Out, opA, opB, m, n, k, 1, a, lda, b, ldb, 0, c, ldc, 1, 0, 0, 0, GemmLaunchStream);
-    }
-
-    /// <summary>
     /// <c>cublasGemmEx</c> with FP32 scalars (alpha and beta point to floats: a 32F compute type), or, without cuBLAS,
     /// the generated GEMM for its type combination: FP32, FP16 or BF16 operands with FP32 output, or FP16 throughout.
     /// </summary>

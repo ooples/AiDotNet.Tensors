@@ -9,7 +9,7 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
-/// Five kernels over 256-wide groups, every buffer a 32-bit integer array (the text and raw bytes packed four per word,
+/// Six kernels over 256-wide groups, every buffer a 32-bit integer array (the text and raw bytes packed four per word,
 /// little-endian; float results stored as their bits), so no value ever passes through a float register: a load that
 /// flushes subnormals or quiets a NaN cannot change a decoded bit.
 /// <list type="bullet">
@@ -22,6 +22,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// the exactly-rounded fast path (more than nineteen significant digits whose rounding the dropped digits could change,
 /// a value that may fall outside the normal float range [1e-37, 1e38), NaN / infinity symbols, a negative zero, any
 /// character the fast grammar does not accept) is flagged for the host instead of guessed.</item>
+/// <item><see cref="EncodeBytes"/>: the inverse of <see cref="Decode"/>, a float32 tensor's elements stored as any
+/// <see cref="NumericStorageType"/> in either byte order (one thread per output word), rounded and saturated as the
+/// host's <c>CpuEngine.TensorToBytes</c> encodes.</item>
 /// </list>
 /// Per-element kernels take <c>firstItem</c>, so a grid larger than one dispatch's 65535 groups runs as several launches.
 /// </summary>
@@ -38,6 +41,7 @@ internal static class DataDecodeKernelTemplate
     internal const string Scan = "dd_exclusive_scan";
     internal const string ScatterBounds = "dd_scatter_bounds";
     internal const string ParseFields = "dd_parse_fields";
+    internal const string EncodeBytes = "dd_encode_bytes";
 
     /// <summary>Style bits <see cref="ParseFields"/> understands (its <c>styleMask</c>).</summary>
     internal const int StyleLeadingWhite = 1, StyleTrailingWhite = 2, StyleLeadingSign = 4, StyleDecimalPoint = 8,
@@ -336,6 +340,9 @@ FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
 }
 ";
 
+    // The encode helpers (dd_f32_to_f16 ... dd_encode_hi), kept as an embedded resource; see KernelSourceResources.
+    private static readonly string EncodeHelpers = KernelSourceResources.Read("DataDecode.encode_helpers.c");
+
     private static readonly string DecodeBody = @"
     int i = gid + firstItem;
     if (i >= nItems) return;
@@ -585,6 +592,10 @@ FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
     status[f] = state;
 ";
 
+    // Word w of the packed output: its four bytes, each from the element it belongs to (one element spans several words,
+    // or one word several elements), in the requested byte order.
+    private static readonly string EncodeBody = KernelSourceResources.Read("DataDecode.dd_encode_bytes.c");
+
     private static Buffer U(string name, bool written = false) => new(name, true, written);
     private static Buffer I(string name, bool written = false) => new(name, false, written);
 
@@ -594,6 +605,8 @@ FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
     /// Scan: vals (in place), total (written) | nItems.
     /// ScatterBounds: words, offs, bounds (written) | textLen, delim, nSegs, trailingNewline, firstItem.
     /// ParseFields: words, bounds, outBits (written), status (written) | nItems, styleMask, missingBits, firstItem.
+    /// EncodeBytes: inBits (a float32 tensor's bits), words (written) | nWords, nItems, typeCode, elemSize, littleEndian,
+    /// firstItem.
     /// </summary>
     internal static readonly Spec[] Kernels =
     {
@@ -606,6 +619,8 @@ FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
             new[] { "textLen", "delim", "nSegs", "trailingNewline", "firstItem" }, ScatterBody),
         new(ParseFields, new[] { U("words"), I("bounds"), U("outBits", true), I("status", true) },
             new[] { "nItems", "styleMask", "missingBits", "firstItem" }, ParseBody),
+        new(EncodeBytes, new[] { U("inBits"), U("words", true) },
+            new[] { "nWords", "nItems", "typeCode", "elemSize", "littleEndian", "firstItem" }, EncodeBody),
     };
 
     /// <summary>Every kernel name, in <see cref="Kernels"/> order.</summary>
@@ -631,7 +646,7 @@ FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
         var sb = new StringBuilder();
         if (dialect == WinogradKernelDialect.Metal) sb.Append("#include <metal_stdlib>\nusing namespace metal;\n");
         if (dialect == WinogradKernelDialect.Hip) sb.Append("typedef unsigned int uint;\n");
-        sb.Append(Spell(Helpers, dialect));
+        sb.Append(Spell(Helpers + EncodeHelpers, dialect));
         foreach (var spec in Kernels)
         {
             sb.Append('\n').Append(dialect switch
@@ -697,7 +712,7 @@ FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
         foreach (var p in spec.Ints) sb.Append("int ").Append(p).Append("; ");
         sb.Append("};\n");
         if (spec.SharedInts > 0) sb.Append("shared int sm[").Append(spec.SharedInts).Append("];\n");
-        sb.Append(Spell(Helpers, WinogradKernelDialect.Glsl));
+        sb.Append(Spell(Helpers + EncodeHelpers, WinogradKernelDialect.Glsl));
         sb.Append("void main()\n{\n    int gid = int(gl_GlobalInvocationID.x);\n    int lid = int(gl_LocalInvocationID.x);\n");
         sb.Append(Spell(spec.Body, WinogradKernelDialect.Glsl)).Append("}\n");
         return sb.ToString();

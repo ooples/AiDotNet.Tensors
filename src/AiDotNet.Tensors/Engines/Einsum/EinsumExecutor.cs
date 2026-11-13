@@ -44,6 +44,21 @@ public static class EinsumExecutor
             throw new ArgumentException(
                 $"Expected {binding.Equation.Operands.Count} tensor(s), got {operands.Length}");
 
+        // Half/BFloat16: contract in float32 and round each output once. The generic kernels below accumulate in T,
+        // where a Half running sum stops growing at 2048 (PyTorch's einsum contracts half operands in float32 too).
+        if (CpuEngine.IsLowPrecisionFloat<T>())
+        {
+            var widened = new Tensor<float>[operands.Length];
+            for (int i = 0; i < operands.Length; i++)
+            {
+                var operand = operands[i];
+                widened[i] = new Tensor<float>(CpuEngine.WidenToFloat(operand.GetFlattenedData(), operand.Length),
+                    (int[])operand._shape.Clone());
+            }
+            var contracted = Execute(binding, path, widened);
+            return new Tensor<T>(CpuEngine.NarrowFromFloat<T>(contracted.ToArray()), (int[])contracted._shape.Clone());
+        }
+
         var eq = binding.Equation;
         int batchRank = binding.BatchDims.Length;
 

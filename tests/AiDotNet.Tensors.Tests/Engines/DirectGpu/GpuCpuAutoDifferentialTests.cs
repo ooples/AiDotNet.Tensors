@@ -692,6 +692,17 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "TensorFritschCarlsonLimit(Tensor<T>,Tensor<T>)",
         "TensorCTCLabelPosteriors(Tensor<T>,Tensor<Int32>,Int32[],Int32[],Int32)",
         "TensorLinearSumAssignment(Tensor<T>)",
+        // Caller-Random draws (the Random is the caller's, its stream must end where the scalar loop's does), the row
+        // gather with long ids and the lfilter recursion with coupled coefficient / state shapes: DataOps2GpuParityTests,
+        // GPU vs CPU with no recorded fallback (NormalFromRng_AndBothGammaOverloads_MatchTheCpu_AndTheStream for the
+        // host-drawn normal and gamma overloads, bit for bit), and DataTransformPortTests per backend.
+        "TensorNormalFromRng(Random,Int32[],Func<Random,Double>)",
+        "TensorTruncatedNormalFromRng(Random,Int32[],BoxMullerVariant,Double,Double,Double,Double)",
+        "TensorGammaFromRng(Random,Double,Tensor<T>,BoxMullerVariant)",
+        "TensorGammaFromRng(Random,Tensor<T>,Tensor<T>,BoxMullerVariant)",
+        "TensorGatherRows(Tensor<T>,Tensor<Int64>)",
+        "TensorLinearFilter(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        "TensorLinearFilterGuarded(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Double)",
         // Class-index gather (CE/NLL core): GPU-vs-CPU forward + gradient parity and residency in ClassGatherTests.
         "TensorGatherClassValues(Tensor<T>,Tensor<T>)",
         // Model-level ops with per-argument shapes (CRF emissions [B,S,K] + transitions [K,K] + scores [K]; hyperbolic
