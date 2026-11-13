@@ -18406,6 +18406,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
+    // Blocks for one 32-lane warp per item (CudaGatedDeltaNetKernels).
+    private static uint GatedDeltaNetWarpGrid(long warps) => (uint)checked((warps * 32 + DefaultBlockSize - 1) / DefaultBlockSize);
+
     // ── Fused Gated DeltaNet scan forward (#1464) ──────────────────────────────────────────
     public unsafe void GatedDeltaNetScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
@@ -18418,16 +18421,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
-        if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_forward");
+        string variant = Kernels.CudaGatedDeltaNetKernels.Variant(headDim);
+        if (!_kernelCache.TryGetValue("gated_delta_scan_forward" + variant, out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_forward" + variant);
 
         using var _ = PushContext();
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, pout = output.Handle;
         void** args = stackalloc void*[11];
         args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pa; args[4] = &pb; args[5] = &pout;
         args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim; args[9] = &numHeads; args[10] = &headDim;
-        uint total = (uint)(batch * numHeads * headDim);
-        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+        LaunchKernel(kernel, GatedDeltaNetWarpGrid((long)batch * numHeads * headDim), (uint)DefaultBlockSize, args);
     }
 
     unsafe void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
@@ -18443,17 +18446,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
         GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
-        if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
-            !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
+        string variant = Kernels.CudaGatedDeltaNetKernels.Variant(headDim);
+        if (!_kernelCache.TryGetValue("gated_delta_scan_recompute" + variant, out var recompute) ||
+            !_kernelCache.TryGetValue("gated_delta_scan_backward" + variant, out var backward))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward" + variant);
 
         using var _ = PushContext();
         // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
         // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
         bool det = GpuDeterminism.IsActive;
         IntPtr dqKernel = IntPtr.Zero, reduceKernel = IntPtr.Zero;
-        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
-                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
+        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq" + variant, out dqKernel)
+                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce" + variant, out reduceKernel)))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
         int n = batch * seqLen * modelDim;
         if (!det)
@@ -18471,8 +18475,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer trajScratch;
         using (DeviceMemoryReclaim.EnterScopedScratch()) trajScratch = AllocateBufferUninitialized(trajLen);
         using var trajBuf = trajScratch;
-        uint total = (uint)(batch * numHeads * headDim);
-        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        // A warp per state row (recompute, backward); a warp per (batch, step, head) for dq and reduce.
+        uint grid = GatedDeltaNetWarpGrid((long)batch * numHeads * headDim);
 
         IntPtr pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, ptr = trajBuf.Handle;
         void** ra = stackalloc void*[10];
@@ -18482,8 +18486,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         IntPtr pdo = dOut.Handle, pq = q.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
-        // dq and reduce run one warp per element (32 threads each).
-        uint nGrid = (uint)checked(((long)n * 32 + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint nGrid = GatedDeltaNetWarpGrid((long)batch * seqLen * numHeads);
         using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
         IntPtr pp = partials?.Handle ?? IntPtr.Zero;
         if (det)
