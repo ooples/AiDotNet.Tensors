@@ -674,7 +674,10 @@ public sealed partial class HipBackend : IGatedDeltaNetBackwardBackend
             throw new InvalidOperationException(
                 $"GatedDeltaNet trajectory buffer size ({trajLenLong}) exceeds int.MaxValue.");
         int trajLen = (int)trajLenLong;
-        using var trajBuf = AllocateBuffer(trajLen);
+        // Disposed below and fully written by the recompute kernel: uncharged and uninitialized.
+        IGpuBuffer trajScratch;
+        using (DeviceMemoryReclaim.EnterScopedScratch()) trajScratch = AllocateBufferUninitialized(trajLen);
+        using var trajBuf = trajScratch;
         // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
         // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
         bool det = GpuDeterminism.IsActive;

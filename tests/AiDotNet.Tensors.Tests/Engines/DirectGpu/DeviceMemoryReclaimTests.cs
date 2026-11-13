@@ -166,6 +166,39 @@ public sealed class DeviceMemoryReclaimTests
     }
 
     [Fact]
+    public void ScopedScratch_InsideATape_IsNotChargedAndForcesNoCollection()
+    {
+        // Scratch its allocating method disposes (the GatedDeltaNet backward's trajectory) never becomes garbage, so it
+        // must not count toward the in-tape threshold: charging it forced a blocking GC inside every training step.
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            DeviceMemoryReclaim.ResetCountsForTests();
+            int collectionsBefore = GC.CollectionCount(1);
+            long epoch;
+            using (DeviceMemoryReclaim.EnterScopedScratch())
+            {
+                Assert.True(DeviceMemoryReclaim.InScopedScratch);
+                epoch = DeviceMemoryReclaim.OnDeviceAllocation(2 * DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes);
+            }
+            Assert.False(DeviceMemoryReclaim.InScopedScratch);
+            Assert.Equal(-1, epoch);
+            Assert.Equal(collectionsBefore, GC.CollectionCount(1));
+            Assert.False(DeviceMemoryReclaim.CollectionDue);
+            Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
+            // Outside the scope the same allocation is charged as before.
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.ResetCountsForTests();
+        }
+    }
+
+    [Fact]
     public void StepBoundary_SkipsTheCollection_WhenOwnersDisposedWhatWasHandedOut()
     {
         // A TensorScope ending an inference call disposes its intermediates: they are back in the pool and credited, so

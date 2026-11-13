@@ -18384,7 +18384,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (trajLenL > int.MaxValue)
             throw new ArgumentException("GatedDeltaNet trajectory buffer is too large for a single allocation.");
         int trajLen = (int)trajLenL;
-        using var trajBuf = AllocateBuffer(trajLen);
+        // Disposed below and fully written by gated_delta_scan_recompute: uncharged and uninitialized.
+        IGpuBuffer trajScratch;
+        using (DeviceMemoryReclaim.EnterScopedScratch()) trajScratch = AllocateBufferUninitialized(trajLen);
+        using var trajBuf = trajScratch;
         uint total = (uint)(batch * numHeads * headDim);
         uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
 
@@ -20508,7 +20511,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         allocatedDuringCapture = IsCapturingOnThisThread;
         contextGeneration = ContextGenerationOf(context);
-        if (chargeBytes > 0 && !allocatedDuringCapture && !IsRuntimeTearingDown && !ProcessExiting)
+        if (chargeBytes > 0 && !allocatedDuringCapture && !IsRuntimeTearingDown && !ProcessExiting
+            && !DeviceMemoryReclaim.InScopedScratch)
         {
             reclaimCharge = chargeBytes;
             reclaimEpoch = ChargeCudaReclaim(chargeBytes);
@@ -20789,7 +20793,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void ChargeReclaim(long bytes)
         {
-            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
+            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting || DeviceMemoryReclaim.InScopedScratch) return;
             _reclaimCharge = bytes;
             _reclaimEpoch = ChargeCudaReclaim(bytes);
         }

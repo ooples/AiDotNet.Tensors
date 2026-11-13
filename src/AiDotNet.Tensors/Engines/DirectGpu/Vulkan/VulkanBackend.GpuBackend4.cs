@@ -847,7 +847,9 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
         // Inside a batch the dispatches below are only recorded; disposing the scratch here would return it to the pool
         // for another allocation to take before they run. The queued release holds it until the batch has completed.
         var release = (IQueuedBufferRelease)this;
-        var traj = AllocateBuffer((int)trajLenLong);
+        // Released below (queued past the batch): not charged toward the reclaim collections.
+        IGpuBuffer traj;
+        using (DeviceMemoryReclaim.EnterScopedScratch()) traj = AllocateBuffer((int)trajLenLong);
         IGpuBuffer? partials = null;
         try
         {

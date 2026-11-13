@@ -111,6 +111,29 @@ internal static class DeviceMemoryReclaim
 
     private static int s_collectionDue;
 
+    [ThreadStatic] private static int t_scopedScratchDepth;
+
+    /// <summary>Whether this thread is inside <see cref="EnterScopedScratch"/>.</summary>
+    internal static bool InScopedScratch => t_scopedScratchDepth != 0;
+
+    /// <summary>
+    /// Device allocations this thread makes until the scope is disposed are not charged toward the reclaim collections.
+    /// For scratch the allocating method itself disposes before it returns: the collections exist to recover buffers
+    /// whose owners were dropped, which such a buffer never is. Charging it anyway made a large one (the GatedDeltaNet
+    /// backward's trajectory: batch*heads*seq*hd^2 floats, 134 MB per layer at B8 H4 S256 hd64) force a blocking GC
+    /// inside every training step: 13% of a warmed-up MoE LM step on an RTX 3090 (PerfView).
+    /// </summary>
+    internal static ScopedScratchScope EnterScopedScratch()
+    {
+        t_scopedScratchDepth++;
+        return default;
+    }
+
+    internal readonly struct ScopedScratchScope : IDisposable
+    {
+        public void Dispose() => t_scopedScratchDepth--;
+    }
+
     // Set by a collection that ran inside an open tape. What the tape still held survived it and was promoted, so the
     // step boundary must still collect, and through Gen 2, once the tape has released those owners.
     private static int s_survivorsPromotedInsideTape;
@@ -167,6 +190,7 @@ internal static class DeviceMemoryReclaim
     /// too, which only brings a collection slightly earlier, never later.</returns>
     internal static long OnDeviceAllocation(long bytes)
     {
+        if (t_scopedScratchDepth != 0) return -1;   // never garbage: see EnterScopedScratch (epoch -1: no credit either)
         long epoch = Volatile.Read(ref s_collectionEpoch);
         Interlocked.Increment(ref s_allocationsSinceCollection);
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
