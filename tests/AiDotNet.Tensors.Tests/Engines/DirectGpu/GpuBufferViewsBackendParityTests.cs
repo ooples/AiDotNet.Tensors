@@ -54,6 +54,36 @@ public sealed class GpuBufferViewsBackendParityTests
         Check(backend);
     }
 
+    /// <summary>
+    /// A view must keep working after its parent is released, and releasing it afterwards must not fault: releases run
+    /// in no fixed order (the retirement reap goes newest first), and NVIDIA's runtime crashed the test host
+    /// (0xC0000005 in clReleaseMemObject) releasing a sub-buffer whose parent had already gone.
+    /// </summary>
+    [SkippableFact]
+    public void OpenCl_AView_OutlivesItsReleasedParent()
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
+        var views = Assert.IsAssignableFrom<IGpuBufferViews>(backend);
+        var data = new float[ParentLength];
+        for (int i = 0; i < data.Length; i++) data[i] = i * 0.5f;
+        var parent = Assert.IsType<DirectOpenClGpuBuffer>(backend.AllocateBuffer(data));
+        var view = views.TryCreateView(parent, Offset, Count)
+            ?? throw new InvalidOperationException($"OpenCL refused a view at element offset {Offset}.");
+
+        backend.Scale(view, view, -2f, Count);
+        // Released, not returned to the pool: the native parent is let go while the view still has work queued on it.
+        parent.Release();
+        backend.Scale(view, view, 3f, Count);
+        var read = backend.DownloadBuffer(view);
+        for (int i = 0; i < Count; i++) Assert.Equal(data[Offset + i] * -6f, read[i]);
+
+        view.Dispose();
+        // A reap releases whatever retired with it; the next allocation runs one.
+        using var next = backend.AllocateBuffer(new float[Count]);
+        Assert.Equal(Count, next.Size);
+    }
+
     [SkippableFact]
     public void Cuda_BufferViews_AddressTheParentRange()
     {

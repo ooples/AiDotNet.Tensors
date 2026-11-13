@@ -280,7 +280,9 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             LinalgEigh(input, eigenvalues, eigenvectors, batchCount, n);
             return;
         }
-        throw new InvalidOperationException($"Direct PTX lower Eigh specialization rejected the request: {DirectPtxLastError}");
+        // The established route reads the upper triangle only, and the lower specialization is opt-in (off by
+        // default): report a capability gap, which the engine answers with its CPU path, not a failure.
+        throw new NotSupportedException($"Direct PTX lower Eigh specialization rejected the request: {DirectPtxLastError}");
     }
 
     void IExtendedLinalgBackend.LinalgLdlFactor(

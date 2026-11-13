@@ -29,6 +29,11 @@ public class VulkanBufferPoolTests
         }
         Skip.If(backend is null, "No Vulkan device.");
         Skip.IfNot(VulkanGpuBuffer.PoolingEnabled, "Vulkan buffer pooling is disabled by the environment.");
+        // The pool is process-wide and capped at a quarter of device memory. By the time this collection runs, the
+        // suites before it can have parked buffers up to that cap (1,240 of them on a 6 GB laptop GPU), and a full
+        // pool frees every return instead of parking it, so no reuse these tests assert could happen. Each test
+        // starts from an empty pool.
+        VulkanGpuBuffer.Pool.DrainAll();
         return backend!;
     }
 

@@ -373,7 +373,7 @@ public static class GradientCheckpointing<T>
     /// </summary>
     private static Tensor<T> CloneCheckpointBoundary(Tensor<T> source, IEngine engine)
     {
-        if (engine is DirectGpuTensorEngine && source.TryGetGpuBuffer() is not null)
+        if (engine.Is<DirectGpuTensorEngine>() && source.TryGetGpuBuffer() is not null)
         {
             using (GradientTape<T>.NoGrad())
             {

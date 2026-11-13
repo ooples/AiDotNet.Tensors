@@ -416,8 +416,9 @@ jobs:
               $idColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'pid' } | Select-Object -First 1
               $nameColumn = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -eq 'process_name' } | Select-Object -First 1
               $id = [uint32]0
-              if ($idColumn -and [uint32]::TryParse($idColumn.Value.Trim(), [ref]$id) -and -not $ownIds.ContainsKey($id)) {
-                $name = if ($nameColumn) { Split-Path -Leaf $nameColumn.Value.Trim() } else { 'unknown' }
+              if ($idColumn -and [uint32]::TryParse("$($idColumn.Value)".Trim(), [ref]$id) -and -not $ownIds.ContainsKey($id)) {
+                $rawName = if ($nameColumn) { "$($nameColumn.Value)".Trim() } else { '' }
+                $name = if ($rawName) { Split-Path -Leaf $rawName } else { 'unknown' }
                 "$name ($id)"
               } } | Sort-Object -Unique)
             if ($others.Count -gt 0) {
@@ -436,7 +437,7 @@ jobs:
           function Read-Number($row, $prefix) {
             $column = $row.PSObject.Properties | Where-Object { $_.Name.Trim() -like "$prefix*" } | Select-Object -First 1
             $value = 0.0
-            if ($column -and [double]::TryParse(($column.Value.Trim() -split ' ')[0], [ref]$value)) { return $value }
+            if ($column -and [double]::TryParse(("$($column.Value)".Trim() -split ' ')[0], [ref]$value)) { return $value }
             return $null
           }
           $clocks = @($rows | ForEach-Object { Read-Number $_ 'clocks.current.sm' } | Where-Object { $null -ne $_ })
@@ -446,7 +447,7 @@ jobs:
           $limited = @($rows | Where-Object {
             $column = $_.PSObject.Properties | Where-Object { $_.Name.Trim() -like 'clocks_*reasons*' } | Select-Object -First 1
             $bits = [uint64]0
-            $column -and [uint64]::TryParse(($column.Value.Trim() -replace '^0x', ''),
+            $column -and [uint64]::TryParse(("$($column.Value)".Trim() -replace '^0x', ''),
               [Globalization.NumberStyles]::HexNumber, [Globalization.CultureInfo]::InvariantCulture, [ref]$bits) -and
               ($bits -shr 1) -ne 0 }).Count
           $line = "GPU samples: $($rows.Count); SM clock $(($clocks | Measure-Object -Minimum).Minimum)-" +
