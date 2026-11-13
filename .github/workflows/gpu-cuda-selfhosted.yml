@@ -226,10 +226,21 @@ jobs:
     - name: Record the GPU and driver
       id: gpu
       run: |
-        $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
+        # A runner on a multi-GPU machine is pinned to its card by CUDA_VISIBLE_DEVICES=<GPU UUID> in its .env. CUDA
+        # honours that; nvidia-smi does not, so every nvidia-smi call in this job selects the card with -i
+        # $env:NVSMI_GPU. Only a single UUID is unambiguous (nvidia-smi's index order is PCI bus order, CUDA's default
+        # is fastest-first), so anything else is refused rather than measuring the wrong card.
+        $pin = "$env:CUDA_VISIBLE_DEVICES".Trim()
+        $smiSelect = @()
+        if ($pin) {
+          if ($pin -notmatch '^GPU-[0-9a-fA-F-]+$') { Write-Output "::error::CUDA_VISIBLE_DEVICES='$pin': pin a runner with one GPU UUID (nvidia-smi -L)."; exit 1 }
+          $smiSelect = @('-i', $pin)
+          "NVSMI_GPU=$pin" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
+        }
+        $gpu = nvidia-smi @smiSelect --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
-        "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
-        $cap = "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1)".Trim()
+        "Runner GPU: $gpu$(if ($pin) { " (pinned: $pin)" })" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        $cap = "$(nvidia-smi @smiSelect --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1)".Trim()
         if ($cap -notmatch '^\d+\.\d+$') { Write-Output "::error::nvidia-smi reported no compute capability ('$cap')."; exit 1 }
         "sm=sm$($cap -replace '\.', '')" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_OUTPUT
 
@@ -443,12 +454,13 @@ jobs:
         # clocks_event_reasons; older ones only accept clocks_throttle_reasons.
         $samples = "${{ runner.temp }}/trx"
         $reasons = 'clocks_event_reasons.active'
+        $smiSelect = if ($env:NVSMI_GPU) { "-i $env:NVSMI_GPU " } else { '' }
         nvidia-smi --query-gpu=$reasons --format=csv,noheader 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { $reasons = 'clocks_throttle_reasons.active' }
         $gpuFields = "timestamp,utilization.gpu,memory.used,clocks.sm,clocks.max.sm,temperature.gpu,power.draw,$reasons"
         $samplers = @(
-          (Start-Process nvidia-smi -ArgumentList "--query-gpu=$gpuFields --format=csv -l 30 -f `"$samples/gpu-samples.csv`"" -NoNewWindow -PassThru),
-          (Start-Process nvidia-smi -ArgumentList "--query-compute-apps=timestamp,pid,process_name,used_memory --format=csv -l 30 -f `"$samples/gpu-processes.csv`"" -NoNewWindow -PassThru))
+          (Start-Process nvidia-smi -ArgumentList "$smiSelect--query-gpu=$gpuFields --format=csv -l 30 -f `"$samples/gpu-samples.csv`"" -NoNewWindow -PassThru),
+          (Start-Process nvidia-smi -ArgumentList "$smiSelect--query-compute-apps=timestamp,pid,process_name,used_memory --format=csv -l 30 -f `"$samples/gpu-processes.csv`"" -NoNewWindow -PassThru))
         # This run's processes: the tree under dotnet test, walked at every wait slice so the sampled process ids can be
         # told apart from another workload's, which may also be a dotnet or a testhost. Ids, parents and names only (a
         # command line could carry a credential).
