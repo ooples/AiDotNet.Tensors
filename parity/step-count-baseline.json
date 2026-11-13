@@ -17,9 +17,14 @@
     "transformer:cuda:NVIDIA RTX 1000 Ada Generation Laptop GPU:cudnn": { "allocatedBytesPerStep": 1920, "kernelNodes": 34, "memcpyNodes": 0, "memsetNodes": 2 },
     "resnet18:cuda:NVIDIA RTX 1000 Ada Generation Laptop GPU:cudnn": { "allocatedBytesPerStep": 8064, "kernelNodes": 168, "memcpyNodes": 0, "memsetNodes": 5 },
     "mlp:cuda:NVIDIA GeForce RTX 3080:cudnn": { "allocatedBytesPerStep": 896, "kernelNodes": 24, "memcpyNodes": 0, "memsetNodes": 0 },
-    "cnn:cuda:NVIDIA GeForce RTX 3080:cudnn": { "allocatedBytesPerStep": 1152, "kernelNodes": 39, "memcpyNodes": 0, "memsetNodes": 2 },
+    "cnn:cuda:NVIDIA GeForce RTX 3080:cudnn": { "allocatedBytesPerStep": 1152, "kernelNodes": 43, "memcpyNodes": 0, "memsetNodes": 2 },
     "lstm:cuda:NVIDIA GeForce RTX 3080:cudnn": { "allocatedBytesPerStep": 896, "kernelNodes": 9, "memcpyNodes": 0, "memsetNodes": 0 },
     "transformer:cuda:NVIDIA GeForce RTX 3080:cudnn": { "allocatedBytesPerStep": 1920, "kernelNodes": 34, "memcpyNodes": 0, "memsetNodes": 2 },
-    "resnet18:cuda:NVIDIA GeForce RTX 3080:cudnn": { "allocatedBytesPerStep": 8064, "kernelNodes": 158, "memcpyNodes": 0, "memsetNodes": 5 }
+    "resnet18:cuda:NVIDIA GeForce RTX 3080:cudnn": { "allocatedBytesPerStep": 8064, "kernelNodes": 168, "memcpyNodes": 0, "memsetNodes": 5 },
+    "mlp:cuda:NVIDIA GeForce RTX 3090:cudnn": { "allocatedBytesPerStep": 896, "kernelNodes": 23, "memcpyNodes": 0, "memsetNodes": 0 },
+    "cnn:cuda:NVIDIA GeForce RTX 3090:cudnn": { "allocatedBytesPerStep": 1152, "kernelNodes": 39, "memcpyNodes": 0, "memsetNodes": 2 },
+    "lstm:cuda:NVIDIA GeForce RTX 3090:cudnn": { "allocatedBytesPerStep": 896, "kernelNodes": 9, "memcpyNodes": 0, "memsetNodes": 0 },
+    "transformer:cuda:NVIDIA GeForce RTX 3090:cudnn": { "allocatedBytesPerStep": 1920, "kernelNodes": 35, "memcpyNodes": 0, "memsetNodes": 1 },
+    "resnet18:cuda:NVIDIA GeForce RTX 3090:cudnn": { "allocatedBytesPerStep": 8064, "kernelNodes": 158, "memcpyNodes": 0, "memsetNodes": 5 }
   }
 }

@@ -106,7 +106,7 @@ internal static class LinalgInverses
         int batch = 1;
         for (int i = 0; i < inputShape.Length - 2; i++) batch *= inputShape[i];
         int stride = n * n;
-        T one = FromDouble<T>(1.0);
+        T one = Helpers.MathHelper.GetNumericOperations<T>().One;
         for (int b = 0; b < batch; b++)
             for (int i = 0; i < n; i++)
                 data[b * stride + i * n + i] = one;

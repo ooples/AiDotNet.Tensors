@@ -1459,7 +1459,9 @@ public partial class DirectGpuTensorEngine
         // The CPU base downloads BOTH whole vectors to multiply-accumulate on the host; instead
         // do the elementwise multiply + full reduction on the GPU (the expensive O(n) part) and
         // download only the single scalar result. Defer non-conforming shapes / no-GPU to base.
-        if (a.Rank != 1 || b.Rank != 1 || a.Length != b.Length || !TryGetBackend(out _))
+        // Half/BFloat16: the composition below would round every product to T before the sum (a product above 65,504
+        // is +Inf in Half); the CPU engine multiplies and accumulates in float32 and rounds once.
+        if (a.Rank != 1 || b.Rank != 1 || a.Length != b.Length || CpuEngine.IsLowPrecisionFloat<T>() || !TryGetBackend(out _))
             return base.TensorVecDot(a, b);
 
         try
@@ -4810,10 +4812,13 @@ public partial class DirectGpuTensorEngine
             return base.TensorSort(input, axis, descending);
         try
         {
-            var c = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
             int L = input._shape[rank - 1];
             int numRows = L == 0 ? 0 : input.Length / L;
-            if (numRows == 0 || L == 0) return base.TensorSort(input, axis, descending);
+            // The bitonic network carries positions as floats: past MaxFloatExactSortIndexColumns a position (and so the
+            // index tie-break that makes the sort stable) is no longer exact, so such rows sort on the host. Decided
+            // before any contiguous copy, which the host sort does not need.
+            if (numRows == 0 || L > MaxFloatExactSortIndexColumns) return base.TensorSort(input, axis, descending);
+            var c = input.IsContiguous ? input : input.Contiguous();
             // Resident: keep the sorted values AND the int indices on the GPU (FinishGpuOp). The index
             // tensor rides as a float buffer (int-as-float); downstream TakeAlongDim/gather reuse it in
             // place (no re-upload) — completing the argsort -> gather int-residency chain.

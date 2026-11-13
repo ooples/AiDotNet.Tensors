@@ -63,6 +63,13 @@ internal static class QrDecomposition
         // Householder QR: for each column j, compute a reflector that zeros
         // the sub-diagonal of A[:, j] from row j+1 down, apply to trailing
         // submatrix, and (optionally) accumulate into Q.
+        // decimal / Half / BFloat16: the same Householder QR carried out in T.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        {
+            GenericLinalg<T>.Qr(a, offA, q, offQ, r, offR, m, n, qCols, computeQ);
+            return;
+        }
+
         int k = Math.Min(m, n);
         var work = new double[m];
         var trail = new double[n];

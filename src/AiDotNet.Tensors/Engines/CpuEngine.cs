@@ -409,6 +409,13 @@ public partial class CpuEngine : ITensorLevelEngine
             return Unsafe.As<float, T>(ref result);
         }
 
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Float32 accumulation, rounded once: a Half running sum stops growing at 2048.
+            using var lowLease = vector.LeaseArray();
+            return LowPrecisionFromFloat<T>(LowPrecisionSum(lowLease.Array, 0, vector.Length));
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
 
@@ -428,6 +435,13 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
         {
             throw new ArgumentException($"Vectors must have the same length for dot product. Got lengths {a.Length} and {b.Length}.");
+        }
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            using var aLowLease = a.LeaseArray();
+            using var bLowLease = b.LeaseArray();
+            return LowPrecisionFromFloat<T>(LowPrecisionDot(aLowLease.Array, 0, bLowLease.Array, 0, a.Length));
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -457,6 +471,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var bSpan = bSpanLease.Span;
         int len = a.Length;
         int bLen = b.Length;
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            float lowAcc = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                int bIdx = bOffset + i * bStride;
+                if (bIdx >= 0 && bIdx < bLen) lowAcc += LowPrecisionToFloat(aSpan[i]) * LowPrecisionToFloat(bSpan[bIdx]);
+            }
+            return LowPrecisionFromFloat<T>(lowAcc);
+        }
 
         for (int i = 0; i < len; i++)
         {
@@ -501,6 +526,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Float32 accumulation: the count does not fit Half above 65,504 (see LowPrecisionStatistics).
+            using var lowLease = vector.LeaseArray();
+            return LowPrecisionMean(lowLease.Array, vector.Length);
+        }
         T sum = Sum(vector);
         T length = numOps.FromDouble(vector.Length);
         return numOps.Divide(sum, length);
@@ -720,6 +751,13 @@ public partial class CpuEngine : ITensorLevelEngine
         if (vector.Length == 0) throw new ArgumentException("Cannot compute standard deviation of empty vector.");
         var numOps = MathHelper.GetNumericOperations<T>();
 
+        if (IsLowPrecisionFloat<T>())
+        {
+            using var lowLease = vector.LeaseArray();
+            LowPrecisionMoments(lowLease.Array, vector.Length, out _, out float lowSumSq);
+            return NarrowFromFloat<T>((float)Math.Sqrt(lowSumSq / vector.Length));
+        }
+
         T mean = Mean(vector);
         T sumSquaredDiff = numOps.Zero;
 
@@ -737,6 +775,12 @@ public partial class CpuEngine : ITensorLevelEngine
     public T Norm<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
+        if (IsLowPrecisionFloat<T>())
+        {
+            using var lowLease = vector.LeaseArray();
+            var lowData = lowLease.Array;
+            return LowPrecisionFromFloat<T>((float)Math.Sqrt(LowPrecisionDot(lowData, 0, lowData, 0, vector.Length)));
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         T sumSquares = numOps.Zero;
         for (int i = 0; i < vector.Length; i++)
@@ -1710,6 +1754,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(matrix.Rows);
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Float32 products and sums, each output rounded once.
+            int rows = matrix.Rows, columns = matrix.Columns;
+            var matrixData = matrix.AsMemory().ToArray();
+            using var vectorLease = vector.LeaseArray();
+            var lowOut = new T[rows];
+            for (int i = 0; i < rows; i++)
+                lowOut[i] = LowPrecisionFromFloat<T>(LowPrecisionDot(matrixData, i * columns, vectorLease.Array, 0, columns));
+            return new Vector<T>(lowOut);
+        }
 
         for (int i = 0; i < matrix.Rows; i++)
         {
@@ -3036,8 +3092,22 @@ public partial class CpuEngine : ITensorLevelEngine
             // matmul (e.g. per-token Q·K^T at 197×64×197 = ~12K FMAs
             // per row, ~2.5M total) below grain size runs serial.
             long mmGenericWork = (long)m * n * k;
+            bool lowPrecisionMm = IsLowPrecisionFloat<T>();
             Helpers.CpuParallelSettings.ParallelForOrSerial(0, m, mmGenericWork, i =>
             {
+                if (lowPrecisionMm)
+                {
+                    // Half/BFloat16: float32 products and sums, each output rounded once.
+                    for (int j = 0; j < n; j++)
+                    {
+                        float acc = 0f;
+                        for (int p = 0; p < k; p++)
+                            acc += LowPrecisionToFloat(aDataArr[aOff + i * aStride0 + p * aStride1])
+                                * LowPrecisionToFloat(bDataArr[bOff + p * bStride0 + j * bStride1]);
+                        rDataArr[i * n + j] = LowPrecisionFromFloat<T>(acc);
+                    }
+                    return;
+                }
                 for (int j = 0; j < n; j++)
                 {
                     T sum = numOps.Zero;
@@ -8968,6 +9038,21 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceSum", tensor._shape); if (ac is not null) return ac.Execute(); }
 
+        // Half/BFloat16: accumulate in float32 and round each sum once (a Half running sum stops growing at 2048).
+        // Full reductions go through TensorSum below, which already accumulates them in float32.
+        if (IsLowPrecisionFloat<T>() && axes != null && axes.Length > 0)
+        {
+            var lowAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
+            var lowShape = LowPrecisionReducedShape(tensor._shape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            var lowResult = TensorAllocator.Rent<T>(lowShape,
+                LowPrecisionAxisSum(tensor.GetFlattenedData(), tensor._shape, lowAxes, lowSize, squares: false, squareRoot: false));
+            DifferentiableOps.RecordUnary("ReduceSum", lowResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                new object[] { lowAxes, keepDims });
+            return lowResult;
+        }
+
         // Stride-aware: for single-axis reduction on non-contiguous views, use direct stride math
         if (!tensor.IsContiguous && axes != null && axes.Length == 1)
         {
@@ -9345,6 +9430,10 @@ public partial class CpuEngine : ITensorLevelEngine
             double result = dSum / tensor.Length;
             return Unsafe.As<double, T>(ref result);
         }
+
+        // Half/BFloat16: float32 sum and divide (the count overflows Half above 65,504).
+        if (IsLowPrecisionFloat<T>())
+            return LowPrecisionMean(tensor.GetFlattenedData(), tensor.Length);
 
         // Generic path
         T sum = TensorSum(tensor);
@@ -25257,6 +25346,16 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= input._shape[i];
 
+        // Half/BFloat16: max, exponentials, their sum and the division in float32, each output rounded once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowResult = TensorAllocator.Rent<T>(input._shape,
+                LowPrecisionSoftmax(input.GetFlattenedData(), outerSize, axisSize, innerSize, LowPrecisionSoftmaxForm.Softmax));
+            DifferentiableOps.RecordUnary("Softmax", lowResult, inputOrig, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = inputOrig; int ax = axis; AutoTracer.RecordOp("Softmax", lowResult, eng => eng.Softmax(c, ax), paramHash: ax); }
+            return lowResult;
+        }
+
         // Fast SIMD path for float when softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
@@ -26569,6 +26668,8 @@ public partial class CpuEngine : ITensorLevelEngine
                             DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                             DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedMean);
                             DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedVar);
+                            CarryLowPrecisionStatistic(freshMean, capturedMean);
+                            CarryLowPrecisionStatistic(freshVar, capturedVar);
                         }
                         finally
                         {
@@ -26615,6 +26716,24 @@ public partial class CpuEngine : ITensorLevelEngine
         // Handle 1D [features] - treat as single sample [1, features]
         bool was1D = input._shape.Length == 1;
         Tensor<T> workingInput = was1D ? input.Reshape([1, input._shape[0]]) : input;
+
+        // Half/BFloat16: statistics and normalisation in float32 (the float kernel), rounded once. The generic paths put
+        // the per-channel count (batch x spatial, easily above 65,504) into T, where it is +Inf in Half.
+        if (IsLowPrecisionFloat<T>() && workingInput._shape.Length >= 2 && workingInput._shape.Length <= 4)
+        {
+            GetLowPrecisionBatchNormDims(workingInput._shape, out int bnBatch, out int bnChannels, out int bnSpatial);
+            int lowLength = workingInput.Length;
+            var lowOut = new float[lowLength];
+            var lowMean = new float[bnChannels];
+            var lowVar = new float[bnChannels];
+            BatchNorm4DFloat(WidenToFloat(workingInput.GetFlattenedData(), lowLength), WidenToFloat(gamma.GetFlattenedData(), bnChannels),
+                WidenToFloat(beta.GetFlattenedData(), bnChannels), (float)epsilon, bnBatch, bnChannels, bnSpatial, lowMean, lowVar, lowOut);
+            mean = RentLowPrecisionStatistic<T>(new[] { bnChannels }, lowMean);
+            variance = RentLowPrecisionStatistic<T>(new[] { bnChannels }, lowVar);
+            var bnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
+            DifferentiableOps.RecordIfActive("BatchNorm", bnLow, new[] { inputOrig, gamma, beta }, BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
+            return bnLow;
+        }
 
         // Handle 2D [batch, features], 3D [channels, height, width], and 4D [batch, channels, height, width] tensors
         if (workingInput._shape.Length == 4)
@@ -27452,6 +27571,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
+
+        // Half/BFloat16: the float kernel on widened operands, each gradient rounded once (the generic paths put the
+        // per-channel count into T, +Inf in Half above 65,504).
+        if (IsLowPrecisionFloat<T>() && input._shape.Length >= 2 && input._shape.Length <= 4)
+        {
+            GetLowPrecisionBatchNormDims(input._shape, out int bnBatch, out int bnChannels, out int bnSpatial);
+            int lowLength = input.Length;
+            var lowGradInput = new float[lowLength];
+            var lowGradGamma = new float[bnChannels];
+            var lowGradBeta = new float[bnChannels];
+            BatchNormBackward4DFloat(WidenToFloat(gradOutput.GetFlattenedData(), lowLength), WidenToFloat(input.GetFlattenedData(), lowLength),
+                WidenToFloat(gamma.GetFlattenedData(), bnChannels), LowPrecisionStatisticValues(mean, mean.GetFlattenedData(), bnChannels),
+                LowPrecisionStatisticValues(variance, variance.GetFlattenedData(), bnChannels), (float)epsilon, bnBatch, bnChannels, bnSpatial,
+                lowGradInput, 0, false, lowGradGamma, 0, false, lowGradBeta, 0, false);
+            gradGamma = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowGradGamma));
+            gradBeta = TensorAllocator.Rent<T>(new[] { bnChannels }, NarrowFromFloat<T>(lowGradBeta));
+            return TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowGradInput));
+        }
 
         // Handle both 2D [batch, features] and 4D [batch, channels, height, width] tensors
         if (input._shape.Length == 4)
@@ -28345,6 +28482,25 @@ public partial class CpuEngine : ITensorLevelEngine
         var gammaData = gamma.GetReadOnlyDataArray();
         var betaData = beta.GetReadOnlyDataArray();
 
+        // Half/BFloat16: statistics and normalisation in float32 (the float kernel below), rounded once. The generic
+        // path put the feature count into T (+Inf in Half above 65,504) and summed in T.
+        if (IsLowPrecisionFloat<T>())
+        {
+            int lowLength = batchSize * featureSize;
+            var lowOut = new float[lowLength];
+            var lowMean = new float[batchSize];
+            var lowVar = new float[batchSize];
+            ProcessBatchesSimd(WidenToFloat(inputData, lowLength), WidenToFloat(gammaData, featureSize),
+                WidenToFloat(betaData, featureSize), lowOut, lowMean, lowVar, batchSize, featureSize, (float)epsilon);
+            mean = RentLowPrecisionStatistic<T>(batchShape, lowMean);
+            variance = RentLowPrecisionStatistic<T>((int[])batchShape.Clone(), lowVar);
+            var lnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
+            DifferentiableOps.RecordIfActive("LayerNorm", lnLow, new[] { input, gamma, beta },
+                BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("LayerNorm", lnLow, eng => eng.LayerNorm(input, gamma, beta, epsilon, out _, out _));
+            return lnLow;
+        }
+
         // Float fast path: SIMD mean, variance, and normalize via Vector256
         // with FMA — fused into a SINGLE pass over the input using
         // <c>Var[X] = E[(X-K)²] - E[X-K]²</c> with K the row's first element (ShiftedMoments; the
@@ -29181,6 +29337,30 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 System.Buffers.ArrayPool<float>.Shared.Return(lnPartial);
             }
+        }
+        else if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: the float kernel on widened operands, each gradient rounded once.
+            int lowLength = batchSize * featureSize;
+            var lowGradInput = new float[lowLength];
+            var lowGradGamma = new float[featureSize];
+            var lowGradBeta = new float[featureSize];
+            var lowPartial = System.Buffers.ArrayPool<float>.Shared.Rent(LayerNormBackwardFloatScratchLength(batchSize, featureSize));
+            try
+            {
+                LayerNormBackwardFloatFused(WidenToFloat(gradOutputData, lowLength), 0, WidenToFloat(inputData, lowLength), 0,
+                    WidenToFloat(gammaData, featureSize), 0, LowPrecisionStatisticValues(mean, meanData, batchSize),
+                    LowPrecisionStatisticValues(variance, varData, batchSize),
+                    batchSize, featureSize, (float)epsilon,
+                    lowGradInput, 0, false, lowGradGamma, 0, false, lowGradBeta, 0, false, lowPartial);
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(lowPartial);
+            }
+            Array.Copy(NarrowFromFloat<T>(lowGradInput), gradInputData, lowLength);
+            Array.Copy(NarrowFromFloat<T>(lowGradGamma), gradGammaData, featureSize);
+            Array.Copy(NarrowFromFloat<T>(lowGradBeta), gradBetaData, featureSize);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -30125,6 +30305,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedGNMean);
                         DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedGNVar);
+                        CarryLowPrecisionStatistic(freshMean, capturedGNMean);
+                        CarryLowPrecisionStatistic(freshVar, capturedGNVar);
                     },
                     // SavedState order per #178 fix above: numGroups must come first so
                     // GroupNormBackward reads savedState[0] as int (not as Tensor).
@@ -30189,6 +30371,32 @@ public partial class CpuEngine : ITensorLevelEngine
                 BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
             if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("GroupNorm", result, eng => eng.GroupNorm(inputOrig, numGroups, gamma, beta, epsilon, out _, out _));
             return result;
+        }
+
+        // Half/BFloat16: the float kernel above on widened operands, rounded once. The generic path below put the
+        // group size into T (+Inf in Half above 65,504) and summed in T.
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowIn = WidenToFloat(input.GetReadOnlyDataArray(), input.Length);
+            var lowGamma = WidenToFloat(gamma.GetReadOnlyDataArray(), channels);
+            var lowBeta = WidenToFloat(beta.GetReadOnlyDataArray(), channels);
+            var lowOut = new float[input.Length];
+            float[] lowMean, lowVar;
+            unsafe
+            {
+                fixed (float* pIn = lowIn, pOut = lowOut, pGamma = lowGamma, pBeta = lowBeta)
+                {
+                    GroupNormFloatPtr(pIn, pOut, pGamma, pBeta, batch, channels, spatialSize, numGroups, channelsPerGroup,
+                        (float)epsilon, out lowMean, out lowVar);
+                }
+            }
+            mean = RentLowPrecisionStatistic<T>(new[] { batch, numGroups }, lowMean);
+            variance = RentLowPrecisionStatistic<T>(new[] { batch, numGroups }, lowVar);
+            var gnLow = TensorAllocator.Rent<T>(input._shape, NarrowFromFloat<T>(lowOut));
+            DifferentiableOps.RecordIfActive("GroupNorm", gnLow, new[] { inputOrig, gamma, beta },
+                BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("GroupNorm", gnLow, eng => eng.GroupNorm(inputOrig, numGroups, gamma, beta, epsilon, out _, out _));
+            return gnLow;
         }
 
         // COW Stage 2 (#624): input/gamma/beta are read-only norm operands — non-privatizing read.
@@ -30549,6 +30757,21 @@ public partial class CpuEngine : ITensorLevelEngine
 
             GroupNormBackwardFloat(fGradOut, fInput, fGamma, fMean, fVar, fGradGamma, fGradBeta, fGradInput,
                 batch, channels, spatialSize, numGroups, fEps);
+        }
+        else if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: the float kernel on widened operands, each gradient rounded once.
+            int lowLength = input.Length;
+            var lowGradInput = new float[lowLength];
+            var lowGradGamma = new float[channels];
+            var lowGradBeta = new float[channels];
+            GroupNormBackwardFloat(WidenToFloat(gradOutputData, lowLength), WidenToFloat(inputData, lowLength),
+                WidenToFloat(gammaData, channels), LowPrecisionStatisticValues(mean, meanData, batch * numGroups),
+                LowPrecisionStatisticValues(variance, varData, batch * numGroups),
+                lowGradGamma, lowGradBeta, lowGradInput, batch, channels, spatialSize, numGroups, (float)epsilon);
+            Array.Copy(NarrowFromFloat<T>(lowGradInput), gradInputData, lowLength);
+            Array.Copy(NarrowFromFloat<T>(lowGradGamma), gradGammaData, channels);
+            Array.Copy(NarrowFromFloat<T>(lowGradBeta), gradBetaData, channels);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -36086,8 +36309,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceMean", input._shape); if (ac is not null) return ac.Execute(); }
 
-        // Stride-aware single-axis mean
-        if (!input.IsContiguous && axes.Length == 1)
+        // Stride-aware single-axis mean (Half/BFloat16 take the float32-accumulating generic path below)
+        if (!input.IsContiguous && axes.Length == 1 && !IsLowPrecisionFloat<T>())
         {
             var ops = MathHelper.GetNumericOperations<T>();
             int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
@@ -36190,6 +36413,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
+
+        // Half/BFloat16: accumulate and divide in float32, round once (the count overflows Half above 65,504).
+        if (IsLowPrecisionFloat<T>())
+        {
+            outputData = LowPrecisionAxisStatistic(inputData, inputShape, normalizedAxes, outputSize, variance: false, correction: 0, squareRoot: false);
+            goto meanRecord;
+        }
 
         // #653: dense single-axis float/double mean, parallel and bit-identical to the odometer below.
         if (normalizedAxes.Length == 1 && TryReduceMeanSingleAxisDense(inputData, outputData, inputShape, normalizedAxes[0]))
@@ -36311,6 +36541,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var rmbOutStrideForDim = BuildReducedOutStrideForDim(inputShape, gradOutputShape, normalizedAxes);
         var rmbCoord = new int[rmbRank];
         int rmbOutFlat = 0;
+        // Half/BFloat16: 1/count is subnormal or zero in Half, so divide in float32 and round once.
+        if (IsLowPrecisionFloat<T>())
+            return TensorAllocator.Rent<T>(inputShape, LowPrecisionMeanBackward(gradOutputData, inputShape, normalizedAxes));
+
         for (int i = 0; i < inputSize; i++)
         {
             gradInputData[i] = numOps.Multiply(gradOutputData[rmbOutFlat], scale);
@@ -36345,8 +36579,8 @@ public partial class CpuEngine : ITensorLevelEngine
             return ReduceVarianceTapeAware(input, axes, keepDims);
         }
 
-        // Stride-aware: compute mean then variance with stride math
-        if (!input.IsContiguous && axes.Length == 1)
+        // Stride-aware: compute mean then variance with stride math (Half/BFloat16 take the float32 path below)
+        if (!input.IsContiguous && axes.Length == 1 && !IsLowPrecisionFloat<T>())
         {
             var ops = MathHelper.GetNumericOperations<T>();
             int axis = axes[0] < 0 ? input.Rank + axes[0] : axes[0];
@@ -36480,6 +36714,16 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var inputData = input.GetFlattenedData();
         var inputShape = input._shape;
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
+            var lowShape = LowPrecisionReducedShape(inputShape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            return TensorAllocator.Rent<T>(lowShape,
+                LowPrecisionAxisStatistic(inputData, inputShape, lowAxes, lowSize, variance: true, correction: 0, squareRoot: false));
+        }
 
         // First compute the mean
         var mean = ReduceMean(input, axes, keepDims: true);
@@ -36635,6 +36879,12 @@ public partial class CpuEngine : ITensorLevelEngine
         foreach (var ax in normalizedAxes) reduceCount *= inputShape[ax];
         T scale = numOps.Divide(numOps.One, numOps.FromDouble(reduceCount));
 
+        if (IsLowPrecisionFloat<T>())
+        {
+            outputData = LowPrecisionAxisStatistic(inputData, inputShape, normalizedAxes, outputSize, variance: true, correction: 0, squareRoot: false);
+            goto rvtRecord;
+        }
+
         // Allocation-free odometer (output + keepDims mean), see ReduceVariance.
         int rvtRank = inputShape.Length;
         var rvtOutStrideForDim = BuildReducedOutStrideForDim(inputShape, outputShape, normalizedAxes);
@@ -36655,6 +36905,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Multiply(outputData[i], scale);
 
+    rvtRecord:
         var result = TensorAllocator.Rent<T>(outputShape, outputData);
         // savedState order matches existing BackwardFunctions<T>.ReduceVarianceBackward: [axes, mean].
         // Snapshot axes (caller-owned int[]) and key the recorded op against the
@@ -36703,6 +36954,11 @@ public partial class CpuEngine : ITensorLevelEngine
         var rvbMeanStrideForDim = BuildReducedOutStrideForDim(inputShape, meanShape, normalizedAxes);
         var rvbCoord = new int[rvbRank];
         int rvbOutFlat = 0, rvbMeanFlat = 0;
+        // Half/BFloat16: 2/N is subnormal or zero in Half; evaluate in float32 (centred on the float32 mean the forward
+        // used, not the rounded saved one) and round once.
+        if (IsLowPrecisionFloat<T>())
+            return TensorAllocator.Rent<T>(inputShape, LowPrecisionVarianceBackward(inputData, gradOutputData, inputShape, normalizedAxes));
+
         for (int i = 0; i < inputSize; i++)
         {
             // gradient = 2 * (x - mean) * gradOutput / N
@@ -38550,7 +38806,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var hi = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 1);
             var lo = System.Runtime.Intrinsics.X86.Avx.ExtractVector128(vsum0, 0);
             var s128 = System.Runtime.Intrinsics.X86.Sse2.Add(lo, hi);
-            var shuf = System.Runtime.Intrinsics.X86.Sse2.Shuffle(s128, s128, 0b_01_00_11_10);
+            // shufpd reads two control bits, one per lane: 1 puts lane 1 of the first operand in lane 0. The 0b_01_00_11_10
+            // mask written for shufps selected lanes 0 and 1 again, so the sum doubled lane 0 and dropped lane 1.
+            var shuf = System.Runtime.Intrinsics.X86.Sse2.Shuffle(s128, s128, 0b_01);
             s128 = System.Runtime.Intrinsics.X86.Sse2.Add(s128, shuf);
             double tmp;
             System.Runtime.Intrinsics.X86.Sse2.StoreScalar(&tmp, s128);
@@ -40525,6 +40783,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
+        // Half/BFloat16: float32 running sum, each prefix rounded once (a Half running sum stops growing at 2048).
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowResult = TensorAllocator.Rent<T>(tensor._shape,
+                LowPrecisionCumSum(tensor.GetFlattenedData(), outerSize, axisSize, innerSize));
+            DifferentiableOps.RecordUnary("TensorCumSum", lowResult, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", lowResult, eng => eng.TensorCumSum(c, ca)); }
+            return lowResult;
+        }
+
         // Float fast path for 1D (common case). Uses the SIMD Sklansky
         // prefix-sum from Simd.ScanKernels when AVX2 is available, 8x the
         // scalar throughput on bandwidth-limited 1-D cumsum.
@@ -40663,6 +40931,28 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Normalize axis
         if (axis < 0) axis = tensor._shape.Length + axis;
+
+        // Half/BFloat16: max-shift, exponentials, their sum and the log in float32, each output rounded once. The
+        // reduced dim is kept for the recorded backward (it broadcasts the output against the input) and squeezed by
+        // a recorded reshape.
+        if (IsLowPrecisionFloat<T>())
+        {
+            if (axis < 0 || axis >= tensor.Rank)
+                throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for rank {tensor.Rank}");
+            var lowInput = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            int lowOuter = 1, lowInner = 1;
+            for (int d = 0; d < axis; d++) lowOuter *= tensor._shape[d];
+            for (int d = axis + 1; d < tensor.Rank; d++) lowInner *= tensor._shape[d];
+            var keptShape = (int[])tensor._shape.Clone();
+            keptShape[axis] = 1;
+            var lse = TensorAllocator.Rent<T>(keptShape,
+                LowPrecisionLogSumExp(lowInput.GetFlattenedData(), lowOuter, tensor._shape[axis], lowInner));
+            DifferentiableOps.RecordUnary("LogSumExp", lse, tensor, BackwardFunctions<T>.LogSumExpBackward, new object[] { axis });
+            if (keepDims) return lse;
+            var squeezed = new List<int>(tensor.Rank);
+            for (int d = 0; d < tensor.Rank; d++) if (d != axis) squeezed.Add(tensor._shape[d]);
+            return Reshape(lse, squeezed.ToArray());
+        }
 
         // Compute max along axis for numerical stability
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
@@ -41276,8 +41566,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 return TensorOuterProduct(tensors[0], tensors[1]);
             }
-            // Batched dot: bi,bi->b
-            if (normalized == "bi,bi->b")
+            // Batched dot: bi,bi->b. Half/BFloat16 take the generic path, which contracts in float32: this loop
+            // accumulates in T, where a Half running sum stops growing at 2048.
+            if (normalized == "bi,bi->b" && !IsLowPrecisionFloat<T>())
             {
                 int batch = tensors[0]._shape[0];
                 int n = tensors[0]._shape[1];
@@ -41627,6 +41918,23 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NormBackward, new object[] { capAxis });
             }
+        }
+
+        // Half/BFloat16: squares summed in float32, square-rooted and rounded once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            int lowAxis = axis < 0 ? tensor.Rank + axis : axis;
+            if (lowAxis < 0 || lowAxis >= tensor.Rank)
+                throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for rank {tensor.Rank}");
+            var lowAxes = new[] { lowAxis };
+            var lowShape = LowPrecisionReducedShape(tensor._shape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            var normResult = TensorAllocator.Rent<T>(lowShape,
+                LowPrecisionAxisSum(tensor.GetFlattenedData(), tensor._shape, lowAxes, lowSize, squares: true, squareRoot: true));
+            DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { lowAxis });
+            if (AutoTracer.ShouldRecord) { var c = tensor; var ca = lowAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
+            return normResult;
         }
 
         // Float fast path for 2D L2 norm along axis: fused sum(x²) + sqrt per row/col
@@ -42822,6 +43130,17 @@ public partial class CpuEngine : ITensorLevelEngine
         int outerSize = 1, axisSize = tensor._shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= tensor._shape[i];
+
+        // Half/BFloat16: the log-sum-exp denominator is accumulated in float32, each output rounded once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowResult = TensorAllocator.Rent<T>(tensor._shape,
+                LowPrecisionSoftmax(tensor.GetFlattenedData(), outerSize, axisSize, innerSize, LowPrecisionSoftmaxForm.LogSoftmax));
+            DifferentiableOps.RecordUnary("LogSoftmax", lowResult, tensorOrig,
+                BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("LogSoftmax", lowResult, eng => eng.TensorLogSoftmax(c, ca)); }
+            return lowResult;
+        }
 
         // Fast SIMD path for float when log_softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
@@ -44313,47 +44632,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new Tensor<int>(input._shape);
-        var inputData = input.GetFlattenedData();
-        using var resultDataLease = result.LeaseArray();
-        var resultData = resultDataLease.Array;
-
-        int axisSize = input._shape[axis];
-        int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
-        int innerSize = 1;
-        for (int i = axis + 1; i < input._shape.Length; i++) innerSize *= input._shape[i];
-
-        for (int outer = 0; outer < outerSize; outer++)
-        {
-            for (int inner = 0; inner < innerSize; inner++)
-            {
-                var axisValues = new (T value, int index)[axisSize];
-                for (int a = 0; a < axisSize; a++)
-                {
-                    int flatIndex = outer * axisSize * innerSize + a * innerSize + inner;
-                    axisValues[a] = (inputData[flatIndex], a);
-                }
-
-                if (descending)
-                {
-                    Array.Sort(axisValues, (x, y) => numOps.Compare(y.value, x.value));
-                }
-                else
-                {
-                    Array.Sort(axisValues, (x, y) => numOps.Compare(x.value, y.value));
-                }
-
-                for (int a = 0; a < axisSize; a++)
-                {
-                    int flatIndex = outer * axisSize * innerSize + a * innerSize + inner;
-                    resultData[flatIndex] = axisValues[a].index;
-                }
-            }
-        }
-
-        return result;
+        // Stable, in PyTorch's order: the same permutation TensorSort and TensorArgsort return (equal values keep their
+        // index order ascending and descending), so seeded consumers see no tie reordering.
+        return StableSortAlongAxis(input, axis, descending, valuesOut: null);
     }
 
     /// <inheritdoc/>
@@ -49140,6 +49421,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!targets.IsContiguous) targets = targets.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
 
+        // Half/BFloat16: float32 terms, sum and divide (the count overflows Half above 65,504).
+        if (IsLowPrecisionFloat<T>())
+            return LowPrecisionPairMean(predictions, targets, (p, t) => (p - t) * (p - t));
+
         // MSE = mean((pred - target)^2) = (dot(diff, diff)) / N
         // Use span-based subtract + dot product instead of ToArray + ToDouble per element
         var diff = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
@@ -49745,6 +50030,37 @@ public partial class CpuEngine : ITensorLevelEngine
         return LayerNorm(input, gamma, beta, epsilon, out _, out _);
     }
 
+    /// <summary>
+    /// The recorded standard deviation for Half/BFloat16. A Half variance overflows long before the standard deviation
+    /// does ([0, 1000] has variance 250,000 but standard deviation 500), so the recorded composition runs on
+    /// (x - c) / s, where c and s are each slice's mean and standard deviation computed in float32 and held constant:
+    /// that has unit variance, and std(x) = s * std((x - c) / s) is exact in value and gradient (the standard deviation
+    /// is shift-invariant and homogeneous of degree one in x).
+    /// </summary>
+    private Tensor<T> LowPrecisionTapedStd<T>(Tensor<T> input, int[] axes, bool keepDims)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var stdAxes = ValidateAndNormalizeAxes(axes is null || axes.Length == 0 ? Enumerable.Range(0, input.Rank).ToArray() : axes, input.Rank);
+        var dense = input.IsContiguous ? input : input.Contiguous();
+        var data = dense.GetFlattenedData();
+        var keptShape = LowPrecisionReducedShape(dense._shape, stdAxes, keepDims: true);
+        int keptSize = 1;
+        foreach (int dim in keptShape) keptSize *= dim;
+        var centre = LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: false, correction: 0, squareRoot: false);
+        var scaleF = WidenToFloat(
+            LowPrecisionAxisStatistic(data, dense._shape, stdAxes, keptSize, variance: true, correction: 0, squareRoot: true), keptSize);
+        for (int i = 0; i < scaleF.Length; i++)
+            if (float.IsNaN(scaleF[i]) || scaleF[i] <= 0f || float.IsInfinity(scaleF[i])) scaleF[i] = 1f; // a constant slice keeps std 0 and its gradient
+        var scale = NarrowFromFloat<T>(scaleF);
+        var centreKept = new Tensor<T>(centre, (int[])keptShape.Clone());
+        var scaleKept = new Tensor<T>(scale, (int[])keptShape.Clone());
+        var standardized = TensorDivide(
+            TensorSubtract(input, TensorBroadcastTo(centreKept, input._shape)),
+            TensorBroadcastTo(scaleKept, input._shape));
+        var unitStd = TensorSqrt(TensorClampMin(ReduceVariance(standardized, stdAxes, keepDims), numOps.Zero));
+        return TensorMultiply(unitStd, keepDims ? scaleKept : Reshape(scaleKept, unitStd._shape));
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceStd<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
@@ -49773,7 +50089,23 @@ public partial class CpuEngine : ITensorLevelEngine
         // nothing, so ReduceStd had NO gradient at all -- eager training through it failed with "the tape has no
         // recorded operations" and compiled training silently dropped it.
         if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
+        {
+            if (IsLowPrecisionFloat<T>())
+                return LowPrecisionTapedStd(input, axes, keepDims);
             return TensorSqrt(TensorClampMin(ReduceVariance(input, axes, keepDims), numOps.Zero));
+        }
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: variance and square root in float32, rounded once (as torch.std's opmath).
+            var lowInput = input.IsContiguous ? input : input.Contiguous();
+            var lowAxes = ValidateAndNormalizeAxes(axes is null || axes.Length == 0 ? Enumerable.Range(0, input.Rank).ToArray() : axes, input.Rank);
+            var lowShape = LowPrecisionReducedShape(lowInput._shape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            return TensorAllocator.Rent<T>(lowShape,
+                LowPrecisionAxisStatistic(lowInput.GetFlattenedData(), lowInput._shape, lowAxes, lowSize, variance: true, correction: 0, squareRoot: true));
+        }
 
         // std = sqrt(variance)
         var variance = ReduceVariance(input, axes, keepDims);
@@ -50236,10 +50568,17 @@ public partial class CpuEngine : ITensorLevelEngine
         T mean;
         using (new NoGradScope<T>())
         {
-            var diff = TensorSubtract(predictions, targets);
-            var sq = TensorMultiply(diff, diff);
-            T sum = TensorSum(sq);
-            mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+            if (IsLowPrecisionFloat<T>())
+            {
+                mean = LowPrecisionPairMean(predictions, targets, (p, t) => (p - t) * (p - t));
+            }
+            else
+            {
+                var diff = TensorSubtract(predictions, targets);
+                var sq = TensorMultiply(diff, diff);
+                T sum = TensorSum(sq);
+                mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+            }
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("MSELoss", result, predictions, targets, BackwardFunctions<T>.MSELossBackward);
@@ -50306,10 +50645,17 @@ public partial class CpuEngine : ITensorLevelEngine
         T mean;
         using (new NoGradScope<T>())
         {
-            var diff = TensorSubtract(predictions, targets);
-            var absDiff = TensorAbs(diff);
-            T sum = TensorSum(absDiff);
-            mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+            if (IsLowPrecisionFloat<T>())
+            {
+                mean = LowPrecisionPairMean(predictions, targets, (p, t) => Math.Abs(p - t));
+            }
+            else
+            {
+                var diff = TensorSubtract(predictions, targets);
+                var absDiff = TensorAbs(diff);
+                T sum = TensorSum(absDiff);
+                mean = numOps.Divide(sum, numOps.FromDouble(predictions.Length));
+            }
         }
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordBinary("L1Loss", result, predictions, targets, BackwardFunctions<T>.L1LossBackward);
@@ -50384,6 +50730,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
             if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", scalarResult, eng => eng.TensorHuberLoss(cp, ct, cd)); }
             return scalarResult;
+        }
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: float32 terms, sum and divide (the count overflows Half above 65,504).
+            float deltaF = (float)delta;
+            var lowResult = new Tensor<T>(new[] { LowPrecisionPairMean(predictions, targets, (p, t) => { float d = p - t; float ad = Math.Abs(d); return ad <= deltaF ? 0.5f * d * d : deltaF * (ad - 0.5f * deltaF); }) }, [1]);
+            DifferentiableOps.RecordBinary("HuberLoss", lowResult, predictions, targets,
+                BackwardFunctions<T>.HuberLossBackward, savedState: new object[] { delta });
+            if (AutoTracer.ShouldRecord) { var cp = predictions; var ct = targets; var cd = delta; AutoTracer.RecordOp("HuberLoss", lowResult, eng => eng.TensorHuberLoss(cp, ct, cd)); }
+            return lowResult;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -50470,6 +50827,17 @@ public partial class CpuEngine : ITensorLevelEngine
                 BackwardFunctions<T>.BCEWithLogitsLossBackward);
             if (AutoTracer.ShouldRecord) { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", scalarResultD, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
             return scalarResultD;
+        }
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: float32 terms, sum and divide (the count overflows Half above 65,504).
+            var lowResult = new Tensor<T>(new[] { LowPrecisionPairMean(logits, targets,
+                (x, t) => Math.Max(x, 0f) - x * t + (float)Math.Log(1 + Math.Exp(-Math.Abs(x)))) }, [1]);
+            DifferentiableOps.RecordBinary("BCEWithLogitsLoss", lowResult, logits, targets,
+                BackwardFunctions<T>.BCEWithLogitsLossBackward);
+            if (AutoTracer.ShouldRecord) { var cl = logits; var ct = targets; AutoTracer.RecordOp("BCEWithLogitsLoss", lowResult, eng => eng.TensorBCEWithLogitsLoss(cl, ct)); }
+            return lowResult;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -50599,6 +50967,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.TensorKLDivLoss(capturedInput, capturedTarget); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.KLDivLossBackward);
             }
+        }
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: float32 terms, sum and divide (the count overflows Half above 65,504).
+            var lowResult = new Tensor<T>(new[] { LowPrecisionPairMean(input, target,
+                (x, t) => t > 0f ? t * ((float)Math.Log(t) - x) : 0f) }, [1]);
+            DifferentiableOps.RecordBinary("KLDivLoss", lowResult, input, target,
+                BackwardFunctions<T>.KLDivLossBackward);
+            AutoTracer.RecordOp("KLDivLoss", lowResult, eng => eng.TensorKLDivLoss(input, target));
+            return lowResult;
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -51132,8 +51511,12 @@ public partial class CpuEngine : ITensorLevelEngine
             var src = srcLease.Span;
             using var dstLease = result.LeaseWritable();
             var dst = dstLease.Span;
+            // As the float SIMD kernel: NaN has sign 0 (Math.Sign throws on it).
             for (int i = 0; i < src.Length; i++)
-                dst[i] = numOps.FromDouble(Math.Sign(numOps.ToDouble(src[i])));
+            {
+                double v = numOps.ToDouble(src[i]);
+                dst[i] = numOps.FromDouble(v > 0 ? 1 : (v < 0 ? -1 : 0));
+            }
         }
         DifferentiableOps.RecordUnary("Sign", result, tensorOrig, BackwardFunctions<T>.SignBackward);
         { var c = tensor; AutoTracer.RecordOp("Sign", result, eng => eng.Cast<CpuEngine>().TensorSign(c)); }
@@ -51533,6 +51916,31 @@ public partial class CpuEngine : ITensorLevelEngine
         using var outDataLease = result.LeaseArray();
         var outData = outDataLease.Array;
 
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Half/BFloat16: window sums and the divide in float32, rounded once (the kernel size is +Inf in Half
+            // above 65,504 and a Half running sum overflows).
+            var lowIn = WidenToFloat(inData, input.Length);
+            var lowOut = new float[batch * channels * outW];
+            for (int p = 0; p < batch * channels; p++)
+                for (int ow = 0; ow < outW; ow++)
+                {
+                    float sum = 0f, compensation = 0f;
+                    int start = p * width + ow * stride;
+                    for (int k = 0; k < kernelSize; k++)
+                    {
+                        float y = lowIn[start + k] - compensation;
+                        float t = sum + y;
+                        // An infinite element makes (t - sum) - y NaN; the window's sum is then the infinity.
+                        compensation = float.IsInfinity(t) ? 0f : (t - sum) - y;
+                        sum = t;
+                    }
+                    lowOut[p * outW + ow] = sum / kernelSize;
+                }
+            Array.Copy(NarrowFromFloat<T>(lowOut), outData, lowOut.Length);
+            goto avgPool1DRecord;
+        }
+
         for (int b = 0; b < batch; b++)
             for (int c = 0; c < channels; c++)
                 for (int ow = 0; ow < outW; ow++)
@@ -51543,6 +51951,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         sum = numOps.Add(sum, inData[(b * channels + c) * width + startW + k]);
                     outData[(b * channels + c) * outW + ow] = numOps.Divide(sum, numOps.FromDouble(kernelSize));
                 }
+    avgPool1DRecord:
         DifferentiableOps.RecordUnary("AvgPool1D", result, input, BackwardFunctions<T>.AvgPool1DBackward,
             savedState: new object[] { kernelSize, stride });
         AutoTracer.RecordOp("AvgPool1D", result, eng => eng.TensorAvgPool1D(input, kernelSize, stride));
@@ -51625,8 +52034,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        T sum = TensorSum(tensor);
-        T mean = numOps.Divide(sum, numOps.FromDouble(tensor.Length));
+        T mean = IsLowPrecisionFloat<T>()
+            ? LowPrecisionMean(tensor.GetFlattenedData(), tensor.Length)
+            : numOps.Divide(TensorSum(tensor), numOps.FromDouble(tensor.Length));
         var result = new Tensor<T>(new[] { mean }, [1]);
         DifferentiableOps.RecordUnary("Mean", result, tensor, BackwardFunctions<T>.MeanBackward);
         AutoTracer.RecordOp("Mean", result, eng => eng.TensorMeanDiff(tensor));
@@ -54538,6 +54948,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Empty rows have nothing to normalize (the row max would read element 0 of an empty row).
         if (cols == 0) return result;
 
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowInput = input.IsContiguous ? input : input.Contiguous();
+            return TensorAllocator.Rent<T>(input._shape,
+                LowPrecisionSoftmax(lowInput.GetFlattenedData(), rows, cols, 1, LowPrecisionSoftmaxForm.Softmax));
+        }
+
         for (int r = 0; r < rows; r++)
         {
             int offset = r * cols;
@@ -56342,100 +56759,25 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CTCLossBackward, savedState: new object[] { clp, ct, cil, ctl, cb }); } }
 
-        var ops = MathHelper.GetNumericOperations<T>();
-        int maxT = logProbs._shape[0];
-        int batchSize = logProbs._shape[1];
-        int numClasses = logProbs._shape[2];
-
-        if (inputLengths.Length != batchSize || targetLengths.Length != batchSize)
-            throw new ArgumentException("inputLengths and targetLengths must have length == batchSize.");
-
-        if (blank < 0 || blank >= numClasses)
-            throw new ArgumentOutOfRangeException(nameof(blank), $"Blank index {blank} must be in [0, {numClasses}).");
-
-        // Validate target bounds
-        int totalTargets = 0;
-        for (int n = 0; n < batchSize; n++)
-            totalTargets += targetLengths[n];
-        if (totalTargets > targets.Length)
-            throw new ArgumentException($"Sum of targetLengths ({totalTargets}) exceeds targets length ({targets.Length}).");
-
-        var losses = new Tensor<T>(new[] { batchSize });
-
-        // Forward-backward algorithm per batch element
-        int targetOffset = 0;
-        for (int n = 0; n < batchSize; n++)
+        // The lattice is CtcLattice's (CpuEngine.CtcLattice.cs), shared with the backward and with
+        // TensorCTCForwardBackward / TensorCTCLabelPosteriors, so the loss and its gradient use one recursion.
+        var problem = CtcLattice.Prepare(logProbs, targets, inputLengths, targetLengths, blank);
+        var lp = RoIAlignPlan.ToDoubles(logProbs);
+        var nll = new double[problem.Batch];
+        int stride = problem.MaxStates;
+        CpuParallelSettings.ParallelForOrSerial(0, problem.Batch, (long)problem.MaxTime * stride * problem.Batch * 2, n =>
         {
-            int T_n = inputLengths[n];
-            int U_n = targetLengths[n];
-
-            if (T_n < 0 || T_n > maxT)
-                throw new ArgumentOutOfRangeException(nameof(inputLengths), $"inputLengths[{n}]={T_n} must be in [0, {maxT}].");
-            if (U_n < 0)
-                throw new ArgumentOutOfRangeException(nameof(targetLengths), $"targetLengths[{n}]={U_n} must be non-negative.");
-
-            int S = 2 * U_n + 1; // expanded label length with blanks
-
-            // Build expanded label sequence: blank, l1, blank, l2, blank, ...
-            var expandedLabels = new int[S];
-            for (int s = 0; s < S; s++)
-            {
-                int label = (s % 2 == 0) ? blank : targets.GetFlat(targetOffset + s / 2);
-                if (label < 0 || label >= numClasses)
-                    throw new ArgumentOutOfRangeException(nameof(targets), $"Target label {label} must be in [0, {numClasses}).");
-                expandedLabels[s] = label;
-            }
-
-            // Alpha (forward) pass — log domain for numerical stability
-            var alpha = new double[T_n, S];
-            double negInf = double.NegativeInfinity;
-            for (int t = 0; t < T_n; t++)
-                for (int s = 0; s < S; s++)
-                    alpha[t, s] = negInf;
-
-            // Initialize
-            alpha[0, 0] = ops.ToDouble(logProbs[0, n, expandedLabels[0]]);
-            if (S > 1)
-                alpha[0, 1] = ops.ToDouble(logProbs[0, n, expandedLabels[1]]);
-
-            // Forward recursion
-            for (int t = 1; t < T_n; t++)
-            {
-                for (int s = 0; s < S; s++)
-                {
-                    double logProbTS = ops.ToDouble(logProbs[t, n, expandedLabels[s]]);
-                    double prevSum = alpha[t - 1, s];
-                    if (s >= 1)
-                        prevSum = LogSumExp(prevSum, alpha[t - 1, s - 1]);
-                    if (s >= 2 && expandedLabels[s] != blank && expandedLabels[s] != expandedLabels[s - 2])
-                        prevSum = LogSumExp(prevSum, alpha[t - 1, s - 2]);
-                    alpha[t, s] = prevSum + logProbTS;
-                }
-            }
-
-            // Total log-probability
-            double logProb = alpha[T_n - 1, S - 1];
-            if (S >= 2)
-                logProb = LogSumExp(logProb, alpha[T_n - 1, S - 2]);
-
+            var alpha = new double[Math.Max(1, problem.InputLengths[n] * stride)];
             // CTC loss = -log P(labels | input)
-            losses.SetFlat(n, ops.FromDouble(-logProb));
-            targetOffset += U_n;
-        }
+            nll[n] = -CtcLattice.Alpha(lp, problem, n, alpha, stride);
+        }, deterministicSafe: true);
+        var losses = RoIAlignPlan.FromDoubles<T>(nll, new[] { problem.Batch });
 
         Autodiff.DifferentiableOps.RecordIfActive("CTCLoss", losses,
             new[] { logProbs }, Autodiff.BackwardFunctions<T>.CTCLossBackward,
             new object[] { logProbs, targets, inputLengths, targetLengths, blank });
         { var clp2 = logProbs; var ct2 = targets; var cil2 = inputLengths; var ctl2 = targetLengths; var cb2 = blank; AutoTracer.RecordOp("CTCLoss", losses, eng => eng.TensorCTCLoss(clp2, ct2, cil2, ctl2, cb2)); }
         return losses;
-    }
-
-    private static double LogSumExp(double a, double b)
-    {
-        if (double.IsNegativeInfinity(a)) return b;
-        if (double.IsNegativeInfinity(b)) return a;
-        double max = Math.Max(a, b);
-        return max + Math.Log(Math.Exp(a - max) + Math.Exp(b - max));
     }
 
     #endregion

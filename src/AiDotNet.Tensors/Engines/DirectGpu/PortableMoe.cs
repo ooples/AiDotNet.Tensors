@@ -65,7 +65,7 @@ internal static class PortableMoe
 
     private static void Elementwise(IMoeKernelBackend be, string kernel, int total, IGpuBuffer[] buffers, int[] ints)
     {
-        // baseOffset is the last int of Route, Combine, and DScores.
+        // baseOffset is the last int of Route and Combine (DScores chunks by workgroup: ChunkedGroups).
         int baseSlot = ints.Length - 1;
         for (long baseOffset = 0; baseOffset < total; baseOffset += MaxElementsPerLaunch)
         {
@@ -131,9 +131,10 @@ internal static class PortableMoe
         Elementwise(be, MoeKernelTemplate.Route, n, new[] { scores, bias ?? scores, ids, gates, ssum },
             new[] { n, g, k, bias is null ? 0 : 1, 0 });
 
+    // One workgroup per token (baseOffset is the first token of each launch).
     internal static void LaunchDScores(IMoeKernelBackend be, int n, int d, int g, int k, IGpuBuffer o, IGpuBuffer dy,
         IGpuBuffer pos, IGpuBuffer gates, IGpuBuffer ssum, IGpuBuffer ids, IGpuBuffer ds) =>
-        Elementwise(be, MoeKernelTemplate.DScores, n, new[] { o, dy, pos, gates, ssum, ids, ds },
+        ChunkedGroups(be, MoeKernelTemplate.DScores, n, new[] { o, dy, pos, gates, ssum, ids, ds },
             new[] { n, d, g, k, 0 });
 
     /// <summary>
