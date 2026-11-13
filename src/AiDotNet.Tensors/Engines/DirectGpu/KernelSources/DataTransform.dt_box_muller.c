@@ -1,9 +1,8 @@
 
     int i = gid + first * 256;
     if (i >= N) return;
-    float u1 = uv[2 * i];
+    float r = uv[2 * i];
     float u2 = uv[2 * i + 1];
-    float r = SQRTF(-2.0f * LOGF(u1));
     float ang = 6.2831855f * u2;
     float z = r * COSF(ang);
     if (branch == 1) z = r * SINF(ang);

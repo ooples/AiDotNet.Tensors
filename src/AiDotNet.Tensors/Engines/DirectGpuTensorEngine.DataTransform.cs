@@ -45,6 +45,20 @@ public partial class DirectGpuTensorEngine
         return result;
     }
 
+    // Each drawn pair as (r, u2) with r = sqrt(-2 ln u1) taken in double: float32 cannot carry u1 itself, since every
+    // u1 within 2^-25 of 1 rounds to 1f and its radius (up to 2.4e-4) would vanish; r and u2 as floats are within
+    // float rounding of the host's, so the device's trig and affine steps agree with the host to float rounding.
+    private static float[] BoxMullerRadii(double[] pairs)
+    {
+        var result = new float[pairs.Length];
+        for (int i = 0; i < pairs.Length; i += 2)
+        {
+            result[i] = (float)Math.Sqrt(-2.0 * Math.Log(pairs[i]));
+            result[i + 1] = (float)pairs[i + 1];
+        }
+        return result;
+    }
+
     // Each double draw as (a, r): a = (float)u and r = (float)(u - a). u - a is exact in double, and r keeps its sign
     // (r is never subnormal for u in [2^-53, 1)), so the pair orders u against any float exactly.
     private static float[] SplitDraws(double[] draws)
@@ -79,15 +93,14 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (generator is null) throw new ArgumentNullException(nameof(generator));
         int count = ValidateShapeElements(shape);
-        if (variant.Branch != BoxMullerBranch.Cosine && variant.Branch != BoxMullerBranch.Sine)
-            throw new ArgumentOutOfRangeException(nameof(variant), variant.Branch, "Unknown Box-Muller branch.");
+        ValidateVariant(variant);
         ValidateClampBounds(low, high);
         if (typeof(T) != typeof(float) || count == 0 || (long)count * 2 > int.MaxValue / 2
             || !TryGetTransformBackend("TruncatedNormalFromRng", out var backend, out var transforms))
             return base.TensorTruncatedNormalFromRng<T>(generator, shape, variant, mean, stdDev, low, high);
 
         var pairs = DrawBoxMullerUniforms(generator, variant, count);
-        var uv = new OwnedBuffer(backend.AllocateBuffer(ToSingles(pairs)), ownsBuffer: true);
+        var uv = new OwnedBuffer(backend.AllocateBuffer(BoxMullerRadii(pairs)), ownsBuffer: true);
         try
         {
             using var output = AllocateFullyWrittenOutputBuffer(backend, count);
@@ -293,7 +306,10 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         var (vocab, rowSize, outShape) = GatherRowsShape(table, rows);
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || rows.Length == 0 || rowSize == 0)
+        // A host table is gathered on the host: uploading it would move all vocab * rowSize values to read k rows, the
+        // O(vocab * rowSize) cost the row gather exists to avoid (the scatter takes the same rule).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || rows.Length == 0 || rowSize == 0
+            || !IsOnDevice(table))
             return base.TensorGatherRows(table, rows);
         var ids = ReadAll(rows);
         var deviceIds = DeviceRowIds(ids, vocab, lastWins: false);

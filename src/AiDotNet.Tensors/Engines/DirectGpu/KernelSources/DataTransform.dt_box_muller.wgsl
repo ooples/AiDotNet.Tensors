@@ -8,9 +8,8 @@ struct Params { N: i32, branch: i32, meanBits: i32, stdBits: i32, clampOn: i32, 
 fn dt_box_muller(@builtin(global_invocation_id) gidv: vec3<u32>) {
     let i = i32(gidv.x) + pm.first * 256;
     if (i >= pm.N) { return; }
-    let u1 = uv[2 * i];
+    let r = uv[2 * i];
     let u2 = uv[2 * i + 1];
-    let r = sqrt(-2.0 * log(u1));
     let ang = 6.2831855 * u2;
     var z = r * cos(ang);
     if (pm.branch == 1) { z = r * sin(ang); }

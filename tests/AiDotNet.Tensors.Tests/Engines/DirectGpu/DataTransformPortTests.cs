@@ -160,9 +160,16 @@ public class DataTransformPortTests
     private static void CheckBoxMuller(IDirectGpuBackend backend, IDataTransformBackend dt, int n, BoxMullerBranch branch, bool clamp)
     {
         var rng = RandomHelper.CreateSeededRandom(51 + n);
+        // The kernel takes (r, u2): r = sqrt(-2 ln u1) from the host's double u1, as the engine uploads it.
         var uv = new float[2 * n];
-        for (int i = 0; i < uv.Length; i++) uv[i] = (float)(1.0 - rng.NextDouble());   // (0, 1]
-        uv[0] = 1f; uv[2] = 1e-30f; uv[3] = 0.25f;   // r = 0, a large r (normal u1), an exact quarter turn
+        for (int i = 0; i < uv.Length; i += 2)
+        {
+            uv[i] = (float)Math.Sqrt(-2.0 * Math.Log(1.0 - rng.NextDouble()));   // u1 in (0, 1]
+            uv[i + 1] = (float)(1.0 - rng.NextDouble());
+        }
+        uv[0] = 0f;                                       // u1 = 1: r = 0
+        uv[2] = (float)Math.Sqrt(-2.0 * Math.Log(1e-30)); // a large r
+        uv[3] = 0.25f;                                    // an exact quarter turn
         const float mean = 0.5f, std = 1.75f, low = -1.25f, high = 2.0f;
         using var bu = backend.AllocateBuffer(uv);
         using var bo = Output(backend, n);
@@ -170,12 +177,13 @@ public class DataTransformPortTests
         var actual = Download(backend, bo, n);
         for (int i = 0; i < n; i++)
         {
-            double z = CpuEngine.BoxMullerNormal(uv[2 * i], uv[2 * i + 1], branch);
+            double angle = 2.0 * Math.PI * uv[2 * i + 1];
+            double z = uv[2 * i] * (branch == BoxMullerBranch.Sine ? Math.Sin(angle) : Math.Cos(angle));
             double e = mean + std * z;
             if (clamp) e = CpuEngine.ClampNormal(e, low, high);
-            // Float log / sqrt / sin / cos of float arguments: a few ulps of r and of the angle 2 pi u2.
+            // Float sin / cos of a float angle: a few ulps of the angle 2 pi u2.
             Assert.True(Math.Abs(e - actual[i]) <= 5e-5 * Math.Max(1.0, Math.Abs(e)),
-                $"box-muller {branch} clamp={clamp} [{i}] (u1 {uv[2 * i]:R}, u2 {uv[2 * i + 1]:R}): expected {e:R}, got {actual[i]:R}");
+                $"box-muller {branch} clamp={clamp} [{i}] (r {uv[2 * i]:R}, u2 {uv[2 * i + 1]:R}): expected {e:R}, got {actual[i]:R}");
         }
     }
 

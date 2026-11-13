@@ -79,6 +79,23 @@ public sealed class DataOps2GpuParityTests : IClassFixture<GpuCpuCorrectnessFixt
     }
 
     [SkippableFact]
+    public void BoxMuller_FirstUniformJustBelowOne_KeepsItsRadiusOnTheDevice()
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
+        // Every u1 within 2^-25 of 1 rounds to 1f, so a device log of a float u1 gives r = 0 where the host's
+        // sqrt(-2 ln u1) is up to 2.4e-4: 1 - 2^-26 has r = 1.7e-4, 1 - 2^-30 has r = 4.3e-5.
+        double[] draws = { 1 - Math.Pow(2, -26), 0.1, 1 - Math.Pow(2, -30), 0.35, 0.5, 0.2, 1 - Math.Pow(2, -40), 0.9 };
+        var raw = new BoxMullerVariant(BoxMullerFirstUniform.Raw, 0.0, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine);
+        GpuLaunchProbe.Reset();
+        var gpu = _fixture.Gpu.TensorNormalBoxMullerFromRng<float>(new ReplayRandom(draws), new[] { 4 }, raw).ToArray();
+        AssertNoFallback("TruncatedNormalFromRng");
+        var cpu = _fixture.Cpu.TensorNormalBoxMullerFromRng<float>(new ReplayRandom(draws), new[] { 4 }, raw).ToArray();
+        Assert.True(cpu[0] > 1e-4f, $"the fixture's first radius should be 1.7e-4, got {cpu[0]:R}");
+        // Float trig of a float angle on a float radius: a few float ulps of each value.
+        AssertClose(cpu, gpu, 2e-6, "u1 near 1");
+    }
+
+    [SkippableFact]
     public void Bernoulli_AndRademacher_MatchTheCpuExactly()
     {
         Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
@@ -184,6 +201,20 @@ public sealed class DataOps2GpuParityTests : IClassFixture<GpuCpuCorrectnessFixt
         AssertNoFallback("ScatterRows");
         _fixture.Cpu.TensorScatterRowsInPlace(cpuTable, scatterIds, source);
         AssertBitsEqual(cpuTable.ToArray(), gpuTable.ToArray(), "scatter");
+    }
+
+    /// <summary>A Random that replays fixed NextDouble values.</summary>
+    private sealed class ReplayRandom : Random
+    {
+        private readonly double[] _values;
+        private int _next;
+
+        // The base seed is irrelevant: every draw the ops make goes through NextDouble below.
+        public ReplayRandom(double[] values) : base(0) => _values = values;
+
+        public override double NextDouble() => _values[_next++];
+
+        protected override double Sample() => NextDouble();
     }
 
     [SkippableFact]

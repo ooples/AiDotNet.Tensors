@@ -186,9 +186,10 @@ public static class TensorDataEngineExtensions
     /// <c>mean + stdDev * (Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2))</c> and converted to
     /// <typeparamref name="T"/>, so a loop written in that order gets identical values; a loop that multiplies in another
     /// order (<c>scale * sqrt(..) * cos(..)</c>) can differ in the last bit.</para>
-    /// <para>The draws are host-side by necessity; on DirectGpuTensorEngine a float32 result's uniforms upload once and
-    /// the transform runs as a device kernel on all six backends, in float32 (agreeing with the host to float32
-    /// rounding of the log, sqrt and trig).</para>
+    /// <para>The draws are host-side by necessity; on DirectGpuTensorEngine a float32 result's radii
+    /// <c>sqrt(-2 ln u1)</c> (taken in double while the stream is drawn, so a <c>u1</c> just below 1 keeps its radius)
+    /// and <c>u2</c> upload once and the trig, scale and clamp run as a device kernel on all six backends, in float32
+    /// (agreeing with the host to float32 rounding of the radius and the trig).</para>
     /// </remarks>
     public static Tensor<T> TensorNormalBoxMullerFromRng<T>(this IEngine engine, Random generator, int[] shape,
         BoxMullerVariant variant, double mean = 0.0, double stdDev = 1.0)
@@ -209,8 +210,10 @@ public static class TensorDataEngineExtensions
     /// <param name="low">The lower clamp bound.</param>
     /// <param name="high">The upper clamp bound (at least <paramref name="low"/>).</param>
     /// <returns>The filled tensor.</returns>
-    /// <remarks><b>PyTorch:</b> <c>torch.nn.init.trunc_normal_</c>'s clamp form, <c>normal_(mean, std).clamp_(low, high)</c>.
-    /// The transform and the clamp run as one device kernel on DirectGpuTensorEngine.</remarks>
+    /// <remarks><b>PyTorch:</b> <c>torch.empty(shape).normal_(mean, std, generator=g).clamp_(low, high)</c>: a clamped
+    /// normal, whose bounds carry the clipped mass, not <c>torch.nn.init.trunc_normal_</c>'s truncated distribution
+    /// (inverse-CDF sampling inside the bounds). The transform and the clamp run as one device kernel on
+    /// DirectGpuTensorEngine.</remarks>
     public static Tensor<T> TensorTruncatedNormalFromRng<T>(this IEngine engine, Random generator, int[] shape,
         BoxMullerVariant variant, double mean, double stdDev, double low, double high)
         => BuiltIn(engine).TensorTruncatedNormalFromRng<T>(generator, shape, variant, mean, stdDev, low, high);

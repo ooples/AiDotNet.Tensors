@@ -11,8 +11,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <summary>
 /// The kernels behind <see cref="IDataTransformBackend"/>, every one over 256-wide groups of float buffers:
 /// <list type="bullet">
-/// <item><see cref="BoxMuller"/>: one thread per element turns the host-drawn pair <c>(u1, u2)</c> into
-/// <c>mean + std * sqrt(-2 ln u1) cos(2 pi u2)</c> (or sin), optionally clamped.</item>
+/// <item><see cref="BoxMuller"/>: one thread per element turns the host-drawn pair, carried as <c>(r, u2)</c> with
+/// <c>r = sqrt(-2 ln u1)</c> taken on the host in double, into <c>mean + std * r cos(2 pi u2)</c> (or sin), optionally
+/// clamped.</item>
 /// <item><see cref="Threshold"/>: one thread per element compares the host-drawn double uniform, carried as a float and
 /// its signed residual, with a float threshold exactly, and writes one of two values.</item>
 /// <item><see cref="LinearFilter"/>: one thread per signal runs scipy's direct form II transposed recursion over time,
@@ -42,7 +43,8 @@ internal static class DataTransformKernelTemplate
     internal const string ScatterRows = "dt_scatter_rows";
     internal const string RoundIntegral = "dt_round_integral";
 
-    // uv holds (u1, u2) per element; 6.2831855f is 2 pi rounded to float.
+    // uv holds (r, u2) per element, r = sqrt(-2 ln u1) from the host's double u1 (a float u1 loses every u1 within 2^-25
+    // of 1, whose radius is up to 2.4e-4); 6.2831855f is 2 pi rounded to float.
     private static readonly string BoxMullerBody = KernelSourceResources.Read("DataTransform.dt_box_muller.c");
 
     // uv holds (a, r) per element: a = (float)u, r = (float)(u - a). Against a float t, u < t exactly when a < t or

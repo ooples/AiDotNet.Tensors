@@ -503,6 +503,105 @@ public sealed class SweepDataOpsTests
         AssertClose(new[] { -0.13778388, -0.3975856, 2.087328, 1.4556073, -0.064799, 0.3390575 }, grads[zi].ToArray(), 2e-9, "dzi");
     }
 
+    // ------------------------------------------------------------------ review fixes
+
+    [Fact]
+    public void BoxMuller_InvalidVariant_ThrowsBeforeDrawing()
+    {
+        // An undefined second-uniform rule used to throw only after the first pair had been drawn, leaving the caller's
+        // Random advanced; an undefined first-uniform rule with nothing to draw did not throw at all.
+        var badSecond = new BoxMullerVariant(BoxMullerFirstUniform.Raw, 0.0, (BoxMullerSecondUniform)7, BoxMullerBranch.Cosine);
+        var r1 = new SequenceRandom(0.5, 0.25, 0.75, 0.125);
+        Assert.Throws<ArgumentOutOfRangeException>(() => Cpu.TensorNormalBoxMullerFromRng<double>(r1, new[] { 2 }, badSecond));
+        Assert.Equal(0, r1.Calls);
+        var r2 = new SequenceRandom(0.5, 0.25, 0.75, 0.125);
+        Assert.Throws<ArgumentOutOfRangeException>(() => Cpu.TensorGammaFromRng(r2, 2.0, D(new[] { 1.0 }, 1), badSecond));
+        Assert.Equal(0, r2.Calls);
+        var badFirst = new BoxMullerVariant((BoxMullerFirstUniform)9, 0.0, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            Cpu.TensorNormalBoxMullerFromRng<double>(new SequenceRandom(), new[] { 0 }, badFirst));
+    }
+
+    [Fact]
+    public void ScatterRows_BumpsTheTableVersion()
+    {
+        // An in-place write must advance Version (the GPU buffer cache and the tape's saved-tensor check key on it); the
+        // contiguous path wrote through a lease, which does not.
+        var table = Table();
+        int before = table.Version;
+        Cpu.TensorScatterRowsInPlace(table, new Tensor<long>(new[] { 2L }, new[] { 1 }), D(new double[] { 7, 8, 9 }, 1, 3));
+        Assert.Equal(new double[] { 7, 8, 9 }, table.ToArray().Skip(6).Take(3).ToArray());
+        Assert.True(table.Version > before, $"version {table.Version} did not advance past {before}");
+    }
+
+    [Fact]
+    public void LinearFilter_Gradients_LongNumerator_ShortSignal_MatchFiniteDifferences()
+    {
+        // len(b) > len(a), and a signal shorter than the K - 1 = 3 states: the zero-padded feedback taps, the lags past the
+        // signal and the zi entries that never reach an output all take their branch. Central differences (h = 1e-6) of
+        // the forward pass, itself checked against scipy.signal.lfilter above.
+        double[] bv = { 0.4, -0.3, 0.2, 0.15 }, av = { 1.25, -0.5 }, xv = { 0.7, -1.1, 0.3, 0.9 },
+            ziv = { 0.2, -0.1, 0.05, -0.3, 0.25, 0.1 }, wv = { 1.3, -0.6, 0.4, 2.1 };
+        var w = D(wv, 2, 2);
+        double Loss(double[] b, double[] a, double[] x, double[] zi)
+        {
+            var y = Cpu.TensorLinearFilter(D(b, 4), D(a, 2), D(x, 2, 2), D(zi, 2, 3)).ToArray();
+            return y.Select((v, i) => v * wv[i]).Sum();
+        }
+        double[] Numeric(int which)
+        {
+            var arrays = new[] { bv, av, xv, ziv };
+            var g = new double[arrays[which].Length];
+            for (int i = 0; i < g.Length; i++)
+            {
+                var plus = arrays.Select(v => (double[])v.Clone()).ToArray();
+                var minus = arrays.Select(v => (double[])v.Clone()).ToArray();
+                plus[which][i] += 1e-6;
+                minus[which][i] -= 1e-6;
+                g[i] = (Loss(plus[0], plus[1], plus[2], plus[3]) - Loss(minus[0], minus[1], minus[2], minus[3])) / 2e-6;
+            }
+            return g;
+        }
+        var tb = D(bv, 4); var ta = D(av, 2); var tx = D(xv, 2, 2); var tz = D(ziv, 2, 3);
+        Dictionary<Tensor<double>, Tensor<double>> grads;
+        using (var tape = new GradientTape<double>())
+        {
+            var y = Cpu.TensorLinearFilter(tb, ta, tx, tz);
+            grads = tape.ComputeGradients(Cpu.ReduceSum(Cpu.TensorMultiply(y, w), null), new[] { tb, ta, tx, tz });
+        }
+        AssertClose(Numeric(0), grads[tb].ToArray(), 1e-8, "db");
+        AssertClose(Numeric(1), grads[ta].ToArray(), 1e-8, "da");
+        AssertClose(Numeric(2), grads[tx].ToArray(), 1e-8, "dx");
+        AssertClose(Numeric(3), grads[tz].ToArray(), 1e-8, "dzi");
+        // The third state of each signal never reaches an output of length 2.
+        Assert.Equal(0.0, grads[tz].ToArray()[2]);
+        Assert.Equal(0.0, grads[tz].ToArray()[5]);
+    }
+
+    [Fact]
+    public void Cast_SaturatesEveryIntegerType_AtItsExactBounds()
+    {
+        // 2^64, 2^63 and 2^32 are exact doubles and the first values past ulong, long and uint; their predecessors are in
+        // range. NaN is 0 and a negative value is 0 for every unsigned type.
+        var x = D(new[] { 18446744073709551616.0, 18446744073709549568.0, -1.0, double.NaN, 4294967296.0, 4294967295.0,
+            9223372036854775808.0, 65535.7, -32768.9, double.NegativeInfinity }, 10);
+        Assert.Equal(new[] { ulong.MaxValue, 18446744073709549568UL, 0UL, 0UL, 4294967296UL, 4294967295UL,
+            9223372036854775808UL, 65535UL, 0UL, 0UL }, Cpu.TensorCast<double, ulong>(x).ToArray());
+        Assert.Equal(new[] { uint.MaxValue, uint.MaxValue, 0u, 0u, uint.MaxValue, 4294967295u, uint.MaxValue, 65535u, 0u, 0u },
+            Cpu.TensorCast<double, uint>(x).ToArray());
+        Assert.Equal(new[] { long.MaxValue, long.MaxValue, -1L, 0L, 4294967296L, 4294967295L, long.MaxValue, 65535L,
+            -32768L, long.MinValue }, Cpu.TensorCast<double, long>(x).ToArray());
+        Assert.Equal(new ushort[] { 65535, 65535, 0, 0, 65535, 65535, 65535, 65535, 0, 0 },
+            Cpu.TensorCast<double, ushort>(x).ToArray());
+        Assert.Equal(new short[] { 32767, 32767, -1, 0, 32767, 32767, 32767, 32767, -32768, -32768 },
+            Cpu.TensorCast<double, short>(x).ToArray());
+        Assert.Equal(new sbyte[] { 127, 127, -1, 0, 127, 127, 127, 127, -128, -128 }, Cpu.TensorCast<double, sbyte>(x).ToArray());
+        Assert.Throws<OverflowException>(() => Cpu.TensorCast<long, ulong>(new Tensor<long>(new[] { -1L }, new[] { 1 }),
+            RoundingMode.TowardZero, CastOverflowBehavior.Throw));
+        Assert.Equal(new[] { ulong.MaxValue },
+            Cpu.TensorCast<ulong, ulong>(new Tensor<ulong>(new[] { ulong.MaxValue }, new[] { 1 })).ToArray());
+    }
+
     /// <summary>A Random that replays a fixed sequence of NextDouble values (and counts the calls).</summary>
     private sealed class SequenceRandom : Random
     {
