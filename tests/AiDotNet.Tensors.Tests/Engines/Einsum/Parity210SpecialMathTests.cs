@@ -39,6 +39,22 @@ public class Parity210SpecialMathTests
     }
 
     [Fact]
+    public void Digamma_Double_IsAccurateToMachinePrecision()
+    {
+        // In double, ψ must match scipy.special.psi to ~1e-15. The asymptotic series is applied at x >= 6; cut after
+        // its 1/252 term it is off by the next term, 1/(240 x^8), about 2.5e-9 there - and every small argument is
+        // shifted up to x >= 6, so ψ(1) through ψ(5) all carried that error. Euler-Mascheroni to 16 digits:
+        const double EulerGamma = 0.5772156649015329;
+        var x = new Tensor<double>(new[] { 1.0, 3.0, 5.5, 100.0 }, new[] { 4 });
+        var r = E.TensorDigamma(x);
+        Assert.Equal(-EulerGamma, r[0], 14);
+        Assert.Equal(1.5 - EulerGamma, r[1], 14);
+        // scipy.special.psi(5.5) = 1.6110931485817511, psi(100.0) = 4.600161852738087
+        Assert.Equal(1.6110931485817511, r[2], 14);
+        Assert.Equal(4.600161852738087, r[3], 14);
+    }
+
+    [Fact]
     public void Lgamma_LargeX_AgreesWithDirectLog()
     {
         // For x = 10, Γ(10) = 362880; log should be ~log(362880) ≈ 12.80.

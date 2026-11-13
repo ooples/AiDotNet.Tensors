@@ -9842,7 +9842,8 @@ internal static partial class BackwardFunctions<T>
             while (xd < 6.0) { shift -= 1.0 / xd; xd += 1.0; }
             double inv = 1.0 / xd; double inv2 = inv * inv;
             double series = System.Math.Log(xd) - 0.5 * inv
-                - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 / 252.0));
+                - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0
+                    - inv2 * (1.0 / 132.0 - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))));
             dX[i] = ops.Multiply(dY[i], ops.FromDouble(shift + series));
         }
         DifferentiableOps.AccumulateGrad(grads, x, gX, engine);

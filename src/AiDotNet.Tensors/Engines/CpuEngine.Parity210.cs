@@ -4690,7 +4690,8 @@ public partial class CpuEngine
             double xinv = 1.0 / xd;
             double xinv2 = xinv * xinv;
             acc += System.Math.Log(xd) - 0.5 * xinv
-                     - xinv2 * (1.0 / 12.0 - xinv2 * (1.0 / 120.0 - xinv2 / 252.0));
+                     - xinv2 * (1.0 / 12.0 - xinv2 * (1.0 / 120.0 - xinv2 * (1.0 / 252.0 - xinv2 * (1.0 / 240.0
+                         - xinv2 * (1.0 / 132.0 - xinv2 * (691.0 / 32760.0 - xinv2 / 12.0))))));
             return ops.FromDouble(acc);
         }, "TensorDigamma");
         DifferentiableOps.RecordUnary("TensorDigamma", result, tensor, BackwardFunctions<T>.DigammaBackward);
