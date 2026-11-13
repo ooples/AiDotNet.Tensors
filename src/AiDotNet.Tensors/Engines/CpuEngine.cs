@@ -409,6 +409,13 @@ public partial class CpuEngine : ITensorLevelEngine
             return Unsafe.As<float, T>(ref result);
         }
 
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Float32 accumulation, rounded once: a Half running sum stops growing at 2048.
+            using var lowLease = vector.LeaseArray();
+            return LowPrecisionFromFloat<T>(LowPrecisionSum(lowLease.Array, 0, vector.Length));
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T sum = numOps.Zero;
 
@@ -428,6 +435,13 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
         {
             throw new ArgumentException($"Vectors must have the same length for dot product. Got lengths {a.Length} and {b.Length}.");
+        }
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            using var aLowLease = a.LeaseArray();
+            using var bLowLease = b.LeaseArray();
+            return LowPrecisionFromFloat<T>(LowPrecisionDot(aLowLease.Array, 0, bLowLease.Array, 0, a.Length));
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -457,6 +471,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var bSpan = bSpanLease.Span;
         int len = a.Length;
         int bLen = b.Length;
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            float lowAcc = 0f;
+            for (int i = 0; i < len; i++)
+            {
+                int bIdx = bOffset + i * bStride;
+                if (bIdx >= 0 && bIdx < bLen) lowAcc += LowPrecisionToFloat(aSpan[i]) * LowPrecisionToFloat(bSpan[bIdx]);
+            }
+            return LowPrecisionFromFloat<T>(lowAcc);
+        }
 
         for (int i = 0; i < len; i++)
         {
@@ -750,6 +775,12 @@ public partial class CpuEngine : ITensorLevelEngine
     public T Norm<T>(Vector<T> vector)
     {
         if (vector == null) throw new ArgumentNullException(nameof(vector));
+        if (IsLowPrecisionFloat<T>())
+        {
+            using var lowLease = vector.LeaseArray();
+            var lowData = lowLease.Array;
+            return LowPrecisionFromFloat<T>((float)Math.Sqrt(LowPrecisionDot(lowData, 0, lowData, 0, vector.Length)));
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         T sumSquares = numOps.Zero;
         for (int i = 0; i < vector.Length; i++)
@@ -1723,6 +1754,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(matrix.Rows);
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Float32 products and sums, each output rounded once.
+            int rows = matrix.Rows, columns = matrix.Columns;
+            var matrixData = matrix.AsMemory().ToArray();
+            using var vectorLease = vector.LeaseArray();
+            var lowOut = new T[rows];
+            for (int i = 0; i < rows; i++)
+                lowOut[i] = LowPrecisionFromFloat<T>(LowPrecisionDot(matrixData, i * columns, vectorLease.Array, 0, columns));
+            return new Vector<T>(lowOut);
+        }
 
         for (int i = 0; i < matrix.Rows; i++)
         {
@@ -3049,8 +3092,22 @@ public partial class CpuEngine : ITensorLevelEngine
             // matmul (e.g. per-token Q·K^T at 197×64×197 = ~12K FMAs
             // per row, ~2.5M total) below grain size runs serial.
             long mmGenericWork = (long)m * n * k;
+            bool lowPrecisionMm = IsLowPrecisionFloat<T>();
             Helpers.CpuParallelSettings.ParallelForOrSerial(0, m, mmGenericWork, i =>
             {
+                if (lowPrecisionMm)
+                {
+                    // Half/BFloat16: float32 products and sums, each output rounded once.
+                    for (int j = 0; j < n; j++)
+                    {
+                        float acc = 0f;
+                        for (int p = 0; p < k; p++)
+                            acc += LowPrecisionToFloat(aDataArr[aOff + i * aStride0 + p * aStride1])
+                                * LowPrecisionToFloat(bDataArr[bOff + p * bStride0 + j * bStride1]);
+                        rDataArr[i * n + j] = LowPrecisionFromFloat<T>(acc);
+                    }
+                    return;
+                }
                 for (int j = 0; j < n; j++)
                 {
                     T sum = numOps.Zero;
@@ -8980,6 +9037,21 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceSum", tensor._shape); if (ac is not null) return ac.Execute(); }
+
+        // Half/BFloat16: accumulate in float32 and round each sum once (a Half running sum stops growing at 2048).
+        // Full reductions go through TensorSum below, which already accumulates them in float32.
+        if (IsLowPrecisionFloat<T>() && axes != null && axes.Length > 0)
+        {
+            var lowAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
+            var lowShape = LowPrecisionReducedShape(tensor._shape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            var lowResult = TensorAllocator.Rent<T>(lowShape,
+                LowPrecisionAxisSum(tensor.GetFlattenedData(), tensor._shape, lowAxes, lowSize, squares: false, squareRoot: false));
+            DifferentiableOps.RecordUnary("ReduceSum", lowResult, tensor, BackwardFunctions<T>.ReduceSumBackward,
+                new object[] { lowAxes, keepDims });
+            return lowResult;
+        }
 
         // Stride-aware: for single-axis reduction on non-contiguous views, use direct stride math
         if (!tensor.IsContiguous && axes != null && axes.Length == 1)
@@ -25274,6 +25346,16 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axis; i++) outerSize *= input._shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= input._shape[i];
 
+        // Half/BFloat16: max, exponentials, their sum and the division in float32, each output rounded once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowResult = TensorAllocator.Rent<T>(input._shape,
+                LowPrecisionSoftmax(input.GetFlattenedData(), outerSize, axisSize, innerSize, LowPrecisionSoftmaxForm.Softmax));
+            DifferentiableOps.RecordUnary("Softmax", lowResult, inputOrig, BackwardFunctions<T>.SoftmaxBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = inputOrig; int ax = axis; AutoTracer.RecordOp("Softmax", lowResult, eng => eng.Softmax(c, ax), paramHash: ax); }
+            return lowResult;
+        }
+
         // Fast SIMD path for float when softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
@@ -40699,6 +40781,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = axis + 1; i < tensor._shape.Length; i++) innerSize *= tensor._shape[i];
 
+        // Half/BFloat16: float32 running sum, each prefix rounded once (a Half running sum stops growing at 2048).
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowResult = TensorAllocator.Rent<T>(tensor._shape,
+                LowPrecisionCumSum(tensor.GetFlattenedData(), outerSize, axisSize, innerSize));
+            DifferentiableOps.RecordUnary("TensorCumSum", lowResult, tensorOrig, BackwardFunctions<T>.CumSumBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("TensorCumSum", lowResult, eng => eng.TensorCumSum(c, ca)); }
+            return lowResult;
+        }
+
         // Float fast path for 1D (common case). Uses the SIMD Sklansky
         // prefix-sum from Simd.ScanKernels when AVX2 is available, 8x the
         // scalar throughput on bandwidth-limited 1-D cumsum.
@@ -40837,6 +40929,28 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Normalize axis
         if (axis < 0) axis = tensor._shape.Length + axis;
+
+        // Half/BFloat16: max-shift, exponentials, their sum and the log in float32, each output rounded once. The
+        // reduced dim is kept for the recorded backward (it broadcasts the output against the input) and squeezed by
+        // a recorded reshape.
+        if (IsLowPrecisionFloat<T>())
+        {
+            if (axis < 0 || axis >= tensor.Rank)
+                throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for rank {tensor.Rank}");
+            var lowInput = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            int lowOuter = 1, lowInner = 1;
+            for (int d = 0; d < axis; d++) lowOuter *= tensor._shape[d];
+            for (int d = axis + 1; d < tensor.Rank; d++) lowInner *= tensor._shape[d];
+            var keptShape = (int[])tensor._shape.Clone();
+            keptShape[axis] = 1;
+            var lse = TensorAllocator.Rent<T>(keptShape,
+                LowPrecisionLogSumExp(lowInput.GetFlattenedData(), lowOuter, tensor._shape[axis], lowInner));
+            DifferentiableOps.RecordUnary("LogSumExp", lse, tensor, BackwardFunctions<T>.LogSumExpBackward, new object[] { axis });
+            if (keepDims) return lse;
+            var squeezed = new List<int>(tensor.Rank);
+            for (int d = 0; d < tensor.Rank; d++) if (d != axis) squeezed.Add(tensor._shape[d]);
+            return Reshape(lse, squeezed.ToArray());
+        }
 
         // Compute max along axis for numerical stability
         var maxVals = ReduceMax(tensor, new[] { axis }, keepDims: true, out _);
@@ -41801,6 +41915,23 @@ public partial class CpuEngine : ITensorLevelEngine
                     (eng, output) => { var r = eng.TensorNorm(captured, capAxis, capKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.NormBackward, new object[] { capAxis });
             }
+        }
+
+        // Half/BFloat16: squares summed in float32, square-rooted and rounded once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            int lowAxis = axis < 0 ? tensor.Rank + axis : axis;
+            if (lowAxis < 0 || lowAxis >= tensor.Rank)
+                throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for rank {tensor.Rank}");
+            var lowAxes = new[] { lowAxis };
+            var lowShape = LowPrecisionReducedShape(tensor._shape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            var normResult = TensorAllocator.Rent<T>(lowShape,
+                LowPrecisionAxisSum(tensor.GetFlattenedData(), tensor._shape, lowAxes, lowSize, squares: true, squareRoot: true));
+            DifferentiableOps.RecordUnary("Norm", normResult, tensor, BackwardFunctions<T>.NormBackward, new object[] { lowAxis });
+            if (AutoTracer.ShouldRecord) { var c = tensor; var ca = lowAxis; var ck = keepDims; AutoTracer.RecordOp("Norm", normResult, eng => eng.TensorNorm(c, ca, ck)); }
+            return normResult;
         }
 
         // Float fast path for 2D L2 norm along axis: fused sum(x²) + sqrt per row/col
@@ -42996,6 +43127,17 @@ public partial class CpuEngine : ITensorLevelEngine
         int outerSize = 1, axisSize = tensor._shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= tensor._shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= tensor._shape[i];
+
+        // Half/BFloat16: the log-sum-exp denominator is accumulated in float32, each output rounded once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowResult = TensorAllocator.Rent<T>(tensor._shape,
+                LowPrecisionSoftmax(tensor.GetFlattenedData(), outerSize, axisSize, innerSize, LowPrecisionSoftmaxForm.LogSoftmax));
+            DifferentiableOps.RecordUnary("LogSoftmax", lowResult, tensorOrig,
+                BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
+            if (AutoTracer.ShouldRecord) { var c = tensorOrig; var ca = axis; AutoTracer.RecordOp("LogSoftmax", lowResult, eng => eng.TensorLogSoftmax(c, ca)); }
+            return lowResult;
+        }
 
         // Fast SIMD path for float when log_softmax is on the last axis (innerSize==1)
         if (typeof(T) == typeof(float) && innerSize == 1)
@@ -54802,6 +54944,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Tensor<T>(input._shape);
         // Empty rows have nothing to normalize (the row max would read element 0 of an empty row).
         if (cols == 0) return result;
+
+        if (IsLowPrecisionFloat<T>())
+        {
+            var lowInput = input.IsContiguous ? input : input.Contiguous();
+            return TensorAllocator.Rent<T>(input._shape,
+                LowPrecisionSoftmax(lowInput.GetFlattenedData(), rows, cols, 1, LowPrecisionSoftmaxForm.Softmax));
+        }
 
         for (int r = 0; r < rows; r++)
         {
