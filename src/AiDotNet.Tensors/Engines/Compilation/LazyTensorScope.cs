@@ -336,6 +336,13 @@ internal sealed class LazyTensorScope : IDisposable
             backwardFn: backwardFn,
             savedState: savedState,
             externalPrerequisite: prevProducer);
+        // Every node that read the target since its prior producer must run before this write.
+        long since = prevProducer?.RecordOrder ?? 0;
+        var readers = new List<ILazyNode>();
+        foreach (var recorded in _nodes)
+            if (recorded is LazyNode<T> reader && reader.RecordOrder > since && !reader.WritesInPlace && reader.Reads(target))
+                readers.Add(reader);
+        node.SetEarlierReaders(readers.ToArray());
         target.LazySource = node;
         AddNode(node);
     }
@@ -419,6 +426,9 @@ internal sealed class LazyTensorScope : IDisposable
     /// <summary>Gets all recorded nodes (for graph compiler).</summary>
     internal IReadOnlyList<ILazyNode> Nodes => _nodes;
 
+    // Process-wide, so record order also holds between nodes of nested or successive traces.
+    private static long s_recordOrder;
+
     private void AddNode(ILazyNode node)
     {
         // Acquire ownership before publishing the node. A composite is free to dispose a
@@ -426,6 +436,7 @@ internal sealed class LazyTensorScope : IDisposable
         // hold an independent storage reference from the moment the node becomes visible.
         node.AddStorageLeases(_storageLeases);
         node.RecordingEngine = _engine;
+        node.RecordOrder = System.Threading.Interlocked.Increment(ref s_recordOrder);
         _nodes.Add(node);
     }
 

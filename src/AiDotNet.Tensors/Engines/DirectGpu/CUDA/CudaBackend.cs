@@ -363,29 +363,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (buffer.DetachForPool() is { } lease) _bufferPool.Return(lease);
     }
 
-    private static readonly bool s_memsetTrace = Environment.GetEnvironmentVariable("AIDN_MEMSET_TRACE") == "1"; // TEMP DIAG
-    private static readonly Dictionary<string, int> s_memsetSites = new(); // TEMP DIAG
-    private static void MemsetTraceNote() // TEMP DIAG
-    {
-        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
-        var parts = new List<string>();
-        foreach (var f in frames)
-        {
-            var m = f.GetMethod();
-            if (m?.DeclaringType is not { } t) continue;
-            string n = t.FullName ?? t.Name;
-            if (n.Contains("CudaBackend") || n.StartsWith("System.") || m.Name.Contains("Allocat")) continue;
-            parts.Add(t.Name + "." + m.Name);
-            if (parts.Count == 4) break;
-        }
-        var key = string.Join(" < ", parts);
-        lock (s_memsetSites)
-        {
-            if (s_memsetSites.Count == 0)
-                AppDomain.CurrentDomain.ProcessExit += (_, _) => { foreach (var kv in s_memsetSites.OrderByDescending(e => e.Value).Take(30)) Console.Error.WriteLine($"[memset] {kv.Value,5} {kv.Key}"); };
-            s_memsetSites[key] = s_memsetSites.TryGetValue(key, out var c) ? c + 1 : 1;
-        }
-    }
 
     // The training-step arena (CudaStepArena), created on first use. Null outside a step, during a capture, and for
     // allocations a captured graph or another stream owns.
@@ -2180,7 +2157,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
-        if (s_memsetTrace && TrainingStep.Current == 4) MemsetTraceNote(); // TEMP DIAG
         var arena = StepArenaForThisAllocation();
         if (arena?.TryRent(size) is { } slot)
         {

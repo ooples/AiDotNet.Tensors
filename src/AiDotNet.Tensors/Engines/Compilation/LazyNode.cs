@@ -52,6 +52,27 @@ internal sealed class LazyNode<T> : ILazyNode
     // ═══ Graph metadata ═══
     public bool IsRealized { get; set; }
     public int TopologicalIndex { get; set; } = -1;
+    public long RecordOrder { get; set; }
+    public bool WritesInPlace => ReferenceEquals(Input0, Output);
+    public ILazyNode? PriorWriter => WritesInPlace ? _externalPrerequisite : null;
+
+    // An in-place write's earlier readers of its target (recorded after the target's prior producer): the write must
+    // run after them, or a reader scheduled later would see the updated value (write-after-read).
+    private ILazyNode[]? _earlierReaders;
+
+    internal void SetEarlierReaders(ILazyNode[] readers) => _earlierReaders = readers.Length == 0 ? null : readers;
+
+    /// <summary>Whether <paramref name="tensor"/> is one of the node's inputs.</summary>
+    internal bool Reads(Tensor<T> tensor)
+    {
+        if (ReferenceEquals(Input0, tensor) || ReferenceEquals(Input1, tensor) || ReferenceEquals(Input2, tensor)) return true;
+        if (InputsOverflow is not null)
+            foreach (var input in InputsOverflow)
+                if (ReferenceEquals(input, tensor)) return true;
+        return false;
+    }
+
+    private ILazyNode? ProducerOf(Tensor<T>? input) => LazyNodeOrder.ProducerAsOf(input?.LazySource as ILazyNode, RecordOrder);
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
@@ -157,8 +178,20 @@ internal sealed class LazyNode<T> : ILazyNode
             // Ensure inputs are realized first
             RealizeInputs(engine);
 
-            // Execute the operation
-            Execute(engine, Output);
+            // Execute the operation, each input showing the producer it had when this node was recorded: a read of
+            // an input auto-realizes its LazySource, which for a tensor updated in place later in the trace is that
+            // later write. Realizing this node (an eager op reading its output mid-trace) then ran the write early,
+            // and the compiled plan ran it again: an MoE's selection-bias nudge landed twice in the first step.
+            var shown = ShowInputsAsRecorded();
+            try
+            {
+                Execute(engine, Output);
+            }
+            finally
+            {
+                if (shown is not null)
+                    foreach (var (input, latest) in shown) input.LazySource = latest;
+            }
         }
         catch
         {
@@ -170,6 +203,30 @@ internal sealed class LazyNode<T> : ILazyNode
         {
             GraphMode.SetCurrent(savedScope);
         }
+    }
+
+    // Points every input whose LazySource is a write recorded after this node back at its producer as of this node;
+    // returns what to restore (null when nothing moved, the common case).
+    private List<(Tensor<T> Input, ILazyNode? Latest)>? ShowInputsAsRecorded()
+    {
+        List<(Tensor<T>, ILazyNode?)>? shown = null;
+        void Show(Tensor<T>? input)
+        {
+            if (input is null || ReferenceEquals(input, Output) || input.LazySource is not { } latest) return;
+            var asOf = ProducerOf(input);
+            if (ReferenceEquals(asOf, latest)) return;
+            if (shown is not null)
+                foreach (var (seen, _) in shown)
+                    if (ReferenceEquals(seen, input)) return;
+            (shown ??= new()).Add((input, latest));
+            input.LazySource = asOf;
+        }
+        Show(Input0);
+        Show(Input1);
+        Show(Input2);
+        if (InputsOverflow is not null)
+            foreach (var input in InputsOverflow) Show(input);
+        return shown;
     }
 
     private void RealizeInputs(IEngine engine)
@@ -186,12 +243,16 @@ internal sealed class LazyNode<T> : ILazyNode
         // EARLIER op in an in-place chain that is a LATER node, so following it
         // would recurse into a not-yet-realized successor. Skip it.
         bool input0IsInPlaceTarget = ReferenceEquals(Input0, Output);
-        if (!input0IsInPlaceTarget && Input0.LazySource is ILazyNode n0 && !n0.IsRealized && !ReferenceEquals(n0, this)) n0.Realize(engine);
-        if (Input1?.LazySource is ILazyNode n1 && !n1.IsRealized && !ReferenceEquals(n1, this)) n1.Realize(engine);
-        if (Input2?.LazySource is ILazyNode n2 && !n2.IsRealized && !ReferenceEquals(n2, this)) n2.Realize(engine);
+        if (!input0IsInPlaceTarget && ProducerOf(Input0) is { IsRealized: false } n0 && !ReferenceEquals(n0, this)) n0.Realize(engine);
+        if (ProducerOf(Input1) is { IsRealized: false } n1 && !ReferenceEquals(n1, this)) n1.Realize(engine);
+        if (ProducerOf(Input2) is { IsRealized: false } n2 && !ReferenceEquals(n2, this)) n2.Realize(engine);
         if (InputsOverflow != null)
             foreach (var inp in InputsOverflow)
-                if (inp.LazySource is ILazyNode n && !n.IsRealized && !ReferenceEquals(n, this)) n.Realize(engine);
+                if (ProducerOf(inp) is { IsRealized: false } n && !ReferenceEquals(n, this)) n.Realize(engine);
+        // A write realizes the target's earlier readers first, so they read the value before it.
+        if (_earlierReaders is not null)
+            foreach (var reader in _earlierReaders)
+                if (!reader.IsRealized && !ReferenceEquals(reader, this)) reader.Realize(engine);
     }
 
     /// <summary>The prior producer of an in-place target (see <c>_externalPrerequisite</c>), or null.</summary>
@@ -215,12 +276,15 @@ internal sealed class LazyNode<T> : ILazyNode
         // in-place chain from the compiled plan. The dropped EMA never executes,
         // leaving the persistent running-stat tensor stale (BatchNorm clone bug).
         bool input0IsInPlaceTarget = ReferenceEquals(Input0, Output);
-        if (!input0IsInPlaceTarget && Input0.LazySource is ILazyNode n0 && !ReferenceEquals(n0, this)) nodes.Add(n0);
-        if (Input1?.LazySource is ILazyNode n1 && !ReferenceEquals(n1, this)) nodes.Add(n1);
-        if (Input2?.LazySource is ILazyNode n2 && !ReferenceEquals(n2, this)) nodes.Add(n2);
+        if (!input0IsInPlaceTarget && ProducerOf(Input0) is { } n0 && !ReferenceEquals(n0, this)) nodes.Add(n0);
+        if (ProducerOf(Input1) is { } n1 && !ReferenceEquals(n1, this)) nodes.Add(n1);
+        if (ProducerOf(Input2) is { } n2 && !ReferenceEquals(n2, this)) nodes.Add(n2);
         if (InputsOverflow != null)
             foreach (var inp in InputsOverflow)
-                if (inp.LazySource is ILazyNode n && !ReferenceEquals(n, this)) nodes.Add(n);
+                if (ProducerOf(inp) is { } n && !ReferenceEquals(n, this)) nodes.Add(n);
+        if (_earlierReaders is not null)
+            foreach (var reader in _earlierReaders)
+                if (!ReferenceEquals(reader, this)) nodes.Add(reader);
         return nodes.ToArray();
     }
 

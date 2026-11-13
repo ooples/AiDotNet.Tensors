@@ -642,8 +642,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // not. Batches are fed through AsWritableSpan, which by contract does not bump the GPU-cache version, so after
         // a failed capture the eager step kept reading the pre-pass batch as current: every later step trained on a
         // stale target (measured: the loss matched MSE(pred(x_t), y_(t-1)) exactly).
-        if (!_graphHasEmbedding)
-            foreach (var leaf in GraphExternalLeaves()) Unbind(leaf);
+        foreach (var leaf in GraphExternalLeaves()) Unbind(leaf);
         _ownedLeafBuffers.Clear();
     }
 
@@ -983,7 +982,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private Engines.DirectGpu.IGraphStepIo? TryCreateStepIo(Engines.DirectGpu.IGpuGraphCapture cb)
     {
-        if (typeof(T) != typeof(float) || _graphHasEmbedding) return null;
+        if (typeof(T) != typeof(float)) return null;
         var leaves = new List<Tensor<T>>();
         var buffers = new List<Engines.DirectGpu.IGpuBuffer>();
         var lengths = new List<int>();
@@ -4198,19 +4197,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool RefreshGraphInputInPlace(Engines.DirectGpu.IGpuGraphCapture cb)
     {
         bool allLive = true;
-        if (!_graphHasEmbedding)
+        // Every caller-fed leaf, embedding-first plans included (their indices refresh separately; the target does not).
+        foreach (var leaf in GraphExternalLeaves())
         {
-            foreach (var leaf in GraphExternalLeaves())
-            {
-                if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
-                if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
-                if (leafBuffer is null) continue;
-                using var leafDataLease = leaf.LeaseArray();
-                var leafData = leafDataLease.Array;
-                if (leafBuffer.Size < leaf.Length) continue;
-                UploadForReplay(cb, (float[])(object)leafData, leafBuffer);
-                leaf._gpuBufferVersion = leaf.GpuCacheVersion;
-            }
+            if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
+            if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
+            if (leafBuffer is null) continue;
+            using var leafDataLease = leaf.LeaseArray();
+            var leafData = leafDataLease.Array;
+            if (leafBuffer.Size < leaf.Length) continue;
+            UploadForReplay(cb, (float[])(object)leafData, leafBuffer);
+            leaf._gpuBufferVersion = leaf.GpuCacheVersion;
         }
         // In-graph embedding design: for an embedding-first plan there is NO float input to refresh (the gather
         // happens on-device inside the captured graph; only the small index buffer is refreshed, via
@@ -4509,8 +4506,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var de = engine as Engines.DirectGpuTensorEngine;
         de?.SetCurrentScratchAction(-1);
         // Pre-pass only (allocation is illegal inside the capture): give every external leaf a stable device buffer
-        // holding its current data, so the captured ops read it through that buffer and replays can refresh it.
-        if (de is not null && !_graphHasEmbedding && !IsCapturing())
+        // holding its current data, so the captured ops read it through that buffer and replays can refresh it. An
+        // embedding-first plan included: its indices refresh through the engine's registered action, but its other
+        // caller-fed tensors (the target) are leaves like any plan's. Skipping them here baked the capture step's
+        // target into the graph, and every replay trained on that one batch's labels.
+        if (de is not null && !IsCapturing())
             foreach (var leaf in GraphExternalLeaves())
             {
                 // EnsureResidentInput reuses any bound buffer with a live-looking handle. A binding this plan did not
@@ -10202,7 +10202,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             .Where(output => !used.Contains(output) && !(output.LazySource is ILazyNode producer && kept.Contains(producer))))
         {
             output.LazySource = null;   // never realized from the removed node again
-            output.TryDropStorageForStreaming();
+            // A view shares its base's storage, which is the base's to drop (streaming drop rejects views outright).
+            if (output.IsContiguous && output._storageOffset == 0 && !output.IsView)
+                output.TryDropStorageForStreaming();
         }
     }
     /// <summary>

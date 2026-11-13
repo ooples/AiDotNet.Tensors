@@ -55,7 +55,6 @@ internal sealed class CudaStepArena
 
     /// <summary>Slots handed out, pool fallbacks and replans, for tests and diagnostics.</summary>
     internal long SlotHits, PoolFallbacks;
-    internal long DiagNoSlot, DiagSelfLive, DiagConflict, DiagConflictEarlier; // TEMP DIAG
     internal int Replans => _replans;
     internal long PlannedBytes => _plan?.Bytes ?? 0;
 
@@ -132,32 +131,12 @@ internal sealed class CudaStepArena
     {
         if (_pendingRecord < 0) return;
         lock (_lock) _recorded[buffer] = _pendingRecord;
-        if (s_trace) _site[buffer] = Site(); // TEMP DIAG
         _pendingRecord = -1;
     }
 
     /// <summary>A pool buffer is going back: if recorded this step, that is the end of its lifetime.</summary>
-    private readonly Dictionary<CudaBackend.CudaGpuBuffer, int> _late = new(Autodiff.ReferenceEqualityComparer<CudaBackend.CudaGpuBuffer>.Instance); // TEMP DIAG
-    private int _lateShown; // TEMP DIAG
-    private readonly Dictionary<CudaBackend.CudaGpuBuffer, string> _site = new(Autodiff.ReferenceEqualityComparer<CudaBackend.CudaGpuBuffer>.Instance); // TEMP DIAG
-    private static string Site() // TEMP DIAG
-    {
-        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
-        var parts = new List<string>();
-        foreach (var f in frames)
-        {
-            var m = f.GetMethod();
-            if (m?.DeclaringType is not { } t) continue;
-            string n = t.FullName ?? t.Name;
-            if (n.Contains("CudaBackend") || n.Contains("CudaStepArena") || n.StartsWith("System.")) continue;
-            parts.Add(t.Name + "." + m.Name);
-            if (parts.Count == 6) break;
-        }
-        return string.Join(" < ", parts);
-    }
     internal void OnReturned(CudaBackend.CudaGpuBuffer buffer)
     {
-        if (s_trace) lock (_lock) if (_late.Remove(buffer) && _lateShown++ < 6) Console.Error.WriteLine($"[arena] late return at step {TrainingStep.Current} inStep {TrainingStep.InStep} thread {Environment.CurrentManagedThreadId} :: {Environment.StackTrace}"); // TEMP DIAG
         if (_mode != Mode.Recording) return;
         lock (_lock)
         {
@@ -191,20 +170,17 @@ internal sealed class CudaStepArena
         }
         long offset = plan.Offset[i];
         var block = _block!;
-        if (offset < 0) { PoolFallbacks++; DiagNoSlot++; return null; }
-        if (Volatile.Read(ref block.SlotLive[i])) { PoolFallbacks++; DiagSelfLive++; return null; }
+        if (offset < 0 || Volatile.Read(ref block.SlotLive[i])) { PoolFallbacks++; return null; }
         foreach (int j in plan.Conflicts[i])
-            if (Volatile.Read(ref block.SlotLive[j])) { PoolFallbacks++; DiagConflict++; if (j < i) DiagConflictEarlier++; return null; }   // outlived its recorded lifetime
+            if (Volatile.Read(ref block.SlotLive[j])) { PoolFallbacks++; return null; }   // outlived its recorded lifetime
         block.SlotLive[i] = true;
         Interlocked.Increment(ref block.Live);
         SlotHits++;
         return CudaBackend.CudaGpuBuffer.ForArenaSlot(_context, new IntPtr(block.Ptr.ToInt64() + offset), size, block, i);
     }
 
-    private static readonly bool s_trace = Environment.GetEnvironmentVariable("AIDN_ARENA_TRACE") == "1"; // TEMP DIAG
     private void BeginStep(int step)
     {
-        if (s_trace) Console.Error.WriteLine($"[arena] step {step} mode {_mode} hits {SlotHits} fallbacks {PoolFallbacks} replans {_replans} next {_next}/{_plan?.Size.Length} plan {PlannedBytes} rec {_sizes.Count} aborted {_aborted} noslot {DiagNoSlot} selflive {DiagSelfLive} conflict {DiagConflict} earlier {DiagConflictEarlier} blocklive {_block?.Live}"); // TEMP DIAG
         _step = step;
         FreeRetiredBlocks();
         switch (_mode)
@@ -242,7 +218,7 @@ internal sealed class CudaStepArena
 
     private void BuildPlan()
     {
-        lock (_lock) { if (s_trace) foreach (var kv in _recorded) _late[kv.Key] = kv.Value; Console.Error.WriteLine($"[arena] not returned in recorded step: {_recorded.Count}"); if (s_trace) { var agg = new Dictionary<string, int>(); foreach (var kv in _recorded) { var k = _site.TryGetValue(kv.Key, out var v) ? v : "?"; agg[k] = agg.TryGetValue(k, out var c) ? c + 1 : 1; } foreach (var kv in agg.OrderByDescending(e => e.Value).Take(25)) Console.Error.WriteLine($"[arena] {kv.Value,5} {kv.Key}"); } _recorded.Clear(); }   // still out at the step's end: they stay on the pool
+        lock (_lock) _recorded.Clear();   // still out at the step's end: they stay on the pool
         int n = _sizes.Count;
         var bytes = new long[n];
         var order = new List<int>(n);

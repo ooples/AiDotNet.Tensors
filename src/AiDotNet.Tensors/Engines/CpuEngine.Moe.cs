@@ -82,12 +82,71 @@ public partial class CpuEngine
     }
 
     /// <summary>The fused MoE forward (<see cref="MixtureOfExperts.SwiGluExperts"/>); the host computes in double.</summary>
-    internal virtual Tensor<T> MoeSwiGlu<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
+    internal Tensor<T> MoeSwiGlu<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
         Tensor<T> w2, int topK, int sequences, out Tensor<T> loads)
-        => MoeSwiGluHost(x, scores, bias, w1, w3, w2, topK, sequences, out loads, out _);
+    {
+        // In a compiled training trace the op is one node that re-runs every step: routing, loads and output follow
+        // each step's inputs and the current selection bias. (Run eagerly at trace time instead, it froze into the
+        // plan as a constant - the capture batch's output and loads every step, and no gradient to its inputs.) The
+        // node's backward reads the intermediates its own forward kept that step, so it costs no second forward.
+        var slot = new MoeSavedSlot<T>();
+        if (TryRecordCompiledOp<T, Tensor<T>>("MoeSwiGlu", new[] { x, scores, bias, w1, w3, w2 },
+                eng =>
+                {
+                    var y = (eng as CpuEngine ?? this).MoeSwiGluForward(x, scores, bias, w1, w3, w2, topK, sequences,
+                        keepSaved: true, out slot.Loads, out slot.Saved);
+                    return (y, slot.Loads);
+                },
+                static (eng, fresh, held) => { },
+                out var recorded, out var tracedLoads,
+                backward: (gradOutput, inputs, output, savedState, engine, grads) =>
+                    AccumulateMoeGradients(gradOutput, x, scores, w1, w3, w2, slot.Saved!, engine, grads))
+            && GraphMode.Current is { } scope)
+        {
+            // The loads are a node of their own, downstream of the op: a consumer (the selection-bias update) then
+            // runs after each step's routing and reads that step's loads. As a bare tensor they had no producer in the
+            // graph, so nothing ordered their readers after the op.
+            loads = scope.RecordMaterializedUnary(LazyNodeType.Custom, "MoeSwiGluLoads", recorded,
+                (Tensor<T>)tracedLoads.CloneDeepCopy(),
+                (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, slot.Loads!, output));
+            return recorded;
+        }
+
+        var result = MoeSwiGluForward(x, scores, bias, w1, w3, w2, topK, sequences,
+            keepSaved: DifferentiableOps.IsRecording<T>(), out loads, out var saved);
+        if (saved is not null) RecordMoe(result, x, scores, w1, w3, w2, saved);
+        return result;
+    }
+
+    /// <summary>The intermediates of the latest replay of a recorded MoE node, for that node's backward.</summary>
+    private sealed class MoeSavedSlot<T>
+    {
+        internal MoeSaved? Saved;
+        internal Tensor<T>? Loads;
+    }
+
+    /// <summary>
+    /// The fused MoE forward without recording: returns the output and the loads, and (when <paramref name="keepSaved"/>)
+    /// the intermediates its backward needs. The host computes in double.
+    /// </summary>
+    internal virtual Tensor<T> MoeSwiGluForward<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
+        Tensor<T> w2, int topK, int sequences, bool keepSaved, out Tensor<T> loads, out MoeSaved? saved)
+    {
+        var output = MoeSwiGluHostForward(x, scores, bias, w1, w3, w2, topK, sequences, out loads, out var hostSaved);
+        saved = keepSaved ? hostSaved : null;
+        return output;
+    }
 
     /// <summary>The host forward, also returning what it keeps for the backward.</summary>
     internal Tensor<T> MoeSwiGluHost<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
+        Tensor<T> w2, int topK, int sequences, out Tensor<T> loads, out MoeSaved saved)
+    {
+        var output = MoeSwiGluHostForward(x, scores, bias, w1, w3, w2, topK, sequences, out loads, out saved);
+        RecordMoe(output, x, scores, w1, w3, w2, saved);
+        return output;
+    }
+
+    private Tensor<T> MoeSwiGluHostForward<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
         Tensor<T> w2, int topK, int sequences, out Tensor<T> loads, out MoeSaved saved)
     {
         ValidateMoe(x, scores, bias, w1, w3, w2, topK, sequences, out int n, out int d, out int g, out int f);
@@ -105,9 +164,7 @@ public partial class CpuEngine
             Ids = ids, Gates = gates, Ssum = ssum, Perm = perm, Pos = pos, Ends = ends, H13 = h13, O = o,
         };
         loads = MoeTensor(load, new[] { sequences, g }, ops);
-        var output = MoeTensor(y, new[] { n, d }, ops);
-        RecordMoe(output, x, scores, w1, w3, w2, saved);
-        return output;
+        return MoeTensor(y, new[] { n, d }, ops);
     }
 
     private static void RouteTokensHost(double[] S, double[]? Bv, int n, int g, int topK,
@@ -231,6 +288,18 @@ public partial class CpuEngine
         var outs = new[] { dx, ds, dw1, dw3, dw2 };
         for (int i = 0; i < 5; i++)
             if (DifferentiableOps.IsGradientRequired(inputs[i])) DifferentiableOps.AccumulateGrad(grads, inputs[i], outs[i], engine);
+    }
+
+    // A compiled MoE node's backward: the plan keeps the gradients it needs (the selection bias gets none).
+    private static void AccumulateMoeGradients<T>(Tensor<T> gradOutput, Tensor<T> x, Tensor<T> scores, Tensor<T> w1,
+        Tensor<T> w3, Tensor<T> w2, MoeSaved saved, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var (dx, ds, dw1, dw3, dw2) = ResolveMoeGradEngine(engine, saved).MoeSwiGluGradients(gradOutput, x, w1, w3, w2, saved);
+        DifferentiableOps.AccumulateGrad(grads, x, dx, engine);
+        DifferentiableOps.AccumulateGrad(grads, scores, ds, engine);
+        DifferentiableOps.AccumulateGrad(grads, w1, dw1, engine);
+        DifferentiableOps.AccumulateGrad(grads, w3, dw3, engine);
+        DifferentiableOps.AccumulateGrad(grads, w2, dw2, engine);
     }
 
     private static CpuEngine ResolveMoeGradEngine(IEngine tapeEngine, MoeSaved saved)

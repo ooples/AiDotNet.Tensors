@@ -18875,10 +18875,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return false;
-        var outBuf = output.TryGetGpuBuffer();
-        var tableBuf = embeddingTable.TryGetGpuBuffer() ?? ResolveResidentEmbeddingTable(backend, embeddingTable);
-        if (outBuf is null || tableBuf is null) return false;
         int embeddingDim = embeddingTable.Shape._dims[^1];
+        var tableBuf = embeddingTable.TryGetGpuBuffer() ?? ResolveResidentEmbeddingTable(backend, embeddingTable);
+        // On the resident step (and so in capture) give the output its resident buffer, as the float-index gather does:
+        // declining here sent the int-id gather to the host, which a captured graph cannot replay.
+        var outBuf = output.TryGetGpuBuffer()
+            ?? (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && output.IsContiguous
+                ? GetOrCreateResidentBuffer(backend, output, n * embeddingDim) : null);
+        if (outBuf is null || tableBuf is null) return false;
         if ((long)n * embeddingDim > outBuf.Size) return false;
         if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(indices, n);   // eager: refresh inline
         if (_cachedEmbIndexBuffer is null) return false;

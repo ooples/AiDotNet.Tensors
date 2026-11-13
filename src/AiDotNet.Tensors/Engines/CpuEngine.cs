@@ -38728,7 +38728,15 @@ public partial class CpuEngine : ITensorLevelEngine
                         if (eng is DirectGpuTensorEngine gpuEng)
                         {
                             gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(capturedIndices, n));
-                            if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output)) return;
+                            if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output))
+                            {
+                                // The backward scatters through idxSnap off the resident step: refresh it here too, or
+                                // the GPU gather read this step's tokens while the table gradient went to the trace
+                                // batch's rows (measured: a GPU-compiled int-id plan diverged from the CPU from step 2).
+                                var liveIds = capturedIndices.GetReadOnlyDataArray();
+                                for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveIds[i]);
+                                return;
+                            }
                         }
                         // #1331-for-embeddings: re-read the LIVE indices each replay. The compiled plan is
                         // traced once and replayed across steps; the higher-level Train() loop refreshes the
@@ -38747,7 +38755,12 @@ public partial class CpuEngine : ITensorLevelEngine
                         // reject mutation; asking for write intent here made a pure gather fail
                         // after its first eviction. Keep only the destination writable.
                         var embDataLocal = capturedEmb.GetReadOnlyDataArray();
-                        using var outDataLocalLease = output.LeaseArray();
+                        // Gather into a host tensor and hand it over through CopyResultInto, which drops every device
+                        // copy of the output first. Writing the output's host array in place left its device copy
+                        // from the previous step looking current, so on a GPU engine every consumer kept reading the
+                        // first step's embeddings (measured: an int-id compiled plan diverged from the CPU at step 2).
+                        var gathered = new Tensor<TValue>(output._shape);
+                        using var outDataLocalLease = gathered.LeaseArray();
                         var outDataLocal = outDataLocalLease.Array;
                         for (int i = 0; i < n; i++)
                         {
@@ -38761,6 +38774,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             int dstOff = i * capturedDim;
                             Array.Copy(embDataLocal, srcOff, outDataLocal, dstOff, capturedDim);
                         }
+                        DirectGpuTensorEngine.CopyResultInto(eng, gathered, output);
                     },
                     BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
                     new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim, capturedIndices });

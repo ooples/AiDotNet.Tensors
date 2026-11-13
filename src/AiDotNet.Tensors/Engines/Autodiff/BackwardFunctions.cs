@@ -2193,6 +2193,16 @@ internal static class BackwardFunctions<T>
         var vocabSize = (int)savedState[2];
         var embeddingDim = (int)savedState[3];
 
+        // Resident step (and so every captured replay): scatter through the forward's stable on-device index buffer,
+        // which the plan refreshes before each launch. A host index array here would be uploaded inside the capture
+        // and replayed with the capture step's ids, as the float-index sister path documents.
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deEmb && deEmb.ResidentStepActive
+            && deEmb.TryEmbeddingBackwardResident<T>(gradOutput, indicesData.Length, vocabSize, embeddingDim, inputs[0]._shape) is { } residentTableGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], residentTableGrad, engine);
+            return;
+        }
+
         var indices = new Tensor<long>(indicesData, indicesShape);
 
         // Sparse-grad recording: (gradOutput, indices) is everything a
