@@ -12,6 +12,9 @@ layout(push_constant) uniform PC {
     int phaseTarget;
 };
 #define P210_PI 3.14159265358979323846
+// Phase-gradient magnitude floor: BackwardFunctions.PhaseGradientMagnitudeFloor. DC and the even-length Nyquist bin
+// are real for a real frame, so their phase is piecewise constant (0 or pi) and its gradient is exactly zero.
+const float STFT_BWD_PHASE_FLOOR = 1e-12;
 void main() {
     int idx = int(gl_GlobalInvocationID.x); if (idx >= batch*numFrames*nFft) return;
     int i = idx % nFft; int tmp = idx / nFft; int frame = tmp % numFrames; int b = tmp / numFrames;
@@ -21,7 +24,7 @@ void main() {
     for (int k = 0; k < numFreqs; k++) {
         int bin = specOff + k*numFrames; float g = grad[bin]; float p = phase[bin];
         float cp = cos(p); float sp = sin(p); float sr; float si;
-        if (phaseTarget != 0) { float mg = magnitude[bin]; float r = mg > 1e-12 ? g / mg : 0.0; sr = -r*sp; si = r*cp; }
+        if (phaseTarget != 0) { float mg = magnitude[bin]; float r = (k != 0 && 2 * k != nFft && mg > STFT_BWD_PHASE_FLOOR) ? g / mg : 0.0; sr = -r*sp; si = r*cp; }
         else { sr = g*cp; si = g*sp; }
         float c; float s;
         if (m == 0) { c = 1.0; s = 0.0; }

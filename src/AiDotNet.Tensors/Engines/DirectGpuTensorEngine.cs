@@ -15581,6 +15581,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradWindow = null;
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
+            // A recording deferred scope would run these unrecorded kernels at once, before the recorded work that
+            // produces their inputs, and a replay could not reproduce them: the host adjoint runs instead.
+            || backend is Gpu.RecordingGpuBackend { IsRecording: true, ExecuteWhileRecording: false }
             || window.Length != nFft || nFft <= 0 || hopLength <= 0)
             return false;
 
@@ -15593,17 +15596,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             || magnitude.Length != gradient.Length || phase.Length != gradient.Length)
             return false;
 
-        using var gradBuffer = GetOrAllocateBuffer(backend, gradient);
-        using var magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
-        using var phaseBuffer = GetOrAllocateBuffer(backend, phase);
-        using var waveformBuffer = GetOrAllocateBuffer(backend, waveform);
-        using var windowBuffer = GetOrAllocateBuffer(backend, window);
-        using var frameGradBuffer = AllocateFullyWrittenOutputBuffer(backend, batch * numFrames * nFft);
-        var signalGradBuffer = AllocateFullyWrittenOutputBuffer(backend, waveform.Length);
-        var windowGradBuffer = AllocateFullyWrittenOutputBuffer(backend, nFft);
+        // The kernels are queued when this returns, so every temporary they read is released only after that work
+        // (CUDA's legacy allocator would otherwise hand the memory to another stream while they still use it).
+        OwnedBuffer gradBuffer = default, magnitudeBuffer = default, phaseBuffer = default, waveformBuffer = default,
+            windowBuffer = default, frameGradBuffer = default, signalGradBuffer = default, windowGradBuffer = default;
         bool handedOff = false;
         try
         {
+            gradBuffer = GetOrAllocateBuffer(backend, gradient);
+            magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
+            phaseBuffer = GetOrAllocateBuffer(backend, phase);
+            waveformBuffer = GetOrAllocateBuffer(backend, waveform);
+            windowBuffer = GetOrAllocateBuffer(backend, window);
+            frameGradBuffer = AllocateFullyWrittenOutputBuffer(backend, batch * numFrames * nFft);
+            signalGradBuffer = AllocateFullyWrittenOutputBuffer(backend, waveform.Length);
+            windowGradBuffer = AllocateFullyWrittenOutputBuffer(backend, nFft);
             backend.StftBackwardFrames(gradBuffer.Buffer, magnitudeBuffer.Buffer, phaseBuffer.Buffer, frameGradBuffer.Buffer,
                 batch, nFft, numFrames, numFreqs, phaseTarget ? 1 : 0);
             backend.StftBackwardSignal(frameGradBuffer.Buffer, windowBuffer.Buffer, signalGradBuffer.Buffer,
@@ -15621,11 +15628,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!handedOff)
             {
-                signalGradBuffer.Dispose();
-                windowGradBuffer.Dispose();
+                signalGradBuffer.DisposeAfterQueuedUse(backend);
+                windowGradBuffer.DisposeAfterQueuedUse(backend);
                 gradWaveform = null;
                 gradWindow = null;
             }
+            frameGradBuffer.DisposeAfterQueuedUse(backend);
+            windowBuffer.DisposeAfterQueuedUse(backend);
+            waveformBuffer.DisposeAfterQueuedUse(backend);
+            phaseBuffer.DisposeAfterQueuedUse(backend);
+            magnitudeBuffer.DisposeAfterQueuedUse(backend);
+            gradBuffer.DisposeAfterQueuedUse(backend);
         }
     }
 

@@ -243,19 +243,19 @@ public sealed partial class WebGpuBackend
     }
     public void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget)
     {
-        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
         DispatchNBufferAsync("Audit:StftBackwardFrames", WebGpuAuditKernels.StftBackwardFrames, "main",
             new IGpuBuffer[] { grad, magnitude, phase, frameGrad }, new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(nFft), BitConverter.Int32BitsToSingle(numFrames), BitConverter.Int32BitsToSingle(numFreqs), BitConverter.Int32BitsToSingle(phaseTarget), 0f, 0f, 0f }, __total).GetAwaiter().GetResult();
     }
     public void StftBackwardSignal(IGpuBuffer frameGrad, IGpuBuffer window, IGpuBuffer gradSignal, int batch, int length, int pad, int nFft, int hop, int numFrames)
     {
-        int __total = batch*length; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
         DispatchNBufferAsync("Audit:StftBackwardSignal", WebGpuAuditKernels.StftBackwardSignal, "main",
             new IGpuBuffer[] { frameGrad, window, gradSignal }, new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(length), BitConverter.Int32BitsToSingle(pad), BitConverter.Int32BitsToSingle(nFft), BitConverter.Int32BitsToSingle(hop), BitConverter.Int32BitsToSingle(numFrames), 0f, 0f }, __total).GetAwaiter().GetResult();
     }
     public void StftBackwardWindow(IGpuBuffer frameGrad, IGpuBuffer signal, IGpuBuffer gradWindow, int batch, int length, int pad, int nFft, int hop, int numFrames)
     {
-        int __total = nFft; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
         DispatchNBufferAsync("Audit:StftBackwardWindow", WebGpuAuditKernels.StftBackwardWindow, "main",
             new IGpuBuffer[] { frameGrad, signal, gradWindow }, new float[] { BitConverter.Int32BitsToSingle(batch), BitConverter.Int32BitsToSingle(length), BitConverter.Int32BitsToSingle(pad), BitConverter.Int32BitsToSingle(nFft), BitConverter.Int32BitsToSingle(hop), BitConverter.Int32BitsToSingle(numFrames), 0f, 0f }, __total).GetAwaiter().GetResult();
     }

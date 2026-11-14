@@ -14021,7 +14021,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         var kernel = ResolveParity210Kernel("parity210_stft_backward_frames");
         using var _ = PushContext();
-        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = grad.Handle; IntPtr la1 = magnitude.Handle; IntPtr la2 = phase.Handle; IntPtr la3 = frameGrad.Handle; int la4 = batch; int la5 = nFft; int la6 = numFrames; int la7 = numFreqs; int la8 = phaseTarget;
         void** args = stackalloc void*[9];
@@ -14032,7 +14032,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         var kernel = ResolveParity210Kernel("parity210_stft_backward_signal");
         using var _ = PushContext();
-        int __total = batch*length; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = frameGrad.Handle; IntPtr la1 = window.Handle; IntPtr la2 = gradSignal.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
         void** args = stackalloc void*[9];
@@ -14043,7 +14043,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         var kernel = ResolveParity210Kernel("parity210_stft_backward_window");
         using var _ = PushContext();
-        int __total = nFft; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = frameGrad.Handle; IntPtr la1 = signal.Handle; IntPtr la2 = gradWindow.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
         void** args = stackalloc void*[9];

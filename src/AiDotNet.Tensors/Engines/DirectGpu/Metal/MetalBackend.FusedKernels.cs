@@ -514,7 +514,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_stft_backward_frames");
-        int __total = batch*numFrames*nFft; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -533,7 +533,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_stft_backward_signal");
-        int __total = batch*length; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
@@ -552,7 +552,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         var pipeline = GetParity210Pipeline("parity210_stft_backward_window");
-        int __total = nFft; if (__total <= 0) return;
+        int __total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
         var (tgr, tpg) = pipeline.Calculate1DDispatch(__total);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);

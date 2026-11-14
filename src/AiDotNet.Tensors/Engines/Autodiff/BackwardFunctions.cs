@@ -12796,8 +12796,12 @@ internal static partial class BackwardFunctions<T>
                     }
                     else
                     {
+                        // DC and the even-length Nyquist bin are real for a real frame: their phase is 0 or π,
+                        // piecewise constant, so its gradient is exactly zero. Seeding them from the stored phase
+                        // would turn the rounding of a stored π (sin ≠ 0) into a gradient scaled by 1/|C|.
                         double binMagnitude = numOps.ToDouble(magnitudeData[binIndex]);
-                        double reciprocal = binMagnitude > PhaseGradientMagnitudeFloor
+                        bool realBin = k == 0 || 2 * k == nFft;
+                        double reciprocal = !realBin && binMagnitude > PhaseGradientMagnitudeFloor
                             ? g / binMagnitude
                             : 0.0;
                         seedReal = -reciprocal * sinPhase;

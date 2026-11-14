@@ -4,6 +4,9 @@
 @group(0) @binding(3) var<storage, read_write> frameGrad : array<f32>;
 struct P { batch: i32, nFft: i32, numFrames: i32, numFreqs: i32, phaseTarget: i32 };
 @group(0) @binding(4) var<uniform> pc : P;
+// Phase-gradient magnitude floor: BackwardFunctions.PhaseGradientMagnitudeFloor. DC and the even-length Nyquist bin
+// are real for a real frame, so their phase is piecewise constant (0 or pi) and its gradient is exactly zero.
+const STFT_BWD_PHASE_FLOOR : f32 = 1e-12;
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let idx = i32(gid.x);
   if (idx >= pc.batch * pc.numFrames * pc.nFft) { return; }
@@ -15,7 +18,7 @@ struct P { batch: i32, nFft: i32, numFrames: i32, numFreqs: i32, phaseTarget: i3
     let bin = specOff + k * numFrames; let g = grad[bin]; let p = phase[bin];
     let cp = cos(p); let sp = sin(p); var sr = g * cp; var si = g * sp;
     if (pc.phaseTarget != 0) {
-      let mg = magnitude[bin]; var r = 0.0; if (mg > 1e-12) { r = g / mg; }
+      let mg = magnitude[bin]; var r = 0.0; if (k != 0 && 2 * k != nFft && mg > STFT_BWD_PHASE_FLOOR) { r = g / mg; }
       sr = -r * sp; si = r * cp;
     }
     var c = 0.0; var s = 0.0;

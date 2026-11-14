@@ -1,4 +1,7 @@
 // STFT analysis adjoint (backward of IEngine.STFT): frames, waveform (overlap-add + reflection fold), window.
+// Phase-gradient magnitude floor: BackwardFunctions.PhaseGradientMagnitudeFloor. DC and the even-length Nyquist bin
+// are real for a real frame, so their phase is piecewise constant (0 or pi) and its gradient is exactly zero.
+#define STFT_BWD_PHASE_FLOOR 1e-12f
 extern "C" __global__ void parity210_stft_backward_frames(
     const float* __restrict__ grad, const float* __restrict__ magnitude, const float* __restrict__ phase,
     float* __restrict__ frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget)
@@ -11,7 +14,7 @@ extern "C" __global__ void parity210_stft_backward_frames(
     for (int k = 0; k < numFreqs; k++) {
         int bin = specOff + k*numFrames; float g = grad[bin]; float p = phase[bin];
         float cp = cosf(p); float sp = sinf(p); float sr; float si;
-        if (phaseTarget != 0) { float mg = magnitude[bin]; float r = mg > 1e-12f ? g / mg : 0.0f; sr = -r*sp; si = r*cp; }
+        if (phaseTarget != 0) { float mg = magnitude[bin]; float r = (k != 0 && 2 * k != nFft && mg > STFT_BWD_PHASE_FLOOR) ? g / mg : 0.0f; sr = -r*sp; si = r*cp; }
         else { sr = g*cp; si = g*sp; }
         float c; float s;
         if (m == 0) { c = 1.0f; s = 0.0f; }
