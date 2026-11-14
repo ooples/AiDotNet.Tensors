@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.151.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.150.0...v0.151.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engines:** add data loading, numeric recurrences and generic linalg ([#1720](https://github.com/ooples/AiDotNet.Tensors/issues/1720))
+* **engines:** add portable programs, model ops and higher-order autodiff ([#1722](https://github.com/ooples/AiDotNet.Tensors/issues/1722))
+
+### Features
+
+* **engines:** add data loading, numeric recurrences and generic linalg ([#1720](https://github.com/ooples/AiDotNet.Tensors/issues/1720)) ([3a84eac](https://github.com/ooples/AiDotNet.Tensors/commit/3a84eaceb10887b6a28748e1eecd2f9984906100))
+* **engines:** add portable programs, model ops and higher-order autodiff ([#1722](https://github.com/ooples/AiDotNet.Tensors/issues/1722)) ([fcedf2a](https://github.com/ooples/AiDotNet.Tensors/commit/fcedf2a7f8e9531636e82300a9869fbf8fc76d77))
+* **gpu,moe,routing,ce:** fused SwiGLU MoE, grouped GEMM, sparse routing, detached CE & FP16/BF16 autocast conv across all 6 backends ([#1718](https://github.com/ooples/AiDotNet.Tensors/issues/1718)) ([0e8db6a](https://github.com/ooples/AiDotNet.Tensors/commit/0e8db6a5f2f541234dc4ac8bd28173f68992f3c4))
+* **gpu:** extend buffer pooling, cache release, and on-chip BatchedFFT across all 6 DirectGpu backends ([#1729](https://github.com/ooples/AiDotNet.Tensors/issues/1729)) ([cffdd53](https://github.com/ooples/AiDotNet.Tensors/commit/cffdd534d4c87264cdf5aff7648eb7751c5ab66a))
+
+
+### Bug Fixes
+
+* add both lanes in the double sum-of-squares horizontal sum ([#1733](https://github.com/ooples/AiDotNet.Tensors/issues/1733)) ([6181b58](https://github.com/ooples/AiDotNet.Tensors/commit/6181b588b9d629ff686ea47fa613fe67d13e6bc3))
+* carry the digamma asymptotic series to machine precision in double ([#1732](https://github.com/ooples/AiDotNet.Tensors/issues/1732)) ([58d2094](https://github.com/ooples/AiDotNet.Tensors/commit/58d2094e5bfd159d38c57a32c091ecea67d02a48))
+* correct the bessel i0 family and its gradients ([#1745](https://github.com/ooples/AiDotNet.Tensors/issues/1745)) ([bc892c6](https://github.com/ooples/AiDotNet.Tensors/commit/bc892c6e12b6cfe72fa1e1d93bdd3e88356e67ca))
+* **cuda,opencl,ci:** standalone PTX runtimes share the primary context; drained OpenCL queues report complete; quiet-GPU wait and disk preflight for the 3090 runners ([#1736](https://github.com/ooples/AiDotNet.Tensors/issues/1736)) ([983e640](https://github.com/ooples/AiDotNet.Tensors/commit/983e6401255842841515ba2b42f5046fcf7ca033))
+* **cuda:** make the sm_75 lane pass: fp16 gemm algorithm, cuda headers, honest skips ([#1741](https://github.com/ooples/AiDotNet.Tensors/issues/1741)) ([32fadb1](https://github.com/ooples/AiDotNet.Tensors/commit/32fadb1bf81006c22d58fea0f97c23b2992f94cf))
+* **engines:** accumulate half and bfloat16 reductions and matmul in float32 ([#1735](https://github.com/ooples/AiDotNet.Tensors/issues/1735)) ([b5fe4f6](https://github.com/ooples/AiDotNet.Tensors/commit/b5fe4f6b71bfe290b1fb03d58401dbdd2c35eccb))
+* **gpu:** step-1 host parameter residency and [#1737](https://github.com/ooples/AiDotNet.Tensors/issues/1737) audit fixes ([#1755](https://github.com/ooples/AiDotNet.Tensors/issues/1755)) ([c41f6a6](https://github.com/ooples/AiDotNet.Tensors/commit/c41f6a64077a240518ec8ed93caf51fe688597d0))
+* **hip:** make the MFMA GEMM compile and compute correctly on CDNA, add gfx950 ([#1748](https://github.com/ooples/AiDotNet.Tensors/issues/1748)) ([151f0bf](https://github.com/ooples/AiDotNet.Tensors/commit/151f0bf24ff34bb9a063dfc46949eff03bb6f729))
+* **ptx:** emit a PTX ISA version that can name the target; report why CudaBackend is unavailable ([#1719](https://github.com/ooples/AiDotNet.Tensors/issues/1719)) ([906dd37](https://github.com/ooples/AiDotNet.Tensors/commit/906dd377f1e08f68cbaee1e5177ad8db19f914e1))
+* unwrap the engine in gradient checkpointing so main builds under tens0020 ([#1731](https://github.com/ooples/AiDotNet.Tensors/issues/1731)) ([2c90aed](https://github.com/ooples/AiDotNet.Tensors/commit/2c90aed63b16626e628c0ee316eef147c43ee93e))
+
+
+### Performance
+
+* **gpu,autodiff:** eliminate GPU/CPU sync stalls, LOH churn, and checkpoint VRAM retention across 6 backends ([#1737](https://github.com/ooples/AiDotNet.Tensors/issues/1737)) ([515bf91](https://github.com/ooples/AiDotNet.Tensors/commit/515bf91b070da5b418a3d603f7c97a526053d665))
+* **gpu:** eager TensorNegate allocates nothing on the host ([#1730](https://github.com/ooples/AiDotNet.Tensors/issues/1730)) ([bb8beec](https://github.com/ooples/AiDotNet.Tensors/commit/bb8beec823cfdf81499a4aa66b1e43a3b15eb67f))
+
 ## [0.150.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.149.0...v0.150.0) (2026-11-10)
 
 
