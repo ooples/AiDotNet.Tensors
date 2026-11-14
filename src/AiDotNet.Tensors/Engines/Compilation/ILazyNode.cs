@@ -10,6 +10,9 @@ internal interface ILazyNode
     /// <summary>The operation type for pattern matching during fusion.</summary>
     LazyNodeType OpType { get; }
 
+    /// <summary>The operation's name as recorded (used in diagnostics and objective signatures).</summary>
+    string OpName { get; }
+
     /// <summary>Output tensor shape (computed eagerly during recording).</summary>
     int[] OutputShape { get; }
 
@@ -21,6 +24,20 @@ internal interface ILazyNode
 
     /// <summary>Number of downstream nodes that depend on this node's output.</summary>
     int ConsumerCount { get; set; }
+
+    /// <summary>
+    /// The node's position in the order its trace recorded it (1, 2, ...; 0 for a node no trace recorded, such as one a
+    /// fusion pass built). A node reads each input as it was when the node was recorded: an in-place write recorded
+    /// later is not its producer (see <see cref="LazyNodeOrder.ProducerAsOf"/>).
+    /// </summary>
+    long RecordOrder { get; set; }
+
+    /// <summary>For an in-place write: the producer of its target before the write (null when the target came from
+    /// outside the trace). For any other node: null.</summary>
+    ILazyNode? PriorWriter { get; }
+
+    /// <summary>Whether the node writes one of its inputs in place.</summary>
+    bool WritesInPlace { get; }
 
     /// <summary>
     /// The engine that recorded this node: the scope's bound engine (the one the op was invoked on), stamped when the
@@ -54,4 +71,23 @@ internal interface ILazyNode
 
     /// <summary>Adds every tensor storage structurally retained by this node.</summary>
     void AddStorageLeases(TensorStorageLeaseSet leases);
+}
+
+/// <summary>Resolves a node's producers by record order.</summary>
+internal static class LazyNodeOrder
+{
+    /// <summary>
+    /// The producer a node recorded at <paramref name="order"/> read: <paramref name="latest"/> (the input's current
+    /// <c>LazySource</c>) stepped back past every in-place write recorded after the reader. Without this, a node that
+    /// read a tensor before a later in-place update of it (an MoE reading its selection bias, then the bias nudged
+    /// from the MoE's loads) took the update as its producer: a cycle, and the topological sort dropped every node on
+    /// it from the compiled plan.
+    /// </summary>
+    internal static ILazyNode? ProducerAsOf(ILazyNode? latest, long order)
+    {
+        if (order <= 0) return latest;
+        while (latest is { RecordOrder: > 0, WritesInPlace: true } writer && writer.RecordOrder > order)
+            latest = writer.PriorWriter;
+        return latest;
+    }
 }

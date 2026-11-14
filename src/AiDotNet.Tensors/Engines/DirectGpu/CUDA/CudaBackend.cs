@@ -97,7 +97,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
         }
         int drained = 0;
-        foreach (var peer in peers) drained += peer._bufferPool.DrainAll();
+        foreach (var peer in peers)
+        {
+            peer._stepArena?.FreeRetiredBlocks();
+            drained += peer._bufferPool.DrainAll();
+        }
         return drained;
     }
 
@@ -402,6 +406,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private void ReturnAsyncBuffer(CudaGpuBuffer buffer)
     {
+        _stepArena?.OnReturned(buffer);
         if (_backendStreamCaptureActive)
             buffer.Release();
         else if (buffer.DetachForPool() is { } lease)
@@ -414,8 +419,47 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// </summary>
     private void ReturnPooledBuffer(CudaGpuBuffer buffer)
     {
+        _stepArena?.OnReturned(buffer);
         if (buffer.DetachForPool() is { } lease) _bufferPool.Return(lease);
     }
+
+
+    // The training-step arena (CudaStepArena), created on first use. Null outside a step, during a capture, and for
+    // allocations a captured graph or another stream owns.
+    private CudaStepArena? _stepArena;
+
+    private CudaStepArena? StepArenaForThisAllocation()
+    {
+        if (!CudaStepArena.Enabled || !TrainingStep.InStep || CaptureMemoryPool.Current is not null
+            || IsCapturingOnThisThread || _backendStreamCaptureActive)
+            return null;
+        return _stepArena ??= new CudaStepArena(_cudaContext, _contextGeneration,
+            bytes => AllocDeviceMemoryWithRetry(bytes),
+            FreeArenaBlock);
+    }
+
+    private void FreeArenaBlock(IntPtr ptr)
+    {
+        if (ptr == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting) return;
+        lock (ContextLifecycleLock)
+        {
+            if (_cudaContext == IntPtr.Zero || !IsLiveContext(_cudaContext, _contextGeneration)) return;
+            try
+            {
+                CuBlasNative.cuCtxPushCurrent(_cudaContext);
+                GpuMemoryTracker.OnFree(ptr);
+                CuBlasNative.cuMemFree(ptr); // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                CuBlasNative.cuCtxPopCurrent(out _);
+            }
+            catch
+            {
+                // Suppress disposal errors during context teardown.
+            }
+        }
+    }
+
+    /// <summary>Test hook: this backend's step arena, if one was created.</summary>
+    internal CudaStepArena? StepArenaForTests => _stepArena;
 
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
     {
@@ -1985,6 +2029,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public void FreeBufferDeferred(IGpuBuffer? buffer)
     {
         if (buffer == null) return;
+        if (buffer is CudaGpuBuffer released)
+        {
+            // A step arena slot is reused only by later work on this same stream: its lifetime ends here, in stream
+            // order, not when an event says the GPU has caught up (that would make the plan depend on GPU progress).
+            if (released.IsArenaSlot)
+            {
+                released.Dispose();
+                return;
+            }
+            // Recording: the logical end of this buffer's lifetime, for the same reason.
+            _stepArena?.OnReturned(released);
+        }
         // Stream-ordered buffers (#558 layer 6): cuMemFreeAsync is already ordered after prior stream
         // work, so free immediately — deferring via an event would delay pool reclamation and erase the
         // mid-step reuse that bounds peak. Disposing routes to cuMemFreeAsync (see CudaGpuBuffer.Release).
@@ -2176,6 +2232,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Reclaim event-deferred frees first (#555) — under genuine pressure block on
             // their events so their device memory returns to the pool — then drain the pool.
             DrainDeferredFrees(blockOldest: true);
+            _stepArena?.FreeRetiredBlocks();
             int drained = _bufferPool.DrainAll() + DrainPeerPools();
             // When _asyncAlloc is on, freed stream-ordered allocations are RETAINED in the default mem
             // pool (release threshold maxed for caching), so they show as device free=0 and the legacy
@@ -2227,6 +2284,22 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        var arena = StepArenaForThisAllocation();
+        if (arena?.TryRent(size) is { } slot)
+        {
+            // Same zero-initialised contract as the pool, ordered on _stream after the slot's previous user.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(slot.Handle, 0, (ulong)size * sizeof(float), _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                "cuMemsetD8Async(arena)");
+            return slot;
+        }
+        var allocated = AllocateBufferFromPool(size);
+        if (arena is not null && allocated is CudaGpuBuffer tracked) arena.Track(tracked);
+        return allocated;
+    }
+
+    private IGpuBuffer AllocateBufferFromPool(int size)
+    {
         if (_asyncAlloc)
         {
             if (TryRentAsyncBuffer(size) is { } reused)
@@ -2281,9 +2354,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!_asyncAlloc)
             return AllocateBuffer(size);
         using var _ = PushContext();
-        var buffer = TryRentAsyncBuffer(size)
-            ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
-                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+        var arena = StepArenaForThisAllocation();
+        var buffer = arena?.TryRent(size);
+        if (buffer is null)
+        {
+            buffer = TryRentAsyncBuffer(size)
+                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            arena?.Track(buffer);
+        }
         if (PoisonUninitializedBuffers)
         {
             try
@@ -5575,7 +5654,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 4L * Math.Max(1, ComputeUnits) / outerSize));
             int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
             chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
-            using var partial = AllocateStreamOrderedScratchBuffer(outerSize * chunks);
+            // sum_axis_rows_split writes one partial per (row, chunk) block: the whole buffer.
+            using var partial = AllocateStreamOrderedScratchBufferUninitialized(outerSize * chunks);
             using (PushContext())
             {
                 IntPtr inPtr = A.Handle, partialPtr = partial.Handle;
@@ -14278,13 +14358,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (outerSize <= 0) return;
         if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
             return;
-        if (!_kernelCache.TryGetValue("max_axis", out var kernel))
+        // Long rows: a block per row (a thread per row read each row serially, uncoalesced: 7 ms for 600 rows of 49k).
+        bool rows = reduceSize >= 256 && _kernelCache.ContainsKey("max_axis_rows");
+        if (!_kernelCache.TryGetValue(rows ? "max_axis_rows" : "max_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: max_axis");
 
         using var _ = PushContext();
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = rows ? (uint)outerSize : (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = A.Handle;
         IntPtr bPtr = B.Handle;
         void** args = stackalloc void*[4];
@@ -18547,6 +18630,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
     }
 
+    // Blocks for one 32-lane warp per item (CudaGatedDeltaNetKernels).
+    private static uint GatedDeltaNetWarpGrid(long warps) => (uint)checked((warps * 32 + DefaultBlockSize - 1) / DefaultBlockSize);
+
     // ── Fused Gated DeltaNet scan forward (#1464) ──────────────────────────────────────────
     public unsafe void GatedDeltaNetScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
@@ -18559,16 +18645,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (headDim > Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
-        if (!_kernelCache.TryGetValue("gated_delta_scan_forward", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_forward");
+        string variant = Kernels.CudaGatedDeltaNetKernels.Variant(headDim);
+        if (!_kernelCache.TryGetValue("gated_delta_scan_forward" + variant, out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_forward" + variant);
 
         using var _ = PushContext();
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, pout = output.Handle;
         void** args = stackalloc void*[11];
         args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pa; args[4] = &pb; args[5] = &pout;
         args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim; args[9] = &numHeads; args[10] = &headDim;
-        uint total = (uint)(batch * numHeads * headDim);
-        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+        LaunchKernel(kernel, GatedDeltaNetWarpGrid((long)batch * numHeads * headDim), (uint)DefaultBlockSize, args);
     }
 
     unsafe void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
@@ -18584,17 +18670,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.CudaGatedDeltaNetKernels.MaxHeadDim}).");
         GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
-        if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
-            !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
+        string variant = Kernels.CudaGatedDeltaNetKernels.Variant(headDim);
+        if (!_kernelCache.TryGetValue("gated_delta_scan_recompute" + variant, out var recompute) ||
+            !_kernelCache.TryGetValue("gated_delta_scan_backward" + variant, out var backward))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward" + variant);
 
         using var _ = PushContext();
         // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
         // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
         bool det = GpuDeterminism.IsActive;
         IntPtr dqKernel = IntPtr.Zero, reduceKernel = IntPtr.Zero;
-        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
-                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
+        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq" + variant, out dqKernel)
+                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce" + variant, out reduceKernel)))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
         int n = batch * seqLen * modelDim;
         if (!det)
@@ -18608,9 +18695,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (trajLenL > int.MaxValue)
             throw new ArgumentException("GatedDeltaNet trajectory buffer is too large for a single allocation.");
         int trajLen = (int)trajLenL;
-        using var trajBuf = AllocateBuffer(trajLen);
-        uint total = (uint)(batch * numHeads * headDim);
-        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        // Disposed below and fully written by gated_delta_scan_recompute: uncharged and uninitialized.
+        IGpuBuffer trajScratch;
+        using (DeviceMemoryReclaim.EnterScopedScratch()) trajScratch = AllocateBufferUninitialized(trajLen);
+        using var trajBuf = trajScratch;
+        // A warp per state row (recompute, backward); a warp per (batch, step, head) for dq and reduce.
+        uint grid = GatedDeltaNetWarpGrid((long)batch * numHeads * headDim);
 
         IntPtr pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, ptr = trajBuf.Handle;
         void** ra = stackalloc void*[10];
@@ -18620,8 +18710,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         IntPtr pdo = dOut.Handle, pq = q.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
-        // dq and reduce run one warp per element (32 threads each).
-        uint nGrid = (uint)checked(((long)n * 32 + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint nGrid = GatedDeltaNetWarpGrid((long)batch * seqLen * numHeads);
         using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
         IntPtr pp = partials?.Handle ?? IntPtr.Zero;
         if (det)
@@ -19409,6 +19498,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // have to go back before the pool they came from does.
         DisposeConvScratch();
         _pinnedPool.Dispose();
+        _stepArena?.Dispose();
+        _stepArena = null;
         _bufferPool.Dispose();
 
         // cuDNN helper disposes its workspace + context. Only created if
@@ -20784,7 +20875,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         allocatedDuringCapture = IsCapturingOnThisThread;
         contextGeneration = ContextGenerationOf(context);
-        if (chargeBytes > 0 && !allocatedDuringCapture && !IsRuntimeTearingDown && !ProcessExiting)
+        if (chargeBytes > 0 && !allocatedDuringCapture && !IsRuntimeTearingDown && !ProcessExiting
+            && !DeviceMemoryReclaim.InScopedScratch)
         {
             reclaimCharge = chargeBytes;
             reclaimEpoch = ChargeCudaReclaim(chargeBytes);
@@ -20810,7 +20902,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return false;
     }
 
-    private static void CompleteCudaBufferReclaimOrFinalizer(
+    internal static void CompleteCudaBufferReclaimOrFinalizer(
         long reclaimCharge, long reclaimEpoch,
         IntPtr finalizerPtr, IntPtr context, long contextGeneration, IntPtr asyncFreeStream)
     {
@@ -20867,6 +20959,32 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         /// <summary>Pins this buffer to <paramref name="pool"/>: its releases are parked until the pool retires.</summary>
         internal void PinTo(CaptureMemoryPool pool) => pool.Pin(ref _capturePins, this);
+
+        // A slot of a step arena's block (CudaStepArena): the memory is the arena's. Disposing, releasing or finalizing
+        // the buffer only marks the slot dead; it never goes to the pool or the driver.
+        private CudaStepArena.Block? _arenaBlock;
+        private int _arenaSlot;
+
+        internal bool IsArenaSlot => _arenaBlock is not null;
+
+        internal static CudaGpuBuffer ForArenaSlot(IntPtr context, IntPtr devicePtr, int size, CudaStepArena.Block block, int slot)
+        {
+            var buffer = new CudaGpuBuffer(context, devicePtr, size);
+            buffer._arenaBlock = block;
+            buffer._arenaSlot = slot;
+            return buffer;
+        }
+
+        // Ends an arena slot's lease: Handle reads 0 for every binding that still holds this object.
+        private bool TryEndArenaLease()
+        {
+            if (_arenaBlock is not { } block) return false;
+            if (Interlocked.Exchange(ref _devicePtr, IntPtr.Zero) != IntPtr.Zero)
+                CudaStepArena.OnSlotDead(block, _arenaSlot);
+            _context = IntPtr.Zero;
+            GC.SuppressFinalize(this);
+            return true;
+        }
         internal IntPtr OwningContext => _context;
 
         /// <param name="account">The device's memory counters, for a fresh allocation; null for a pool's new wrapper of
@@ -20943,6 +21061,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
             var latePins = Volatile.Read(ref _capturePins);
             if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, ReleaseCore)) return;
+            if (TryEndArenaLease()) return;
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
@@ -21021,6 +21140,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
             var latePins = Volatile.Read(ref _capturePins);
             if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
+            if (TryEndArenaLease()) return;
             if (_returnToPool == null || _capturedAllocation)
             {
                 ReleaseCore();
@@ -21048,6 +21168,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // 0xC0000005). Defer the device free to a real op thread via the pending-free queue.
             // Atomically CLAIM the pointer: if a concurrent ReleaseCore already took it we get Zero and
             // enqueue nothing, so the pointer is never freed twice (the double-free that crashed the host).
+            if (_arenaBlock is { } block)
+            {
+                // Only marks the slot dead (safe on the finalizer thread): the arena owns the memory.
+                if (Interlocked.Exchange(ref _devicePtr, IntPtr.Zero) != IntPtr.Zero) CudaStepArena.OnSlotDead(block, _arenaSlot);
+                return;
+            }
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
             if (ptr != IntPtr.Zero) _memory.OnFreed();
             CompleteCudaBufferReclaimOrFinalizer(0, -1, ptr, _context, _contextGeneration, _asyncFreeStream);
@@ -21082,7 +21208,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         private void ChargeReclaim(long bytes)
         {
-            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting) return;
+            if (bytes <= 0 || IsCapturingOnThisThread || IsRuntimeTearingDown || ProcessExiting || DeviceMemoryReclaim.InScopedScratch) return;
             _reclaimCharge = bytes;
             _reclaimEpoch = ChargeCudaReclaim(bytes);
         }

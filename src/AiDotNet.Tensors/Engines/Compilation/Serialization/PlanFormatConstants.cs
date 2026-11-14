@@ -46,8 +46,10 @@ internal static class PlanFormatConstants
     /// the tag, so they must reject these plans by version rather than fail on it mid-read.
     /// Version 13 adds TensorFlagExternal tensor-table entries (a reference to a tensor the loader supplies instead of
     /// stored data). Version 12 readers would allocate them as zero tensors, so they must reject these plans by version.
+    /// Version 14 adds the SGD-momentum learning-rate-in-velocity switch (FusedOptimizerExtras.VelocityIncludesLearningRate)
+    /// to the fused-optimizer extras. It selects the update rule, so version 13 plans are rejected rather than read misaligned.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 13;
+    internal const ushort CurrentFormatVersion = 14;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:

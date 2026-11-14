@@ -48,9 +48,13 @@ public sealed class LazyGraphCompilerPerformanceTests
         public StubLazyNode(params ILazyNode[] inputs) => _inputs = inputs;
 
         public LazyNodeType OpType => LazyNodeType.Negate;
+        public string OpName => "Negate";
         public int[] OutputShape { get; } = [1];
         public bool IsRealized { get; set; }
         public int TopologicalIndex { get; set; }
+        public long RecordOrder { get; set; }
+        public ILazyNode? PriorWriter => null;
+        public bool WritesInPlace => false;
         public int ConsumerCount { get; set; }
         public IEngine RecordingEngine { get; set; } = StubEngine;
 

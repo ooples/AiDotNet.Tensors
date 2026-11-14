@@ -25,13 +25,25 @@ internal delegate Tensor<TIn>? CrossTypeBackwardFunction<TIn, TOut>(
 /// <see cref="BackwardFn"/>, the differentiable FP32↔FP16 cast that bridges the two grad spaces in
 /// mixed-precision (#555) training.
 /// </summary>
-internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
+internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNode
 {
+    Type ISignableLazyNode.OutputElementType => typeof(TOut);
+    object ISignableLazyNode.OutputTensor => Output;
+    int ISignableLazyNode.SignatureInputCount => 1;
+    object? ISignableLazyNode.GetSignatureInput(int index) => index == 0 ? Input : null;
+    Delegate ISignableLazyNode.ExecuteDelegate => Execute;
+    Delegate? ISignableLazyNode.BackwardDelegate => BackwardFn;
+    object[]? ISignableLazyNode.SavedStateObjects => SavedState;
+    bool ISignableLazyNode.ReplaysHostStateFlag => false;
+
     public LazyNodeType OpType { get; }
     public string OpName { get; }
     public int[] OutputShape { get; }
     public bool IsRealized { get; set; }
     public int TopologicalIndex { get; set; } = -1;
+    public long RecordOrder { get; set; }
+    public ILazyNode? PriorWriter => null;
+    public bool WritesInPlace => false;
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
@@ -76,6 +88,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
+        if (GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
         IsRealized = true; // Set BEFORE executing to prevent re-entrant recursion
 
         // Issue #238: the Execute delegate re-invokes the engine op (e.g.,
@@ -94,7 +107,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
         try
         {
             // Realize input first if it's also lazy
-            if (Input is { LazySource: ILazyNode inputNode } && !inputNode.IsRealized)
+            if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { IsRealized: false } inputNode)
                 inputNode.Realize(engine);
 
             Execute(engine, Output);
@@ -114,7 +127,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
 
     public ILazyNode[] GetInputNodes()
     {
-        if (Input?.LazySource is ILazyNode node)
+        if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { } node)
             return new[] { node };
         return Array.Empty<ILazyNode>();
     }

@@ -447,6 +447,27 @@ static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TopKWeightedRowMix
 static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TopKWeightedRowMixBackwardWeights<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! table, AiDotNet.Tensors.LinearAlgebra.Tensor<int>! indices) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TopKWeightedRowMixBackwardTable<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! gradOutput, AiDotNet.Tensors.LinearAlgebra.Tensor<int>! indices, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! weights, int numEntries) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.SparseRoutingEngineExtensions.TensorCountIndices<T>(this AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<int>! indices, int numBins) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.StableDecayShape
+AiDotNet.Tensors.Engines.Compilation.StableDecayShape.Cosine = 1 -> AiDotNet.Tensors.Engines.Compilation.StableDecayShape
+AiDotNet.Tensors.Engines.Compilation.StableDecayShape.Linear = 0 -> AiDotNet.Tensors.Engines.Compilation.StableDecayShape
+AiDotNet.Tensors.Engines.Compilation.StableDecayShape.OneMinusSqrt = 2 -> AiDotNet.Tensors.Engines.Compilation.StableDecayShape
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.WarmupStableDecay(double lrMax, int warmupSteps, int decayStartStep, int decaySteps, AiDotNet.Tensors.Engines.Compilation.StableDecayShape shape = AiDotNet.Tensors.Engines.Compilation.StableDecayShape.Linear, double endLr = 0) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+AiDotNet.Tensors.Engines.Compilation.OneCycleAnneal
+AiDotNet.Tensors.Engines.Compilation.OneCycleAnneal.Cosine = 0 -> AiDotNet.Tensors.Engines.Compilation.OneCycleAnneal
+AiDotNet.Tensors.Engines.Compilation.OneCycleAnneal.Linear = 1 -> AiDotNet.Tensors.Engines.Compilation.OneCycleAnneal
+AiDotNet.Tensors.Engines.Compilation.CyclicLrMode
+AiDotNet.Tensors.Engines.Compilation.CyclicLrMode.Triangular = 0 -> AiDotNet.Tensors.Engines.Compilation.CyclicLrMode
+AiDotNet.Tensors.Engines.Compilation.CyclicLrMode.Triangular2 = 1 -> AiDotNet.Tensors.Engines.Compilation.CyclicLrMode
+AiDotNet.Tensors.Engines.Compilation.CyclicLrMode.ExponentialRange = 2 -> AiDotNet.Tensors.Engines.Compilation.CyclicLrMode
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.Polynomial(double lr0, int totalSteps, double power = 1, double endLr = 0) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.MultiStep(double lr0, System.Collections.Generic.IReadOnlyList<int>! milestones, double gamma = 0.1, double minLr = 0) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.TriStage(double lr0, int warmupSteps, int holdSteps, int totalSteps, double minLr = 0, double decayPower = 1) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.NoamHoldAnnealing(double peak, int warmupSteps, int holdSteps, double decayRate) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.CosineWarmRestarts(double lr0, int t0, int tMult = 1, double etaMin = 0) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.OneCycleWithAnneal(double lrMax, int totalSteps, double pctStart = 0.3, double divFactor = 25, double finalDivFactor = 10000, AiDotNet.Tensors.Engines.Compilation.OneCycleAnneal anneal = AiDotNet.Tensors.Engines.Compilation.OneCycleAnneal.Cosine) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.Cyclic(double lrBase, double lrMax, int stepSizeUp, int stepSizeDown, AiDotNet.Tensors.Engines.Compilation.CyclicLrMode mode, double gamma = 1) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.Sequential(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.Compilation.LrSchedule!>! schedules, System.Collections.Generic.IReadOnlyList<int>! milestones) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
+static AiDotNet.Tensors.Engines.Compilation.LrSchedule.CosineAnnealing(double lr0, int tMax, double etaMin = 0) -> AiDotNet.Tensors.Engines.Compilation.LrSchedule!
 static AiDotNet.Tensors.Engines.Autodiff.GradientCheckpointing<T>.CheckpointSegments(System.Collections.Generic.IReadOnlyList<System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!>! functions, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, System.Collections.Generic.IReadOnlyList<System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!>? segmentParameters, int segmentSize = 2, System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, bool>? tryConsumeParameterGradient = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.ApplyRoPEInterleaved<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! cos, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! sin, int startPosition = 0) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TryAccumulateSumOfSquares<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, ref AiDotNet.Tensors.LinearAlgebra.Tensor<T>? scalarAccumulator) -> bool
@@ -569,4 +590,8 @@ override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorGatherRows<T>(AiDo
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorScatterRowsInPlace<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! table, AiDotNet.Tensors.LinearAlgebra.Tensor<long>! rows, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! source) -> void
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLinearFilter<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! x, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? zi = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLinearFilterGuarded<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! x, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? zi, double maxAbs) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.FusedOptimizerExtras.VelocityIncludesLearningRate.get -> bool
+AiDotNet.Tensors.Engines.Compilation.FusedOptimizerExtras.VelocityIncludesLearningRate.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseDeviceActivationsAtLastUse.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseDeviceActivationsAtLastUse.init -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.AmdGpuArchitecture.MI350 = 8 -> AiDotNet.Tensors.Engines.DirectGpu.HIP.AmdGpuArchitecture

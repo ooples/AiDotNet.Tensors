@@ -9,7 +9,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// A compiled GPU plan leases each backward output's scratch for the action that writes it, instead of keeping a buffer
 /// per output for the plan's life. A residual network trained for several SGD steps must reach the same parameters as
-/// the CPU plan with leases on and off, and the leased plan must hold fewer scratch bytes.
+/// the CPU plan with leases on and off, and the leased plan must hold fewer scratch bytes. On a backend with graph
+/// capture the same holds for a plan that captures its step: the graph replays the reuse its recording run made.
 /// </summary>
 [Collection("DirectGpuSerial")]
 public class CompiledGpuScratchLeaseTests
@@ -22,7 +23,7 @@ public class CompiledGpuScratchLeaseTests
         return t;
     }
 
-    private static (float[] Parameters, long ScratchBytes) Train(IEngine engine, int steps)
+    private static (float[] Parameters, long ScratchBytes) Train(IEngine engine, int steps, bool captured = false)
     {
         // Identical residual blocks h += ReLU(BatchNorm(Conv(h))): each convolution's input gradient is the second
         // contribution to h's gradient (the add passes it the first), so it is written to scratch and added, never
@@ -49,9 +50,7 @@ public class CompiledGpuScratchLeaseTests
         using (plan)
         {
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.001f);
-            // A captured step graph bakes in its scratch addresses, so a capturing plan keeps its slots (CUDA captures
-            // by default): both arms run uncaptured, where leasing applies on every backend.
-            if (plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
+            if (!captured && plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
             for (int s = 0; s < steps; s++) plan.Step();
             long bytes = plan is CompiledTrainingPlan<float> compiled ? compiled.ScratchBufferBytes : -1;
             var all = new System.Collections.Generic.List<float>();
@@ -92,6 +91,52 @@ public class CompiledGpuScratchLeaseTests
                 }
                 Assert.True(leased.ScratchBytes > 0 && leased.ScratchBytes < kept.ScratchBytes,
                     $"leased plan holds {leased.ScratchBytes} scratch bytes, kept plan {kept.ScratchBytes}");
+            }
+            finally
+            {
+                CompiledTrainingPlan<float>.LeaseBackwardScratch = previous;
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void Leased_backward_scratch_in_a_captured_step_graph_trains_like_the_cpu_and_holds_fewer_bytes()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true },
+            "The backend does not capture step graphs.");
+        bool previous = CompiledTrainingPlan<float>.LeaseBackwardScratch;
+        using (gpu)
+        {
+            try
+            {
+                // Enough steps that the captured graph replays several times after the warm-up and capture steps.
+                const int steps = 8;
+                var expected = Train(new CpuEngine(), steps).Parameters;
+                CompiledTrainingPlan<float>.LeaseBackwardScratch = false;
+                var kept = Train(gpu, steps, captured: true);
+                CompiledTrainingPlan<float>.LeaseBackwardScratch = true;
+                long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
+                var leased = Train(gpu, steps, captured: true);
+                Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore,
+                    "the leased plan never replayed a captured step graph, so this test did not exercise capture");
+
+                foreach (var (actual, name) in new[] { (kept.Parameters, "kept"), (leased.Parameters, "leased") })
+                {
+                    Assert.Equal(expected.Length, actual.Length);
+                    for (int i = 0; i < expected.Length; i++)
+                        Assert.True(Math.Abs(expected[i] - actual[i]) <= 2e-3f * (1f + Math.Abs(expected[i])),
+                            $"{name} [{i}]: cpu {expected[i]}, gpu {actual[i]}");
+                }
+                Assert.True(leased.ScratchBytes > 0 && leased.ScratchBytes < kept.ScratchBytes,
+                    $"leased captured plan holds {leased.ScratchBytes} scratch bytes, kept plan {kept.ScratchBytes}");
             }
             finally
             {
