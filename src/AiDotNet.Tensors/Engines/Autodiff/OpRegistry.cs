@@ -257,6 +257,12 @@ internal static class OpRegistry
         // Audio element-wise / linear ops — backward wired.
         "Spectrogram", "AmplitudeToDB", "ComputeDeltas", "Resample",
         "ISTFT", "StftPhase",
+        // STFT records one edge per out result (magnitude, phase) whose inputs are the waveform and the window
+        // (BackwardFunctions<T>.StftMagnitudeBackward / StftPhaseOutputBackward), as torch.stft is differentiable.
+        "STFT",
+        // The complex transforms record one edge per out part, each with both input parts as inputs; the backward is
+        // the adjoint transform (BackwardFunctions<T>.FftBackward), as torch.fft.fft/ifft/fft2/ifft2 are differentiable.
+        "FFT", "IFFT", "FFT2D", "IFFT2D",
 
         // Mel spectrogram — |STFT|^2, mel filterbank matmul and the optional dB conversion are
         // all differentiable, so the op records one node with BackwardFunctions<T>.
@@ -419,16 +425,10 @@ internal static class OpRegistry
         // transpose of overlap-add synthesis, derived there in full.
         "GriffinLim",
 
-        // Raw transforms that emit their outputs through `out` parameters. These are
-        // deliberately NOT recorded: they are primitives that the recorded ops above are built
-        // from (Spectrogram and MelSpectrogram call STFT internally and record a single node
-        // with a proper adjoint), and their out-parameter signatures cannot flow through the
-        // Record* helpers, which key on a returned tensor.
-        //
-        // They were previously in NO registry set at all: TapeCompletenessTests only inspected
-        // methods whose RETURN type is a tensor, so nothing ever required them to be classified.
-        // AllTensorOutParameterMethods_AreClassified now closes that hole.
-        "STFT", "FFT", "IFFT", "FFT2D", "IFFT2D", "FFTND",
+        // Ops that write their results into caller tensors. The FFT family and STFT once sat here on the claim that
+        // out-parameter results cannot flow through the Record* helpers, which was false: each out result records as its
+        // own edge. DifferentiableOpsGradCheckSweep.EveryNonDifferentiableOp_HasNoSmoothDerivative finite-differences
+        // every op in this set and fails for one whose output moves smoothly with its input.
         "GroupNormInto", "ProjectGaussians3DTo2D",
 
         // Real/complex conversions (CpuEngine.TorchComplex); TensorAngle of a real input is piecewise constant,

@@ -46516,6 +46516,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        // A training trace records one replayable node per output; each node's backward re-runs this op under a tape.
+        if (TryRecordCompiledOp("FFTReal", new Tensor<T>?[] { inputReal, inputImag },
+                e => { e.FFT(inputReal, inputImag, out Tensor<T> r, out Tensor<T> _); return r; },
+                out var realNode))
+        {
+            if (!TryRecordCompiledOp("FFTImag", new Tensor<T>?[] { inputReal, inputImag },
+                    e => { e.FFT(inputReal, inputImag, out Tensor<T> _, out Tensor<T> i); return i; },
+                    out var imagNode))
+                throw new InvalidOperationException("FFT recorded its real node but not its imaginary node.");
+            outputReal = realNode;
+            outputImag = imagNode;
+            return;
+        }
         if (GraphMode.IsInferenceTrace)
         {
             Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
@@ -46558,7 +46571,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 imagIn[i] = inputImagData[offset + i];
             }
 
-            var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: false);
+            var (realOut, imagOut) = UnnormalizedTransform<T>(realIn, imagIn, inverse: false);
 
             for (int i = 0; i < n; i++)
             {
@@ -46567,6 +46580,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
+        RecordFftTapeEdges("FFT", inputReal, inputImag, outReal, outImag, FftTransform.Forward);
         outputReal = outReal;
         outputImag = outImag;
     }
@@ -46576,6 +46590,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        // A training trace records one replayable node per output; each node's backward re-runs this op under a tape.
+        if (TryRecordCompiledOp("IFFTReal", new Tensor<T>?[] { inputReal, inputImag },
+                e => { e.IFFT(inputReal, inputImag, out Tensor<T> r, out Tensor<T> _); return r; },
+                out var realNode))
+        {
+            if (!TryRecordCompiledOp("IFFTImag", new Tensor<T>?[] { inputReal, inputImag },
+                    e => { e.IFFT(inputReal, inputImag, out Tensor<T> _, out Tensor<T> i); return i; },
+                    out var imagNode))
+                throw new InvalidOperationException("IFFT recorded its real node but not its imaginary node.");
+            outputReal = realNode;
+            outputImag = imagNode;
+            return;
+        }
         if (GraphMode.IsInferenceTrace)
         {
             Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
@@ -46624,7 +46651,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 imagIn[i] = inputImagData[offset + i];
             }
 
-            var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: true);
+            var (realOut, imagOut) = UnnormalizedTransform<T>(realIn, imagIn, inverse: true);
 
             for (int i = 0; i < n; i++)
             {
@@ -46633,6 +46660,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
+        RecordFftTapeEdges("IFFT", inputRealOrig, inputImagOrig, outReal, outImag, FftTransform.Inverse);
         outputReal = outReal;
         outputImag = outImag;
     }
@@ -46643,6 +46671,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        // A training trace records one replayable node per output; each node's backward re-runs this op under a tape.
+        if (TryRecordCompiledOp("FFT2DReal", new Tensor<T>?[] { inputReal, inputImag },
+                e => { e.FFT2D(inputReal, inputImag, out Tensor<T> r, out Tensor<T> _); return r; },
+                out var realNode))
+        {
+            if (!TryRecordCompiledOp("FFT2DImag", new Tensor<T>?[] { inputReal, inputImag },
+                    e => { e.FFT2D(inputReal, inputImag, out Tensor<T> _, out Tensor<T> i); return i; },
+                    out var imagNode))
+                throw new InvalidOperationException("FFT2D recorded its real node but not its imaginary node.");
+            outputReal = realNode;
+            outputImag = imagNode;
+            return;
+        }
         if (GraphMode.IsInferenceTrace)
         {
             Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
@@ -46663,8 +46704,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (inputReal._shape.Length < 2)
             throw new ArgumentException("Input must be at least 2D");
 
-        // FFT along last dimension (columns)
-        FFT(inputReal, inputImag, out var tempReal, out var tempImag);
+        // FFT along last dimension (columns). The public FFT records its own edges; only FFT2D's belong on the tape.
+        Tensor<T> tempReal, tempImag;
+        using (new NoGradScope<T>())
+            FFT(inputReal, inputImag, out tempReal, out tempImag);
 
         // Transpose, FFT along rows, transpose back
         int height = inputReal._shape[^2];
@@ -46700,7 +46743,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     imagIn[row] = tempImagData[idx];
                 }
 
-                var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: false);
+                var (realOut, imagOut) = UnnormalizedTransform<T>(realIn, imagIn, inverse: false);
 
                 for (int row = 0; row < height; row++)
                 {
@@ -46711,6 +46754,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
+        RecordFftTapeEdges("FFT2D", inputRealOrig, inputImagOrig, outReal, outImag, FftTransform.Forward2D);
         outputReal = outReal;
         outputImag = outImag;
     }
@@ -46720,6 +46764,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        // A training trace records one replayable node per output; each node's backward re-runs this op under a tape.
+        if (TryRecordCompiledOp("IFFT2DReal", new Tensor<T>?[] { inputReal, inputImag },
+                e => { e.IFFT2D(inputReal, inputImag, out Tensor<T> r, out Tensor<T> _); return r; },
+                out var realNode))
+        {
+            if (!TryRecordCompiledOp("IFFT2DImag", new Tensor<T>?[] { inputReal, inputImag },
+                    e => { e.IFFT2D(inputReal, inputImag, out Tensor<T> _, out Tensor<T> i); return i; },
+                    out var imagNode))
+                throw new InvalidOperationException("IFFT2D recorded its real node but not its imaginary node.");
+            outputReal = realNode;
+            outputImag = imagNode;
+            return;
+        }
         if (GraphMode.IsInferenceTrace)
         {
             Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
@@ -46775,7 +46832,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     imagIn[row] = inputImagData[idx];
                 }
 
-                var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: true);
+                var (realOut, imagOut) = UnnormalizedTransform<T>(realIn, imagIn, inverse: true);
 
                 for (int row = 0; row < height; row++)
                 {
@@ -46798,7 +46855,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     imagIn[col] = tempImagData[rowOffset + col];
                 }
 
-                var (realOut, imagOut) = FFTCore<T>(realIn, imagIn, inverse: true);
+                var (realOut, imagOut) = UnnormalizedTransform<T>(realIn, imagIn, inverse: true);
 
                 for (int col = 0; col < width; col++)
                 {
@@ -46808,8 +46865,23 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         });
 
+        RecordFftTapeEdges("IFFT2D", inputReal, inputImag, outReal, outImag, FftTransform.Inverse2D);
         outputReal = outReal;
         outputImag = outImag;
+    }
+
+    /// <summary>
+    /// Records one tape edge per output of a complex transform, each with both input parts as its inputs. The transforms
+    /// are linear, so the backward reads no saved values: it applies the adjoint transform to the output's gradient.
+    /// </summary>
+    private protected static void RecordFftTapeEdges<T>(string operationName, Tensor<T> inputReal, Tensor<T> inputImag,
+        Tensor<T> outputReal, Tensor<T> outputImag, FftTransform transform)
+    {
+        if (!DifferentiableOps.IsRecording<T>()) return;
+        DifferentiableOps.RecordBinary(operationName + "Real", outputReal, inputReal, inputImag,
+            BackwardFunctions<T>.FftBackward, new object[] { transform, false });
+        DifferentiableOps.RecordBinary(operationName + "Imag", outputImag, inputReal, inputImag,
+            BackwardFunctions<T>.FftBackward, new object[] { transform, true });
     }
 
     /// <summary>
