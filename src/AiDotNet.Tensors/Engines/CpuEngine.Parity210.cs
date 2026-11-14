@@ -1485,6 +1485,11 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
+        if (IsLowPrecisionFloat<T>())
+        {
+            // Float32 products and sums, rounded once (a Half running sum stops growing at 2048).
+            return LowPrecisionFromFloat<T>(LowPrecisionDot(a.GetFlattenedData(), 0, b.GetFlattenedData(), 0, a.Length));
+        }
         using var avLease = a.Lease();
         var av = avLease.Span;
         using var bvLease = b.Lease();
@@ -1559,9 +1564,11 @@ public partial class CpuEngine
         }
         return CumulativeAlongAxis(tensor, axis,
             CumulativeInitial<T>(max: true),
-            (a, b) => {
+            // The running value moves only to a strictly greater element (ScanKernels.RunningMaxFloat's rule): taking
+            // the new element unless the running value was greater let a NaN in and handed +0 / -0 ties to the later one.
+            (acc, x) => {
                 var ops = MathHelper.GetNumericOperations<T>();
-                return ops.GreaterThan(a, b) ? a : b;
+                return ops.GreaterThan(x, acc) ? x : acc;
             },
             "TensorCumMax", BackwardFunctions<T>.CumMaxBackward);
     }
@@ -1606,9 +1613,10 @@ public partial class CpuEngine
         }
         return CumulativeAlongAxis(tensor, axis,
             CumulativeInitial<T>(max: false),
-            (a, b) => {
+            // Only a strictly smaller element replaces the running value (ScanKernels.RunningMinFloat's rule).
+            (acc, x) => {
                 var ops = MathHelper.GetNumericOperations<T>();
-                return ops.LessThan(a, b) ? a : b;
+                return ops.LessThan(x, acc) ? x : acc;
             },
             "TensorCumMin", BackwardFunctions<T>.CumMinBackward);
     }
@@ -2948,9 +2956,21 @@ public partial class CpuEngine
         int rank = input.Rank;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
-
-        var numOps = MathHelper.GetNumericOperations<T>();
         var valuesOut = AutoTensorCache.RentOrAllocate<T>(input._shape);
+        var indicesOut = StableSortAlongAxis(input, axis, descending, valuesOut);
+        return (valuesOut, indicesOut);
+    }
+
+    /// <summary>
+    /// The stable sort behind <see cref="TensorSort{T}"/>, <see cref="TensorArgsort{T}"/> and
+    /// <see cref="ArgSort{T}"/> along a validated, non-negative <paramref name="axis"/>: the permutation in PyTorch's
+    /// order, equal values in their original index order in both directions (LINQ OrderBy / OrderByDescending), and the
+    /// sorted values into <paramref name="valuesOut"/> when one is given.
+    /// </summary>
+    private static Tensor<int> StableSortAlongAxis<T>(Tensor<T> input, int axis, bool descending, Tensor<T>? valuesOut)
+    {
+        int rank = input.Rank;
+        var numOps = MathHelper.GetNumericOperations<T>();
         var indicesOut = new Tensor<int>(input._shape);
 
         if (!input.IsContiguous) input = input.Contiguous();
@@ -2968,8 +2988,11 @@ public partial class CpuEngine
         // is copied once.
         var srcArr = input.GetCpuBackingForStridedRead(out int srcOff);
         if (srcArr is null) { srcArr = input.ToArray(); srcOff = 0; }
-        var valArr = valuesOut.GetCpuBackingForContiguousWrite(out int valOff)
-            ?? throw new InvalidOperationException("TensorSort needs a host values buffer.");
+        int valOff = 0;
+        var valArr = valuesOut is null
+            ? null
+            : valuesOut.GetCpuBackingForContiguousWrite(out valOff)
+              ?? throw new InvalidOperationException("TensorSort needs a host values buffer.");
         var idxArr = indicesOut.GetCpuBackingForContiguousWrite(out int idxOff)
             ?? throw new InvalidOperationException("TensorSort needs a host indices buffer.");
         int dop = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -3002,12 +3025,12 @@ public partial class CpuEngine
                 for (int a = 0; a < axisSize; a++)
                 {
                     int pos = baseIdx + a * innerSize;
-                    valArr[valOff + pos] = srcArr[srcOff + baseIdx + order[a] * innerSize];
+                    if (valArr is not null) valArr[valOff + pos] = srcArr[srcOff + baseIdx + order[a] * innerSize];
                     idxArr[idxOff + pos] = order[a];
                 }
             }
         }, deterministicSafe: true);
-        return (valuesOut, indicesOut);
+        return indicesOut;
     }
 
     /// <summary>
@@ -4679,7 +4702,7 @@ public partial class CpuEngine
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = ToDoubleSafe(x);
             double acc = 0;
-            while (xd < 6.0)
+            while (xd < 10.0)
             {
                 acc -= 1.0 / xd;
                 xd += 1.0;
@@ -4687,7 +4710,8 @@ public partial class CpuEngine
             double xinv = 1.0 / xd;
             double xinv2 = xinv * xinv;
             acc += System.Math.Log(xd) - 0.5 * xinv
-                     - xinv2 * (1.0 / 12.0 - xinv2 * (1.0 / 120.0 - xinv2 / 252.0));
+                     - xinv2 * (1.0 / 12.0 - xinv2 * (1.0 / 120.0 - xinv2 * (1.0 / 252.0 - xinv2 * (1.0 / 240.0
+                         - xinv2 * (1.0 / 132.0 - xinv2 * (691.0 / 32760.0 - xinv2 / 12.0))))));
             return ops.FromDouble(acc);
         }, "TensorDigamma");
         DifferentiableOps.RecordUnary("TensorDigamma", result, tensor, BackwardFunctions<T>.DigammaBackward);

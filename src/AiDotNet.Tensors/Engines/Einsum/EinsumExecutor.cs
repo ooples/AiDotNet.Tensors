@@ -44,6 +44,21 @@ public static class EinsumExecutor
             throw new ArgumentException(
                 $"Expected {binding.Equation.Operands.Count} tensor(s), got {operands.Length}");
 
+        // Half/BFloat16: contract in float32 and round each output once. The generic kernels below accumulate in T,
+        // where a Half running sum stops growing at 2048 (PyTorch's einsum contracts half operands in float32 too).
+        if (CpuEngine.IsLowPrecisionFloat<T>())
+        {
+            var widened = new Tensor<float>[operands.Length];
+            for (int i = 0; i < operands.Length; i++)
+            {
+                var operand = operands[i];
+                widened[i] = new Tensor<float>(CpuEngine.WidenToFloat(operand.GetFlattenedData(), operand.Length),
+                    (int[])operand._shape.Clone());
+            }
+            var contracted = Execute(binding, path, widened);
+            return new Tensor<T>(CpuEngine.NarrowFromFloat<T>(contracted.ToArray()), (int[])contracted._shape.Clone());
+        }
+
         var eq = binding.Equation;
         int batchRank = binding.BatchDims.Length;
 
@@ -377,6 +392,12 @@ public static class EinsumExecutor
         var aShape = A.Shape;
         var bShape = B.Shape;
 
+        // A label-less operand is a scalar factor of every term: its VALUE multiplies in, not 1. (Reading it as 1 made
+        // einsum ",i->i" ignore the scalar - the backward of a full contraction such as TensorInner/TensorDot, which
+        // feeds the scalar upstream gradient as that operand, then dropped the upstream gradient entirely.)
+        var aScalar = la.Length == 0 ? A.GetFlat(0) : numOps.One;
+        var bScalar = lb.Length == 0 ? B.GetFlat(0) : numOps.One;
+
         var iter = new int[allLabels.Count];
         var aIdx = new int[la.Length];
         var bIdx = new int[lb.Length];
@@ -407,8 +428,8 @@ public static class EinsumExecutor
                 tIdx[i] = iter[labelPos];
             }
 
-            var a = la.Length == 0 ? numOps.One : A[aIdx];
-            var b = lb.Length == 0 ? numOps.One : B[bIdx];
+            var a = la.Length == 0 ? aScalar : A[aIdx];
+            var b = lb.Length == 0 ? bScalar : B[bIdx];
             var prod = numOps.Multiply(a, b);
             var cur = result[tIdx];
             result[tIdx] = numOps.Add(cur, prod);

@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         public static string GetSource()
         {
-            return @"
+            return ExactFloatKernels.OpenCl + @"
 // ===========================================================================
 // Fast exp4 — Cephes-style polynomial approximation for float4.
 // ~0.01% relative error, 3-5x faster than hardware exp() on most GPUs.
@@ -343,7 +343,8 @@ __kernel void divide_vectors(
     }
 }
 
-// Vector min: C = min(A, B)
+// Vector min: C = a < b ? a : b (the CPU engine's x86 MINPS), decided and selected on the bit patterns: fmin flushed
+// subnormals under fast math and dropped a NaN the CPU returns. See ExactFloatKernels.
 __kernel void min_vectors(
     __global const float* A,
     __global const float* B,
@@ -352,16 +353,19 @@ __kernel void min_vectors(
 {
     const int idx = get_global_id(0);
     const int idx4 = idx * 4;
+    __global const uint* a = (__global const uint*)A;
+    __global const uint* b = (__global const uint*)B;
+    __global uint* c = (__global uint*)C;
     if (idx4 + 3 < size) {
-        float4 a = vload4(idx, A);
-        float4 b = vload4(idx, B);
-        vstore4(fmin(a, b), idx, C);
+        uint4 va = vload4(idx, a);
+        uint4 vb = vload4(idx, b);
+        vstore4((uint4)(xf_min(va.x, vb.x), xf_min(va.y, vb.y), xf_min(va.z, vb.z), xf_min(va.w, vb.w)), idx, c);
     } else {
-        for (int i = idx4; i < size; i++) C[i] = fmin(A[i], B[i]);
+        for (int i = idx4; i < size; i++) c[i] = xf_min(a[i], b[i]);
     }
 }
 
-// Vector max: C = max(A, B)
+// Vector max: C = a > b ? a : b (the CPU engine's x86 MAXPS), exact on the bit patterns.
 __kernel void max_vectors(
     __global const float* A,
     __global const float* B,
@@ -370,12 +374,15 @@ __kernel void max_vectors(
 {
     const int idx = get_global_id(0);
     const int idx4 = idx * 4;
+    __global const uint* a = (__global const uint*)A;
+    __global const uint* b = (__global const uint*)B;
+    __global uint* c = (__global uint*)C;
     if (idx4 + 3 < size) {
-        float4 a = vload4(idx, A);
-        float4 b = vload4(idx, B);
-        vstore4(fmax(a, b), idx, C);
+        uint4 va = vload4(idx, a);
+        uint4 vb = vload4(idx, b);
+        vstore4((uint4)(xf_max(va.x, vb.x), xf_max(va.y, vb.y), xf_max(va.z, vb.z), xf_max(va.w, vb.w)), idx, c);
     } else {
-        for (int i = idx4; i < size; i++) C[i] = fmax(A[i], B[i]);
+        for (int i = idx4; i < size; i++) c[i] = xf_max(a[i], b[i]);
     }
 }
 
@@ -403,11 +410,13 @@ __kernel void scale_by_device_scalar(__global float* buf, __global const float* 
     if (idx < size) buf[idx] *= scalar[0];
 }
 
-// Absolute value
+// Absolute value: the sign bit cleared, so a subnormal survives where a flushing fabs would zero it.
 __kernel void abs_vector(__global const float* A, __global float* B, const int size) {
     const int idx = get_global_id(0); const int idx4 = idx * 4;
-    if (idx4 + 3 < size) { vstore4(fabs(vload4(idx, A)), idx, B); }
-    else { for (int i = idx4; i < size; i++) B[i] = fabs(A[i]); }
+    __global const uint* a = (__global const uint*)A;
+    __global uint* b = (__global uint*)B;
+    if (idx4 + 3 < size) { vstore4(vload4(idx, a) & (uint4)(0x7FFFFFFFu), idx, b); }
+    else { for (int i = idx4; i < size; i++) b[i] = xf_abs(a[i]); }
 }
 
 // Exponential
@@ -466,13 +475,13 @@ __kernel void sqrt_vector(__global const float* A, __global float* B, const int 
     else { for (int i = idx4; i < size; i++) B[i] = sqrt(A[i]); }
 }
 
-// Sign
+// Sign: 1, -1, or +0 for both zeros and NaN (the CPU engine's SIMD sign), decided on the bit pattern so a subnormal
+// keeps its sign under fast math.
 __kernel void sign_vector(__global const float* A, __global float* B, const int size) {
     const int idx = get_global_id(0); const int idx4 = idx * 4;
-    if (idx4 + 3 < size) {
-        float4 x = vload4(idx, A);
-        vstore4(select(select((float4)(0.0f), (float4)(-1.0f), isless(x, (float4)(0.0f))), (float4)(1.0f), isgreater(x, (float4)(0.0f))), idx, B);
-    } else { for (int i = idx4; i < size; i++) { float x = A[i]; B[i] = x > 0.0f ? 1.0f : (x < 0.0f ? -1.0f : 0.0f); } }
+    __global const uint* a = (__global const uint*)A;
+    __global uint* b = (__global uint*)B;
+    for (int i = idx4; i < idx4 + 4 && i < size; i++) b[i] = xf_sign(a[i]);
 }
 
 // Power with scalar exponent
@@ -680,7 +689,8 @@ __kernel void log10_vector(
     B[idx] = log10(A[idx]);
 }
 
-// Negate
+// Negate: the IEEE negate, the sign bit flipped on the bits, so a subnormal is never flushed (amin = -max(-x) relies
+// on it).
 __kernel void negate_vector(
     __global const float* A,
     __global float* B,
@@ -689,7 +699,7 @@ __kernel void negate_vector(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    B[idx] = -A[idx];
+    ((__global uint*)B)[idx] = ((__global const uint*)A)[idx] ^ 0x80000000u;
 }
 
 // Floor
@@ -901,7 +911,8 @@ __kernel void hardtanh(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    output[idx] = fmin(fmax(input[idx], minVal), maxVal);
+    // The CPU's x < lo ? lo : (x > hi ? hi : x), on bits: NaN stays NaN and -0 keeps its sign.
+    output[idx] = as_float(xf_clamp(as_uint(input[idx]), as_uint(minVal), as_uint(maxVal)));
 }
 
 // ===========================================================================
@@ -1053,7 +1064,8 @@ __kernel void hardtanh_backward(
 __kernel void relu6(__global const float* input, __global float* output, const int size)
 {
     const int idx = get_global_id(0); if (idx >= size) return;
-    float x = input[idx]; output[idx] = fmin(fmax(x, 0.0f), 6.0f);
+    // The CPU clamp(x, 0, 6) on bits: -0 stays -0 (-cl-no-signed-zeros let fmax return +0) and NaN stays NaN.
+    output[idx] = as_float(xf_clamp(as_uint(input[idx]), 0u, 0x40C00000u));
 }
 __kernel void relu6_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const int size)
 {
@@ -1173,9 +1185,18 @@ __kernel void max_pool1d(__global const float* input, __global float* output, co
     const int idx = get_global_id(0); int total = batch * channels * outLength; if (idx >= total) return;
     int o = idx % outLength; int c = (idx / outLength) % channels; int b = idx / (outLength * channels);
     int inOff = (b * channels + c) * inLength;
-    float maxVal = -3.402823466e+38f;
-    for (int k = 0; k < kernelSize; k++) { int pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, input[inOff + pos]); }
-    output[idx] = maxVal;
+    // The CPU max-pool rule on bit patterns: the window's first cell, then only a strictly greater one. The
+    // -FLT_MAX seed answered -FLT_MAX for a -inf window, and max() dropped NaN and ordered the zeros its own way.
+    uint maxBits = 0xFF800000u;
+    int have = 0;
+    for (int k = 0; k < kernelSize; k++) {
+        int pos = o * stride + k;
+        if (pos < inLength) {
+            uint v = as_uint(input[inOff + pos]);
+            if (!have || xf_gt(v, maxBits)) { maxBits = v; have = 1; }
+        }
+    }
+    output[idx] = as_float(maxBits);
 }
 
 // Bilinear upsample — matches PyTorch's align_corners=False (the

@@ -7,6 +7,8 @@ internal enum TorchParityUnaryOp
     BesselJ0, BesselJ1, BesselY0, BesselY1, ModifiedBesselI0, ModifiedBesselI1, Erfcx, Ndtr, Ndtri, Entr, Signbit, IsPosInf, IsNegInf,
     LogNdtr, ModifiedBesselK0, ModifiedBesselK1, ScaledModifiedBesselK0, ScaledModifiedBesselK1, SphericalBesselJ0, AiryAi, Mvlgamma,
     Angle, NonZero,
+    // The model-level activations (CpuEngine.TorchModelOps), whose kernels live in TorchModelOpsKernels.
+    Lisht, BentIdentity, Gaussian, ScaledTanh, ThresholdedRelu, Isru, Sqrbf, SurrogateSpike,
 }
 
 /// <summary>Binary (same-shape) PyTorch-parity elementwise ops with a device kernel (#1112).</summary>

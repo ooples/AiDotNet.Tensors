@@ -131,7 +131,7 @@ public partial class DirectGpuTensorEngine
         // Eager CpuEngine / fallback forward nodes record [stride, padding, dilation] without RecordedConvPrecision;
         // keep FP32 if an autocast scope is opened later around backward. Symbolic GraphMode / CompiledTrainingPlan
         // nodes run inside ResidentStepActive and resolve the compiled step's active AutocastScope.
-        if (engine is not DirectGpuTensorEngine { ResidentStepActive: true })
+        if (!(engine.TryGet<DirectGpuTensorEngine>(out var residentGpu) && residentGpu.ResidentStepActive))
             return new BackwardConvPrecisionScope(RecordedConvPrecision.Fp32);
         return default;
     }

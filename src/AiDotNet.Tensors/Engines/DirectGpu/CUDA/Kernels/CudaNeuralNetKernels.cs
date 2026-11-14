@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     {
         public static string GetSource()
         {
-            return @"
+            return ExactFloatKernels.Cuda + @"
 #include <math.h>
 
 // 1 - beta^t for the optimizer bias corrections, without cancellation. These modules compile with --use_fast_math,
@@ -728,8 +728,9 @@ extern ""C"" __global__ __launch_bounds__(256) void clamp(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    // NaN propagates, as in torch.clamp (fminf/fmaxf return the non-NaN operand, which turned NaN into maxVal).
-    output[idx] = isnan(x) ? x : fmaxf(fminf(x, maxVal), minVal);
+    // The CPU clamp (ExactFloatKernels): x < lo ? lo : x, then above hi -> hi, decided on the bit patterns. NaN propagates
+    // (fminf/fmaxf returned the bound), and fast math no longer flushes a subnormal or drops the sign of zero.
+    output[idx] = xf_clampf(x, minVal, maxVal);
 }
 
 // Class-index gather for sparse cross-entropy: out[r] = values[r, round(cls[r])], or 0 when the class is outside
@@ -863,7 +864,8 @@ extern ""C"" __global__ __launch_bounds__(256) void greater_than(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    C[idx] = A[idx] > B[idx] ? 1.0f : 0.0f;
+    // Exact on the bit patterns: --use_fast_math flushed subnormals in the float compare (1.4e-45 > 0 was false).
+    C[idx] = xf_gtf(A[idx], B[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void less_than(
@@ -871,7 +873,7 @@ extern ""C"" __global__ __launch_bounds__(256) void less_than(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    C[idx] = A[idx] < B[idx] ? 1.0f : 0.0f;
+    C[idx] = xf_ltf(A[idx], B[idx]);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void equals(
@@ -910,7 +912,8 @@ extern ""C"" __global__ __launch_bounds__(256) void where_cond(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    C[idx] = condition[idx] != 0.0f ? A[idx] : B[idx];
+    // condition != 0 on the bits (a flushed subnormal condition read as false), the operand passed through bit for bit.
+    C[idx] = xf_selectf(condition[idx], A[idx], B[idx]);
 }
 
 // ===========================================================================
@@ -944,13 +947,17 @@ extern ""C"" __global__ __launch_bounds__(256) void argmax_axis(
     int outer = blockIdx.x * blockDim.x + threadIdx.x;
     if (outer >= outerSize) return;
 
-    int baseIdx = outer * axisSize;
-    float maxVal = input[baseIdx];
+    // The CPU scan, exact on the bit patterns (ExactFloatKernels): start at the first element and move only on a
+    // strictly greater value, so the first of equal maxima wins, a later NaN is skipped and a leading NaN is kept.
+    // A float compare flushed subnormals to ties under --use_fast_math.
+    if (axisSize <= 0) { indices[outer] = 0.0f; return; }
+    const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
+    unsigned int best = row[0];
     int maxIdx = 0;
     for (int i = 1; i < axisSize; i++) {
-        float val = input[baseIdx + i];
-        if (val > maxVal) {
-            maxVal = val;
+        unsigned int val = row[i];
+        if (xf_gt(val, best)) {
+            best = val;
             maxIdx = i;
         }
     }
@@ -963,13 +970,15 @@ extern ""C"" __global__ __launch_bounds__(256) void argmin_axis(
     int outer = blockIdx.x * blockDim.x + threadIdx.x;
     if (outer >= outerSize) return;
 
-    int baseIdx = outer * axisSize;
-    float minVal = input[baseIdx];
+    // The CPU scan, as argmax_axis with a strictly smaller value.
+    if (axisSize <= 0) { indices[outer] = 0.0f; return; }
+    const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
+    unsigned int best = row[0];
     int minIdx = 0;
     for (int i = 1; i < axisSize; i++) {
-        float val = input[baseIdx + i];
-        if (val < minVal) {
-            minVal = val;
+        unsigned int val = row[i];
+        if (xf_lt(val, best)) {
+            best = val;
             minIdx = i;
         }
     }
@@ -979,19 +988,20 @@ extern ""C"" __global__ __launch_bounds__(256) void argmin_axis(
 // Reduce-max along the innermost (contiguous) axis: output[outer] = max over the axisSize block.
 // Mirrors argmax_axis but emits the max VALUE (not its index). Consumers: GumbelSoftmax / softmax-max
 // subtraction, MelSpectrogram log-floor normalization, BinCount range sizing.
+// The CPU ReduceMax scan, exact on the bit patterns: from -inf, take a value only when strictly greater, so a NaN is
+// skipped, an all-NaN row gives -inf, and the first of equal maxima (-0 before +0) is kept.
 extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     const float* input, float* output, int outerSize, int axisSize)
 {
     int outer = blockIdx.x * blockDim.x + threadIdx.x;
     if (outer >= outerSize) return;
 
-    int baseIdx = outer * axisSize;
-    float maxVal = input[baseIdx];
-    for (int i = 1; i < axisSize; i++) {
-        float val = input[baseIdx + i];
-        if (val > maxVal) maxVal = val;
+    const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
+    unsigned int best = 0xFF800000u;
+    for (int i = 0; i < axisSize; i++) {
+        if (xf_gt(row[i], best)) best = row[i];
     }
-    output[outer] = maxVal;
+    output[outer] = __uint_as_float(best);
 }
 
 // max_axis for long rows: one block per row, coalesced strided reads and a shared-memory reduction. Same result as

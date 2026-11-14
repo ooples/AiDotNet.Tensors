@@ -485,7 +485,7 @@ public sealed partial class CudaBackend
         _sortKeysA = _sortValuesA = _sortKeysB = _sortValuesB = _sortTileCounts = _sortStarts = null;
         if (_sortedScatterModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_sortedScatterModule);
+            UnloadModule(_sortedScatterModule);
             _sortedScatterModule = IntPtr.Zero;
         }
     }

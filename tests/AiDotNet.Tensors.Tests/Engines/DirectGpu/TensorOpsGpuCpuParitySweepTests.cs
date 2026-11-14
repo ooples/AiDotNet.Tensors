@@ -52,6 +52,8 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         ["TensorBatchMatMul"] = "contracts operands of different shapes",
         ["TensorMatMul"] = "contracts operands of different shapes",
         ["TensorAddMM"] = "contracts operands of different shapes",
+        // Compared GPU vs CPU (forward, gradients, residency) in TorchModelOpsGpuTests.
+        ["TensorHyperbolicLinear"] = "contracts operands of different shapes",
         ["TensorAddmv"] = "contracts operands of different shapes",
         ["TensorAddbmm"] = "contracts operands of different shapes",
         ["TensorBaddbmm"] = "contracts operands of different shapes",
@@ -96,6 +98,8 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         ["TensorLcm"] = "an integer-only op; the CPU rejects float",
         ["TensorDiagonalScatter"] = "its source is a diagonal, not the input's shape",
         ["TensorGatherClassValues"] = "gathers with class indices of another shape",
+        // Compared GPU vs the scalar recurrence in NumericRecurrenceGpuTests.FritschCarlsonLimit_MatchesScalarRecurrence.
+        ["TensorFritschCarlsonLimit"] = "its secants are [..., n - 1] against slopes [..., n]",
     };
 
     private static readonly int[][] Shapes =

@@ -60,6 +60,61 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // holds it; this counts the holders. Both are changed only under ContextLifecycleLock.
     private static readonly Dictionary<IntPtr, int> PrimaryContextHolders = new();
 
+    // Every live backend, so an out-of-memory retry can reach the buffers its peers on the same primary context have
+    // parked: each backend's reuse pool may hold up to 1/PooledMemoryDivisor of the device, and draining only the
+    // failing backend's pool left an allocation failing while another engine on the device held reclaimable memory.
+    // Weak, so a registry entry never keeps an engine alive; its own lock, taken only to snapshot, so draining a peer
+    // never holds it (or orders it against ContextLifecycleLock).
+    private static readonly object s_devicePeersLock = new();
+    private static readonly List<WeakReference<CudaBackend>> s_devicePeers = new();
+
+    private void RegisterDevicePeer()
+    {
+        lock (s_devicePeersLock)
+        {
+            s_devicePeers.RemoveAll(peer => !peer.TryGetTarget(out _));
+            s_devicePeers.Add(new WeakReference<CudaBackend>(this));
+        }
+    }
+
+    private void UnregisterDevicePeer()
+    {
+        lock (s_devicePeersLock)
+            s_devicePeers.RemoveAll(peer => !peer.TryGetTarget(out var backend) || ReferenceEquals(backend, this));
+    }
+
+    /// <summary>Releases the reuse-pool buffers of every other live backend on this primary context.</summary>
+    private int DrainPeerPools()
+    {
+        var peers = new List<CudaBackend>();
+        lock (s_devicePeersLock)
+        {
+            foreach (var peer in s_devicePeers)
+            {
+                if (peer.TryGetTarget(out var backend) && !ReferenceEquals(backend, this) && !backend._disposed
+                    && backend._cudaContext == _cudaContext)
+                    peers.Add(backend);
+            }
+        }
+        int drained = 0;
+        foreach (var peer in peers) drained += peer._bufferPool.DrainAll();
+        return drained;
+    }
+
+    /// <summary>Backends currently holding a primary context, over all devices (diagnostics and tests).</summary>
+    internal static int PrimaryContextHolderCount
+    {
+        get
+        {
+            lock (ContextLifecycleLock)
+            {
+                int total = 0;
+                foreach (var holders in PrimaryContextHolders.Values) total += holders;
+                return total;
+            }
+        }
+    }
+
     /// <summary>
     /// Registers one more backend holding <paramref name="context"/> and returns the context's registration generation.
     /// Caller holds ContextLifecycleLock.
@@ -328,8 +383,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private static long ReadMemPoolBytes(IntPtr pool, int attribute)
         => CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value) == CudaResult.Success ? (long)value : 0;
 
-    private const int MaxPooledBufferElements = 16_777_216;
-    private const int MaxPooledBuffersPerSize = 4;
+    private const int MaxPooledBufferElements = int.MaxValue;
+    private const int MaxPooledBuffersPerSize = 4096;
+    private const int PooledMemoryDivisor = 6;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
 
@@ -471,6 +527,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe bool TryStageUpload(IntPtr destination, float[] data, ulong byteSize)
     {
+        fixed (float* src = data)
+            return TryStageUploadBytes(destination, src, byteSize);
+    }
+
+    private unsafe bool TryStageUpload(IntPtr destination, int[] data, ulong byteSize)
+    {
+        fixed (int* src = data)
+            return TryStageUploadBytes(destination, src, byteSize);
+    }
+
+    private unsafe bool TryStageUploadBytes(IntPtr destination, void* src, ulong byteSize)
+    {
         if (_backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
             return false;
         int bytes = checked((int)byteSize);
@@ -492,8 +560,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var pinned = _pinnedPool.Rent(bytes);
         try
         {
-            fixed (float* src = data)
-                Buffer.MemoryCopy(src, (void*)pinned, bytes, bytes);
+            Buffer.MemoryCopy(src, (void*)pinned, bytes, bytes);
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemcpyHtoDAsync(destination, pinned, byteSize, _stream),
                 "cuMemcpyHtoDAsync(staged upload)");
@@ -640,6 +707,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public CudaBackend(int deviceIndex)
     {
+        // Backends collected without Dispose release their native resources before this one takes more.
+        if (!PendingAbandonedBackends.IsEmpty && !IsCapturingOnThisThread) DrainPendingAbandonedBackends();
         DeviceOrdinal = deviceIndex;
         _memoryAccount = DeviceMemoryAccount.For("cuda", deviceIndex);
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
@@ -691,6 +760,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuDeviceTotalMem(out ulong totalMem, device), "cuDeviceTotalMem");
             GlobalMemoryBytes = (long)totalMem;
+            _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
             // Issue #285: per-allocation cap. CUDA has no formal cap attribute;
             // practical limit is the largest contiguous free block. We use
             // total VRAM as the upper bound. NOTE: this means the cap guard
@@ -713,6 +783,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(_cudaContext), "cuCtxPushCurrent(primary)");
             // A buffer may only free against a live context, and only against the lifetime it was allocated in.
             lock (ContextLifecycleLock) _contextGeneration = AddContextHolder(_cudaContext);
+            RegisterDevicePeer();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _mainStream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
             _defaultStream = new CudaStream(this, _mainStream, GpuStreamType.Default, ownsHandle: false);
@@ -1120,6 +1191,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                         GpuKernelDiagnostics.RegisterKernelName(kernel, kernelName);
                     }
 
+                    _loadedModules[cachedModule] = 0;
                     return cachedModule;
                 }
                 finally
@@ -1221,7 +1293,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             GpuKernelDiagnostics.RegisterKernelName(kernel, kernelName);
         }
 
+        _loadedModules[module] = 0;
         return module;
+    }
+
+    // Every module this backend loaded and has not unloaded. Unloads claim their module here first (UnloadModule), and
+    // Dispose unloads whatever is left: a module no field kept (a recompile that replaced one, a lazily built module
+    // without its own unload) was loaded into the device's SHARED primary context and stayed there, with its code and
+    // constant memory, for the life of the process - about 4 MB of device memory per backend created and disposed.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, byte> _loadedModules = new();
+
+    /// <summary>Unloads a module this backend loaded, once: false (and nothing done) if it was already unloaded.</summary>
+    private bool UnloadModule(IntPtr module)
+    {
+        if (module == IntPtr.Zero) return false;
+        _loadedModules.TryRemove(module, out _);
+        CudaNativeBindings.cuModuleUnload(module);
+        return true;
+    }
+
+    private void UnloadRemainingModules()
+    {
+        foreach (var module in _loadedModules.Keys)
+            if (_loadedModules.TryRemove(module, out _))
+                try { CudaNativeBindings.cuModuleUnload(module); } catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException) { }
     }
 
     private void CompileAllKernels(int device)
@@ -1271,6 +1366,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             _torchParityElementwiseModule = IntPtr.Zero;
             System.Diagnostics.Trace.TraceWarning($"CUDA torch-parity kernels unavailable; those ops use the CPU path: {ex.Message}");
+        }
+        // Model-level ops (CpuEngine.TorchModelOps): precise math, same optional policy as the parity module.
+        try
+        {
+            _torchModelOpsModule = CompileKernelModule(device, TorchModelOpsKernels.CudaPrelude + TorchModelOpsKernels.Source,
+                "torch_model_ops_kernels", TorchModelOpsKernels.KernelNames, useFastMath: false);
+        }
+        catch (Exception ex)
+        {
+            _torchModelOpsModule = IntPtr.Zero;
+            System.Diagnostics.Trace.TraceWarning($"CUDA model-op kernels unavailable; those ops use the CPU path: {ex.Message}");
         }
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
@@ -1925,7 +2031,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
         // An event recorded on the capturing stream becomes a captured event that cuEventQuery rejects later. (Only
         // synchronously allocated buffers get here, and those cannot have been allocated inside a capture.)
-        if (TryDeferReleaseUntilCaptureEnds(allocatedDuringCapture: false, () => FreeBufferDeferred(buffer))) return;
+        if (IsCapturingOnThisThread && TryDeferReleaseUntilCaptureEnds(allocatedDuringCapture: false, () => FreeBufferDeferred(buffer))) return;
         CudaEvent evt;
         using (PushContext())
             evt = new CudaEvent(this, _defaultStream, enableTiming: false); // creates + records on the compute stream
@@ -2106,7 +2212,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Reclaim event-deferred frees first (#555) — under genuine pressure block on
             // their events so their device memory returns to the pool — then drain the pool.
             DrainDeferredFrees(blockOldest: true);
-            int drained = _bufferPool.DrainAll();
+            int drained = _bufferPool.DrainAll() + DrainPeerPools();
             // When _asyncAlloc is on, freed stream-ordered allocations are RETAINED in the default mem
             // pool (release threshold maxed for caching), so they show as device free=0 and the legacy
             // cuMemAlloc here can't reach them. Sync the context so pending cuMemFreeAsync reclamations
@@ -2198,8 +2304,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             CuBlasNative.CheckCudaResult(
-                CuBlasNative.cuMemsetD32(pooled.Handle, 0, (ulong)size), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
-                "cuMemsetD32");
+                CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                "cuMemsetD32Async");
             return pooled;
         }
 
@@ -2316,8 +2422,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // with its real name rather than let it masquerade as the cuMemAllocAsync OOM below.
             // Trim is best-effort.
             // Buffers parked in the host-side reuse pool are still allocated as far as the driver knows; release
-            // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request.
+            // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request, and those
+            // of every other backend on this context, which the same sync and trim then return.
             _bufferPool.DrainAll();
+            DrainPeerPools();
             // GPU results are owned by their tensors and freed by the buffer finalizer once unreachable; the GC cannot see
             // device memory, so collect, run those finalizers and free what they queued. Then synchronize the context -
             // every backend shares it, so frees other backends queued into the same pool complete too - through the
@@ -6429,6 +6537,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
         // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
         // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
+        DrainPendingAbandonedBackends();
         DrainPendingContextDestroys();
     }
 
@@ -6451,7 +6560,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private bool CanRunDeferredFrees()
     {
         if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty
-            && PendingExternalReleases.IsEmpty) return false;
+            && PendingExternalReleases.IsEmpty && PendingAbandonedBackends.IsEmpty) return false;
         if (IsCapturingOnThisThread || CaptureMemoryPool.Current is not null) return false;
         return _cudaContext == IntPtr.Zero || !IsStreamCapturingCurrentContext();
     }
@@ -6466,7 +6575,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (_threadCurrentContext == _cudaContext &&
             PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty && PendingGraphDestroys.IsEmpty &&
-            PendingExternalReleases.IsEmpty)
+            PendingExternalReleases.IsEmpty && PendingAbandonedBackends.IsEmpty)
             return;
         EnsureContextCurrent();
     }
@@ -6566,11 +6675,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // allocation zero-fills on the device; uploading a zero array was a host-to-device transfer counted against
         // whichever op first used cuBLAS on this thread (a residency scope saw it as that op leaving the device).
         IGpuBuffer? skinnyCounters = workspace is null ? null : AllocateBuffer(SkinnyCounterSlots);
-        return new ThreadCublas
+        var created = new ThreadCublas
         {
             Handle = h, IsDeterministic = det, Stream = _stream, Workspace = workspace, SkinnyCounters = skinnyCounters,
         };
+        _allThreadCublas.Enqueue(created);
+        return created;
     }
+
+    // Every per-thread cuBLAS handle ever created, independent of the ThreadLocal: an abandoned backend is disposed after
+    // the GC has finalized that ThreadLocal (its Values then throws), and its handles still have to be destroyed.
+    private readonly ConcurrentQueue<ThreadCublas> _allThreadCublas = new();
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
     // cuMemFree) from the GC finalizer thread races with op threads' driver entry and faults with an
@@ -6630,6 +6745,52 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // handle (an IntPtr, safe to read) and a real op thread destroys it here. cuCtxDestroy reclaims the
     // context's stream, buffers, cuBLAS handles and modules in ONE call, so the context is all we need.
     internal static readonly ConcurrentQueue<(IntPtr Ctx, long Gen, IntPtr Stream, int Device)> PendingContextDestroys = new();
+
+    // Backends collected without Dispose (see the finalizer path of Dispose(bool)). Each is resurrected here until an op
+    // thread - or the next CudaBackend constructor - runs its full Dispose(true): modules, streams, events, cuBLAS,
+    // cuBLASLt and cuDNN handles, pinned host blocks and its hold on the primary context, released exactly once.
+    internal static readonly ConcurrentQueue<CudaBackend> PendingAbandonedBackends = new();
+
+    internal static void DrainPendingAbandonedBackends()
+    {
+        // Not re-entrant: the Dispose below makes contexts current, which drains again.
+        if (s_drainingAbandoned) return;
+        s_drainingAbandoned = true;
+        try
+        {
+            while (PendingAbandonedBackends.TryDequeue(out var backend))
+                backend.DisposeAbandoned();
+        }
+        finally
+        {
+            s_drainingAbandoned = false;
+        }
+    }
+
+    [ThreadStatic] private static bool s_drainingAbandoned;
+
+    // The deferred Dispose of an abandoned backend, on an ordinary thread. Its context is pushed for the duration:
+    // module unloads and handle destroys act on the CURRENT context, and the draining thread may be on another device.
+    private void DisposeAbandoned()
+    {
+        if (_disposed || IsRuntimeTearingDown || ProcessExiting) return;
+        IntPtr context = _cudaContext;
+        if (context == IntPtr.Zero || !IsLiveContext(context, _contextGeneration))
+        {
+            _disposed = true;
+            return;
+        }
+        bool pushed = CuBlasNative.cuCtxPushCurrent(context) == CudaResult.Success;
+        try
+        {
+            Dispose(disposing: true);
+        }
+        finally
+        {
+            if (pushed) CuBlasNative.cuCtxPopCurrent(out _);
+            if (_threadCurrentContext == context) _threadCurrentContext = IntPtr.Zero;
+        }
+    }
 
     internal static void DrainPendingContextDestroys()
     {
@@ -9828,8 +9989,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Cuda);
+        AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(int));
+        LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(int));
 
-        using var _ = PushContext();
         int size = data.Length;
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(data), "Buffer size must be positive.");
@@ -9838,6 +10000,61 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
         DrainFinalizedFreesBeforeAllocation();
+
+        using var _ = PushContext();
+        if (_asyncAlloc)
+        {
+            var target = TryRentAsyncBuffer(size)
+                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            try
+            {
+                if (TryStageUpload(target.Handle, data, byteSize))
+                    return target;
+            }
+            catch
+            {
+                target.Dispose();
+                throw;
+            }
+
+            var pAsync = target.Handle;
+            try
+            {
+                unsafe
+                {
+                    fixed (int* src = data)
+                    {
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuMemcpyHtoDAsync(pAsync, (IntPtr)src, byteSize, _stream),
+                            "cuMemcpyHtoDAsync(int upload)");
+                        CuBlasNative.CheckCudaResult(
+                            CudaNativeBindings.cuStreamSynchronize(_stream),
+                            "cuStreamSynchronize(int upload)");
+                    }
+                }
+            }
+            catch
+            {
+                target.Dispose();
+                throw;
+            }
+            return target;
+        }
+
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null)
+        {
+            unsafe
+            {
+                fixed (int* src = data)
+                {
+                    CuBlasNative.CheckCudaResult(
+                        CuBlasNative.cuMemcpyHtoD(pooled.Handle, (IntPtr)src, byteSize),
+                        "cuMemcpyHtoD(int)");
+                }
+            }
+            return pooled;
+        }
 
         // The shared allocator reclaims and retries once on out-of-memory, then raises GpuOutOfMemoryException.
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
@@ -9860,7 +10077,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw;
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, account: _memoryAccount);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
     }
 
     #endregion
@@ -19142,6 +19359,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
 
         _disposed = true;
+        UnregisterDevicePeer();
 
         // The multi-tensor tables hold device buffers: free them only on an explicit dispose, never from the
         // finalizer (the context may already be gone).
@@ -19190,8 +19408,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // safe to read in a finalizer) and let a real op thread cuCtxDestroy it later, which reclaims the
             // stream, buffers, cuBLAS handles and modules in one shot. Skip during process/runtime teardown
             // (driver may be gone; the OS reclaims everything at exit).
+            //
+            // The whole backend is queued, not just its context and stream: the device's primary context is shared, so
+            // dropping this backend's hold reclaims nothing while any other backend lives, and every module, cuBLAS /
+            // cuBLASLt / cuDNN handle, event and pinned host block it created stayed allocated for the life of the
+            // process. DrainPendingAbandonedBackends runs the ordinary Dispose(true) for it on an op thread instead.
+            // Device buffers need nothing here: each claims its own pointer in its finalizer (CudaGpuBuffer).
             if (!disposing && !IsRuntimeTearingDown && !ProcessExiting && _cudaContext != IntPtr.Zero)
-                PendingContextDestroys.Enqueue((_cudaContext, _contextGeneration, _mainStream, _cuDevice));
+            {
+                _disposed = false; // so the deferred Dispose(true) runs in full
+                PendingAbandonedBackends.Enqueue(this);
+            }
             return;
         }
 
@@ -19259,7 +19486,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // _cublasHandle property here would instead lazily create a fresh handle on the disposing thread.
         if (_threadCublas is not null)
         {
-            var handles = _threadCublas.Values;
+            // From the registry, not _threadCublas.Values: an abandoned backend is disposed after the GC finalized the
+            // ThreadLocal (Values then throws), and its handles still have to go.
+            var handles = _allThreadCublas.ToArray();
             lock (CaptureGateFor(_cudaContext))
                 foreach (var tc in handles.Where(tc => tc is not null && tc.Handle != IntPtr.Zero))
                 {
@@ -19276,7 +19505,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 tc.SkinnyCounters = null;
             }
 
-            _threadCublas.Dispose();
+            try { _threadCublas.Dispose(); } catch (ObjectDisposedException) { }
             _threadCublas = null;
         }
 
@@ -19310,71 +19539,76 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (_residentRowsModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_residentRowsModule);
+            UnloadModule(_residentRowsModule);
             _residentRowsModule = IntPtr.Zero;
         }
         if (_residentProgramModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_residentProgramModule);
+            UnloadModule(_residentProgramModule);
             _residentProgramModule = IntPtr.Zero;
             _residentProgramBlocksPerSm = 0;
         }
 
         if (_convolutionModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_convolutionModule);
+            UnloadModule(_convolutionModule);
             _convolutionModule = IntPtr.Zero;
         }
 
         if (_poolingModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_poolingModule);
+            UnloadModule(_poolingModule);
             _poolingModule = IntPtr.Zero;
         }
 
         if (_normalizationModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_normalizationModule);
+            UnloadModule(_normalizationModule);
             _normalizationModule = IntPtr.Zero;
         }
 
         if (_neuralNetModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_neuralNetModule);
+            UnloadModule(_neuralNetModule);
             _neuralNetModule = IntPtr.Zero;
         }
 
         if (_activationModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_activationModule);
+            UnloadModule(_activationModule);
             _activationModule = IntPtr.Zero;
         }
 
         if (_fusedAttentionModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_fusedAttentionModule);
+            UnloadModule(_fusedAttentionModule);
             _fusedAttentionModule = IntPtr.Zero;
         }
         if (_torchParityElementwiseModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_torchParityElementwiseModule);
+            UnloadModule(_torchParityElementwiseModule);
             _torchParityElementwiseModule = IntPtr.Zero;
+        }
+        if (_torchModelOpsModule != IntPtr.Zero)
+        {
+            UnloadModule(_torchModelOpsModule);
+            _torchModelOpsModule = IntPtr.Zero;
         }
         if (_octonionModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_octonionModule);
+            UnloadModule(_octonionModule);
             _octonionModule = IntPtr.Zero;
         }
 
         if (_parity210Module != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_parity210Module);
+            UnloadModule(_parity210Module);
             _parity210Module = IntPtr.Zero;
         }
 
         if (_fftModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_fftModule);
+            UnloadModule(_fftModule);
             _fftModule = IntPtr.Zero;
         }
 
@@ -19382,219 +19616,221 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (_spectralPerfModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_spectralPerfModule);
+            UnloadModule(_spectralPerfModule);
             _spectralPerfModule = IntPtr.Zero;
         }
 
         if (_spatialTransformerModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_spatialTransformerModule);
+            UnloadModule(_spatialTransformerModule);
             _spatialTransformerModule = IntPtr.Zero;
         }
 
         if (_locallyConnectedModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_locallyConnectedModule);
+            UnloadModule(_locallyConnectedModule);
             _locallyConnectedModule = IntPtr.Zero;
         }
 
         if (_deformableConvModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_deformableConvModule);
+            UnloadModule(_deformableConvModule);
             _deformableConvModule = IntPtr.Zero;
         }
 
         if (_capsuleModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_capsuleModule);
+            UnloadModule(_capsuleModule);
             _capsuleModule = IntPtr.Zero;
         }
 
         if (_specializedModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_specializedModule);
+            UnloadModule(_specializedModule);
             _specializedModule = IntPtr.Zero;
         }
 
         if (_fp16Module != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_fp16Module);
+            UnloadModule(_fp16Module);
             _fp16Module = IntPtr.Zero;
         }
 
         if (_lstmModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_lstmModule);
+            UnloadModule(_lstmModule);
             _lstmModule = IntPtr.Zero;
         }
 
         if (_glaModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_glaModule);
+            UnloadModule(_glaModule);
             _glaModule = IntPtr.Zero;
         }
 
         if (_xlstmModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_xlstmModule);
+            UnloadModule(_xlstmModule);
             _xlstmModule = IntPtr.Zero;
         }
 
         if (_gatedDeltaNetModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_gatedDeltaNetModule);
+            UnloadModule(_gatedDeltaNetModule);
             _gatedDeltaNetModule = IntPtr.Zero;
         }
 
         if (_rgLruModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_rgLruModule);
+            UnloadModule(_rgLruModule);
             _rgLruModule = IntPtr.Zero;
         }
 
         if (_rwkv4Module != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_rwkv4Module);
+            UnloadModule(_rwkv4Module);
             _rwkv4Module = IntPtr.Zero;
         }
 
         if (_mambaModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_mambaModule);
+            UnloadModule(_mambaModule);
             _mambaModule = IntPtr.Zero;
         }
 
         if (_mamba2Module != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_mamba2Module);
+            UnloadModule(_mamba2Module);
             _mamba2Module = IntPtr.Zero;
         }
 
         if (_fusedCeModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_fusedCeModule);
+            UnloadModule(_fusedCeModule);
             _fusedCeModule = IntPtr.Zero;
         }
 
         if (_gruModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_gruModule);
+            UnloadModule(_gruModule);
             _gruModule = IntPtr.Zero;
         }
 
         if (_snnModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_snnModule);
+            UnloadModule(_snnModule);
             _snnModule = IntPtr.Zero;
         }
 
         if (_skinnyGemmModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_skinnyGemmModule);
+            UnloadModule(_skinnyGemmModule);
             _skinnyGemmModule = IntPtr.Zero;
         }
         DisposeSortedScatter();
 
         if (_implicitConvModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_implicitConvModule);
+            UnloadModule(_implicitConvModule);
             _implicitConvModule = IntPtr.Zero;
         }
 
         if (_wmmaModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_wmmaModule);
+            UnloadModule(_wmmaModule);
             _wmmaModule = IntPtr.Zero;
         }
 
         if (_fusedConvolutionModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_fusedConvolutionModule);
+            UnloadModule(_fusedConvolutionModule);
             _fusedConvolutionModule = IntPtr.Zero;
         }
 
         if (_quantGemmModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_quantGemmModule);
+            UnloadModule(_quantGemmModule);
             _quantGemmModule = IntPtr.Zero;
         }
 
         if (_pagedAttnModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_pagedAttnModule);
+            UnloadModule(_pagedAttnModule);
             _pagedAttnModule = IntPtr.Zero;
         }
 
         if (_flashDecodeModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_flashDecodeModule);
+            UnloadModule(_flashDecodeModule);
             _flashDecodeModule = IntPtr.Zero;
         }
 
         if (_fusedModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_fusedModule);
+            UnloadModule(_fusedModule);
             _fusedModule = IntPtr.Zero;
         }
 
         if (_attentionModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_attentionModule);
+            UnloadModule(_attentionModule);
             _attentionModule = IntPtr.Zero;
         }
 
         if (_sparseModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_sparseModule);
+            UnloadModule(_sparseModule);
             _sparseModule = IntPtr.Zero;
         }
 
         if (_dotProductModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_dotProductModule);
+            UnloadModule(_dotProductModule);
             _dotProductModule = IntPtr.Zero;
         }
 
         if (_linalgModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_linalgModule);
+            UnloadModule(_linalgModule);
             _linalgModule = IntPtr.Zero;
         }
 
         if (_detectionModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_detectionModule);
+            UnloadModule(_detectionModule);
             _detectionModule = IntPtr.Zero;
         }
 
         if (_geometryModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_geometryModule);
+            UnloadModule(_geometryModule);
             _geometryModule = IntPtr.Zero;
         }
 
         if (_roiModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_roiModule);
+            UnloadModule(_roiModule);
             _roiModule = IntPtr.Zero;
         }
 
         if (_audioModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_audioModule);
+            UnloadModule(_audioModule);
             _audioModule = IntPtr.Zero;
         }
 
         if (_annModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_annModule);
+            UnloadModule(_annModule);
             _annModule = IntPtr.Zero;
         }
         if (_deterministicNormModule != IntPtr.Zero)
         {
-            CudaNativeBindings.cuModuleUnload(_deterministicNormModule);
+            UnloadModule(_deterministicNormModule);
             _deterministicNormModule = IntPtr.Zero;
         }
+
+        UnloadRemainingModules();
 
         if (_cudaContext != IntPtr.Zero)
         {
@@ -20586,6 +20822,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
     }
 
+    private static bool MayNeedCudaBufferDeferral(CaptureMemoryPool[]? pins, bool allocatedDuringCapture)
+        => (pins is { Length: > 0 })
+            || AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.IsActive
+            || (IsCapturingOnThisThread && !allocatedDuringCapture);
+
     private static bool TryDeferCudaBufferAction(
         CaptureMemoryPool[]? pins, bool allocatedDuringCapture, Action outerAction, Action coreAction)
     {
@@ -20741,13 +20982,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // #642: while a deferred-execution scope is recording/replaying, queue the free
             // until after the graph runs — the recorded op graph still references this buffer.
             // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
-            if (TryDeferCudaBufferAction(Volatile.Read(ref _capturePins), _allocatedDuringCapture, Release, ReleaseCore))
+            var pins = Volatile.Read(ref _capturePins);
+            if (MayNeedCudaBufferDeferral(pins, _allocatedDuringCapture)
+                && TryDeferCudaBufferAction(pins, _allocatedDuringCapture, Release, ReleaseCore))
                 return;
             ReleaseCore();
         }
 
         private void ReleaseCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, ReleaseCore)) return;
             if (TryEndArenaLease()) return;
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
@@ -20814,13 +21061,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // scope finishes — returning to the pool mid-record could re-rent + overwrite a
             // buffer the recorded graph still reads. Runs normally once the gate is cleared.
             // A captured graph's memory goes back to no pool while the graph can replay (CaptureMemoryPool).
-            if (TryDeferCudaBufferAction(Volatile.Read(ref _capturePins), _allocatedDuringCapture, Dispose, DisposeCore))
+            var pins = Volatile.Read(ref _capturePins);
+            if (MayNeedCudaBufferDeferral(pins, _allocatedDuringCapture)
+                && TryDeferCudaBufferAction(pins, _allocatedDuringCapture, Dispose, DisposeCore))
                 return;
             DisposeCore();
         }
 
         private void DisposeCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
             if (TryEndArenaLease()) return;
             if (_returnToPool == null || _capturedAllocation)
             {
@@ -20917,14 +21170,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         public void Dispose()
         {
-            if (CaptureMemoryPool.TryDeferRelease(Volatile.Read(ref _capturePins), Dispose)) return;
+            var pins = Volatile.Read(ref _capturePins);
+            if (pins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(pins, Dispose)) return;
             // Then memory allocated before an open capture: its free must wait for the capture to end.
-            if (TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, DisposeCore)) return;
+            if (IsCapturingOnThisThread && !_allocatedDuringCapture && TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, DisposeCore)) return;
             DisposeCore();
         }
 
         private void DisposeCore()
         {
+            // A queued release (deferral scope, end of capture) can run after a capture that began meanwhile read Handle
+            // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
+            var latePins = Volatile.Read(ref _capturePins);
+            if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
             // Atomically CLAIM the device pointer so a concurrent finalizer can't enqueue the SAME pointer
             // for a deferred free (double-free → uncatchable 0xC0000005 in DrainPendingFinalizerFrees).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);

@@ -1178,10 +1178,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void DisposeStepIo()
     {
         // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
-        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
+        using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
         ReleasePingPong();
         // A disposed engine's context took the page-locked results with it: nothing in them can be read any more.
-        bool live = _engine is Engines.DirectGpuTensorEngine gte
+        bool live = _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true };
         if (_capturedOptimizer is not null && _stepIo is not null)
         {
@@ -1274,8 +1274,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void LandGradientsOnHost()
     {
         // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
-        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
-        if (_engine is not Engines.DirectGpuTensorEngine gte
+        using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
+        if (!_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             || gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { ContextIsLive: true })
             return;
         // Parameter gradients and requested input-leaf gradients: both are read after the plan retires.
@@ -1354,11 +1354,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void InvalidateCapturedStepGraph()
     {
         // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
-        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
+        using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
         // The current weights back in the buffers the plan's other paths update (stream-ordered after every replay),
         // while the graphs that pin the second buffers still keep them alive.
         ReleasePingPong();
-        if (_engine is Engines.DirectGpuTensorEngine gte
+        if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
         {
             if (_stepGraphExec != IntPtr.Zero) cb.DestroyCapturedGraph(_stepGraphExec);
@@ -1372,11 +1372,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         DisposeStepIo();   // before the rollback below, which may read the loss
         // The eager step accumulates into HOST gradient arrays; leaving the accumulators bound to the capture's
         // device buffers made its in-place adds land on never-zeroed device memory (gradients piled up across steps).
-        if (hadGraph && _engine is Engines.DirectGpuTensorEngine gRoll)
+        if (hadGraph && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gRoll))
             RollBackCaptureResidency(gRoll, deviceHoldsResults: true);
         // Balance the graph-lifetime eviction suspension (Step()): once the captured graph is gone,
         // the buffers no longer need stable pointers, so re-enable normal activation eviction.
-        if (_graphEvictionSuspended && _engine is Engines.DirectGpuTensorEngine gEvict)
+        if (_graphEvictionSuspended && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gEvict))
         {
             gEvict.EndGraphLifetime();
             _graphEvictionSuspended = false;
@@ -1422,7 +1422,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private void UploadHostWrittenParameters()
     {
-        if (typeof(T) != typeof(float) || _engine is not Engines.DirectGpuTensorEngine gte) return;
+        if (typeof(T) != typeof(float) || !_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)) return;
         for (int p = 0; p < _parameters.Length; p++)
         {
             var parameter = _parameters[p];
@@ -1482,7 +1482,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 + "captured graph each time; train with a device-resident optimizer update to keep graph replay");
         }
         _parameters[p].IncrementVersion();
-        (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
+        (_engine.As<Engines.DirectGpuTensorEngine>())?.InvalidateResidentWeightBuffer(_parameters[p]);
     }
 
     /// <summary>
@@ -1751,7 +1751,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         deviceAliases = null;
         // The buffer each aliased gradient is ultimately a view of.
         var rootOf = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-        bool device = engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine;
+        bool device = engine.SupportsGpu || engine.Is<Engines.DirectGpuTensorEngine>();
         HashSet<CompiledStep<T>>? aliased = null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
         // With AIDOTNET_COMPILED_INPUT_GRADS the external leaves publish .Grad from the backward that writes them. An
@@ -1839,7 +1839,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Only where the step is captured into a device graph (CUDA): the pass exists to cut that graph's copy nodes, and
         // on Vulkan, which replays no graph, merged multi-consumer gradients gave the permute and spectral (RFFT/IRFFT)
         // ops a wrong first-step gradient in CompiledTrainingOpStalenessProbeTests while the per-tensor buffers do not.
-        if (staticReverseBackward && (engine as Engines.DirectGpuTensorEngine)?.QueryBackend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
+        if (staticReverseBackward && (engine.As<Engines.DirectGpuTensorEngine>())?.QueryBackend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true })
             AliasMultiConsumerPassThroughs(forwardSteps, parameterSet, device, gradMap, dropped, rootOf, ref deviceAliases);
         if (dropped.Count > 0)
             allGrads.RemoveAll(g => dropped.Contains(g));
@@ -3347,7 +3347,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void ApplyL2Regularization()
     {
         if (_l2Regularization == 0f) return;
-        var engine = _engine as Engines.DirectGpuTensorEngine;
+        var engine = _engine.As<Engines.DirectGpuTensorEngine>();
         using var __gpuOp = engine?.EnterGpuOp() ?? default;
         var backend = engine?.GetBackend();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -3813,7 +3813,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Every compiled step on a GPU engine holds the engine's step lock (see DirectGpuTensorEngine.CompiledStepLock).
         // Taking it only once the engine was seen shared left a race: a step that read "not shared" kept running
         // unlocked beside the first step of the thread that made it shared. Uncontended, the lock costs nothing.
-        var gpuEngine = _engine as Engines.DirectGpuTensorEngine;
+        var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
         gpuEngine?.NoteCompiledStepThread();
         if (gpuEngine is null) return StepLocked();
         lock (gpuEngine.CompiledStepLock) return StepLocked();
@@ -3835,7 +3835,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Tensor<T> StepCore()
     {
         // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
-        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
+        using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
         using var graphModeSuspension = GraphMode.SuspendRecording();
 
         // Opt-in CUDA-graph replay of the whole compiled step. Narrowly gated:
@@ -3854,7 +3854,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // produce the FP16 VRAM win with correct loss/grads). FP16+capture compose in a follow-up increment.
         if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
             && _checkpointing is null && _fp16HeteroOrder is null
-            && _engine is Engines.DirectGpuTensorEngine gte
+            && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb
             && RetireGraphIfEngineShared(gte))
         {
@@ -4058,13 +4058,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Tensor<T> StepResidentOrEager()
     {
         // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
-        using var __gpuOp = (_engine as Engines.DirectGpuTensorEngine)?.EnterGpuOp() ?? default;
+        using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
         // The uncaptured resident body needs only fills and device copies, so it runs on every DirectGpu backend
         // (OpenCL, Vulkan, Metal, HIP as well as CUDA). The host-array eager step downloads every device gradient to
         // accumulate it; only the graph capture above is CUDA's.
         if (s_residentStepEnabled && !_residentStepFailed && _graphStepEligible && typeof(T) == typeof(float)
             && _checkpointing is null && _fp16HeteroOrder is null
-            && _engine is Engines.DirectGpuTensorEngine gte
+            && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is { } cb
             && DeviceParametersLiveOn(cb))
         {
@@ -4109,7 +4109,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // accumulations landed on the previous step's device gradients (on OpenCL, where a host write to a parameter
         // drops its device binding and sends the next step here, every compiled gradient after that came back as a
         // multiple of the true one). Roll the residency back first, as a failed capture does.
-        if (_residentBodyRanLast && _engine is Engines.DirectGpuTensorEngine rollEngine)
+        if (_residentBodyRanLast && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var rollEngine))
         {
             RollBackCaptureResidency(rollEngine, deviceHoldsResults: true);
             _residentBodyRanLast = false;
@@ -4440,7 +4440,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // Lend this plan's first-write redirects to the engine for the body only: the eager optimizer, evaluation and
         // any other plan on the engine never see them.
-        var redirectEngine = _engine as Engines.DirectGpuTensorEngine;
+        var redirectEngine = _engine.As<Engines.DirectGpuTensorEngine>();
         bool executed = !(backend is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } capturing
                           && capturing.IsStreamCapturing());
         bool completed = false;
@@ -4503,7 +4503,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // STATIC (action,local)-keyed pool → identical device addresses across the pre-residency pass, the capture
         // pass, and every replay (XLA/TensorRT-style position-keyed buffer assignment). action=-1 disables pooling
         // (the pre-pass's persistent EnsureResidentBuffer allocs must NOT be pooled).
-        var de = engine as Engines.DirectGpuTensorEngine;
+        var de = engine.As<Engines.DirectGpuTensorEngine>();
         de?.SetCurrentScratchAction(-1);
         // Pre-pass only (allocation is illegal inside the capture): give every external leaf a stable device buffer
         // holding its current data, so the captured ops read it through that buffer and replays can refresh it. An
@@ -4548,7 +4548,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // backward accumulates into gradMap[input] in place; without a resident buffer that accumulator lived on
         // the host and every TensorAddInPlace downloaded it → CUDA-900 abort). Allocate ONLY in the not-capturing
         // pre-pass; during capture/replay the buffers already exist and we just memset + accumulate in place.
-        var residentEngine = engine as Engines.DirectGpuTensorEngine;
+        var residentEngine = engine.As<Engines.DirectGpuTensorEngine>();
         bool capturingNow = IsCapturing();
         if (residentEngine is not null && !capturingNow)
         {
@@ -4751,12 +4751,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // whole step resident; safest, what shipped in the #226 fix).
         var evictGuard = System.Environment.GetEnvironmentVariable("AIDOTNET_GPU_OFFLOAD") == "1"
             ? null
-            : engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+            : engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
         evictGuard?.SuspendActivationEviction();
         // Snapshot the activation-cache timestamp before this eager compiled step. Step() returns only the scalar
         // loss and exposes parameter gradients; all other forward/backward intermediates created during the step
         // are dead after the optimizer runs and must not accumulate across long training loops.
-        var stepActivationEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        var stepActivationEngine = engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
         long stepActivationSnapshot = stepActivationEngine?.ActivationCacheTimestampSnapshot() ?? -1;
         // FP16 mixed precision on the FUSED path (AiDotNet #1354 / #555). The fused plan
         // ignores AiDotNet's _mixedPrecisionContext, but the Tensors-level AutocastScope is
@@ -4910,7 +4910,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         long t1 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordForward(Stopwatch.GetTimestamp() - fwdStart);
 
-        if (_pooledGradients is not null && engine is Engines.DirectGpuTensorEngine) UnpoolGradients();
+        if (_pooledGradients is not null && engine.Is<Engines.DirectGpuTensorEngine>()) UnpoolGradients();
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
         // The first step zeroes every gradient buffer; later steps zero only the accumulating ones (below).
@@ -4948,7 +4948,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // not write keep being zeroed (see RecordEagerFirstWriteCoverage).
         int eagerGradWriteGeneration = 0;
         var eagerCandidates = _eagerFirstWriteCandidates;
-        if (eagerCandidates is not null && engine is not Engines.DirectGpuTensorEngine && _fp16HeteroOrder is null)
+        if (eagerCandidates is not null && !engine.Is<Engines.DirectGpuTensorEngine>() && _fp16HeteroOrder is null)
         {
             eagerGradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
             bool verified = _eagerFirstWriteVerified;
@@ -5140,7 +5140,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // before that deferred producer has committed its values to live
         // storage. Specialized delegates already write synchronously and pay
         // only the null check here.
-        if (_optimizerUpdate is not null && _engine is not Engines.DirectGpuTensorEngine)
+        if (_optimizerUpdate is not null && !_engine.Is<Engines.DirectGpuTensorEngine>())
         {
             for (int p = 0; p < _gradients.Length; p++)
             {
@@ -5250,7 +5250,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // here but their device memory is only released by the GC finalizer, which cannot keep
             // pace under fast stepping (steady climb to OOM, "drained 0 pooled buffers"). Force a
             // finalizer-backed reclaim under memory pressure (cheap no-op when not pressured).
-            (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.ReclaimGpuMemoryUnderPressure();
+            (engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>())?.ReclaimGpuMemoryUnderPressure();
         }
     }
 
@@ -5901,7 +5901,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // resident FP16 training), so the optimizer below updates it ON THE DEVICE. Unbound, a float32 parameter took
             // the host update path: weights round-tripped every step and each host write retired the captured step
             // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
-            if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+            if (_engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var rde))
                 rde.BindResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
@@ -6617,7 +6617,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 for (int p = 0; p < paramCount; p++)
                 {
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
-                    if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                    if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine) && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
                     {
                         rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
                         CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
@@ -6640,7 +6640,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 for (int p = 0; p < paramCount; p++)
                 {
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
-                    if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                    if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine) && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
                     {
                         rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
                         CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
@@ -6851,7 +6851,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // mistrain that hit the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS on by default).
                     // Re-registering re-arms the download against the CURRENT device buffer (HostSync
                     // .Register TryAdds, so it's a no-op if a read is still pending, and re-arms after one fired).
-                    if (_engine is Engines.DirectGpuTensorEngine _rebindEngine)
+                    if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var _rebindEngine))
                     {
                         _rebindEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
                         CommitDeviceParameterUpdate(_rebindEngine, p, gpuP, gpuBe);
@@ -7124,7 +7124,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // authoritative copy everywhere it is looked up; `from` is the set the persistent weight cache names now.
             void BindSet(int set, int from)
             {
-                if (_engine is not Engines.DirectGpuTensorEngine rebindEngine) return;
+                if (!_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine)) return;
                 for (int p = 0; p < paramCount; p++)
                 {
                     if (gpuParam[p] is not { } a || gpuBackends[p] is not { } beBind) continue;
@@ -7337,7 +7337,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // resident FP16 training), so the optimizer below updates it ON THE DEVICE. Unbound, a float32 parameter took
             // the host update path: weights round-tripped every step and each host write retired the captured step
             // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
-            if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+            if (_engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var rde))
                 rde.BindResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
@@ -7705,7 +7705,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // And make the update authoritative in the persistent weight cache, as the non-grouped branch does:
                     // a cache entry stamped with the pre-update version judged the updated buffer stale and re-uploaded
                     // the old host weights over it. Every float32 parameter reaches this branch now, not just FP16 plans.
-                    if (_engine is Engines.DirectGpuTensorEngine groupedEngine)
+                    if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var groupedEngine))
                     {
                         groupedEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
                         CommitDeviceParameterUpdate(groupedEngine, p, gpuP, gpuBe);
@@ -8940,7 +8940,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // device buffer instead of the fresh host weights, needlessly diverging the gradients from the FP32
         // reference. Leaving the param unpinned lets TryCastResidentForwardHalf fall back to the tested host cast.
         if (ResidentFp16TrainingEnabled && _optimizerUpdate is not null
-            && engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine prde)
+            && engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var prde))
             for (int p = 0; p < _parameters.Length; p++)
                 prde.RegisterResidentParamBuffer(_parameters[p]);
 
@@ -8968,7 +8968,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The paged plan's backward pages activations in (up-cast) before each node's backward reads them and
         // frees them after the last read — the tested mixed-dtype reverse pass (MixedPrecisionGraphBackward).
         var result = _fp16PagedPlan.Backward();
-        var residentEng = ResidentFp16TrainingEnabled ? engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine : null;
+        var residentEng = ResidentFp16TrainingEnabled ? engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>() : null;
         if (residentEng is not null && (_residentGradBuffers is null || _residentGradBuffers.Length != _parameters.Length))
             _residentGradBuffers = new Engines.DirectGpu.IGpuBuffer?[_parameters.Length];
         for (int p = 0; p < _parameters.Length; p++)
@@ -9369,7 +9369,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var convEpilogueChains = new Dictionary<int, int[]>();
         var convEpilogueDeadInternals = new List<Tensor<T>>();
         if (typeof(T) == typeof(float) && !useGradPool && !preferGenericForGpu
-            && engine is CpuEngine && !engine.SupportsGpu
+            && engine.Is<CpuEngine>() && !engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
         {
             var claimedElsewhere = new HashSet<int>(fusedStepIndices);
@@ -9551,7 +9551,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var shortcutPairs = new Dictionary<int, (int Main, int Shortcut)>();
         var consumedByShortcutPair = new HashSet<int>();
         if (typeof(T) == typeof(float) && preferGenericForGpu && !useGradPool && fp16HeteroOrder is null
-            && engine is IConvShortcutPairEngine shortcutEngine
+            && engine.TryGet<IConvShortcutPairEngine>(out var shortcutEngine)
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION") != "0")
         {
             var excluded = new HashSet<int>(fusedStepIndices);
@@ -10049,7 +10049,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if ((fs.OpName == "BatchNormReLU" || fs.OpName == "BatchNormAddReLU")
                     && consumerCount.TryGetValue(fs.OutputBuffer, out int outputUses) && outputUses == 2)
                     deferrable.Add(fs.OutputBuffer);
-            if (deferrable.Count > 0 && engine is DirectGpuTensorEngine) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
+            if (deferrable.Count > 0 && engine.Is<DirectGpuTensorEngine>()) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
             scope.ReleaseStorageLeases();
             DropStorageOfRemovedOutputs(scope.Nodes, optimized, forwardSteps, parameters);
             plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
@@ -11090,7 +11090,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (step.OpType == OpType.Swish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // ELU forward: pinned SIMD ELUUnsafe
@@ -11114,7 +11114,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Log forward: pinned LogUnsafe — bypass EnsureMaterialized
@@ -11136,7 +11136,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (step.OpType == OpType.TensorLog && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Exp forward: SIMD ExpUnsafe, pinned GCHandle
@@ -11163,7 +11163,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Mish forward: pinned MishUnsafe — bypass EnsureMaterialized
@@ -11185,7 +11185,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (step.OpType == OpType.Mish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
@@ -11325,7 +11325,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var capDilation = dilation;
                 return eng =>
                 {
-                    if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                    if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                         cpuEng.Conv2DInto(o, inp, kernel, capStride, capPadding, capDilation);
                     else
                     {
@@ -11344,7 +11344,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var defDilation = new[] { 1, 1 };
             return eng =>
             {
-                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                     cpuEng.Conv2DInto(o, inp, kernel, defStride, defPadding, defDilation);
                 else
                 {
@@ -11390,7 +11390,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var capOutPad = new[] { 0, 0 };
             return eng =>
             {
-                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                     cpuEng.ConvTranspose2DInto(o, inp, kernel, capStride, capPadding, capOutPad);
                 else
                 {
@@ -11443,7 +11443,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return eng =>
             {
                 Tensor<T> freshMean, freshVar;
-                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
                     cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
                 else
                 {
@@ -11478,9 +11478,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // LogSoftmax forward: pinned SIMD FusedLogSoftmaxRow per row
+        // LogSoftmax forward: pinned SIMD FusedLogSoftmaxRow per row -- a row is the LAST axis, so only a step recorded
+        // over that axis (the axis the node saves; old nodes without it were last-axis). Taking any rank-2 LogSoftmax
+        // here replayed a log-softmax over axis 0 as one over axis 1: wrong values, which looked like the compiled plan
+        // ignoring its live inputs. Other axes fall through to the generic replay of the recorded engine call.
         if (step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1 && typeof(T) == typeof(float)
-            && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2)
+            && step.Inputs[0].IsContiguous && step.Inputs[0].Rank == 2
+            && (step.SavedState is not { Length: > 0 } || (step.SavedState[0] is int lsmForwardAxis && (lsmForwardAxis == 1 || lsmForwardAxis == -1))))
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             var inH = PinAndTrack(
@@ -11532,21 +11536,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (step.OpType == OpType.TensorSqrt && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Sin forward: SIMD via CpuEngine.TensorSinInto
         if (step.OpType == OpType.Sin && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Cos forward: SIMD via CpuEngine.TensorCosInto
         if (step.OpType == OpType.Cos && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Softplus forward: SIMD SoftplusUnsafe with pinned arrays
@@ -12555,7 +12559,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         return engine =>
         {
-            if (engine is not CpuEngine cpu)
+            if (!engine.TryGet<CpuEngine>(out var cpu))
             {
                 ReplayBroadcastBinaryEagerly(engine, step.OpType, left, right, output);
                 return;
@@ -12728,7 +12732,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 // A fallback only on a GPU engine. On the CPU engine host gradients are the normal case, and recording
                 // it (a formatted key + a ConcurrentDictionary update) cost every CPU training step ~1% of its time.
-                if (_engine is Engines.DirectGpuTensorEngine)
+                if (_engine.Is<Engines.DirectGpuTensorEngine>())
                     Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
                 return false;
             }
@@ -12810,7 +12814,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!zeroNonFinite) RecordClipSumOfSquares(cb, buffers, sizes);
             multi.MultiTensorClipScale(buffers, sizes, scale, zeroNonFinite);
             for (int p = 0; p < owners.Count; p++)
-                (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(owners[p], buffers[p], cb);
+                (_engine.As<Engines.DirectGpuTensorEngine>())?.BindResidentBuffer(owners[p], buffers[p], cb);
             return true;
         }
 
@@ -12863,7 +12867,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // The scale is a device write: re-arm the host copy's pending download, or a host reader whose copy
                 // was already materialized (a host optimizer, for one) keeps the UNCLIPPED values. Measured on an LM
                 // compiled step with SGD: every parameter moved 2.8x the clipped amount.
-                (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(g, buf, cb);
+                (_engine.As<Engines.DirectGpuTensorEngine>())?.BindResidentBuffer(g, buf, cb);
             }
         }
         return true;
@@ -13250,7 +13254,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (typeof(T) == typeof(float) && step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1
             && step.Inputs[0].Rank == 2 && step.Inputs[0].IsContiguous && step.OutputBuffer.IsContiguous
             && (step.SavedState is not { Length: > 0 } || (step.SavedState[0] is int lsmAxis && (lsmAxis == 1 || lsmAxis == -1)))
-            && engine is CpuEngine lsmCpu && !engine.SupportsGpu)
+            && engine.TryGet<CpuEngine>(out var lsmCpu) && !engine.SupportsGpu)
         {
             var lsmIn = step.Inputs[0];
             var lsmOut = step.OutputBuffer;
@@ -13717,7 +13721,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var capDilation = dilation;
             return eng =>
             {
-                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu)
                 {
                     if (needInputGrad)
                         cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
@@ -13808,7 +13812,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // batch-norm backward kernel, straight into the plan's buffers, claiming first writes like the BatchNorm branch
         // below. The BatchNorm output and its gradient never exist.
         if (step.OpName == "BatchNormReLU" && typeof(T) == typeof(float) && step.Inputs.Length == 3
-            && engine is CpuEngine && !engine.SupportsGpu
+            && engine.Is<CpuEngine>() && !engine.SupportsGpu
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.Inputs[2].IsContiguous
             && step.OutputBuffer.IsContiguous
             && step.SavedState is { Length: >= 3 } fusedSaved
@@ -13831,7 +13835,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bool accumInput = AccumulatesInto(fusedGradInput, sharedInput);
                 bool accumGamma = AccumulatesInto(fusedGradGamma, sharedGamma);
                 bool accumBeta = AccumulatesInto(fusedGradBeta, sharedBeta);
-                if (eng is not CpuEngine cpu || !cpu.TryBatchNormReluBackwardInto(
+                if (!eng.TryGet<CpuEngine>(out var cpu) || !cpu.TryBatchNormReluBackwardInto(
                         (Tensor<float>)(object)fusedGradInput, (Tensor<float>)(object)fusedGradGamma,
                         (Tensor<float>)(object)fusedGradBeta, (Tensor<float>)(object)fusedGradOut,
                         (Tensor<float>)(object)reluOut, (Tensor<float>)(object)x, (Tensor<float>)(object)gammaT,
@@ -13883,7 +13887,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bool accumInput = AccumulatesInto(gradInput, sharedInput);
                 bool accumGamma = AccumulatesInto(gradGamma, sharedGamma);
                 bool accumBeta = AccumulatesInto(gradBeta, sharedBeta);
-                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu)
                 {
                     cpu.BatchNormBackwardInto(gradInput, gradGamma, gradBeta,
                         gradOut, input, gammaT, meanT, varianceT, epsilonD,
@@ -14180,7 +14184,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && geometry[0] is int[] { Length: 2 } recomputePool
             && geometry[1] is int[] { Length: 2 } recomputeStride
             && step.Inputs[0].Rank == 4 && step.Inputs[0].IsContiguous
-            && engine is CpuEngine && !engine.SupportsGpu)
+            && engine.Is<CpuEngine>() && !engine.SupportsGpu)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -14190,7 +14194,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int pH = recomputePool[0], pW = recomputePool[1], sH = recomputeStride[0], sW = recomputeStride[1];
             return eng =>
             {
-                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu)
                 {
                     cpu.MaxPool2DBackwardRecomputeInto(gradIn, gradOut, input, pH, pW, sH, sW, accum);
                 }
@@ -14220,7 +14224,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && step.Inputs[0].Rank == 4 && step.OutputBuffer.Rank == 4
             && step.OutputBuffer._shape[2] == aapOutH && step.OutputBuffer._shape[3] == aapOutW
             && step.BackwardFn is { } genericBackward
-            && engine is CpuEngine && !engine.SupportsGpu)
+            && engine.Is<CpuEngine>() && !engine.SupportsGpu)
         {
             var input = step.Inputs[0];
             var output = step.OutputBuffer;
@@ -14234,7 +14238,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var savedState = step.SavedState;
             return eng =>
             {
-                if (eng is CpuEngine && !eng.SupportsGpu)
+                if (eng.Is<CpuEngine>() && !eng.SupportsGpu)
                 {
                     CpuEngine.AdaptiveAvgPool2DBackwardFloat(gradOutArr, 0, gradInArr, 0, planes,
                         inH, inW, aapOutH, aapOutW, accum);
@@ -14301,14 +14305,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // The scalar AvgPool2D overload also records padding and whether padded cells count in the divisor.
             int[] poolPad = savedState.Length > 2 && savedState[2] is int[] { Length: 2 } recordedPad ? recordedPad : new[] { 0, 0 };
             bool countIncludePad = savedState.Length > 3 && savedState[3] is bool recordedCip && recordedCip;
-            bool direct = typeof(T) == typeof(float) && engine is CpuEngine && !engine.SupportsGpu
+            bool direct = typeof(T) == typeof(float) && engine.Is<CpuEngine>() && !engine.SupportsGpu
                 && input.Rank == 4 && output.Rank == 4;
             return eng =>
             {
                 // A float plan on the CPU spreads the gradient straight into the input-gradient buffer. The eager op
                 // rented a fresh input-sized result every step (a large-object-heap array per transition layer) to
                 // copy or add in. The arrays are fetched each step: a pooled gradient's array is assigned after build.
-                if (direct && eng is CpuEngine && !eng.SupportsGpu && gradOut.IsContiguous && gradIn.IsContiguous
+                if (direct && eng.Is<CpuEngine>() && !eng.SupportsGpu && gradOut.IsContiguous && gradIn.IsContiguous
                     && gradOut.GetCpuBackingForStridedRead(out int goOff) is float[] go
                     && gradIn.GetCpuBackingForContiguousWrite(out int giOff) is float[] gi
                     && go.Length - goOff >= gradOut.Length && gi.Length - giOff >= gradIn.Length)
@@ -15257,7 +15261,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             forwardSpecs[convIdx] = eng =>
             {
-                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu)
                 {
                     // Nothing reads the raw convolution once the chain is fused (the backward uses the activation),
                     // so the conv writes the activation directly. The forward diagnostics inspect each step's own
@@ -15281,7 +15285,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
             backwardSpecs[poolIdx >= 0 ? poolIdx : last] = eng =>
             {
-                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu)
                 {
                     if (gradPoolOutF is not null && poolIsAdaptiveAvg)
                         cpu.AdaptiveAvgPoolReluBiasBackwardInto(gradConvOutF, gradBiasF, gradPoolOutF, yF, accumBias);

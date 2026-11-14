@@ -745,7 +745,7 @@ public partial class CpuEngine
                 DifferentiableOps.AccumulateGrad(grads, inputs[i], recorded[i], engine);
             return;
         }
-        if (engine is DirectGpuTensorEngine gpu && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
         {
             for (int i = 0; i < 5; i++)
                 DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);

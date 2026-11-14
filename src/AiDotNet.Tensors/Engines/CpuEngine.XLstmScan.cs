@@ -528,7 +528,10 @@ public partial class CpuEngine
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
-        if (engine is DirectGpuTensorEngine gpu)
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.CreatesGraph && XLstmScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, numHeads))
+            return;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             gpu.XLstmDeviceBackward(gradOutput, inputs, numHeads, grads);
             return;
@@ -581,5 +584,54 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, iGate, dI, engine);
         DifferentiableOps.AccumulateGrad(grads, fGate, dF, engine);
         DifferentiableOps.AccumulateGrad(grads, oGate, dO, engine);
+    }
+
+    // The create-graph path of XLstmScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool XLstmScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            int numHeads)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => XLstmScanComposite(e, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], numHeads));
+
+    // The mLSTM recurrence as recorded ops (see XLstmScanForward). The input gate's clamp and the normaliser's
+    // max(|n·q|, 1) select their branch through constant masks read from the values, as their derivatives do.
+    private static Tensor<T> XLstmScanComposite<T>(IEngine e, Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj,
+        Tensor<T> iGate, Tensor<T> fGate, Tensor<T> oGate, int numHeads)
+    {
+        int batch = qProj.Shape[0], seqLen = qProj.Shape[1], modelDim = qProj.Shape[2], headDim = modelDim / numHeads;
+        double kappa = 1.0 / Math.Sqrt(headDim);
+        Tensor<T> cell = RecordedOps<T>.Zeros(batch, numHeads, headDim, headDim);
+        Tensor<T> norm = RecordedOps<T>.Zeros(batch, numHeads, headDim);
+        Tensor<T> Vec(Tensor<T> x, int t) => RecordedOps<T>.R(e, RecordedOps<T>.At(e, x, 1, t), batch, numHeads, headDim);
+        Tensor<T> Gate(Tensor<T> x, int t) => RecordedOps<T>.R(e, RecordedOps<T>.At(e, x, 1, t), batch, numHeads, 1);
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var iRaw = Gate(iGate, t);
+            var keep = RecordedOps<T>.Constant(iRaw, v => v > XLstmIGateClamp ? 0.0 : 1.0);
+            var i = e.TensorAdd(e.TensorMultiply(iRaw, keep),
+                RecordedOps<T>.Constant(iRaw, v => v > XLstmIGateClamp ? XLstmIGateClamp : 0.0));
+            var f = Gate(fGate, t);
+            var o = Gate(oGate, t);
+            var kS = RecordedOps<T>.Scale(e, Vec(kProj, t), kappa);
+            var q = Vec(qProj, t);
+            norm = e.TensorAdd(RecordedOps<T>.Mul(e, f, norm), RecordedOps<T>.Mul(e, i, kS));
+            var write = RecordedOps<T>.Mul(e,
+                RecordedOps<T>.R(e, Vec(vProj, t), batch, numHeads, headDim, 1), RecordedOps<T>.R(e, kS, batch, numHeads, 1, headDim));
+            var f4 = RecordedOps<T>.R(e, f, batch, numHeads, 1, 1);
+            var i4 = RecordedOps<T>.R(e, i, batch, numHeads, 1, 1);
+            cell = e.TensorAdd(RecordedOps<T>.Mul(e, f4, cell), RecordedOps<T>.Mul(e, i4, write));
+            var nq = RecordedOps<T>.Sum(e, e.TensorMultiply(norm, q), 2, keep: true);                     // [B, H, 1]
+            var sign = RecordedOps<T>.Constant(nq, v => Math.Abs(v) >= 1.0 ? (v < 0 ? -1.0 : 1.0) : 0.0);
+            var floor = RecordedOps<T>.Constant(nq, v => Math.Abs(v) >= 1.0 ? 0.0 : 1.0);
+            var nf = e.TensorAdd(e.TensorMultiply(nq, sign), floor);
+            var num = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, cell, RecordedOps<T>.R(e, q, batch, numHeads, 1, headDim)), 3, keep: false);
+            var h = RecordedOps<T>.Div(e, RecordedOps<T>.Mul(e, o, num), nf);
+            ys.Add(RecordedOps<T>.R(e, h, batch, modelDim));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 }

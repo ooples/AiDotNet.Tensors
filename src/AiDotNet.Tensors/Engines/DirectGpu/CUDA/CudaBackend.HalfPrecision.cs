@@ -50,22 +50,14 @@ public sealed partial class CudaBackend : IFp16ConvBatchedGemmBackend
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
 
+        // FP16 operands and output, FP32 accumulation (PyTorch's half matmul: cuBLAS CUBLAS_COMPUTE_32F). cublasHgemm
+        // and a half-accumulating kernel would round every partial sum to FP16, which stops growing at 2048 + 1.
         if (TryDirectPtxFp16Gemm(
             aFp16, bFp16, cFp16, m, n, k,
-            outputType: DirectPtxGemmOutputType.Float16,
-            halfAccumulate: true))
+            outputType: DirectPtxGemmOutputType.Float16))
             return;
 
-        using var _ = PushContext();
-        // C = A · B (alpha = 1, beta = 0). cuBLAS is column-major. To compute row-major C = A · B we
-        // dispatch as C^T = B^T · A^T → cublas args (B, A, B->ldb=n,
-        // A->lda=k, C->ldc=n) with swapped m/n.
-        BlasHgemmUnit(
-                CublasOperation.None, CublasOperation.None,
-                n, m, k,
-                bFp16.Handle, n,
-                aFp16.Handle, k,
-                cFp16.Handle, n, "cublasHgemm");
+        CublasGemmFp16HalfOut(aFp16, bFp16, cFp16, m, n, k, 1f, 0f);
     }
 
     /// <inheritdoc/>

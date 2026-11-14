@@ -32,7 +32,7 @@ public partial class CpuEngine
             return scope.RecordBinary(LazyNodeType.Custom, "CausalDepthwiseConv1D", input, kernel, (int[])input._shape.Clone(),
                 (eng, result) =>
                 {
-                    var conv = eng as CpuEngine ?? new CpuEngine();
+                    var conv = eng.As<CpuEngine>() ?? new CpuEngine();
                     DirectGpuTensorEngine.CopyResultInto(eng, conv.CausalDepthwiseConv1D(capturedInput, capturedKernel), result);
                 },
                 CausalDepthwiseConv1DBackward<T>);
@@ -91,7 +91,7 @@ public partial class CpuEngine
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // A non-CpuEngine IEngine has no causal-convolution kernels; the managed CPU ones compute the same sums.
-        var conv = engine as CpuEngine ?? new CpuEngine();
+        var conv = engine.As<CpuEngine>() ?? new CpuEngine();
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
             DifferentiableOps.AccumulateGrad(grads, inputs[0], conv.CausalDepthwiseConv1DBackwardInput(gradOutput, inputs[1]), engine);
         if (DifferentiableOps.IsGradientRequired(inputs[1]))

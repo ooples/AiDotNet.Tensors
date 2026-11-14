@@ -438,6 +438,10 @@ public partial class CpuEngine
         var cParam = inputs[4];
         var dParam = inputs[5];
 
+        // Under create-graph the gradient must itself be differentiable: differentiate the scan written as recorded ops.
+        if (BackwardFunctions<T>.CreatesGraph && MambaSelectiveScanBackwardCreateGraph<T>(gradOutput, inputs, engine, grads, x, delta, aLog, bParam, cParam, dParam))
+            return;
+
         int batch = x.Shape[0];
         int seqLen = x.Shape[1];
         int innerDim = x.Shape[2];
@@ -479,5 +483,45 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, bParam, dB, engine);
         DifferentiableOps.AccumulateGrad(grads, cParam, dC, engine);
         DifferentiableOps.AccumulateGrad(grads, dParam, dD, engine);
+    }
+
+    // The create-graph path of MambaSelectiveScanBackward, kept out of it so its first-order path allocates no closure.
+    private static bool MambaSelectiveScanBackwardCreateGraph<T>(
+            Tensor<T> gradOutput,
+            Tensor<T>[] inputs,
+            IEngine engine,
+            Dictionary<Tensor<T>, Tensor<T>> grads,
+            Tensor<T> x,
+            Tensor<T> delta,
+            Tensor<T> aLog,
+            Tensor<T> bParam,
+            Tensor<T> cParam,
+            Tensor<T> dParam)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => MambaSelectiveScanComposite(e, x, delta, aLog, bParam, cParam, dParam));
+
+    // The selective scan as recorded ops (the create-graph backward differentiates it):
+    // h_t = exp(Δ_t ⊙ -exp(A)) ⊙ h_{t-1} + Δ_t ⊙ B_t ⊙ x_t,  y_t = Σ_n C_t ⊙ h_t + D ⊙ x_t.
+    private static Tensor<T> MambaSelectiveScanComposite<T>(IEngine e, Tensor<T> x, Tensor<T> delta, Tensor<T> aLog,
+        Tensor<T> bParam, Tensor<T> cParam, Tensor<T> dParam)
+    {
+        int batch = x.Shape[0], seqLen = x.Shape[1], innerDim = x.Shape[2], stateDim = aLog.Shape[1];
+        var negA = RecordedOps<T>.R(e, e.TensorNegate(e.TensorExp(aLog)), 1, innerDim, stateDim);
+        var d = RecordedOps<T>.R(e, dParam, 1, innerDim);
+        Tensor<T> h = RecordedOps<T>.Zeros(batch, innerDim, stateDim);
+        var ys = new List<Tensor<T>>(seqLen);
+        for (int t = 0; t < seqLen; t++)
+        {
+            var xt = RecordedOps<T>.At(e, x, 1, t);
+            var dt = RecordedOps<T>.R(e, RecordedOps<T>.At(e, delta, 1, t), batch, innerDim, 1);
+            var bt = RecordedOps<T>.R(e, RecordedOps<T>.At(e, bParam, 1, t), batch, 1, stateDim);
+            var ct = RecordedOps<T>.R(e, RecordedOps<T>.At(e, cParam, 1, t), batch, 1, stateDim);
+            var aBar = e.TensorExp(RecordedOps<T>.Mul(e, dt, negA));
+            var drive = RecordedOps<T>.Mul(e, RecordedOps<T>.Mul(e, dt, bt), RecordedOps<T>.R(e, xt, batch, innerDim, 1));
+            h = RecordedOps<T>.Add(e, RecordedOps<T>.Mul(e, aBar, h), drive);
+            var y = RecordedOps<T>.Sum(e, RecordedOps<T>.Mul(e, ct, h), 2, keep: false);
+            ys.Add(RecordedOps<T>.Add(e, y, RecordedOps<T>.Mul(e, d, xt)));
+        }
+        return RecordedOps<T>.Stack(e, ys, 1);
     }
 }

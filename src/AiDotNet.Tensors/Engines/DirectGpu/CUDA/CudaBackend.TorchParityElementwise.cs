@@ -37,6 +37,7 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         TorchParityUnaryOp.Mvlgamma => "parity_mvlgamma",
         TorchParityUnaryOp.Angle => "parity_angle",
         TorchParityUnaryOp.NonZero => "parity_nonzero",
+        _ when TorchModelOpsCodes.ActivationKernel(op) is { } modelKernel => modelKernel,
         _ => throw new ArgumentOutOfRangeException(nameof(op)),
     };
 

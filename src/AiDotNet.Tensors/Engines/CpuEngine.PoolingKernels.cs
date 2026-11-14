@@ -14,11 +14,10 @@ public partial class CpuEngine
     /// <summary>
     /// One plane of the tiling 2x2 stride-2 max-pool backward (<see cref="MaxPool2DBackwardRecomputeInto{T}"/>), eight
     /// windows per AVX step: the two input rows are de-interleaved into the four taps, each window's winner is chosen
-    /// with the scalar rule (start at float.MinValue, strict ordered greater-than in tap order, so the first maximum
-    /// wins and NaN never does), and the four output cells are written as <c>0 + g</c> on the winner and +0 elsewhere,
-    /// re-interleaved into the two rows. A window with no winner (all NaN or -inf) sends its gradient to its own first
-    /// tap, as the saved-index forward records it: the same additions in the same order as the scalar loop, so the
-    /// plane is bit-identical. The columns past the last full block of eight windows run the scalar loop.
+    /// with the forward rule (start at tap 0, strict ordered greater-than in tap order, so the first maximum wins, a
+    /// NaN tap 0 stays and a later NaN never wins), and the four output cells are written as <c>0 + g</c> on the winner
+    /// and +0 elsewhere, re-interleaved into the two rows: the same additions in the same order as the scalar loop, so
+    /// the plane is bit-identical. The columns past the last full block of eight windows run the scalar loop.
     /// </summary>
     [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     private static unsafe void MaxPool2x2Stride2TilesBackwardPlane(
@@ -52,10 +51,9 @@ public partial class CpuEngine
                 for (; ow < outW; ow++)
                 {
                     int iw0 = 2 * ow;
-                    float maxVal = float.MinValue;
-                    int winner = 0;   // a winnerless window routes to its own first cell
-                    float v = x0[iw0]; if (v > maxVal) { maxVal = v; winner = 0; }
-                    v = x0[iw0 + 1]; if (v > maxVal) { maxVal = v; winner = 1; }
+                    float maxVal = x0[iw0];   // tap 0, then only a strictly greater tap
+                    int winner = 0;
+                    float v = x0[iw0 + 1]; if (v > maxVal) { maxVal = v; winner = 1; }
                     v = x1[iw0]; if (v > maxVal) { maxVal = v; winner = 2; }
                     v = x1[iw0 + 1]; if (v > maxVal) { winner = 3; }
                     d0[iw0] = 0f; d0[iw0 + 1] = 0f; d1[iw0] = 0f; d1[iw0 + 1] = 0f;
@@ -71,7 +69,6 @@ public partial class CpuEngine
     [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
     private static unsafe void MaxPoolBackward8(float* x0, float* x1, float* gr, float* d0, float* d1, int ow)
     {
-                    var minV = Vector256.Create(float.MinValue);
                     var zero = Vector256<float>.Zero;
                     var t0 = Vector256.Create(0f); var t1 = Vector256.Create(1f);
                     var t2 = Vector256.Create(2f); var t3 = Vector256.Create(3f);
@@ -85,12 +82,10 @@ public partial class CpuEngine
                         var b = DeinterleaveOdd(r0lo, r0hi);
                         var cc = DeinterleaveEven(r1lo, r1hi);
                         var dd = DeinterleaveOdd(r1lo, r1hi);
-                        var m = minV;
-                        // Tap 0 until a tap beats float.MinValue: a winnerless window routes to its own first cell.
+                        // Tap 0, replaced only by a strictly greater tap (the forward's rule).
+                        var m = a;
                         var sel = t0;
-                        var gt = Avx.Compare(a, m, FloatComparisonMode.OrderedGreaterThanNonSignaling);
-                        m = Avx.BlendVariable(m, a, gt); sel = Avx.BlendVariable(sel, t0, gt);
-                        gt = Avx.Compare(b, m, FloatComparisonMode.OrderedGreaterThanNonSignaling);
+                        var gt = Avx.Compare(b, m, FloatComparisonMode.OrderedGreaterThanNonSignaling);
                         m = Avx.BlendVariable(m, b, gt); sel = Avx.BlendVariable(sel, t1, gt);
                         gt = Avx.Compare(cc, m, FloatComparisonMode.OrderedGreaterThanNonSignaling);
                         m = Avx.BlendVariable(m, cc, gt); sel = Avx.BlendVariable(sel, t2, gt);
@@ -119,11 +114,9 @@ public partial class CpuEngine
         var dd = Sse.Shuffle(r1lo, r1hi, 0b11_01_11_01);
         var t0 = Vector128.Create(0f); var t1 = Vector128.Create(1f);
         var t2 = Vector128.Create(2f); var t3 = Vector128.Create(3f);
-        var m = Vector128.Create(float.MinValue);
+        var m = a;   // tap 0, replaced only by a strictly greater tap (the forward's rule)
         var sel = t0;
-        var gt = Sse.CompareGreaterThan(a, m);
-        m = Sse41.BlendVariable(m, a, gt); sel = Sse41.BlendVariable(sel, t0, gt);
-        gt = Sse.CompareGreaterThan(b, m);
+        var gt = Sse.CompareGreaterThan(b, m);
         m = Sse41.BlendVariable(m, b, gt); sel = Sse41.BlendVariable(sel, t1, gt);
         gt = Sse.CompareGreaterThan(cc, m);
         m = Sse41.BlendVariable(m, cc, gt); sel = Sse41.BlendVariable(sel, t2, gt);

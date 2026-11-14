@@ -181,7 +181,7 @@ public partial class DirectGpuTensorEngine
             lastStepOnly ? new[] { b, h } : new[] { b, t, h },
             (eng, output) =>
             {
-                var gpu = (DirectGpuTensorEngine)eng;
+                var gpu = eng.Cast<DirectGpuTensorEngine>();
                 using var __gpuOp = gpu.EnterGpuOp();
                 var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
                 // The cache is resolved when the node runs, with the backend live; it is per layer (keyed by the
@@ -219,7 +219,7 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         var backend = GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
-        var inputC = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+        var inputC = input.IsContiguous ? input : input.Contiguous();
         using var bufInput = GetOrAllocateBuffer(backend, inputC);
         using var bufWih = GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = GetOrAllocateBuffer(backend, wHh);
@@ -246,7 +246,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var gpu = (DirectGpuTensorEngine)engine;
+        var gpu = engine.Cast<DirectGpuTensorEngine>();
         var c = (LstmTrainCache)savedState[0];
         var stamp = (LstmForwardStamp)savedState[1];
         bool lastStepOnly = savedState.Length > 2 && savedState[2] is true;
@@ -261,9 +261,9 @@ public partial class DirectGpuTensorEngine
         var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var input = inputs[0]; var wIh = inputs[1]; var wHh = inputs[2];
 
-        var gradOutC = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+        var gradOutC = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
         using var bufGradOut = gpu.GetOrAllocateBuffer(backend, gradOutC);
-        var inputC = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+        var inputC = input.IsContiguous ? input : input.Contiguous();
         using var bufInput = gpu.GetOrAllocateBuffer(backend, inputC);
         using var bufWih = gpu.GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = gpu.GetOrAllocateBuffer(backend, wHh);

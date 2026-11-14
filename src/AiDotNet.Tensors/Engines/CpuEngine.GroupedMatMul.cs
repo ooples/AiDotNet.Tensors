@@ -43,7 +43,7 @@ public partial class CpuEngine
             var ca = a; var cb = b; var cbias = bias;
             Action<IEngine, Tensor<T>> execute = (eng, result) =>
             {
-                var host = eng as CpuEngine ?? new CpuEngine();
+                var host = eng.As<CpuEngine>() ?? new CpuEngine();
                 DirectGpuTensorEngine.CopyResultInto(eng, host.GroupedRowsMatMul(ca, cb, ends, transposeB, cbias), result);
             };
             var state = new object[] { ends, transposeB };
@@ -112,7 +112,7 @@ public partial class CpuEngine
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var ends = (int[])savedState[0];
-        var grouped = engine as CpuEngine ?? new CpuEngine();
+        var grouped = engine.As<CpuEngine>() ?? new CpuEngine();
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
             DifferentiableOps.AccumulateGrad(grads, inputs[0], grouped.GroupedRowsMatMul(inputs[1], gradOutput, ends, true), engine);
         if (DifferentiableOps.IsGradientRequired(inputs[1]))
@@ -149,7 +149,7 @@ public partial class CpuEngine
     {
         var ends = (int[])savedState[0];
         bool transposeB = (bool)savedState[1];
-        var grouped = engine as CpuEngine ?? new CpuEngine();
+        var grouped = engine.As<CpuEngine>() ?? new CpuEngine();
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
             DifferentiableOps.AccumulateGrad(grads, inputs[0], grouped.GroupedRowsMatMul(gradOutput, inputs[1], ends, !transposeB), engine);
         if (DifferentiableOps.IsGradientRequired(inputs[1]))

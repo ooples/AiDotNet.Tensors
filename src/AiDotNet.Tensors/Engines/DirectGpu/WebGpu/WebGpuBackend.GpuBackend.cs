@@ -124,7 +124,7 @@ public sealed partial class WebGpuBackend
         long actualBytes = floatCountLong * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("WebGPU", actualBytes, MaxBufferAllocBytes, DeviceName);
         // Callers using byte-level access must account for the 4:1 byte-to-float ratio.
-        return new WebGpuBuffer(checked((int)floatCountLong));
+        return AllocateBufferCore(checked((int)floatCountLong), zeroInitialize: true);
     }
 
     public IGpuBuffer AllocateIntBuffer(int size)
@@ -133,7 +133,7 @@ public sealed partial class WebGpuBackend
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Int buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
-        return new WebGpuBuffer(size);
+        return AllocateBufferCore(size, zeroInitialize: true);
     }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
@@ -144,9 +144,11 @@ public sealed partial class WebGpuBackend
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.WebGpu);
         var floatData = new float[data.Length];
-        for (int i = 0; i < data.Length; i++)
-            floatData[i] = BitConverter.Int32BitsToSingle(data[i]);
-        return new WebGpuBuffer(floatData);
+        if (data.Length > 0)
+            Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
+        var buffer = WebGpuBuffer.Rent(floatData.Length, out _);
+        buffer.CopyFrom(floatData);
+        return buffer;
     }
 
     #endregion

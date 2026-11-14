@@ -340,8 +340,11 @@ public sealed partial class WebGpuBackend
             gradOutput, input, gradInput, MakeUniform3(size, minVal, maxVal), size).GetAwaiter().GetResult();
     }
 
+    // The CPU's clamp(x, 0, 6), through the exact clamp kernel: the activation module's min(max(x, 0), 6) took +0 for
+    // -0 and a bound for NaN.
     public void Relu6(IGpuBuffer A, IGpuBuffer B, int size)
-        => DispatchActivationAsync("relu6", A, B, size, 0).GetAwaiter().GetResult();
+        => Dispatch2BufferAsync("Clamp", WebGpuKernels.ClampSource, "clamp_op",
+            A, B, MakeUniform3(size, 0f, 6f), size).GetAwaiter().GetResult();
 
     public void Relu6Backward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size)
     {
@@ -418,7 +421,7 @@ public sealed partial class WebGpuBackend
 
     public void MaxPool1D(IGpuBuffer input, IGpuBuffer output, int batch, int channels, int inLength, int outLength, int kernelSize, int stride)
     {
-        Dispatch2BufferAsync("Pool1D", WebGpuKernels.Pool1DSource, "max_pool1d",
+        Dispatch2BufferAsync("ExactMaxPool1D", WebGpuExactPoolKernels.MaxPool1D, "max_pool1d",
             input, output, MakePoolUniform(batch, channels, inLength, outLength, kernelSize, stride),
             batch * channels * outLength).GetAwaiter().GetResult();
     }

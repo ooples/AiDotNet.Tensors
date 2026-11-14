@@ -542,6 +542,22 @@ export function copyBufferToBuffer(srcBufferId, srcOffset, dstBufferId, dstOffse
     queue.submit([commandEncoder.finish()]);
 }
 
+// Zeroes a byte range on the device. Submitted without waiting: the queue orders it before every later submission,
+// so a caller reusing a pooled buffer gets zeros without blocking (a browser's .NET thread cannot block on a Promise).
+export function clearBuffer(bufferId, offsetBytes, sizeBytes) {
+    if (!device) return;
+
+    const buffer = buffers.get(bufferId);
+    if (!buffer) {
+        console.error('Buffer not found');
+        return;
+    }
+
+    const commandEncoder = device.createCommandEncoder();
+    commandEncoder.clearBuffer(buffer, offsetBytes, sizeBytes);
+    queue.submit([commandEncoder.finish()]);
+}
+
 // Staging buffer pool management
 function getStagingBuffer(size) {
     for (let i = 0; i < stagingBufferPool.length; i++) {

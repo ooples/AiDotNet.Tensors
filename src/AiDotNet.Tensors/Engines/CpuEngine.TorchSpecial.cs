@@ -15,13 +15,17 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 public partial class CpuEngine
 {
-    // y = f(x) element-wise; dy/dx = derivative(x, y) when the op is differentiable.
+    // y = f(x) element-wise; dy/dx = derivative(x, y) when the op is differentiable. recordedDerivative(engine, x, y)
+    // is the same derivative written as recorded engine ops: under create-graph the backward multiplies by it, so the
+    // gradient stays differentiable in both the upstream gradient and x (see SpecialBackward.Unary).
     private static Tensor<T> SpecialUnary<T>(string opName, Tensor<T> tensor, Func<double, double> f,
-        Func<double, double, double>? derivative, Func<IEngine, Tensor<T>> replay)
+        Func<double, double, double>? derivative, Func<IEngine, Tensor<T>> replay,
+        Func<IEngine, Tensor<T>, Tensor<T>, Tensor<T>>? recordedDerivative = null)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         BackwardFunction<T>? backward = derivative is null ? null : SpecialBackward<T>.Unary;
-        object[]? saved = derivative is null ? null : new object[] { derivative };
+        object[]? saved = derivative is null ? null
+            : recordedDerivative is null ? new object[] { derivative } : new object[] { derivative, recordedDerivative };
         var lazy = TryRecordLazyUnary(opName, tensor, replay, backward, saved);
         if (lazy != null) return lazy;
         var ops = MathHelper.GetNumericOperations<T>();
@@ -31,14 +35,17 @@ public partial class CpuEngine
     }
 
     // y = f(a, b) element-wise over equal shapes; ∂y/∂a and ∂y/∂b = da/db(a, b, y) when given.
+    // recorded: the same partials as recorded engine ops of (engine, a, b, y), used under create-graph.
     private static Tensor<T> SpecialBinary<T>(string opName, Tensor<T> a, Tensor<T> b, Func<double, double, double> f,
-        Func<double, double, double, double>? da, Func<double, double, double, double>? db, Func<IEngine, Tensor<T>> replay)
+        Func<double, double, double, double>? da, Func<double, double, double, double>? db, Func<IEngine, Tensor<T>> replay,
+        RecordedBinaryDerivatives<T>? recorded = null)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         bool differentiable = da is not null || db is not null;
         BackwardFunction<T>? backward = differentiable ? SpecialBackward<T>.Binary : null;
-        object[]? saved = differentiable ? new object[] { new BinaryDerivatives(da, db) } : null;
+        object[]? saved = !differentiable ? null
+            : recorded is null ? new object[] { new BinaryDerivatives(da, db) } : new object[] { new BinaryDerivatives(da, db), recorded };
         var lazy = TryRecordLazyBinary(opName, a, b, replay, backward, saved);
         if (lazy != null) return lazy;
         var ops = MathHelper.GetNumericOperations<T>();
@@ -71,7 +78,7 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorErf<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorErf", tensor, Erf, (x, _) => TwoOverSqrtPi * Math.Exp(-x * x), e => e.TensorErf(tensor));
+        => SpecialUnary("TensorErf", tensor, Erf, (x, _) => TwoOverSqrtPi * Math.Exp(-x * x), e => e.TensorErf(tensor), DErf<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogit<T>(Tensor<T> tensor, double? eps = null)
@@ -80,7 +87,7 @@ public partial class CpuEngine
         return SpecialUnary("TensorLogit", tensor,
             x => { double c = Math.Min(Math.Max(x, lo), hi); return Math.Log(c / (1 - c)); },
             (x, _) => x < lo || x > hi ? 0 : 1 / (x * (1 - x)),
-            e => e.TensorLogit(tensor, eps));
+            e => e.TensorLogit(tensor, eps), (e, x, _) => DLogit(e, x, lo, hi));
     }
 
     /// <inheritdoc/>
@@ -89,15 +96,17 @@ public partial class CpuEngine
             x => x == 0 ? 1 : double.IsInfinity(x) ? 0 : SpecialFunctions.SinPi(x) / (Math.PI * x),
             (x, _) => x == 0 || double.IsInfinity(x) ? 0
                 : (SpecialFunctions.CosPi(x) * Math.PI * x - SpecialFunctions.SinPi(x)) / (Math.PI * x * x),
-            e => e.TensorSinc(tensor));
+            e => e.TensorSinc(tensor), DSinc<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorDeg2Rad<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorDeg2Rad", tensor, x => x * (Math.PI / 180), (_, _) => Math.PI / 180, e => e.TensorDeg2Rad(tensor));
+        => SpecialUnary("TensorDeg2Rad", tensor, x => x * (Math.PI / 180), (_, _) => Math.PI / 180, e => e.TensorDeg2Rad(tensor),
+            (_, x, _) => BackwardFunctions<T>.ConstantLike(x, Math.PI / 180));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRad2Deg<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorRad2Deg", tensor, x => x * (180 / Math.PI), (_, _) => 180 / Math.PI, e => e.TensorRad2Deg(tensor));
+        => SpecialUnary("TensorRad2Deg", tensor, x => x * (180 / Math.PI), (_, _) => 180 / Math.PI, e => e.TensorRad2Deg(tensor),
+            (_, x, _) => BackwardFunctions<T>.ConstantLike(x, 180 / Math.PI));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorPositive<T>(Tensor<T> tensor)
@@ -136,13 +145,13 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorFmax<T>(Tensor<T> a, Tensor<T> b)
         => SpecialBinary("TensorFmax", a, b, (x, y) => double.IsNaN(x) ? y : double.IsNaN(y) ? x : Math.Max(x, y),
             (x, y, _) => x >= y || double.IsNaN(y) ? 1 : 0, (x, y, _) => x >= y || double.IsNaN(y) ? 0 : 1,
-            e => e.TensorFmax(a, b));
+            e => e.TensorFmax(a, b), FminFmaxRecorded<T>(max: true));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFmin<T>(Tensor<T> a, Tensor<T> b)
         => SpecialBinary("TensorFmin", a, b, (x, y) => double.IsNaN(x) ? y : double.IsNaN(y) ? x : Math.Min(x, y),
             (x, y, _) => x <= y || double.IsNaN(y) ? 1 : 0, (x, y, _) => x <= y || double.IsNaN(y) ? 0 : 1,
-            e => e.TensorFmin(a, b));
+            e => e.TensorFmin(a, b), FminFmaxRecorded<T>(max: false));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFloorDivide<T>(Tensor<T> a, Tensor<T> b)
@@ -255,6 +264,28 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorNanMean<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        // Half/BFloat16: the composition below holds the sum and the count in T, both +Inf past 65,504 (70,000 Half
+        // ones gave NaN). Sum in float32, count in an int, divide in float32 and round once.
+        if (IsLowPrecisionFloat<T>())
+        {
+            int[] lowAxes;
+            if (axes is null || axes.Length == 0)
+            {
+                lowAxes = new int[tensor.Rank];
+                for (int d = 0; d < tensor.Rank; d++) lowAxes[d] = d;
+            }
+            else
+            {
+                lowAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
+            }
+            var lowShape = LowPrecisionReducedShape(tensor._shape, lowAxes, keepDims);
+            int lowSize = 1;
+            foreach (int dim in lowShape) lowSize *= dim;
+            var lowResult = new Tensor<T>(LowPrecisionNanMean(tensor.GetFlattenedData(), tensor._shape, lowAxes, lowSize), lowShape);
+            DifferentiableOps.RecordUnary("TensorNanMean", lowResult, tensor, LowPrecisionGradients.NanMeanBackward,
+                new object[] { lowAxes, keepDims });
+            return lowResult;
+        }
         var (kept, present) = NonNanParts(tensor);
         Tensor<T> count;
         using (new NoGradScope<T>()) count = ReduceSum(present, axes, keepDims);
@@ -277,11 +308,13 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorIgamma<T>(Tensor<T> a, Tensor<T> x)
-        => SpecialBinary("TensorIgamma", a, x, Igamma, null, (s, v, _) => IgammaDensity(s, v), e => e.TensorIgamma(a, x));
+        => SpecialBinary("TensorIgamma", a, x, Igamma, null, (s, v, _) => IgammaDensity(s, v), e => e.TensorIgamma(a, x),
+            new RecordedBinaryDerivatives<T>(null, (e, s, v, _) => DIgammaX(e, s, v, 1)));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorIgammac<T>(Tensor<T> a, Tensor<T> x)
-        => SpecialBinary("TensorIgammac", a, x, Igammac, null, (s, v, _) => -IgammaDensity(s, v), e => e.TensorIgammac(a, x));
+        => SpecialBinary("TensorIgammac", a, x, Igammac, null, (s, v, _) => -IgammaDensity(s, v), e => e.TensorIgammac(a, x),
+            new RecordedBinaryDerivatives<T>(null, (e, s, v, _) => DIgammaX(e, s, v, -1)));
 
     // ∂P(a, x)/∂x = e^{-x} x^{a-1} / Γ(a). As in PyTorch, no gradient flows to a.
     private static double IgammaDensity(double a, double x) => x <= 0 ? 0 : Math.Exp(-x + (a - 1) * Math.Log(x) - LogGamma(a));
@@ -292,83 +325,89 @@ public partial class CpuEngine
         if (p < 1) throw new ArgumentOutOfRangeException(nameof(p), "p must be at least 1.");
         return SpecialUnary("TensorMvlgamma", tensor,
             x => x <= (p - 1) / 2.0 ? double.NaN : Mvlgamma(x, p),
-            (x, _) => MvlgammaDerivative(x, p), e => e.TensorMvlgamma(tensor, p));
+            (x, _) => MvlgammaDerivative(x, p), e => e.TensorMvlgamma(tensor, p), (e, x, _) => DMvlgamma(e, x, p));
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorEntr<T>(Tensor<T> tensor)
         => SpecialUnary("TensorEntr", tensor,
             x => double.IsNaN(x) ? x : x > 0 ? -x * Math.Log(x) : x == 0 ? 0 : double.NegativeInfinity,
-            (x, _) => -(Math.Log(x) + 1), e => e.TensorEntr(tensor));
+            (x, _) => -(Math.Log(x) + 1), e => e.TensorEntr(tensor), DEntr<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorErfcx<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorErfcx", tensor, Erfcx, (x, y) => 2 * x * y - TwoOverSqrtPi, e => e.TensorErfcx(tensor));
+        => SpecialUnary("TensorErfcx", tensor, Erfcx, (x, y) => 2 * x * y - TwoOverSqrtPi, e => e.TensorErfcx(tensor), DErfcx<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorNdtr<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorNdtr", tensor, Ndtr, (x, _) => InvSqrtTwoPi * Math.Exp(-0.5 * x * x), e => e.TensorNdtr(tensor));
+        => SpecialUnary("TensorNdtr", tensor, Ndtr, (x, _) => InvSqrtTwoPi * Math.Exp(-0.5 * x * x), e => e.TensorNdtr(tensor), DNdtr<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLogNdtr<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorLogNdtr", tensor, LogNdtr, (x, y) => InvSqrtTwoPi * Math.Exp(-0.5 * x * x - y), e => e.TensorLogNdtr(tensor));
+        => SpecialUnary("TensorLogNdtr", tensor, LogNdtr, (x, y) => InvSqrtTwoPi * Math.Exp(-0.5 * x * x - y), e => e.TensorLogNdtr(tensor), DLogNdtr<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorNdtri<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorNdtri", tensor, Ndtri, (_, y) => Math.Sqrt(2 * Math.PI) * Math.Exp(0.5 * y * y), e => e.TensorNdtri(tensor));
+        => SpecialUnary("TensorNdtri", tensor, Ndtri, (_, y) => Math.Sqrt(2 * Math.PI) * Math.Exp(0.5 * y * y), e => e.TensorNdtri(tensor), DNdtri<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBesselJ0<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorBesselJ0", tensor, x => BesselJ(0, x), (x, _) => -BesselJ(1, x), e => e.TensorBesselJ0(tensor));
+        => SpecialUnary("TensorBesselJ0", tensor, x => BesselJ(0, x), (x, _) => -BesselJ(1, x), e => e.TensorBesselJ0(tensor),
+            (e, x, _) => e.TensorNegate(e.TensorBesselJ1(x)));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBesselJ1<T>(Tensor<T> tensor)
         => SpecialUnary("TensorBesselJ1", tensor, x => BesselJ(1, x),
-            (x, y) => x == 0 ? 0.5 : BesselJ(0, x) - y / x, e => e.TensorBesselJ1(tensor));
+            (x, y) => x == 0 ? 0.5 : BesselJ(0, x) - y / x, e => e.TensorBesselJ1(tensor), DBesselJ1<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBesselY0<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorBesselY0", tensor, x => BesselY(0, x), (x, _) => -BesselY(1, x), e => e.TensorBesselY0(tensor));
+        => SpecialUnary("TensorBesselY0", tensor, x => BesselY(0, x), (x, _) => -BesselY(1, x), e => e.TensorBesselY0(tensor),
+            (e, x, _) => e.TensorNegate(e.TensorBesselY1(x)));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBesselY1<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorBesselY1", tensor, x => BesselY(1, x), (x, y) => BesselY(0, x) - y / x, e => e.TensorBesselY1(tensor));
+        => SpecialUnary("TensorBesselY1", tensor, x => BesselY(1, x), (x, y) => BesselY(0, x) - y / x, e => e.TensorBesselY1(tensor), DBesselY1<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorModifiedBesselI0<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorModifiedBesselI0", tensor, x => BesselI(0, x), (x, _) => BesselI(1, x), e => e.TensorModifiedBesselI0(tensor));
+        => SpecialUnary("TensorModifiedBesselI0", tensor, x => BesselI(0, x), (x, _) => BesselI(1, x), e => e.TensorModifiedBesselI0(tensor),
+            (e, x, _) => e.TensorModifiedBesselI1(x));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorModifiedBesselI1<T>(Tensor<T> tensor)
         => SpecialUnary("TensorModifiedBesselI1", tensor, x => BesselI(1, x),
-            (x, y) => x == 0 ? 0.5 : BesselI(0, x) - y / x, e => e.TensorModifiedBesselI1(tensor));
+            (x, y) => x == 0 ? 0.5 : BesselI(0, x) - y / x, e => e.TensorModifiedBesselI1(tensor), DModifiedBesselI1<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorModifiedBesselK0<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorModifiedBesselK0", tensor, x => BesselK(0, x), (x, _) => -BesselK(1, x), e => e.TensorModifiedBesselK0(tensor));
+        => SpecialUnary("TensorModifiedBesselK0", tensor, x => BesselK(0, x), (x, _) => -BesselK(1, x), e => e.TensorModifiedBesselK0(tensor),
+            (e, x, _) => e.TensorNegate(e.TensorModifiedBesselK1(x)));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorModifiedBesselK1<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorModifiedBesselK1", tensor, x => BesselK(1, x), (x, y) => -BesselK(0, x) - y / x, e => e.TensorModifiedBesselK1(tensor));
+        => SpecialUnary("TensorModifiedBesselK1", tensor, x => BesselK(1, x), (x, y) => -BesselK(0, x) - y / x, e => e.TensorModifiedBesselK1(tensor), DModifiedBesselK1<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorScaledModifiedBesselK0<T>(Tensor<T> tensor)
         => SpecialUnary("TensorScaledModifiedBesselK0", tensor, x => BesselKScaled(0, x),
-            (x, y) => y - BesselKScaled(1, x), e => e.TensorScaledModifiedBesselK0(tensor));
+            (x, y) => y - BesselKScaled(1, x), e => e.TensorScaledModifiedBesselK0(tensor), DScaledModifiedBesselK0<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorScaledModifiedBesselK1<T>(Tensor<T> tensor)
         => SpecialUnary("TensorScaledModifiedBesselK1", tensor, x => BesselKScaled(1, x),
-            (x, y) => y - BesselKScaled(0, x) - y / x, e => e.TensorScaledModifiedBesselK1(tensor));
+            (x, y) => y - BesselKScaled(0, x) - y / x, e => e.TensorScaledModifiedBesselK1(tensor), DScaledModifiedBesselK1<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSphericalBesselJ0<T>(Tensor<T> tensor)
         => SpecialUnary("TensorSphericalBesselJ0", tensor, SphericalBesselJ0,
-            (x, _) => Math.Abs(x) < 1e-4 ? -x / 3 : (x * Math.Cos(x) - Math.Sin(x)) / (x * x), e => e.TensorSphericalBesselJ0(tensor));
+            (x, _) => Math.Abs(x) < 1e-4 ? -x / 3 : (x * Math.Cos(x) - Math.Sin(x)) / (x * x), e => e.TensorSphericalBesselJ0(tensor),
+            DSphericalBesselJ0<T>);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAiryAi<T>(Tensor<T> tensor)
-        => SpecialUnary("TensorAiryAi", tensor, AiryAi, (x, _) => AiryAiDerivative(x), e => e.TensorAiryAi(tensor));
+        => SpecialUnary("TensorAiryAi", tensor, AiryAi, (x, _) => AiryAiDerivative(x), e => e.TensorAiryAi(tensor),
+            (_, x, _) => AiryAiPrime(x));
 
     // Pₙ(x) per element, with the degree taken from n (rounded, as PyTorch truncates an integral n tensor).
     private static Tensor<T> PolynomialOp<T>(string opName, PolynomialKind kind, bool shifted, Tensor<T> x, Tensor<T> n,
@@ -446,6 +485,12 @@ public partial class CpuEngine
         public static void Unary(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
             object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
         {
+            if (BackwardFunctions<T>.CreatesGraph && savedState.Length > 1
+                && savedState[1] is Func<IEngine, Tensor<T>, Tensor<T>, Tensor<T>> recorded)
+            {
+                BackwardFunctions<T>.AccumulateScaled(grads, inputs[0], gradOutput, recorded(engine, inputs[0], output), engine);
+                return;
+            }
             var derivative = (Func<double, double, double>)savedState[0];
             var ops = MathHelper.GetNumericOperations<T>();
             var x = inputs[0].IsContiguous ? inputs[0] : inputs[0].Contiguous();
@@ -469,6 +514,14 @@ public partial class CpuEngine
             object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
         {
             var derivatives = (BinaryDerivatives)savedState[0];
+            if (BackwardFunctions<T>.CreatesGraph && savedState.Length > 1 && savedState[1] is RecordedBinaryDerivatives<T> recorded)
+            {
+                if (derivatives.WithRespectToA is not null && recorded.WithRespectToA is { } ra)
+                    BackwardFunctions<T>.AccumulateScaled(grads, inputs[0], gradOutput, ra(engine, inputs[0], inputs[1], output), engine);
+                if (derivatives.WithRespectToB is not null && recorded.WithRespectToB is { } rb)
+                    BackwardFunctions<T>.AccumulateScaled(grads, inputs[1], gradOutput, rb(engine, inputs[0], inputs[1], output), engine);
+                return;
+            }
             var ops = MathHelper.GetNumericOperations<T>();
             var a = inputs[0].IsContiguous ? inputs[0] : inputs[0].Contiguous();
             var b = inputs[1].IsContiguous ? inputs[1] : inputs[1].Contiguous();

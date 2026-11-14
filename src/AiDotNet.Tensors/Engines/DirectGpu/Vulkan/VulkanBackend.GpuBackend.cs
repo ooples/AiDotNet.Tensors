@@ -90,7 +90,10 @@ public sealed unsafe partial class VulkanBackend
         {
             (uint)size, (uint)op, FloatBits(p0), FloatBits(p1), FloatBits(p2)
         };
-        GlslUnaryOp(VulkanGlslKernels.UnaryElementwise, input, output, size, pushConstants, 5 * sizeof(uint));
+        // Sign-bit and selection ops must be exact for every float (ExactFloatKernels): they run on the uint-bound shader.
+        bool exact = op is ResidentUnaryOp.Abs or ResidentUnaryOp.Sign or ResidentUnaryOp.Negate or ResidentUnaryOp.Clamp;
+        GlslUnaryOp(exact ? VulkanGlslKernels.ExactUnaryElementwise : VulkanGlslKernels.UnaryElementwise,
+            input, output, size, pushConstants, 5 * sizeof(uint));
     }
 
     private void ResidentBinary(ResidentBinaryOp op, IGpuBuffer left, IGpuBuffer right, IGpuBuffer output,
@@ -100,7 +103,10 @@ public sealed unsafe partial class VulkanBackend
         {
             (uint)size, (uint)op, FloatBits(p0), FloatBits(p1), FloatBits(p2)
         };
-        GlslBinaryOp(VulkanGlslKernels.BinaryElementwise, left, right, output, size, pushConstants, 5 * sizeof(uint));
+        // Comparisons and min/max must be exact for every float (ExactFloatKernels): they run on the uint-bound shader.
+        bool exact = op is ResidentBinaryOp.Min or ResidentBinaryOp.Max or ResidentBinaryOp.Greater or ResidentBinaryOp.Less;
+        GlslBinaryOp(exact ? VulkanGlslKernels.ExactBinaryElementwise : VulkanGlslKernels.BinaryElementwise,
+            left, right, output, size, pushConstants, 5 * sizeof(uint));
     }
 
     // Bit conversion helpers compatible with net471 and later
@@ -449,8 +455,8 @@ public sealed unsafe partial class VulkanBackend
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Vulkan);
         var floatData = new float[data.Length];
-        for (int i = 0; i < data.Length; i++)
-            floatData[i] = Int32BitsToSingleCompat(data[i]);
+        if (data.Length > 0)
+            Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && floatData.Length > 0)

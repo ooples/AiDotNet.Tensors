@@ -217,7 +217,7 @@ internal sealed class CompiledDelegateChain<T>
         // than tensor-object-aware because metadata views can alias a saved tensor needed by a later step. The
         // release schedule is precomputed with the chain, preserving progressive reclamation without adding a
         // per-replay graph scan. Loss/source/retain-grad storages remain caller-owned after backward.
-        var gpuEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
+        var gpuEngine = engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
         HashSet<object>? protectedStorages = null;
         if (gpuEngine is not null)
         {

@@ -62,6 +62,14 @@ internal static class HipCustomSparseBackend
                 if (_sharedTried) return _shared;
                 _sharedTried = true;
                 if (!HipBackend.IsHipAvailable) return null;
+                // The process-wide GPU engine's backend when it is HIP and built the SpMM kernels: a second one is a
+                // second device context with its own copy of every compiled module.
+                if (Engine.DirectGpuIfCreated is { IsAvailable: true, Backend: HipBackend { IsAvailable: true } engineBackend }
+                    && Array.TrueForAll(RequiredKernels, engineBackend.HasCompiledKernel))
+                {
+                    _shared = engineBackend;
+                    return _shared;
+                }
                 HipBackend? candidate = null;
                 try
                 {

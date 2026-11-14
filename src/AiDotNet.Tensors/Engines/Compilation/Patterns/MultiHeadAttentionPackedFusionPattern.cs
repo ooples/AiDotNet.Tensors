@@ -95,7 +95,7 @@ internal sealed class MultiHeadAttentionPackedFusionPattern : IFusionPattern
         narrow = null!;
         start = 0; length = 0;
         if (node is not LazyNode<float> { OpType: LazyNodeType.Custom } candidate
-            || candidate.RecordingEngine is not DirectGpuTensorEngine || candidate.SavedState is not { } state)
+            || !candidate.RecordingEngine.Is<DirectGpuTensorEngine>() || candidate.SavedState is not { } state)
             return false;
         int rank = candidate.Input0.Rank;
         if (candidate.OpName == "Narrow")

@@ -15,7 +15,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal static class TorchParityF32Kernels
 {
-    public static string GetSource() => Tables() + Helpers + SpecialFunctions + Elementwise + Sampling + Indexing;
+    // The model-op kernels (TorchModelOpsKernels) ride along: Metal and WebGPU build this one library.
+    public static string GetSource() => Tables() + Helpers + SpecialFunctions + Elementwise + Sampling + Indexing + TorchModelOpsKernels.Source;
 
     private static string Tables()
     {
@@ -40,6 +41,30 @@ __device__ __forceinline__ float tp_nan() { return __uint_as_float(0x7FC00000u);
 __device__ __forceinline__ float tp_inf() { return __uint_as_float(0x7F800000u); }
 __device__ __forceinline__ float tp_ninf() { return __uint_as_float(0xFF800000u); }
 __device__ __forceinline__ float tp_pick(bool c, float a, float b) { if (c) { return a; } return b; }
+// The exact float order on the bit patterns (ExactFloatKernels): integer compares only, so a subnormal is never
+// flushed into a tie with zero (Metal and WebGPU may flush fp32 subnormals in float compares and min/max). -0 and +0
+// share key 0; NaN has no order and is tested apart.
+__device__ __forceinline__ int tp_key(float v)
+{
+    unsigned int b = __float_as_uint(v);
+    int m = (int)(b & 0x7FFFFFFFu);
+    if ((b & 0x80000000u) != 0u) { return 0 - m; }
+    return m;
+}
+__device__ __forceinline__ bool tp_ge(float a, float b) { return !tp_isnan(a) && !tp_isnan(b) && tp_key(a) >= tp_key(b); }
+// Math.Max / Math.Min of two non-NaN values (IEEE 754-2019: +0 above -0), selected on the bits.
+__device__ __forceinline__ float tp_max_nonnan(float a, float b)
+{
+    if (tp_key(a) == tp_key(b)) { return __uint_as_float(__float_as_uint(a) & __float_as_uint(b)); }
+    if (tp_key(a) > tp_key(b)) { return a; }
+    return b;
+}
+__device__ __forceinline__ float tp_min_nonnan(float a, float b)
+{
+    if (tp_key(a) == tp_key(b)) { return __uint_as_float(__float_as_uint(a) | __float_as_uint(b)); }
+    if (tp_key(a) < tp_key(b)) { return a; }
+    return b;
+}
 
 // min(max(v, lo), hi) with NaN propagating from v or either bound (Math.Max / Math.Min semantics).
 __device__ __forceinline__ float tp_clamp_nan(float v, float lo, float hi)
@@ -715,7 +740,7 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_fmax(const float* a, cons
     if (t >= n) { return; }
     float u = a[t];
     float w = b[t];
-    if (tp_isnan(u)) { y[t] = w; } else if (tp_isnan(w)) { y[t] = u; } else { y[t] = tp_pick(u > w, u, w); }
+    if (tp_isnan(u)) { y[t] = w; } else if (tp_isnan(w)) { y[t] = u; } else { y[t] = tp_max_nonnan(u, w); }
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void tp_fmin(const float* a, const float* b, float* y, int n)
@@ -724,7 +749,7 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_fmin(const float* a, cons
     if (t >= n) { return; }
     float u = a[t];
     float w = b[t];
-    if (tp_isnan(u)) { y[t] = w; } else if (tp_isnan(w)) { y[t] = u; } else { y[t] = tp_pick(u < w, u, w); }
+    if (tp_isnan(u)) { y[t] = w; } else if (tp_isnan(w)) { y[t] = u; } else { y[t] = tp_min_nonnan(u, w); }
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void tp_heaviside(const float* a, const float* b, float* y, int n)
@@ -739,14 +764,14 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_greater_equal(const float
 {
     int t = bx_gid();
     if (t >= n) { return; }
-    y[t] = tp_pick(a[t] >= b[t], 1.0f, 0.0f);
+    y[t] = tp_pick(tp_ge(a[t], b[t]), 1.0f, 0.0f);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void tp_less_equal(const float* a, const float* b, float* y, int n)
 {
     int t = bx_gid();
     if (t >= n) { return; }
-    y[t] = tp_pick(a[t] <= b[t], 1.0f, 0.0f);
+    y[t] = tp_pick(tp_ge(b[t], a[t]), 1.0f, 0.0f);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void tp_igamma(const float* a, const float* b, float* y, int n)

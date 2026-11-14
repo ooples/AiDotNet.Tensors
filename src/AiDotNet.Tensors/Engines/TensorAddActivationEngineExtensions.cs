@@ -28,7 +28,7 @@ public static class TensorAddActivationEngineExtensions
 
         // Every built-in engine derives from CpuEngine; virtual dispatch reaches the GPU kernel where available. Keeping
         // the primitive off IEngine avoids an ABI break for external engines compiled against an earlier package.
-        if (engine is CpuEngine builtIn)
+        if (engine.TryGet<CpuEngine>(out var builtIn))
             return builtIn.TensorAddActivation(a, b, activation);
 
         // A third-party engine composes it from the IEngine contract.

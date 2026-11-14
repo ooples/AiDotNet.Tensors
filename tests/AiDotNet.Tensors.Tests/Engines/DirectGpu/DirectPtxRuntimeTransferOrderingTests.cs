@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using Xunit;
 
@@ -47,6 +48,56 @@ public sealed class DirectPtxRuntimeTransferOrderingTests
             Assert.Fail(
                 $"transfer ordering failed at {mismatch}: expected {expected[mismatch]}, " +
                 $"actual {actual[mismatch]}");
+    }
+
+    /// <summary>
+    /// A standalone runtime retains the device's primary context, as every backend does, instead of creating a private
+    /// one: a private context per runtime was destroyed on Dispose, and on the RTX 3090 runner that cuCtxDestroy stalled
+    /// every other test thread's cuMemAllocHost and cublasCreate until the hang blame killed the host. Disposing the
+    /// runtime must leave the shared context alive for everyone else holding it.
+    /// </summary>
+    [SkippableFact]
+    public void StandaloneRuntime_SharesThePrimaryContext_AndLeavesItAliveOnDispose()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        Assert.Equal(CudaResult.Success, CuBlasNative.cuInit(0));
+        Assert.Equal(CudaResult.Success, CuBlasNative.cuDevicePrimaryCtxRetain(out IntPtr primary, 0));
+        try
+        {
+            var runtime = new DirectPtxRuntime();
+            Assert.Equal(primary, runtime.Context);
+            Assert.False(runtime.OwnsContext);
+            runtime.Dispose();
+
+            using var again = new DirectPtxRuntime();
+            Assert.Equal(primary, again.Context);
+            var expected = new[] { 1f, 2f, 3f, 4f };
+            using var buffer = again.AllocateBytes((nuint)(expected.Length * sizeof(float)));
+            buffer.Upload<float>(expected);
+            var actual = new float[expected.Length];
+            buffer.Download<float>(actual);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            CuBlasNative.cuDevicePrimaryCtxRelease(0);
+        }
+    }
+
+    /// <summary>
+    /// The primary context a standalone runtime retains outlives the runtime, so destroying a private context no longer
+    /// frees whatever a caller forgot to dispose: the runtime's Dispose must free its own leftover buffers.
+    /// </summary>
+    [SkippableFact]
+    public void StandaloneRuntime_Dispose_FreesUndisposedBuffers()
+    {
+        Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
+        var runtime = new DirectPtxRuntime();
+        var leftover = runtime.AllocateBytes((nuint)(1024 * sizeof(float)));
+        Assert.NotEqual(IntPtr.Zero, leftover.Pointer);
+        runtime.Dispose();
+        Assert.Equal(IntPtr.Zero, leftover.Pointer);
+        leftover.Dispose();   // already freed by the runtime: a no-op, not a double free
     }
 
     private static string EmitCopyPtx(int elements) =>

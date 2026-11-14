@@ -53,7 +53,7 @@ public static class GpuRoutingHelpers
     /// </returns>
     public static bool IsGpuActive(IEngine? engine)
     {
-        if (engine is not DirectGpuTensorEngine gpu) return false;
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu)) return false;
         return gpu.SupportsDeferredExecution;
     }
 
@@ -77,7 +77,7 @@ public static class GpuRoutingHelpers
     /// </returns>
     public static IAsyncGpuBackend? TryGetAsyncBackend(IEngine? engine)
     {
-        if (engine is not DirectGpuTensorEngine gpu) return null;
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu)) return null;
         // A query: the caller gets the backend for capability checks and scheduling. Work it launches on the
         // backend outside the engine's ops is not leased against a concurrent Dispose.
         return gpu.QueryBackend as IAsyncGpuBackend;
@@ -134,7 +134,7 @@ public static class GpuRoutingHelpers
             cpuFallback();
             return false;
         }
-        if (engine is not DirectGpuTensorEngine gpu)
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu))
         {
             reason = $"Engine '{engine.GetType().Name}' is not a GPU engine; CPU path runs.";
             cpuFallback();

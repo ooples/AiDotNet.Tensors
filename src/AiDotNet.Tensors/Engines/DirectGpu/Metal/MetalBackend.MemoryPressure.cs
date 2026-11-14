@@ -16,8 +16,12 @@ public sealed partial class MetalBackend : IDeviceMemoryPressure
 
     void IDeviceMemoryPressure.ReclaimNow() => DeviceMemorySweep.Run();
 
-    // No buffer pool: a freed buffer goes straight back to the driver.
-    int IDeviceMemoryPressure.ReleaseCachedBuffers() => 0;
+    int IDeviceMemoryPressure.ReleaseCachedBuffers()
+    {
+        MetalGpuBuffer.PendingFrees.Drain();
+        return _device?.BufferPool.DrainAll() ?? 0;
+    }
 
-    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => false;
+    /// <remarks>MetalGpuBuffer collects unreachable buffers, drains the device pool and retries once on out-of-memory.</remarks>
+    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => true;
 }

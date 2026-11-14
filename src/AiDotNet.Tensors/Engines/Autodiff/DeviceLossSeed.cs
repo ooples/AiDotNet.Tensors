@@ -15,7 +15,7 @@ internal static class DeviceLossSeed
 {
     internal static bool TryCreate<T>(IEngine? engine, Tensor<T> loss, out Tensor<T> seed)
     {
-        if (engine is DirectGpuTensorEngine gpu && gpu.TryCreateDeviceSeed(loss, out seed)) return true;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryCreateDeviceSeed(loss, out seed)) return true;
         seed = null!;
         return false;
     }

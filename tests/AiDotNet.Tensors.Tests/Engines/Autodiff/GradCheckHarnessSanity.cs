@@ -75,6 +75,28 @@ public class GradCheckHarnessSanity
     }
 
     /// <summary>
+    /// The same control through the public checker the sweep runs on (<see cref="GradCheck"/>): its numerical gradient
+    /// matches 1/x, and its analytical-versus-numerical check passes the sweep's settings.
+    /// </summary>
+    [Fact]
+    public void PublicGradCheck_OnTensorLog_AgreesWithTheClosedForm()
+    {
+        var x = new Tensor<double>([6]);
+        var rng = new Random(1234);
+        for (int i = 0; i < x.Length; i++) x[i] = 0.35 + rng.NextDouble() * 0.6;
+
+        var numerical = GradCheck.NumericalGradient(t => _engine.TensorSum(_engine.TensorLog(t)), x, 1e-3);
+        for (int k = 0; k < x.Length; k++)
+            Assert.True(Math.Abs(numerical[k] - 1.0 / x[k]) * x[k] < 1e-3,
+                $"[{k}] numerical {numerical[k]:G10} != 1/x {1.0 / x[k]:G10} — the HARNESS is wrong.");
+
+        var result = GradCheck.Check(t => _engine.TensorLog(t), x,
+            new GradCheckOptions { Engine = _engine, Epsilon = 1e-6, AbsoluteTolerance = 1e-4, RelativeTolerance = 1e-4, RandomOutputGradient = false });
+        _out.WriteLine(result.ToString());
+        Assert.True(result.Passed, result.ToString());
+    }
+
+    /// <summary>
     /// Second control: does re-invoking an op after mutating its input in place actually observe
     /// the new value? If any caching keyed on tensor identity is in play, finite differences
     /// computed by the sweep would be silently stale.

@@ -114,7 +114,7 @@ internal sealed class DDIMStepFusionPattern : IFusionPattern
             finalOutput,
             (eng, output) =>
             {
-                if (eng is DirectGpuTensorEngine gpu)
+                if (eng.TryGet<DirectGpuTensorEngine>(out var gpu))
                 {
                     gpu.FusedDDIMStepInto(output, capturedXt, capturedEps, capturedAlphaT, capturedAlphaTm1);
                 }

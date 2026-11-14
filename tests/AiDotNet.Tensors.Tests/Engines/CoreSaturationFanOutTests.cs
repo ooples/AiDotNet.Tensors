@@ -207,8 +207,9 @@ public class CoreSaturationFanOutTests
         }
     }
 
-    // Single-axis ReduceMax fans out: values and absolute argmax indices equal the serial semantics (MinValue start,
-    // strictly-greater updates so the first maximum wins and NaN never does, -inf below MinValue keeps index -1).
+    // Single-axis ReduceMax fans out: values and absolute argmax indices equal the serial semantics (a -infinity start,
+    // as ReduceMaxSeed: strictly-greater updates so the first maximum wins and NaN never does, and an all -infinity row
+    // reduces to -infinity with index -1; it used to start at float.MinValue and report -3.4e38 for that row).
     [Theory]
     [InlineData(1)]
     [InlineData(0)]
@@ -243,7 +244,7 @@ public class CoreSaturationFanOutTests
             for (int o = 0; o < outer; o++)
                 for (int j = 0; j < inner; j++)
                 {
-                    float best = float.MinValue; int bi = -1;
+                    float best = float.NegativeInfinity; int bi = -1;
                     for (int a = 0; a < shape[axis]; a++)
                     {
                         int flat = (o * shape[axis] + a) * inner + j;

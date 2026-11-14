@@ -89,8 +89,14 @@ public sealed class MetalShaderCompilationTests
         // mask the backward rebuilds rounds the same as the forward because both go through one explicit fma, not
         // because the compiler was asked to keep the operators apart.
         yield return ("BatchNormRegister", () => BatchNormRegisterKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
+        // Strict: false, as MetalBackend.DataDecode compiles it (the two-argument overload).
+        yield return ("DataDecode", () => DataDecodeKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict: false, as MetalBackend.ConvDgradS2 compiles it (the two-argument overload).
         yield return ("ConvDgradS2", () => ConvDgradS2KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
+        // Strict, as MetalBackend.NumericRecurrence compiles it: the log-domain lattice and the assignment's comparisons.
+        yield return ("NumericRecurrence", () => NumericRecurrenceKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), true);
+        // Strict, as MetalBackend.DataTransform compiles it: the exact threshold and rounding comparisons.
+        yield return ("DataTransform", () => DataTransformKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), true);
         // Strict: false, as MetalBackend.GroupedGemm compiles it (the two-argument overload).
         yield return ("GroupedGemm", () => GroupedGemmKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict: false, as MetalBackend.Moe compiles it (the two-argument overload).

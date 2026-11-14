@@ -16,8 +16,15 @@ public sealed unsafe partial class VulkanBackend : IDeviceMemoryPressure
 
     void IDeviceMemoryPressure.ReclaimNow() => DeviceMemorySweep.Run();
 
-    // The Vulkan buffer pool is process-wide; its buffers are free whichever backend pooled them.
-    int IDeviceMemoryPressure.ReleaseCachedBuffers() => VulkanGpuBuffer.Pool.DrainAll();
+    // The Vulkan buffer pool is process-wide; wait for pending submissions and drain finalizer-queued frees first so
+    // in-flight released buffers are reclaimed too.
+    int IDeviceMemoryPressure.ReleaseCachedBuffers()
+    {
+        if (IsAvailable) _device.WaitForPendingSubmissions();
+        VulkanGpuBuffer.PendingFrees.Drain();
+        return VulkanGpuBuffer.Pool.DrainAll();
+    }
 
-    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => false;
+    /// <remarks>VulkanGpuBuffer.Rent collects unreachable buffers, drains the pool and retries once on out-of-memory.</remarks>
+    bool IDeviceMemoryPressure.ReclaimsOnAllocationFailure => true;
 }

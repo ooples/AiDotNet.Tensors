@@ -36,7 +36,7 @@ public static class MixtureOfExperts
         Tensor<T> w1, Tensor<T> w3, Tensor<T> w2, int topK, int sequences, out Tensor<T> loads)
     {
         if (engine is null) throw new ArgumentNullException(nameof(engine));
-        return (engine as CpuEngine ?? new CpuEngine()).MoeSwiGlu(x, scores, selectionBias, w1, w3, w2, topK, sequences, out loads);
+        return (engine.As<CpuEngine>() ?? new CpuEngine()).MoeSwiGlu(x, scores, selectionBias, w1, w3, w2, topK, sequences, out loads);
     }
 }
 
@@ -93,7 +93,7 @@ public partial class CpuEngine
         if (TryRecordCompiledOp<T, Tensor<T>>("MoeSwiGlu", new[] { x, scores, bias, w1, w3, w2 },
                 eng =>
                 {
-                    var y = (eng as CpuEngine ?? this).MoeSwiGluForward(x, scores, bias, w1, w3, w2, topK, sequences,
+                    var y = (eng.TryGet<CpuEngine>(out var replayEngine) ? replayEngine : this).MoeSwiGluForward(x, scores, bias, w1, w3, w2, topK, sequences,
                         keepSaved: true, out slot.Loads, out slot.Saved);
                     return (y, slot.Loads);
                 },
@@ -306,7 +306,7 @@ public partial class CpuEngine
     {
         if (saved.DH13 is not null)
         {
-            if (tapeEngine is DirectGpuTensorEngine tapeGpu && !tapeGpu.IsDisposed
+            if (tapeEngine.TryGet<DirectGpuTensorEngine>(out var tapeGpu) && !tapeGpu.IsDisposed
                 && (saved.DeviceBackend is null
                     || ReferenceEquals(tapeGpu.PlacementBackend, saved.DeviceBackend)
                     || ReferenceEquals(tapeGpu.QueryBackend, saved.DeviceBackend)))
@@ -316,14 +316,14 @@ public partial class CpuEngine
             if (owner is not null && !owner.IsDisposed)
                 return owner;
 
-            if (AiDotNetEngine.Current is DirectGpuTensorEngine currentGpu && !currentGpu.IsDisposed
+            if (AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var currentGpu) && !currentGpu.IsDisposed
                 && (saved.DeviceBackend is null || ReferenceEquals(currentGpu.PlacementBackend, saved.DeviceBackend)))
                 return currentGpu;
 
-            if (tapeEngine is DirectGpuTensorEngine fallbackGpu)
+            if (tapeEngine.TryGet<DirectGpuTensorEngine>(out var fallbackGpu))
                 return fallbackGpu;
         }
-        return tapeEngine as CpuEngine ?? new CpuEngine();
+        return tapeEngine.As<CpuEngine>() ?? new CpuEngine();
     }
 
     /// <summary>Gradients of the fused MoE (dx, dscores, dw1, dw3, dw2) from the saved forward; the host computes in double.</summary>

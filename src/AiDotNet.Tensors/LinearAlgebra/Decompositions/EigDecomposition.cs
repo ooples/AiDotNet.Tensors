@@ -66,6 +66,13 @@ internal static class EigDecomposition
         T[] src, int offSrc, T[] w, int offW, T[] v, int offV, int n)
         where T : unmanaged, IEquatable<T>, IComparable<T>
     {
+        // decimal / Half / BFloat16: Hessenberg + Francis double-shift QR carried out in T.
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        {
+            GenericLinalg<T>.Eig(src, offSrc, w, offW, v, offV, n);
+            return;
+        }
+
         // Working matrix H (will become upper Hessenberg, then quasi-triangular
         // via QR iterations) and Q (accumulated similarity transforms).
         var h = new double[n * n];

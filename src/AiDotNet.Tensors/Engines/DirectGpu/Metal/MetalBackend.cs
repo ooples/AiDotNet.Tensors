@@ -543,13 +543,15 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Metal);
 
-        return new MetalGpuBuffer(_device, data);
+        return MetalGpuBuffer.Create(_device, data);
     }
 
     /// <summary>
-    /// Allocates an empty GPU buffer.
+    /// Allocates a zero-initialized GPU buffer.
     /// </summary>
-    public IGpuBuffer AllocateBuffer(int size)
+    public IGpuBuffer AllocateBuffer(int size) => AllocateBufferCore(size, zeroInitialize: true);
+
+    internal IGpuBuffer AllocateBufferCore(int size, bool zeroInitialize)
     {
         ThrowIfDisposed();
 
@@ -560,7 +562,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("Metal", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
 
-        return new MetalGpuBuffer(_device, size);
+        return MetalGpuBuffer.Create(_device, size, zeroInitialize);
     }
 
     /// <summary>
@@ -704,7 +706,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         // After the cap check, the float-count is guaranteed to fit in int
         // (because actualBytes <= MaxBufferAllocBytes <= long.MaxValue and
         // floatSizeLong * 4 <= int.MaxValue when actualBytes is reasonable).
-        return new MetalGpuBuffer(_device, checked((int)floatSizeLong));
+        return MetalGpuBuffer.Create(_device, checked((int)floatSizeLong), zeroInitialize: true);
     }
 
     /// <summary>
@@ -721,7 +723,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         GpuBufferSizeGuard.EnsureFits("Metal", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
         // Metal can store int32 in the same buffer format as float32
-        return new MetalGpuBuffer(_device, size);
+        return MetalGpuBuffer.Create(_device, size, zeroInitialize: true);
     }
 
     /// <summary>
@@ -770,14 +772,10 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Metal);
 
-        // Convert int array to float array for buffer allocation
         var floatData = new float[data.Length];
-        for (int i = 0; i < data.Length; i++)
-        {
-            floatData[i] = Int32BitsToSingleCompat(data[i]);
-        }
+        Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
 
-        return new MetalGpuBuffer(_device, floatData);
+        return MetalGpuBuffer.Create(_device, floatData);
     }
 
     /// <summary>

@@ -161,7 +161,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // DataVector is intentionally available to trusted engine code, but the returned
             // Vector is mutable. Attach the tensor owner's guard before exposing it so a direct
             // AsWritableSpan/indexer/in-place call cannot bypass streaming or COW safety.
-            _data.SetBeforeWriteGuard(EnsureDataVectorWriteAllowed);
+            _data.SetBeforeWriteGuard(this);
             // A traced value not yet computed: the raw vector would be uninitialized memory. Realize it as every
             // other host read does (and, in an inference trace, record that the forward escaped the graph).
             if (LazySource is ILazyNode node && !node.IsRealized)
@@ -3710,7 +3710,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// storage repeatedly and make the result traversal-order dependent.
     /// </summary>
     [MethodImpl(Hot)]
-    private void EnsureNonOverlappingWritableLayout()
+    internal void EnsureNonOverlappingWritableLayout()
     {
         if (IsContiguous || Length <= 1 || Rank == 0)
             return;
@@ -3968,7 +3968,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>Validates mutations attempted through the trusted backing-vector accessor.</summary>
-    private void EnsureDataVectorWriteAllowed()
+    internal void EnsureDataVectorWriteAllowed()
     {
         EnsureStreamingStoreWritable();
         if (_cowFamily?.RequiresDetach == true)
@@ -3985,6 +3985,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// copy and pending download, so without the detach the update reached the snapshot as well.
     /// </summary>
     internal void EnsureOwnedForDeviceWrite() => EnsureOwnedForWrite();
+
+    /// <summary>True while a copy-on-write peer still shares this tensor's storage (a write must detach first).</summary>
+    internal bool HasPendingCopyOnWritePeer => _cowFamily?.RequiresDetach == true;
 
     protected void EnsureOwnedForWrite()
     {
@@ -4096,6 +4099,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     return;
                 }
 
+                // The shared storage's device copy may be the current one (a device-authoritative source whose
+                // download is still pending): bring it to the host first, or the clone below copies stale host
+                // values into both sides of the detach.
+                if (requester.GetBackingArrayForCacheLookupUnsafe() is { } sharedArray)
+                    Helpers.HostSync.TryMaterialize(sharedArray);
                 var fresh = requester._data.Clone();
                 var privateStorage = new TensorStorage<T>(fresh);
                 privateStorage.CopyGpuCacheTrackingFrom(requester._storage);

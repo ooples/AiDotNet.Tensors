@@ -111,10 +111,10 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             throw;
         }
 
-        _gpuFp16 = (paging && engine is DirectGpuTensorEngine dg
+        _gpuFp16 = (paging && engine.TryGet<DirectGpuTensorEngine>(out var dg)
                     && Environment.GetEnvironmentVariable("AIDOTNET_FP16_GPU_CACHE") == "1") ? dg : null;
         if (_paging) BuildPagingSchedule();
-        else if (engine is DirectGpuTensorEngine fdg
+        else if (engine.TryGet<DirectGpuTensorEngine>(out var fdg)
                  && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FREE") != "1")
         {
             _freeEng = fdg;
@@ -134,7 +134,7 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         // Compile()/Trace() inference path (its contract is bit-for-bit eager replay). Opt-out
         // AIDOTNET_FP16_NO_FWD_STORE; an explicit Fp16FwdStoreOverride wins.
         _fwdStoreDefault = fwdStoreEligible
-            && engine is DirectGpuTensorEngine
+            && engine.Is<DirectGpuTensorEngine>()
             && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE") != "1";
     }
 
