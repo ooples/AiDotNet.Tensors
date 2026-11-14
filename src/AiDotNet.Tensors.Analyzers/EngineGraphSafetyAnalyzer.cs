@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
@@ -85,11 +86,11 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
         if (!IsHostValueEngineMember(method, engine)) return;
         if (method.GetAttributes().Any(a => a.AttributeClass?.Name == MetadataOnlyAttributeName)) return;
 
-        foreach (var invocation in context.Operation.Descendants().OfType<IInvocationOperation>())
+        // A boundary in a branch, a loop, a lambda or after a short-circuit protects only some calls.
+        foreach (var target in context.Operation.Descendants().OfType<IInvocationOperation>()
+                     .Where(inv => RunsOnEveryCall(inv, context.Operation))
+                     .Select(inv => inv.TargetMethod))
         {
-            // A boundary in a branch, a loop, a lambda or after a short-circuit protects only some calls.
-            if (!RunsOnEveryCall(invocation, context.Operation)) continue;
-            var target = invocation.TargetMethod;
             // GraphMode.ThrowIfActiveUnsupported refuses every trace kind, which is stricter than the boundary.
             // ThrowIfInferenceUnsupported and ThrowIfNonInferenceUnsupported each leave one trace kind unguarded.
             if (target.Name is BoundaryMethodName or ActiveTraceGuardName) return;
@@ -139,13 +140,14 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
         if (SymbolEqualityComparer.Default.Equals(method.ContainingType, engine)) return true;
         var type = method.ContainingType;
         if (type is null || !type.AllInterfaces.Contains(engine, SymbolEqualityComparer.Default)) return false;
-        foreach (var member in engine.GetMembers(method.Name).OfType<IMethodSymbol>())
+        foreach (var impl in engine.GetMembers(method.Name).OfType<IMethodSymbol>()
+                     .Select(member => type.FindImplementationForInterfaceMember(member))
+                     .OfType<IMethodSymbol>())
         {
-            var impl = type.FindImplementationForInterfaceMember(member);
-            if (impl is IMethodSymbol m && SymbolEqualityComparer.Default.Equals(m.OriginalDefinition, method)) return true;
+            if (SymbolEqualityComparer.Default.Equals(impl.OriginalDefinition, method)) return true;
             // An override of the implementing virtual (a GPU engine overriding CpuEngine's member).
             for (var o = method.OverriddenMethod; o is not null; o = o.OverriddenMethod)
-                if (impl is IMethodSymbol mi && SymbolEqualityComparer.Default.Equals(mi.OriginalDefinition, o.OriginalDefinition))
+                if (SymbolEqualityComparer.Default.Equals(impl.OriginalDefinition, o.OriginalDefinition))
                     return true;
         }
         return false;
@@ -179,7 +181,6 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
             || property.ContainingType?.ContainingNamespace?.ToDisplayString() != TensorNamespace)
             return;
         var body = Root(reference);
-        if (body is null) return;
         if (Classify(reference, body, depth: 0) == Use.Read)
             context.ReportDiagnostic(Diagnostic.Create(WritableAccessorForRead, reference.Syntax.GetLocation(),
                 reference.Syntax.ToString()));
@@ -187,7 +188,7 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
 
     private enum Use { Read, Write }
 
-    private static IOperation? Root(IOperation operation)
+    private static IOperation Root(IOperation operation)
     {
         var current = operation;
         while (current.Parent is not null) current = current.Parent;
@@ -284,10 +285,10 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
     {
         if (local.RefKind != RefKind.None) return Use.Write;
         bool any = false;
-        foreach (var reference in body.Descendants().OfType<ILocalReferenceOperation>())
+        foreach (var reference in body.Descendants().OfType<ILocalReferenceOperation>()
+                     .Where(r => SymbolEqualityComparer.Default.Equals(r.Local, local)
+                                 && !(r.Parent is ISimpleAssignmentOperation a && ReferenceEquals(a.Target, r))))
         {
-            if (!SymbolEqualityComparer.Default.Equals(reference.Local, local)) continue;
-            if (reference.Parent is ISimpleAssignmentOperation a && ReferenceEquals(a.Target, reference)) continue;
             any = true;
             if (Classify(reference, body, depth + 1) == Use.Write) return Use.Write;
         }

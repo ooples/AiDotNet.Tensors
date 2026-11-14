@@ -80,7 +80,7 @@ internal static class OpRegistry
         // Activations
         "ReLU", "Sigmoid", "Tanh", "GELU", "LeakyReLU", "Swish", "Mish",
         "Softplus", "SELU", "ELU", "HardSigmoid", "HardSwish", "ReLU6",
-        "Softmax", "LogSoftmax",
+        "Softmax", "LogSoftmax", "TensorSoftmaxRows",
         "GLU", "Sparsemax", "TaylorSoftmax",
 
         // Shape
@@ -119,6 +119,7 @@ internal static class OpRegistry
 
         // Scatter/Gather
         "Gather", "Scatter", "ScatterAdd", "ScatterMean", "ScatterMax", "ScatterSoftmax",
+        "TensorScatter", "TensorTopK",
         "TensorIndexSelect", "TensorMaskedFill", "TensorMaskedSelect",
 
         // Parity-210 movement / cumulative / clamp
@@ -343,8 +344,6 @@ internal static class OpRegistry
         // In-place mutation semantics
         "TensorSetSlice",
 
-        // Discrete selection
-        "TensorTopK", "TensorScatter",
         // Shape-splitting — each split output is a differentiable slice, but
         // the multi-tensor return type is currently treated as
         // non-differentiable at the tape level.
@@ -452,7 +451,6 @@ internal static class OpRegistry
         "NativeBispectrum", "NativeTrispectrum",
         "NativeBatchedCavityForward",
         "NativeMfccFeatures", "NativeWidebandFeatures", "NativePacFeatures",
-        "TensorSoftmaxRows",
 
         // Rounding (non-differentiable, STE would need explicit annotation)
         "TensorFloor", "TensorCeiling", "TensorRound",
@@ -505,10 +503,6 @@ internal static class OpRegistry
 
         // Image codec — byte-level I/O, not meaningfully differentiable.
         "ImageDecode",
-
-        // InterpolateByScale is a pure delegator to Interpolate (which is
-        // in DifferentiableOps) — it performs no recording of its own.
-        "InterpolateByScale",
     };
 
     /// <summary>
@@ -518,6 +512,8 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // InterpolateByScale delegates directly to Interpolate (in DifferentiableOps), which records.
+        "InterpolateByScale",
         // Advanced indexing (TensorTake) and grouped GEMM (narrow / matmul / concat): composed from recorded ops
         "TensorIndex", "TensorGroupedMatMul",
         // Conv, inference batch norm and activation: recorded as the unfused ops under a tape, folded otherwise (#1432)

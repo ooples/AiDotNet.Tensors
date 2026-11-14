@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 #if NET10_0_OR_GREATER
 using System;
 using System.Collections.Immutable;

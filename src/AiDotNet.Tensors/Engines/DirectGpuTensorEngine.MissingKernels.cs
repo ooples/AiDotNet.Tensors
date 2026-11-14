@@ -4962,9 +4962,10 @@ public partial class DirectGpuTensorEngine
 
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         int normalizedAxis = axis < 0 ? axis + tensor.Rank : axis;
+        // Graph capture records its node in the host implementation (the node replays through this engine).
         // An empty tensor has no rows to sort (an empty last axis would also divide by zero below), and the row sort
         // carries indices as floats, which are exact only up to 2^24: the CPU selection handles both.
-        if (tensor.Length == 0
+        if (Compilation.GraphMode.IsActive || tensor.Length == 0
             || (normalizedAxis >= 0 && normalizedAxis < tensor.Rank && tensor._shape[normalizedAxis] > MaxFloatExactSortIndexColumns))
             return base.TensorTopK(tensor, k, axis, out indices);
         // Last axis of a higher-rank contiguous tensor (e.g. [B, S, V] logits): the same rows-on-device kernel over

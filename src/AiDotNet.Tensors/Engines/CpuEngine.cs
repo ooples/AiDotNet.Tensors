@@ -43286,7 +43286,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
-        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
 
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
@@ -43295,6 +43295,16 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (axis < 0 || axis >= tensor.Rank)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} is out of range for a rank-{tensor.Rank} tensor.");
+
+        int capturedAxis = axis;
+        if (TryRecordCompiledOp("TensorTopK", new Tensor<T>?[] { tensor },
+                e => (e.TensorTopK(tensor, k, capturedAxis, out var fresh), fresh),
+                RefreshIndices, out var compiledNode, out var compiledIndices))
+        {
+            indices = compiledIndices;
+            return compiledNode;
+        }
+
         // Any rank and axis (torch.topk): k is clamped to the axis length, the largest values come first.
         var (values, selected) = TopK(tensor, Math.Min(k, tensor._shape[axis]), axis, largest: true);
         indices = selected;
@@ -46891,19 +46901,22 @@ public partial class CpuEngine : ITensorLevelEngine
     /// second input of both, so a learnable window trains as it does through torch.stft.
     /// </summary>
     /// <remarks>
-    /// The magnitude edge saves a copy of the phase. It is recorded before the phase edge, so an in-place write to the
-    /// phase output, which rebases only edges recorded after its producer, would otherwise change the values the
-    /// magnitude backward reads without an error. The phase edge's saved magnitude is rebased by such a write.
+    /// Both edges save immutable snapshots (<c>StopGradient</c> for <c>float</c> so GPU results copy on device without
+    /// downloading to the host, and <c>Clone()</c> for other element types to preserve exact precision) of the polar
+    /// outputs. Direct indexer or span writes to either returned output tensor bypass <see cref="IEngine"/> in-place
+    /// tape rebasing and would otherwise corrupt the saved polar state read by the backward pass.
     /// </remarks>
-    private protected static void RecordStftTapeEdges<T>(Tensor<T> input, int nFft, int hopLength, Tensor<T> window,
+    private protected void RecordStftTapeEdges<T>(Tensor<T> input, int nFft, int hopLength, Tensor<T> window,
         bool center, Tensor<T> magnitude, Tensor<T> phase)
     {
         if (!DifferentiableOps.IsRecording<T>()) return;
         int origLength = input._shape[^1];
+        var phaseSnapshot = typeof(T) == typeof(float) ? StopGradient(phase) : phase.Clone();
+        var magnitudeSnapshot = typeof(T) == typeof(float) ? StopGradient(magnitude) : magnitude.Clone();
         DifferentiableOps.RecordBinary("STFTMagnitude", magnitude, input, window, BackwardFunctions<T>.StftMagnitudeBackward,
-            new object[] { nFft, hopLength, phase.Clone(), origLength, center });
+            new object[] { nFft, hopLength, phaseSnapshot, origLength, center });
         DifferentiableOps.RecordBinary("STFTPhase", phase, input, window, BackwardFunctions<T>.StftPhaseOutputBackward,
-            new object[] { nFft, hopLength, magnitude, origLength, center });
+            new object[] { nFft, hopLength, magnitudeSnapshot, origLength, center, phaseSnapshot });
     }
 
     /// <inheritdoc/>

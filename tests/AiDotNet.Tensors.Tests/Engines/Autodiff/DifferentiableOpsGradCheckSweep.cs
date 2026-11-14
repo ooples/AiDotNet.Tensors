@@ -173,6 +173,7 @@ public partial class DifferentiableOpsGradCheckSweep
         ["ApplyRoPEInterleaved"] = r => [SafeTensor([1, 1, 4, 4], r), SafeTensor([4, 2], r), SafeTensor([4, 2], r), 0],
         ["PadNd"] = r => [SafeTensor([1, 1, 3, 3], r), new[] { 1, 1, 1, 1 }, PadMode.Constant, 0.0],
         ["Interpolate"] = r => [SafeTensor([1, 2, 2, 2], r), new[] { 4, 4 }, InterpolateMode.Bilinear, false],
+        ["InterpolateByScale"] = r => [SafeTensor([1, 2, 2, 2], r), new[] { 2.0, 2.0 }, InterpolateMode.Bilinear, false],
         // Dropout at rate 0 is deterministic, so it CAN be gradient-checked (unlike TensorDropout,
         // which is exempted as stochastic). training:true keeps the real code path.
         ["Dropout"] = r => [SafeTensor([2, 3], r), 0.0, true, null!],
@@ -312,6 +313,8 @@ public partial class DifferentiableOpsGradCheckSweep
         // the loop walks `idx < indices.Length` against innerSize, so a full-size index grid overruns
         // the values array.
         ["Scatter"] = r => [SafeTensor([2, 3], r), IdxTensor([2], 3, r), SafeTensor([2, 2], r), 1],
+        ["TensorScatter"] = r => [SafeTensor([2, 3], r), new Tensor<int>(new[] { 0, 2, 1, 0 }, new[] { 2, 2 }), SafeTensor([2, 2], r), 1],
+        ["TensorTopK"] = _ => [new Tensor<double>(new[] { 0.2, 0.45, 0.7, 0.95, 0.3, 0.55, 0.8, 1.05 }, new[] { 2, 4 }), 2, 1, new Tensor<int>(new[] { 1 })],
         ["ScatterAdd|T,Ti,T,int"] = r => [SafeTensor([2, 3], r), IdxTensor([2], 3, r), SafeTensor([2, 2], r), 1],
         // Segment-style scatter family: source rows are grouped by indices along dim.
         ["ScatterAdd|T,Ti,int,int?"] = r => [SafeTensor([4, 2], r), IdxTensor([4], 3, r), 0, 3],
@@ -441,6 +444,7 @@ public partial class DifferentiableOpsGradCheckSweep
         AddCasesSpatialAndAttention(all);
         AddCasesLinearAlgebraAndLosses(all);
         AddCasesVariants(all);
+        AddCasesNonDifferentiableAudit(all);
         return all;
     }
 
@@ -456,6 +460,7 @@ public partial class DifferentiableOpsGradCheckSweep
     }
 
     static partial void AddCasesVariants(Dictionary<string, Func<Random, object[]>> cases);
+    static partial void AddCasesNonDifferentiableAudit(Dictionary<string, Func<Random, object[]>> cases);
 
     static partial void AddCasesFusedActivations(Dictionary<string, Func<Random, object[]>> cases);
     static partial void AddCasesReductionsAndIndexing(Dictionary<string, Func<Random, object[]>> cases);
@@ -679,7 +684,14 @@ public partial class DifferentiableOpsGradCheckSweep
 
     private static bool IsTensorDouble(Type t) =>
         t == typeof(Tensor<double>) ||
-        (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Tensor<>));
+        (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Tensor<>)
+         && t.GetGenericArguments()[0].IsGenericParameter);
+
+    private static bool IsDifferentiableOutTensor(Type t) =>
+        t == typeof(Tensor<double>) ||
+        t == typeof(Tensor<float>) ||
+        (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Tensor<>)
+         && t.GetGenericArguments()[0].IsGenericParameter);
 
     /// <summary>
     /// True when <paramref name="m"/> produces a tensor to differentiate: it returns one, or it returns nothing and
@@ -692,7 +704,7 @@ public partial class DifferentiableOpsGradCheckSweep
 
     private static bool IsTensorOut(ParameterInfo p) =>
         p.IsOut && p.ParameterType.IsByRef && p.ParameterType.GetElementType() is { } e
-        && (IsTensorDouble(e) || (e.IsGenericType && e.GetGenericTypeDefinition() == typeof(Tensor<>)));
+        && IsDifferentiableOutTensor(e);
 
     /// <summary>A value for an out slot: reflection overwrites it, and a tensor of the slot's type is accepted.</summary>
     internal static Tensor<double> OutSlot() => new(new[] { 1 });
@@ -771,6 +783,8 @@ public partial class DifferentiableOpsGradCheckSweep
                 if (!ps[i].IsOut) return null;
                 var element = pt.GetElementType();
                 if (element == typeof(Tensor<double>)) { args[i] = OutSlot(); continue; }
+                if (element == typeof(Tensor<int>)) { args[i] = new Tensor<int>(new[] { 1 }); continue; }
+                if (element == typeof(Tensor<Bit>)) { args[i] = new Tensor<Bit>(new[] { 1 }); continue; }
                 if (element == typeof(int[])) { args[i] = Array.Empty<int>(); continue; }
                 return null;
             }

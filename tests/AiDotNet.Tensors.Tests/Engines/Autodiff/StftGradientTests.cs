@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
@@ -182,7 +183,7 @@ public class StftGradientTests
                 Assert.True(Math.Abs(first[leaf][i] - plainFirst[leaf][i]) <= 1e-10 * Math.Max(1, Math.Abs(plainFirst[leaf][i])),
                     $"center={center}, dL/d{name}[{i}]: create-graph {first[leaf][i]:R}, first-order {plainFirst[leaf][i]:R}");
 
-        const double step = 1e-5;
+        const double step = 1e-6;
         foreach (var (name, leaf) in new[] { ("x", x), ("w", window) })
         {
             Assert.True(second.ContainsKey(leaf), $"center={center}: the second order reached no gradient for {name}");
@@ -311,6 +312,280 @@ public class StftGradientTests
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void BelowFloorNonZeroWaveform_CreateGraphPhaseGradient_IsZeroAndFinite(bool center)
+    {
+        // Nonzero bins with 0 < |C| <= 1e-12 (PhaseGradientMagnitudeFloor) must contribute zero phase gradient
+        // without overflow or NaN under both first-order and create-graph differentiation.
+        var engine = new CpuEngine();
+        var window = Hann();
+        var x = Signal();
+        for (int i = 0; i < x.Length; i++) x[i] *= 1e-15;
+        engine.STFT(x, NFft, Hop, window, center, out Tensor<double> m0, out Tensor<double> _);
+        bool sawNonZeroBelowFloor = false;
+        for (int i = 0; i < m0.Length; i++)
+        {
+            Assert.True(m0[i] <= 1e-12, $"bin {i} magnitude {m0[i]:R} exceeded floor");
+            if (m0[i] > 0.0) sawNonZeroBelowFloor = true;
+        }
+        Assert.True(sawNonZeroBelowFloor, "Expected at least one strictly positive bin below the floor.");
+
+        var zeroMagWeights = new Tensor<double>((int[])m0._shape.Clone());
+        var phaseWeights = new Tensor<double>((int[])m0._shape.Clone());
+        for (int i = 0; i < phaseWeights.Length; i++) phaseWeights[i] = 0.2 + Math.Cos(i * 0.53);
+
+        Dictionary<Tensor<double>, Tensor<double>> plain, graph, second;
+        using (var tape = new GradientTape<double>())
+        {
+            engine.STFT(x, NFft, Hop, window, center, out Tensor<double> magnitude, out Tensor<double> phase);
+            plain = tape.ComputeGradients(Loss(engine, magnitude, phase, zeroMagWeights, phaseWeights), new[] { x, window });
+        }
+        using (var tape = new GradientTape<double>())
+        {
+            engine.STFT(x, NFft, Hop, window, center, out Tensor<double> magnitude, out Tensor<double> phase);
+            graph = tape.ComputeGradients(Loss(engine, magnitude, phase, zeroMagWeights, phaseWeights), new[] { x, window }, createGraph: true);
+            second = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(graph[x], graph[x]), null), new[] { x, window });
+        }
+
+        foreach (var (name, leaf) in new[] { ("x", x), ("w", window) })
+        {
+            for (int i = 0; i < leaf.Length; i++)
+            {
+                Assert.Equal(0.0, plain[leaf][i]);
+                Assert.Equal(0.0, graph[leaf][i]);
+                if (second.TryGetValue(leaf, out var s))
+                    Assert.True(!double.IsNaN(s[i]) && !double.IsInfinity(s[i]), $"center={center}, second order d/d{name}[{i}] is {s[i]:R}");
+            }
+        }
+    }
+
+    [Fact]
+    public void InPlaceMutationOfOutputs_DoesNotCorruptTapeGradients()
+    {
+        var engine = new CpuEngine();
+        var window = Hann();
+        var x = Signal();
+        engine.STFT(x, NFft, Hop, window, center: true, out Tensor<double> m0, out Tensor<double> p0);
+        var (a, b) = Weights(m0, p0);
+
+        Dictionary<Tensor<double>, Tensor<double>> cleanMagGrad, mutatedMagGrad, cleanPhaseGrad, mutatedPhaseGrad;
+        using (var tape = new GradientTape<double>())
+        {
+            engine.STFT(x, NFft, Hop, window, center: true, out Tensor<double> mag, out Tensor<double> _);
+            cleanMagGrad = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(mag, a), null), new[] { x, window });
+        }
+        using (var tape = new GradientTape<double>())
+        {
+            engine.STFT(x, NFft, Hop, window, center: true, out Tensor<double> mag, out Tensor<double> phase);
+            var loss = engine.ReduceSum(engine.TensorMultiply(mag, a), null);
+            for (int i = 0; i < mag.Length; i++) mag[i] = 999.0;
+            for (int i = 0; i < phase.Length; i++) phase[i] = 1.75;
+            mutatedMagGrad = tape.ComputeGradients(loss, new[] { x, window });
+        }
+
+        using (var tape = new GradientTape<double>())
+        {
+            engine.STFT(x, NFft, Hop, window, center: true, out Tensor<double> _, out Tensor<double> phase);
+            cleanPhaseGrad = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(phase, b), null), new[] { x, window });
+        }
+        using (var tape = new GradientTape<double>())
+        {
+            engine.STFT(x, NFft, Hop, window, center: true, out Tensor<double> mag, out Tensor<double> phase);
+            var loss = engine.ReduceSum(engine.TensorMultiply(phase, b), null);
+            for (int i = 0; i < mag.Length; i++) mag[i] = 999.0;
+            for (int i = 0; i < phase.Length; i++) phase[i] = -2.5;
+            mutatedPhaseGrad = tape.ComputeGradients(loss, new[] { x, window });
+        }
+
+        foreach (var leaf in new[] { x, window })
+        {
+            for (int i = 0; i < leaf.Length; i++)
+            {
+                Assert.Equal(cleanMagGrad[leaf][i], mutatedMagGrad[leaf][i], 12);
+                Assert.Equal(cleanPhaseGrad[leaf][i], mutatedPhaseGrad[leaf][i], 12);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void DirectGpuStft_FloatAndDoubleTapeGradients_MatchCpu_AndShortCenterSignalThrows()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend.");
+            IEngine gpuEngine = gpu;
+            var cpu = new CpuEngine();
+
+            // Short centered signal (signalLength <= nFft / 2 while numFrames > 0) must reject cleanly, never launch OOB ReflectPad1d.
+            var shortSignal = new Tensor<float>(new[] { 1, 4 });
+            var shortWindow = new Tensor<float>(new[] { NFft });
+            Assert.Throws<ArgumentException>(() =>
+                gpuEngine.STFT(shortSignal, NFft, Hop, shortWindow, center: true, out Tensor<float> _, out Tensor<float> _));
+
+            // Double taped STFT on DirectGpuTensorEngine routes through exact double path and matches CPU to machine precision.
+            var wDouble = Hann();
+            var xDouble = Signal();
+            cpu.STFT(xDouble, NFft, Hop, wDouble, center: true, out Tensor<double> m0, out Tensor<double> p0);
+            var (aDouble, bDouble) = Weights(m0, p0);
+            Dictionary<Tensor<double>, Tensor<double>> cpuDoubleGrads, gpuDoubleGrads;
+            using (var tape = new GradientTape<double>())
+            {
+                cpu.STFT(xDouble, NFft, Hop, wDouble, center: true, out Tensor<double> mag, out Tensor<double> phase);
+                cpuDoubleGrads = tape.ComputeGradients(Loss(cpu, mag, phase, aDouble, bDouble), new[] { xDouble, wDouble });
+            }
+            using (var tape = new GradientTape<double>())
+            {
+                gpuEngine.STFT(xDouble, NFft, Hop, wDouble, center: true, out Tensor<double> mag, out Tensor<double> phase);
+                // Keep downstream scalar reduction in exact double so we test gpuEngine.STFT's double path directly
+                // without float32 rounding from DirectGpuTensorEngine elementwise ops.
+                gpuDoubleGrads = tape.ComputeGradients(Loss(cpu, mag, phase, aDouble, bDouble), new[] { xDouble, wDouble });
+            }
+            for (int i = 0; i < xDouble.Length; i++)
+                Assert.True(Math.Abs(gpuDoubleGrads[xDouble][i] - cpuDoubleGrads[xDouble][i]) <= 1e-12 * Math.Max(1.0, Math.Abs(cpuDoubleGrads[xDouble][i])),
+                    $"double dL/dx[{i}]: gpu {gpuDoubleGrads[xDouble][i]:R}, cpu {cpuDoubleGrads[xDouble][i]:R}");
+            for (int i = 0; i < wDouble.Length; i++)
+                Assert.True(Math.Abs(gpuDoubleGrads[wDouble][i] - cpuDoubleGrads[wDouble][i]) <= 1e-12 * Math.Max(1.0, Math.Abs(cpuDoubleGrads[wDouble][i])),
+                    $"double dL/dw[{i}]: gpu {gpuDoubleGrads[wDouble][i]:R}, cpu {cpuDoubleGrads[wDouble][i]:R}");
+
+            // Float taped STFT on DirectGpuTensorEngine runs on device and matches CPU float tape gradients.
+            var wFloat = new Tensor<float>(new[] { NFft });
+            for (int i = 0; i < NFft; i++) wFloat[i] = (float)wDouble[i];
+            var xFloat = new Tensor<float>(new[] { Batch, Length });
+            for (int i = 0; i < xFloat.Length; i++) xFloat[i] = (float)xDouble[i];
+            var aFloat = new Tensor<float>((int[])aDouble._shape.Clone());
+            var bFloat = new Tensor<float>((int[])bDouble._shape.Clone());
+            for (int i = 0; i < aFloat.Length; i++) { aFloat[i] = (float)aDouble[i]; bFloat[i] = (float)bDouble[i]; }
+
+            Dictionary<Tensor<float>, Tensor<float>> cpuFloatGrads, gpuFloatGrads;
+            using (var tape = new GradientTape<float>())
+            {
+                cpu.STFT(xFloat, NFft, Hop, wFloat, center: true, out Tensor<float> mag, out Tensor<float> phase);
+                var loss = cpu.ReduceSum(cpu.TensorAdd(cpu.TensorMultiply(mag, aFloat), cpu.TensorMultiply(phase, bFloat)), null);
+                cpuFloatGrads = tape.ComputeGradients(loss, new[] { xFloat, wFloat });
+            }
+            using (var tape = new GradientTape<float>())
+            {
+                gpuEngine.STFT(xFloat, NFft, Hop, wFloat, center: true, out Tensor<float> mag, out Tensor<float> phase);
+                var loss = gpuEngine.ReduceSum(gpuEngine.TensorAdd(gpuEngine.TensorMultiply(mag, aFloat), gpuEngine.TensorMultiply(phase, bFloat)), null);
+                for (int i = 0; i < mag.Length; i++) mag[i] = 999f;
+                for (int i = 0; i < phase.Length; i++) phase[i] = -2.5f;
+                gpuFloatGrads = tape.ComputeGradients(loss, new[] { xFloat, wFloat });
+            }
+            for (int i = 0; i < xFloat.Length; i++)
+                Assert.True(Math.Abs(gpuFloatGrads[xFloat][i] - cpuFloatGrads[xFloat][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuFloatGrads[xFloat][i])),
+                    $"float dL/dx[{i}]: gpu {gpuFloatGrads[xFloat][i]}, cpu {cpuFloatGrads[xFloat][i]}");
+            for (int i = 0; i < wFloat.Length; i++)
+                Assert.True(Math.Abs(gpuFloatGrads[wFloat][i] - cpuFloatGrads[wFloat][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuFloatGrads[wFloat][i])),
+                    $"float dL/dw[{i}]: gpu {gpuFloatGrads[wFloat][i]}, cpu {cpuFloatGrads[wFloat][i]}");
+        }
+    }
+
+    [SkippableFact]
+    public void DirectGpuPowerOfTwoFftFamily_TapeAndCompiledTrainingGradients_MatchCpu()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend.");
+            IEngine gpuEngine = gpu;
+            var cpu = new CpuEngine();
+
+            void CheckTransform(string name, int[] shape, Action<IEngine, Tensor<float>, Tensor<float>, out_pair> invoke)
+            {
+                var re = new Tensor<float>(shape);
+                var im = new Tensor<float>(shape);
+                var wRe = new Tensor<float>(shape);
+                var wIm = new Tensor<float>(shape);
+                for (int i = 0; i < re.Length; i++)
+                {
+                    re[i] = (float)(0.4 * Math.Sin(0.31 * i + 0.2) + 0.15 * Math.Cos(0.73 * i));
+                    im[i] = (float)(0.35 * Math.Cos(0.29 * i - 0.1) - 0.2 * Math.Sin(0.61 * i));
+                    wRe[i] = (float)(0.3 + 0.5 * Math.Cos(0.41 * i));
+                    wIm[i] = (float)(-0.2 + 0.6 * Math.Sin(0.53 * i));
+                }
+
+                Dictionary<Tensor<float>, Tensor<float>> cpuGrads, gpuGrads;
+                using (var tape = new GradientTape<float>())
+                {
+                    var pair = new out_pair();
+                    invoke(cpu, re, im, pair);
+                    var loss = cpu.ReduceSum(cpu.TensorAdd(cpu.TensorMultiply(pair.Re, wRe), cpu.TensorMultiply(pair.Im, wIm)), null);
+                    cpuGrads = tape.ComputeGradients(loss, new[] { re, im });
+                }
+                using (var tape = new GradientTape<float>())
+                {
+                    var pair = new out_pair();
+                    invoke(gpuEngine, re, im, pair);
+                    var loss = gpuEngine.ReduceSum(gpuEngine.TensorAdd(gpuEngine.TensorMultiply(pair.Re, wRe), gpuEngine.TensorMultiply(pair.Im, wIm)), null);
+                    gpuGrads = tape.ComputeGradients(loss, new[] { re, im });
+                }
+
+                for (int i = 0; i < re.Length; i++)
+                {
+                    Assert.True(Math.Abs(gpuGrads[re][i] - cpuGrads[re][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuGrads[re][i])),
+                        $"{name} tape dL/dRe[{i}]: gpu {gpuGrads[re][i]}, cpu {cpuGrads[re][i]}");
+                    Assert.True(Math.Abs(gpuGrads[im][i] - cpuGrads[im][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuGrads[im][i])),
+                        $"{name} tape dL/dIm[{i}]: gpu {gpuGrads[im][i]}, cpu {cpuGrads[im][i]}");
+                }
+
+                var previous = AiDotNetEngine.Current;
+                try
+                {
+                    AiDotNetEngine.Current = gpuEngine;
+                    ICompiledTrainingPlan<float> plan;
+                    using (var scope = GraphMode.EnableTraining(new[] { re, im }))
+                    {
+                        var pair = new out_pair();
+                        invoke(gpuEngine, re, im, pair);
+                        gpuEngine.ReduceSum(gpuEngine.TensorAdd(gpuEngine.TensorMultiply(pair.Re, wRe), gpuEngine.TensorMultiply(pair.Im, wIm)), null);
+                        plan = scope.CompileTraining(new[] { re, im });
+                    }
+                    using (plan)
+                    {
+                        plan.Step();
+                        for (int i = 0; i < re.Length; i++)
+                        {
+                            Assert.True(Math.Abs(plan.Gradients[0][i] - cpuGrads[re][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuGrads[re][i])),
+                                $"{name} compiled dL/dRe[{i}]: gpu {plan.Gradients[0][i]}, cpu {cpuGrads[re][i]}");
+                            Assert.True(Math.Abs(plan.Gradients[1][i] - cpuGrads[im][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuGrads[im][i])),
+                                $"{name} compiled dL/dIm[{i}]: gpu {plan.Gradients[1][i]}, cpu {cpuGrads[im][i]}");
+                        }
+                    }
+                }
+                finally
+                {
+                    AiDotNetEngine.Current = previous;
+                }
+            }
+
+            CheckTransform("FFT", new[] { 2, 8 }, (e, r, i, p) => { e.FFT(r, i, out var or, out var oi); p.Re = or; p.Im = oi; });
+            CheckTransform("IFFT", new[] { 2, 8 }, (e, r, i, p) => { e.IFFT(r, i, out var or, out var oi); p.Re = or; p.Im = oi; });
+            CheckTransform("FFT2D", new[] { 2, 4, 8 }, (e, r, i, p) => { e.FFT2D(r, i, out var or, out var oi); p.Re = or; p.Im = oi; });
+            CheckTransform("IFFT2D", new[] { 2, 4, 8 }, (e, r, i, p) => { e.IFFT2D(r, i, out var or, out var oi); p.Re = or; p.Im = oi; });
+        }
+    }
+
+    private sealed class out_pair
+    {
+        public Tensor<float> Re = new(new[] { 1 });
+        public Tensor<float> Im = new(new[] { 1 });
+    }
+
+    [Theory]
     [InlineData(0, false)]   // DC of a constant negative frame: phase π
     [InlineData(4, true)]    // Nyquist of an alternating frame whose Nyquist coefficient is negative: phase π
     public void PhaseGradient_AtTheRealBins_IsExactlyZero(int bin, bool alternating)
@@ -325,19 +600,63 @@ public class StftGradientTests
         var window = new Tensor<float>(new[] { n });
         for (int i = 0; i < n; i++) window[i] = 1f;
 
-        Dictionary<Tensor<float>, Tensor<float>> grads;
-        using (var tape = new GradientTape<float>())
+        foreach (bool createGraph in new[] { false, true })
         {
-            engine.STFT(x, n, n, window, false, out Tensor<float> _, out Tensor<float> phase);
-            Assert.True(Math.Abs(Math.Abs(phase[bin]) - Math.PI) < 1e-6, $"bin {bin} phase {phase[bin]:R}, expected ±π");
-            var seed = new Tensor<float>((int[])phase._shape.Clone());
-            seed[bin] = 1f;
-            grads = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(phase, seed), null), new[] { x, window });
-        }
+            Dictionary<Tensor<float>, Tensor<float>> grads;
+            using (var tape = new GradientTape<float>())
+            {
+                engine.STFT(x, n, n, window, false, out Tensor<float> _, out Tensor<float> phase);
+                Assert.True(Math.Abs(Math.Abs(phase[bin]) - Math.PI) < 1e-6, $"bin {bin} phase {phase[bin]:R}, expected ±π");
+                var seed = new Tensor<float>((int[])phase._shape.Clone());
+                seed[bin] = 1f;
+                grads = tape.ComputeGradients(
+                    engine.ReduceSum(engine.TensorMultiply(phase, seed), null),
+                    new[] { x, window },
+                    createGraph: createGraph);
+            }
 
-        Assert.True(grads.TryGetValue(x, out var gx), "no waveform gradient was recorded");
-        for (int i = 0; i < n; i++) Assert.Equal(0f, gx[i]);
-        Assert.True(grads.TryGetValue(window, out var gw), "no window gradient was recorded");
-        for (int i = 0; i < n; i++) Assert.Equal(0f, gw[i]);
+            Assert.True(grads.TryGetValue(x, out var gx), $"createGraph={createGraph}: no waveform gradient was recorded");
+            for (int i = 0; i < n; i++) Assert.Equal(0f, gx[i]);
+            Assert.True(grads.TryGetValue(window, out var gw), $"createGraph={createGraph}: no window gradient was recorded");
+            for (int i = 0; i < n; i++) Assert.Equal(0f, gw[i]);
+        }
     }
+
+#if NETCOREAPP
+    [Fact]
+    public void PureRecordingDeferredScope_RefusesStftBackward_ForFloatAndDouble()
+    {
+        var physical = AiDotNet.Tensors.Tests.Engines.DirectGpu.MockDirectGpuBackend.Create(
+            new AiDotNet.Tensors.Tests.Engines.DirectGpu.MockBackendState());
+        var recording = new AiDotNet.Tensors.Engines.Gpu.RecordingGpuBackend(physical)
+        {
+            ExecuteWhileRecording = false,
+        };
+        using var graph = new AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder();
+        using var direct = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(recording);
+        using var gpu = new DirectGpuTensorEngine(direct);
+
+        var xFloat = new Tensor<float>(new[] { 1, 16 });
+        var wFloat = new Tensor<float>(new[] { 8 });
+        var gFloat = new Tensor<float>(new[] { 1, 5, 3 });
+        var xDouble = new Tensor<double>(new[] { 1, 16 });
+        var wDouble = new Tensor<double>(new[] { 8 });
+        var gDouble = new Tensor<double>(new[] { 1, 5, 3 });
+
+        recording.BeginRecording(graph);
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() =>
+                gpu.TryStftBackward(gFloat, gFloat, gFloat, phaseTarget: false, xFloat, wFloat, 8, 4, center: false,
+                    out _, out _));
+            Assert.Throws<InvalidOperationException>(() =>
+                gpu.TryStftBackward(gDouble, gDouble, gDouble, phaseTarget: false, xDouble, wDouble, 8, 4, center: false,
+                    out _, out _));
+        }
+        finally
+        {
+            recording.EndRecording();
+        }
+    }
+#endif
 }

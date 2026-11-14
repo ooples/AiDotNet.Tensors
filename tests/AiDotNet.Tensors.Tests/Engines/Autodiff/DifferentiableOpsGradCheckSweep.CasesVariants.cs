@@ -23,6 +23,7 @@ public partial class DifferentiableOpsGradCheckSweep
             // Scatter / ScatterAdd(input, 1-D indices, values, axis): values carry one slice per index along the axis.
             // Distinct indices, so the overwriting scatter is a function of every source element.
             cases[$"Scatter|axis={a}"] = r => [SafeTensor([3, 2], r), new Tensor<int>(new[] { 2, 0 }, new[] { 2 }), SafeTensor([2, 2], r), a];
+            cases[$"TensorScatter|axis={a}"] = r => [SafeTensor([3, 2], r), new Tensor<int>(new[] { 2, 0, 1, 2 }, new[] { 2, 2 }), SafeTensor([2, 2], r), a];
             cases[$"ScatterAdd|T,Ti,T,int|axis={a}"] = r => [SafeTensor([3, 2], r), new Tensor<int>(new[] { 2, 0 }, new[] { 2 }), SafeTensor([2, 2], r), a];
             // cross product along the size-3 axis 0.
             cases[$"TensorCross|dim={a}"] = r => [SafeTensor([3, 2], r), SafeTensor([3, 2], r), a];
@@ -56,5 +57,7 @@ public partial class DifferentiableOpsGradCheckSweep
         // Linear interpolation is 1-D (N, C, L); trilinear is 3-D (N, C, D, H, W).
         cases["Interpolate|mode=Linear"] = r => [SafeTensor([1, 2, 3], r), new[] { 5 }, InterpolateMode.Linear, false];
         cases["Interpolate|mode=Trilinear"] = r => [SafeTensor([1, 1, 2, 2, 2], r), new[] { 3, 3, 3 }, InterpolateMode.Trilinear, false];
+        cases["InterpolateByScale|mode=Linear"] = r => [SafeTensor([1, 2, 3], r), new[] { 2.0 }, InterpolateMode.Linear, false];
+        cases["InterpolateByScale|mode=Trilinear"] = r => [SafeTensor([1, 1, 2, 2, 2], r), new[] { 2.0, 2.0, 2.0 }, InterpolateMode.Trilinear, false];
     }
 }

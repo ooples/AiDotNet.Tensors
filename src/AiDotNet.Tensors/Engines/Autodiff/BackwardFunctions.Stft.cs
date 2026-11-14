@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
@@ -38,11 +39,10 @@ internal static partial class BackwardFunctions<T>
         int origLength = SavedInt(nameof(StftMagnitudeBackward), savedState, 3, "origLength");
         bool center = SavedBool(nameof(StftMagnitudeBackward), savedState, 4, "center");
 
-        if (TryCompositeBackward(gradOutput, new[] { waveform, window }, engine, grads,
-                e => StftMagnitudeComposite(e, waveform, window, nFft, hopLength, center)))
+        if (CreatesGraph && StftMagnitudeBackwardCreateGraph(gradOutput, inputs, engine, grads, waveform, window, nFft, hopLength, center))
             return;
 
-        if (TryDeviceStftBackward(gradOutput, output, phase, phaseTarget: false, waveform, window, nFft, hopLength, center,
+        if (TryDeviceStftBackward(gradOutput, phase, phase, phaseTarget: false, waveform, window, nFft, hopLength, center,
                 engine, grads))
             return;
 
@@ -53,6 +53,12 @@ internal static partial class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
         DifferentiableOps.AccumulateGrad(grads, window, DoublesAsTensor(windowGradient, window._shape), engine);
     }
+
+    private static bool StftMagnitudeBackwardCreateGraph(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads,
+        Tensor<T> waveform, Tensor<T> window, int nFft, int hopLength, bool center)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => StftMagnitudeComposite(e, waveform, window, nFft, hopLength, center));
 
     // The same first-order adjoint on the GPU engine's backend (all six implement the three kernels), so a device
     // training step does not download the spectrogram gradient to run it on the host.
@@ -77,28 +83,34 @@ internal static partial class BackwardFunctions<T>
     {
         var waveform = inputs[0];
         var window = inputs[1];
-        RequireSavedState(nameof(StftPhaseOutputBackward), savedState, 5);
+        RequireSavedState(nameof(StftPhaseOutputBackward), savedState, 6);
         int nFft = SavedInt(nameof(StftPhaseOutputBackward), savedState, 0, "nFft");
         int hopLength = SavedInt(nameof(StftPhaseOutputBackward), savedState, 1, "hopLength");
         var magnitude = SavedTensor(nameof(StftPhaseOutputBackward), savedState, 2, "magnitude");
         int origLength = SavedInt(nameof(StftPhaseOutputBackward), savedState, 3, "origLength");
         bool center = SavedBool(nameof(StftPhaseOutputBackward), savedState, 4, "center");
+        var savedPhase = SavedTensor(nameof(StftPhaseOutputBackward), savedState, 5, "phase");
 
-        if (TryCompositeBackward(gradOutput, new[] { waveform, window }, engine, grads,
-                e => StftPhaseComposite(e, waveform, window, nFft, hopLength, center)))
+        if (CreatesGraph && StftPhaseOutputBackwardCreateGraph(gradOutput, inputs, engine, grads, waveform, window, nFft, hopLength, center))
             return;
 
-        if (TryDeviceStftBackward(gradOutput, magnitude, output, phaseTarget: true, waveform, window, nFft, hopLength, center,
+        if (TryDeviceStftBackward(gradOutput, magnitude, savedPhase, phaseTarget: true, waveform, window, nFft, hopLength, center,
                 engine, grads))
             return;
 
         var windowGradient = new double[nFft];
         var result = StftAnalysisAdjoint(
-            gradOutput, magnitude, output, StftAdjointTarget.Phase,
+            gradOutput, magnitude, savedPhase, StftAdjointTarget.Phase,
             nFft, hopLength, window, origLength, waveform._shape, center, waveform, windowGradient);
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
         DifferentiableOps.AccumulateGrad(grads, window, DoublesAsTensor(windowGradient, window._shape), engine);
     }
+
+    private static bool StftPhaseOutputBackwardCreateGraph(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads,
+        Tensor<T> waveform, Tensor<T> window, int nFft, int hopLength, bool center)
+        => TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => StftPhaseComposite(e, waveform, window, nFft, hopLength, center));
 
     private static Tensor<T> StftMagnitudeComposite(IEngine e, Tensor<T> waveform, Tensor<T> window, int nFft,
         int hopLength, bool center)
@@ -276,8 +288,19 @@ internal static partial class BackwardFunctions<T>
         {
             for (int k = 0; k < numFreqs; k++)
             {
-                double angle = 2 * Math.PI * k * i / nFft;
-                data[i * numFreqs + k] = ops.FromDouble(imaginary ? -Math.Sin(angle) : Math.Cos(angle));
+                // DC (k == 0) and even-length Nyquist (2 * k == nFft) are purely real: keep their imaginary basis
+                // identically zero rather than -Math.Sin(Math.PI * i), so create-graph phase gradients stay exact zero.
+                double basisValue;
+                if (k == 0)
+                    basisValue = imaginary ? 0.0 : 1.0;
+                else if (2 * k == nFft)
+                    basisValue = imaginary ? 0.0 : (i % 2 == 0 ? 1.0 : -1.0);
+                else
+                {
+                    double angle = 2 * Math.PI * k * i / nFft;
+                    basisValue = imaginary ? -Math.Sin(angle) : Math.Cos(angle);
+                }
+                data[i * numFreqs + k] = ops.FromDouble(basisValue);
             }
         }
         return new Tensor<T>(data, new[] { nFft, numFreqs });
