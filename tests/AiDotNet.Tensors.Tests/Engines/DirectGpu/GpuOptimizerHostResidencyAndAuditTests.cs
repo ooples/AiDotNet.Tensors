@@ -103,6 +103,9 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
         int worstIdx = 0;
         for (int i = 0; i < expected.Length; i++)
         {
+            Assert.False(
+                float.IsNaN(expected[i]) || float.IsInfinity(expected[i]) || float.IsNaN(actual[i]) || float.IsInfinity(actual[i]),
+                $"{label} non-finite value at [{i}]: expected {expected[i]:R}, actual {actual[i]:R}");
             float diff = Math.Abs(expected[i] - actual[i]);
             if (diff > maxDiff)
             {
@@ -953,18 +956,59 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
 
             // Dispose backendA from a fresh OS thread (where current CUDA context is guaranteed IntPtr.Zero) while backendB stays live!
             Exception? disposeError = null;
+            IntPtr threadCtxAfterZeroDispose = new IntPtr(-1);
             var disposeThread = new System.Threading.Thread(() =>
             {
-                try { backendA.Dispose(); }
+                try
+                {
+                    backendA.Dispose();
+                    if (CudaNativeBindings.cuCtxGetCurrent(out var current) == CudaResult.Success)
+                        threadCtxAfterZeroDispose = current;
+                }
                 catch (Exception ex) { disposeError = ex; }
             });
             disposeThread.Start();
             disposeThread.Join();
             Assert.Null(disposeError);
+            Assert.Equal(IntPtr.Zero, threadCtxAfterZeroDispose);
             Assert.False(backendA.IsAvailable);
             Assert.Throws<GpuCapabilityUnavailableException>(() => backendA.AllocateBuffer(4));
 
-            // Verify backendB remains healthy after cross-context teardown of backendA.
+            // Verify same-thread multi-context Dispose restores the caller's underlying active CUDA context and _threadCurrentContext!
+            var backendC = new CudaBackend(0);
+            try
+            {
+                using (var bufC = backendC.AllocateBuffer(new[] { 1f, 2f, 3f, 4f }))
+                {
+                    var checkC = new float[4];
+                    backendC.DownloadBuffer(bufC, checkC);
+                    AssertClose(new[] { 1f, 2f, 3f, 4f }, checkC, 1e-6f, "CudaMultiContext.PreSameThreadDisposeC");
+                }
+
+                // Make backendB's context active on this thread, then dispose backendC on this same thread.
+                using var activeBufB = backendB.AllocateBuffer(new[] { 7f, 9f });
+                var activeDstB = new float[2];
+                backendB.DownloadBuffer(activeBufB, activeDstB);
+                backendB.EnsureContextCurrent();
+                Assert.Equal(CudaResult.Success, CudaNativeBindings.cuCtxGetCurrent(out IntPtr ctxBeforeDispose));
+                Assert.Equal(ctxBeforeDispose, CudaBackend.ThreadCurrentContextForTests);
+
+                backendC.Dispose();
+
+                Assert.Equal(CudaResult.Success, CudaNativeBindings.cuCtxGetCurrent(out IntPtr ctxAfterDispose));
+                if (deviceCount >= 2)
+                {
+                    Assert.NotEqual(IntPtr.Zero, ctxBeforeDispose);
+                    Assert.Equal(ctxBeforeDispose, ctxAfterDispose);
+                    Assert.Equal(ctxBeforeDispose, CudaBackend.ThreadCurrentContextForTests);
+                }
+            }
+            finally
+            {
+                backendC.Dispose();
+            }
+
+            // Verify backendB remains healthy after cross-context teardown of backendA and backendC.
             using var postBufB = backendB.AllocateBuffer(new[] { 4f, 6f, 8f, 10f });
             Assert.Throws<ObjectDisposedException>(() => backendA.UploadBufferInPlace(new float[4], postBufB));
             Assert.Throws<ObjectDisposedException>(() => backendA.DownloadBuffer(postBufB, new float[4]));
@@ -1497,6 +1541,10 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
             using var sharedView = destStorageShared.Reshape(new[] { 2, 2 });
             Assert.True(destStorageShared._storage.RefCount > 1);
 
+            var destNonGpuOwner = HostTensor(new[] { 13f, 14f, 15f, 16f });
+            var customOwner = new TrackingDisposable();
+            destNonGpuOwner._storage.AttachGpuBufferOwner(customOwner);
+
             engine.BeginGraphLifetime();
             try
             {
@@ -1504,6 +1552,7 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
                 {
                     DirectGpuTensorEngine.CopyResultInto(engine, src, destStorageSingle);
                     DirectGpuTensorEngine.CopyResultInto(engine, src, destStorageShared);
+                    DirectGpuTensorEngine.CopyResultInto(engine, src, destNonGpuOwner);
                 }
             }
             finally
@@ -1514,6 +1563,9 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
             Assert.Equal(1, storageBuf1.DisposeCount);
             Assert.False(destStorageSingle._storage.HasGpuBufferOwner);
             Assert.False(destStorageSingle._storage.OwnsGpuBuffer(srcBuf));
+            Assert.Equal(1, customOwner.DisposeCount);
+            Assert.False(destNonGpuOwner._storage.HasGpuBufferOwner);
+            destNonGpuOwner.Dispose();
 
             // Shared storage keeps storageBuf2 alive for sharedView, while OwnsGpuBuffer(srcBuf) returns false!
             Assert.Equal(0, storageBuf2.DisposeCount);
@@ -1528,6 +1580,104 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
             destStorageShared.Dispose();
             Assert.Equal(0, srcBuf.DisposeCount);
             srcBuf.Dispose();
+
+            // Verify ReleaseSupersededOwnedBuffer directly on CPU-only runs for both deferred and non-deferred capture paths:
+            var capDeferredBuf = new MockGpuBuffer(new[] { 1f });
+            AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.Begin();
+            try
+            {
+                DirectGpuTensorEngine.ReleaseSupersededOwnedBuffer(capDeferredBuf, backend, capturing: true);
+                Assert.Equal(0, capDeferredBuf.DisposeCount);
+            }
+            finally
+            {
+                AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.EndAndRelease();
+            }
+            Assert.Equal(1, capDeferredBuf.DisposeCount);
+
+            var capImmediateBuf = new MockGpuBuffer(new[] { 2f });
+            DirectGpuTensorEngine.ReleaseSupersededOwnedBuffer(capImmediateBuf, backend, capturing: true);
+            Assert.Equal(1, capImmediateBuf.DisposeCount);
+
+            // Verify AcquireParameterBuffer in-place refresh on an owned parameter modified on host:
+            using var ownedParam = GpuOptimizer.CreateStateTensor(new[] { 2 });
+            ownedParam.AsWritableSpan()[0] = 42f;
+            ownedParam.IncrementVersion();
+            var refreshedBuf = engine.AcquireParameterBuffer(ownedParam, out var refreshedBe);
+            Assert.NotNull(refreshedBuf);
+            Assert.Same(backend, refreshedBe);
         });
+
+        Assert.False(CudaBackend.TryPushDisposeContext(IntPtr.Zero));
+        CudaBackend.ClearThreadCurrentContext(IntPtr.Zero);
+
+        // 3. When a graph-capturing backend is available, verify superseded storage-owned buffers are deferred during
+        // stream capture rather than left pinned on _storage or freed illegally mid-capture:
+        if (_gpuReady && _gpu is { } gpuCtxEngine
+            && gpuCtxEngine.GetBackend() is IGpuGraphCapture capturer
+            && capturer.SupportsGraphCapture)
+        {
+            IDirectGpuBackend gpuCtxBackend = capturer;
+            using var realSrcBuf = gpuCtxBackend.AllocateBuffer(new[] { 100f, 200f, 300f, 400f });
+            using var realSrc = Tensor<float>.FromGpuBuffer(gpuCtxBackend, realSrcBuf, new[] { 4 }, GpuTensorRole.Activation, ownsBuffer: false);
+            var destDuringCapture = HostTensor(new[] { 1f, 2f, 3f, 4f });
+            var deferredStorageOwner = new TrackingDisposable();
+            destDuringCapture._storage.AttachGpuBufferOwner(deferredStorageOwner);
+            var destFromGpuCapture = HostTensor(new[] { 5f, 6f, 7f, 8f });
+            var mockOwnedCaptureBuf = new MockGpuBuffer(new[] { 5f, 6f, 7f, 8f });
+            destFromGpuCapture._storage.AttachGpuBufferOwner(mockOwnedCaptureBuf);
+            destFromGpuCapture._gpuBuffer = mockOwnedCaptureBuf;
+            destFromGpuCapture._gpuBackend = gpuCtxBackend;
+
+            AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.Begin();
+            IntPtr graphExec = IntPtr.Zero;
+            bool deferralReleased = false;
+            gpuCtxEngine.BeginGraphLifetime();
+            try
+            {
+                using (gpuCtxEngine.EnterCompiledCapturePath())
+                {
+                    graphExec = capturer.CaptureGraph(() =>
+                    {
+                        DirectGpuTensorEngine.CopyResultInto(gpuCtxEngine, realSrc, destDuringCapture);
+                        DirectGpuTensorEngine.CopyResultInto(gpuCtxEngine, realSrc, destFromGpuCapture);
+                    });
+                }
+
+                // Ownership cleared immediately during capture, while actual Dispose is held in GpuBufferReleaseDeferral!
+                Assert.False(destDuringCapture._storage.HasGpuBufferOwner);
+                Assert.False(destFromGpuCapture._storage.HasGpuBufferOwner);
+                Assert.Equal(0, deferredStorageOwner.DisposeCount);
+                Assert.Equal(0, mockOwnedCaptureBuf.DisposeCount);
+
+                AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.EndAndRelease();
+                deferralReleased = true;
+
+                Assert.Equal(1, deferredStorageOwner.DisposeCount);
+                Assert.Equal(1, mockOwnedCaptureBuf.DisposeCount);
+            }
+            finally
+            {
+                if (!deferralReleased)
+                    AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.EndAndRelease();
+                if (graphExec != IntPtr.Zero)
+                    capturer.DestroyCapturedGraph(graphExec);
+                gpuCtxEngine.EndGraphLifetime();
+                destDuringCapture.Dispose();
+                destFromGpuCapture.Dispose();
+            }
+        }
+
+        // Verify AssertClose rejects NaN and +/-Infinity immediately rather than silently passing 0 maxDiff:
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(() => AssertClose(new[] { 1f, 2f }, new[] { 1f, float.NaN }, 1e-3f, "NaNActual"));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(() => AssertClose(new[] { float.NaN, 2f }, new[] { 1f, 2f }, 1e-3f, "NaNExpected"));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(() => AssertClose(new[] { 1f, 2f }, new[] { 1f, float.PositiveInfinity }, 1e-3f, "PosInfActual"));
+        Assert.ThrowsAny<Xunit.Sdk.XunitException>(() => AssertClose(new[] { 1f, 2f }, new[] { 1f, float.NegativeInfinity }, 1e-3f, "NegInfActual"));
+    }
+
+    private sealed class TrackingDisposable : IDisposable
+    {
+        public int DisposeCount { get; private set; }
+        public void Dispose() => DisposeCount++;
     }
 }

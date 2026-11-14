@@ -2396,7 +2396,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         removed?.Dispose();
     }
 
-    private static void ReleaseSupersededOwnedBuffer(IGpuBuffer buffer, IDirectGpuBackend? ownerBackend, bool capturing)
+    internal static void ReleaseSupersededOwnedBuffer(IGpuBuffer buffer, IDirectGpuBackend? ownerBackend, bool capturing)
     {
         if (StepScratchPool.IsPooled(buffer)) return;
         if (!capturing)
@@ -4880,18 +4880,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             ReleaseSupersededActivation(destArr, srcBuf);
             ReleaseSupersededActivation(dest.DataVector, srcBuf);
-            if (dest._storage.RefCount == 1 && dest._storage.HasGpuBufferOwner && !dest._storage.OwnsGpuBuffer(srcBuf))
+        }
+        if (dest._storage.RefCount == 1 && dest._storage.HasGpuBufferOwner && !dest._storage.OwnsGpuBuffer(srcBuf))
+        {
+            var prevStorageBackend = dest._gpuBackend;
+            dest._storage.DisposeGpuBufferOwner(owner =>
             {
-                var prevStorageBackend = dest._gpuBackend;
-                dest._storage.DisposeGpuBufferOwner(owner =>
-                {
-                    if (ReferenceEquals(owner, srcBuf)) return;
-                    if (owner is IGpuBuffer gpuOwner)
-                        ReleaseSupersededOwnedBuffer(gpuOwner, prevStorageBackend, capturing: false);
-                    else
-                        owner.Dispose();
-                });
-            }
+                if (ReferenceEquals(owner, srcBuf)) return;
+                if (owner is IGpuBuffer gpuOwner)
+                    ReleaseSupersededOwnedBuffer(gpuOwner, prevStorageBackend, streamCapturing);
+                else if (!streamCapturing || !Gpu.GpuBufferReleaseDeferral.TryDefer(owner.Dispose))
+                    owner.Dispose();
+            });
         }
         if (dest._ownsGpuBuffer)
         {

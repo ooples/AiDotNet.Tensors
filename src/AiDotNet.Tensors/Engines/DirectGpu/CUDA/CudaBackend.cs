@@ -580,6 +580,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     [ThreadStatic]
     private static IntPtr _threadCurrentContext;
+    internal static IntPtr ThreadCurrentContextForTests => _threadCurrentContext;
 
     private bool _isAvailable;
 
@@ -19296,12 +19297,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         GC.SuppressFinalize(this);
     }
 
-    private static bool TryPushDisposeContext(IntPtr cudaContext)
+    internal static bool TryPushDisposeContext(IntPtr cudaContext)
     {
-        if (cudaContext == IntPtr.Zero || _threadCurrentContext == cudaContext)
+        if (cudaContext == IntPtr.Zero)
             return false;
         try
         {
+            if (CudaNativeBindings.cuCtxGetCurrent(out var currentContext) == CudaResult.Success
+                && currentContext == cudaContext)
+            {
+                _threadCurrentContext = cudaContext;
+                return false;
+            }
+
             if (CuBlasNative.cuCtxPushCurrent(cudaContext) == 0)
             {
                 _threadCurrentContext = cudaContext;
@@ -19319,12 +19327,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return false;
     }
 
-    private static void PopDisposeContext()
+    private static void PopDisposeContext(IntPtr disposedContext)
     {
         try
         {
-            CuBlasNative.cuCtxPopCurrent(out var previousContext);
-            _threadCurrentContext = previousContext;
+            CuBlasNative.cuCtxPopCurrent(out _);
+            _threadCurrentContext = CudaNativeBindings.cuCtxGetCurrent(out var activeContext) == CudaResult.Success
+                && activeContext != disposedContext
+                ? activeContext
+                : IntPtr.Zero;
         }
         catch (DllNotFoundException)
         {
@@ -19334,6 +19345,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             _threadCurrentContext = IntPtr.Zero;
         }
+    }
+
+    internal static void ClearThreadCurrentContext(IntPtr disposedContext)
+    {
+        if (_threadCurrentContext == disposedContext)
+            _threadCurrentContext = IntPtr.Zero;
     }
 
     private void Dispose(bool disposing)
@@ -19414,8 +19431,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Ensure this backend's CUDA context is current on the disposing thread before draining events,
         // freeing staged/pinned buffers, or destroying stream/module handles (a multi-GPU caller may have
         // switched the thread to another device's context prior to Dispose).
-        bool pushedDisposeContext = TryPushDisposeContext(_cudaContext);
-
+        IntPtr disposeContext = _cudaContext;
+        bool pushedDisposeContext = TryPushDisposeContext(disposeContext);
+        try
+        {
         DrainDeferredFrees(blockOldest: true);
 
         // Direct-PTX modules borrow this backend's context and stream. Unload
@@ -19819,9 +19838,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         UnloadRemainingModules();
-
+        }
+        finally
+        {
         if (pushedDisposeContext)
-            PopDisposeContext();
+            PopDisposeContext(disposeContext);
 
         if (_cudaContext != IntPtr.Zero)
         {
@@ -19835,7 +19856,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 RemoveContextHolder(context, _cuDevice);
                 _cudaContext = IntPtr.Zero;
             }
-            if (_threadCurrentContext == context) _threadCurrentContext = IntPtr.Zero;
+            ClearThreadCurrentContext(context);
+        }
         }
 
         GC.SuppressFinalize(this);
