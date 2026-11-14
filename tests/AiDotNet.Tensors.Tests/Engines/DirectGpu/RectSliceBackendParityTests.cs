@@ -22,6 +22,11 @@ public sealed class RectSliceBackendParityTests
         (new[] { 10 }, new[] { 3 }, new[] { 4 }),
         (new[] { 3, 5, 7, 4 }, new[] { 1, 0, 2, 1 }, new[] { 2, 5, 3, 2 }),
         (new[] { 2, 3, 2, 3, 4 }, new[] { 0, 0, 0, 0, 0 }, new[] { 2, 3, 2, 3, 4 }),
+        // Rows of contiguous runs (the CUDA strided row copy): an NCHW channel slice with float4-aligned runs and
+        // offsets, the same slice with runs and offsets off the float4 grid, and unit axes around a merged run.
+        (new[] { 3, 6, 4, 4 }, new[] { 0, 2, 0, 0 }, new[] { 3, 3, 4, 4 }),
+        (new[] { 3, 6, 3, 3 }, new[] { 0, 1, 0, 0 }, new[] { 3, 4, 3, 3 }),
+        (new[] { 4, 1, 5, 6 }, new[] { 2, 0, 1, 0 }, new[] { 1, 1, 3, 6 }),
     };
 
     private static void Check(IDirectGpuBackend backend)
@@ -70,6 +75,15 @@ public sealed class RectSliceBackendParityTests
             for (int i = 0; i < full; i++)
                 Assert.Equal(expected[i], scattered[i]);
         }
+    }
+
+    [SkippableFact]
+    public void Cuda_RectSlice_MatchesCpu()
+    {
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "No CUDA driver.");
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend unavailable.");
+        Check(backend);
     }
 
     [SkippableFact]
