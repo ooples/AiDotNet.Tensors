@@ -662,6 +662,8 @@ internal static class HeadToHeadNetworkHarness
         internal int? KernelNodes { get; set; }
         internal int? MemcpyNodes { get; set; }
         internal int? MemsetNodes { get; set; }
+        /// <summary>Each memset node's bytes and the kernel it feeds (CUDA; see GraphNodeCounts.MemsetSources).</summary>
+        internal string? MemsetSources { get; set; }
         /// <summary>Why no graph was captured, when none was (CUDA).</summary>
         internal string? GraphCaptureFailure { get; set; }
     }
@@ -719,6 +721,7 @@ internal static class HeadToHeadNetworkHarness
                     counts.KernelNodes = nodes.Kernel;
                     counts.MemcpyNodes = nodes.Memcpy;
                     counts.MemsetNodes = nodes.Memset;
+                    counts.MemsetSources = nodes.MemsetSources;
                 }
             }
             return new TrainRun(new Dictionary<string, PhaseStats>(), Array.Empty<double>());
