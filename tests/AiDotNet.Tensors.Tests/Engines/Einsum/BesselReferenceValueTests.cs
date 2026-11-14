@@ -92,4 +92,41 @@ public class BesselReferenceValueTests
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(grad[i] - expected[i]) <= 1e-12, $"d I1e/dx at {x[i]}: expected {expected[i]:R}, got {grad[i]:R}");
     }
+
+    [Fact]
+    public void TensorI0AndI1_StayFinitePastTheExpOverflow()
+    {
+        // e^{|x|} overflows double past 709.78 while I0 and I1 stay finite to about 713.98. scipy.special.i0/i1 return
+        // inf here, so the references are scipy's i0e/i1e times e^x evaluated in 40-digit decimal arithmetic.
+        double[] xs = { 709.9, 710.0 };
+        double[] i0Expected = { 3.027197150068327e+306, 3.345334558619656e+306 };
+        double[] i1Expected = { 3.0250642688739804e+306, 3.3429778585097626e+306 };
+        var engine = new CpuEngine();
+        var x = new Tensor<double>((double[])xs.Clone(), new[] { xs.Length });
+        var i0 = engine.TensorI0(x);
+        var i1 = engine.TensorI1(x);
+        for (int i = 0; i < xs.Length; i++)
+        {
+            AssertRelative(i0Expected[i], i0[i], $"TensorI0({xs[i]})");
+            AssertRelative(i1Expected[i], i1[i], $"TensorI1({xs[i]})");
+        }
+    }
+
+#if NET5_0_OR_GREATER
+    [Fact]
+    public void I1eGradient_HalfStaysFiniteForTinyArguments()
+    {
+        // 1/x overflows Half (max 65504) for 0 < |x| < 1.5e-5; at x = ±2^-17 it is 131072. The derivative there is
+        // I0e(x) − I1e(x)·sign(x) − I1e(x)/x: I1e(±2^-17) rounds to ±2^-18 in Half, 1 − 2^-18 rounds to 1, so the
+        // Half result is exactly 1 − ½ = ½.
+        var engine = new CpuEngine();
+        Half tiny = (Half)Math.Pow(2, -17);
+        var x = new Tensor<Half>(new[] { tiny, -tiny }, new[] { 2 });
+        using var tape = new GradientTape<Half>();
+        var loss = engine.ReduceSum(engine.TensorI1e(x), null);
+        var grad = tape.ComputeGradients(loss, new[] { x })[x];
+        for (int i = 0; i < 2; i++)
+            Assert.Equal((Half)0.5, grad[i]);
+    }
+#endif
 }

@@ -10984,20 +10984,23 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>
-    /// I1e backward using d/dx I1e(x) = I0e(x) - I1e(x)·sign(x) - I1e(x)/|x|.
-    /// For x = 0 the limit is finite (I0e(0) = 1, I1e(0) = 0) so we guard.
+    /// I1e backward using d/dx I1e(x) = I0e(x) - I1e(x)·sign(x) - I1e(x)/x.
+    /// At x = 0 the limit is ½ (I1e(x) ≈ x/2 there), so that point is guarded.
     /// </summary>
     internal static void I1eBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // d/dx e^{-|x|}I₁(x) = I0e(x) − I1e(x)·(sign(x) + 1/x) (I₁' = I₀ − I₁/x), and ½ at x = 0, as torch's
-        // i1e_backward; sign is a constant factor. Through the engine (see I0Backward).
+        // d/dx e^{-|x|}I₁(x) = I0e(x) − I1e(x)·sign(x) − I1e(x)/x (I₁' = I₀ − I₁/x), and ½ at x = 0, as torch's
+        // i1e_backward; sign is a constant factor. Through the engine (see I0Backward). The last term is the quotient
+        // I1e(x)/x, not I1e(x)·(1/x): 1/x overflows Half for 0 < |x| < 1.5e-5, while the quotient is about ½ there.
         var x = inputs[0];
         var atZero = HostMask(x, v => v == 0);
         var safe = SafeArgument(engine, x, atZero, 1);
-        var factor = engine.TensorAdd(HostMap(x, v => System.Math.Sign(v)), engine.TensorReciprocal(safe));
-        var d = engine.TensorSubtract(engine.TensorI0e(x), engine.TensorMultiply(output, factor));
+        var sign = HostMap(x, v => System.Math.Sign(v));
+        var d = engine.TensorSubtract(
+            engine.TensorSubtract(engine.TensorI0e(x), engine.TensorMultiply(output, sign)),
+            engine.TensorDivide(output, safe));
         AccumulateScaled(grads, x, gradOutput, Select(engine, atZero, ConstantLike(x, 0.5), d), engine);
     }
 

@@ -399,9 +399,16 @@ internal static class SpecialFunctions
     }
 
     /// <summary>The modified Bessel function of the first kind I_n(x), integer n.</summary>
+    /// <remarks>
+    /// The scaling e^{|x|} is applied as two factors of e^{|x|/2}: e^{|x|} alone overflows past |x| ≈ 709.78 while
+    /// I_n(x) itself stays finite to about |x| ≈ 713.98 (I0(710) ≈ 3.35e306).
+    /// </remarks>
     public static double BesselI(int n, double x)
-        => double.IsInfinity(x) ? (n % 2 == 1 && x < 0 ? double.NegativeInfinity : double.PositiveInfinity)
-            : BesselIScaled(n, x) * Math.Exp(Math.Abs(x));
+    {
+        if (double.IsInfinity(x)) return n % 2 == 1 && x < 0 ? double.NegativeInfinity : double.PositiveInfinity;
+        double halfScale = Math.Exp(Math.Abs(x) / 2);
+        return BesselIScaled(n, x) * halfScale * halfScale;
+    }
 
     /// <summary>
     /// The modified Bessel function of the second kind, exponentially scaled: e^{x}·K_ν(x), x &gt; 0, any real ν.
