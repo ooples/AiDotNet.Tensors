@@ -119,6 +119,11 @@ public class MockDirectGpuBackend : DispatchProxy
             case "get_LocalMemoryBytes": return 0L;
             case "get_MaxBufferAllocBytes": return _state.MaxBufferAllocBytes;
             case "get_TheoreticalGflops": return 0.0;
+            case "Synchronize":
+            {
+                object synced = null;
+                return synced;
+            }
             case "Dispose": return null!;
 
             // ── Buffer allocation + download — what the chunker uses ──
@@ -154,10 +159,90 @@ public class MockDirectGpuBackend : DispatchProxy
             case "DownloadBuffer" when args.Length == 2:
             {
                 _state.DownloadBufferCalls++;
-                var b = (MockGpuBuffer)args[0]!;
-                var dest = (float[])args[1]!;
+                var b = (MockGpuBuffer)args[0];
+                var dest = (float[])args[1];
+                if (dest.Length < b.Size)
+                    throw new ArgumentException("Destination array is too small.", nameof(args));
                 Array.Copy(b.Data, dest, b.Size);
-                return null!;
+                object none = null;
+                return none;
+            }
+            case "UploadBufferInPlace" when args.Length == 2 && args[0] is float[] uploadSrc && args[1] is MockGpuBuffer uploadDst:
+            {
+                if (uploadSrc.Length > uploadDst.Size)
+                    throw new ArgumentException("Host data exceeds buffer capacity.", nameof(args));
+                Array.Copy(uploadSrc, uploadDst.Data, uploadSrc.Length);
+                object none = null;
+                return none;
+            }
+            case "AllocateIntBuffer" when args.Length == 1 && args[0] is int intSize:
+            {
+                _state.AllocationSizes.Add(intSize);
+                var intBuf = new MockGpuBuffer(new float[intSize]);
+                _state.AllocatedBuffers.Add(intBuf);
+                return intBuf;
+            }
+            case "AllocateIntBuffer" when args.Length == 1 && args[0] is int[] intArr:
+            {
+                _state.AllocationSizes.Add(intArr.Length);
+                var encoded = new float[intArr.Length];
+                for (int i = 0; i < intArr.Length; i++)
+                {
+#if NETCOREAPP
+                    encoded[i] = BitConverter.Int32BitsToSingle(intArr[i]);
+#else
+                    unsafe
+                    {
+                        int bits = intArr[i];
+                        encoded[i] = *(float*)&bits;
+                    }
+#endif
+                }
+                var intBuf = new MockGpuBuffer(encoded);
+                _state.AllocatedBuffers.Add(intBuf);
+                return intBuf;
+            }
+            case "AllocateByteBuffer" when args.Length == 1 && args[0] is int byteCount:
+            {
+                int floatSlots = Math.Max(1, (byteCount + sizeof(float) - 1) / sizeof(float));
+                _state.AllocationSizes.Add(floatSlots);
+                var byteBuf = new MockGpuBuffer(new float[floatSlots]);
+                _state.AllocatedBuffers.Add(byteBuf);
+                return byteBuf;
+            }
+            case "Copy" when args.Length == 5 && args[0] is MockGpuBuffer copySrc && args[2] is MockGpuBuffer copyDst:
+            {
+                int srcOff = (int)args[1];
+                int dstOff = (int)args[3];
+                int copyLen = (int)args[4];
+                Array.Copy(copySrc.Data, srcOff, copyDst.Data, dstOff, copyLen);
+                object none = null;
+                return none;
+            }
+            case "Copy" when args.Length == 3 && args[0] is MockGpuBuffer copySrc3 && args[1] is MockGpuBuffer copyDst3:
+            {
+                int copyLen3 = (int)args[2];
+                Array.Copy(copySrc3.Data, 0, copyDst3.Data, 0, copyLen3);
+                object none = null;
+                return none;
+            }
+            case "Add" when args.Length == 4 && args[0] is MockGpuBuffer addLeft && args[1] is MockGpuBuffer addRight && args[2] is MockGpuBuffer addOut:
+            {
+                int addLen = (int)args[3];
+                for (int i = 0; i < addLen; i++)
+                    addOut.Data[i] = addLeft.Data[i] + addRight.Data[i];
+                object none = null;
+                return none;
+            }
+            case "DotProduct" when args.Length == 4 && args[0] is MockGpuBuffer dotLeft && args[1] is MockGpuBuffer dotRight && args[2] is MockGpuBuffer dotOut:
+            {
+                int dotLen = (int)args[3];
+                double sum = 0.0;
+                for (int i = 0; i < dotLen; i++)
+                    sum += (double)dotLeft.Data[i] * dotRight.Data[i];
+                dotOut.Data[0] = (float)sum;
+                object none = null;
+                return none;
             }
 
             // Device-resident non-finite-gradient preflight used by compiled optimizers.
@@ -288,8 +373,11 @@ public class MockDirectGpuBackend : DispatchProxy
             case "SparseNadamUpdate":
             case "SparseFtrlUpdate":
             case "SparseProximalL1Update":
+            case "AdamBf16Update":
+            case "Adam8BitUpdate":
                 _state.OptimizerCalls.Add(targetMethod.Name);
-                return null!;
+                object noResult = null;
+                return noResult;
         }
         throw new NotImplementedException(
             $"MockDirectGpuBackend does not implement {targetMethod.Name}. " +

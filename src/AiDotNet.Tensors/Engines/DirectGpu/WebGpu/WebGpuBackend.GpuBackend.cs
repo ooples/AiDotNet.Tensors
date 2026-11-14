@@ -53,9 +53,14 @@ public sealed partial class WebGpuBackend
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         EnsureInitialized();
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (destination.Length < buffer.Size)
+            throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
+        if (buffer.Size == 0) return;
         var data = DownloadBufferData(buffer);
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.WebGpu);
-        Array.Copy(data, destination, Math.Min(data.Length, destination.Length));
+        Array.Copy(data, destination, data.Length);
     }
 
     public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)

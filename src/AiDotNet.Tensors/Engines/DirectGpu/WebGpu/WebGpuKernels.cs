@@ -3069,15 +3069,14 @@ fn sparse_adam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let k = gid.x;
     if (k >= opt_params.size) { return; }
     let i = sparse_slot(k); if (i >= opt_params.param_size) { return; }
-    let grad = values[k];
+    var grad = values[k];
+    if (opt_params.weight_decay > 0.0) { grad = grad + opt_params.weight_decay * params_arr[i]; }
     state1[i] = opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad;
     state2[i] = opt_params.beta2 * state2[i] + (1.0 - opt_params.beta2) * grad * grad;
     let step = f32(opt_params.t);
     let m_hat = state1[i] / (wgsl_bias_correction(opt_params.beta1, step));
     let v_hat = state2[i] / (wgsl_bias_correction(opt_params.beta2, step));
-    var update = opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
-    if (opt_params.weight_decay > 0.0) { update = update + opt_params.lr * opt_params.weight_decay * params_arr[i]; }
-    params_arr[i] = params_arr[i] - update;
+    params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }
 
 @compute @workgroup_size(256)

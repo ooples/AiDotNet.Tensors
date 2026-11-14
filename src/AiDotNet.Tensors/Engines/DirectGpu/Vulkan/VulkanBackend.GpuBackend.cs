@@ -358,6 +358,8 @@ public sealed unsafe partial class VulkanBackend
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         EnsureInitialized();
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
         if (destination.Length < buffer.Size)
             throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
         var vb = AsVulkan(buffer);
