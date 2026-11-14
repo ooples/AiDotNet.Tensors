@@ -26,9 +26,10 @@ namespace AiDotNet.Tensors.Analyzers;
 /// </summary>
 /// <remarks>
 /// TENS0040 applies to members of a class implementing <c>IEngine</c> that implement an <c>IEngine</c> member, return a
-/// type with no tensor in it, and take a tensor. It is satisfied by a call to <c>BeginHostScalarRead</c> or to another
-/// such host-value engine member (which is itself checked), or by <c>[HostValueFromMetadata]</c> on a member that reads
-/// only shapes. TENS0041 follows the accessor's value through <c>AsFloatMemory</c>/<c>AsDoubleMemory</c>, <c>.Span</c>,
+/// type with no tensor in it, and take a tensor. It is satisfied by a call to <c>BeginHostScalarRead</c>,
+/// <c>GraphMode.ThrowIfActiveUnsupported</c> or another such host-value engine member (which is itself checked) that
+/// runs on every call (not inside a branch, loop, lambda or short-circuit operand), or by <c>[HostValueFromMetadata]</c>
+/// on a member that reads only shapes. TENS0041 follows the accessor's value through <c>AsFloatMemory</c>/<c>AsDoubleMemory</c>, <c>.Span</c>,
 /// <c>Slice</c> and locals, and reports only when every use is a read; any use it cannot prove read-only (an element
 /// write, a pin, an argument of a writable type) counts as a write.
 /// </remarks>
@@ -38,6 +39,7 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
     internal const string EngineMetadataName = "AiDotNet.Tensors.Engines.IEngine";
     internal const string TensorNamespace = "AiDotNet.Tensors.LinearAlgebra";
     internal const string BoundaryMethodName = "BeginHostScalarRead";
+    internal const string ActiveTraceGuardName = "ThrowIfActiveUnsupported";
     internal const string MetadataOnlyAttributeName = "HostValueFromMetadataAttribute";
 
     internal static readonly DiagnosticDescriptor HostValueWithoutBoundary = new(
@@ -85,9 +87,12 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
 
         foreach (var invocation in context.Operation.Descendants().OfType<IInvocationOperation>())
         {
+            // A boundary in a branch, a loop, a lambda or after a short-circuit protects only some calls.
+            if (!RunsOnEveryCall(invocation, context.Operation)) continue;
             var target = invocation.TargetMethod;
-            // ThrowIfInferenceUnsupported refuses every trace kind, which is stricter than the boundary.
-            if (target.Name is BoundaryMethodName or "ThrowIfInferenceUnsupported") return;
+            // GraphMode.ThrowIfActiveUnsupported refuses every trace kind, which is stricter than the boundary.
+            // ThrowIfInferenceUnsupported and ThrowIfNonInferenceUnsupported each leave one trace kind unguarded.
+            if (target.Name is BoundaryMethodName or ActiveTraceGuardName) return;
             if (!SymbolEqualityComparer.Default.Equals(target.OriginalDefinition, method.OriginalDefinition)
                 && IsHostValueEngineMember(target, engine))
                 return;
@@ -95,6 +100,33 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
 
         context.ReportDiagnostic(Diagnostic.Create(HostValueWithoutBoundary,
             method.Locations.FirstOrDefault() ?? context.Operation.Syntax.GetLocation(), method.Name));
+    }
+
+    // True when the invocation is reached on every call that reaches the end of its top-level statement: no enclosing
+    // conditional, loop, switch, try/catch, lambda, local function, null-conditional or short-circuit operand.
+    private static bool RunsOnEveryCall(IOperation invocation, IOperation body)
+    {
+        for (IOperation? child = invocation, parent = invocation.Parent; parent is not null; child = parent, parent = parent.Parent)
+        {
+            if (ReferenceEquals(parent, body)) return true;
+            switch (parent)
+            {
+                case IConditionalOperation conditional when !ReferenceEquals(conditional.Condition, child):
+                case ILoopOperation:
+                case ISwitchOperation:
+                case ISwitchExpressionOperation:
+                case ITryOperation:
+                case ICatchClauseOperation:
+                case IAnonymousFunctionOperation:
+                case ILocalFunctionOperation:
+                case IConditionalAccessOperation:
+                case ICoalesceOperation coalesce when !ReferenceEquals(coalesce.Value, child):
+                case IBinaryOperation { OperatorKind: BinaryOperatorKind.ConditionalAnd or BinaryOperatorKind.ConditionalOr } binary
+                    when !ReferenceEquals(binary.LeftOperand, child):
+                    return false;
+            }
+        }
+        return false;
     }
 
     private static bool IsHostValueEngineMember(IMethodSymbol method, INamedTypeSymbol engine)
@@ -231,9 +263,22 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
             case IVariableInitializerOperation init
                 when init.Parent is IVariableDeclaratorOperation d && d.Symbol.RefKind != RefKind.None:
                 return Use.Write;
+            // A field or property of a struct element: `span[0].Value = v` writes through the span.
+            case IMemberReferenceOperation member when ReferenceEquals(member.Instance, element):
+                return MayMutateThrough(element.Type);
+            case IInvocationOperation call when ReferenceEquals(call.Instance, element):
+                return MayMutateThrough(element.Type);
             default: return Use.Read;
         }
     }
+
+    // A member of a mutable struct element can write through the span; built-in numeric, bool and char elements and
+    // readonly structs cannot be written by their members (CompareTo, ToString).
+    private static Use MayMutateThrough(ITypeSymbol? type) =>
+        type is { IsValueType: true, IsReadOnly: false }
+        && type.SpecialType is not (>= SpecialType.System_Boolean and <= SpecialType.System_Double)
+            ? Use.Write
+            : Use.Read;
 
     private static Use LocalUses(ILocalSymbol local, IOperation body, int depth)
     {

@@ -40,6 +40,14 @@ namespace AiDotNet.Tensors.Engines
     using AiDotNet.Tensors.Helpers;
     using AiDotNet.Tensors.LinearAlgebra;
 
+    internal static class GraphMode
+    {
+        internal static void ThrowIfInferenceUnsupported() { }
+        internal static void ThrowIfActiveUnsupported() { }
+    }
+
+    public struct Cell { public float Value; }
+
     public interface IEngine
     {
         T TensorMaxValue<T>(Tensor<T> x);
@@ -55,6 +63,7 @@ namespace AiDotNet.Tensors.Engines
         private static Memory<float> AsFloatMemory<T>(Memory<T> m) => default;
         private static float ReadAll(ReadOnlyMemory<float> m) => 0f;
         private static void Consume(Memory<float> m) { }
+        private Tensor<Cell> _cells;
         public virtual T TensorMaxValue<T>(Tensor<T> x) { /*MAX*/ return default; }
         public virtual T TensorSum<T>(Tensor<T> x) { /*SUM*/ return default; }
         public virtual bool TensorIsSameSize<T>(Tensor<T> a, Tensor<T> b) { /*SAME*/ return true; }
@@ -133,9 +142,27 @@ namespace AiDotNet.Tensors.Engines
     [Theory]
     [InlineData("return TensorSum(x);")]                         // delegates to a checked host-value member
     [InlineData("var n = x.Length; BeginHostScalarRead(x); return default;")]
+    [InlineData("if (x == null) return default; BeginHostScalarRead(x); return default;")]   // an early return first
+    [InlineData("GraphMode.ThrowIfActiveUnsupported(); return default;")]                     // refuses every trace
     public void BoundaryOrDelegation_IsNotReported(string body)
     {
         Assert.Empty(Analyze(max: body));
+    }
+
+    [Theory]
+    // A boundary that runs on only some calls leaves the others unguarded.
+    [InlineData("if (x.Length == 0) BeginHostScalarRead(x); return default;")]
+    [InlineData("for (int i = 0; i < x.Length; i++) BeginHostScalarRead(x); return default;")]
+    [InlineData("System.Action a = () => BeginHostScalarRead(x); return default;")]
+    [InlineData("var ok = x.Length > 0 && TensorSum(x) != null; return default;")]
+    [InlineData("return x.Length == 0 ? default : TensorSum(x);")]
+    // ThrowIfInferenceUnsupported returns in a training trace, which still freezes the value.
+    [InlineData("GraphMode.ThrowIfInferenceUnsupported(); return default;")]
+    public void BoundaryOnSomePathsOnly_IsReported(string body)
+    {
+        var hit = Assert.Single(Analyze(max: body));
+        Assert.Equal("TENS0040", hit.Id);
+        Assert.Contains("TensorMaxValue", hit.GetMessage(), StringComparison.Ordinal);
     }
 
     [Theory]
@@ -158,6 +185,7 @@ namespace AiDotNet.Tensors.Engines
     [InlineData("input.ReadOnlyDataUnmarked.Span.CopyTo(output.DataUnmarked.Span);")]   // the destination of a copy
     [InlineData("Consume(AsFloatMemory(output.DataUnmarked));")]                          // a writable argument
     [InlineData("var m = output.DataUnmarked; var h = m.Pin(); h.Dispose();")]           // a pin may write
+    [InlineData("_cells.DataUnmarked.Span[0].Value = 1f;")]                               // a struct element's field
     public void WritableAccessorWritten_IsNotReported(string body)
     {
         Assert.Empty(Analyze(conv: body));
