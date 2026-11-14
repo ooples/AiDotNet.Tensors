@@ -5575,7 +5575,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 4L * Math.Max(1, ComputeUnits) / outerSize));
             int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
             chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
-            using var partial = AllocateStreamOrderedScratchBuffer(outerSize * chunks);
+            // sum_axis_rows_split writes one partial per (row, chunk) block: the whole buffer.
+            using var partial = AllocateStreamOrderedScratchBufferUninitialized(outerSize * chunks);
             using (PushContext())
             {
                 IntPtr inPtr = A.Handle, partialPtr = partial.Handle;
