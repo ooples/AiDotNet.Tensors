@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -18,14 +19,19 @@ public sealed class CudaLongRowKernelTests
     {
         DirectGpuTensorEngine? gpu = null;
         try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.IfNot(gpu is not null && gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "CUDA backend did not resolve.");
-        return (gpu!, (CudaBackend)gpu!.GetBackend()!);
+        if (gpu is null || !gpu.IsGpuAvailable || gpu.GetBackend() is not CudaBackend cuda)
+        {
+            gpu?.Dispose();
+            Skip.If(true, "CUDA backend did not resolve.");
+            throw new InvalidOperationException("Unreachable after Skip.If.");
+        }
+        return (gpu, cuda);
     }
 
     [SkippableTheory]
     [InlineData(600, 49152)]
-    [InlineData(7, 300)]
-    [InlineData(3, 256)]
+    [InlineData(9, 300)]
+    [InlineData(7, 256)]
     [InlineData(1000, 17)]   // short rows: the thread-per-row kernel
     public void MaxAxis_MatchesTheCpu_IncludingNaNAndInfinities(int rows, int width)
     {
@@ -49,14 +55,16 @@ public sealed class CudaLongRowKernelTests
                 data[5 * width + 1] = -0f;
                 data[5 * width + width - 1] = 0f;
             }
-
-            var expected = new float[rows];
-            for (int r = 0; r < rows; r++)
+            if (rows > 6)
             {
-                float m = float.NegativeInfinity;
-                for (int i = 0; i < width; i++) if (data[r * width + i] > m) m = data[r * width + i];
-                expected[r] = m;
+                // Subnormals: never flushed to zero under --use_fast_math.
+                for (int i = 0; i < width; i++) data[6 * width + i] = -float.Epsilon;
+                data[6 * width + width - 1] = float.Epsilon;
             }
+
+            var expected = new CpuEngine()
+                .ReduceMax(new Tensor<float>(data, new[] { rows, width }), new[] { 1 }, keepDims: false)
+                .ToArray();
 
             using var input = cuda.AllocateBuffer(data);
             using var output = cuda.AllocateBuffer(rows);

@@ -4238,7 +4238,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             using var leafDataLease = leaf.LeaseArray();
             var leafData = leafDataLease.Array;
             if (leafBuffer.Size < leaf.Length) continue;
-            UploadForReplay(cb, (float[])(object)leafData, leafBuffer);
+            if (leafData is float[] floatLeafData)
+                UploadForReplay(cb, floatLeafData, leafBuffer);
             leaf._gpuBufferVersion = leaf.GpuCacheVersion;
         }
         // In-graph embedding design: for an embedding-first plan there is NO float input to refresh (the gather
@@ -4267,7 +4268,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         using var dataLease = inT.LeaseArray();
         var data = dataLease.Array;                 // host backing (T==float on the graph path)
         if (buf.Size < inT.Length) return allLive;
-        UploadForReplay(cb, (float[])(object)data, buf);
+        if (data is float[] floatData)
+            UploadForReplay(cb, floatData, buf);
         inT._gpuBufferVersion = inT.GpuCacheVersion;
         return allLive;
     }
@@ -6877,18 +6879,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 // on a GPU-resident plan is rejected eagerly by
                                 // ValidatePlanOptimizerSupport, so reaching here means classical momentum
                                 // is what the caller asked for.
+                                var momentumBuf = gpuM[p]
+                                    ?? throw new InvalidOperationException("Momentum buffer was not initialized.");
                                 if (extras.VelocityIncludesLearningRate)
                                 {
                                     // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
                                     // weight decay lr*wd is exactly that, without a new backend entry point.
                                     var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
                                     gpuBe.Scale(gradBuf, scaledGrad, lr, len);
-                                    gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, gpuM[p]!,
+                                    gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, momentumBuf,
                                         1f, b1, wd * lr, len);
                                 }
                                 else
                                 {
-                                    gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
+                                    gpuBe.SgdMomentumUpdate(gpuP, gradBuf, momentumBuf,
                                         lr, b1, wd, len);
                                 }
                                 break;
@@ -7755,18 +7759,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 // on a GPU-resident plan is rejected eagerly by
                                 // ValidatePlanOptimizerSupport, so reaching here means classical momentum
                                 // is what the caller asked for.
+                                var momentumBuf = gpuM[p]
+                                    ?? throw new InvalidOperationException("Momentum buffer was not initialized.");
                                 if (extras.VelocityIncludesLearningRate)
                                 {
                                     // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
                                     // weight decay lr*wd is exactly that, without a new backend entry point.
                                     var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
                                     gpuBe.Scale(gradBuf, scaledGrad, lr, len);
-                                    gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, gpuM[p]!,
+                                    gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, momentumBuf,
                                         1f, b1, wd * lr, len);
                                 }
                                 else
                                 {
-                                    gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
+                                    gpuBe.SgdMomentumUpdate(gpuP, gradBuf, momentumBuf,
                                         lr, b1, wd, len);
                                 }
                                 break;

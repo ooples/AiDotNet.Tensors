@@ -49,8 +49,13 @@ public sealed class CudaStepArenaGpuTests
     {
         DirectGpuTensorEngine? gpu = null;
         try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.IfNot(gpu is not null && gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "CUDA backend did not resolve.");
-        return (gpu!, (CudaBackend)gpu!.GetBackend()!);
+        if (gpu is null || !gpu.IsGpuAvailable || gpu.GetBackend() is not CudaBackend cuda)
+        {
+            gpu?.Dispose();
+            Skip.If(true, "CUDA backend did not resolve.");
+            throw new InvalidOperationException("Unreachable after Skip.If.");
+        }
+        return (gpu, cuda);
     }
 
     [SkippableFact]
@@ -69,7 +74,8 @@ public sealed class CudaStepArenaGpuTests
 
             var arena = cuda.StepArenaForTests;
             Assert.NotNull(arena);
-            _output.WriteLine($"hits {arena!.SlotHits}, fallbacks {arena.PoolFallbacks}, replans {arena.Replans}, plan {arena.PlannedBytes} B");
+            if (arena is null) return;
+            _output.WriteLine($"hits {arena.SlotHits}, fallbacks {arena.PoolFallbacks}, replans {arena.Replans}, plan {arena.PlannedBytes} B");
             Assert.True(arena.SlotHits > 0, "no allocation was served from the plan");
             Assert.Equal(0, arena.Replans);
         }
@@ -98,8 +104,10 @@ public sealed class CudaStepArenaGpuTests
                 AssertClose(expectedOther, Step(gpu, other, w, retain: false).Grad, $"later step {step} dL/dw");
             AssertClose(expectedA, kept.ToArray(), "kept a");
 
-            var arena = cuda.StepArenaForTests!;
-            _output.WriteLine($"hits {arena.SlotHits}, fallbacks {arena.PoolFallbacks}, replans {arena.Replans}");
+            var arena = cuda.StepArenaForTests;
+            Assert.NotNull(arena);
+            if (arena is not null)
+                _output.WriteLine($"hits {arena.SlotHits}, fallbacks {arena.PoolFallbacks}, replans {arena.Replans}");
         }
     }
 
@@ -119,12 +127,48 @@ public sealed class CudaStepArenaGpuTests
             var expectedLarge = CpuGrad(large, wh);
 
             for (int step = 0; step < 4; step++) AssertClose(expectedSmall, Step(gpu, xs, w, false).Grad, $"small {step}");
-            var arena = cuda.StepArenaForTests!;
+            var arena = cuda.StepArenaForTests;
+            Assert.NotNull(arena);
+            if (arena is null) return;
             long hitsBefore = arena.SlotHits;
             for (int step = 0; step < 4; step++) AssertClose(expectedLarge, Step(gpu, xl, w, false).Grad, $"large {step}");
             _output.WriteLine($"hits {hitsBefore} -> {arena.SlotHits}, fallbacks {arena.PoolFallbacks}, replans {arena.Replans}");
             Assert.True(arena.Replans >= 1, "a mismatched step did not re-plan");
             Assert.True(arena.SlotHits > hitsBefore, "the new shape was never served from its new plan");
+        }
+    }
+
+    [SkippableFact]
+    public void EngineDispose_FreesArenaBlock_EvenWhenSlotTensorOutlivesEngine()
+    {
+        // Keep one peer CUDA backend alive on the shared primary context so cuDevicePrimaryCtxRelease cannot mask a
+        // leaked arena block, and verify that disposing a transient engine frees its step-arena block cleanly even if
+        // a retained slot tensor is collected after engine.Dispose().
+        var (peerGpu, peerCuda) = Cuda();
+        using (peerGpu)
+        {
+            static void RunTransientEngineAndDropRetainedSlot()
+            {
+                var (gpu, cuda) = Cuda();
+                Tensor<float>? outlived;
+                using (gpu)
+                {
+                    var x = gpu.UploadToGpu(Values(32, 64, 11), GpuTensorRole.General);
+                    var w = gpu.UploadToGpu(Values(64, 48, 12), GpuTensorRole.General);
+                    for (int step = 0; step < 3; step++) Step(gpu, x, w, retain: false);
+                    Assert.NotNull(cuda.StepArenaForTests);
+                    (_, outlived) = Step(gpu, x, w, retain: true);
+                }
+                Assert.Null(cuda.StepArenaForTests);
+                GC.KeepAlive(outlived);
+            }
+
+            RunTransientEngineAndDropRetainedSlot();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            using var probe = peerCuda.AllocateBuffer(16);
+            Assert.Equal(16, probe.Size);
         }
     }
 

@@ -97,7 +97,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
         }
         int drained = 0;
-        foreach (var peer in peers) drained += peer._bufferPool.DrainAll();
+        foreach (var peer in peers)
+        {
+            peer._stepArena?.FreeRetiredBlocks();
+            drained += peer._bufferPool.DrainAll();
+        }
         return drained;
     }
 
@@ -429,13 +433,29 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!CudaStepArena.Enabled || !TrainingStep.InStep || CaptureMemoryPool.Current is not null
             || IsCapturingOnThisThread || _backendStreamCaptureActive)
             return null;
-        return _stepArena ??= new CudaStepArena(_cudaContext,
+        return _stepArena ??= new CudaStepArena(_cudaContext, _contextGeneration,
             bytes => AllocDeviceMemoryWithRetry(bytes),
-            ptr =>
+            FreeArenaBlock);
+    }
+
+    private void FreeArenaBlock(IntPtr ptr)
+    {
+        if (ptr == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting) return;
+        lock (ContextLifecycleLock)
+        {
+            if (_cudaContext == IntPtr.Zero || !IsLiveContext(_cudaContext, _contextGeneration)) return;
+            try
             {
-                using var _ = PushContext();
-                CuBlasNative.cuMemFree(ptr);
-            });
+                CuBlasNative.cuCtxPushCurrent(_cudaContext);
+                GpuMemoryTracker.OnFree(ptr);
+                CuBlasNative.cuMemFree(ptr); // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                CuBlasNative.cuCtxPopCurrent(out _);
+            }
+            catch
+            {
+                // Suppress disposal errors during context teardown.
+            }
+        }
     }
 
     /// <summary>Test hook: this backend's step arena, if one was created.</summary>
@@ -2212,6 +2232,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Reclaim event-deferred frees first (#555) — under genuine pressure block on
             // their events so their device memory returns to the pool — then drain the pool.
             DrainDeferredFrees(blockOldest: true);
+            _stepArena?.FreeRetiredBlocks();
             int drained = _bufferPool.DrainAll() + DrainPeerPools();
             // When _asyncAlloc is on, freed stream-ordered allocations are RETAINED in the default mem
             // pool (release threshold maxed for caching), so they show as device free=0 and the legacy
@@ -2268,7 +2289,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             // Same zero-initialised contract as the pool, ordered on _stream after the slot's previous user.
             CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuMemsetD8Async(slot.Handle, 0, (ulong)size * sizeof(float), _stream), "cuMemsetD8Async(arena)");
+                CudaNativeBindings.cuMemsetD8Async(slot.Handle, 0, (ulong)size * sizeof(float), _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                "cuMemsetD8Async(arena)");
             return slot;
         }
         var allocated = AllocateBufferFromPool(size);
@@ -14328,6 +14350,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
+        if (outerSize <= 0) return;
         if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
             return;
         // Long rows: a block per row (a thread per row read each row serially, uncoalesced: 7 ms for 600 rows of 49k).
@@ -19447,6 +19470,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // have to go back before the pool they came from does.
         DisposeConvScratch();
         _pinnedPool.Dispose();
+        _stepArena?.Dispose();
+        _stepArena = null;
         _bufferPool.Dispose();
 
         // cuDNN helper disposes its workspace + context. Only created if
@@ -20836,7 +20861,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return false;
     }
 
-    private static void CompleteCudaBufferReclaimOrFinalizer(
+    internal static void CompleteCudaBufferReclaimOrFinalizer(
         long reclaimCharge, long reclaimEpoch,
         IntPtr finalizerPtr, IntPtr context, long contextGeneration, IntPtr asyncFreeStream)
     {

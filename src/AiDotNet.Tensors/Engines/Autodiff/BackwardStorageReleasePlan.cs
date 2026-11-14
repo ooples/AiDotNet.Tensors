@@ -183,8 +183,9 @@ internal sealed class BackwardStorageReleasePlan<T>
                     key = shapeKey * 1_000_033L + ordinal;
                     signature = (signature * 1_099_511_628_211L) ^ key;
                 }
-                releases[step]![counts[step]++] = new ReleaseCandidate(usage.Identity, usage.ReleaseCandidate,
-                    new LastUseReleaseNote(usage.ReleaseCandidate._shape, producer, usage.ProducerStep, method(step), step, key), key);
+                if (releases[step] is { } slot)
+                    slot[counts[step]++] = new ReleaseCandidate(usage.Identity, usage.ReleaseCandidate,
+                        new LastUseReleaseNote(usage.ReleaseCandidate._shape, producer, usage.ProducerStep, method(step), step, key), key);
             }
 
             return new BackwardStorageReleasePlan<T>(releases, signature);
@@ -278,6 +279,9 @@ internal sealed class BackwardStorageReleasePlan<T>
         DirectGpuTensorEngine engine,
         HashSet<object> protectedStorages)
     {
+        // Higher-order AD (createGraph: true) records new differentiable ops during backward whose own backward pass
+        // may read forward activations saved by this first backward; keep them intact until the outer tape finishes.
+        if (DifferentiableOps._isBackwardCreateGraph) return;
         var candidates = _releasesAfterStep[step];
         if (!ReleaseScope.FreeDeviceActivations)
         {
@@ -296,8 +300,9 @@ internal sealed class BackwardStorageReleasePlan<T>
         }
         if (step <= _lastStep)
         {
-            // A new backward run of this graph: its previous probe window ends, and its first run probes.
-            _probing = AutoRetainProbe.BeginRun(_signature);
+            // A nested opted-in backward walk (e.g. a custom recompute inside an outer step's Backward delegate)
+            // frees its private recomputed activations immediately rather than opening a quarantine window.
+            _probing = DifferentiableOps.IsInsideBackwardStep ? false : AutoRetainProbe.BeginRun(_signature);
         }
         _lastStep = step;
         if (candidates is null) return;

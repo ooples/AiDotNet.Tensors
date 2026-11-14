@@ -235,8 +235,8 @@ internal sealed class CompiledDelegateChain<T>
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
         // On the GPU, the same for gradients: with sources named, an intermediate's gradient is dead once the step that
         // consumes it returns, as PyTorch frees it when its refcount drops.
-        var gradientReleaser = gpuEngine is not null && sources is not null && !DifferentiableOps._isBackwardCreateGraph
-            ? new DeviceGradientReleaser<T>(_steps, _count, protectedStorages!, loss, sources, retainedTensors) : null;
+        var gradientReleaser = gpuEngine is not null && protectedStorages is not null && sources is not null && !DifferentiableOps._isBackwardCreateGraph
+            ? new DeviceGradientReleaser<T>(_steps, _count, protectedStorages, loss, sources, retainedTensors) : null;
         try
         {
             // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
@@ -254,15 +254,15 @@ internal sealed class CompiledDelegateChain<T>
                 if (!DifferentiableOps.IsGradientRequired(step.Output))
                 {
                     recycler?.AfterStep(grads, step.Output, i);
-                    if (gpuEngine is not null)
-                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    if (gpuEngine is not null && protectedStorages is not null)
+                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages);
                     continue;
                 }
                 if (!grads.TryGetValue(step.Output, out var gradOutput))
                 {
                     recycler?.AfterStep(grads, step.Output, i);
-                    if (gpuEngine is not null)
-                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    if (gpuEngine is not null && protectedStorages is not null)
+                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages);
                     continue;
                 }
 
@@ -295,9 +295,12 @@ internal sealed class CompiledDelegateChain<T>
                 }
 
                 recycler?.AfterStep(grads, step.Output, i);
-                gradientReleaser?.AfterStep(grads, step.Output, gpuEngine!);
                 if (gpuEngine is not null)
-                    _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                {
+                    gradientReleaser?.AfterStep(grads, step.Output, gpuEngine);
+                    if (protectedStorages is not null)
+                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages);
+                }
             }
         }
         finally

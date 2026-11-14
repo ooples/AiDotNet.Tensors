@@ -242,15 +242,15 @@ internal static class RebindablePlanCache<T>
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
                 {
                     recycler?.AfterStep(grads, entry.Output, i);
-                    if (gpuEngine is not null)
-                        storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    if (gpuEngine is not null && storageReleasePlan is not null && protectedStorages is not null)
+                        storageReleasePlan.ReleaseAfterStep(i, gpuEngine, protectedStorages);
                     continue;
                 }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 {
                     recycler?.AfterStep(grads, entry.Output, i);
-                    if (gpuEngine is not null)
-                        storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    if (gpuEngine is not null && storageReleasePlan is not null && protectedStorages is not null)
+                        storageReleasePlan.ReleaseAfterStep(i, gpuEngine, protectedStorages);
                     continue;
                 }
 
@@ -276,8 +276,8 @@ internal static class RebindablePlanCache<T>
                     BackwardTiming.Record(entry.Backward.Method.Name, ticks);
                 }
                 recycler?.AfterStep(grads, entry.Output, i);
-                if (gpuEngine is not null)
-                    storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                if (gpuEngine is not null && storageReleasePlan is not null && protectedStorages is not null)
+                    storageReleasePlan.ReleaseAfterStep(i, gpuEngine, protectedStorages);
             }
         }
         finally

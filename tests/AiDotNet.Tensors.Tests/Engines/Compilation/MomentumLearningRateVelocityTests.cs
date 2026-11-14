@@ -24,7 +24,7 @@ public class MomentumLearningRateVelocityTests
     private static LrSchedule Schedule() => LrSchedule.Exponential(0.1, 0.7);
 
     // f(w) = sum(w^2): the gradient is 2w at the parameters before the step. Step k (1-based) runs at GetLr(k).
-    private static double[] Reference(bool lrInVelocity)
+    private static double[] Reference(bool lrInVelocity, float weightDecay = 0f)
     {
         var schedule = Schedule();
         var w = Array.ConvertAll(Init, x => (double)x);
@@ -34,7 +34,7 @@ public class MomentumLearningRateVelocityTests
             double lr = (float)schedule.GetLr(k);
             for (int i = 0; i < w.Length; i++)
             {
-                double g = 2 * w[i];
+                double g = 2 * w[i] + weightDecay * w[i];
                 if (lrInVelocity) { v[i] = Mu * v[i] + lr * g; w[i] -= v[i]; }
                 else { v[i] = Mu * v[i] + g; w[i] -= lr * v[i]; }
             }
@@ -93,8 +93,9 @@ public class MomentumLearningRateVelocityTests
     {
         FusedOptimizerCheckpoint? checkpoint = null;
         Run(true, plan => checkpoint = Assert.IsType<CompiledTrainingPlan<float>>(plan).CaptureFusedOptimizerCheckpoint());
-        Assert.NotNull(checkpoint);
-        Assert.True(checkpoint!.Extras.VelocityIncludesLearningRate);
+        if (checkpoint is null)
+            throw new InvalidOperationException("Expected compiled plan to capture a fused optimizer checkpoint.");
+        Assert.True(checkpoint.Extras.VelocityIncludesLearningRate);
 
         using var stream = new MemoryStream();
         using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, leaveOpen: true))
@@ -110,5 +111,41 @@ public class MomentumLearningRateVelocityTests
     {
         Assert.Throws<ArgumentException>(() =>
             new FusedOptimizerExtras { VelocityIncludesLearningRate = true, Nesterov = true }.Validate());
+    }
+
+    [SkippableTheory]
+    [InlineData(true, 0f)]
+    [InlineData(false, 0f)]
+    [InlineData(true, 0.05f)]
+    [InlineData(false, 0.05f)]
+    public void Gpu_plan_runs_the_requested_rule_under_a_schedule(bool lrInVelocity, float weightDecay)
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend.");
+        var prevEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var hostWeight = new Tensor<float>((float[])Init.Clone(), new[] { Init.Length });
+            var weight = gpu.UploadToGpu(hostWeight, AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.Weight);
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                gpu.ReduceSum(gpu.TensorMultiply(weight, weight), null);
+                plan = scope.CompileTraining(new[] { weight });
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGDMomentum, Schedule(), Mu, 0f, 0f, weightDecay,
+                    new FusedOptimizerExtras { VelocityIncludesLearningRate = lrInVelocity });
+                for (int k = 0; k < Steps; k++) plan.Step();
+            }
+            double err = MaxAbs(weight.ToArray(), Reference(lrInVelocity, weightDecay));
+            Assert.True(err < 1e-4, $"GPU lrInVelocity={lrInVelocity}, wd={weightDecay}: plan vs reference max |diff| {err:E3}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prevEngine;
+        }
     }
 }

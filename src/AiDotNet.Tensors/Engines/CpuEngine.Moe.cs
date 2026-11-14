@@ -100,7 +100,11 @@ public partial class CpuEngine
                 static (eng, fresh, held) => { },
                 out var recorded, out var tracedLoads,
                 backward: (gradOutput, inputs, output, savedState, engine, grads) =>
-                    AccumulateMoeGradients(gradOutput, x, scores, w1, w3, w2, slot.Saved!, engine, grads))
+                {
+                    if (slot.Saved is not { } replaySaved)
+                        throw new InvalidOperationException("Compiled MoeSwiGlu backward ran before its forward populated saved intermediates.");
+                    AccumulateMoeGradients(gradOutput, x, scores, w1, w3, w2, replaySaved, engine, grads);
+                })
             && GraphMode.Current is { } scope)
         {
             // The loads are a node of their own, downstream of the op: a consumer (the selection-bias update) then
@@ -108,7 +112,12 @@ public partial class CpuEngine
             // graph, so nothing ordered their readers after the op.
             loads = scope.RecordMaterializedUnary(LazyNodeType.Custom, "MoeSwiGluLoads", recorded,
                 (Tensor<T>)tracedLoads.CloneDeepCopy(),
-                (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, slot.Loads!, output));
+                (eng, output) =>
+                {
+                    if (slot.Loads is not { } replayLoads)
+                        throw new InvalidOperationException("Compiled MoeSwiGluLoads ran before MoeSwiGlu populated routing loads.");
+                    DirectGpuTensorEngine.CopyResultInto(eng, replayLoads, output);
+                });
             return recorded;
         }
 

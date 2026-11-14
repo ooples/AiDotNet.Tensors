@@ -423,7 +423,10 @@ public class LrScheduleTests
     public void WarmupStableDecay_MatchesTheEagerBatchSequence_BitForBit(StableDecayShape shape, int warmup, int decayStart, int decaySteps, double endLr)
     {
         var s = LrSchedule.WarmupStableDecay(3e-4, warmup, decayStart, decaySteps, shape, endLr);
-        var restored = s.TryCaptureCheckpoint()!.ToSchedule();
+        var checkpoint = s.TryCaptureCheckpoint();
+        Assert.NotNull(checkpoint);
+        if (checkpoint is null) return;
+        var restored = checkpoint.ToSchedule();
         for (int step = 1; step <= 120; step++)
         {
             double expected = EagerWsd(step - 1, 3e-4, warmup, decayStart, decaySteps, shape, endLr);

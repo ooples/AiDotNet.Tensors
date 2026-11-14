@@ -115,7 +115,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sorted_scatter_starts(
     int lo = 0, hi = count;
     while (lo < hi)
     {
-        int mid = (lo + hi) >> 1;
+        int mid = lo + ((hi - lo) >> 1);
         if (keys[mid] < d) lo = mid + 1; else hi = mid;
     }
     starts[d] = lo;

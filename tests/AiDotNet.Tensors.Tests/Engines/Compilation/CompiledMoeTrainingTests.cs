@@ -138,8 +138,10 @@ public class CompiledMoeTrainingTests : IDisposable
                 if (failure is not null) throw new InvalidOperationException("step " + s + " failed", failure);
                 losses[s] = stepLoss;
             }
-            var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
-                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
+            var execField = typeof(CompiledTrainingPlan<float>)
+                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+            var exec = execField.GetValue(concrete) is IntPtr handle ? handle : IntPtr.Zero;
             return (losses, m.Parameters.Select(p => p.ToArray()).ToArray(), m.Bias.ToArray(), exec != IntPtr.Zero);
         }
     }
@@ -199,19 +201,24 @@ public class CompiledMoeTrainingTests : IDisposable
         {
             Skip.If(true, "GPU backend did not resolve.");
         }
+        if (gpu is null)
+        {
+            Skip.If(true, "GPU backend did not resolve.");
+            return;
+        }
         using (gpu)
         {
-            AiDotNetEngine.Current = gpu!;
+            AiDotNetEngine.Current = gpu;
             if (capture)
             {
-                Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Whole-step graph capture is CUDA-only.");
+                Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Whole-step graph capture is CUDA-only.");
                 Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0", "Graph capture is disabled for this process.");
             }
-            var eager = TrainEager(gpu!);
+            var eager = TrainEager(gpu);
             AssertNotVacuous(eager);
             // A host-only bias (HreLm's router keeps its bias on the host): the in-place nudge took the host path and the
             // MoE re-uploaded the bias inside the capture, so the plan never captured.
-            var compiled = TrainCompiled(gpu!, capture, hopThreads: hopThreads, hostBias: hostBias);
+            var compiled = TrainCompiled(gpu, capture, hopThreads: hopThreads, hostBias: hostBias);
             AssertSameTraining(capture ? (hopThreads ? "gpu-captured-hopping" : "gpu-captured") : "gpu", eager, (compiled.Losses, compiled.Weights, compiled.Bias), 1e-4);
             // A thread change between steps is not a second trainer: it used to turn capture off for the engine's life.
             if (capture) Assert.True(compiled.Replayed, "the captured plan is not replaying a graph after warm-up");

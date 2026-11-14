@@ -111,9 +111,12 @@ internal sealed class OptimizedBackwardPlan<T>
         // ~600 entries on SenseVoice. Same buffers CompiledBackwardGraph
         // uses — they're per-T thread-local so the two execute paths share
         // them safely (the buffers don't carry state across calls).
-        _inputsBuf1 = BackwardInputBuffers<T>.Get1();
-        _inputsBuf2 = BackwardInputBuffers<T>.Get2();
-        _inputsBuf3 = BackwardInputBuffers<T>.Get3();
+        var inputsBuf1 = BackwardInputBuffers<T>.Get1();
+        var inputsBuf2 = BackwardInputBuffers<T>.Get2();
+        var inputsBuf3 = BackwardInputBuffers<T>.Get3();
+        _inputsBuf1 = inputsBuf1;
+        _inputsBuf2 = inputsBuf2;
+        _inputsBuf3 = inputsBuf3;
 
         // Reclaim graph-owned activation storages progressively after their final declared backward use.
         // Storage identity, not Tensor object identity, is the lifetime unit because metadata views alias their
@@ -141,14 +144,14 @@ internal sealed class OptimizedBackwardPlan<T>
 
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
                 {
-                    if (gpuEngine is not null)
-                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
+                    if (gpuEngine is not null && protectedStorages is not null)
+                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages);
                     continue;
                 }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 {
-                    if (gpuEngine is not null)
-                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
+                    if (gpuEngine is not null && protectedStorages is not null)
+                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages);
                     continue;
                 }
 
@@ -157,38 +160,32 @@ internal sealed class OptimizedBackwardPlan<T>
                 var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
                 try
                 {
-                    // Try optimized path for MatMul operations
-                    if (TryOptimizedMatMulBackward(ref entry, gradOutput, cse, grads))
+                    // Try optimized path for MatMul operations; otherwise run the original backward function.
+                    if (!TryOptimizedMatMulBackward(ref entry, gradOutput, cse, grads))
                     {
-                        if (gpuEngine is not null)
-                            _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
-                        continue;
+                        // Phase A (#338) timing wrapper records per-op ticks when
+                        // AIDOTNET_BWD_TIMING=1.
+                        //
+                        // Issue #433 phase-2: GetInputsArrayInto with thread-local
+                        // scratch buffers eliminates the per-entry array allocation
+                        // GetInputsArray() previously paid. Buffers acquired once
+                        // before the loop, reused across all entries; same buffers
+                        // CompiledBackwardGraph.Execute uses.
+                        var inputsArray = entry.GetInputsArrayInto(inputsBuf1, inputsBuf2, inputsBuf3);
+                        long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                        entry.Backward(gradOutput, inputsArray, entry.Output,
+                            entry.SavedState ?? Array.Empty<object>(), _engine, grads);
+                        if (BackwardTiming.Enabled)
+                            BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
                     }
-
-                    // Default path: use the original backward function.
-                    // Phase A (#338) timing wrapper records per-op ticks when
-                    // AIDOTNET_BWD_TIMING=1.
-                    //
-                    // Issue #433 phase-2: GetInputsArrayInto with thread-local
-                    // scratch buffers eliminates the per-entry array allocation
-                    // GetInputsArray() previously paid. Buffers acquired once
-                    // before the loop, reused across all entries; same buffers
-                    // CompiledBackwardGraph.Execute uses.
-                    var inputsArray = entry.GetInputsArrayInto(_inputsBuf1!, _inputsBuf2!, _inputsBuf3!);
-                    long _bwdStart = BackwardTiming.Enabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    entry.Backward(gradOutput, inputsArray, entry.Output,
-                        entry.SavedState ?? Array.Empty<object>(), _engine, grads);
-                    if (BackwardTiming.Enabled)
-                        BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
-
                 }
                 finally
                 {
                     DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                 }
 
-                if (gpuEngine is not null)
-                    _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
+                if (gpuEngine is not null && protectedStorages is not null)
+                    _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages);
             }
         }
         finally

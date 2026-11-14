@@ -547,8 +547,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 if (s > 0) Feed(s);
                 losses[s] = plan.Step().ToArray()[0];
             }
-            var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
-                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
+            var execField = typeof(CompiledTrainingPlan<float>)
+                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+            var exec = execField.GetValue(concrete) is IntPtr handle ? handle : IntPtr.Zero;
             return (losses, parameters.Select(p => p.ToArray()).ToArray(), exec != IntPtr.Zero);
         }
     }

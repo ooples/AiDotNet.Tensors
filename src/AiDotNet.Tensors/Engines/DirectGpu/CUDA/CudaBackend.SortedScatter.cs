@@ -104,7 +104,7 @@ public sealed partial class CudaBackend
 
             void** startArgs = stackalloc void*[4];
             startArgs[0] = &sortedKeys; startArgs[1] = &st; startArgs[2] = &n; startArgs[3] = &dest;
-            LaunchKernel(startsKernel, (uint)((destinations + 1 + 255) / 256), 256, startArgs);
+            LaunchKernel(startsKernel, checked((uint)(((long)destinations + 1 + 255) / 256)), 256, startArgs);
 
             IntPtr rowPtr = rows?.Handle ?? IntPtr.Zero, weightPtr = weights?.Handle ?? IntPtr.Zero;
             IntPtr countPtr = counts?.Handle ?? IntPtr.Zero;

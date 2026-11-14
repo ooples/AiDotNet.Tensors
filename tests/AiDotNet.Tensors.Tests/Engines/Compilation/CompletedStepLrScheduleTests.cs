@@ -35,7 +35,10 @@ public class CompletedStepLrScheduleTests
     [MemberData(nameof(Schedules))]
     public void Checkpoint_RestoresTheIdenticalSequence(string name, LrSchedule schedule)
     {
-        var restored = schedule.TryCaptureCheckpoint()!.ToSchedule();
+        var checkpoint = schedule.TryCaptureCheckpoint();
+        Assert.NotNull(checkpoint);
+        if (checkpoint is null) return;
+        var restored = checkpoint.ToSchedule();
         for (int step = 0; step <= 200; step++)
             Assert.True(BitConverter.DoubleToInt64Bits(schedule.GetLr(step)) == BitConverter.DoubleToInt64Bits(restored.GetLr(step)),
                 $"{name} step {step}: {schedule.GetLr(step):R} vs restored {restored.GetLr(step):R}");
@@ -95,17 +98,40 @@ public class CompletedStepLrScheduleTests
     [Fact]
     public void MalformedCheckpoints_FailAtRestore()
     {
-        var cp = LrSchedule.TriStage(1.0, 2, 2, 10).TryCaptureCheckpoint()!;
+        var cp = LrSchedule.TriStage(1.0, 2, 2, 10).TryCaptureCheckpoint();
+        Assert.NotNull(cp);
+        if (cp is null) return;
         cp.Ints[0] = 9;   // warmup + hold now exceed the run
         Assert.Throws<InvalidDataException>(() => cp.ToSchedule());
 
-        var seq = LrSchedule.Sequential(new[] { LrSchedule.Constant(1), LrSchedule.Polynomial(1, 5) }, new[] { 3 }).TryCaptureCheckpoint()!;
+        var seq = LrSchedule.Sequential(new List<LrSchedule> { LrSchedule.Constant(1), LrSchedule.Polynomial(1, 5) }, new List<int> { 3 }).TryCaptureCheckpoint();
+        Assert.NotNull(seq);
+        if (seq is null) return;
         var truncated = new FusedLrScheduleCheckpoint(seq.Kind, seq.Doubles, seq.Ints.Take(seq.Ints.Length - 1).ToArray());
         Assert.Throws<InvalidDataException>(() => truncated.ToSchedule());
 
-        var nan = LrSchedule.Polynomial(1, 5).TryCaptureCheckpoint()!;
+        var nan = LrSchedule.Polynomial(1, 5).TryCaptureCheckpoint();
+        Assert.NotNull(nan);
+        if (nan is null) return;
         nan.Doubles[1] = double.NaN;
         Assert.Throws<InvalidDataException>(() => nan.ToSchedule());
+    }
+
+    [Fact]
+    public void CosineWarmRestarts_LargeStepAndMultiplier_DoesNotOverflowOrHang()
+    {
+        foreach (int tMult in new[] { 2, 10 })
+        {
+            var s = LrSchedule.CosineWarmRestarts(0.1, 7, tMult, 1e-4);
+            foreach (int step in new[] { 1_000_000, 1_000_000_000, int.MaxValue })
+            {
+                double lr = s.GetLr(step);
+                Assert.True(!double.IsNaN(lr) && !double.IsInfinity(lr) && lr >= 1e-4 && lr <= 0.1,
+                    $"tMult={tMult} step={step}: lr={lr}");
+            }
+        }
+        var ms = LrSchedule.MultiStep(0.1, new List<int> { 3, 7 }, 0.5, 1e-4);
+        Assert.Equal(0.025, ms.GetLr(8), 12);
     }
 
     [Fact]

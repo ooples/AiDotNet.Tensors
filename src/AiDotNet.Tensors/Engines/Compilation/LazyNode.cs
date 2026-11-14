@@ -72,7 +72,7 @@ internal sealed class LazyNode<T> : ILazyNode
         return false;
     }
 
-    private ILazyNode? ProducerOf(Tensor<T>? input) => LazyNodeOrder.ProducerAsOf(input?.LazySource as ILazyNode, RecordOrder);
+    private ILazyNode? ProducerOf(Tensor<T>? input) => LazyNodeOrder.ProducerAsOf(input?.LazySource, RecordOrder);
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 

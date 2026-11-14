@@ -97,7 +97,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
         try
         {
             // Realize input first if it's also lazy
-            if (LazyNodeOrder.ProducerAsOf(Input?.LazySource as ILazyNode, RecordOrder) is { IsRealized: false } inputNode)
+            if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { IsRealized: false } inputNode)
                 inputNode.Realize(engine);
 
             Execute(engine, Output);
@@ -117,7 +117,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
 
     public ILazyNode[] GetInputNodes()
     {
-        if (LazyNodeOrder.ProducerAsOf(Input?.LazySource as ILazyNode, RecordOrder) is { } node)
+        if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { } node)
             return new[] { node };
         return Array.Empty<ILazyNode>();
     }

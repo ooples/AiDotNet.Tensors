@@ -3752,7 +3752,7 @@ internal static partial class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         double beta = savedState.Length > 0 ? (double)savedState[0] : 1.0;
-        if (beta == 1.0 && !DifferentiableOps._isBackwardCreateGraph)
+        if (BitConverter.DoubleToInt64Bits(beta) == BitConverter.DoubleToInt64Bits(1.0) && !DifferentiableOps._isBackwardCreateGraph)
         {
             // softplus'(x) = sigmoid(x): one fused kernel instead of a scale, a sigmoid and a multiply.
             DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.SoftplusBackward(gradOutput, inputs[0]), engine);

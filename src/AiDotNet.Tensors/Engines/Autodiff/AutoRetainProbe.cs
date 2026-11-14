@@ -101,8 +101,23 @@ internal static class AutoRetainProbe
             probe = s_probedGraphs.Add(graphSignature);
         }
         if (closing is not null)
+        {
+            Exception? firstFailure = null;
             foreach (var q in closing)
-                if (!q.Probe.Hit && q.IsAlive) q.Release();
+            {
+                if (q.Probe.Hit || !q.IsAlive) continue;
+                try
+                {
+                    q.Release();
+                }
+                catch (Exception ex)
+                {
+                    firstFailure ??= ex;
+                }
+            }
+            if (firstFailure is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFailure).Throw();
+        }
         return probe;
     }
 

@@ -154,12 +154,13 @@ internal sealed class MultiStepLr : CompletedStepLr
     private readonly double _lr0, _gamma, _min;
     private readonly int[] _milestones;
 
-    public MultiStepLr(double lr0, int[] milestones, double gamma, double minLr)
+    public MultiStepLr(double lr0, System.Collections.Generic.IReadOnlyList<int> milestones, double gamma, double minLr)
     {
         RequireRate(lr0, nameof(lr0));
         RequireRate(minLr, nameof(minLr));
-        Require(milestones is { Length: > 0 }, nameof(milestones), "Milestones cannot be empty.");
-        for (int k = 1; k < milestones!.Length; k++)
+        if (milestones is null || milestones.Count == 0)
+            throw new ArgumentOutOfRangeException(nameof(milestones), "Milestones cannot be empty.");
+        for (int k = 1; k < milestones.Count; k++)
             Require(milestones[k] > milestones[k - 1], nameof(milestones), "Milestones must be strictly increasing.");
         Require(gamma > 0 && gamma <= 1, nameof(gamma), "Gamma must be in (0, 1].");
         _lr0 = lr0; _milestones = milestones.ToArray(); _gamma = gamma; _min = minLr;
@@ -265,15 +266,14 @@ internal sealed class CosineWarmRestartsLr : CompletedStepLr
 
     internal override double RateAfter(int t)
     {
-        int cycle = 0, period = _t0, accumulated = 0;
-        while (accumulated + period <= t)
+        long accumulated = 0;
+        double currentPeriod = _t0;
+        while (accumulated + currentPeriod <= t)
         {
-            accumulated += period;
-            cycle++;
-            period = _t0 * (int)System.Math.Pow(_tMult, cycle);
+            accumulated += (long)currentPeriod;
+            currentPeriod *= _tMult;
         }
-        int position = t - accumulated;
-        int currentPeriod = _t0 * (int)System.Math.Pow(_tMult, cycle);
+        double position = t - accumulated;
         double cosine = System.Math.Cos(System.Math.PI * position / currentPeriod);
         return _etaMin + 0.5 * (_lr0 - _etaMin) * (1 + cosine);
     }
@@ -400,13 +400,13 @@ internal sealed class SequentialLr : LrSchedule
     private readonly LrSchedule[] _schedules;
     private readonly int[] _milestones;
 
-    public SequentialLr(LrSchedule[] schedules, int[] milestones)
+    public SequentialLr(System.Collections.Generic.IReadOnlyList<LrSchedule> schedules, System.Collections.Generic.IReadOnlyList<int> milestones)
     {
-        if (schedules is null || schedules.Length == 0) throw new ArgumentOutOfRangeException(nameof(schedules), "Schedules cannot be empty.");
+        if (schedules is null || schedules.Count == 0) throw new ArgumentOutOfRangeException(nameof(schedules), "Schedules cannot be empty.");
         if (schedules.Any(s => s is null)) throw new ArgumentOutOfRangeException(nameof(schedules), "Schedules cannot contain null.");
-        if (milestones is null || milestones.Length != schedules.Length - 1)
+        if (milestones is null || milestones.Count != schedules.Count - 1)
             throw new ArgumentOutOfRangeException(nameof(milestones), "Milestones must number one fewer than the schedules.");
-        for (int k = 1; k < milestones.Length; k++)
+        for (int k = 1; k < milestones.Count; k++)
             if (milestones[k] <= milestones[k - 1])
                 throw new ArgumentOutOfRangeException(nameof(milestones), "Milestones must be strictly increasing.");
         _schedules = schedules.ToArray();

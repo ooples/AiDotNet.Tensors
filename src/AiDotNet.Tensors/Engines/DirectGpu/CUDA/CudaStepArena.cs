@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <para>The first step of a thread is not recorded (it allocates the step's one-time state: optimizer moments, lazily
 /// uploaded weights); the second is, the third and later replay.</para>
 /// </remarks>
-internal sealed class CudaStepArena
+internal sealed class CudaStepArena : IDisposable
 {
     /// <summary>Process switch for tests that need the plain pool.</summary>
     internal static bool Enabled = true;
@@ -27,9 +27,11 @@ internal sealed class CudaStepArena
     private const int MaxReplans = 4;
 
     private readonly IntPtr _context;
+    private readonly long _contextGeneration;
     private readonly Func<ulong, IntPtr> _allocateBlock;
     private readonly Action<IntPtr> _freeBlock;
     private readonly object _lock = new();
+    private bool _disposed;
 
     private enum Mode { WarmUp, Recording, Replaying, Off }
     private Mode _mode = Mode.WarmUp;
@@ -58,9 +60,10 @@ internal sealed class CudaStepArena
     internal int Replans => _replans;
     internal long PlannedBytes => _plan?.Bytes ?? 0;
 
-    internal CudaStepArena(IntPtr context, Func<ulong, IntPtr> allocateBlock, Action<IntPtr> freeBlock)
+    internal CudaStepArena(IntPtr context, long contextGeneration, Func<ulong, IntPtr> allocateBlock, Action<IntPtr> freeBlock)
     {
         _context = context;
+        _contextGeneration = contextGeneration;
         _allocateBlock = allocateBlock;
         _freeBlock = freeBlock;
     }
@@ -83,14 +86,19 @@ internal sealed class CudaStepArena
 
     internal sealed class Block
     {
-        internal readonly IntPtr Ptr;
-        internal readonly bool[] SlotLive;
+        internal IntPtr Ptr;
+        internal readonly IntPtr Context;
+        internal readonly long ContextGeneration;
+        internal readonly int[] SlotLive;
         internal int Live;
+        internal int ArenaDisposed;
 
-        internal Block(IntPtr ptr, int slots)
+        internal Block(IntPtr ptr, IntPtr context, long contextGeneration, int slots)
         {
             Ptr = ptr;
-            SlotLive = new bool[slots];
+            Context = context;
+            ContextGeneration = contextGeneration;
+            SlotLive = new int[slots];
         }
     }
 
@@ -102,6 +110,7 @@ internal sealed class CudaStepArena
     internal CudaBackend.CudaGpuBuffer? TryRent(int size)
     {
         _pendingRecord = -1;
+        if (Volatile.Read(ref _disposed)) return null;
         int thread = Environment.CurrentManagedThreadId;
         if (_thread != thread)
         {
@@ -151,15 +160,19 @@ internal sealed class CudaStepArena
     /// <summary>A slot buffer was disposed, released or finalized: its memory may be handed out again.</summary>
     internal static void OnSlotDead(Block block, int slot)
     {
-        if (!block.SlotLive[slot]) return;
-        Volatile.Write(ref block.SlotLive[slot], false);
-        Interlocked.Decrement(ref block.Live);
+        if (Interlocked.Exchange(ref block.SlotLive[slot], 0) == 0) return;
+        if (Interlocked.Decrement(ref block.Live) == 0 && Volatile.Read(ref block.ArenaDisposed) != 0)
+        {
+            var ptr = Interlocked.Exchange(ref block.Ptr, IntPtr.Zero);
+            if (ptr != IntPtr.Zero)
+                CudaBackend.CompleteCudaBufferReclaimOrFinalizer(
+                    0, -1, ptr, block.Context, block.ContextGeneration, IntPtr.Zero);
+        }
     }
 
     private CudaBackend.CudaGpuBuffer? Replay(int size)
     {
-        var plan = _plan!;
-        if (_aborted) { PoolFallbacks++; return null; }
+        if (_aborted || _plan is not { } plan || _block is not { } block) { PoolFallbacks++; return null; }
         int i = _next++;
         if (i >= plan.Size.Length || plan.Size[i] != size)
         {
@@ -169,14 +182,14 @@ internal sealed class CudaStepArena
             return null;
         }
         long offset = plan.Offset[i];
-        var block = _block!;
-        if (offset < 0 || Volatile.Read(ref block.SlotLive[i])) { PoolFallbacks++; return null; }
+        var blockPtr = Volatile.Read(ref block.Ptr);
+        if (offset < 0 || blockPtr == IntPtr.Zero || Volatile.Read(ref block.SlotLive[i]) != 0) { PoolFallbacks++; return null; }
         foreach (int j in plan.Conflicts[i])
-            if (Volatile.Read(ref block.SlotLive[j])) { PoolFallbacks++; return null; }   // outlived its recorded lifetime
-        block.SlotLive[i] = true;
+            if (Volatile.Read(ref block.SlotLive[j]) != 0) { PoolFallbacks++; return null; }   // outlived its recorded lifetime
+        Volatile.Write(ref block.SlotLive[i], 1);
         Interlocked.Increment(ref block.Live);
         SlotHits++;
-        return CudaBackend.CudaGpuBuffer.ForArenaSlot(_context, new IntPtr(block.Ptr.ToInt64() + offset), size, block, i);
+        return CudaBackend.CudaGpuBuffer.ForArenaSlot(_context, new IntPtr(blockPtr.ToInt64() + offset), size, block, i);
     }
 
     private void BeginStep(int step)
@@ -194,7 +207,7 @@ internal sealed class CudaStepArena
                 BuildPlan();
                 break;
             case Mode.Replaying:
-                if (_aborted || _next != _plan!.Size.Length)
+                if (_aborted || _plan is null || _next != _plan.Size.Length)
                 {
                     if (++_replans > MaxReplans) { Retire(); _mode = Mode.Off; return; }
                     Retire();
@@ -269,9 +282,9 @@ internal sealed class CudaStepArena
 
         IntPtr ptr;
         try { ptr = _allocateBlock((ulong)total); }
-        catch (Exception) { _mode = Mode.Off; return; }   // no room for the plan: the pool serves the steps
+        catch (InvalidOperationException) { _mode = Mode.Off; return; }   // no room for the plan: the pool serves the steps
         _plan = new Plan(_sizes.ToArray(), offset, conflicts, total);
-        _block = new Block(ptr, n);
+        _block = new Block(ptr, _context, _contextGeneration, n);
         _next = 0;
         _aborted = false;
         _mode = Mode.Replaying;
@@ -280,18 +293,57 @@ internal sealed class CudaStepArena
     // The current block stops serving; its memory is freed once every slot it handed out is dead.
     private void Retire()
     {
-        if (_block is { } block) _retiring.Add(block);
-        _block = null;
-        _plan = null;
+        lock (_lock)
+        {
+            if (_block is { } block) _retiring.Add(block);
+            _block = null;
+            _plan = null;
+        }
     }
 
-    private void FreeRetiredBlocks()
+    internal void FreeRetiredBlocks()
     {
-        for (int i = _retiring.Count - 1; i >= 0; i--)
+        List<IntPtr>? toFree = null;
+        lock (_lock)
         {
-            if (Volatile.Read(ref _retiring[i].Live) != 0) continue;
-            try { _freeBlock(_retiring[i].Ptr); } catch (Exception) { /* the context may be gone */ }
-            _retiring.RemoveAt(i);
+            for (int i = _retiring.Count - 1; i >= 0; i--)
+            {
+                if (Volatile.Read(ref _retiring[i].Live) != 0) continue;
+                var ptr = Interlocked.Exchange(ref _retiring[i].Ptr, IntPtr.Zero);
+                if (ptr != IntPtr.Zero) (toFree ??= new List<IntPtr>()).Add(ptr);
+                _retiring.RemoveAt(i);
+            }
+        }
+        if (toFree is not null)
+            foreach (var ptr in toFree) _freeBlock(ptr);
+    }
+
+    public void Dispose()
+    {
+        Block[] blocks;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            Volatile.Write(ref _disposed, true);
+            _mode = Mode.Off;
+            _recorded.Clear();
+            if (_block is { } active)
+            {
+                _retiring.Add(active);
+                _block = null;
+            }
+            _plan = null;
+            blocks = _retiring.ToArray();
+            _retiring.Clear();
+        }
+        foreach (var block in blocks)
+        {
+            Interlocked.Exchange(ref block.ArenaDisposed, 1);
+            if (Volatile.Read(ref block.Live) == 0)
+            {
+                var ptr = Interlocked.Exchange(ref block.Ptr, IntPtr.Zero);
+                if (ptr != IntPtr.Zero) _freeBlock(ptr);
+            }
         }
     }
 }

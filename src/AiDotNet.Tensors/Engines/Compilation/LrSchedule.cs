@@ -175,7 +175,7 @@ public abstract class LrSchedule
     /// steps have completed), never below <paramref name="minLr"/>. Image of
     /// <c>AiDotNet.LearningRateSchedulers.MultiStepLRScheduler</c> stepped per batch.
     /// </summary>
-    public static LrSchedule MultiStep(double lr0, int[] milestones, double gamma = 0.1, double minLr = 0.0)
+    public static LrSchedule MultiStep(double lr0, System.Collections.Generic.IReadOnlyList<int> milestones, double gamma = 0.1, double minLr = 0.0)
         => new MultiStepLr(lr0, milestones, gamma, minLr);
 
     /// <summary>
@@ -224,7 +224,7 @@ public abstract class LrSchedule
     /// completed, each later schedule from its own step 1. Image of
     /// <c>AiDotNet.LearningRateSchedulers.SequentialLRScheduler</c> stepped per batch.
     /// </summary>
-    public static LrSchedule Sequential(LrSchedule[] schedules, int[] milestones)
+    public static LrSchedule Sequential(System.Collections.Generic.IReadOnlyList<LrSchedule> schedules, System.Collections.Generic.IReadOnlyList<int> milestones)
         => new SequentialLr(schedules, milestones);
 
     /// <summary>

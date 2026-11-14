@@ -3462,7 +3462,7 @@ public sealed class GradientTape<T> : IDisposable
         if (_beganTrainingStep) Engines.DirectGpu.TrainingStep.End();
     }
 
-    private bool _beganTrainingStep;
+    private readonly bool _beganTrainingStep;
 
     // ──────────────────────────────────────────────────────────────
     // NoGradScope: suppress tape recording during inference

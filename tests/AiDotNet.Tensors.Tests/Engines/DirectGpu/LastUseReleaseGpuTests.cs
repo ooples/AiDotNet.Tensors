@@ -23,7 +23,7 @@ public sealed class LastUseReleaseGpuTests
     private static Tensor<float> Input(int seed) =>
         new(Enumerable.Range(0, 105).Select(i => (float)Math.Sin(i * 0.37 + seed)).ToArray(), Shape);
 
-    private static float[] Sigmoid(float[] x) => x.Select(v => 1f / (1f + MathF.Exp(-v))).ToArray();
+    private static float[] Sigmoid(float[] x) => x.Select(v => 1f / (1f + (float)Math.Exp(-v))).ToArray();
 
     private static readonly GradientTapeOptions OptIn = new() { ReleaseDeviceActivationsAtLastUse = true };
 
@@ -54,7 +54,9 @@ public sealed class LastUseReleaseGpuTests
         for (int run = 0; run < 3; run++)
         {
             Step(gpu, x, w, readAfterBackward: true, out var read);
-            Assert.Equal(expected, read!, new FloatTolerance(1e-5f));
+            Assert.NotNull(read);
+            if (read is not null)
+                Assert.Equal(expected, read, new FloatTolerance(1e-5f));
         }
         Assert.True(AutoRetainProbe.RetainedCount >= 1, "the probe did not retain the intermediate it saw read");
     }
@@ -79,7 +81,9 @@ public sealed class LastUseReleaseGpuTests
 
         // The failed read was recorded: the next run keeps y.
         Step(gpu, x, w, readAfterBackward: true, out var read);
-        Assert.Equal(Sigmoid(host.ToArray()), read!, new FloatTolerance(1e-5f));
+        Assert.NotNull(read);
+        if (read is not null)
+            Assert.Equal(Sigmoid(host.ToArray()), read, new FloatTolerance(1e-5f));
     }
 
     [SkippableFact]
@@ -164,6 +168,70 @@ public sealed class LastUseReleaseGpuTests
         Step(gpu, x, w, readAfterBackward: false, out _, optIn: false);
         Assert.Equal(Sigmoid(host.ToArray()), y.ToArray(), new FloatTolerance(1e-5f));
         Assert.Equal(0, AutoRetainProbe.OpenWindowCount);   // and a default tape never probes
+    }
+
+    [SkippableFact]
+    public void CreateGraph_True_KeepsSavedActivationsForHigherOrderBackward()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var hostX = Input(13);
+        var hostW = Input(14);
+        var s = Sigmoid(hostX.ToArray());
+        var wArr = hostW.ToArray();
+        // d²/dx² [w * sigmoid(x)] = w * s * (1 - s) * (1 - 2s)
+        var expectedSecond = s.Select((si, idx) => wArr[idx] * si * (1f - si) * (1f - 2f * si)).ToArray();
+
+        var x = gpu.UploadToGpu(hostX, GpuTensorRole.General);
+        var w = gpu.UploadToGpu(hostW, GpuTensorRole.General);
+        for (int run = 0; run < 3; run++)
+        {
+            using var outerTape = new GradientTape<float>(
+                new GradientTapeOptions { Persistent = true, ReleaseDeviceActivationsAtLastUse = true });
+            var y = gpu.Sigmoid(x);
+            var loss = gpu.ReduceSum(gpu.TensorMultiply(y, w), null);
+            var first = outerTape.ComputeGradients(loss, new[] { x }, createGraph: true)[x];
+            var gradSum = gpu.ReduceSum(first, null);
+            var second = outerTape.ComputeGradients(gradSum, new[] { x })[x];
+            Assert.Equal(expectedSecond, second.ToArray(), new FloatTolerance(1e-4f));
+        }
+    }
+
+    [SkippableFact]
+    public void GradientCheckpointing_InsideOptedInOuterTape_PreservesOuterProbeAndRetention()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var hostX = Input(15);
+        var hostW = Input(16);
+        var x = gpu.UploadToGpu(hostX, GpuTensorRole.General);
+        var w = gpu.UploadToGpu(hostW, GpuTensorRole.General);
+        var expectedStem = Sigmoid(hostX.ToArray());
+
+        for (int run = 0; run < 3; run++)
+        {
+            using var tape = new GradientTape<float>(OptIn);
+            var stem = gpu.Sigmoid(x);
+            var ckptOut = GradientCheckpointing<float>.CheckpointSegments(
+                new Func<Tensor<float>, Tensor<float>>[]
+                {
+                    t => gpu.TensorMultiply(t, w),
+                    t => gpu.Sigmoid(t)
+                },
+                stem,
+                segmentParameters: new System.Collections.Generic.IReadOnlyList<Tensor<float>>[]
+                {
+                    new[] { w }
+                },
+                segmentSize: 2);
+            var head = gpu.TensorMultiply(ckptOut, w);
+            var loss = gpu.ReduceSum(head, null);
+            tape.ComputeGradients(loss, new[] { x, w });
+            Assert.Equal(expectedStem, stem.ToArray(), new FloatTolerance(1e-5f));
+        }
+        Assert.True(AutoRetainProbe.RetainedCount >= 1, "outer probe retention was lost across nested checkpoint backward");
     }
 
     private sealed class FloatTolerance : System.Collections.Generic.IEqualityComparer<float>
