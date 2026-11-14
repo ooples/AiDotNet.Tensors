@@ -10,8 +10,24 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// operation later (during Realize) or to fuse it with adjacent operations.
 /// </summary>
 /// <typeparam name="T">The numeric element type.</typeparam>
-internal sealed class LazyNode<T> : ILazyNode
+internal sealed class LazyNode<T> : ILazyNode, ISignableLazyNode
 {
+    Type ISignableLazyNode.OutputElementType => typeof(T);
+    object ISignableLazyNode.OutputTensor => Output;
+    // InputCount is 0xFF for 4+ inputs; the overflow array holds inputs 3 and up.
+    int ISignableLazyNode.SignatureInputCount => InputsOverflow is { } extra ? 3 + extra.Length : InputCount;
+    object? ISignableLazyNode.GetSignatureInput(int index) => index switch
+    {
+        0 => Input0,
+        1 => Input1,
+        2 => Input2,
+        _ => InputsOverflow is { } overflow && index - 3 < overflow.Length ? overflow[index - 3] : null,
+    };
+    Delegate ISignableLazyNode.ExecuteDelegate => Execute;
+    Delegate? ISignableLazyNode.BackwardDelegate => BackwardFn;
+    object[]? ISignableLazyNode.SavedStateObjects => SavedState;
+    bool ISignableLazyNode.ReplaysHostStateFlag => ReplaysHostState;
+
     // ═══ Operation identity ═══
     public LazyNodeType OpType { get; }
     public string OpName { get; }

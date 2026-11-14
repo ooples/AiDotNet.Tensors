@@ -84,8 +84,25 @@ internal enum StreamingReleaseOutcome
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource, IBackingArraySource
+public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource, IBackingArraySource, ISignatureTensor
 {
+    Type ISignatureTensor.ElementType => typeof(T);
+    int[] ISignatureTensor.SignatureShape => _shape;
+    int[] ISignatureTensor.SignatureStrides => _strides;
+    int ISignatureTensor.SignatureOffset => _storageOffset;
+    bool ISignatureTensor.SignatureIsContiguous => IsContiguous;
+    object ISignatureTensor.SignatureStorageIdentity => _storage;
+
+    void ISignatureTensor.CopyLeafFrom(ISignatureTensor source)
+    {
+        if (source is not TensorBase<T> typed)
+            throw new ArgumentException($"A {typeof(T).Name} leaf cannot be rebound from a {source.ElementType.Name} tensor.", nameof(source));
+        if (typed.Length != Length)
+            throw new ArgumentException($"Leaf length {Length} cannot be rebound from a tensor of length {typed.Length}.", nameof(source));
+        typed.AsSpan().CopyTo(AsWritableSpan());
+        IncrementVersion();
+    }
+
     private bool _disposed;
 
     /// <summary>
