@@ -108,6 +108,18 @@ public class BatchNormRegisterPortTests
         Check(backend, batch, channels, spatial);
     }
 
+    [Fact]
+    public void WebGpu_register_batchnorm_wgsl_backward_includes_grad_input_accumulate_mode()
+    {
+        foreach (int k in BatchNormRegisterKernelTemplate.PerThread)
+        {
+            string wgsl = AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBatchNormRegisterKernels.SourceFor(
+                BatchNormRegisterKernelTemplate.BackwardName(k));
+            Assert.Contains("(pm.mode & 16) != 0", wgsl);
+            Assert.Contains("dxv + dxout[idx]", wgsl);
+        }
+    }
+
     /// <summary>The HIP module compiles as CUDA C++ under NVRTC (the dialect has nothing HIP-specific), on any CUDA box.</summary>
     [SkippableFact]
     public void Hip_register_batchnorm_module_compiles_as_cuda_cxx()

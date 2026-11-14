@@ -559,7 +559,7 @@ __device__ __forceinline__ void bn_bwd_split_apply(const float* __restrict__ gra
     const float sumDy = (float)sums[0], sumDyXhat = (float)sums[1];
     if (blockIdx.y == 0 && threadIdx.x == 0) { gradGamma[c] = sumDyXhat; gradBeta[c] = sumDy; }
     const float mean = saveMean[c], inv = rsqrtf(saveVar[c] + epsilon), g = gamma[c];
-    const float invN = 1.0f / (float)(batch * spatial);
+    const float invN = 1.0f / (float)((long long)batch * spatial);
     const float sumDxhat = g * sumDy, sumDxhatXhat = g * sumDyXhat;
     int s4, begin, end;
     bn_split_range(batch, spatial, splits, s4, begin, end);

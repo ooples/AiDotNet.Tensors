@@ -8911,7 +8911,7 @@ public partial class DirectGpuTensorEngine
         int rows = cols == 0 ? 0 : x.Length / cols;
         var c = x.IsContiguous ? x : x.Contiguous();
         using var inBuf = GetOrAllocateBuffer(backend, c);
-        var outBuf = AllocateFullyWrittenOutputBuffer(backend, x.Length);
+        using var outBuf = AllocateFullyWrittenOutputBuffer(backend, x.Length);
         backend.SoftmaxRows(inBuf.Buffer, outBuf.Buffer, rows, cols);
         var result = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, (int[])x._shape.Clone());
         outBuf.RelinquishOwnership();
@@ -9413,7 +9413,7 @@ public partial class DirectGpuTensorEngine
     {
         var src = tensor.IsContiguous ? tensor : tensor.Contiguous();
         using var bufIn = GetOrAllocateBuffer(backend, src);
-        var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
+        using var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
         var kernelShape = physicalInputShape ?? src.Shape._dims;
         backend.Permute(bufIn.Buffer, bufOut.Buffer, kernelShape, axes);
         var outShape = resultShape ?? new int[kernelShape.Length];

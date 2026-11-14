@@ -23,7 +23,23 @@ public sealed class BatchNormActivationConv2DTests
         return new Tensor<float>(data, shape);
     }
 
-    private sealed record Bn(Tensor<float> Gamma, Tensor<float> Beta, Tensor<float> Mean, Tensor<float> Variance);
+    private sealed class Bn
+    {
+        public Bn(Tensor<float> gamma, Tensor<float> beta, Tensor<float> mean, Tensor<float> variance)
+        {
+            Gamma = gamma;
+            Beta = beta;
+            Mean = mean;
+            Variance = variance;
+        }
+
+        public Tensor<float> Gamma { get; }
+        public Tensor<float> Beta { get; }
+        public Tensor<float> Mean { get; }
+        public Tensor<float> Variance { get; }
+
+        public Bn WithVariance(Tensor<float> variance) => new(Gamma, Beta, Mean, variance);
+    }
 
     private static Bn MakeBn(int seed, int c) => new(Rand(seed, 0.5f, 1.5f, c), Rand(seed + 1, -0.3f, 0.3f, c),
         Rand(seed + 2, -0.2f, 0.2f, c), Rand(seed + 3, 0.1f, 2f, c));
@@ -113,12 +129,38 @@ public sealed class BatchNormActivationConv2DTests
         var pre = MakeBn(10, 4);
         var kernel = Rand(2, -0.5f, 0.5f, 6, 4, 1, 1);
         Fused(cpu, x, pre, kernel, null, null, 1, 0, FusedActivationType.None);
-        var changed = pre with { Variance = Rand(99, 0.1f, 2f, 4) };
+        var changed = pre.WithVariance(Rand(99, 0.1f, 2f, 4));
         AssertClose(Reference(cpu, x, changed, kernel, null, null, 1, 0, FusedActivationType.None),
             Fused(cpu, x, changed, kernel, null, null, 1, 0, FusedActivationType.None), 1e-4f);
         // In place: the same tensor written with new values.
         pre.Mean[0] = 0.75f;
         AssertClose(Reference(cpu, x, pre, kernel, null, null, 1, 0, FusedActivationType.None),
             Fused(cpu, x, pre, kernel, null, null, 1, 0, FusedActivationType.None), 1e-4f);
+    }
+
+    [SkippableFact]
+    public void ZeroStride_ThrowsArgumentException_AndTwoInputRowConcat_MatchesCpu()
+    {
+        var cpu = new CpuEngine();
+        var x = Rand(1, -1f, 1f, 2, 4, 8, 8);
+        var pre = MakeBn(10, 4);
+        var kernel = Rand(2, -0.5f, 0.5f, 6, 4, 1, 1);
+        Assert.ThrowsAny<ArgumentException>(() =>
+            cpu.BatchNormActivationConv2D(x, pre.Gamma, pre.Beta, pre.Mean, pre.Variance, 1e-5, kernel, null,
+                0, 1, 0, 0, 1, 1, FusedActivationType.ReLU));
+
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "No DirectGpu backend.");
+        using var _ = gpu;
+
+        Assert.ThrowsAny<ArgumentException>(() =>
+            gpu.BatchNormActivationConv2D(x, pre.Gamma, pre.Beta, pre.Mean, pre.Variance, 1e-5, kernel, null,
+                0, 1, 0, 0, 1, 1, FusedActivationType.ReLU));
+
+        // Exercise 2-input float4-aligned Concatenate along channel axis (outer = B = 4 > 1, inner = 8*8 = 64).
+        var a = Rand(7, -2f, 2f, 4, 12, 8, 8);
+        var b = Rand(8, -2f, 2f, 4, 20, 8, 8);
+        AssertClose(cpu.Concat(new[] { a, b }, axis: 1), gpu.Concat(new[] { a, b }, axis: 1), 0f);
     }
 }

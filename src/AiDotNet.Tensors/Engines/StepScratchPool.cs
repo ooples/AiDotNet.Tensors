@@ -221,7 +221,7 @@ internal sealed class StepScratchPool
         if (_lent.Count == 0) return;
         _free.RemoveAll(_lent.ContainsKey);
         // A lease names its slot in Keys; the buffer is its forward slot's again.
-        foreach (var entry in _lent) Keys[entry.Key] = entry.Value;
+        foreach (var kv in _lent) Keys[kv.Key] = kv.Value;
         _lent.Clear();
     }
 

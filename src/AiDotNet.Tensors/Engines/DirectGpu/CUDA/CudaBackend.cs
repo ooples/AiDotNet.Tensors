@@ -2751,9 +2751,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             useVendor: true);
         // Gemm with beta = 0 writes every element and never reads C (the contract ExecutePlannedGemm relies on too),
         // so the output skips the zero fill.
-        var output = AllocateBufferUninitialized(M * N);
-        Gemm(A, B, output, M, N, K, 1.0f, 0.0f);
-        return output;
+        var output = AllocateBufferUninitialized(checked(M * N));
+        try
+        {
+            Gemm(A, B, output, M, N, K, 1.0f, 0.0f);
+            return output;
+        }
+        catch
+        {
+            output.Dispose();
+            throw;
+        }
     }
 
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
@@ -3444,7 +3452,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer? output = null;
         try
         {
-            output = AllocateBufferUninitialized(M * N);
+            output = AllocateBufferUninitialized(checked(M * N));
             lt.MatmulFused(
                 aDev: B.Handle, m: N, k: K, transA: false,
                 bDev: A.Handle, n: M, transB: false,
@@ -3598,11 +3606,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             A, B, bias, M, K, N, DirectPtxLinearActivation.None);
         if (directPtx is not null) return directPtx;
         var output = MatMul(A, B, M, N, K);
-        if (_kernelCache.TryGetValue("bias_act_inplace", out var biasAct))
-            LaunchBiasActivationInPlace(biasAct, output, bias, M, N, act: 0);
-        else
-            ApplyBiasInPlace(output, bias, M, N);
-        return output;
+        try
+        {
+            if (_kernelCache.TryGetValue("bias_act_inplace", out var biasAct))
+                LaunchBiasActivationInPlace(biasAct, output, bias, M, N, act: 0);
+            else
+                ApplyBiasInPlace(output, bias, M, N);
+            return output;
+        }
+        catch
+        {
+            output.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Weight-only fused dequant-GEMM (int8): C[M,N]=act[M,K]·dequant(int8 W[K,N]). Symmetric
@@ -6468,12 +6484,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // data[r, c] = act(data[r, c] + bias[c]) in place (the bias_activation_kernels module); act 0 none, 1 GELU.
     private unsafe void LaunchBiasActivationInPlace(IntPtr kernel, IGpuBuffer data, IGpuBuffer bias, int rows, int cols, int act)
     {
+        if (rows < 0 || cols < 0)
+            throw new ArgumentOutOfRangeException(rows < 0 ? nameof(rows) : nameof(cols));
+        if (rows == 0 || cols == 0)
+            return;
+        long total = (long)rows * cols;
+        if (data.Size < total || bias.Size < cols)
+            throw new ArgumentOutOfRangeException(data.Size < total ? nameof(data) : nameof(bias), "Buffer is smaller than rows * cols / cols.");
         using var _ = PushContext();
         IntPtr dataPtr = data.Handle;
         IntPtr biasPtr = bias.Handle;
         int r = rows, c = cols;
         int vec4 = (cols & 3) == 0 && ((long)dataPtr & 15) == 0 && ((long)biasPtr & 15) == 0 ? 1 : 0;
-        long work = vec4 == 1 ? (long)rows * cols / 4 : (long)rows * cols;
+        long work = vec4 == 1 ? total / 4 : total;
         uint grid = (uint)Math.Max(1, Math.Min((work + DefaultBlockSize - 1) / DefaultBlockSize, 65535));
         void** args = stackalloc void*[6];
         args[0] = &dataPtr;
@@ -8467,11 +8490,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 kernelH, kernelW, strideH, strideW, padH, padW))
             return;
 
+        if (batch == 0 || channels == 0 || outHeight == 0 || outWidth == 0)
+            return;
+        if (batch < 0 || channels < 0 || inHeight <= 0 || inWidth <= 0 || outHeight < 0 || outWidth < 0
+            || kernelH < 1 || kernelW < 1 || strideH < 1 || strideW < 1 || padH < 0 || padW < 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Invalid MaxPool2D geometry.");
+
         using var _ = PushContext();
         // A plane narrower or shorter than the 16x16 block (2x2 and 1x1 outputs in VGG) idles most of every block:
         // one thread per output cell instead.
         if ((outHeight < 16 || outWidth < 16) && _kernelCache.TryGetValue("maxpool2d_flat", out var flatKernel))
         {
+            long cells = (long)batch * channels * outHeight * outWidth;
+            long inCells = (long)batch * channels * inHeight * inWidth;
+            if (input.Size < inCells || output.Size < cells || (indices is not null && indices.Size < cells))
+                throw new ArgumentOutOfRangeException(nameof(output), "Pool buffer is smaller than the requested plane geometry.");
             IntPtr fin = input.Handle, fout = output.Handle, fidx = indices?.Handle ?? IntPtr.Zero;
             int fsave = indices is not null ? 1 : 0;
             void** fargs = stackalloc void*[16];
@@ -8479,7 +8512,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             fargs[5] = &inHeight; fargs[6] = &inWidth; fargs[7] = &outHeight; fargs[8] = &outWidth;
             fargs[9] = &kernelH; fargs[10] = &kernelW; fargs[11] = &strideH; fargs[12] = &strideW;
             fargs[13] = &padH; fargs[14] = &padW; fargs[15] = &fsave;
-            long cells = (long)batch * channels * outHeight * outWidth;
             LaunchKernel(flatKernel, (uint)Math.Min((cells + 255) / 256, 65535L * 16), 256, fargs);
             return;
         }
@@ -8526,7 +8558,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer gradInput, int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW)
     {
-        if (!IsAvailable || kernelH < 1 || kernelW < 1 || kernelH != strideH || kernelW != strideW
+        if (!IsAvailable || batch <= 0 || channels <= 0 || outHeight <= 0 || outWidth <= 0
+            || (long)batch * channels > int.MaxValue
+            || kernelH < 1 || kernelW < 1 || kernelH != strideH || kernelW != strideW
             || inHeight != outHeight * kernelH || inWidth != outWidth * kernelW || gradInput.Handle == input.Handle
             || !_kernelCache.TryGetValue("maxpool2d_backward_recompute_tiled", out var recomputeKernel))
             return false;
@@ -8534,6 +8568,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr g = gradOutput.Handle, x = input.Handle, dx = gradInput.Handle;
         int planes = batch * channels, rih = inHeight, riw = inWidth, roh = outHeight, row = outWidth, rkh = kernelH, rkw = kernelW;
         long windows = (long)planes * outHeight * outWidth;
+        if (gradOutput.Size < windows || input.Size < (long)planes * inHeight * inWidth || gradInput.Size < (long)planes * inHeight * inWidth)
+            return false;
         void** argsR = stackalloc void*[10];
         argsR[0] = &g; argsR[1] = &x; argsR[2] = &dx; argsR[3] = &planes; argsR[4] = &rih;
         argsR[5] = &riw; argsR[6] = &roh; argsR[7] = &row; argsR[8] = &rkh; argsR[9] = &rkw;
@@ -8546,7 +8582,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW)
     {
-        if (!IsAvailable || kernelH < 1 || kernelW < 1 || kernelH != strideH || kernelW != strideW
+        if (!IsAvailable || batch <= 0 || channels <= 0 || outHeight <= 0 || outWidth <= 0
+            || (long)batch * channels > int.MaxValue
+            || kernelH < 1 || kernelW < 1 || kernelH != strideH || kernelW != strideW
             || inHeight != outHeight * kernelH || inWidth != outWidth * kernelW
             || !_kernelCache.TryGetValue("maxpool2d_backward_tiled", out var tiledKernel))
             return false;
@@ -8554,6 +8592,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr g = gradOutput.Handle, idx = indices.Handle, dx = gradInput.Handle;
         int planes = batch * channels, tih = inHeight, tiw = inWidth, toh = outHeight, tow = outWidth, tkh = kernelH, tkw = kernelW;
         long windows = (long)planes * outHeight * outWidth;
+        if (gradOutput.Size < windows || indices.Size < windows || gradInput.Size < (long)planes * inHeight * inWidth)
+            return false;
         void** argsT = stackalloc void*[10];
         argsT[0] = &g; argsT[1] = &idx; argsT[2] = &dx; argsT[3] = &planes; argsT[4] = &tih;
         argsT[5] = &tiw; argsT[6] = &toh; argsT[7] = &tow; argsT[8] = &tkh; argsT[9] = &tkw;
@@ -8660,18 +8700,27 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int strideH, int strideW, int padH, int padW,
         bool countIncludePad)
     {
+        if (batch == 0 || channels == 0 || outHeight == 0 || outWidth == 0)
+            return;
+        if (batch < 0 || channels < 0 || inHeight <= 0 || inWidth <= 0 || outHeight < 0 || outWidth < 0
+            || kernelH < 1 || kernelW < 1 || strideH < 1 || strideW < 1 || padH < 0 || padW < 0)
+            throw new ArgumentOutOfRangeException(nameof(batch), "Invalid AvgPool2D geometry.");
+
         using var _ = PushContext();
         int countPad = countIncludePad ? 1 : 0;
         // Planes smaller than the 16x16 block: one thread per output cell (see MaxPool2D).
         if ((outHeight < 16 || outWidth < 16) && _kernelCache.TryGetValue("avgpool2d_flat", out var flatKernel))
         {
+            long cells = (long)batch * channels * outHeight * outWidth;
+            long inCells = (long)batch * channels * inHeight * inWidth;
+            if (input.Size < inCells || output.Size < cells)
+                throw new ArgumentOutOfRangeException(nameof(output), "Pool buffer is smaller than the requested plane geometry.");
             IntPtr fin = input.Handle, fout = output.Handle;
             void** fargs = stackalloc void*[15];
             fargs[0] = &fin; fargs[1] = &fout; fargs[2] = &batch; fargs[3] = &channels;
             fargs[4] = &inHeight; fargs[5] = &inWidth; fargs[6] = &outHeight; fargs[7] = &outWidth;
             fargs[8] = &kernelH; fargs[9] = &kernelW; fargs[10] = &strideH; fargs[11] = &strideW;
             fargs[12] = &padH; fargs[13] = &padW; fargs[14] = &countPad;
-            long cells = (long)batch * channels * outHeight * outWidth;
             LaunchKernel(flatKernel, (uint)Math.Min((cells + 255) / 256, 65535L * 16), 256, fargs);
             return;
         }
@@ -11003,8 +11052,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int rows)
     {
         // float4 moves only: the columns and every base 16-byte aligned (a DenseNet concatenation's channel planes are).
-        long n4 = (long)rows * ((colsA + colsB) / 4);
+        long n4 = (long)rows * (((long)colsA + colsB) >> 2);
         if (!IsAvailable || rows <= 0 || colsA <= 0 || colsB <= 0 || ((colsA | colsB) & 3) != 0 || n4 > int.MaxValue
+            || a.Size < (long)rows * colsA || b.Size < (long)rows * colsB || destination.Size < (long)rows * ((long)colsA + colsB)
             || ((long)a.Handle & 15) != 0 || ((long)b.Handle & 15) != 0 || ((long)destination.Handle & 15) != 0
             || !_kernelCache.TryGetValue("concat_rows2_4", out var kernel))
             return false;

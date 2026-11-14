@@ -76,7 +76,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
 
     private void UnmarkMeasurementParked(TBuffer buffer)
     {
-        if (Volatile.Read(ref _measurementParkedCount) != 0 && _measurementParked.TryRemove(buffer, out _))
+        if (Volatile.Read(ref _measurementParkedCount) > 0 && _measurementParked.TryRemove(buffer, out _))
             Interlocked.Decrement(ref _measurementParkedCount);
     }
 
@@ -336,14 +336,13 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                     {
                         while (affinityBuffers.TryPop(out var buffer))
                         {
+                            UnmarkMeasurementParked(buffer);
                             buffer.Release();
                         }
                     }
                 }
 
                 _buckets.Clear();
-                _measurementParked.Clear();
-                Volatile.Write(ref _measurementParkedCount, 0);
             }
             catch (ObjectDisposedException)
             {

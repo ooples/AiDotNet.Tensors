@@ -121,8 +121,10 @@ public sealed partial class CudaBackend
         string name = (tile == 128 ? "conv2d_fprop_ig128_" : "conv2d_fprop_ig64_") + (tapUniform ? "tap" : "gen")
                       + ConvMainloopSuffix(mainloop);
         // The kernels' four trailing arguments: the epilogue's bias and flags (0 with split-K: the partials are
-        // summed after) and the prologue's per-input-channel scale and shift (null: none).
-        int epiFlags = fuseEpilogue && splits == 1 ? a.EpilogueFlags : 0;
+        // summed after, or when the activation is not one the output store fuses) and the prologue's per-input-channel
+        // scale and shift (null: none).
+        bool canFuseEpilogue = fuseEpilogue && splits == 1 && ConvEpilogue.Fuses(a.Activation);
+        int epiFlags = canFuseEpilogue ? a.EpilogueFlags : 0;
         if (!_kernelCache.TryGetValue(name, out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
         if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
@@ -140,7 +142,7 @@ public sealed partial class CudaBackend
         int batch = a.Batch, inC = a.InChannels, inH = a.InHeight, inW = a.InWidth, outC = a.OutChannels;
         int outH = a.OutHeight, outW = a.OutWidth, kH = a.KernelH, kW = a.KernelW, sH = a.StrideH, sW = a.StrideW;
         int pH = a.PadH, pW = a.PadW, dH = a.DilationH, dW = a.DilationW;
-        IntPtr biasPtr = (epiFlags & 1) != 0 ? a.Bias!.Handle : IntPtr.Zero;
+        IntPtr biasPtr = canFuseEpilogue && a.Bias is not null ? a.Bias.Handle : IntPtr.Zero;
         IntPtr scalePtr = a.PreScale?.Handle ?? IntPtr.Zero, shiftPtr = a.PreShift?.Handle ?? IntPtr.Zero;
         void** args = stackalloc void*[23];
         args[0] = &xPtr; args[1] = &wPtr; args[2] = &outPtr;
@@ -150,7 +152,7 @@ public sealed partial class CudaBackend
         args[14] = &pH; args[15] = &pW; args[16] = &dH; args[17] = &dW; args[18] = &kPerSplit;
         args[19] = &biasPtr; args[20] = &epiFlags; args[21] = &scalePtr; args[22] = &shiftPtr;
         LaunchKernel3D(gemm, (uint)tilesN, (uint)tilesM, (uint)splits, (uint)DefaultBlockSize, 1, 1, args, 0);
-        epilogueApplied = epiFlags == a.EpilogueFlags;
+        epilogueApplied = canFuseEpilogue || (a.Bias is null && a.Activation == FusedActivationType.None);
 
         if (splits > 1)
         {

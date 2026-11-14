@@ -1,5 +1,7 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -35,8 +37,51 @@ public class RunningStatisticsTests
         }
     }
 
+    private static void CheckGraphModeReplay(IEngine engine)
+    {
+        const int n = 19;
+        var rng = new Random(23);
+        var running = new Tensor<float>(new[] { n });
+        var param = new Tensor<float>(new[] { n });
+        var expected = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            running[i] = (float)rng.NextDouble();
+            expected[i] = running[i];
+            param[i] = (float)(rng.NextDouble() * 2.0 - 0.5);
+        }
+        const float keep = 0.9f, scale = 0.1f;
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var scaled = engine.TensorMultiplyScalar(param, 2.0f);
+            RunningStatistics.UpdateInPlace(engine, running, scaled, keep, scale);
+            engine.ReduceSum(engine.TensorMultiply(scaled, scaled), null);
+            plan = scope.CompileTraining(new[] { param });
+        }
+        using (plan)
+        {
+            for (int step = 0; step < 3; step++)
+            {
+                var pSnap = param.ToArray();
+                plan.Step();
+                for (int i = 0; i < n; i++) expected[i] = keep * expected[i] + scale * (2.0 * pSnap[i]);
+                var host = running.ToArray();
+                for (int i = 0; i < n; i++)
+                    Assert.True(Math.Abs(host[i] - expected[i]) <= 1e-5 * (1 + Math.Abs(expected[i])),
+                        $"graph step {step} element {i}: {host[i]} vs {expected[i]}");
+            }
+        }
+    }
+
     [Fact]
-    public void Cpu_update_matches_the_ema() => Check(new CpuEngine());
+    public void Cpu_update_matches_the_ema()
+    {
+        var cpu = new CpuEngine();
+        Check(cpu);
+        CheckGraphModeReplay(cpu);
+    }
 
     [SkippableFact]
     public void Gpu_update_matches_the_ema_from_first_touch_onward()
@@ -45,5 +90,6 @@ public class RunningStatisticsTests
         using var engine = new DirectGpuTensorEngine();
         Skip.IfNot(engine.IsGpuAvailable, "No DirectGpu backend.");
         Check(engine);
+        CheckGraphModeReplay(engine);
     }
 }

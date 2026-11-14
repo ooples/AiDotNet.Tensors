@@ -65,6 +65,15 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         return _batchNormSplitPartials;
     }
 
+    private void DisposeBatchNormScratch()
+    {
+        lock (_batchNormSplitLock)
+        {
+            _batchNormSplitPartials?.Dispose();
+            _batchNormSplitPartials = null;
+        }
+    }
+
     private unsafe bool TryBatchNormSplitForward(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels, int spatial, float epsilon, bool relu,
         IGpuBuffer? residual)
@@ -109,7 +118,7 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         {
             if (EnsureBatchNormSplitPartials(channels * splits * 2) is not { } partials) return false;
             using var _ = PushContext();
-            IntPtr pdy = gradOutput.Handle, pms = rebuildMask ? beta!.Handle : reluOutput?.Handle ?? IntPtr.Zero,
+            IntPtr pdy = gradOutput.Handle, pms = rebuildMask && beta is not null ? beta.Handle : reluOutput?.Handle ?? IntPtr.Zero,
                 pdy2 = gradOutput2?.Handle ?? IntPtr.Zero, pgr = gradResidual?.Handle ?? IntPtr.Zero, px = input.Handle,
                 pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle, pdx = gradInput.Handle,
                 pdg = gradGamma.Handle, pdb = gradBeta.Handle, pp = partials.Handle;
@@ -202,7 +211,7 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
                 out var kernel))
             return false;
         using var _ = PushContext();
-        IntPtr pro = rebuildMask ? beta!.Handle : reluOutput?.Handle ?? IntPtr.Zero, pgr = gradResidual?.Handle ?? IntPtr.Zero;
+        IntPtr pro = rebuildMask && beta is not null ? beta.Handle : reluOutput?.Handle ?? IntPtr.Zero, pgr = gradResidual?.Handle ?? IntPtr.Zero;
         IntPtr pdy = gradOutput.Handle, px = input.Handle, pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle,
             pdx = gradInput.Handle, pdg = gradGamma.Handle, pdb = gradBeta.Handle;
         int b = batch, c = channels, s = spatial, acc = accumulateGradInput ? 1 : 0;

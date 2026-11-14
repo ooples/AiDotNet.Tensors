@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;

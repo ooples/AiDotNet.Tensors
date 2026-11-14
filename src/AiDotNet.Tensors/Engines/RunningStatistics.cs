@@ -1,4 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
+using System;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -20,6 +21,9 @@ internal static class RunningStatistics
 {
     internal static void UpdateInPlace<T>(IEngine engine, Tensor<T> running, Tensor<T> batch, T keep, T batchScale)
     {
+        if (engine is null) throw new ArgumentNullException(nameof(engine));
+        if (running is null) throw new ArgumentNullException(nameof(running));
+        if (batch is null) throw new ArgumentNullException(nameof(batch));
         if (GraphMode.IsActive && GraphMode.Current is { } scope)
         {
             scope.BindEngineIfUnset(engine);

@@ -4369,7 +4369,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static Dictionary<Tensor<T>, int>? PlanLastBackwardReads(int actions, List<int[]?> coverage,
         List<CompiledStep<T>> forwardSteps, Tensor<T>[] parameters, Tensor<T> lossOutput)
     {
-        if (typeof(T) != typeof(float) || !LendForwardSlots || coverage.Count != actions || coverage.Any(c => c is null))
+        if (typeof(T) != typeof(float) || !LendForwardSlots || coverage.Count != actions)
             return null;
         var lastRead = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         void Read(Tensor<T>? t, int a)
@@ -4378,7 +4378,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             lastRead[t] = lastRead.TryGetValue(t, out int prior) ? Math.Max(prior, a) : a;
         }
         for (int a = 0; a < actions; a++)
-            foreach (int s in coverage[a]!)
+        {
+            if (coverage[a] is not { } covered) return null;
+            foreach (int s in covered)
             {
                 var step = forwardSteps[s];
                 Read(step.OutputBuffer, a);
@@ -4387,6 +4389,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     foreach (var item in state)
                         if (item is Tensor<T> t) Read(t, a);
             }
+        }
         // Kept out as never-lendable: marked with -1, so a buffer bound to one of them is never lent.
         foreach (var p in parameters) lastRead[p] = -1;
         lastRead[lossOutput] = -1;
@@ -4404,7 +4407,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// or never-lendable) is not lent.
     /// </summary>
     private List<(long Key, Engines.DirectGpu.IGpuBuffer Buffer)>?[] BuildLendSchedule(Engines.StepScratchPool pool,
-        int forwardActionCount, int backwardActionCount)
+        Dictionary<Tensor<T>, int> lastBackwardReads, int forwardActionCount, int backwardActionCount)
     {
         var schedule = new List<(long, Engines.DirectGpu.IGpuBuffer)>?[backwardActionCount];
         var lastByBuffer = new Dictionary<Engines.DirectGpu.IGpuBuffer, int>(
@@ -4412,7 +4415,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         void Bind(Tensor<T>? t)
         {
             if (t is null || t.TryGetGpuBuffer() is not { } buffer) return;
-            int last = _lastBackwardReads!.TryGetValue(t, out int a) ? a : -1;
+            int last = lastBackwardReads.TryGetValue(t, out int a) ? a : -1;
             lastByBuffer[buffer] = lastByBuffer.TryGetValue(buffer, out int prior)
                 ? (prior < 0 || last < 0 ? -1 : Math.Max(prior, last))
                 : last;
@@ -4428,10 +4431,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         foreach (var p in _parameters) Bind(p);
         Bind(_lossOutput);
-        foreach (var entry in lastByBuffer)
+        foreach (var kv in lastByBuffer)
         {
-            var buffer = entry.Key;
-            int last = entry.Value;
+            var buffer = kv.Key;
+            int last = kv.Value;
             if (last < 0 || last >= backwardActionCount || !pool.Keys.TryGetValue(buffer, out long key)) continue;
             if ((int)(key >> 32) >= forwardActionCount || !pool.Slots.TryGetValue(key, out var slot)
                 || !ReferenceEquals(slot, buffer)) continue;
@@ -4780,6 +4783,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // uncaptured resident body (add AIDOTNET_STEP_PROF_SYNC=1 for device time), dumped to <AIDOTNET_STEP_PROF_PATH>.ops.txt.
         bool residentProf = s_stepProf && !IsCapturing();
         long[]? resFwdUs = residentProf ? EnsureResidentProfArrays(fwd.Length, _backwardActions.Length) : null;
+        long[]? resBwdUs = residentProf ? _profPerStepUs : null;
         for (int i = _graphEagerFwd; i < fwd.Length; i++)
         {
             de?.SetCurrentScratchAction(i);   // pool this forward action's transient scratch by (i, local)
@@ -4891,11 +4895,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Autodiff.DifferentiableOps.GradWriteGeneration = gradWriteGeneration;
         // Forward slots lent to the backward's leases as they die (BuildLendSchedule): same order every run, so a capture
         // records the assignment the eager runs settled.
-        var lendPool = de is not null && _lastBackwardReads is not null && _scratchPool is { FirstLeasedAction: < int.MaxValue } lp
-                       && _checkpointing is null
-            ? lp
-            : null;
-        var lend = lendPool is not null ? _lendSchedule ??= BuildLendSchedule(lendPool, fwd.Length, bwd.Length) : null;
+        (StepScratchPool Pool, List<(long Key, Engines.DirectGpu.IGpuBuffer Buffer)>?[] Schedule)? lendState =
+            de is not null && _lastBackwardReads is { } lastReads
+            && _scratchPool is { FirstLeasedAction: < int.MaxValue } lp && _checkpointing is null
+                ? (lp, _lendSchedule ??= BuildLendSchedule(lp, lastReads, fwd.Length, bwd.Length))
+                : null;
         try
         {
             for (int i = 0; i < bwd.Length; i++)
@@ -4903,11 +4907,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 long rb = 0;
-                if (residentProf) { ProfSync(engine); rb = System.Diagnostics.Stopwatch.GetTimestamp(); }
+                if (resBwdUs is not null) { ProfSync(engine); rb = System.Diagnostics.Stopwatch.GetTimestamp(); }
                 bwd[i](engine);
-                if (residentProf) { ProfSync(engine); _profPerStepUs![i] += ProfElapsedUs(rb); }
+                if (resBwdUs is not null) { ProfSync(engine); resBwdUs[i] += ProfElapsedUs(rb); }
                 de?.EndScratchAction();
-                if (lend is not null && lend[i] is { } dead) lendPool!.Lend(dead);
+                if (lendState is { } ls && ls.Schedule[i] is { } dead) ls.Pool.Lend(dead);
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
                     string nm = i < bwdNames.Length ? bwdNames[i] : "?";
@@ -4920,7 +4924,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             Autodiff.DifferentiableOps.GradWriteGeneration = 0;
-            lendPool?.WithdrawLent();   // the next forward writes them again
+            // End any open backward lease BEFORE withdrawing lent forward slots: if a backward action threw while
+            // holding a lent forward buffer, EndScratchAction must settle _leases while _lent still tracks it.
+            de?.EndScratchAction();
+            if (lendState is { } lsFinally) lsFinally.Pool.WithdrawLent();   // the next forward writes them again
         }
         CommitReplacedParameterGradients(engine);
         // An uncaptured run executed the backward for real, so it knows which buffers nothing wrote; later steps

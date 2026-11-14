@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 

@@ -19,11 +19,18 @@ public partial class DirectGpuTensorEngine
         FusedActivationType activation)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || IsRecordingPreActivatedConv<T>() || input is null || kernel is null
-            || input.Rank != 4 || kernel.Rank != 4 || preGamma is null || preBeta is null || preMean is null
-            || preVariance is null || !TryGetBackend(out var backend) || backend is not IConvPreActivationBackend pre
+        if (input is null) throw new System.ArgumentNullException(nameof(input));
+        if (preGamma is null) throw new System.ArgumentNullException(nameof(preGamma));
+        if (preBeta is null) throw new System.ArgumentNullException(nameof(preBeta));
+        if (preMean is null) throw new System.ArgumentNullException(nameof(preMean));
+        if (preVariance is null) throw new System.ArgumentNullException(nameof(preVariance));
+        if (kernel is null) throw new System.ArgumentNullException(nameof(kernel));
+        if (typeof(T) != typeof(float) || IsRecordingPreActivatedConv<T>()
+            || input.Rank != 4 || kernel.Rank != 4
+            || strideH <= 0 || strideW <= 0 || padH < 0 || padW < 0 || dilationH <= 0 || dilationW <= 0
+            || !TryGetBackend(out var backend) || backend is not IConvPreActivationBackend pre
             || DirectGpuEngine.ShouldFallbackForPrecision<T>())
-            return base.BatchNormActivationConv2D(input!, preGamma!, preBeta!, preMean!, preVariance!, preEpsilon, kernel!,
+            return base.BatchNormActivationConv2D(input, preGamma, preBeta, preMean, preVariance, preEpsilon, kernel,
                 bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
         int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1];

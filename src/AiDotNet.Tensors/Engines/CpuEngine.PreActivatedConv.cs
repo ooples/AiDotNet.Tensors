@@ -18,6 +18,10 @@ public partial class CpuEngine
         FusedActivationType activation)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (preGamma is null) throw new ArgumentNullException(nameof(preGamma));
+        if (preBeta is null) throw new ArgumentNullException(nameof(preBeta));
+        if (preMean is null) throw new ArgumentNullException(nameof(preMean));
+        if (preVariance is null) throw new ArgumentNullException(nameof(preVariance));
         if (kernel is null) throw new ArgumentNullException(nameof(kernel));
         var pre = PreActivate(input, preGamma, preBeta, preMean, preVariance, preEpsilon);
         return FusedConv2D(pre, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
@@ -32,7 +36,15 @@ public partial class CpuEngine
         FusedActivationType activation)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (preGamma is null) throw new ArgumentNullException(nameof(preGamma));
+        if (preBeta is null) throw new ArgumentNullException(nameof(preBeta));
+        if (preMean is null) throw new ArgumentNullException(nameof(preMean));
+        if (preVariance is null) throw new ArgumentNullException(nameof(preVariance));
         if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (runningMean is null) throw new ArgumentNullException(nameof(runningMean));
+        if (runningVariance is null) throw new ArgumentNullException(nameof(runningVariance));
         // Recording keeps the unfused, recorded ops (FusedConv2DBatchNorm records the convolution and batch norm).
         if (IsRecordingPreActivatedConv<T>())
             return FusedConv2DBatchNorm(PreActivate(input, preGamma, preBeta, preMean, preVariance, preEpsilon), kernel, bias,

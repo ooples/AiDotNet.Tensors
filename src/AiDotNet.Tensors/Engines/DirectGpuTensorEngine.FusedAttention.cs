@@ -468,10 +468,12 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         if (!ShortAttentionEnabled || GraphMode.IsActive || typeof(T) != typeof(float)
+            || batch <= 0 || heads <= 0 || seq <= 0 || headDim <= 0
             || Autodiff.DifferentiableOps.IsRecording<T>() || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
             || backend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
             || (backend is IFusedAttentionPreference preference && preference.PrefersFusedAttention(batch, heads, seq, seq, headDim))
-            || (long)batch * seq * 3 * heads * headDim > int.MaxValue)
+            || (long)heads * headDim > int.MaxValue / 3
+            || (long)batch * seq > int.MaxValue / (3L * heads * headDim))
             return null;
         int width = heads * headDim, rows = batch * seq;
         try
@@ -507,14 +509,18 @@ public partial class DirectGpuTensorEngine
         Tensor<T> vWeight, int batch, int heads, int seq, int headDim, double scale)
     {
         using var __gpuOp = EnterGpuOp();
-        int width = heads * headDim, rows = batch * seq;
         if (GraphMode.IsActive || typeof(T) != typeof(float) || Autodiff.DifferentiableOps.IsRecording<T>()
+            || batch <= 0 || heads <= 0 || seq <= 0 || headDim <= 0
             || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
             || backend is not IFusedAttentionBackend fused || !fused.SupportsFusedAttention(headDim)
             || backend is not IGpuBufferViews views || !views.ViewsAreFreeAtAnyOffset
             || !(backend is IFusedAttentionPreference preference && preference.PrefersFusedAttention(batch, heads, seq, seq, headDim))
-            || width % 4 != 0 || (long)rows * 3 * width > int.MaxValue)
+            || ((long)heads * headDim) % 4 != 0
+            || (long)heads * headDim > int.MaxValue / 3
+            || (long)batch * seq > int.MaxValue / (3L * heads * headDim)
+            || (long)batch * heads * seq > int.MaxValue)
             return null;
+        int width = heads * headDim, rows = batch * seq;
         try
         {
             var fusedWeight = FusedQkvWeight<T>.Get(this, qWeight, kWeight, vWeight);                    // [D, 3D]
@@ -523,9 +529,9 @@ public partial class DirectGpuTensorEngine
             using var w = GetWeightBufferPreferResident(backend, fusedWeight, PersistentTensorRole.Weights);
             using var packed = AllocateFullyWrittenOutputBuffer(backend, packedLength);
             backend.Gemm(x.Buffer, w.Buffer, packed.Buffer, rows, 3 * width, width);                     // [B*S, 3D]
-            var q = views.TryCreateView(packed.Buffer, 0, packedLength);
-            var k = views.TryCreateView(packed.Buffer, width, packedLength - width);
-            var v = views.TryCreateView(packed.Buffer, 2 * width, packedLength - 2 * width);
+            using var q = views.TryCreateView(packed.Buffer, 0, packedLength);
+            using var k = views.TryCreateView(packed.Buffer, width, packedLength - width);
+            using var v = views.TryCreateView(packed.Buffer, 2 * width, packedLength - 2 * width);
             if (q is null || k is null || v is null) return null;
             var p = FusedParams(batch, heads, seq, seq, headDim, interleaved: true, scale, 0.0, causal: false, causalOffset: 0);
             long packedRow = 3L * width;

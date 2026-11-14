@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Collections.Generic;
 using System.Reflection;
@@ -25,16 +26,18 @@ public class DropTransientActivationsRingTests
         public void Dispose() => DisposeCount++;
     }
 
-    private static readonly MethodInfo CacheActivationMethod = typeof(DirectGpuTensorEngine).GetMethod(
+    private static readonly MethodInfo? CacheActivationMethod = typeof(DirectGpuTensorEngine).GetMethod(
         "CacheActivation", BindingFlags.NonPublic | BindingFlags.Instance, null,
         new[] { typeof(object), typeof(IGpuBuffer), typeof(int[]), typeof(IDirectGpuBackend), typeof(bool), typeof(int), typeof(int) },
-        null)!;
+        null);
 
     private static (object Key, TrackingGpuBuffer Buffer) Cache(DirectGpuTensorEngine engine)
     {
+        var method = CacheActivationMethod
+            ?? throw new InvalidOperationException("DirectGpuTensorEngine.CacheActivation overload was not found.");
         var key = new float[4];
         var buffer = new TrackingGpuBuffer();
-        CacheActivationMethod.Invoke(engine, new object?[] { key, buffer, new[] { 4 }, null, false, 0, 0 });
+        method.Invoke(engine, new object?[] { key, buffer, new[] { 4 }, null, false, 0, 0 });
         return (key, buffer);
     }
 
