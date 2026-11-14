@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -41,12 +42,32 @@ internal static partial class BackwardFunctions<T>
                 e => StftMagnitudeComposite(e, waveform, window, nFft, hopLength, center)))
             return;
 
+        if (TryDeviceStftBackward(gradOutput, output, phase, phaseTarget: false, waveform, window, nFft, hopLength, center,
+                engine, grads))
+            return;
+
         var windowGradient = new double[nFft];
         var result = StftAnalysisAdjoint(
             gradOutput, magnitude: null, phase, StftAdjointTarget.Magnitude,
             nFft, hopLength, window, origLength, waveform._shape, center, waveform, windowGradient);
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
         DifferentiableOps.AccumulateGrad(grads, window, DoublesAsTensor(windowGradient, window._shape), engine);
+    }
+
+    // The same first-order adjoint on the GPU engine's backend (all six implement the three kernels), so a device
+    // training step does not download the spectrogram gradient to run it on the host.
+    private static bool TryDeviceStftBackward(Tensor<T> gradOutput, Tensor<T> magnitude, Tensor<T> phase, bool phaseTarget,
+        Tensor<T> waveform, Tensor<T> window, int nFft, int hopLength, bool center, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpu)
+            || !gpu.TryStftBackward(gradOutput, magnitude, phase, phaseTarget, waveform, window, nFft, hopLength, center,
+                out var gradWaveform, out var gradWindow)
+            || gradWaveform is null || gradWindow is null)
+            return false;
+        DifferentiableOps.AccumulateGrad(grads, waveform, gradWaveform, engine);
+        DifferentiableOps.AccumulateGrad(grads, window, gradWindow, engine);
+        return true;
     }
 
     /// <summary>Backward of the phase output of <c>IEngine.STFT</c>; inputs are the waveform and the window.</summary>
@@ -65,6 +86,10 @@ internal static partial class BackwardFunctions<T>
 
         if (TryCompositeBackward(gradOutput, new[] { waveform, window }, engine, grads,
                 e => StftPhaseComposite(e, waveform, window, nFft, hopLength, center)))
+            return;
+
+        if (TryDeviceStftBackward(gradOutput, magnitude, output, phaseTarget: true, waveform, window, nFft, hopLength, center,
+                engine, grads))
             return;
 
         var windowGradient = new double[nFft];

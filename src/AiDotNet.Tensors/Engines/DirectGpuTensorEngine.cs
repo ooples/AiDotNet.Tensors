@@ -15568,6 +15568,68 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// The first-order STFT backward on the device: the waveform gradient and the window gradient of one output's seed
+    /// (<see cref="Autodiff.BackwardFunctions{T}.StftMagnitudeBackward"/> and its phase sibling), with the same analysis
+    /// adjoint as the host kernel. Returns false, computing nothing, where the host path must run: non-float data, no
+    /// backend, an active graph trace, or a window that is not <paramref name="nFft"/> long.
+    /// </summary>
+    internal bool TryStftBackward<T>(Tensor<T> gradient, Tensor<T> magnitude, Tensor<T> phase, bool phaseTarget,
+        Tensor<T> waveform, Tensor<T> window, int nFft, int hopLength, bool center,
+        out Tensor<T>? gradWaveform, out Tensor<T>? gradWindow)
+    {
+        gradWaveform = null;
+        gradWindow = null;
+        using var __gpuOp = EnterGpuOp();
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
+            || window.Length != nFft || nFft <= 0 || hopLength <= 0)
+            return false;
+
+        int length = waveform.Shape._dims[^1];
+        int numFreqs = nFft / 2 + 1;
+        int numFrames = gradient.Shape._dims[^1];
+        int batch = length == 0 ? 0 : waveform.Length / length;
+        int pad = center ? nFft / 2 : 0;
+        if (batch <= 0 || numFrames <= 0 || gradient.Length != batch * numFreqs * numFrames
+            || magnitude.Length != gradient.Length || phase.Length != gradient.Length)
+            return false;
+
+        using var gradBuffer = GetOrAllocateBuffer(backend, gradient);
+        using var magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
+        using var phaseBuffer = GetOrAllocateBuffer(backend, phase);
+        using var waveformBuffer = GetOrAllocateBuffer(backend, waveform);
+        using var windowBuffer = GetOrAllocateBuffer(backend, window);
+        using var frameGradBuffer = AllocateFullyWrittenOutputBuffer(backend, batch * numFrames * nFft);
+        var signalGradBuffer = AllocateFullyWrittenOutputBuffer(backend, waveform.Length);
+        var windowGradBuffer = AllocateFullyWrittenOutputBuffer(backend, nFft);
+        bool handedOff = false;
+        try
+        {
+            backend.StftBackwardFrames(gradBuffer.Buffer, magnitudeBuffer.Buffer, phaseBuffer.Buffer, frameGradBuffer.Buffer,
+                batch, nFft, numFrames, numFreqs, phaseTarget ? 1 : 0);
+            backend.StftBackwardSignal(frameGradBuffer.Buffer, windowBuffer.Buffer, signalGradBuffer.Buffer,
+                batch, length, pad, nFft, hopLength, numFrames);
+            backend.StftBackwardWindow(frameGradBuffer.Buffer, waveformBuffer.Buffer, windowGradBuffer.Buffer,
+                batch, length, pad, nFft, hopLength, numFrames);
+            gradWaveform = DeferTensorResult<T>(backend, signalGradBuffer.Buffer, waveform.Length, waveform.Shape.ToArray());
+            gradWindow = DeferTensorResult<T>(backend, windowGradBuffer.Buffer, nFft, window.Shape.ToArray());
+            signalGradBuffer.RelinquishOwnership();
+            windowGradBuffer.RelinquishOwnership();
+            handedOff = true;
+            return true;
+        }
+        finally
+        {
+            if (!handedOff)
+            {
+                signalGradBuffer.Dispose();
+                windowGradBuffer.Dispose();
+                gradWaveform = null;
+                gradWindow = null;
+            }
+        }
+    }
+
+    /// <summary>
     /// GPU-accelerated inverse Short-Time Fourier Transform.
     /// </summary>
     Tensor<T> IEngine.ISTFT<T>(

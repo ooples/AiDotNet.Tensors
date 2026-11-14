@@ -736,7 +736,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
     else         r = (av > 0.0f) ? (r - 1u) : (r + 1u);
     output[idx] = as_float(r);
 }
-";
+" + KernelSourceResources.Read("Spectral.stft_backward.opencl.c");
     }
 
     public static string[] GetKernelNames()
@@ -751,7 +751,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
             "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "int32_to_float", "scatter_positions", "rwkv7_forward", "hsoftmax_paths",
-            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
+            "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "stft_backward_frames", "stft_backward_signal", "stft_backward_window", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }
 }

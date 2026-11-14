@@ -1,12 +1,15 @@
 #if NET7_0_OR_GREATER
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -14,7 +17,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// #941: the spectral transform ops of the #850 family that no test called on any backend (<c>AnalyticSignalMask</c>,
 /// <c>ApplyMelFilterbank</c>, <c>BatchedFFT2D</c>, <c>BuildSpectrum</c>, <c>IstftFromSpectrum</c>, <c>IstftNormalize</c>,
-/// <c>PhaseVocoder</c>, <c>SpectralFilter</c>, <c>StftMagPhase</c>), called directly on each backend and compared with a
+/// <c>PhaseVocoder</c>, <c>SpectralFilter</c>, <c>StftMagPhase</c>, and the STFT backward), called directly on each backend and compared with a
 /// CPU reference written from the CUDA kernels' definitions. Outputs are pre-filled with NaN, so an element a kernel
 /// does not write fails; every op that disagrees is reported, not only the first. WebGPU runs on Dawn
 /// (AIDOTNET_WEBGPU_NODE_DIR).
@@ -62,7 +65,7 @@ public sealed class SpectralTransformBackendParityTests
         {
             ("AnalyticSignalMask", AnalyticSignalMask), ("ApplyMelFilterbank", ApplyMelFilterbank), ("BatchedFFT2D", BatchedFFT2D),
             ("BuildSpectrum", BuildSpectrum), ("Istft", Istft), ("PhaseVocoder", PhaseVocoder), ("SpectralFilter", SpectralFilter),
-            ("StftMagPhase", StftMagPhase),
+            ("StftMagPhase", StftMagPhase), ("StftBackward", StftBackward),
         })
         {
             try { op(backend); }
@@ -400,6 +403,63 @@ public sealed class SpectralTransformBackendParityTests
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA is not available.");
         Check(backend);
+    }
+
+    // The STFT backward (StftBackwardFrames -> StftBackwardSignal, and StftBackwardWindow) against the CPU tape gradient
+    // of the same loss Σ g·output, which StftGradientTests checks against finite differences, for both outputs and both
+    // values of center.
+    private static void StftBackward(IDirectGpuBackend backend)
+    {
+        var cpu = new CpuEngine();
+        foreach (var (batch, length, nFft, hop, center) in new[] { (1, 24, 8, 2, true), (2, 40, 16, 4, true), (2, 37, 8, 3, false), (3, 64, 16, 5, false) })
+        {
+            var x = new Tensor<double>(new[] { batch, length });
+            float[] xs = Values(batch * length, 91 + length);
+            for (int i = 0; i < xs.Length; i++) x[i] = xs[i];
+            var window = new Tensor<double>(new[] { nFft });
+            float[] ws = Values(nFft, 92 + nFft, 0.1, 1);
+            for (int i = 0; i < nFft; i++) window[i] = ws[i];
+            cpu.STFT(x, nFft, hop, window, center, out Tensor<double> mag0, out Tensor<double> phase0);
+            int frames = mag0._shape[^1], freqs = nFft / 2 + 1;
+            float[] g = Values(mag0.Length, 93 + mag0.Length);
+            var seed = new Tensor<double>((int[])mag0._shape.Clone());
+            for (int i = 0; i < g.Length; i++) seed[i] = g[i];
+
+            foreach (bool phaseTarget in new[] { false, true })
+            {
+                Dictionary<Tensor<double>, Tensor<double>> expected;
+                using (var tape = new GradientTape<double>())
+                {
+                    cpu.STFT(x, nFft, hop, window, center, out Tensor<double> magnitude, out Tensor<double> phase);
+                    var loss = cpu.ReduceSum(cpu.TensorMultiply(phaseTarget ? phase : magnitude, seed), null);
+                    expected = tape.ComputeGradients(loss, new[] { x, window });
+                }
+                var magF = new float[mag0.Length];
+                var phaseF = new float[mag0.Length];
+                for (int i = 0; i < magF.Length; i++) { magF[i] = (float)mag0[i]; phaseF[i] = (float)phase0[i]; }
+                using var dGrad = backend.AllocateBuffer(g);
+                using var dMag = backend.AllocateBuffer(magF);
+                using var dPhase = backend.AllocateBuffer(phaseF);
+                using var dX = backend.AllocateBuffer(xs);
+                using var dWin = backend.AllocateBuffer(ws);
+                using var frameGrad = Filled(backend, batch * frames * nFft, float.NaN);
+                using var gradX = Filled(backend, batch * length, float.NaN);
+                using var gradW = Filled(backend, nFft, float.NaN);
+                int pad = center ? nFft / 2 : 0;
+                backend.StftBackwardFrames(dGrad, dMag, dPhase, frameGrad, batch, nFft, frames, freqs, phaseTarget ? 1 : 0);
+                backend.StftBackwardSignal(frameGrad, dWin, gradX, batch, length, pad, nFft, hop, frames);
+                backend.StftBackwardWindow(frameGrad, dX, gradW, batch, length, pad, nFft, hop, frames);
+                string what = $"{(phaseTarget ? "phase" : "magnitude")} batch={batch} length={length} nFft={nFft} hop={hop} center={center}";
+                var ex = new double[batch * length];
+                for (int i = 0; i < ex.Length; i++) ex[i] = expected[x][i];
+                var ew = new double[nFft];
+                for (int i = 0; i < nFft; i++) ew[i] = expected[window][i];
+                // The phase seed divides by |C|: a bin near the floor amplifies float rounding of the inputs.
+                double tolerance = phaseTarget ? 2e-3 : 1e-4;
+                Compare(ex, backend, gradX, tolerance, "StftBackward.signal " + what);
+                Compare(ew, backend, gradW, tolerance, "StftBackward.window " + what);
+            }
+        }
     }
 
     [SkippableFact]
