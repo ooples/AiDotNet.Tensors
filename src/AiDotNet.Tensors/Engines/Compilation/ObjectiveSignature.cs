@@ -43,6 +43,16 @@ internal interface ISignatureTensor
 }
 
 /// <summary>
+/// A node's own working buffer kept in its closure or saved state (statistics its Execute writes and its Backward
+/// reads, such as LayerNorm's per-row mean and variance). Its contents are this step's results, not configuration, so
+/// a signature compares only its type and size.
+/// </summary>
+internal interface ISignatureScratch
+{
+    /// <summary>The buffer's size, the only part of it a compiled plan freezes.</summary>
+    int SignatureLength { get; }
+}
+/// <summary>
 /// The structural identity of a traced objective: everything a compiled plan freezes when it is built from the
 /// trace. Two traces with equal signatures compile to the same plan up to the data held in their external leaves,
 /// so a plan compiled from one can replay the other once the leaves' data is copied across.
@@ -384,6 +394,10 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
                     return null;
                 case Array a:
                     return AddArray(a, opName, where, depth);
+                case ISignatureScratch scratch:
+                    Tokens.Add(value.GetType());
+                    Tokens.Add(scratch.SignatureLength);
+                    return null;
             }
 
             var type = value.GetType();
@@ -396,7 +410,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             // Stateless numeric operations (one cached instance per element type) carry no per-step data.
             if (IsNumericOperations(type)) { Tokens.Add(type); return null; }
 
-            if (type.IsValueType || IsCompilerGenerated(type))
+            if (type.IsValueType || IsCompilerGenerated(type) || IsPlainRecord(type))
                 return AddObjectFields(value, type, opName, where, depth);
 
             return $"op '{opName}' field '{where}' holds a {type.FullName}, whose value cannot be compared";
@@ -425,6 +439,30 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
     private static bool IsCompilerGenerated(Type type)
         => type.IsDefined(typeof(CompilerGeneratedAttribute), inherit: false)
            || type.Name.IndexOf('<') >= 0;
+
+    private static readonly ConcurrentDictionary<Type, bool> PlainRecordCache = new();
+
+    /// <summary>
+    /// A sealed class whose instance fields are all readonly and hold only primitives, enums, strings or primitive
+    /// arrays: an op's saved shape or option record. Its fields are its whole value, so it compares field by field.
+    /// </summary>
+    private static bool IsPlainRecord(Type type)
+        => PlainRecordCache.GetOrAdd(type, t =>
+        {
+            if (!t.IsClass || !t.IsSealed || t.BaseType != typeof(object)) return false;
+            var fields = Fields(t);
+            if (fields.Length == 0) return false;
+            foreach (var f in fields)
+            {
+                if (!f.IsInitOnly) return false;
+                var ft = f.FieldType;
+                var et = ft.IsArray ? ft.GetElementType() : null;
+                bool ok = ft.IsPrimitive || ft.IsEnum || ft == typeof(string) || ft == typeof(decimal)
+                          || (et is not null && ft.GetArrayRank() == 1 && (et.IsPrimitive || et.IsEnum));
+                if (!ok) return false;
+            }
+            return true;
+        });
 
     private static bool IsNumericOperations(Type type)
     {

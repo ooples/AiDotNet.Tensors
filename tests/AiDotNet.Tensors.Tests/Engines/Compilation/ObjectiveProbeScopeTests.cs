@@ -38,9 +38,10 @@ public class ObjectiveProbeScopeTests
 
         Probe(); // warm up JIT and field caches
 #if NET6_0_OR_GREATER
-        long before = GC.GetTotalAllocatedBytes(true);
+        // This thread's allocations only: the process-wide counter also counts tests running in parallel.
+        long before = GC.GetAllocatedBytesForCurrentThread();
         int count = Probe();
-        long delta = GC.GetTotalAllocatedBytes(true) - before;
+        long delta = GC.GetAllocatedBytesForCurrentThread() - before;
 #else
         // net471 has no allocation counter; the live-heap delta after a forced collection still shows retained storage.
         long before = GC.GetTotalMemory(forceFullCollection: true);

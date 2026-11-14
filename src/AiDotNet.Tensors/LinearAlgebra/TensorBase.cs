@@ -2344,6 +2344,32 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         Lifetime = WeightLifetime.Deferred;
     }
 
+    /// <summary>
+    /// Gives a shape-only probe tensor the layout of a view (strides, offset): a reshape, narrow, transpose or other
+    /// view of a probe value is itself a probe value with no storage, but downstream ops still see whether it is
+    /// contiguous, exactly as they would in the trace the plan was compiled from.
+    /// </summary>
+    private protected void SetProbeViewLayout(int[] strides, int storageOffset)
+    {
+        _strides = (int[])strides.Clone();
+        _storageOffset = storageOffset;
+        IsView = true;
+        IsContiguous = CheckContiguous(_shape, _strides);
+        _probeView = true;
+    }
+
+    // A view of a probe value (SetProbeViewLayout): never materializable, whatever its LazySource.
+    private bool _probeView;
+
+    /// <summary>
+    /// Marks a shape-only tensor as a probe value an op produced outside a recorded node (a side output such as
+    /// LayerNorm's mean): reading it aborts the probe like reading any recorded probe value.
+    /// </summary>
+    private protected void MarkProbeStandIn() => _probeView = true;
+
+    /// <summary>Whether this is a probe stand-in (<see cref="SetProbeViewLayout"/>, <see cref="MarkProbeStandIn"/>).</summary>
+    private protected bool IsProbeView => _probeView;
+
     /// <summary>Fill to run when deferred storage is first created; cleared once applied.</summary>
     private Action<TensorBase<T>>? _deferredInitializer;
 
@@ -2400,6 +2426,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // eagerly against them, so the probe aborts exactly as a realization would.
         if (GraphMode.IsProbe && LazySource is ILazyNode probeNode && !probeNode.IsRealized)
             throw new ObjectiveProbeAbortedException(probeNode.OpName);
+        if (_probeView && GraphMode.IsProbe)
+            throw new ObjectiveProbeAbortedException(LazySource?.OpName ?? "view");
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         lock (System.Threading.LazyInitializer.EnsureInitialized(ref _deferredLock)!)
         {

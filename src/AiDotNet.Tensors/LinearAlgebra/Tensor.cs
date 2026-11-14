@@ -145,6 +145,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// construction that later allocates, it cannot disagree with what you eventually get.
     /// </para>
     /// </remarks>
+    /// <summary>A shape-only probe value for an op's side output under a probe trace; reading it aborts the probe.</summary>
+    internal static Tensor<T> CreateProbeStandIn(int[] dimensions)
+    {
+        var t = new Tensor<T>(dimensions, null, deferred: true);
+        t.MarkProbeStandIn();
+        return t;
+    }
+
     public static Tensor<T> CreateDeferred(int[] dimensions, Action<Tensor<T>>? initializer = null)
     {
         Action<TensorBase<T>>? adapted =
@@ -229,6 +237,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private Tensor<T> CreateStorageView(int[] shape, int[] strides, int storageOffset)
     {
+        // A view of a probe value (a shape-only tensor a probe trace recorded) has no storage to share: it is another
+        // shape-only tensor with the view's layout, recorded like any other op.
+        if (IsStorageDeferred && Engines.Compilation.GraphMode.IsProbe && (LazySource is not null || IsProbeView))
+        {
+            var probeView = new Tensor<T>(shape, null, deferred: true);
+            probeView.SetProbeViewLayout(strides, storageOffset);
+            return probeView;
+        }
+
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
         // vector/storage snapshot and family registration under the detach lock; otherwise a
