@@ -96,11 +96,21 @@ internal sealed class StepScratchPool
     // Buffers leased since the last TrimUnleased: a free buffer outside it served no lease in the last run.
     private readonly HashSet<IGpuBuffer> _leasedThisRun = new();
 
+    /// <summary>
+    /// Forward actions whose output slots are leased until a later forward action ends (producer action to release
+    /// action), or null: outputs no backward reads, which the plan keeps only until their last forward consumer.
+    /// </summary>
+    internal Dictionary<int, int>? ForwardLeaseUntil { get; set; }
+
+    private readonly List<(long Key, IGpuBuffer Buffer, int Until)> _forwardLeases = new();
+
     /// <summary>Whether slot <paramref name="key"/> of the running action is leased.</summary>
-    internal bool Leases(long key) => Action >= FirstLeasedAction && !_pinned.Contains(key);
+    internal bool Leases(long key)
+        => (Action >= FirstLeasedAction && !_pinned.Contains(key))
+           || (Action >= 0 && ForwardLeaseUntil is { } forward && forward.ContainsKey(Action));
 
     /// <summary>The device buffers the pool holds: kept slots, the transient arena and free leased buffers.</summary>
-    internal int BufferCount => Slots.Count + Transient.Count + _free.Count + _leases.Count;
+    internal int BufferCount => Slots.Count + Transient.Count + _free.Count + _leases.Count + _forwardLeases.Count;
 
     /// <summary>The bytes of those buffers.</summary>
     internal long BufferBytes
@@ -112,6 +122,7 @@ internal sealed class StepScratchPool
             foreach (var b in Transient.Values) bytes += b.SizeInBytes;
             foreach (var b in _free) bytes += b.SizeInBytes;
             foreach (var (_, b) in _leases) bytes += b.SizeInBytes;
+            foreach (var (_, b, _) in _forwardLeases) bytes += b.SizeInBytes;
             return bytes;
         }
     }
@@ -145,7 +156,10 @@ internal sealed class StepScratchPool
             buffer = backend.AllocateBuffer(length);
             Track(buffer);
         }
-        _leases.Add((key, buffer));
+        if (Action < FirstLeasedAction && ForwardLeaseUntil is { } forward && forward.TryGetValue(Action, out int until))
+            _forwardLeases.Add((key, buffer, until));
+        else
+            _leases.Add((key, buffer));
         _leasedThisRun.Add(buffer);
         Keys[buffer] = key;
         return buffer;
@@ -171,6 +185,18 @@ internal sealed class StepScratchPool
             }
         }
         _leases.Clear();
+    }
+
+    /// <summary>Returns the forward leases due at or before <paramref name="action"/> to the free list.</summary>
+    internal void EndForwardLeases(int action)
+    {
+        for (int i = _forwardLeases.Count - 1; i >= 0; i--)
+        {
+            if (_forwardLeases[i].Until > action) continue;
+            _free.Add(_forwardLeases[i].Buffer);
+            _forwardLeases[i] = _forwardLeases[_forwardLeases.Count - 1];
+            _forwardLeases.RemoveAt(_forwardLeases.Count - 1);
+        }
     }
 
     /// <summary>
@@ -199,6 +225,7 @@ internal sealed class StepScratchPool
     internal void Release()
     {
         EndLeases(null);
+        EndForwardLeases(int.MaxValue);
         foreach (var buffer in Slots.Values) DisposeReleased(buffer);
         foreach (var buffer in Transient.Values) DisposeReleased(buffer);
         foreach (var buffer in _free) DisposeReleased(buffer);

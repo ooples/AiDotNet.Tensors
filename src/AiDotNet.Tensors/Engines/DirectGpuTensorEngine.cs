@@ -5811,6 +5811,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         pool.EndLeases(escaped);
     }
 
+    /// <summary>Ends the forward output leases due at <paramref name="action"/> (<see cref="StepScratchPool.ForwardLeaseUntil"/>).</summary>
+    internal void EndForwardLeases(int action) => CurrentScratchPool?.EndForwardLeases(action);
+
     /// <summary>True while inside a compiled action whose transient scratch should draw from its plan's pool, on the
     /// thread running that step.</summary>
     private bool ScratchPoolingActive => CurrentScratchPool is { Action: >= 0 } && ResidentStepActive;
@@ -5862,6 +5865,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (pool.Leases(key))
         {
             // A backward output, consumed within its action: a buffer leased until the action ends (EndScratchAction).
+            // Or a forward output no backward reads: leased until its last forward consumer ends (EndForwardLeases).
             var leased = pool.Lease(key, backend, length);
             if (!fullyWritten)
             {

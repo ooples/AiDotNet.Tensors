@@ -137,4 +137,85 @@ public class CompiledGpuScratchLeaseTests
             }
         }
     }
+    private static (float[] Parameters, long ScratchBytes) TrainDenseBlocks(IEngine engine, int steps, bool capture)
+    {
+        // Dense blocks h = cat(h, Conv3x3(ReLU(BatchNorm(h)))), then a 1x1 convolution average-pooled: every 3x3 output
+        // is read only by its concatenation and the 1x1 output only by the pool, so none of them is kept for the backward.
+        var x = Filled(new[] { 4, 8, 8, 8 }, 2, 2f);
+        var parameters = new System.Collections.Generic.List<Tensor<float>>();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = x;
+            int channels = 8;
+            for (int b = 0; b < 4; b++)
+            {
+                var gamma = Filled(new[] { channels }, 40 + b, 1f);
+                var beta = Filled(new[] { channels }, 50 + b, 1f);
+                var k = Filled(new[] { 4, channels, 3, 3 }, 60 + b, 0.2f);
+                parameters.Add(gamma); parameters.Add(beta); parameters.Add(k);
+                var pre = engine.ReLU(engine.BatchNorm(h, gamma, beta, 1e-5, out _, out _));
+                var grown = engine.Conv2D(pre, k, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+                h = engine.TensorConcatenate(new[] { h, grown }, 1);
+                channels += 4;
+            }
+            var squeeze = Filled(new[] { 8, channels, 1, 1 }, 70, 0.2f);
+            parameters.Add(squeeze);
+            var reduced = engine.Conv2D(h, squeeze, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 1, 1 });
+            var pooled = engine.AvgPool2D(reduced, new[] { 2, 2 }, new[] { 2, 2 });
+            engine.ReduceSum(engine.TensorMultiply(pooled, pooled), null);
+            plan = scope.CompileTraining(parameters.ToArray());
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.001f);
+            if (!capture && plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
+            for (int s = 0; s < steps; s++) plan.Step();
+            long bytes = plan is CompiledTrainingPlan<float> compiled ? compiled.ScratchBufferBytes : -1;
+            var all = new System.Collections.Generic.List<float>();
+            foreach (var p in parameters) all.AddRange(p.ToArray());
+            return (all.ToArray(), bytes);
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Leased_forward_outputs_no_backward_reads_train_identically_and_hold_fewer_bytes(bool capture)
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        bool previous = CompiledTrainingPlan<float>.LeaseForwardOutputs;
+        using (gpu)
+        {
+            try
+            {
+                // Enough steps for a capturing backend to capture and replay many times (see the backward test above).
+                const int steps = 16;
+                var expected = TrainDenseBlocks(new CpuEngine(), steps, capture: false).Parameters;
+                CompiledTrainingPlan<float>.LeaseForwardOutputs = false;
+                var kept = TrainDenseBlocks(gpu, steps, capture);
+                CompiledTrainingPlan<float>.LeaseForwardOutputs = true;
+                var leased = TrainDenseBlocks(gpu, steps, capture);
+
+                Assert.Equal(kept.Parameters, leased.Parameters);
+                Assert.Equal(expected.Length, leased.Parameters.Length);
+                for (int i = 0; i < expected.Length; i++)
+                    Assert.True(Math.Abs(expected[i] - leased.Parameters[i]) <= 2e-3f * (1f + Math.Abs(expected[i])),
+                        $"[{i}]: cpu {expected[i]}, gpu {leased.Parameters[i]}");
+                Assert.True(leased.ScratchBytes > 0 && leased.ScratchBytes < kept.ScratchBytes,
+                    $"leased plan holds {leased.ScratchBytes} scratch bytes, kept plan {kept.ScratchBytes}");
+            }
+            finally
+            {
+                CompiledTrainingPlan<float>.LeaseForwardOutputs = previous;
+            }
+        }
+    }
 }

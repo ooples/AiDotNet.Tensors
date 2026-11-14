@@ -2235,6 +2235,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _forwardActions = rebuiltForward.ToArray();
+        _forwardOutputLeases = null;   // planned over the original actions
         _isFrozenWeights = true;
         // Installing host-only forward specializations makes the action set unsafe for
         // CUDA-graph capture (they'd freeze under replay); the forward delegates also
@@ -3921,6 +3922,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (!_graphEvictionSuspended) { gte.BeginGraphLifetime(); _graphEvictionSuspended = true; }
                 if (_stepGraphExec == IntPtr.Zero)
                 {
+                    ReleaseUnusedMemoryBeforeFirstResidentStep(gte);
                     // Nothing else on the engine starts compiled GPU work while this records (see
                     // DirectGpuTensorEngine.NoteCompiledStepThread); released when this block exits.
                     using var captureExclusion = gte.EnterGraphCaptureExclusion();
@@ -4317,8 +4319,89 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    /// <summary>
+    /// Before this plan's first device-resident step (captured or not), frees the device memory nothing uses: the host
+    /// reuse pool and the driver pool's slack. That step allocates its whole working set from size-classed scratch, which
+    /// the reuse pool's exact-size buffers never serve, so whatever the eager passes before it parked there (a
+    /// lazy-initialization forward's dead activations, the warmup steps' transients) stayed reserved beside it: about
+    /// 1 GB of a DenseNet-121 b64 training peak. Once per plan.
+    /// </summary>
+    private void ReleaseUnusedMemoryBeforeFirstResidentStep(Engines.DirectGpuTensorEngine gte)
+    {
+        if (_releasedUnusedMemory || !ReleaseUnusedMemoryBeforeCapture) return;
+        _releasedUnusedMemory = true;
+        gte.ReleaseUnusedDeviceMemory();
+    }
+
+    private bool _releasedUnusedMemory;
+
+    /// <summary>
+    /// Forward actions whose output slots are leased until a later forward action ends, by producer action (see
+    /// <see cref="PlanForwardOutputLeases"/>); null when none qualify.
+    /// </summary>
+    private Dictionary<int, int>? _forwardOutputLeases;
+
+    /// <summary>
+    /// Leases forward outputs that nothing reads after their last forward consumer (<see cref="PlanForwardOutputLeases"/>).
+    /// On by default; <c>AIDOTNET_GPU_FORWARD_LEASES=0</c> keeps every forward output for the whole step.
+    /// </summary>
+    internal static bool LeaseForwardOutputs { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_FORWARD_LEASES") != "0";
+
+    /// <summary>
+    /// The forward outputs a step need not keep until its backward, as PyTorch frees a tensor autograd did not save: a
+    /// convolution's output (its backward reads the input and kernel, never the output) whose every consumer's backward
+    /// reads only its inputs' shapes (a concatenation, an average pool). Each such producer's output slots are leased
+    /// until its last consumer's action ends instead of held all step: DenseNet-121 keeps none of its 3x3 growth
+    /// convolutions' outputs (they live on in the concatenation) nor its transition convolutions' (pooled at once).
+    /// Only engine-dispatched actions qualify, so a fused or specialized consumer keeps the output. Returns the release
+    /// action by producer action, or null.
+    /// </summary>
+    private static Dictionary<int, int>? PlanForwardOutputLeases(List<CompiledStep<T>> steps, int[] actionOfStep,
+        Tensor<T> lossOutput)
+    {
+        if (typeof(T) != typeof(float) || !LeaseForwardOutputs) return null;
+        var consumers = new Dictionary<Tensor<T>, List<int>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var saved = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int j = 0; j < steps.Count; j++)
+        {
+            foreach (var input in steps[j].Inputs)
+            {
+                if (input is null) continue;
+                if (!consumers.TryGetValue(input, out var list)) consumers[input] = list = new List<int>(2);
+                list.Add(j);
+            }
+            if (steps[j].SavedState is { } state)
+                foreach (var item in state)
+                    if (item is Tensor<T> t) saved.Add(t);
+        }
+        Dictionary<int, int>? leases = null;
+        for (int i = 0; i < steps.Count; i++)
+        {
+            var step = steps[i];
+            if (actionOfStep[i] < 0 || step.BackwardFn?.Method.Name != "Conv2DBackward") continue;
+            var output = step.OutputBuffer;
+            if (ReferenceEquals(output, lossOutput) || saved.Contains(output)
+                || !consumers.TryGetValue(output, out var readers)) continue;
+            int until = -1;
+            foreach (int j in readers)
+            {
+                string? reader = steps[j].BackwardFn?.Method.Name;
+                if (j <= i || actionOfStep[j] < 0 || (reader != "ConcatenateBackward" && reader != "AvgPool2DBackward"))
+                {
+                    until = -1;
+                    break;
+                }
+                until = Math.Max(until, actionOfStep[j]);
+            }
+            if (until > actionOfStep[i]) (leases ??= new Dictionary<int, int>())[actionOfStep[i]] = until;
+        }
+        return leases;
+    }
+
     private bool TryRunResidentBody(Engines.DirectGpuTensorEngine gte, Engines.DirectGpu.IDirectGpuBackend cb)
     {
+        ReleaseUnusedMemoryBeforeFirstResidentStep(gte);
         using var _autocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
         try
         {
@@ -4462,6 +4545,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal static bool LeaseBackwardScratch { get; set; } = Environment.GetEnvironmentVariable("AIDOTNET_GPU_SCRATCH_LEASES") != "0";
 
     /// <summary>
+    /// Frees the device memory nothing uses (the host reuse pool and the driver pool's slack) before a step graph's first
+    /// capture, so the eager passes before it do not stay reserved beside the captured step's working set. On by default;
+    /// <c>AIDOTNET_GPU_RELEASE_BEFORE_CAPTURE=0</c> turns it off.
+    /// </summary>
+    internal static bool ReleaseUnusedMemoryBeforeCapture { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_RELEASE_BEFORE_CAPTURE") != "0";
+
+    /// <summary>
     /// Whether a plan that captures its step as a device graph leases its backward scratch too (the assignment repeats run
     /// to run, so the graph bakes in the settled one). AIDOTNET_GPU_SCRATCH_LEASES_CAPTURE=0 keeps a slot per backward
     /// output for a capturing plan, as before.
@@ -4507,7 +4598,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool leaseBackwardOutputs = redirectEngine is not null && LeaseBackwardScratch
                                     && (LeaseBackwardScratchUnderCapture || !MayCaptureStepGraph(backend));
         if (_scratchPool is { } leasingPool)
+        {
             leasingPool.FirstLeasedAction = leaseBackwardOutputs ? _forwardActions.Length : int.MaxValue;
+            // Forward output leases ride the same capture argument as the backward ones: the same actions lease the same
+            // sizes in the same order every run. Not with checkpointing, which re-runs forward actions inside backward.
+            leasingPool.ForwardLeaseUntil = leaseBackwardOutputs && _checkpointing is null ? _forwardOutputLeases : null;
+        }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
         _gradientDeferral?.Reset();
@@ -4522,6 +4618,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (redirectEngine is not null)
             {
                 redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
+                redirectEngine.EndForwardLeases(int.MaxValue);
                 redirectEngine.FirstWriteRedirects = null;
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
@@ -4590,6 +4687,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             long rs = 0;
             if (resFwdUs is not null) { ProfSync(engine); rs = System.Diagnostics.Stopwatch.GetTimestamp(); }
             fwd[i](engine);
+            de?.EndForwardLeases(i);   // outputs whose last reader was this action go back to the lease pool
             if (resFwdUs is not null) { ProfSync(engine); resFwdUs[i] += ProfElapsedUs(rs); }
             if (capDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
             {
@@ -9481,6 +9579,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // constituent steps at the position of the first fused step in each group,
         // ensuring non-fused producers that appear before a fused block still run first.
         var allForwardActions = new List<Action<IEngine>>();
+        // The engine-dispatched action of each step, or -1 (fused, fixed, specialized): forward output leases are planned
+        // over these only.
+        var genericActionOfStep = new int[forwardSteps.Count];
+        for (int g = 0; g < genericActionOfStep.Length; g++) genericActionOfStep[g] = -1;
         int genericForwardCount = 0; // engine-dispatched forward actions (for CUDA-graph eligibility)
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
         // The verdict for each step, recorded as it is reached, so a later rebuild replays this
@@ -9566,6 +9668,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
                 var opName = step.OpName;
+                genericActionOfStep[i] = allForwardActions.Count;
                 allForwardActions.Add(eng =>
                 {
                     Engines.DirectGpuTensorEngine.s_currentForwardOp = opName;
@@ -10100,6 +10203,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 storageLeases);
             storageLeases = null;
             plan._liveGradientMap = gradMap;
+            if (fp16HeteroOrder is null)
+                plan._forwardOutputLeases = PlanForwardOutputLeases(forwardSteps, genericActionOfStep, lossOutput);
             plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
