@@ -8,15 +8,15 @@ public partial class DirectGpuTensorEngine
 {
     // The fused MoE on the device through IMoeKernelBackend (every backend): routing, sort, both projections and the
     // combine with no host read, every intermediate resident for the backward.
-    internal override Tensor<T> MoeSwiGlu<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
-        Tensor<T> w2, int topK, int sequences, out Tensor<T> loads)
+    internal override Tensor<T> MoeSwiGluForward<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
+        Tensor<T> w2, int topK, int sequences, bool keepSaved, out Tensor<T> loads, out MoeSaved? saved)
     {
         using var __gpuOp = EnterGpuOp();
         ValidateMoe(x, scores, bias, w1, w3, w2, topK, sequences, out int n, out int d, out int g, out int f);
         var s = new MoeShape(n, d, g, topK, f, sequences);
         if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || !s.Admitted || !TryGetBackend(out var backend)
             || backend is not IMoeKernelBackend moe || !moe.MoeKernelsReady)
-            return base.MoeSwiGlu(x, scores, bias, w1, w3, w2, topK, sequences, out loads);
+            return base.MoeSwiGluForward(x, scores, bias, w1, w3, w2, topK, sequences, keepSaved, out loads, out saved);
 
         using var xB = GetOrAllocateBuffer(backend, x);
         using var sB = GetOrAllocateBuffer(backend, scores);
@@ -58,8 +58,8 @@ public partial class DirectGpuTensorEngine
             return t;
         }
 
-        MoeSaved? saved = null;
-        if (Autodiff.DifferentiableOps.IsRecording<T>())
+        saved = null;
+        if (keepSaved)
         {
             saved = new MoeSaved(n, d, g, topK, f, sequences)
             {
@@ -85,8 +85,6 @@ public partial class DirectGpuTensorEngine
         load.RelinquishOwnership();
         var result = DeferTensorResult<T>(backend, y.Buffer, n * d, new[] { n, d });
         y.RelinquishOwnership();
-        if (saved is not null)
-            RecordMoe(result, x, scores, w1, w3, w2, saved);
         return result;
     }
 

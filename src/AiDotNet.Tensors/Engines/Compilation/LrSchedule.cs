@@ -18,6 +18,20 @@ public enum WarmupDecayMode
 }
 
 /// <summary>
+/// Decay shape of the final phase of <see cref="LrSchedule.WarmupStableDecay"/>. Mirrors
+/// <c>AiDotNet.LearningRateSchedulers.WarmupStableDecayScheduler.DecayShape</c>.
+/// </summary>
+public enum StableDecayShape
+{
+    /// <summary>Linear from the peak to the end rate.</summary>
+    Linear,
+    /// <summary>Half cosine from the peak to the end rate.</summary>
+    Cosine,
+    /// <summary>1 - sqrt(progress).</summary>
+    OneMinusSqrt
+}
+
+/// <summary>
 /// Per-step learning-rate schedule used by the fused-compiled training path.
 /// Implementations must be pure and allocation-free — they're called inside
 /// the tight <c>Step()</c> loop, once per optimizer step.
@@ -126,6 +140,92 @@ public abstract class LrSchedule
         double warmupInitLr, WarmupDecayMode decayMode, double endLr)
         => new LinearWarmupLr(lrMax, warmupSteps, totalSteps, warmupInitLr, decayMode, endLr,
             LinearWarmupSemantics.LegacyEager);
+
+    /// <summary>
+    /// Warmup-stable-decay (WSD): a linear ramp from 0 over <paramref name="warmupSteps"/> steps, the peak rate until
+    /// <paramref name="decayStartStep"/>, then a decay to <paramref name="endLr"/> over <paramref name="decaySteps"/>
+    /// steps, held after. This is the fused-path image of <c>AiDotNet.LearningRateSchedulers.WarmupStableDecayScheduler</c>
+    /// stepped per batch: optimizer step N runs at the rate the eager scheduler holds after N - 1 completed steps, so
+    /// the two sequences are bit-identical.
+    /// </summary>
+    public static LrSchedule WarmupStableDecay(
+        double lrMax, int warmupSteps, int decayStartStep, int decaySteps,
+        StableDecayShape shape = StableDecayShape.Linear, double endLr = 0.0)
+        => new WarmupStableDecayLr(lrMax, warmupSteps, decayStartStep, decaySteps, shape, endLr);
+
+    /// <summary>
+    /// Cosine annealing from <paramref name="lr0"/> to <paramref name="etaMin"/> over <paramref name="tMax"/> completed
+    /// steps, then held at <paramref name="etaMin"/>. Image of
+    /// <c>AiDotNet.LearningRateSchedulers.CosineAnnealingLRScheduler</c> stepped per batch, operation for operation
+    /// (<see cref="Cosine"/> is PyTorch's shape over the step index and can differ from it in the last bit).
+    /// </summary>
+    public static LrSchedule CosineAnnealing(double lr0, int tMax, double etaMin = 0.0)
+        => new CosineAnnealingHoldLr(lr0, tMax, etaMin);
+
+    /// <summary>
+    /// Polynomial decay from <paramref name="lr0"/> to <paramref name="endLr"/> over <paramref name="totalSteps"/>
+    /// steps: <c>(lr0 - endLr) * (1 - t / totalSteps)^power + endLr</c> after t completed steps, then held. Image of
+    /// <c>AiDotNet.LearningRateSchedulers.PolynomialLRScheduler</c> stepped per batch.
+    /// </summary>
+    public static LrSchedule Polynomial(double lr0, int totalSteps, double power = 1.0, double endLr = 0.0)
+        => new PolynomialLr(lr0, totalSteps, power, endLr);
+
+    /// <summary>
+    /// <paramref name="lr0"/> times <paramref name="gamma"/> once per milestone reached (a milestone m counts once m
+    /// steps have completed), never below <paramref name="minLr"/>. Image of
+    /// <c>AiDotNet.LearningRateSchedulers.MultiStepLRScheduler</c> stepped per batch.
+    /// </summary>
+    public static LrSchedule MultiStep(double lr0, System.Collections.Generic.IReadOnlyList<int> milestones, double gamma = 0.1, double minLr = 0.0)
+        => new MultiStepLr(lr0, milestones, gamma, minLr);
+
+    /// <summary>
+    /// Tri-stage: a linear ramp from <paramref name="minLr"/> over <paramref name="warmupSteps"/>, the peak for
+    /// <paramref name="holdSteps"/>, then <c>(1 - progress)^decayPower</c> down to <paramref name="minLr"/> by
+    /// <paramref name="totalSteps"/>. Image of <c>AiDotNet.LearningRateSchedulers.TriStageScheduler</c> stepped per batch.
+    /// </summary>
+    public static LrSchedule TriStage(double lr0, int warmupSteps, int holdSteps, int totalSteps, double minLr = 0.0, double decayPower = 1.0)
+        => new TriStageLr(lr0, warmupSteps, holdSteps, totalSteps, minLr, decayPower);
+
+    /// <summary>
+    /// Noam warmup to <paramref name="peak"/>, a hold, then <c>peak * (warmup / (t + 1 - hold))^decayRate</c>. Image of
+    /// <c>AiDotNet.LearningRateSchedulers.NoamHoldAnnealingScheduler</c> stepped per batch.
+    /// </summary>
+    public static LrSchedule NoamHoldAnnealing(double peak, int warmupSteps, int holdSteps, double decayRate)
+        => new NoamHoldAnnealingLr(peak, warmupSteps, holdSteps, decayRate);
+
+    /// <summary>
+    /// SGDR cosine annealing with warm restarts: periods <c>t0, t0*tMult, t0*tMult^2, ...</c>, each a cosine from
+    /// <paramref name="lr0"/> to <paramref name="etaMin"/>. Image of
+    /// <c>AiDotNet.LearningRateSchedulers.CosineAnnealingWarmRestartsScheduler</c> stepped per batch.
+    /// </summary>
+    public static LrSchedule CosineWarmRestarts(double lr0, int t0, int tMult = 1, double etaMin = 0.0)
+        => new CosineWarmRestartsLr(lr0, t0, tMult, etaMin);
+
+    /// <summary>
+    /// One-cycle measured from the start rate <c>lrMax / divFactor</c>: a linear ramp over
+    /// <c>(int)(totalSteps * pctStart)</c> completed steps, then a cosine or linear anneal to
+    /// <c>lrMax / divFactor / finalDivFactor</c>. Image of <c>AiDotNet.LearningRateSchedulers.OneCycleLRScheduler</c>
+    /// stepped per batch; <see cref="OneCycle"/> is PyTorch's variant (rounded warmup, cosine only).
+    /// </summary>
+    public static LrSchedule OneCycleWithAnneal(double lrMax, int totalSteps, double pctStart = 0.3, double divFactor = 25.0,
+        double finalDivFactor = 1e4, OneCycleAnneal anneal = OneCycleAnneal.Cosine)
+        => new OneCycleWithAnnealLr(lrMax, totalSteps, pctStart, divFactor, finalDivFactor, anneal);
+
+    /// <summary>
+    /// Cyclic rate between <paramref name="lrBase"/> and <paramref name="lrMax"/> with separate rise and fall lengths
+    /// and a per-cycle amplitude policy. Image of <c>AiDotNet.LearningRateSchedulers.CyclicLRScheduler</c> stepped per
+    /// batch, every mode.
+    /// </summary>
+    public static LrSchedule Cyclic(double lrBase, double lrMax, int stepSizeUp, int stepSizeDown, CyclicLrMode mode, double gamma = 1.0)
+        => new CyclicRangeLr(lrBase, lrMax, stepSizeUp, stepSizeDown, mode, gamma);
+
+    /// <summary>
+    /// Runs <paramref name="schedules"/>[0] from the start and schedules[k] once milestones[k - 1] steps have
+    /// completed, each later schedule from its own step 1. Image of
+    /// <c>AiDotNet.LearningRateSchedulers.SequentialLRScheduler</c> stepped per batch.
+    /// </summary>
+    public static LrSchedule Sequential(System.Collections.Generic.IReadOnlyList<LrSchedule> schedules, System.Collections.Generic.IReadOnlyList<int> milestones)
+        => new SequentialLr(schedules, milestones);
 
     /// <summary>
     /// Noam schedule from "Attention Is All You Need" (Vaswani et al. 2017,

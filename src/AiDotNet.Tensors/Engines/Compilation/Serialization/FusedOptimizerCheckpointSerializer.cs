@@ -121,6 +121,8 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(extras.AmsgradDisableBiasCorrection);
         WriteNullableDouble(writer, extras.AmsgradExactBeta1);
         WriteNullableDouble(writer, extras.AmsgradExactBeta2);
+        // Format version 14: SGD momentum whose velocity carries the learning rate - a different rule under a schedule.
+        writer.Write(extras.VelocityIncludesLearningRate);
     }
 
     private static void WriteNullableDouble(BinaryWriter writer, double? value)
@@ -167,6 +169,7 @@ internal static class FusedOptimizerCheckpointSerializer
             AmsgradDisableBiasCorrection = reader.ReadBoolean(),
             AmsgradExactBeta1 = ReadNullableDouble(reader),
             AmsgradExactBeta2 = ReadNullableDouble(reader),
+            VelocityIncludesLearningRate = reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

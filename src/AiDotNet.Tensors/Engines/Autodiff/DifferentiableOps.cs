@@ -1140,6 +1140,15 @@ internal static class DifferentiableOps
         return GradientAccumulatorOwnership<T>.Owners!;
     }
 
+    [ThreadStatic]
+    private static int _backwardStepDepth;
+
+    /// <summary>
+    /// True while a backward step delegate is executing on the current thread (so any backward walk entered inside it,
+    /// such as a <see cref="GradientCheckpointing{T}"/> segment recompute, is nested within an enclosing backward walk).
+    /// </summary>
+    internal static bool IsInsideBackwardStep => _backwardStepDepth > 0;
+
     /// <summary>
     /// Starts one backward operation's donation scope.
     /// </summary>
@@ -1152,6 +1161,7 @@ internal static class DifferentiableOps
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static Dictionary<Tensor<T>, Tensor<T>>? BeginBackwardStep<T>()
     {
+        _backwardStepDepth++;
         var previous = GradientAccumulatorOwnership<T>.Owners;
         var available = GradientAccumulatorOwnership<T>.Available;
         var current = available is { Count: > 0 }
@@ -1168,6 +1178,7 @@ internal static class DifferentiableOps
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void EndBackwardStep<T>(Dictionary<Tensor<T>, Tensor<T>>? previous)
     {
+        if (_backwardStepDepth > 0) _backwardStepDepth--;
         var completed = GradientAccumulatorOwnership<T>.Owners;
         GradientAccumulatorOwnership<T>.Owners = previous;
         if (completed is null || ReferenceEquals(completed, previous))

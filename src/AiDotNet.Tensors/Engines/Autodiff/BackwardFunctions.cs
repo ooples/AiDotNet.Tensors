@@ -657,6 +657,13 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps._isBackwardCreateGraph)
+        {
+            // One fused kernel (IEngine.SwishBackward) instead of 6 element-wise ops and their temporaries. A create-graph
+            // backward keeps the composite below: its ops are recorded so the gradient can be differentiated again.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.SwishBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         var sig = engine.Sigmoid(inputs[0]);
         // 1 - sig as device ops: a host tensor of ones (CreateOnes) forced an upload per step - illegal inside a
@@ -674,6 +681,13 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps._isBackwardCreateGraph)
+        {
+            // One fused kernel (IEngine.MishBackward) instead of 11 element-wise ops and their temporaries. A create-graph
+            // backward keeps the composite below: its ops are recorded so the gradient can be differentiated again.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.MishBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         var numOps = MathHelper.GetNumericOperations<T>();
         // softplus = log(1 + exp(x))
         var expX = engine.TensorExp(inputs[0]);
@@ -2418,6 +2432,16 @@ internal static partial class BackwardFunctions<T>
             return;
         }
 
+        // Resident step (and so every captured replay): scatter through the forward's stable on-device index buffer,
+        // which the plan refreshes before each launch. A host index array here would be uploaded inside the capture
+        // and replayed with the capture step's ids, as the float-index sister path documents.
+        if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deEmb) && deEmb.ResidentStepActive
+            && deEmb.TryEmbeddingBackwardResident<T>(gradOutput, indicesData.Length, vocabSize, embeddingDim, inputs[0]._shape) is { } residentTableGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], residentTableGrad, engine);
+            return;
+        }
+
         var indices = new Tensor<long>(indicesData, indicesShape);
 
         // Sparse-grad recording: (gradOutput, indices) is everything a
@@ -3728,6 +3752,12 @@ internal static partial class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         double beta = savedState.Length > 0 ? (double)savedState[0] : 1.0;
+        if (BitConverter.DoubleToInt64Bits(beta) == BitConverter.DoubleToInt64Bits(1.0) && !DifferentiableOps._isBackwardCreateGraph)
+        {
+            // softplus'(x) = sigmoid(x): one fused kernel instead of a scale, a sigmoid and a multiply.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.SoftplusBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         // d(softplus(x))/dx = sigmoid(beta*x)
         var scaled = engine.TensorMultiplyScalar(inputs[0], numOps.FromDouble(beta));
         var sig = engine.TensorSigmoid(scaled);
@@ -3769,6 +3799,13 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (!DifferentiableOps._isBackwardCreateGraph)
+        {
+            // One fused kernel (IEngine.HardswishBackward: (2x+3)/6 on (-3, 3), 0 below, 1 above) instead of the
+            // element-wise ops and their temporaries. A create-graph backward keeps the recorded form below.
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.HardswishBackward(gradOutput, inputs[0]), engine);
+            return;
+        }
         // The derivative used to be clamp((2x+3)/6, 0, 1), which is wrong on [-3, -1.5) (it gave 0 where the slope is
         // negative) and on (1.5, 3] (1 where it is up to 1.5). Recorded ops with constant region masks, so the
         // second derivative (1/3 inside the ramp) follows under create-graph.

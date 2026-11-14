@@ -243,6 +243,38 @@ internal static class FusedOptimizer
         }
     }
 
+    /// <summary>
+    /// Momentum whose velocity carries the learning rate: v = momentum*v + lr*g; p -= v. Equal to the classical form
+    /// (v = momentum*v + g; p -= lr*v) only at a constant rate: under a schedule the classical form re-scales the whole
+    /// accumulated history by the current rate, this one keeps each gradient at the rate it arrived with (AiDotNet's
+    /// MomentumOptimizer).
+    /// </summary>
+    [MethodImpl(HotInline)]
+    internal static unsafe void SgdMomentumLearningRateVelocityUpdateSimd(
+        float* param, float* grad, float* velocity, int length, float lr, float momentum)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (Fma.IsSupported && length >= 8)
+        {
+            var vMu = Vector256.Create(momentum);
+            var vLr = Vector256.Create(lr);
+            int simdLen = length & ~7;
+            for (; i < simdLen; i += 8)
+            {
+                var v = Fma.MultiplyAdd(vMu, Avx.LoadVector256(velocity + i), Avx.Multiply(vLr, Avx.LoadVector256(grad + i)));
+                Avx.Store(velocity + i, v);
+                Avx.Store(param + i, Avx.Subtract(Avx.LoadVector256(param + i), v));
+            }
+        }
+#endif
+        for (; i < length; i++)
+        {
+            velocity[i] = momentum * velocity[i] + lr * grad[i];
+            param[i] -= velocity[i];
+        }
+    }
+
     /// <summary>AVX2 Adam: m = b1*m + (1-b1)*g; v = b2*v + (1-b2)*g^2; p -= lr*mhat/(sqrt(vhat)+eps)</summary>
     [MethodImpl(HotInline)]
     internal static unsafe void AdamUpdateSimd(
@@ -3284,6 +3316,14 @@ public sealed class FusedOptimizerExtras
     public bool Nesterov { get; init; }
 
     /// <summary>
+    /// SGD-momentum only: the velocity carries the learning rate (v = momentum*v + lr*g; p -= v) instead of the classical
+    /// v = momentum*v + g; p -= lr*v. The two agree at a constant rate; under a learning-rate schedule only this form
+    /// matches an optimizer that scales each gradient as it arrives (AiDotNet's MomentumOptimizer). Not combinable with
+    /// <see cref="Nesterov"/>.
+    /// </summary>
+    public bool VelocityIncludesLearningRate { get; init; }
+
+    /// <summary>
     /// FTRL-Proximal's β term in the per-coordinate learning rate <c>α / (β + √n)</c>. Default 0.
     /// </summary>
     /// <remarks>
@@ -3356,6 +3396,9 @@ public sealed class FusedOptimizerExtras
     /// </summary>
     public void Validate()
     {
+        if (VelocityIncludesLearningRate && Nesterov)
+            throw new ArgumentException(
+                "VelocityIncludesLearningRate is defined for classical momentum only; it cannot be combined with Nesterov.");
         if (!(HyperLr >= 0f) || float.IsNaN(HyperLr))
             throw new ArgumentOutOfRangeException(nameof(HyperLr), HyperLr,
                 "Hypergradient-SGD HyperLr (β) must be >= 0.");

@@ -29,12 +29,21 @@ internal interface IHostSyncOwner
 /// reading a half-filled array. A newer registration replaces a pending older one (the newest device result is
 /// the truth), and the pending download lives as long as the host array (never pins device memory past it).</para>
 /// </remarks>
+/// <summary>Why a storage's device data was released, described only when something reads it.</summary>
+internal abstract class ReleaseNote
+{
+    internal abstract string Describe();
+
+    /// <summary>Runs when something reads the released storage, just before the read throws.</summary>
+    internal virtual void OnRead() { }
+}
+
 internal sealed class HostSync
 {
     private readonly object _lock = new();
     private Action<object>? _pending;   // downloads the device copy into the host array
     private object? _pendingKey;        // the object the download was registered with (its callback's argument)
-    private string? _released;          // device data freed without a host copy: host reads throw this
+    private object? _released;          // device data freed without a host copy: host reads throw this (string or ReleaseNote)
     private bool _retained;             // exempt from PyTorch-style release of dead step intermediates
     private bool _downloading;          // a download is filling the host array: other readers wait on _lock
     private LinearAlgebra.VectorDeviceState? _device;
@@ -187,10 +196,12 @@ internal sealed class HostSync
             {
                 // Another thread's download finished while this one waited on the lock, or this is the download's
                 // own (re-entrant) read of the array it is filling: either way the host array is the current copy.
-                if (!_downloading && _released is { } message) throw new InvalidOperationException(message);
+                if (!_downloading && _released is { } reason) throw new InvalidOperationException(MessageOf(reason));
                 return false;
             }
             var key = _pendingKey!;
+            // A host read of an intermediate a probe run quarantined: retain its producer (AutoRetainProbe).
+            if (Engines.Autodiff.AutoRetainProbe.Active) Engines.Autodiff.AutoRetainProbe.NoteAccess(key);
             _pending = null;
             _pendingKey = null;
             _downloading = true;
@@ -241,7 +252,23 @@ internal sealed class HostSync
     /// copy of a step intermediate); a later host read throws <paramref name="message"/>. Returns true when a
     /// pending download was dropped.
     /// </summary>
-    internal static bool Release(object key, string message)
+    internal static bool Release(object key, string message) => Release(key, (object)message);
+
+    /// <summary>
+    /// <see cref="Release(object, string)"/> with a <see cref="ReleaseNote"/>: the message is formatted only if
+    /// something reads the key, so a training step's thousands of releases cost no string building.
+    /// </summary>
+    internal static bool Release(object key, ReleaseNote note) => Release(key, (object)note);
+
+    private static string MessageOf(object reason)
+    {
+        if (reason is string message) return message;
+        var note = (ReleaseNote)reason;
+        note.OnRead();
+        return note.Describe();
+    }
+
+    private static bool Release(object key, object message)
     {
         var sync = For(key);
         lock (sync._lock)
@@ -261,8 +288,8 @@ internal sealed class HostSync
     /// <summary>Throws the release message when <paramref name="key"/>'s device data was released.</summary>
     internal static void ThrowIfReleased(object key)
     {
-        if (Find(key) is { } sync && Volatile.Read(ref sync._released) is { } message)
-            throw new InvalidOperationException(message);
+        if (Find(key) is { } sync && Volatile.Read(ref sync._released) is { } reason)
+            throw new InvalidOperationException(MessageOf(reason));
     }
 
     /// <summary>Clears a release mark: the key's host contents were fully rewritten.</summary>
