@@ -121,19 +121,7 @@ internal sealed class OptimizedBackwardPlan<T>
         // Reclaim graph-owned activation storages progressively after their final declared backward use.
         // Storage identity, not Tensor object identity, is the lifetime unit because metadata views alias their
         // source. Loss/source/retain-grad storages remain protected for the caller.
-        var gpuEngine = _engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
-        HashSet<object>? protectedStorages = null;
-        if (gpuEngine is not null)
-        {
-            protectedStorages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance)
-            {
-                _loss.StorageIdentity
-            };
-            if (_sources is not null)
-                foreach (var source in _sources) protectedStorages.Add(source.StorageIdentity);
-            if (_retainGrad is not null)
-                foreach (var retained in _retainGrad) protectedStorages.Add(retained.StorageIdentity);
-        }
+        var gpuRelease = GpuBackwardRelease<T>.Begin(_engine, _storageReleasePlan, _loss, _sources, _retainGrad);
 
         try
         {
@@ -144,14 +132,12 @@ internal sealed class OptimizedBackwardPlan<T>
 
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
                 {
-                    if (gpuEngine is not null && protectedStorages is not null)
-                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages);
+                    gpuRelease?.ReleaseAfterStep(executionStep);
                     continue;
                 }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 {
-                    if (gpuEngine is not null && protectedStorages is not null)
-                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages);
+                    gpuRelease?.ReleaseAfterStep(executionStep);
                     continue;
                 }
 
@@ -184,8 +170,7 @@ internal sealed class OptimizedBackwardPlan<T>
                     DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                 }
 
-                if (gpuEngine is not null && protectedStorages is not null)
-                    _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages);
+                gpuRelease?.ReleaseAfterStep(executionStep);
             }
         }
         finally

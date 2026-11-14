@@ -339,3 +339,101 @@ internal sealed class BackwardStorageReleasePlan<T>
         return false;
     }
 }
+
+/// <summary>
+/// Per-backward-walk GPU activation and intermediate-gradient release state, bundled into a single optional handle
+/// (mirroring <see cref="BackwardRecycler{T}"/> on CPU) so backward runners avoid correlated null checks across steps.
+/// </summary>
+internal sealed class GpuBackwardRelease<T>
+{
+    private readonly DirectGpuTensorEngine _engine;
+    private readonly HashSet<object> _protectedStorages;
+    private readonly BackwardStorageReleasePlan<T>? _plan;
+    private readonly DeviceGradientReleaser<T>? _gradientReleaser;
+
+    private GpuBackwardRelease(
+        DirectGpuTensorEngine engine,
+        HashSet<object> protectedStorages,
+        BackwardStorageReleasePlan<T>? plan,
+        DeviceGradientReleaser<T>? gradientReleaser)
+    {
+        _engine = engine;
+        _protectedStorages = protectedStorages;
+        _plan = plan;
+        _gradientReleaser = gradientReleaser;
+    }
+
+    internal static GpuBackwardRelease<T>? Begin(
+        IEngine engine,
+        BackwardStorageReleasePlan<T>? plan,
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources,
+        IReadOnlyCollection<Tensor<T>>? retainedTensors)
+    {
+        var gpuEngine = engine.As<DirectGpuTensorEngine>();
+        if (gpuEngine is null) return null;
+        var protectedStorages = BuildProtectedStorages(loss, sources, retainedTensors);
+        return new GpuBackwardRelease<T>(gpuEngine, protectedStorages, plan, gradientReleaser: null);
+    }
+
+    internal static GpuBackwardRelease<T>? BeginChain(
+        IEngine engine,
+        BackwardStorageReleasePlan<T>? plan,
+        BackwardStep<T>[] steps,
+        int stepCount,
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources,
+        IReadOnlyCollection<Tensor<T>>? retainedTensors)
+    {
+        var gpuEngine = engine.As<DirectGpuTensorEngine>();
+        if (gpuEngine is null) return null;
+        var protectedStorages = BuildProtectedStorages(loss, sources, retainedTensors);
+        var gradientReleaser = sources is not null && !DifferentiableOps._isBackwardCreateGraph
+            ? new DeviceGradientReleaser<T>(steps, stepCount, protectedStorages, loss, sources, retainedTensors)
+            : null;
+        return new GpuBackwardRelease<T>(gpuEngine, protectedStorages, plan, gradientReleaser);
+    }
+
+    internal static GpuBackwardRelease<T>? BeginRebound(
+        IEngine engine,
+        TapeEntryArena<T> currentEntries,
+        int[] indices,
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources,
+        IReadOnlyCollection<Tensor<T>>? retainedTensors)
+    {
+        var gpuEngine = engine.As<DirectGpuTensorEngine>();
+        if (gpuEngine is null) return null;
+        var plan = BackwardStorageReleasePlan<T>.Create(currentEntries, indices);
+        var protectedStorages = BuildProtectedStorages(loss, sources, retainedTensors);
+        return new GpuBackwardRelease<T>(gpuEngine, protectedStorages, plan, gradientReleaser: null);
+    }
+
+    internal TensorScope? BeginStepScope()
+        => DifferentiableOps._isBackwardCreateGraph ? null : TensorScope.Begin();
+
+    internal void ReleaseAfterStep(int step)
+        => _plan?.ReleaseAfterStep(step, _engine, _protectedStorages);
+
+    internal void AfterCompletedStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> stepOutput, int step)
+    {
+        _gradientReleaser?.AfterStep(grads, stepOutput, _engine);
+        _plan?.ReleaseAfterStep(step, _engine, _protectedStorages);
+    }
+
+    private static HashSet<object> BuildProtectedStorages(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources,
+        IReadOnlyCollection<Tensor<T>>? retainedTensors)
+    {
+        var protectedStorages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance)
+        {
+            loss.StorageIdentity
+        };
+        if (sources is not null)
+            foreach (var source in sources) protectedStorages.Add(source.StorageIdentity);
+        if (retainedTensors is not null)
+            foreach (var retained in retainedTensors) protectedStorages.Add(retained.StorageIdentity);
+        return protectedStorages;
+    }
+}

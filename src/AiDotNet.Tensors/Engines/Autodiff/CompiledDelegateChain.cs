@@ -217,26 +217,11 @@ internal sealed class CompiledDelegateChain<T>
         // than tensor-object-aware because metadata views can alias a saved tensor needed by a later step. The
         // release schedule is precomputed with the chain, preserving progressive reclamation without adding a
         // per-replay graph scan. Loss/source/retain-grad storages remain caller-owned after backward.
-        var gpuEngine = engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
-        HashSet<object>? protectedStorages = null;
-        if (gpuEngine is not null)
-        {
-            protectedStorages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance)
-            {
-                loss.StorageIdentity
-            };
-            if (sources is not null)
-                foreach (var source in sources) protectedStorages.Add(source.StorageIdentity);
-            if (retainedTensors is not null)
-                foreach (var retained in retainedTensors) protectedStorages.Add(retained.StorageIdentity);
-        }
-
         // On the CPU, the buffers backward rents go back to the step's arena once no gradient references them.
         var recycler = BackwardRecycler<T>.Begin(engine, loss, sources, retainedTensors);
-        // On the GPU, the same for gradients: with sources named, an intermediate's gradient is dead once the step that
-        // consumes it returns, as PyTorch frees it when its refcount drops.
-        var gradientReleaser = gpuEngine is not null && protectedStorages is not null && sources is not null && !DifferentiableOps._isBackwardCreateGraph
-            ? new DeviceGradientReleaser<T>(_steps, _count, protectedStorages, loss, sources, retainedTensors) : null;
+        // On the GPU, bundle protected storages, last-use activation release, and dead intermediate-gradient release.
+        var gpuRelease = GpuBackwardRelease<T>.BeginChain(
+            engine, _storageReleasePlan, _steps, _count, loss, sources, retainedTensors);
         try
         {
             // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
@@ -254,15 +239,13 @@ internal sealed class CompiledDelegateChain<T>
                 if (!DifferentiableOps.IsGradientRequired(step.Output))
                 {
                     recycler?.AfterStep(grads, step.Output, i);
-                    if (gpuEngine is not null && protectedStorages is not null)
-                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages);
+                    gpuRelease?.ReleaseAfterStep(i);
                     continue;
                 }
                 if (!grads.TryGetValue(step.Output, out var gradOutput))
                 {
                     recycler?.AfterStep(grads, step.Output, i);
-                    if (gpuEngine is not null && protectedStorages is not null)
-                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages);
+                    gpuRelease?.ReleaseAfterStep(i);
                     continue;
                 }
 
@@ -271,7 +254,7 @@ internal sealed class CompiledDelegateChain<T>
                 // The device results this step's backward creates and does not leave in grads (its temporaries, and the
                 // contributions it summed into an input's gradient) are dead once it returns: free them now, stream
                 // ordered, as PyTorch's refcount frees them, instead of leaving them to the GC.
-                var stepScope = gpuEngine is not null && !DifferentiableOps._isBackwardCreateGraph ? TensorScope.Begin() : null;
+                var stepScope = gpuRelease?.BeginStepScope();
                 try
                 {
                     step.Backward(gradOutput, step.Inputs, step.Output,
@@ -295,12 +278,7 @@ internal sealed class CompiledDelegateChain<T>
                 }
 
                 recycler?.AfterStep(grads, step.Output, i);
-                if (gpuEngine is not null)
-                {
-                    gradientReleaser?.AfterStep(grads, step.Output, gpuEngine);
-                    if (protectedStorages is not null)
-                        _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages);
-                }
+                gpuRelease?.AfterCompletedStep(grads, step.Output, i);
             }
         }
         finally
