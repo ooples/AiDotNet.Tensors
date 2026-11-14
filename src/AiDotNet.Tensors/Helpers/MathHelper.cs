@@ -342,23 +342,11 @@ public static class MathHelper
     /// </remarks>
     public static T BesselI0<T>(T x)
     {
+        // Evaluated in double by SpecialFunctions.BesselI (series near zero, the scaled integral form beyond, the
+        // asymptotic expansion for large |x|), as scipy.special.i0 is. The term-by-term series this replaced divided
+        // each term by an extra i!, so I0(5) read 12.71 instead of 27.24.
         var numOps = GetNumericOperations<T>();
-        T sum = numOps.One;
-        T y = numOps.Multiply(x, x);
-        T term = numOps.One;
-
-        for (int i = 1; i <= 50; i++)
-        {
-            term = numOps.Multiply(term, numOps.Divide(y, numOps.Multiply(numOps.FromDouble(4 * i * i), Factorial<T>(i))));
-            sum = numOps.Add(sum, term);
-
-            if (numOps.LessThan(term, numOps.FromDouble(1e-12)))
-            {
-                break;
-            }
-        }
-
-        return sum;
+        return numOps.FromDouble(SpecialFunctions.BesselI(0, numOps.ToDouble(x)));
     }
 
     /// <summary>

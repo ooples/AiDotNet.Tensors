@@ -47,6 +47,7 @@ jobs:
       evolution-lifecycle: ${{ steps.filters.outputs.evolution-lifecycle }}
       gemm-bench: ${{ steps.filters.outputs.gemm-bench }}
       cuda: ${{ steps.filters.outputs.cuda }}
+      hip-offline-compile: ${{ steps.filters.outputs.hip-offline-compile }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -204,3 +205,9 @@ jobs:
     if: needs.changes.outputs.ptx-spectral == 'true'
     uses: ./.github/workflows/direct-ptx-spectral-gate.yml
     secrets: inherit
+
+  hip-offline-compile:
+    name: HIP Offline Compile Gate
+    needs: changes
+    if: needs.changes.outputs.hip-offline-compile == 'true'
+    uses: ./.github/workflows/hip-offline-compile.yml

@@ -9939,35 +9939,9 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (CreatesGraph)
-        {
-            AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorI1(inputs[0]), engine);
-            return;
-        }
-        var ops = MathHelper.GetNumericOperations<T>();
-        var x = inputs[0];
-        using var xSrcLease = x.Lease();
-        var xSrc = xSrcLease.Span;
-        using var dYLease = gradOutput.Lease();
-        var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
-        using var dXLease = gX.LeaseWritable();
-        var dX = dXLease.Span;
-        for (int i = 0; i < dX.Length; i++)
-        {
-            double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
-            double halfX = xd / 2.0;
-            double halfSq = halfX * halfX;
-            double term = 1.0, sum = 1.0;
-            for (int k = 1; k < 25; k++)
-            {
-                term *= halfSq / ((double)k * (k + 1));
-                sum += term;
-                if (term < 1e-16 * sum) break;
-            }
-            dX[i] = ops.Multiply(dY[i], ops.FromDouble(halfX * sum));
-        }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        // d/dx I₀(x) = I₁(x), through the engine so every element type (Half included) and the double-precision
+        // I₁ evaluation apply; a host series of 25 terms lost precision past |x| ≈ 25.
+        AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorI1(inputs[0]), engine);
     }
 
     /// <summary>I1 backward: d/dx I₁(x) = I₀(x) − I₁(x)/x.</summary>
@@ -9975,46 +9949,11 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        if (CreatesGraph)
-        {
-            // I₀(x) − I₁(x)/x, with the limit ½ at x = 0.
-            var x0 = inputs[0];
-            var atZero = HostMask(x0, v => v == 0);
-            var d = engine.TensorSubtract(engine.TensorI0(x0), engine.TensorDivide(output, SafeArgument(engine, x0, atZero, 1)));
-            AccumulateScaled(grads, x0, gradOutput, Select(engine, atZero, ConstantLike(x0, 0.5), d), engine);
-            return;
-        }
-        var ops = MathHelper.GetNumericOperations<T>();
-        var x = inputs[0];
-        using var xSrcLease = x.Lease();
-        var xSrc = xSrcLease.Span;
-        using var ySrcLease = output.Lease();
-        var ySrc = ySrcLease.Span;
-        using var dYLease = gradOutput.Lease();
-        var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
-        using var dXLease = gX.LeaseWritable();
-        var dX = dXLease.Span;
-        for (int i = 0; i < dX.Length; i++)
-        {
-            double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
-            double halfX = xd / 2.0;
-            double halfSq = halfX * halfX;
-            // I0(x) series.
-            double term = 1.0, sum = 1.0;
-            for (int k = 1; k < 25; k++)
-            {
-                term *= halfSq / ((double)k * k);
-                sum += term;
-                if (term < 1e-16 * sum) break;
-            }
-            double i0 = sum;
-            // I1(x) = output[i].
-            double i1 = System.Convert.ToDouble(ySrc[i], System.Globalization.CultureInfo.InvariantCulture);
-            double deriv = xd == 0.0 ? 0.5 : i0 - i1 / xd;
-            dX[i] = ops.Multiply(dY[i], ops.FromDouble(deriv));
-        }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        // I₀(x) − I₁(x)/x, with the limit ½ at x = 0, through the engine (see I0Backward).
+        var x0 = inputs[0];
+        var atZero = HostMask(x0, v => v == 0);
+        var d = engine.TensorSubtract(engine.TensorI0(x0), engine.TensorDivide(output, SafeArgument(engine, x0, atZero, 1)));
+        AccumulateScaled(grads, x0, gradOutput, Select(engine, atZero, ConstantLike(x0, 0.5), d), engine);
     }
 
     /// <summary>
@@ -11058,46 +10997,24 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>
-    /// I1e backward using d/dx I1e(x) = I0e(x) - I1e(x)·sign(x) - I1e(x)/|x|.
-    /// For x = 0 the limit is finite (I0e(0) = 1, I1e(0) = 0) so we guard.
+    /// I1e backward using d/dx I1e(x) = I0e(x) - I1e(x)·sign(x) - I1e(x)/x.
+    /// At x = 0 the limit is ½ (I1e(x) ≈ x/2 there), so that point is guarded.
     /// </summary>
     internal static void I1eBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // d/dx e^{-|x|}I₁(x) = I0e(x) − I1e(x)·sign(x) − I1e(x)/x (I₁' = I₀ − I₁/x), and ½ at x = 0, as torch's
+        // i1e_backward; sign is a constant factor. Through the engine (see I0Backward). The last term is the quotient
+        // I1e(x)/x, not I1e(x)·(1/x): 1/x overflows Half for 0 < |x| < 1.5e-5, while the quotient is about ½ there.
         var x = inputs[0];
-        if (CreatesGraph)
-        {
-            // I0e(x) − I1e(x)·(sign(x) + 1/|x|), 0 at x = 0 like the host path (sign is a constant factor).
-            var atZero = HostMask(x, v => v == 0);
-            var safe = SafeArgument(engine, x, atZero, 1);
-            var factor = engine.TensorAdd(HostMap(x, v => System.Math.Sign(v)), engine.TensorReciprocal(engine.TensorAbs(safe)));
-            var d = engine.TensorSubtract(engine.TensorI0e(x), engine.TensorMultiply(output, factor));
-            AccumulateScaled(grads, x, gradOutput, Select(engine, atZero, ConstantLike(x, 0), d), engine);
-            return;
-        }
-        var ops = MathHelper.GetNumericOperations<T>();
-        var deriv = new Tensor<T>(x._shape);
-        using var xsLease = x.Lease();
-        var xs = xsLease.Span;
-        using var i1esLease = output.Lease();
-        var i1es = i1esLease.Span;
-        using var dstLease = deriv.LeaseWritable();
-        var dst = dstLease.Span;
-        // compute I0e on the side
-        var i0e = engine.TensorI0e(x).AsSpan();
-        for (int i = 0; i < xs.Length; i++)
-        {
-            double xi = System.Convert.ToDouble(xs[i], System.Globalization.CultureInfo.InvariantCulture);
-            double i0v = System.Convert.ToDouble(i0e[i], System.Globalization.CultureInfo.InvariantCulture);
-            double i1v = System.Convert.ToDouble(i1es[i], System.Globalization.CultureInfo.InvariantCulture);
-            double d;
-            if (xi == 0.0) d = 0.0; // limit at 0
-            else d = i0v - i1v * (System.Math.Sign(xi) + 1.0 / System.Math.Abs(xi));
-            dst[i] = ops.FromDouble(d);
-        }
-        var grad = engine.TensorMultiply(gradOutput, deriv);
-        DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
+        var atZero = HostMask(x, v => v == 0);
+        var safe = SafeArgument(engine, x, atZero, 1);
+        var sign = HostMap(x, v => System.Math.Sign(v));
+        var d = engine.TensorSubtract(
+            engine.TensorSubtract(engine.TensorI0e(x), engine.TensorMultiply(output, sign)),
+            engine.TensorDivide(output, safe));
+        AccumulateScaled(grads, x, gradOutput, Select(engine, atZero, ConstantLike(x, 0.5), d), engine);
     }
 
     // ─────────────────────────────────────────────────────────────────────
