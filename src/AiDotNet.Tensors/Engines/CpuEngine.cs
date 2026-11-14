@@ -1727,10 +1727,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Box-Muller in double, converted to T once. Formed in T it read u2 back through Convert.ToDouble, which
             // throws for Half and BFloat16 (not IConvertible), and rounded u1 first: a draw below Half's smallest
-            // subnormal became 0 and log(0) made the sample infinite. For double the samples are unchanged; u1 = 0
-            // (log 0) is redrawn.
+            // subnormal became 0 and log(0) made the sample infinite. For double the samples are unchanged; a u1 of 0
+            // (log 0) is redrawn. NextDouble is in [0, 1), so "not positive" is exactly "zero".
             double u1;
-            do { u1 = random.NextDouble(); } while (u1 == 0.0);
+            do { u1 = random.NextDouble(); } while (u1 <= 0.0);
             double u2 = random.NextDouble();
             double z = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
             noise[i] = numOps.Add(mean, numOps.Multiply(standardDeviation, numOps.FromDouble(z)));

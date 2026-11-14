@@ -140,19 +140,15 @@ internal static class SvdWrapper
         // about sqrt(eps)·σ_max came back as noise (9.2e-9 for the rank-2 [[.1,.2,.3],[.4,.5,.6],[.7,.8,.9]],
         // whose third value is about 1e-17), which made rank and nullity tolerances wrong. float is widened to
         // double for the iteration and rounded once.
-        if (typeof(T) == typeof(float))
+        if (src is float[] srcF && u is float[] uF && s is float[] sF && vh is float[] vhF)
         {
             int k = Math.Min(m, n);
             var a = new double[m * n];
-            var srcF = (float[])(object)src;
             for (int i = 0; i < a.Length; i++) a[i] = srcF[offSrc + i];
             var uD = new double[m * uCols];
             var sD = new double[k];
             var vhD = new double[vRows * n];
             GenericLinalg<double>.Svd(a, 0, uD, 0, sD, 0, vhD, 0, m, n, uCols, vRows);
-            var uF = (float[])(object)u;
-            var sF = (float[])(object)s;
-            var vhF = (float[])(object)vh;
             for (int i = 0; i < uD.Length; i++) uF[offU + i] = (float)uD[i];
             for (int i = 0; i < k; i++) sF[offS + i] = (float)sD[i];
             for (int i = 0; i < vhD.Length; i++) vhF[offVh + i] = (float)vhD[i];
