@@ -5,6 +5,7 @@ using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -288,6 +289,15 @@ public partial class DifferentiableOpsGradCheckSweep
         // under a 1e-6 perturbation. Same nFft/hop/window coupling as Spectrogram, whose bins these
         // must match one for one.
         ["StftPhase"] = _ => [WellExcitedWaveform(64), 16, 4, 16, HannWindowFor(16)],
+        // STFT writes magnitude and phase to out slots; the sweep differentiates a weighted sum of both, so the
+        // waveform and the window (both inputs) are checked through each output's edge.
+        ["STFT"] = _ => [WellExcitedWaveform(64), 16, 4, HannWindowFor(16), true, OutSlot(), OutSlot()],
+        // The complex transforms at non-power-of-two lengths: each must be the exact n-point DFT (a zero-padded one is
+        // a different map, whose adjoint the recorded backward is not), checked through both out parts.
+        ["FFT"] = rng => [SafeTensor([2, 6], rng), SafeTensor([2, 6], rng), OutSlot(), OutSlot()],
+        ["IFFT"] = rng => [SafeTensor([2, 6], rng), SafeTensor([2, 6], rng), OutSlot(), OutSlot()],
+        ["FFT2D"] = rng => [SafeTensor([2, 3, 5], rng), SafeTensor([2, 3, 5], rng), OutSlot(), OutSlot()],
+        ["IFFT2D"] = rng => [SafeTensor([2, 3, 5], rng), SafeTensor([2, 3, 5], rng), OutSlot(), OutSlot()],
 
         // --- reductions with explicit axes. ReduceMax is overloaded 3-param / 4-param
         //     (the latter with `out int[] maxIndices`), hence the arity-keyed pair. ---
@@ -672,6 +682,65 @@ public partial class DifferentiableOpsGradCheckSweep
         (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Tensor<>));
 
     /// <summary>
+    /// True when <paramref name="m"/> produces a tensor to differentiate: it returns one, or it returns nothing and
+    /// writes its results to <c>out</c> tensor parameters (STFT, FFT). Every sweep selected ops by a tensor RETURN
+    /// type, so out-parameter ops were invisible to all of them: STFT shipped with no backward, and the FFT family sat
+    /// in NonDifferentiableOps on the claim that out parameters cannot be recorded, with nothing to contradict it.
+    /// </summary>
+    internal static bool HasTensorOutput(MethodInfo m) =>
+        IsTensorDouble(m.ReturnType) || (m.ReturnType == typeof(void) && m.GetParameters().Any(IsTensorOut));
+
+    private static bool IsTensorOut(ParameterInfo p) =>
+        p.IsOut && p.ParameterType.IsByRef && p.ParameterType.GetElementType() is { } e
+        && (IsTensorDouble(e) || (e.IsGenericType && e.GetGenericTypeDefinition() == typeof(Tensor<>)));
+
+    /// <summary>A value for an out slot: reflection overwrites it, and a tensor of the slot's type is accepted.</summary>
+    internal static Tensor<double> OutSlot() => new(new[] { 1 });
+
+    /// <summary>
+    /// Invokes the op and returns what the sweeps differentiate: its returned tensor or, for an op whose results are
+    /// all out tensors, Σ_j (1 + 0.37·j)·sum(out_j), so an error in one output's gradient cannot cancel another's.
+    /// Auxiliary out results of a tensor-returning op (a norm's mean and variance, a max's indices) are statistics, not
+    /// differentiated outputs, as torch marks them.
+    /// </summary>
+    internal static Tensor<T> InvokeOutput<T>(IEngine engine, MethodInfo m, object[] args)
+    {
+        var call = CopyArgs(args);
+        var returned = m.Invoke(engine, call);
+        if (m.ReturnType != typeof(void))
+            return returned as Tensor<T> ?? throw new InvalidOperationException($"{m.Name} returned no tensor.");
+        var ps = m.GetParameters();
+        Tensor<T>? total = null;
+        int j = 0;
+        for (int i = 0; i < ps.Length; i++)
+        {
+            if (!IsTensorOut(ps[i]) || call[i] is not Tensor<T> output) continue;
+            var term = engine.TensorMultiplyScalar(engine.ReduceSum(output, null),
+                MathHelper.GetNumericOperations<T>().FromDouble(1.0 + 0.37 * j++));
+            total = total is null ? term : engine.TensorAdd(total, term);
+        }
+        return total ?? throw new InvalidOperationException($"{m.Name} wrote no out tensor.");
+    }
+
+    /// <summary>The tensor arguments a gradient can flow to: every tensor argument except the out slots.</summary>
+    internal static Tensor<T>[] InputTensors<T>(MethodInfo m, object[] args)
+    {
+        var ps = m.GetParameters();
+        var result = new List<Tensor<T>>();
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (i < ps.Length && ps[i].IsOut) continue;
+            switch (args[i])
+            {
+                case Tensor<T> t: result.Add(t); break;
+                case Tensor<T>[] arr: result.AddRange(arr); break;
+                case IEnumerable<Tensor<T>> seq: result.AddRange(seq); break;
+            }
+        }
+        return result.Distinct().ToArray();
+    }
+
+    /// <summary>
     /// Best-effort argument construction. Returns null when a parameter type is not something
     /// this harness can synthesize, which is reported as a skip.
     /// </summary>
@@ -685,7 +754,15 @@ public partial class DifferentiableOpsGradCheckSweep
         {
             var pt = ps[i].ParameterType;
 
-            if (pt.IsByRef) return null;                     // out/ref ops are covered elsewhere
+            if (pt.IsByRef)
+            {
+                // An out slot only needs a value of its type; ref parameters are not synthesized.
+                if (!ps[i].IsOut) return null;
+                var element = pt.GetElementType();
+                if (element == typeof(Tensor<double>)) { args[i] = OutSlot(); continue; }
+                if (element == typeof(int[])) { args[i] = Array.Empty<int>(); continue; }
+                return null;
+            }
 
             if (IsTensorDouble(pt))
             {
@@ -751,7 +828,7 @@ public partial class DifferentiableOpsGradCheckSweep
         var candidates = engineType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Where(m => !m.IsSpecialName && m.IsGenericMethodDefinition)
             .Where(m => m.GetGenericArguments().Length == 1)
-            .Where(m => IsTensorDouble(m.ReturnType))
+            .Where(HasTensorOutput)
             .ToList();
 
         var shapes = new[] { new[] { 6 }, new[] { 2, 3 } };
@@ -834,19 +911,13 @@ public partial class DifferentiableOpsGradCheckSweep
                 // The IEnumerable case is deliberate and covers more than Tensor<double>[]: an op
                 // declaring IReadOnlyList<Tensor<double>> would otherwise slip back into the blind
                 // spot the array case was added to close.
-                var tensorInputs = args.SelectMany(a => a switch
-                {
-                    Tensor<double> t => new[] { t },
-                    Tensor<double>[] arr => arr,
-                    IEnumerable<Tensor<double>> seq => seq.ToArray(),
-                    _ => Array.Empty<Tensor<double>>(),
-                }).ToArray();
+                var tensorInputs = InputTensors<double>(m, args);
                 Tensor<double> input;
                 Tensor<double> analytical;
                 try
                 {
                     using var tape = new GradientTape<double>();
-                    var outT = (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!;
+                    var outT = InvokeOutput<double>(_engine, m, args);
                     var loss = _engine.ReduceSum(outT, null);
                     var grads = tape.ComputeGradients(loss, tensorInputs);
 
@@ -878,7 +949,7 @@ public partial class DifferentiableOpsGradCheckSweep
                 // Central finite differences on a few elements of that input, through the library's public checker
                 // (GradCheck): the gradient of the plain sum, |analytical - numerical| <= 1e-4 + 1e-4·|numerical|.
                 // The op reads its tensors from args, which the checker perturbs in place.
-                var check = GradCheck.CheckMany<double>(_ => (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!, tensorInputs,
+                var check = GradCheck.CheckMany<double>(_ => InvokeOutput<double>(_engine, m, args), tensorInputs,
                     new GradCheckOptions
                     {
                         Engine = _engine,
@@ -960,7 +1031,7 @@ public partial class DifferentiableOpsGradCheckSweep
         var candidates = typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Where(m => !m.IsSpecialName && m.IsGenericMethodDefinition)
             .Where(m => m.GetGenericArguments().Length == 1)
-            .Where(m => IsTensorDouble(m.ReturnType))
+            .Where(HasTensorOutput)
             .ToList();
         var shapes = new[] { new[] { 6 }, new[] { 2, 3 } };
         foreach (var def in candidates)
@@ -996,14 +1067,6 @@ public partial class DifferentiableOpsGradCheckSweep
         }
     }
 
-    private static Tensor<double>[] TensorInputs(object[] args) => args.SelectMany(a => a switch
-    {
-        Tensor<double> t => new[] { t },
-        Tensor<double>[] arr => arr,
-        IEnumerable<Tensor<double>> seq => seq.ToArray(),
-        _ => Array.Empty<Tensor<double>>(),
-    }).Distinct().ToArray();
-
     /// <summary>
     /// A compiled training step must give every differentiable op the gradients the tape gives it. An op with a tape
     /// edge but no GraphMode node runs once at trace time and is frozen into the plan as a constant: every input
@@ -1023,12 +1086,12 @@ public partial class DifferentiableOpsGradCheckSweep
         {
             foreach (var (name, m, args) in DrivableOps(skipped))
             {
-                var inputs = TensorInputs(args);
+                var inputs = InputTensors<double>(m, args);
                 Dictionary<Tensor<double>, double[]> expected;
                 try
                 {
                     using var tape = new GradientTape<double>();
-                    var outT = (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!;
+                    var outT = InvokeOutput<double>(_engine, m, args);
                     var grads = tape.ComputeGradients(_engine.ReduceSum(outT, null), inputs);
                     expected = inputs.Where(x => grads.TryGetValue(x, out var g) && g is not null)
                         .ToDictionary(x => x, x => grads[x].GetFlattenedData().Select(v => v).ToArray());
@@ -1042,7 +1105,7 @@ public partial class DifferentiableOpsGradCheckSweep
                 {
                     using (var scope = GraphMode.EnableTraining(parameters))
                     {
-                        var outT = (Tensor<double>)m.Invoke(_engine, CopyArgs(args))!;
+                        var outT = InvokeOutput<double>(_engine, m, args);
                         _engine.ReduceSum(outT, null);
                         plan = scope.CompileTraining(parameters);
                     }
