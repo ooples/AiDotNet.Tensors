@@ -313,11 +313,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback: 2^x
         var numOps = MathHelper.GetNumericOperations<T>();
         var genericResult = new Vector<T>(vector.Length);
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            genericResult[i] = numOps.FromDouble(Math.Pow(2.0, val));
+            double val = values[i];
+            values[i] = Math.Pow(2.0, val);
         }
+        GenericFromDoubles(values, genericResult);
         return genericResult;
     }
 
@@ -353,11 +355,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback: 10^x
         var numOps = MathHelper.GetNumericOperations<T>();
         var genericResult = new Vector<T>(vector.Length);
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            genericResult[i] = numOps.FromDouble(Math.Pow(10.0, val));
+            double val = values[i];
+            values[i] = Math.Pow(10.0, val);
         }
+        GenericFromDoubles(values, genericResult);
         return genericResult;
     }
 
@@ -976,11 +980,13 @@ public partial class CpuEngine : ITensorLevelEngine
             // Fallback for other types using INumericOperations
             var numOps = MathHelper.GetNumericOperations<T>();
             var result = new Vector<T>(vector.Length);
-            for (int i = 0; i < vector.Length; i++)
+            var values = GenericToDoubles(vector);
+            for (int i = 0; i < values.Length; i++)
             {
-                double val = Convert.ToDouble(vector[i]);
-                result[i] = numOps.FromDouble(Math.Sin(val));
+                double val = values[i];
+                values[i] = Math.Sin(val);
             }
+            GenericFromDoubles(values, result);
             return result;
         }
     }
@@ -1042,11 +1048,13 @@ public partial class CpuEngine : ITensorLevelEngine
             // Fallback for other types using INumericOperations
             var numOps = MathHelper.GetNumericOperations<T>();
             var result = new Vector<T>(vector.Length);
-            for (int i = 0; i < vector.Length; i++)
+            var values = GenericToDoubles(vector);
+            for (int i = 0; i < values.Length; i++)
             {
-                double val = Convert.ToDouble(vector[i]);
-                result[i] = numOps.FromDouble(Math.Cos(val));
+                double val = values[i];
+                values[i] = Math.Cos(val);
             }
+            GenericFromDoubles(values, result);
             return result;
         }
     }
@@ -1202,11 +1210,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback
         var numOps = MathHelper.GetNumericOperations<T>();
         var genericResult = new Vector<T>(vector.Length);
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            genericResult[i] = numOps.FromDouble(Math.Asin(val));
+            double val = values[i];
+            values[i] = Math.Asin(val);
         }
+        GenericFromDoubles(values, genericResult);
         return genericResult;
     }
 
@@ -1257,11 +1267,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback
         var numOps = MathHelper.GetNumericOperations<T>();
         var genericResult = new Vector<T>(vector.Length);
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            genericResult[i] = numOps.FromDouble(Math.Acos(val));
+            double val = values[i];
+            values[i] = Math.Acos(val);
         }
+        GenericFromDoubles(values, genericResult);
         return genericResult;
     }
 
@@ -1312,11 +1324,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback
         var numOps = MathHelper.GetNumericOperations<T>();
         var genericResult = new Vector<T>(vector.Length);
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            genericResult[i] = numOps.FromDouble(Math.Atan(val));
+            double val = values[i];
+            values[i] = Math.Atan(val);
         }
+        GenericFromDoubles(values, genericResult);
         return genericResult;
     }
 
@@ -1484,11 +1498,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Vector<T>(vector.Length);
 
         // TensorPrimitives.Sinh not available - use Math.Sinh
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            result[i] = numOps.FromDouble(Math.Sinh(val));
+            double val = values[i];
+            values[i] = Math.Sinh(val);
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1501,11 +1517,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Vector<T>(vector.Length);
 
         // TensorPrimitives.Cosh not available - use Math.Cosh
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            result[i] = numOps.FromDouble(Math.Cosh(val));
+            double val = values[i];
+            values[i] = Math.Cosh(val);
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1518,15 +1536,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Vector<T>(vector.Length);
 
         // Use asinh(x) = log(x + sqrt(x^2 + 1))
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
+            double val = values[i];
 #if NET5_0_OR_GREATER
-            result[i] = numOps.FromDouble(Math.Asinh(val));
+            values[i] = Math.Asinh(val);
 #else
-            result[i] = numOps.FromDouble(Math.Log(val + Math.Sqrt(val * val + 1.0)));
+            values[i] = Math.Log(val + Math.Sqrt(val * val + 1.0));
 #endif
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1539,15 +1559,17 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Vector<T>(vector.Length);
 
         // Use acosh(x) = log(x + sqrt(x^2 - 1))
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
+            double val = values[i];
 #if NET5_0_OR_GREATER
-            result[i] = numOps.FromDouble(Math.Acosh(val));
+            values[i] = Math.Acosh(val);
 #else
-            result[i] = numOps.FromDouble(Math.Log(val + Math.Sqrt(val * val - 1.0)));
+            values[i] = Math.Log(val + Math.Sqrt(val * val - 1.0));
 #endif
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1560,11 +1582,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = new Vector<T>(vector.Length);
 
         // Use atanh(x) = 0.5 * log((1 + x) / (1 - x))
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = numOps.ToDouble(vector[i]);
-            result[i] = numOps.FromDouble(MathHelper.Atanh(val));
+            double val = values[i];
+            values[i] = MathHelper.Atanh(val);
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1576,11 +1600,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(vector.Length);
 
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            result[i] = numOps.FromDouble(Math.Round(val));
+            double val = values[i];
+            values[i] = Math.Round(val);
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1592,11 +1618,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(vector.Length);
 
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            result[i] = numOps.FromDouble(Math.Floor(val));
+            double val = values[i];
+            values[i] = Math.Floor(val);
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1608,11 +1636,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(vector.Length);
 
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            result[i] = numOps.FromDouble(Math.Ceiling(val));
+            double val = values[i];
+            values[i] = Math.Ceiling(val);
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1624,11 +1654,13 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(vector.Length);
 
-        for (int i = 0; i < vector.Length; i++)
+        var values = GenericToDoubles(vector);
+        for (int i = 0; i < values.Length; i++)
         {
-            double val = Convert.ToDouble(vector[i]);
-            result[i] = numOps.FromDouble(Math.Truncate(val));
+            double val = values[i];
+            values[i] = Math.Truncate(val);
         }
+        GenericFromDoubles(values, result);
 
         return result;
     }
@@ -1659,7 +1691,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (length < 0) throw new ArgumentException("Length must be non-negative.", nameof(length));
         var random = seed.HasValue ? RandomHelper.CreateSeededRandom(seed.Value) : RandomHelper.CreateSecureRandom();
         var numOps = MathHelper.GetNumericOperations<T>();
-        double dropoutRateDouble = Convert.ToDouble(dropoutRate);
+        double dropoutRateDouble = numOps.ToDouble(dropoutRate);
         var mask = new Vector<T>(length);
         for (int i = 0; i < length; i++)
         {
@@ -1693,13 +1725,15 @@ public partial class CpuEngine : ITensorLevelEngine
         var noise = new Vector<T>(length);
         for (int i = 0; i < length; i++)
         {
-            // Box-Muller transform to generate Gaussian random numbers
-            T u1 = numOps.FromDouble(random.NextDouble());
-            T u2 = numOps.FromDouble(random.NextDouble());
-            T z = numOps.Multiply(
-                numOps.Sqrt(numOps.Multiply(numOps.FromDouble(-2.0), numOps.Log(u1))),
-                numOps.FromDouble(Math.Cos(2.0 * Math.PI * Convert.ToDouble(u2))));
-            noise[i] = numOps.Add(mean, numOps.Multiply(standardDeviation, z));
+            // Box-Muller in double, converted to T once. Formed in T it read u2 back through Convert.ToDouble, which
+            // throws for Half and BFloat16 (not IConvertible), and rounded u1 first: a draw below Half's smallest
+            // subnormal became 0 and log(0) made the sample infinite. For double the samples are unchanged; a u1 of 0
+            // (log 0) is redrawn. NextDouble is in [0, 1), so "not positive" is exactly "zero".
+            double u1;
+            do { u1 = random.NextDouble(); } while (u1 <= 0.0);
+            double u2 = random.NextDouble();
+            double z = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+            noise[i] = numOps.Add(mean, numOps.Multiply(standardDeviation, numOps.FromDouble(z)));
         }
         return noise;
     }
@@ -31639,7 +31673,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     var scaledScore = numOps.Multiply(sum, scaleFactor);
                     // Attention-logit soft-cap (Gemma-2), generic-T path.
                     if (softcap > 0.0)
-                        scaledScore = numOps.FromDouble(softcap * Math.Tanh(Convert.ToDouble(scaledScore) / softcap));
+                        scaledScore = GenericSoftCap(scaledScore, softcap);
                     scoresData[sOffset + i * seqK + j] = scaledScore;
                 }
             }
