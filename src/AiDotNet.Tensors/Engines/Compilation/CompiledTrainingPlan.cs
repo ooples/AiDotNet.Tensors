@@ -5801,6 +5801,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // Moment state starts at zero on the device; allocating and uploading a host zero array
     // adds LOH/GC pressure and a full transfer for every parameter and every optimizer slot.
+    // One gradient-sized scratch per backend for the learning-rate-in-velocity momentum update (see
+    // FusedOptimizerExtras.VelocityIncludesLearningRate). Grown on demand; owned by _gpuOptimizerBuffers.
+    private readonly Dictionary<Engines.DirectGpu.IDirectGpuBackend, Engines.DirectGpu.IGpuBuffer> _lrVelocityScratch
+        = new(ReferenceEqualityComparer<Engines.DirectGpu.IDirectGpuBackend>.Instance);
+
+    private Engines.DirectGpu.IGpuBuffer LearningRateVelocityScratch(Engines.DirectGpu.IDirectGpuBackend backend, int length)
+    {
+        if (_lrVelocityScratch.TryGetValue(backend, out var scratch) && scratch.Size >= length) return scratch;
+        var grown = AllocateGpuOptimizerState(backend, length);
+        _gpuOptimizerBuffers.Add(grown);
+        _lrVelocityScratch[backend] = grown;
+        return grown;
+    }
+
     internal static Engines.DirectGpu.IGpuBuffer AllocateGpuOptimizerState(
         Engines.DirectGpu.IDirectGpuBackend backend, int length)
     {
@@ -6861,8 +6875,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 // on a GPU-resident plan is rejected eagerly by
                                 // ValidatePlanOptimizerSupport, so reaching here means classical momentum
                                 // is what the caller asked for.
-                                gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
-                                    lr, b1, wd, len);
+                                if (extras.VelocityIncludesLearningRate)
+                                {
+                                    // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
+                                    // weight decay lr*wd is exactly that, without a new backend entry point.
+                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
+                                    gpuBe.Scale(gradBuf, scaledGrad, lr, len);
+                                    gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, gpuM[p]!,
+                                        1f, b1, wd * lr, len);
+                                }
+                                else
+                                {
+                                    gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
+                                        lr, b1, wd, len);
+                                }
                                 break;
                             case OptimizerType.AdaMax:
                                 gpuBe.AdamaxUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
@@ -7034,7 +7060,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.SGDMomentum:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
+                            if (extras.VelocityIncludesLearningRate)
+                                FusedOptimizer.SgdMomentumLearningRateVelocityUpdateSimd(pParam, pGrad, pM, len, lr, b1);
+                            else
+                                FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
                             break;
                         case OptimizerType.AdaMax:
                             if (wd != 0f)
@@ -7724,8 +7753,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 // on a GPU-resident plan is rejected eagerly by
                                 // ValidatePlanOptimizerSupport, so reaching here means classical momentum
                                 // is what the caller asked for.
-                                gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
-                                    lr, b1, wd, len);
+                                if (extras.VelocityIncludesLearningRate)
+                                {
+                                    // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
+                                    // weight decay lr*wd is exactly that, without a new backend entry point.
+                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
+                                    gpuBe.Scale(gradBuf, scaledGrad, lr, len);
+                                    gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, gpuM[p]!,
+                                        1f, b1, wd * lr, len);
+                                }
+                                else
+                                {
+                                    gpuBe.SgdMomentumUpdate(gpuP, gradBuf, gpuM[p]!,
+                                        lr, b1, wd, len);
+                                }
                                 break;
                             case OptimizerType.AdaMax:
                                 gpuBe.AdamaxUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
@@ -7865,7 +7906,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.SGDMomentum:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
-                            FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
+                            if (extras.VelocityIncludesLearningRate)
+                                FusedOptimizer.SgdMomentumLearningRateVelocityUpdateSimd(pParam, pGrad, pM, len, lr, b1);
+                            else
+                                FusedOptimizer.SgdMomentumUpdateSimd(pParam, pGrad, pM, len, lr, b1, extras.Nesterov);
                             break;
                         case OptimizerType.AdaMax:
                             if (wd != 0f)
@@ -8799,6 +8843,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             AmsgradExactBeta1 = extras.AmsgradExactBeta1,
             AmsgradExactBeta2 = extras.AmsgradExactBeta2,
             DecoupledWeightDecay = extras.DecoupledWeightDecay,
+            VelocityIncludesLearningRate = extras.VelocityIncludesLearningRate,
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)

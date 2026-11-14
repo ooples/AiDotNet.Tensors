@@ -94,9 +94,6 @@ public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTen
                 Tensor<float> loss;
                 (h, a, loss) = Forward(gpu, x, w);
                 tape.Retain(a);
-                // h is read after backward: under release-at-last-use it must be retained (AutoRetainProbe only
-                // keeps it on its own if this graph's first backward run, possibly another test's, saw the read).
-                tape.Retain(h);
                 GpuLaunchProbe.Reset();
                 grad = tape.ComputeGradients(loss, new[] { w })[w];
                 backwardReadbackBytes = GpuLaunchProbe.ReadbackBytes;
@@ -120,7 +117,7 @@ public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTen
             Assert.True(backwardReadbackBytes <= 64, $"backward read back {backwardReadbackBytes} bytes: {backwardSites}");
             Assert.True(disposeReadbackBytes == 0, $"tape dispose read back {disposeReadbackBytes} bytes: {disposeSites}");
 
-            // A retained forward result keeps its values after the tape: read directly, and
+            // A forward result the caller still holds keeps its values after the tape, as in PyTorch: read directly, and
             // fed to another GPU op (its device buffer must not have been handed to anyone else).
             float[] expectedH;
             {

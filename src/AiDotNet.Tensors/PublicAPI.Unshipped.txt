@@ -590,3 +590,7 @@ override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorGatherRows<T>(AiDo
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorScatterRowsInPlace<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! table, AiDotNet.Tensors.LinearAlgebra.Tensor<long>! rows, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! source) -> void
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLinearFilter<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! x, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? zi = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLinearFilterGuarded<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! x, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? zi, double maxAbs) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.FusedOptimizerExtras.VelocityIncludesLearningRate.get -> bool
+AiDotNet.Tensors.Engines.Compilation.FusedOptimizerExtras.VelocityIncludesLearningRate.init -> void
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseDeviceActivationsAtLastUse.get -> bool
+AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseDeviceActivationsAtLastUse.init -> void

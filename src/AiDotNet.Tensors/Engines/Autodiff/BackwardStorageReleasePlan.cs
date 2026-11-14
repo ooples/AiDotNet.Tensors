@@ -48,6 +48,29 @@ internal sealed class LastUseReleaseNote : Helpers.ReleaseNote
 }
 
 /// <summary>
+/// Whether the backward running on this thread frees device intermediates at their last use: the running tape's
+/// <see cref="GradientTapeOptions.ReleaseDeviceActivationsAtLastUse"/>. Thread scoped, because the backward runners
+/// (eager walk, cached delegate chain, rebindable plan) are shared across tapes; an inner tape (a checkpoint
+/// recompute) sets its own and restores the outer one.
+/// </summary>
+internal static class ReleaseScope
+{
+    [ThreadStatic] private static bool t_freeDeviceActivations;
+
+    internal static bool FreeDeviceActivations => t_freeDeviceActivations;
+
+    /// <summary>Sets the flag for this thread's backward and returns the previous value, to pass to <see cref="Exit"/>.</summary>
+    internal static bool Enter(bool freeDeviceActivations)
+    {
+        bool previous = t_freeDeviceActivations;
+        t_freeDeviceActivations = freeDeviceActivations;
+        return previous;
+    }
+
+    internal static void Exit(bool previous) => t_freeDeviceActivations = previous;
+}
+
+/// <summary>
 /// Precomputed, storage-aware release schedule for progressive GPU activation reclamation.
 /// Tensor objects are not allocation identities: reshape/transpose/slice views can all share
 /// one storage, and a saved tensor can outlive an earlier alias's backward step. The schedule
@@ -255,14 +278,28 @@ internal sealed class BackwardStorageReleasePlan<T>
         DirectGpuTensorEngine engine,
         HashSet<object> protectedStorages)
     {
+        var candidates = _releasesAfterStep[step];
+        if (!ReleaseScope.FreeDeviceActivations)
+        {
+            // The tape did not opt in (GradientTapeOptions.ReleaseDeviceActivationsAtLastUse): a device-only
+            // intermediate stays readable while it is held, as PyTorch keeps a tensor Python still references, and goes
+            // back to the collector's reclaim; one with a host copy is only uncached.
+            if (candidates is null) return;
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                var candidate = candidates[i];
+                if (protectedStorages.Contains(candidate.StorageIdentity)) continue;
+                if (!ReferenceEquals(candidate.Tensor.StorageIdentity, candidate.StorageIdentity)) continue;
+                engine.ReleaseDeadActivation(candidate.Tensor, candidate.Note, freeDeviceStorage: false);
+            }
+            return;
+        }
         if (step <= _lastStep)
         {
-            // A new backward run: the previous probe window ends, and this graph's first run probes.
-            AutoRetainProbe.EndWindow();
-            _probing = AutoRetainProbe.TryBeginProbe(_signature);
+            // A new backward run of this graph: its previous probe window ends, and its first run probes.
+            _probing = AutoRetainProbe.BeginRun(_signature);
         }
         _lastStep = step;
-        var candidates = _releasesAfterStep[step];
         if (candidates is null) return;
         for (int i = 0; i < candidates.Length; i++)
         {
@@ -276,8 +313,9 @@ internal sealed class BackwardStorageReleasePlan<T>
             {
                 var tensor = candidate.Tensor;
                 var note = candidate.Note;
-                AutoRetainProbe.Quarantine(tensor.DataVector, tensor.GetBackingArrayForCacheLookupUnsafe(), candidate.Key,
-                    () => engine.ReleaseDeadActivation(tensor, note));
+                var weak = new WeakReference<Tensor<T>>(tensor);   // the quarantine must not keep it alive
+                AutoRetainProbe.Quarantine(_signature, tensor.DataVector, tensor.GetBackingArrayForCacheLookupUnsafe(),
+                    candidate.Key, () => { if (weak.TryGetTarget(out var held)) engine.ReleaseDeadActivation(held, note); });
                 continue;
             }
             engine.ReleaseDeadActivation(candidate.Tensor, candidate.Note);

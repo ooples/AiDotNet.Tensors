@@ -1121,12 +1121,14 @@ public sealed class GradientTape<T> : IDisposable
                 "This tape's first backward handed its forward activations back to the arena "
                 + "(GradientTapeOptions.ReleaseActivationsDuringBackward), so it cannot run another backward.");
         Dictionary<Tensor<T>, Tensor<T>> grads;
+        bool outerReleaseScope = ReleaseScope.Enter(_options.ReleaseDeviceActivationsAtLastUse);
         try
         {
             grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
         }
         finally
         {
+            ReleaseScope.Exit(outerReleaseScope);
             // Whether or not this backward used it, the forward is over: stop recording rentals into it.
             _activationLogArena?.TakeForwardActivationLog();
         }

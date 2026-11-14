@@ -44,8 +44,6 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
         if (expectOnDevice)
             Assert.True(output.IsGpuResident || output.HasPendingGpuData,
                 "GatedDeltaNetScanForward ran on the host (CPU fallback) under an active tape");
-        // The output is compared after backward, which frees it at its last backward use unless it is retained.
-        tape.Retain(output);
         var loss = engine.ReduceSum(engine.TensorMultiply(output, r), [0, 1, 2], keepDims: false);
         var grads = tape.ComputeGradients(loss, inputs);
         if (expectOnDevice)

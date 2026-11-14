@@ -2347,7 +2347,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// a later backward step (it did, in the HRE LM's specialized backwards). The old materialize-then-free contract
     /// hid that by downloading and re-uploading. A tensor with a valid host copy is simply uncached, as before.
     /// </summary>
-    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor, Helpers.ReleaseNote? note = null)
+    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor, Helpers.ReleaseNote? note = null,
+        bool freeDeviceStorage = true)
     {
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if ((backingArray is not null && Helpers.HostSync.IsRetained(backingArray))
@@ -2356,6 +2357,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if ((backingArray is not null && Helpers.HostSync.IsPending(backingArray))
             || Helpers.HostSync.IsPending(tensor.DataVector))
         {
+            // Not opted in: device-only, so nothing to uncache; it stays readable and the collector reclaims it.
+            if (!freeDeviceStorage) return;
             // Device-only, and its last declared backward use just ran (BackwardStorageReleasePlan proved no later step
             // reads it, and a leaf's storage is never scheduled): free it now, stream ordered, with no download. It used
             // to wait for the GC, as tape dispose no longer releases results the tensors own: 30-40% of a GPU MoE LM
