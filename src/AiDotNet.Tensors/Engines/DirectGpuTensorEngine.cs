@@ -8858,6 +8858,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSum<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
@@ -8870,6 +8871,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMaxValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
@@ -8882,6 +8884,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMinValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
@@ -15499,6 +15502,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> magnitudeOut,
         out Tensor<T> phaseOut)
     {
+        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
+        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
+        Compilation.GraphMode.ThrowIfNonInferenceUnsupported(Compilation.GraphCaptureLimitation.HostBoundary);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft)
         {
@@ -15644,6 +15650,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> window,
         bool powerToDb)
     {
+        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
+        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
+        Compilation.GraphMode.ThrowIfNonInferenceUnsupported(Compilation.GraphCaptureLimitation.HostBoundary);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0)
         {
@@ -28574,6 +28583,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSumOfSquares<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         // Composed from IDirectGpuBackend.DotProduct(x, x, scalarOut, n), which all 6 backends implement without
         // materializing a full-length squares buffer on device (except WebGPU whose DotProduct composes internally);
@@ -30086,6 +30096,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMean<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
         if (ShouldReduceOnDevice(input) && TryGetBackend(out var b))
         {

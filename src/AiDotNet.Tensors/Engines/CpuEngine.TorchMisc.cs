@@ -324,6 +324,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual bool TensorIsNonzero<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length != 1) throw new InvalidOperationException("TensorIsNonzero is defined only for a single-element tensor.");
         var ops = MathHelper.GetNumericOperations<T>();

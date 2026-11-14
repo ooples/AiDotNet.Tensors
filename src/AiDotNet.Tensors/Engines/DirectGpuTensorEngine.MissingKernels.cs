@@ -1451,6 +1451,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override T TensorVecDot<T>(Tensor<T> a, Tensor<T> b)
     {
+        BeginHostScalarRead(a);
+        BeginHostScalarRead(b);
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
@@ -4174,6 +4176,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override int TensorCountNonzero<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (typeof(T) != typeof(float) || tensor.Length == 0 || !TryGetBackend(out var backend))
@@ -4195,6 +4198,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override T TensorNanMedian<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("NanMedian requires a non-empty tensor");
@@ -5042,6 +5046,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override T TensorMedian<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("Median requires a non-empty tensor");
@@ -5064,6 +5069,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k)
     {
+        BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (k < 1 || k > input.Length) throw new ArgumentOutOfRangeException(nameof(k));
@@ -5090,6 +5096,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override (T Value, int Count) TensorMode<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("Mode requires a non-empty tensor");
@@ -8256,6 +8263,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override bool TensorEqual<T>(Tensor<T> a, Tensor<T> b)
     {
+        BeginHostScalarRead(a);
+        BeginHostScalarRead(b);
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
@@ -8304,6 +8313,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override bool TensorAllClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false)
     {
+        BeginHostScalarRead(a);
+        BeginHostScalarRead(b);
         using var __gpuOp = EnterGpuOp();
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
@@ -9326,6 +9337,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         // float-only (the backend reduce kernels are float); other dtypes / no-GPU defer to base.
@@ -9359,6 +9371,7 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override T TensorTrace<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (typeof(T) != typeof(float) || tensor.Rank != 2 || !ShouldReduceOnDevice(tensor) || !TryGetBatchBackend(out var backend))

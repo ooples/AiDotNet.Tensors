@@ -8780,6 +8780,7 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
     public unsafe T TensorSum<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         // Stride-aware: sum via stride indices for non-contiguous views
@@ -9225,6 +9226,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorMaxValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute max of empty tensor.", nameof(tensor));
 
@@ -9265,6 +9267,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorMinValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -9402,6 +9405,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorMean<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Cannot compute mean of empty tensor.", nameof(tensor));
 
@@ -13447,7 +13451,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // The memory feeds only the synchronous loop below; the scopes keep both tensors alive while it runs.
             using var eluTensorKeep = new KeepAliveScope(tensor);
             using var eluResultKeep = new KeepAliveScope(result);
-            var srcMem = (ReadOnlyMemory<double>)AsDoubleReadOnlyMemory(tensor.ReadOnlyDataUnmarked);
+            var srcMem = AsDoubleReadOnlyMemory(tensor.ReadOnlyDataUnmarked);
             var dstMem = AsDoubleMemory(result.DataUnmarked);
             int length = tensor.Length, numChunks = ElementwiseChunks(length);
             if (numChunks < 2) SimdKernels.ELU(srcMem.Span, alpha, dstMem.Span);
@@ -38737,6 +38741,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public unsafe T TensorSumOfSquares<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
 #if NET5_0_OR_GREATER
@@ -46819,6 +46824,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (window == null) throw new ArgumentNullException(nameof(window));
+        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
+        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
+        GraphMode.ThrowIfNonInferenceUnsupported(GraphCaptureLimitation.HostBoundary);
         if (GraphMode.IsInferenceTrace)
         {
             Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
@@ -47183,6 +47191,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (window == null) throw new ArgumentNullException(nameof(window));
+        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
+        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
+        GraphMode.ThrowIfNonInferenceUnsupported(GraphCaptureLimitation.HostBoundary);
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
                 new[] { input, window },
@@ -49261,6 +49272,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public T CrossEntropyLoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        BeginHostScalarRead(predictions);
+        BeginHostScalarRead(targets);
         CrossEntropyLayout(predictions, targets, out int batchSize, out int numClasses, out int inner, out bool sparseTargets);
         var numOps = MathHelper.GetNumericOperations<T>();
         int rows = batchSize * inner;
@@ -49415,6 +49428,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public T MseLoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        BeginHostScalarRead(predictions);
+        BeginHostScalarRead(targets);
         var predictionsOrig = predictions;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!predictions.IsContiguous) predictions = predictions.Contiguous();
         var targetsOrig = targets;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
