@@ -29128,7 +29128,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         try
                         {
                             int axisOffset = 0;
-                            for (int t = 0; t < tensors.Length; t++)
+                            // Two inputs (DenseNet's every concatenation) in one launch where the backend has one: the
+                            // second input's copy alone was a launch too small to fill the device at 8x8 and below.
+                            if (tensors.Length == 2 && outer > 1 && backend is IRowConcatBackend rowConcat
+                                && tensors[0].Shape._dims[normAxis] > 0 && tensors[1].Shape._dims[normAxis] > 0)
+                            {
+                                var first = GetOrAllocateBuffer(backend, tensors[0]);
+                                var second = GetOrAllocateBuffer(backend, tensors[1]);
+                                try
+                                {
+                                    if (rowConcat.TryConcatRows2(first.Buffer, tensors[0].Shape._dims[normAxis] * inner,
+                                            second.Buffer, tensors[1].Shape._dims[normAxis] * inner, outBuf.Buffer, outer))
+                                        axisOffset = axisTotal;
+                                }
+                                finally
+                                {
+                                    first.DisposeAfterQueuedUse(backend);
+                                    second.DisposeAfterQueuedUse(backend);
+                                }
+                            }
+                            for (int t = 0; t < tensors.Length && axisOffset < axisTotal; t++)
                             {
                                 var tensor = tensors[t];
                                 int tensorAxis = tensor.Shape._dims[normAxis];

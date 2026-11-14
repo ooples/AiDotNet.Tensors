@@ -4428,8 +4428,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         foreach (var p in _parameters) Bind(p);
         Bind(_lossOutput);
-        foreach (var (buffer, last) in lastByBuffer)
+        foreach (var entry in lastByBuffer)
         {
+            var buffer = entry.Key;
+            int last = entry.Value;
             if (last < 0 || last >= backwardActionCount || !pool.Keys.TryGetValue(buffer, out long key)) continue;
             if ((int)(key >> 32) >= forwardActionCount || !pool.Slots.TryGetValue(key, out var slot)
                 || !ReferenceEquals(slot, buffer)) continue;

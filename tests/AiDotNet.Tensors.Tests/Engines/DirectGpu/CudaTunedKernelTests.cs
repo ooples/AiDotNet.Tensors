@@ -40,12 +40,14 @@ public sealed class CudaTunedKernelTests
     // LayerNorm's dx on a one-column row, is only accurate relative to those terms, not to its own value.
     private static void AssertClose(float[] expected, float[] actual, int count, string what, double termScale = 1e-30)
     {
+        // A plain-TF32 engine candidate (10-bit mantissa products) is ~1e-3 of the output scale from the fp32 sum.
+        double tolerance = what.Contains("_tf32") ? 2e-3 : Tolerance;
         double scale = termScale;
         for (int i = 0; i < count; i++) scale = Math.Max(scale, Math.Abs(expected[i]));
         for (int i = 0; i < count; i++)
         {
             double err = Math.Abs((double)actual[i] - expected[i]) / scale;
-            Assert.True(err <= Tolerance, $"{what}: index {i} expected {expected[i]} actual {actual[i]} (rel {err:E2})");
+            Assert.True(err <= tolerance, $"{what}: index {i} expected {expected[i]} actual {actual[i]} (rel {err:E2})");
         }
     }
 

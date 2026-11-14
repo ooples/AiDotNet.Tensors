@@ -61,6 +61,17 @@ extern ""C"" __global__ __launch_bounds__(256) void copy_rows4(
     float4* d = dst + (long long)row * dstStride4;
     for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < cols4; c += gridDim.x * blockDim.x) d[c] = s[c];
 }
+// concat_rows2_4: row r of dst = row r of a (ca float4s) then row r of b (cb); one launch for a two-input concatenate.
+extern ""C"" __global__ __launch_bounds__(256) void concat_rows2_4(
+    const float4* __restrict__ a, int ca, const float4* __restrict__ b, int cb, float4* __restrict__ dst, int rows)
+{
+    long long w = ca + cb, n = (long long)rows * w;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+    {
+        long long r = i / w; int c = (int)(i - r * w);
+        dst[i] = c < ca ? a[r * ca + c] : b[r * cb + c - ca];
+    }
+}
 
 // ===========================================================================
 // squash — Squash(input, output, numCapsules, capsuleDim, epsilon)
@@ -252,6 +263,7 @@ extern ""C"" __global__ __launch_bounds__(256) void csr_segmented_stddev(
             "copy_2d_strided",
             "copy_rows",
             "copy_rows4",
+            "concat_rows2_4",
             "squash",
             "squash_backward",
             "var_axis",

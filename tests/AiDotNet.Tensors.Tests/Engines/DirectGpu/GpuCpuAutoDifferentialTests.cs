@@ -746,6 +746,8 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "Conv3D(Tensor<T>,Tensor<T>,Int32,Int32,Int32)",
         "ConvTranspose2D(Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
         "FusedConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
+        // BatchNormActivationConv2DTests.Gpu_MatchesTheCpuComposition (pre-activated convolution, #2561).
+        "BatchNormActivationConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Double,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
         // FusedConv2DBatchNormTests.Gpu_MatchesTheCpuComposition (and its device-fold and tape cases).
         "FusedConv2DBatchNorm(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Double,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
         "Fold(Tensor<T>,Int32[],Int32[],Int32[],Int32[])",

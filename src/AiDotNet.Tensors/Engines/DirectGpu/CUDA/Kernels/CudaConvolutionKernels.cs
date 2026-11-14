@@ -1586,14 +1586,23 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c
 }
 
 " + ConvEngineCore + @"
+// Fusion hooks live: pro = relu(x * ps[ci] + pt[ci]) on in-bounds inputs when ps is set (an inference batch norm and
+// ReLU before the convolution; padding stays 0), epi = + bias[co] (ef bit 0), ReLU (bit 1) in the store (ef = 0 with
+// split-K, whose partials are summed after).
+struct CeAffPro { const float* s; const float* t;
+    __device__ __forceinline__ float operator()(int, int c, int, float x) const { return s ? fmaxf(fmaf(x, s[c], t[c]), 0.0f) : x; } };
+struct CeBiasEpi { const float* b; int f;
+    __device__ __forceinline__ float operator()(int, int c, int, float y) const { if (f & 1) y += b[c]; return (f & 2) ? fmaxf(y, 0.0f) : y; } };
 #define CE_FPROP_KERNEL(NAME, BM, TAPU, MAIN) \
 extern ""C"" __global__ __launch_bounds__(256) void NAME( \
     const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ out, \
     int batch, int inC, int H, int W, int outC, int outH, int outW, \
-    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit) \
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit, \
+    const float* bias, int ef, const float* ps, const float* pt) \
 { \
-    conv2d_fprop_ig_body<BM, BM, TAPU, CeIdentityPro, CeIdentityEpi, MAIN>(input, kernel, out, batch, inC, H, W, \
-        outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit); \
+    CeAffPro pro; pro.s = ps; pro.t = pt; CeBiasEpi epi; epi.b = bias; epi.f = ef; \
+    conv2d_fprop_ig_body<BM, BM, TAPU, CeAffPro, CeBiasEpi, MAIN>(input, kernel, out, batch, inC, H, W, \
+        outC, outH, outW, kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit, pro, epi); \
 }
 CE_FPROP_KERNEL(conv2d_fprop_ig128_tap, 128, true, 0)
 CE_FPROP_KERNEL(conv2d_fprop_ig128_gen, 128, false, 0)

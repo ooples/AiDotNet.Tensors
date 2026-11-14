@@ -25,10 +25,19 @@ public sealed class AutocastConvTests : IDisposable
     private readonly ITestOutputHelper _output;
     private readonly IEngine _prior = AiDotNetEngine.Current;
 
-    public AutocastConvTests(ITestOutputHelper output) => _output = output;
+    // The off-paths are told apart from the 16-bit route by their FP32 accuracy, so FP32 convolutions are pinned here: the
+    // TF32 default (as PyTorch's cuDNN convolutions) is ~1e-3 of the output scale, near FP16 rounding.
+    private readonly bool _priorConvTF32 = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32;
+
+    public AutocastConvTests(ITestOutputHelper output)
+    {
+        _output = output;
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = false;
+    }
 
     public void Dispose()
     {
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = _priorConvTF32;
         AiDotNetEngine.Current = _prior;
         DirectGpuTensorEngine.AutocastConvOverride = null;
         DirectGpuTensorEngine.AutocastConvInjectedFault = null;

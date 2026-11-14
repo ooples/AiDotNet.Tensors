@@ -10913,6 +10913,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     /// <inheritdoc/>
+    unsafe bool IRowConcatBackend.TryConcatRows2(IGpuBuffer a, int colsA, IGpuBuffer b, int colsB, IGpuBuffer destination,
+        int rows)
+    {
+        // float4 moves only: the columns and every base 16-byte aligned (a DenseNet concatenation's channel planes are).
+        long n4 = (long)rows * ((colsA + colsB) / 4);
+        if (!IsAvailable || rows <= 0 || colsA <= 0 || colsB <= 0 || ((colsA | colsB) & 3) != 0 || n4 > int.MaxValue
+            || ((long)a.Handle & 15) != 0 || ((long)b.Handle & 15) != 0 || ((long)destination.Handle & 15) != 0
+            || !_kernelCache.TryGetValue("concat_rows2_4", out var kernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr ap = a.Handle, bp = b.Handle, dp = destination.Handle;
+        int ca = colsA / 4, cb = colsB / 4, r = rows;
+        void** args = stackalloc void*[6];
+        args[0] = &ap; args[1] = &ca; args[2] = &bp; args[3] = &cb; args[4] = &dp; args[5] = &r;
+        // Grid-stride: enough blocks for every SM several times over, never more than the elements need.
+        uint grid = (uint)Math.Max(1, Math.Min((n4 + DefaultBlockSize - 1) / DefaultBlockSize, 8L * Math.Max(1, _multiProcessorCount)));
+        CuBlasNative.CheckCudaResult(
+            CudaNativeBindings.cuLaunchKernel(kernel, grid, 1, 1, (uint)DefaultBlockSize, 1, 1, 0, _stream, (IntPtr)args, IntPtr.Zero),
+            "cuLaunchKernel (concat_rows2_4)");
+        GpuLaunchProbe.OnLaunch();
+        return true;
+    }
+
+    /// <inheritdoc/>
     public unsafe void NearestNeighborUpsample(IGpuBuffer input, IGpuBuffer output, int batchChannels, int height, int width, int scaleFactor)
     {
         if (!IsAvailable)
