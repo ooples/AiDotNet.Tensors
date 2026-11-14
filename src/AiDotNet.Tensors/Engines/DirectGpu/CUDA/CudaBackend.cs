@@ -9247,6 +9247,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             FusedActivationType.GELU => "batchnorm_gelu",
             FusedActivationType.Sigmoid => "batchnorm_sigmoid",
             FusedActivationType.Tanh => "batchnorm_tanh",
+            FusedActivationType.ReLU6 => "batchnorm_relu6",
             _ => ""
         };
 

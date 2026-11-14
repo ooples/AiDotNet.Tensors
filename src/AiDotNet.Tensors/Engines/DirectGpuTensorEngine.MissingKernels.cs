@@ -1597,6 +1597,10 @@ public partial class DirectGpuTensorEngine
                 // No fused kernel for this activation: the device batch norm, then the activation through this engine,
                 // so the value stays on the device. The base ran both on the host (a download and an upload per call).
                 var normalized = BatchNormInference(x, gamma, beta, mean, variance, epsilon);
+                // ReLU6 as a device clamp: its registry handler is a host loop (a download and an upload per call).
+                if (activation == FusedActivationType.ReLU6)
+                    return TensorClamp(normalized, MathHelper.GetNumericOperations<T>().Zero,
+                        MathHelper.GetNumericOperations<T>().FromDouble(6.0));
                 return ActivationRegistry.Get(activation) is { } handler ? handler.Apply(this, normalized) : normalized;
             }
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, x.Length, x.Shape.ToArray());

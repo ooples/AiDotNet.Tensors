@@ -124,6 +124,25 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableTheory]
+    [InlineData(FusedActivationType.ReLU6)]
+    [InlineData(FusedActivationType.ReLU)]
+    public void IEngineBatchNormInference_WithActivation_MatchesCpu(FusedActivationType activation)
+    {
+        SkipIfNoDirectGpu();
+        const int n = 3, c = 5, hw = 7;
+        var rng = new Random(11);
+        float[] R(int len, float scale, float shift) => Enumerable.Range(0, len).Select(_ => (float)(rng.NextDouble() * scale + shift)).ToArray();
+        var x = R(n * c * hw * hw, 16f, -8f);
+        var gamma = R(c, 2f, 0.5f); var beta = R(c, 4f, -2f); var mean = R(c, 2f, -1f); var variance = R(c, 1f, 0.1f);
+        Tensor<float> T(float[] d, params int[] s) => new Tensor<float>((float[])d.Clone(), s);
+        var cpu = new CpuEngine();
+        var expected = cpu.BatchNormInference(T(x, n, c, hw, hw), T(gamma, c), T(beta, c), T(mean, c), T(variance, c), 1e-5, activation);
+        var actual = ((IEngine)Gpu).BatchNormInference(T(x, n, c, hw, hw), T(gamma, c), T(beta, c), T(mean, c), T(variance, c), 1e-5, activation);
+        var e = expected.ToArray(); var a = actual.ToArray();
+        for (int i = 0; i < e.Length; i++) Assert.True(Math.Abs(e[i] - a[i]) <= 1e-4f + 1e-4f * Math.Abs(e[i]), $"[{i}] {e[i]} vs {a[i]}");
+    }
+
+    [SkippableTheory]
     [InlineData(16, 32, 64, 1, 31)]   // a GRU's last timestep: one strided gather, float4-aligned rows
     [InlineData(5, 7, 3, 1, 6)]       // rows off the float4 grid
     [InlineData(3, 4, 5, 0, 2)]       // leading axis: a single contiguous run
