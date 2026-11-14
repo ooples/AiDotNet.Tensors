@@ -2471,6 +2471,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         TraceCapturePathHostRead();
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
@@ -2484,6 +2488,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (destination.Length < buffer.Size)
             throw new ArgumentException("Destination array is too small.", nameof(destination));
+        if (buffer.Size == 0) return;
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Cuda);
 
         using var _ = PushContext();
@@ -2504,7 +2509,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
         long probeSynced = probeStart != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-        ulong byteSize = (ulong)(buffer.Size * sizeof(float));
+        ulong byteSize = (ulong)buffer.Size * sizeof(float);
 
         unsafe
         {
@@ -5839,6 +5844,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
         // Fail fast with a managed exception BEFORE touching the driver — matches the rest of the
         // backend. Without this, a failed backend init or a freed graph-input buffer (zero handle)
         // would fall through to a raw cuMemcpyHtoD and fault the CUDA context (error 700) instead.
@@ -5849,6 +5855,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "GPU buffer was released before its in-place upload.");
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
+        if (data.Length == 0) return;
         using var _ = PushContext();
         ulong byteSize = (ulong)data.Length * sizeof(float);
         // Stream-ordered through pinned staging: the copy lands after the previous replay has finished reading this
@@ -19463,6 +19470,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // now-stale _context handle; when those CudaGpuBuffer instances later finalize
         // they would cuCtxPushCurrent/cuMemFree against a DESTROYED context — the exact
         // finalizer-fatal 0xC0000005 path this method's teardown guards exist to prevent.
+        // Ensure this backend's CUDA context is current on the disposing thread before draining events,
+        // freeing staged/pinned buffers, or destroying stream/module handles (a multi-GPU caller may have
+        // switched the thread to another device's context prior to Dispose).
+        bool pushedDisposeContext = false;
+        if (_cudaContext != IntPtr.Zero && _threadCurrentContext != _cudaContext)
+        {
+            try
+            {
+                if (CuBlasNative.cuCtxPushCurrent(_cudaContext) == 0)
+                {
+                    _threadCurrentContext = _cudaContext;
+                    pushedDisposeContext = true;
+                }
+            }
+            catch
+            {
+                // Suppress context-push errors if the CUDA driver is already tearing down.
+            }
+        }
+
         DrainDeferredFrees(blockOldest: true);
 
         // Direct-PTX modules borrow this backend's context and stream. Unload
@@ -19866,6 +19893,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         UnloadRemainingModules();
+
+        if (pushedDisposeContext)
+        {
+            try
+            {
+                CuBlasNative.cuCtxPopCurrent(out var previousContext);
+                _threadCurrentContext = previousContext;
+            }
+            catch
+            {
+                _threadCurrentContext = IntPtr.Zero;
+            }
+        }
 
         if (_cudaContext != IntPtr.Zero)
         {
