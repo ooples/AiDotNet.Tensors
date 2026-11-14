@@ -43,6 +43,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _stream;
     private HipStream? _defaultStream;
     private IntPtr _mfmaModule;
+    private IntPtr _gemmPortableModule;
     private IntPtr _mfmaGemmF32;
     private IntPtr _mfmaGemmF16;
     private IntPtr _scalarGemmF32;
@@ -176,7 +177,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         return _architecture switch
         {
-            AmdGpuArchitecture.MI100 or AmdGpuArchitecture.MI200 or AmdGpuArchitecture.MI300 => "MFMA",
+            AmdGpuArchitecture.MI100 or AmdGpuArchitecture.MI200 or AmdGpuArchitecture.MI300
+                or AmdGpuArchitecture.MI350 => "MFMA",
             AmdGpuArchitecture.RDNA3 => "RDNA3",
             AmdGpuArchitecture.RDNA2 => "RDNA2",
             AmdGpuArchitecture.RDNA => "RDNA",
@@ -466,6 +468,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         architecture = target switch
         {
+            "gfx950" => AmdGpuArchitecture.MI350,
             "gfx940" or "gfx941" or "gfx942" => AmdGpuArchitecture.MI300,
             "gfx90a" => AmdGpuArchitecture.MI200,
             "gfx908" => AmdGpuArchitecture.MI100,
@@ -614,20 +617,29 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private void CompileKernels()
     {
-        // Get kernel source
-        string source = HipMfmaKernel.GetSource();
         string compileFlags = HipMfmaKernel.GetCompileFlags(_architectureTarget);
 
         Console.WriteLine($"[HipBackend] Compiling kernels for {_architecture} with flags: {compileFlags}");
 
         try
         {
-            // Compile MFMA/GEMM module
+            // The portable GEMM kernels compile on every AMD target. The MFMA kernels are a separate module so a
+            // failure there (an intrinsic a compiler or target lacks) leaves the backend running on the portable ones.
             HipKernelCompilationException? gemmCompilationFailure = CompileKernelModule(
-                source, "mfma_gemm", ref _mfmaModule, new[]
+                HipMfmaKernel.GetPortableSource(), "gemm_portable", ref _gemmPortableModule,
+                HipMfmaKernel.GetPortableKernelNames());
+            if (HipMfmaKernel.SupportsMfma(_architecture))
             {
-                "mfma_gemm_f32", "mfma_gemm_f16", "scalar_gemm_f32", "rdna_gemm_wave32"
-            });
+                HipKernelCompilationException? mfmaFailure = CompileKernelModule(
+                    HipMfmaKernel.GetMfmaSource(), "mfma_gemm", ref _mfmaModule, HipMfmaKernel.GetMfmaKernelNames());
+                if (mfmaFailure is not null)
+                {
+                    // CompileKernelModule already recorded the failure (KernelCompilationFailures); this only notes
+                    // the fallback, through the same Debug trace the other optional modules use.
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[HipBackend] MFMA GEMM module failed to compile; using portable GEMM: {mfmaFailure.Message}");
+                }
+            }
 
             bool hasRequiredGemmKernel = _kernelCache.ContainsKey("scalar_gemm_f32") ||
                                          _kernelCache.ContainsKey("mfma_gemm_f32") ||
@@ -635,7 +647,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             if (!hasRequiredGemmKernel)
             {
                 throw gemmCompilationFailure ?? new HipKernelCompilationException(
-                    "mfma_gemm",
+                    "gemm_portable",
                     HipKernelCompilationStage.FunctionLookup,
                     "The HIP GEMM module did not expose a usable FP32 kernel.");
             }
@@ -1803,9 +1815,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         switch (kernelType)
         {
             case GemmKernelType.Mfma:
-                // MFMA: 128x128 workgroup tiles, 256 threads (4 warps of 64)
-                tileM = 128;
-                tileN = 128;
+                // MFMA: 64x64 workgroup tiles, 256 threads (2 x 2 waves of 64, one 32x32 tile each)
+                tileM = HipMfmaKernel.MfmaTile;
+                tileN = HipMfmaKernel.MfmaTile;
                 blockSize = 256;
                 break;
             case GemmKernelType.RdnaWave32:
@@ -1994,7 +2006,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     private enum GemmKernelType
     {
-        Mfma,       // 128x128 workgroup tiles, 256 threads
+        Mfma,       // 64x64 workgroup tiles, 256 threads
         RdnaWave32, // 32x32 tiles, 256 threads
         Scalar      // 16x16 tiles, 256 threads
     }
@@ -10415,8 +10427,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         switch (kernelType)
         {
             case GemmKernelType.Mfma:
-                tileM = 128;
-                tileN = 128;
+                tileM = HipMfmaKernel.MfmaTile;
+                tileN = HipMfmaKernel.MfmaTile;
                 blockSize = 256;
                 break;
             case GemmKernelType.RdnaWave32:
@@ -11728,6 +11740,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             UnloadModule(_mfmaModule);
             _mfmaModule = IntPtr.Zero;
+        }
+        if (_gemmPortableModule != IntPtr.Zero)
+        {
+            UnloadModule(_gemmPortableModule);
+            _gemmPortableModule = IntPtr.Zero;
         }
         if (_activationModule != IntPtr.Zero)
         {
