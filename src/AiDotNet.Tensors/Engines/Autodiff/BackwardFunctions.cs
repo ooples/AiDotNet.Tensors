@@ -12057,7 +12057,7 @@ internal static partial class BackwardFunctions<T>
             {
                 var re = RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength);
                 var im = RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength);
-                return e.TensorSqrt(e.TensorAdd(e.TensorMultiply(re, re), e.TensorMultiply(im, im)));
+                return RecordedComplexMagnitude(re, im);
             });
 
     /// <summary>
@@ -12091,67 +12091,6 @@ internal static partial class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
 
-    /// <summary>
-    /// Backward of the magnitude output of <c>IEngine.STFT</c>, for either <c>center</c>. The same analysis adjoint as
-    /// <see cref="SpectrogramBackward"/>, seeded from the saved phase.
-    /// </summary>
-    internal static void StftMagnitudeBackward(
-        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
-        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
-    {
-        var waveform = inputs[0];
-        RequireSavedState(nameof(StftMagnitudeBackward), savedState, 6);
-        int nFft = SavedInt(nameof(StftMagnitudeBackward), savedState, 0, "nFft");
-        int hopLength = SavedInt(nameof(StftMagnitudeBackward), savedState, 1, "hopLength");
-        var window = SavedTensor(nameof(StftMagnitudeBackward), savedState, 2, "window");
-        var phase = SavedTensor(nameof(StftMagnitudeBackward), savedState, 3, "phase");
-        int origLength = SavedInt(nameof(StftMagnitudeBackward), savedState, 4, "origLength");
-        bool center = SavedBool(nameof(StftMagnitudeBackward), savedState, 5, "center");
-
-        if (CreatesGraph)
-        {
-            // The recorded linear analysis behind the create-graph path frames the centred signal only.
-            if (!center) throw new NotSupportedException("A create-graph backward through STFT requires center: true.");
-            if (SpectrogramBackwardCreateGraph(gradOutput, waveform, engine, grads, nFft, hopLength, window, origLength))
-                return;
-        }
-
-        var result = StftAnalysisAdjoint(
-            gradOutput, magnitude: null, phase, StftAdjointTarget.Magnitude,
-            nFft, hopLength, window, origLength, waveform._shape, center);
-        DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
-    }
-
-    /// <summary>
-    /// Backward of the phase output of <c>IEngine.STFT</c>, for either <c>center</c>. The same analysis adjoint as
-    /// <see cref="StftPhaseBackward"/>, scaled by the saved magnitudes.
-    /// </summary>
-    internal static void StftPhaseOutputBackward(
-        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
-        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
-    {
-        var waveform = inputs[0];
-        RequireSavedState(nameof(StftPhaseOutputBackward), savedState, 6);
-        int nFft = SavedInt(nameof(StftPhaseOutputBackward), savedState, 0, "nFft");
-        int hopLength = SavedInt(nameof(StftPhaseOutputBackward), savedState, 1, "hopLength");
-        var window = SavedTensor(nameof(StftPhaseOutputBackward), savedState, 2, "window");
-        var magnitude = SavedTensor(nameof(StftPhaseOutputBackward), savedState, 3, "magnitude");
-        int origLength = SavedInt(nameof(StftPhaseOutputBackward), savedState, 4, "origLength");
-        bool center = SavedBool(nameof(StftPhaseOutputBackward), savedState, 5, "center");
-
-        if (CreatesGraph)
-        {
-            if (!center) throw new NotSupportedException("A create-graph backward through STFT requires center: true.");
-            if (StftPhaseBackwardCreateGraph(gradOutput, waveform, engine, grads, nFft, hopLength, window, origLength))
-                return;
-        }
-
-        var result = StftAnalysisAdjoint(
-            gradOutput, magnitude, output, StftAdjointTarget.Phase,
-            nFft, hopLength, window, origLength, waveform._shape, center);
-        DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
-    }
-
     // The create-graph path of StftPhaseBackward, kept out of it so its first-order path allocates no closure.
     private static bool StftPhaseBackwardCreateGraph(
             Tensor<T> gradOutput,
@@ -12163,9 +12102,9 @@ internal static partial class BackwardFunctions<T>
             Tensor<T> window,
             int origLength)
         => TryCompositeBackward(gradOutput, new[] { waveform }, engine, grads, e =>
-            e.TensorAtan2(
-                RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength),
-                RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength)));
+            RecordedComplexPhase(
+                RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength),
+                RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength)));
 
     /// <summary>
     /// Adjoint of <c>RFFT</c>: maps a gradient shaped like the interleaved one-sided spectrum back
@@ -12747,8 +12686,9 @@ internal static partial class BackwardFunctions<T>
     private const double PhaseGradientMagnitudeFloor = 1e-12;
 
     /// <summary>
-    /// Shared adjoint of a one-sided STFT analysis with <c>center: true</c>: maps a gradient shaped
-    /// like the spectrogram back onto the waveform, for either reported output.
+    /// Shared adjoint of a one-sided STFT analysis, centred or not: maps a gradient shaped like the
+    /// spectrogram back onto the waveform, for either reported output, and, when
+    /// <paramref name="windowGradient"/> is given, accumulates the window's gradient into it.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -12772,7 +12712,8 @@ internal static partial class BackwardFunctions<T>
     /// </remarks>
     private static Tensor<T> StftAnalysisAdjoint(
         Tensor<T> gradient, Tensor<T>? magnitude, Tensor<T> phase, StftAdjointTarget target,
-        int nFft, int hopLength, Tensor<T> window, int origLength, int[] waveformShape, bool center = true)
+        int nFft, int hopLength, Tensor<T> window, int origLength, int[] waveformShape, bool center = true,
+        Tensor<T>? windowGradientSignal = null, double[]? windowGradient = null)
     {
         var gradMagnitude = gradient;
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -12809,6 +12750,11 @@ internal static partial class BackwardFunctions<T>
         using var resultDataLease = result.LeaseArray();
         var resultData = resultDataLease.Array;
         var padded = new double[paddedLength];
+        // The window gradient reads the analysed (padded) signal: dL/dw[i] = Σ_frames dL/df[i] · xPadded[start + i].
+        double[] analysed = windowGradient is null ? Array.Empty<double>() : new double[paddedLength];
+        double[] signal = windowGradient is not null && windowGradientSignal is not null
+            ? SignalAsDoubles(windowGradientSignal)
+            : Array.Empty<double>();
 
         // Hoisted out of the frame loop: one pair per (batch, frame) would churn thousands of
         // short-lived vectors on long audio. Reused across frames, and fully rewritten each
@@ -12821,6 +12767,7 @@ internal static partial class BackwardFunctions<T>
         for (int b = 0; b < batchSize; b++)
         {
             Array.Clear(padded, 0, padded.Length);
+            if (windowGradient is not null) FillAnalysedSignal(signal, b, origLength, padAmount, analysed);
             int specOffset = b * numFreqs * numFrames;
 
             for (int frame = 0; frame < numFrames; frame++)
@@ -12868,8 +12815,9 @@ internal static partial class BackwardFunctions<T>
                 int start = frame * hopLength;
                 for (int i = 0; i < nFft; i++)
                 {
-                    padded[start + i] +=
-                        numOps.ToDouble(frameGrad[i]) * numOps.ToDouble(windowData[i]);
+                    double frameGradient = numOps.ToDouble(frameGrad[i]);
+                    padded[start + i] += frameGradient * numOps.ToDouble(windowData[i]);
+                    if (windowGradient is not null) windowGradient[i] += frameGradient * analysed[start + i];
                 }
             }
 

@@ -44,12 +44,22 @@ public class StreamingQuantizedConvKernelTests
             var input = new Tensor<double>(new[] { 1, InChannels, Size, Size });
             for (int i = 0; i < input.Length; i++) input[i] = Math.Cos(i * 0.21);
 
+            // The kernel's stored (dequantized) values before either convolution: the reference is computed from
+            // this copy, and the kernel is compared with it after each call, so an engine that altered the weights
+            // cannot also move the reference.
+            var stored = new double[kernel.Length];
+            for (int i = 0; i < stored.Length; i++) stored[i] = kernel[i];
+
             var engine = new CpuEngine();
             var viaConv2D = engine.Conv2D(input, kernel, stride: 1, padding: 1);
+            for (int i = 0; i < stored.Length; i++)
+                Assert.True(stored[i] == kernel[i], $"Conv2D changed kernel[{i}]: {stored[i]:R} -> {kernel[i]:R}");
             var viaInto = new Tensor<double>(new[] { 1, OutChannels, Size, Size });
             engine.Conv2DInto(viaInto, input, kernel, stride: 1, padding: 1);
+            for (int i = 0; i < stored.Length; i++)
+                Assert.True(stored[i] == kernel[i], $"Conv2DInto changed kernel[{i}]: {stored[i]:R} -> {kernel[i]:R}");
 
-            // Reference: a direct 3x3, padding 1 convolution over the kernel's stored (dequantized) values.
+            // Reference: a direct 3x3, padding 1 convolution over the stored values.
             for (int oc = 0; oc < OutChannels; oc++)
             for (int oy = 0; oy < Size; oy++)
             for (int ox = 0; ox < Size; ox++)
@@ -62,7 +72,7 @@ public class StreamingQuantizedConvKernelTests
                     int iy = oy + ky - 1, ix = ox + kx - 1;
                     if (iy < 0 || iy >= Size || ix < 0 || ix >= Size) continue;
                     expected += input[(ic * Size + iy) * Size + ix]
-                        * kernel[((oc * InChannels + ic) * KernelSize + ky) * KernelSize + kx];
+                        * stored[((oc * InChannels + ic) * KernelSize + ky) * KernelSize + kx];
                 }
                 int o = (oc * Size + oy) * Size + ox;
                 Assert.True(Math.Abs(viaConv2D[o] - expected) <= 1e-12 * Math.Max(1, Math.Abs(expected)),

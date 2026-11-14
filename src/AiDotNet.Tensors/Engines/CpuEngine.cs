@@ -46815,17 +46815,23 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Records the tape edges of an eager STFT: one per output, so a loss over the magnitude, the phase or both
     /// reaches the waveform through the analysis adjoint (the windowed overlap-add of the unnormalised inverse DFT of
-    /// the per-bin seed, folded back through the reflection padding when <paramref name="center"/>).
+    /// the per-bin seed, folded back through the reflection padding when <paramref name="center"/>). The window is the
+    /// second input of both, so a learnable window trains as it does through torch.stft.
     /// </summary>
+    /// <remarks>
+    /// The magnitude edge saves a copy of the phase. It is recorded before the phase edge, so an in-place write to the
+    /// phase output, which rebases only edges recorded after its producer, would otherwise change the values the
+    /// magnitude backward reads without an error. The phase edge's saved magnitude is rebased by such a write.
+    /// </remarks>
     private protected static void RecordStftTapeEdges<T>(Tensor<T> input, int nFft, int hopLength, Tensor<T> window,
         bool center, Tensor<T> magnitude, Tensor<T> phase)
     {
         if (!DifferentiableOps.IsRecording<T>()) return;
         int origLength = input._shape[^1];
-        DifferentiableOps.RecordUnary("STFTMagnitude", magnitude, input, BackwardFunctions<T>.StftMagnitudeBackward,
-            new object[] { nFft, hopLength, window, phase, origLength, center });
-        DifferentiableOps.RecordUnary("STFTPhase", phase, input, BackwardFunctions<T>.StftPhaseOutputBackward,
-            new object[] { nFft, hopLength, window, magnitude, origLength, center });
+        DifferentiableOps.RecordBinary("STFTMagnitude", magnitude, input, window, BackwardFunctions<T>.StftMagnitudeBackward,
+            new object[] { nFft, hopLength, phase.Clone(), origLength, center });
+        DifferentiableOps.RecordBinary("STFTPhase", phase, input, window, BackwardFunctions<T>.StftPhaseOutputBackward,
+            new object[] { nFft, hopLength, magnitude, origLength, center });
     }
 
     /// <inheritdoc/>

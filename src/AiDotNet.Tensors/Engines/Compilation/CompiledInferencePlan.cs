@@ -1356,7 +1356,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             throw new GraphCaptureNotSupportedException(
                 nameof(Compile),
                 GraphCaptureLimitation.HostBoundary,
-                $"The forward read the value of traced operation {escaped.OpType} on the host while tracing, so " +
+                $"The forward read {escaped} on the host while tracing, so " +
                 "whatever it computed from that value ran outside the graph and would replay as a stale constant. " +
                 "Express that computation with engine operations to make the forward compilable.");
 

@@ -15510,7 +15510,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft)
+        // The device kernel computes in float. A taped call in any other precision trains on the CPU path, whose
+        // forward is exact in T, so its recorded gradient matches the function the loss actually sees.
+        if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
             return;

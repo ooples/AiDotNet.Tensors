@@ -41,6 +41,21 @@ public class HostScalarTrainingTraceTests
     }
 
     [Fact]
+    public void InferenceCompile_HostScalarOfAPlanInput_RefusesTheTrace()
+    {
+        // x is a plain input, not a lazy value: TensorVecDot still read it on the host, and the divide would replay
+        // the trace-time dot product for every later input.
+        var engine = new CpuEngine();
+        var x = Signal(16);
+        using var cache = new CompiledModelCache<double>();
+
+        var error = Assert.Throws<GraphCaptureNotSupportedException>(() => cache.GetOrCompileInference(
+            x._shape, () => engine.TensorDivideScalar(x, engine.TensorVecDot(x, x))));
+
+        Assert.Equal(GraphCaptureLimitation.HostBoundary, error.Limitation);
+    }
+
+    [Fact]
     public void InferenceTrace_HostScalarReadsTheComputedLazyOperand()
     {
         var engine = new CpuEngine();
