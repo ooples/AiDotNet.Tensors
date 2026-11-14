@@ -15580,10 +15580,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradWaveform = null;
         gradWindow = null;
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
-            // A recording deferred scope would run these unrecorded kernels at once, before the recorded work that
-            // produces their inputs, and a replay could not reproduce them: the host adjoint runs instead.
-            || backend is Gpu.RecordingGpuBackend { IsRecording: true, ExecuteWhileRecording: false }
+        bool hasBackend = TryGetBackend(out var backend);
+
+        // A pure recording deferred scope has queued, not run, the work that produces these operands. These kernels
+        // are not recorded, so launching them would run them now, ahead of their producers; the host adjoint would
+        // download the same unwritten buffers. A scope executes once, so nothing can run the producers first here:
+        // refuse rather than return a gradient computed from uninitialised memory.
+        // This holds for every element type, since the host adjoint of a double STFT reads the same buffers.
+        if (hasBackend && backend is Gpu.RecordingGpuBackend { IsRecording: true, ExecuteWhileRecording: false })
+            throw new InvalidOperationException(
+                "The STFT backward cannot run inside a deferred scope that records without executing: its operands "
+                + "are not computed until the scope executes. Compute the gradient after DeferredScope.Execute(), or "
+                + "set GpuExecutionOptions.ExecuteEagerlyWhileRecording.");
+        if (!hasBackend || typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || window.Length != nFft || nFft <= 0 || hopLength <= 0)
             return false;
 

@@ -101,6 +101,13 @@ internal static class GpuBufferCapacity
         if (pad < 0 || (pad > 0 && pad >= length))
             throw new ArgumentOutOfRangeException(nameof(pad), $"A reflection pad of {pad} needs a signal longer than it; got {length}.");
         long padded = (long)length + 2L * pad;
+        // The kernels index in 32-bit ints: the overlap bound computes q - nFft + hop with q < padded, and the window
+        // pass f*hop + i < padded. A hop past the padded length frames nothing a shorter one would not, so bounding
+        // both keeps every intermediate under int.MaxValue.
+        if (2L * padded > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(length), $"A padded signal of {padded} samples is too long for the 32-bit kernel indexing.");
+        if (hop > padded)
+            throw new ArgumentOutOfRangeException(nameof(hop), $"The hop length {hop} exceeds the padded signal length {padded}.");
         if (padded < nFft || (long)(numFrames - 1) * hop + nFft > padded)
             throw new ArgumentOutOfRangeException(nameof(numFrames),
                 $"{numFrames} frames of {nFft} samples, {hop} apart, do not fit a padded signal of {padded} samples.");
