@@ -402,6 +402,10 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     }
     __syncthreads();
     maxVal = smem[0];
+    // Every thread must read the max before any thread reuses the shared slots for the sum: without
+    // this barrier the sum pass overwrote [0] while a slower warp had yet to read it (a wrong max for
+    // that warp's columns, an intermittent ~1.5e-2 error on [129,129] rows).
+    __syncthreads();
 
     // Pass 2: exp(x - max) and sum (in FP32)
     float sumVal = 0.0f;

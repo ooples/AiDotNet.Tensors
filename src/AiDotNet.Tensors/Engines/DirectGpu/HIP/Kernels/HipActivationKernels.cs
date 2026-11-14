@@ -149,6 +149,10 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* input, 
     if (tid == 0) smem[0] = localMax;
     __syncthreads();
     float maxVal = smem[0];
+    // Every thread must read the max before any thread reuses the shared slots for the sum: without
+    // this barrier the sum pass overwrote [0] while a slower warp had yet to read it (a wrong max for
+    // that warp's columns, an intermittent ~1.5e-2 error on [129,129] rows).
+    __syncthreads();
 
     // Phase 2: Compute sum of exp(x - max)
     float localSum = 0.0f;

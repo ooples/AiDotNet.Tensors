@@ -200,6 +200,10 @@ extern ""C"" __global__ void softmax_rows(
         n = half;
     }
     maxVal = sdata[0];
+    // Every thread must read the max before any thread reuses the shared slots for the sum: without
+    // this barrier the sum pass overwrote [0] while a slower warp had yet to read it (a wrong max for
+    // that warp's columns, an intermittent ~1.5e-2 error on [129,129] rows).
+    __syncthreads();
 
     // Step 2: exp and sum
     float sumExp = 0.0f;

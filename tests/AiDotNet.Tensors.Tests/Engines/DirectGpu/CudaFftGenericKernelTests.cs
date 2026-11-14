@@ -460,6 +460,9 @@ public class CudaFftGenericKernelTests
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
+        // A device below the type's minimum capability (BFloat16 on sm_75) is a hardware skip, named as one.
+        Skip.IfNot(backend.FftElementTypeHardwareSupported(type),
+            $"CUDA {type} FFT storage requires sm_{type.MinComputeCapabilityX10() / 10}{type.MinComputeCapabilityX10() % 10}+.");
         Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");
 
         const int batch = 2;
@@ -639,6 +642,9 @@ public class CudaFftGenericKernelTests
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
+        // A device below the type's minimum capability (BFloat16 on sm_75) is a hardware skip, named as one.
+        Skip.IfNot(backend.FftElementTypeHardwareSupported(type),
+            $"CUDA {type} FFT storage requires sm_{type.MinComputeCapabilityX10() / 10}{type.MinComputeCapabilityX10() % 10}+.");
         Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");
 
         const int batch = 65_536; // MaxGridDimY (65,535) + 1: blockIdx.y == 0 must stride onto b == 65,535
