@@ -29121,7 +29121,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             return empty;
                         }
 
-                        var outBuf = AllocateOutputBuffer(backend, total);
+                        // Every element is written below (the inputs tile the concatenated axis), so the buffer needs no
+                        // zero fill: on a b16 DenseNet-121 predict the fill was a memset over every concatenation, ~200 MB.
+                        var outBuf = AllocateFullyWrittenOutputBuffer(backend, total);
                         bool handedOff = false;
                         try
                         {
