@@ -14842,7 +14842,18 @@ KERNEL VARIANTS (A/B testing):
                 DeviceMemoryReclaim.OnDeviceFinalized((long)Size * sizeof(float), ReclaimEpoch);
                 var pooledBuffer = Buffer;
                 var memory = _memory.TransferToLease();
-                PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool, memory)));
+                PendingFrees.Enqueue(() =>
+                {
+                    var lease = Pooled(pooledBuffer, returnToPool, memory);
+                    try
+                    {
+                        returnToPool(lease);
+                    }
+                    catch (Exception)
+                    {
+                        lease.ReleaseCore();
+                    }
+                });
                 return;
             }
             if (Interlocked.Exchange(ref _poolState, 2) == 2) return;
@@ -14914,7 +14925,15 @@ KERNEL VARIANTS (A/B testing):
             // and CudaGpuBuffer.DetachForPool) so any stale holder of this wrapper stays permanently released even
             // after TryRent reuses the underlying OpenCL buffer.
             DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float), ReclaimEpoch);
-            returnToPool(Pooled(Buffer, returnToPool, _memory.TransferToLease()));
+            var lease = Pooled(Buffer, returnToPool, _memory.TransferToLease());
+            try
+            {
+                returnToPool(lease);
+            }
+            catch (Exception)
+            {
+                lease.ReleaseCore();
+            }
         }
     }
 

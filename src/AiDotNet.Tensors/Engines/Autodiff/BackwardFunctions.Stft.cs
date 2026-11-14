@@ -192,11 +192,23 @@ internal static partial class BackwardFunctions<T>
                 var squared = eng.TensorAdd(eng.TensorAdd(eng.TensorMultiply(u, u), eng.TensorMultiply(v, v)), fill);
                 var scaledG = eng.TensorMultiply(g, scale);
                 DifferentiableOps.AccumulateGrad(grads, r,
-                    eng.TensorMultiply(scaledG, eng.TensorMultiply(v, eng.TensorDivide(negativeMask, squared))), eng);
+                    eng.TensorMultiply(scaledG, eng.TensorDivide(eng.TensorMultiply(v, negativeMask), squared)), eng);
                 DifferentiableOps.AccumulateGrad(grads, i,
-                    eng.TensorMultiply(scaledG, eng.TensorMultiply(u, eng.TensorDivide(mask, squared))), eng);
+                    eng.TensorMultiply(scaledG, eng.TensorDivide(eng.TensorMultiply(u, mask), squared)), eng);
             });
         return phase;
+    }
+
+    private static readonly int MaxPolarScaleExponent = GetMaxPolarScaleExponent();
+
+    private static int GetMaxPolarScaleExponent()
+    {
+        var t = typeof(T);
+        if (t == typeof(double)) return 1022;
+        if (t == typeof(float) || t == typeof(NumericOperations.BFloat16)) return 126;
+        if (t == typeof(Half) || t == typeof(NumericOperations.Float8E5M2)) return 14;
+        if (t == typeof(decimal)) return 28;
+        return 6;
     }
 
     private sealed class PolarValues
@@ -230,6 +242,7 @@ internal static partial class BackwardFunctions<T>
         var r = re.GetFlattenedData();
         var i = im.GetFlattenedData();
         var values = new PolarValues(r.Length, (int[])re._shape.Clone());
+        int maxShift = MaxPolarScaleExponent;
         for (int k = 0; k < r.Length; k++)
         {
             double x = ops.ToDouble(r[k]), y = ops.ToDouble(i[k]);
@@ -247,19 +260,26 @@ internal static partial class BackwardFunctions<T>
             }
             double p = Math.Atan2(y, x);
             bool live = m > floor;
-            double s = 1.0;
+            T scaleVal = ops.One;
             if (live && maxAbs > 0.0 && !double.IsInfinity(maxAbs) && !double.IsNaN(maxAbs))
             {
                 int exp = (int)Math.Floor(Math.Log(maxAbs) / 0.6931471805599453);
-                int shift = exp < -126 ? 126 : exp > 126 ? -126 : -exp;
-                s = Math.Pow(2.0, shift);
+                int shift = exp < -maxShift ? maxShift : exp > maxShift ? -maxShift : -exp;
+                double s = Math.Pow(2.0, shift);
+                T candidate = ops.FromDouble(s);
+                double roundTrip = ops.ToDouble(candidate);
+                if (roundTrip > 0.0 && !double.IsInfinity(roundTrip) && !double.IsNaN(roundTrip)
+                    && Math.Abs(roundTrip - s) <= 1e-6 * s)
+                {
+                    scaleVal = candidate;
+                }
             }
             values.Magnitude[k] = ops.FromDouble(m);
             values.Phase[k] = ops.FromDouble(p);
             values.Mask[k] = ops.FromDouble(live ? 1.0 : 0.0);
             values.NegativeMask[k] = ops.FromDouble(live ? -1.0 : 0.0);
             values.Fill[k] = ops.FromDouble(live ? 0.0 : 1.0);
-            values.Scale[k] = ops.FromDouble(s);
+            values.Scale[k] = scaleVal;
             values.EmptyCos[k] = ops.FromDouble(live ? 0.0 : Math.Cos(p));
             values.EmptySin[k] = ops.FromDouble(live ? 0.0 : Math.Sin(p));
         }

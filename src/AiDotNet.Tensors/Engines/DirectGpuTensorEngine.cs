@@ -15951,9 +15951,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int batch = length == 0 ? 0 : waveform.Length / length;
         int pad = center ? nFft / 2 : 0;
         long padded = (long)length + 2L * pad;
-        if (batch <= 0 || numFrames <= 0 || (center ? length <= pad : length < nFft)
+        long batchFrames = (long)batch * numFrames;
+        if (batch <= 0 || numFrames <= 0 || batchFrames > int.MaxValue
+            || (center ? length <= pad : length < nFft)
             || 2L * padded > int.MaxValue || hopLength > padded
-            || gradient.Length != batch * numFreqs * numFrames
+            || padded < nFft || (long)(numFrames - 1) * hopLength + nFft > padded
+            || batchFrames * numFreqs != gradient.Length
+            || batchFrames * nFft > int.MaxValue
             || magnitude.Length != gradient.Length || phase.Length != gradient.Length)
             return false;
 
@@ -15969,7 +15973,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             phaseBuffer = GetOrAllocateBuffer(backend, phase);
             waveformBuffer = GetOrAllocateBuffer(backend, waveform);
             windowBuffer = GetOrAllocateBuffer(backend, window);
-            frameGradBuffer = AllocateFullyWrittenOutputBuffer(backend, batch * numFrames * nFft);
+            frameGradBuffer = AllocateFullyWrittenOutputBuffer(backend, (int)(batchFrames * nFft));
             signalGradBuffer = AllocateFullyWrittenOutputBuffer(backend, waveform.Length);
             windowGradBuffer = AllocateFullyWrittenOutputBuffer(backend, nFft);
             backend.StftBackwardFrames(gradBuffer.Buffer, magnitudeBuffer.Buffer, phaseBuffer.Buffer, frameGradBuffer.Buffer,

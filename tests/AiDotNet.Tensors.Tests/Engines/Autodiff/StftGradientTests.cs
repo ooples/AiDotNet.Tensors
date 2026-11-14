@@ -782,7 +782,79 @@ public class StftGradientTests
         }
     }
 
+    [Fact]
+    public void TinyHalfSignal_CreateGraph_ProducesFiniteMagnitudeAndPhaseGradients()
+    {
+        // Half.MaxValue is 65504 (< 2^16). An input around 2e-5 (< 2^-15) previously chose shift >= 16 in
+        // PolarOfCartesian, overflowing scale to Half.PositiveInfinity and poisoning createGraph gradients with NaN.
+        const int n = 4;
+        var engine = new CpuEngine();
+        var window = new Tensor<Half>(new[] { n });
+        for (int i = 0; i < n; i++) window[i] = (Half)1f;
+
+        var xMag = new Tensor<Half>(new[] { 1, n });
+        xMag[0] = (Half)2e-5f;
+        foreach (bool createGraph in new[] { false, true })
+        {
+            Dictionary<Tensor<Half>, Tensor<Half>> magGrads;
+            using (var tape = new GradientTape<Half>())
+            {
+                engine.STFT(xMag, n, n, window, false, out var mag, out _);
+                magGrads = tape.ComputeGradients(engine.ReduceSum(mag, null), new[] { xMag }, createGraph: createGraph);
+            }
+
+            Assert.True(magGrads.TryGetValue(xMag, out var gx), $"createGraph={createGraph}: missing Half magnitude gradient");
+            float[] expected = { 3f, 0f, 1f, 0f };
+            for (int i = 0; i < n; i++)
+            {
+                float actual = (float)gx[i];
+                Assert.False(float.IsNaN(actual) || float.IsInfinity(actual), $"createGraph={createGraph}: gx[{i}]={actual}");
+                Assert.True(Math.Abs(actual - expected[i]) <= 5e-2f, $"createGraph={createGraph}: gx[{i}]={actual}, expected {expected[i]}");
+            }
+        }
+
+        // Phase backward with a subnormal Half amplitude on both seeded and unseeded bins must also stay finite.
+        var xPhase = new Tensor<Half>(new[] { 1, n });
+        xPhase[1] = (Half)2e-5f;
+        xPhase[2] = (Half)1.2e-7f;
+        using (var tape = new GradientTape<Half>())
+        {
+            engine.STFT(xPhase, n, n, window, false, out _, out var phase);
+            var seed = new Tensor<Half>((int[])phase._shape.Clone());
+            seed[1] = (Half)1e-3f;
+            var phaseGrads = tape.ComputeGradients(
+                engine.ReduceSum(engine.TensorMultiply(phase, seed), null),
+                new[] { xPhase },
+                createGraph: true);
+            Assert.True(phaseGrads.TryGetValue(xPhase, out var gxp));
+            for (int i = 0; i < n; i++)
+            {
+                float val = (float)gxp[i];
+                Assert.False(float.IsNaN(val) || float.IsInfinity(val), $"Half phase grad[{i}]={val}");
+            }
+            Assert.True((float)gxp[0] > 45f && (float)gxp[0] < 53f, $"Expected Half phase grad[0] ~ 50, got {(float)gxp[0]}");
+        }
+    }
+
 #if NETCOREAPP
+    [Fact]
+    public void TryStftBackward_RejectsFramingBeyondPaddedSignalLength()
+    {
+        var physical = AiDotNet.Tensors.Tests.Engines.DirectGpu.MockDirectGpuBackend.Create(
+            new AiDotNet.Tensors.Tests.Engines.DirectGpu.MockBackendState());
+        using var direct = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(physical);
+        using var gpu = new DirectGpuTensorEngine(direct);
+
+        var x = new Tensor<float>(new[] { 1, 16 });
+        var w = new Tensor<float>(new[] { 8 });
+        // Valid numFrames for length=16, nFft=8, hop=4, center=false is 3; 5 frames exceed padded length 16.
+        var mismatchedGrad = new Tensor<float>(new[] { 1, 5, 5 });
+        bool ok = gpu.TryStftBackward(mismatchedGrad, mismatchedGrad, mismatchedGrad, phaseTarget: false, x, w,
+            nFft: 8, hopLength: 4, center: false, out var gw, out var gwin);
+        Assert.False(ok);
+        Assert.Null(gw);
+        Assert.Null(gwin);
+    }
     [Fact]
     public void PureRecordingDeferredScope_RefusesStftBackward_ForFloatAndDouble()
     {

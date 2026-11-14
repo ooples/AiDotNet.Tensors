@@ -1,3 +1,4 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;
