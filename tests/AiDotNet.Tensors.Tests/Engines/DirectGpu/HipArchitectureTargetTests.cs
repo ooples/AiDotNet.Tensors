@@ -15,6 +15,7 @@ public sealed class HipArchitectureTargetTests
     [InlineData("gfx1102:sramecc+:xnack-", "gfx1102", AmdGpuArchitecture.RDNA3)]
     [InlineData("gfx90a", "gfx90a", AmdGpuArchitecture.MI200)]
     [InlineData("gfx942", "gfx942", AmdGpuArchitecture.MI300)]
+    [InlineData("gfx950", "gfx950", AmdGpuArchitecture.MI350)]
     [InlineData("gfx1201", "gfx1201", AmdGpuArchitecture.GCN)]
     public void TryParseArchitectureTarget_PreservesExactDeviceTarget(
         string reported,
