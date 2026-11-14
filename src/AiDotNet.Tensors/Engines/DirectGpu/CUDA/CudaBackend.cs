@@ -10873,44 +10873,40 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
-
-        if (!_kernelCache.TryGetValue("copy_2d_strided", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: copy_2d_strided");
-
         if (numRows <= 0 || srcCols <= 0) return;   // an empty grid is an invalid launch, and there is nothing to copy
         using var _ = PushContext();
+        CopyRows(source.Handle, (IntPtr)((long)destination.Handle + (long)destColOffset * sizeof(float)),
+            numRows, srcCols, srcCols, destTotalCols);
+    }
 
-        // Launch configuration: srcCols x numRows grid. gridY is capped at 65535 by the hardware (a taller copy was
-        // an invalid-value launch, e.g. TensorCartesianProd's column concat), so rows go in chunks of at most that,
-        // each chunk addressed by offsetting both base pointers to its first row.
+    /// <summary>
+    /// Copies <paramref name="rows"/> rows of <paramref name="cols"/> floats, <paramref name="srcStride"/> apart in the
+    /// source and <paramref name="dstStride"/> apart in the destination (base pointers at the first element), one launch
+    /// per 65535 rows: float4 moves when the columns, strides and both bases are 16-byte aligned, scalar otherwise.
+    /// The caller holds the context.
+    /// </summary>
+    private unsafe void CopyRows(IntPtr src, IntPtr dst, int rows, int cols, int srcStride, int dstStride)
+    {
+        bool vec = (cols & 3) == 0 && (srcStride & 3) == 0 && (dstStride & 3) == 0
+            && ((long)src & 15) == 0 && ((long)dst & 15) == 0;
+        string name = vec ? "copy_rows4" : "copy_rows";
+        if (!_kernelCache.TryGetValue(name, out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: " + name);
+        int unit = vec ? 4 : 1;
+        int c = cols / unit, ss = srcStride / unit, ds = dstStride / unit;
+        // Enough blocks to cover a row, capped so a very long row grid-strides instead of launching millions of blocks.
+        uint gridX = (uint)Math.Min((c + DefaultBlockSize - 1) / DefaultBlockSize, 1024);
         const int MaxGridY = 65535;
-        uint gridX = (uint)((srcCols + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr srcBase = source.Handle;
-        IntPtr dstBase = destination.Handle;
-
         void** args = stackalloc void*[6];
-        for (int rowStart = 0; rowStart < numRows; rowStart += MaxGridY)
+        for (int rowStart = 0; rowStart < rows; rowStart += MaxGridY)
         {
-            int rows = Math.Min(MaxGridY, numRows - rowStart);
-            IntPtr srcPtr = (IntPtr)((long)srcBase + (long)rowStart * srcCols * sizeof(float));
-            IntPtr dstPtr = (IntPtr)((long)dstBase + (long)rowStart * destTotalCols * sizeof(float));
-            args[0] = &srcPtr;
-            args[1] = &dstPtr;
-            args[2] = &rows;
-            args[3] = &srcCols;
-            args[4] = &destTotalCols;
-            args[5] = &destColOffset;
-
+            int n = Math.Min(MaxGridY, rows - rowStart);
+            IntPtr s = (IntPtr)((long)src + (long)rowStart * srcStride * sizeof(float));
+            IntPtr d = (IntPtr)((long)dst + (long)rowStart * dstStride * sizeof(float));
+            args[0] = &s; args[1] = &d; args[2] = &n; args[3] = &c; args[4] = &ss; args[5] = &ds;
             CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuLaunchKernel(
-                    kernel,
-                    gridX, (uint)rows, 1,
-                    (uint)DefaultBlockSize, 1, 1,
-                    0,
-                    _stream,
-                    (IntPtr)args,
-                    IntPtr.Zero),
-                "cuLaunchKernel (copy_2d_strided)");
+                CudaNativeBindings.cuLaunchKernel(kernel, gridX, (uint)n, 1, (uint)DefaultBlockSize, 1, 1, 0, _stream, (IntPtr)args, IntPtr.Zero),
+                "cuLaunchKernel (" + name + ")");
             GpuLaunchProbe.OnLaunch();
         }
     }

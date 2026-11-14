@@ -55,11 +55,53 @@ public sealed partial class CudaBackend : IRectSliceKernels
             throw new ArgumentException($"RectSlice: the slice buffer holds {slice.Size} elements, the slice needs {total}.", nameof(slice));
 
         using var _ = PushContext();
+        // A slice whose axes collapse to rows of contiguous runs (a channel slice of NCHW: N rows of size*H*W, C*H*W
+        // apart) is a strided row copy: no per-element index decomposition, float4 moves where aligned.
+        if (TryCollapseToRows(fullShape, start, length, out long baseOffset, out int rows, out int cols, out int rowStride))
+        {
+            IntPtr fullAt = (IntPtr)((long)full.Handle + baseOffset * sizeof(float));
+            if (scatter) CopyRows(slice.Handle, fullAt, rows, cols, cols, rowStride);
+            else CopyRows(fullAt, slice.Handle, rows, cols, rowStride, cols);
+            return;
+        }
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr f = full.Handle, s = slice.Handle;
         int mode = scatter ? 1 : 0;
         void** args = stackalloc void*[4];
         args[0] = &f; args[1] = &s; args[2] = &meta; args[3] = &mode;
         LaunchKernel(kernel, gridDim, DefaultBlockSize, args);
+    }
+
+    // The slice as `rows` runs of `cols` contiguous elements, `rowStride` apart in the full tensor from `baseOffset`:
+    // unit-length axes drop out, and an axis merges into the next inner run when that run covers its own axis whole.
+    private static bool TryCollapseToRows(int[] fullShape, int[] start, int[] length,
+        out long baseOffset, out int rows, out int cols, out int rowStride)
+    {
+        baseOffset = 0; rows = 1; cols = 1; rowStride = 0;
+        int rank = fullShape.Length;
+        Span<long> lens = stackalloc long[rank];
+        Span<long> strides = stackalloc long[rank];
+        int count = 0;
+        long stride = 1;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            baseOffset += start[d] * stride;
+            if (length[d] != 1)
+            {
+                if (count > 0 && strides[count - 1] * lens[count - 1] == stride)
+                    lens[count - 1] *= length[d];
+                else { lens[count] = length[d]; strides[count] = stride; count++; }
+            }
+            stride *= fullShape[d];
+        }
+        if (count == 0) return true;
+        if (strides[0] != 1 || count > 2 || lens[0] > int.MaxValue) return false;
+        cols = (int)lens[0];
+        if (count == 2)
+        {
+            if (lens[1] > int.MaxValue || strides[1] > int.MaxValue) return false;
+            rows = (int)lens[1]; rowStride = (int)strides[1];
+        }
+        return true;
     }
 }
