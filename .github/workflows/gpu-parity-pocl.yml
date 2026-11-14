@@ -85,8 +85,10 @@ jobs:
           - { name: resident-program, coverage: true, filter: "FullyQualifiedName~OpenClResidentProgramTests" }
           # The engine lifecycle on a real non-CUDA device: releasing the adopted engine (live results and trained weights
           # downloaded first, cached device memory freed), ResetToCpu, empty slices and concat backward, and deferred-output
-          # disposal. The coverage job has no GPU, so this shard's upload is what measures that code.
-          - { name: engine-lifecycle, coverage: true, filter: "FullyQualifiedName~GpuEngineReleaseTests|FullyQualifiedName~ResetToCpuGpuEngineTests|FullyQualifiedName~EmptySliceGpuTests|FullyQualifiedName~DeferredOutputFailureDisposalTests|FullyQualifiedName~EvictActivationsCreatedAfterLifetimeTests" }
+          # disposal; and the tape's device-memory release (intermediates freed at their last backward use on an opted-in
+          # tape, the auto-retain probe, non-leaf gradients freed at disposal). The coverage job has no GPU, so this
+          # shard's upload is what measures that code.
+          - { name: engine-lifecycle, coverage: true, filter: "FullyQualifiedName~GpuEngineReleaseTests|FullyQualifiedName~ResetToCpuGpuEngineTests|FullyQualifiedName~EmptySliceGpuTests|FullyQualifiedName~DeferredOutputFailureDisposalTests|FullyQualifiedName~EvictActivationsCreatedAfterLifetimeTests|FullyQualifiedName~LastUseReleaseGpuTests|FullyQualifiedName~GpuTapeIntermediateReleaseTests" }
           # Model scale (#1569): ResNet-18 inference at batch 1 and 128 against the CPU (a batch-derived launch dimension
           # past a device limit only appears at model scale), warm training steps of five networks with no host crossing,
           # and the fused GRU, folded conv batch norm and TensorScope on a real OpenCL device.
