@@ -79,6 +79,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
+        if (GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
         IsRealized = true; // Set BEFORE executing to prevent re-entrant recursion
 
         // Issue #238: the Execute delegate re-invokes the engine op (e.g.,

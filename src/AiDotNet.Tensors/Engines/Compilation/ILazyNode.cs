@@ -10,6 +10,9 @@ internal interface ILazyNode
     /// <summary>The operation type for pattern matching during fusion.</summary>
     LazyNodeType OpType { get; }
 
+    /// <summary>The operation's name as recorded (used in diagnostics and objective signatures).</summary>
+    string OpName { get; }
+
     /// <summary>Output tensor shape (computed eagerly during recording).</summary>
     int[] OutputShape { get; }
 

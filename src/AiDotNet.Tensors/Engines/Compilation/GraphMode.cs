@@ -207,6 +207,28 @@ internal static class GraphMode
     }
 
     /// <summary>
+    /// Enables a storage-free probe trace. It records the same training-shaped graph as
+    /// <see cref="EnableTraining{T}"/> (so its nodes can be compared with a compiled plan's), but each recorded
+    /// output is a shape-only tensor and no node executes. Any attempt to compute a probe value — a host read such
+    /// as <c>ToArray()</c>, or an op that needs its input's data while tracing — throws
+    /// <see cref="ObjectiveProbeAbortedException"/>. Parameters are not touched (no copy-on-write privatization),
+    /// because a probe never writes anything. Dispose the scope to discard the trace.
+    /// </summary>
+    internal static LazyTensorScope EnableProbe()
+    {
+        var scope = new LazyTensorScope(_current, GraphTraceKind.Training, isProbe: true);
+        _current = scope;
+        return scope;
+    }
+
+    /// <summary>Whether the active scope on this thread is a probe trace (<see cref="EnableProbe"/>).</summary>
+    internal static bool IsProbe
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _current?.IsProbe == true;
+    }
+
+    /// <summary>
     /// Temporarily disables graph recording while a compiled plan replays.
     /// Generic plan delegates call ordinary engine operations; without this
     /// boundary they can accidentally append to an ambient trace instead of
