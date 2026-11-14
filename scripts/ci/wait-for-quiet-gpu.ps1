@@ -19,7 +19,10 @@ param(
 function Read-Gpu {
     $samples = 1..3 | ForEach-Object {
         if ($_ -gt 1) { Start-Sleep -Seconds 5 }
-        $line = & nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits
+        # NVSMI_GPU (set by the workflow's GPU step from the runner's CUDA_VISIBLE_DEVICES pin) selects this runner's
+        # card on a multi-GPU machine; otherwise the first line is the only card.
+        $select = if ($env:NVSMI_GPU) { @('-i', $env:NVSMI_GPU) } else { @() }
+        $line = & nvidia-smi @select --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits
         if ($LASTEXITCODE -ne 0 -or -not $line) { throw "nvidia-smi failed ($LASTEXITCODE)." }
         $parts = ($line | Select-Object -First 1).Split(',') | ForEach-Object { [double]$_.Trim() }
         [pscustomobject]@{ MemoryGb = $parts[0] / 1024; Utilization = $parts[1] }

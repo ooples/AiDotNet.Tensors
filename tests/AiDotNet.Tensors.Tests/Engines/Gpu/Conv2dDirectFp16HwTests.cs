@@ -36,7 +36,8 @@ public class Conv2dDirectFp16HwTests : IClassFixture<DirectGpuTensorEngineTestFi
         _ = eng!.TensorMatMul(warm, warm);
         var b = eng!.TestBackend as CudaBackend;
         Skip.IfNot(b is not null && b.IsAvailable, "CudaBackend not available");
-        Skip.IfNot(b!.Fp16DirectConvAvailable, "conv2d_direct_fp16hw not compiled (needs the CUDA toolkit / cuda_fp16.h)");
+        Skip.IfNot(b!.Fp16DirectConvAvailable, "conv2d_direct_fp16hw not compiled (needs the CUDA toolkit / cuda_fp16.h): "
+            + (CudaBackend.Fp16ModuleCompileError ?? "no compile error recorded"));
 
         // A tiny-spatial deep conv: N = b*outH*outW = 64 (the documented tiny boundary), K = inC*kh*kw = 576,
         // M = outC = 32 — exactly the shape the im2col+GEMM path skips and the direct kernel is wired for.

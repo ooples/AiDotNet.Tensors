@@ -36,7 +36,11 @@ public class MixedPrecisionCompiledScaleGpuTests
     {
         try
         {
-            var psi = new ProcessStartInfo("nvidia-smi", "--query-gpu=memory.used --format=csv,noheader,nounits")
+            // nvidia-smi ignores CUDA_VISIBLE_DEVICES: on a multi-GPU machine a CI runner pinned to one card by its UUID
+            // would otherwise report the first card's memory.
+            string pin = (Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES") ?? "").Trim();
+            string select = pin.StartsWith("GPU-", StringComparison.Ordinal) && pin.IndexOf(',') < 0 ? $"-i {pin} " : "";
+            var psi = new ProcessStartInfo("nvidia-smi", select + "--query-gpu=memory.used --format=csv,noheader,nounits")
             { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
             using var p = Process.Start(psi);
             if (p is null) return null;

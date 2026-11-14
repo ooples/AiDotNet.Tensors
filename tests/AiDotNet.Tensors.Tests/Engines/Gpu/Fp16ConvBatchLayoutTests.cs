@@ -169,7 +169,8 @@ public class Fp16ConvBatchLayoutTests : IClassFixture<DirectGpuTensorEngineTestF
         _ = eng!.TensorMatMul(warm, warm);
         var backend = eng!.TestBackend as CudaBackend;
         Skip.IfNot(backend is not null && backend.IsAvailable && backend.SupportsHgemm && backend.Fp16Im2colAvailable,
-            "Needs the CUDA FP16 im2col conv path.");
+            "Needs the CUDA FP16 im2col conv path; fp16 module: "
+            + (CudaBackend.Fp16ModuleCompileError ?? "no compile error recorded"));
 
         const int inC = 64, h = 28, w = 28, outC = 64;   // GEMM N = batch * 784 > the tiny-N cutoff, K = 576
         var rng = new Random(1549 + batch);

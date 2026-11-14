@@ -134,8 +134,8 @@ internal static class PtxMmaRateProbe
         return ptx.ToString();
     }
 
-    /// <summary>Runs both loops in ABBA order (each run: a warm-up, then the best of three timed launches) on the runtime's
-    /// stream.</summary>
+    /// <summary>Runs both loops on the runtime's stream: a warm-up of each, then <see cref="MeasureRounds"/> rounds that
+    /// time each form once in alternating order, keeping each form's best.</summary>
     internal static unsafe Result Measure(DirectPtxRuntime runtime, int iterations = 4096)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
@@ -148,30 +148,42 @@ internal static class PtxMmaRateProbe
         double warps = blocks * (ThreadsPerBlock / 32.0);
         double flops = warps * iterations * Chains * (16.0 * 8 * 16 * 2);
 
-        double Tflops(string entry)
+        IntPtr fp32Function = module.GetFunction(Fp32AccumulateEntry);
+        IntPtr fp16Function = module.GetFunction(Fp16AccumulateEntry);
+        ulong pointer = (ulong)output.Pointer;
+        uint count = (uint)iterations;
+        void** arguments = stackalloc void*[2];
+        arguments[0] = &pointer;
+        arguments[1] = &count;
+
+        double Seconds(IntPtr function)
         {
-            IntPtr function = module.GetFunction(entry);
-            ulong pointer = (ulong)output.Pointer;
-            uint count = (uint)iterations;
-            void** arguments = stackalloc void*[2];
-            arguments[0] = &pointer;
-            arguments[1] = &count;
+            var watch = Stopwatch.StartNew();
             module.Launch(function, blocks, 1, 1, ThreadsPerBlock, 1, 1, 0, arguments);
             runtime.Synchronize();
-            double best = double.MaxValue;
-            for (int round = 0; round < 3; round++)
-            {
-                var watch = Stopwatch.StartNew();
-                module.Launch(function, blocks, 1, 1, ThreadsPerBlock, 1, 1, 0, arguments);
-                runtime.Synchronize();
-                best = Math.Min(best, watch.Elapsed.TotalSeconds);
-            }
-            return flops / best / 1e12;
+            return watch.Elapsed.TotalSeconds;
         }
 
-        // ABBA, each form's best: clock ramp or thermal drift hits both forms alike instead of biasing the ratio.
-        double fp32First = Tflops(Fp32AccumulateEntry), fp16First = Tflops(Fp16AccumulateEntry);
-        double fp16Second = Tflops(Fp16AccumulateEntry), fp32Second = Tflops(Fp32AccumulateEntry);
-        return new Result(Math.Max(fp32First, fp32Second), Math.Max(fp16First, fp16Second));
+        // A warm-up of each, then single timed launches of the two forms alternated round by round (AB, BA, AB, ...),
+        // keeping each form's best. Alternating launch by launch, rather than timing one form's launches back to back,
+        // means neither clock ramp nor a burst of other work on the device (another stream or process sharing the SMs)
+        // can cover every sample of one form and none of the other: the old ABBA order timed both FP16 runs
+        // contiguously, and work overlapping that window read FP16 accumulation at 26 against 140 TFLOP/s on an RTX
+        // 3090, classing it full-rate.
+        Seconds(fp32Function);
+        Seconds(fp16Function);
+        double bestFp32 = double.MaxValue, bestFp16 = double.MaxValue;
+        for (int round = 0; round < MeasureRounds; round++)
+        {
+            bool fp32First = (round & 1) == 0;
+            double first = Seconds(fp32First ? fp32Function : fp16Function);
+            double second = Seconds(fp32First ? fp16Function : fp32Function);
+            bestFp32 = Math.Min(bestFp32, fp32First ? first : second);
+            bestFp16 = Math.Min(bestFp16, fp32First ? second : first);
+        }
+        return new Result(flops / bestFp32 / 1e12, flops / bestFp16 / 1e12);
     }
+
+    // Timed launches per form; each round times both forms once, in alternating order.
+    private const int MeasureRounds = 8;
 }

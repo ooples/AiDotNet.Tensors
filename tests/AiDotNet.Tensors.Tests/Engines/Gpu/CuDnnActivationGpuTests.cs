@@ -20,8 +20,7 @@ public class CuDnnActivationGpuTests
         CuDnnContext? ctx = null;
         try { ctx = new CuDnnContext(); }
         catch (InvalidOperationException ex) when (
-            ex.Message.Contains("NotSupported", StringComparison.Ordinal) ||
-            ex.Message.Contains("ArchMismatch", StringComparison.Ordinal) ||
+            CuDnnUnsupported.Is(ex) ||
             ex.Message.Contains("not available", StringComparison.OrdinalIgnoreCase))
         {
             // Skip on machines without cuDNN or with an unsupported
@@ -55,8 +54,7 @@ public class CuDnnActivationGpuTests
         CuDnnContext? ctx = null;
         try { ctx = new CuDnnContext(); }
         catch (InvalidOperationException ex) when (
-            ex.Message.Contains("NotSupported", StringComparison.Ordinal) ||
-            ex.Message.Contains("ArchMismatch", StringComparison.Ordinal) ||
+            CuDnnUnsupported.Is(ex) ||
             ex.Message.Contains("not available", StringComparison.OrdinalIgnoreCase))
         {
             // Skip on machines without cuDNN or with an unsupported
@@ -82,9 +80,7 @@ public class CuDnnActivationGpuTests
                     coef: 0.0,
                     dataType: CuDnnNative.CudnnDataType.Half));
 
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
             Assert.Null(ex);
         }
@@ -97,8 +93,7 @@ public class CuDnnActivationGpuTests
         CuDnnContext? ctx = null;
         try { ctx = new CuDnnContext(); }
         catch (InvalidOperationException ex) when (
-            ex.Message.Contains("NotSupported", StringComparison.Ordinal) ||
-            ex.Message.Contains("ArchMismatch", StringComparison.Ordinal) ||
+            CuDnnUnsupported.Is(ex) ||
             ex.Message.Contains("not available", StringComparison.OrdinalIgnoreCase))
         {
             // Skip on machines without cuDNN or with an unsupported
