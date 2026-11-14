@@ -180,6 +180,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                             a => new[] { (a.Output, a.OutputCount) },
                             a => a.Output.Handle == a.Input.Handle || a.Output.Handle == a.Kernel.Handle),
                         () => GpuDeterminism.IsActive, candidates.ToArray());
+                    _conv2DForwardSlot.UntunedPreference = static shape => ConvUntuned.Forward(shape);
                 }
                 return Created(_conv2DForwardSlot);
             }
