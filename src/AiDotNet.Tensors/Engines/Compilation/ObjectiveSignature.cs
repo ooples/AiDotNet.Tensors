@@ -318,7 +318,11 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             if (d is null) { Tokens.Add("no-delegate"); return null; }
             if (d.GetInvocationList().Length != 1)
                 return $"op '{opName}' {where} is a multicast delegate";
-            Tokens.Add(new MethodToken(d.Method));
+            var method = d.Method;
+            // A dynamic method (an expression-tree or emitted delegate) has no stable handle to compare.
+            if (method is System.Reflection.Emit.DynamicMethod || method.GetType().Name.IndexOf("Dynamic", StringComparison.Ordinal) >= 0)
+                return $"op '{opName}' {where} is a dynamically emitted method, which cannot be compared";
+            Tokens.Add(new MethodToken(method));
             return AddTarget(d.Target, opName, where, depth);
         }
 
