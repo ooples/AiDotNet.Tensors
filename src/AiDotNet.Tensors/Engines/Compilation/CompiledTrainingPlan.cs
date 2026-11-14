@@ -10357,12 +10357,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // gradient nobody produced.
                 actionWrites.Clear();
                 foreach (int s in covered[a])
+                {
+                    // An input gradient that IS the step's output gradient (an alias: a reshape's, an add's) is not
+                    // written by this step, only passed through, so it is a use, not a write. Counting it as a write hid
+                    // a gradient nothing writes (a dead branch's) from the read-before-write check: it was pooled, and
+                    // from the second step on its backward read the previous tenant's values into live gradients.
+                    int passthrough = GradIndex(forwardSteps[s].OutputBuffer);
                     foreach (int w in forwardSteps[s].Inputs.Select(GradIndex).Where(i => i != None))
                     {
+                        lastUse[w] = Math.Max(lastUse[w], a);
+                        if (w == passthrough) continue;
                         actionWrites.Add(w);
                         if (firstWrite[w] == None) firstWrite[w] = a;
-                        lastUse[w] = Math.Max(lastUse[w], a);
                     }
+                }
                 foreach (int r in covered[a].Select(s => GradIndex(forwardSteps[s].OutputBuffer)).Where(i => i != None))
                 {
                     if (firstWrite[r] == None && !actionWrites.Contains(r)) readBeforeWrite[r] = true;

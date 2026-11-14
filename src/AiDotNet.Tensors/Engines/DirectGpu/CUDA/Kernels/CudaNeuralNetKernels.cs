@@ -1004,29 +1004,44 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     output[outer] = __uint_as_float(best);
 }
 
-// max_axis for long rows: one block per row, coalesced strided reads and a shared-memory reduction. Same result as
-// max_axis: the row's first element if it is NaN, else the maximum of its non-NaN elements.
+// max_axis for long rows: one block per row, coalesced strided reads and a shared-memory reduction, with exactly
+// max_axis's result (the CPU ReduceMax scan): NaN is skipped, an all-NaN row gives -inf, and of equal maxima the first
+// is kept (-0 before +0). Each thread scans its strided elements in order with the strictly-greater bit compare and
+// keeps the index of its pick; the reduction takes the other side's pick when it is strictly greater, or equal with a
+// lower index, so the block agrees with one in-order scan.
 extern ""C"" __global__ __launch_bounds__(256) void max_axis_rows(
     const float* __restrict__ input, float* __restrict__ output, int outerSize, int axisSize)
 {
-    __shared__ float partial[256];
+    __shared__ unsigned int bestBits[256];
+    __shared__ int bestIndex[256];
     int outer = blockIdx.x;
     if (outer >= outerSize) return;
-    const float* row = input + (long long)outer * axisSize;
-    float m = -INFINITY;
-    for (int i = threadIdx.x; i < axisSize; i += blockDim.x) m = fmaxf(m, row[i]);
-    partial[threadIdx.x] = m;
+    const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
+    unsigned int best = 0xFF800000u;
+    int bestAt = 0x7FFFFFFF;
+    for (int i = threadIdx.x; i < axisSize; i += blockDim.x)
+    {
+        unsigned int v = row[i];
+        if (xf_gt(v, best)) { best = v; bestAt = i; }
+    }
+    bestBits[threadIdx.x] = best;
+    bestIndex[threadIdx.x] = bestAt;
     __syncthreads();
     for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
     {
-        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        if (threadIdx.x < stride)
+        {
+            unsigned int mine = bestBits[threadIdx.x], other = bestBits[threadIdx.x + stride];
+            int mineAt = bestIndex[threadIdx.x], otherAt = bestIndex[threadIdx.x + stride];
+            if (xf_gt(other, mine) || (!xf_gt(mine, other) && otherAt < mineAt))
+            {
+                bestBits[threadIdx.x] = other;
+                bestIndex[threadIdx.x] = otherAt;
+            }
+        }
         __syncthreads();
     }
-    if (threadIdx.x == 0)
-    {
-        float first = row[0];
-        output[outer] = isnan(first) ? first : partial[0];
-    }
+    if (threadIdx.x == 0) output[outer] = __uint_as_float(bestBits[0]);
 }
 
 // ===========================================================================

@@ -35,16 +35,26 @@ public sealed class CudaLongRowKernelTests
             var rng = new Random(rows * 31 + width);
             var data = new float[rows * width];
             for (int i = 0; i < data.Length; i++) data[i] = (float)(rng.NextDouble() * 200 - 100);
-            data[0] = float.NaN;                                          // row 0 starts with NaN: NaN
-            if (rows > 1) data[width + width / 2] = float.NaN;            // row 1: a later NaN is ignored
+            // The CPU ReduceMax contract (ReduceMaxSeed): scan from -inf, take a value only when strictly greater, so a
+            // NaN never wins wherever it sits, an all-NaN row gives -inf, and of equal maxima the first is kept.
+            data[0] = float.NaN;                                          // row 0: a leading NaN is skipped
+            if (rows > 1) data[width + width / 2] = float.NaN;            // row 1: so is a later one
             if (rows > 2) for (int i = 0; i < width; i++) data[2 * width + i] = float.NegativeInfinity;
             if (rows > 3) data[3 * width + width - 1] = float.PositiveInfinity;
+            if (rows > 4) for (int i = 0; i < width; i++) data[4 * width + i] = float.NaN;   // all NaN: -inf
+            if (rows > 5)
+            {
+                // A -0/+0 tie for the maximum, -0 first: -0 is kept, its bits included.
+                for (int i = 0; i < width; i++) data[5 * width + i] = -1f - i;
+                data[5 * width + 1] = -0f;
+                data[5 * width + width - 1] = 0f;
+            }
 
             var expected = new float[rows];
             for (int r = 0; r < rows; r++)
             {
-                float m = data[r * width];
-                for (int i = 1; i < width; i++) if (data[r * width + i] > m) m = data[r * width + i];
+                float m = float.NegativeInfinity;
+                for (int i = 0; i < width; i++) if (data[r * width + i] > m) m = data[r * width + i];
                 expected[r] = m;
             }
 
@@ -53,7 +63,8 @@ public sealed class CudaLongRowKernelTests
             cuda.MaxAxis(input, output, rows, width);
             var actual = cuda.DownloadBuffer(output);
             for (int r = 0; r < rows; r++)
-                Assert.True(expected[r].Equals(actual[r]), $"row {r}: gpu {actual[r]} cpu {expected[r]}");
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected[r]) == TestHelpers.MathCompat.SingleToInt32Bits(actual[r]),
+                    $"row {r}: gpu {actual[r]} cpu {expected[r]}");
         }
     }
 
@@ -81,8 +92,9 @@ public sealed class CudaLongRowKernelTests
             using var idx = cuda.AllocateIntBuffer(indices);
             using var output = cuda.AllocateBuffer(destinations * features);
             cuda.SortedScatterSwitch = true;
+            cuda.SortedScatterIgnoresCostModel = true;   // the one-item case is one the cost model never sends here
             bool ran = cuda.TrySortedScatterAdd(src, idx, output, count, destinations, features, accumulate: false);
-            Skip.IfNot(ran, "the sorted scatter declined this size (its cost model prefers the scanning kernels).");
+            Assert.True(ran, "the sorted scatter did not run (kernels missing?)");
             var actual = cuda.DownloadBuffer(output);
             for (int i = 0; i < expected.Length; i++)
                 Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),
