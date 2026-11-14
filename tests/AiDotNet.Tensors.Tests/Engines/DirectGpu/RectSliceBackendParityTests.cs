@@ -87,6 +87,40 @@ public sealed class RectSliceBackendParityTests
     }
 
     [SkippableFact]
+    public void Cuda_RectSlice_RejectsStartOverflowAndReleasedBuffers_WithoutCorruptingContext()
+    {
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "No CUDA driver.");
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend unavailable.");
+        var slicer = (IRectSliceKernels)backend;
+
+        using var fullBuf = backend.AllocateBuffer(new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f });
+        using var sliceBuf = backend.AllocateBuffer(new float[4]);
+
+        // start + length wraps negative in 32-bit signed arithmetic; must reject before touching the driver.
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            slicer.RectSlice(fullBuf, sliceBuf, new[] { 8 }, new[] { int.MaxValue }, new[] { 2 }, scatter: false));
+
+        // Released full/slice buffers with non-zero baseOffset (TryCollapseToRows path) and general N-D path must
+        // throw ObjectDisposedException instead of dereferencing IntPtr.Zero + baseOffset * sizeof(float).
+        var releasedFull = backend.AllocateBuffer(new float[8]);
+        releasedFull.Dispose();
+        Assert.Throws<ObjectDisposedException>(() =>
+            slicer.RectSlice(releasedFull, sliceBuf, new[] { 8 }, new[] { 3 }, new[] { 4 }, scatter: false));
+        Assert.Throws<ObjectDisposedException>(() =>
+            slicer.RectSlice(releasedFull, sliceBuf, new[] { 2, 2, 2 }, new[] { 0, 1, 0 }, new[] { 2, 1, 2 }, scatter: false));
+
+        var releasedSlice = backend.AllocateBuffer(new float[4]);
+        releasedSlice.Dispose();
+        Assert.Throws<ObjectDisposedException>(() =>
+            slicer.RectSlice(fullBuf, releasedSlice, new[] { 8 }, new[] { 2 }, new[] { 4 }, scatter: false));
+
+        // Verify the shared primary CUDA context remains healthy after all rejected calls.
+        slicer.RectSlice(fullBuf, sliceBuf, new[] { 8 }, new[] { 2 }, new[] { 4 }, scatter: false);
+        Assert.Equal(new float[] { 3f, 4f, 5f, 6f }, backend.DownloadBuffer(sliceBuf));
+    }
+
+    [SkippableFact]
     public void OpenCl_RectSlice_MatchesCpu()
     {
         using var backend = new OpenClBackend();

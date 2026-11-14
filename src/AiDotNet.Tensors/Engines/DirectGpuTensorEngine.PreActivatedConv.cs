@@ -36,25 +36,37 @@ public partial class DirectGpuTensorEngine
         int batch = input.Shape._dims[0], inChannels = input.Shape._dims[1];
         int inHeight = input.Shape._dims[2], inWidth = input.Shape._dims[3];
         int outChannels = kernel.Shape._dims[0], kernelH = kernel.Shape._dims[2], kernelW = kernel.Shape._dims[3];
-        int outHeight = (inHeight + 2 * padH - (kernelH + (kernelH - 1) * (dilationH - 1))) / strideH + 1;
-        int outWidth = (inWidth + 2 * padW - (kernelW + (kernelW - 1) * (dilationW - 1))) / strideW + 1;
-        // Invalid shapes take the base path, which reports them.
-        if (kernel.Shape._dims[1] != inChannels || preGamma.Length != inChannels || preBeta.Length != inChannels
+        long spanH = inHeight + 2L * padH - (kernelH + (long)(kernelH - 1) * (dilationH - 1));
+        long spanW = inWidth + 2L * padW - (kernelW + (long)(kernelW - 1) * (dilationW - 1));
+        long outHeightL = spanH < 0 ? 0 : spanH / strideH + 1;
+        long outWidthL = spanW < 0 ? 0 : spanW / strideW + 1;
+        // Invalid or overflowing shapes take the base path, which reports them.
+        if (batch <= 0 || inChannels <= 0 || inHeight <= 0 || inWidth <= 0
+            || outChannels <= 0 || kernelH <= 0 || kernelW <= 0
+            || kernel.Shape._dims[1] != inChannels || preGamma.Length != inChannels || preBeta.Length != inChannels
             || preMean.Length != inChannels || preVariance.Length != inChannels
             || (bias is not null && (bias.Rank != 1 || bias.Length != outChannels))
-            || outHeight <= 0 || outWidth <= 0 || batch <= 0)
+            || outHeightL <= 0 || outWidthL <= 0 || outHeightL > int.MaxValue || outWidthL > int.MaxValue)
             return base.BatchNormActivationConv2D(input, preGamma, preBeta, preMean, preVariance, preEpsilon, kernel, bias,
                 strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
+        int outHeight = (int)outHeightL, outWidth = (int)outWidthL;
+        long bc = (long)batch * outChannels;
+        long hw = (long)outHeight * outWidth;
+        long countL = bc <= int.MaxValue && hw <= int.MaxValue ? bc * hw : (long)int.MaxValue + 1;
+        if (countL <= 0 || countL > int.MaxValue)
+            return base.BatchNormActivationConv2D(input, preGamma, preBeta, preMean, preVariance, preEpsilon, kernel, bias,
+                strideH, strideW, padH, padW, dilationH, dilationW, activation);
+
+        int count = (int)countL;
         var (scale, shift) = BatchNormAffineFold<T>.Get(preGamma, preBeta, preMean, preVariance, preEpsilon);
-        int count = batch * outChannels * outHeight * outWidth;
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var kernelBuffer = GetWeightBufferPreferResident(backend, kernel, PersistentTensorRole.Weights);
         using var scaleBuffer = GetWeightBufferPreferResident(backend, scale, PersistentTensorRole.Biases);
         using var shiftBuffer = GetWeightBufferPreferResident(backend, shift, PersistentTensorRole.Biases);
         using var biasBuffer = bias is null ? default : GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
         // The engine's kernels store the whole output.
-        var outputBuffer = AllocateFullyWrittenOutputBuffer(backend, count);
+        using var outputBuffer = AllocateFullyWrittenOutputBuffer(backend, count);
         if (!pre.TryConv2DPreActivatedBiasActivation(inputBuffer.Buffer, scaleBuffer.Buffer, shiftBuffer.Buffer,
                 kernelBuffer.Buffer, bias is null ? null : biasBuffer.Buffer, outputBuffer.Buffer, batch, inChannels, inHeight,
                 inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH,
@@ -66,6 +78,7 @@ public partial class DirectGpuTensorEngine
         }
         var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, count, new[] { batch, outChannels, outHeight, outWidth });
         if (ResidentStepActive) BindResidentBuffer(result, outputBuffer.Buffer, backend);
+        outputBuffer.RelinquishOwnership();
         return result;
     }
 

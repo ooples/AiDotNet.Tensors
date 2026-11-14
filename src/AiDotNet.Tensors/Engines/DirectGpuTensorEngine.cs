@@ -17956,10 +17956,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && !(gradOutput2 is not null && ReferenceEquals(resolvedDx, bufDy2.Buffer))
                 ? (intoInput, resolvedDx)
                 : null;
-        var bufDx = directTarget is null ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
-        var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
-        var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
-        var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
+        using var bufDx = directTarget is null ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
+        using var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
+        using var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
+        using var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
         bool launched = varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer,
             bufMean.Buffer, bufVar.Buffer, directTarget is { } dtLaunch ? dtLaunch.Buffer : bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial,
             (float)epsilon, reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null,
@@ -17967,15 +17967,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             gradOutput2: gradOutput2 is not null ? bufDy2.Buffer : null, accumulateGradInput: directTarget is not null && addInput);
         if (!launched)
         {
-            bufDx.Dispose(); bufDg.Dispose(); bufDb.Dispose();
-            if (withResidual) bufDr.Dispose();
             return null;
         }
-        Tensor<T>? gradResidual = withResidual
-            ? DeferTensorResult<T>(backend, bufDr.Buffer, input.Length, input.Shape.ToArray())
-            : null;
+        Tensor<T>? gradResidual = null;
+        if (withResidual)
+        {
+            gradResidual = DeferTensorResult<T>(backend, bufDr.Buffer, input.Length, input.Shape.ToArray());
+            bufDr.RelinquishOwnership();
+        }
         var gradGamma = DeferTensorResult<T>(backend, bufDg.Buffer, channels, gamma.Shape.ToArray());
+        bufDg.RelinquishOwnership();
         var gradBeta = DeferTensorResult<T>(backend, bufDb.Buffer, channels, gamma.Shape.ToArray());
+        bufDb.RelinquishOwnership();
         if (directTarget is { } dtCommit)
         {
             ResidentSyncCheck("BatchNormReluBackwardInto");
@@ -17983,7 +17986,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             BindResidentBuffer(dtCommit.Target, dtCommit.Buffer, backend);
             return (dtCommit.Target, gradGamma, gradBeta, gradResidual);
         }
-        return (DeferTensorResult<T>(backend, bufDx.Buffer, input.Length, input.Shape.ToArray()), gradGamma, gradBeta, gradResidual);
+        var gradInput = DeferTensorResult<T>(backend, bufDx.Buffer, input.Length, input.Shape.ToArray());
+        bufDx.RelinquishOwnership();
+        return (gradInput, gradGamma, gradBeta, gradResidual);
     }
 
     // #775: GPU InstanceNormBackward. Same shape of contract as BatchNormBackward, but the
