@@ -88,6 +88,18 @@ public sealed class CudaKernelLookupIntegrityTests
         }
     }
 
+    // The names a kernel class's static GetKernelNames() returns (what CudaBackend hands cuModuleGetFunction), or none
+    // when the class has no such method.
+    private static IEnumerable<string> InvokedKernelNames(string className)
+    {
+        var type = typeof(AiDotNet.Tensors.Engines.DirectGpu.DeterministicNormKernels).Assembly.GetTypes()
+            .FirstOrDefault(t => t.Name == className && t.Namespace is not null
+                && t.Namespace.StartsWith("AiDotNet.Tensors.Engines.DirectGpu.CUDA", StringComparison.Ordinal));
+        var method = type?.GetMethod("GetKernelNames", System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static, null, Type.EmptyTypes, null);
+        return method?.Invoke(null, null) as string[] ?? Array.Empty<string>();
+    }
+
     [Fact]
     public void EveryCudaKernelLookupHasADefinition()
     {
@@ -99,11 +111,15 @@ public sealed class CudaKernelLookupIntegrityTests
         string[] backendFiles = Directory.GetFiles(cuda, "CudaBackend*.cs", SearchOption.TopDirectoryOnly);
         Assert.NotEmpty(backendFiles);
         string backend = string.Join("\n", backendFiles.Select(File.ReadAllText));
+        // A lookup followed by "+" names a family ("gated_delta_scan_forward" + variant, the variant picked at run time):
+        // it is a prefix, and it needs a defined kernel spelled prefix + "_...".
+        var lookups = Regex.Matches(backend,
+                @"_kernelCache\s*(?:(?:\.TryGetValue|\.ContainsKey)\s*\(\s*|\[\s*)""([a-z0-9_]+)""(\s*\+)?")
+            .Cast<Match>().ToList();
         var lookedUp = new HashSet<string>(
-            Regex.Matches(backend,
-                    @"_kernelCache\s*(?:(?:\.TryGetValue|\.ContainsKey)\s*\(\s*|\[\s*)""([a-z0-9_]+)""")
-                 .Select(m => m.Groups[1].Value),
-            StringComparer.Ordinal);
+            lookups.Where(m => !m.Groups[2].Success).Select(m => m.Groups[1].Value), StringComparer.Ordinal);
+        var lookedUpPrefixes = new HashSet<string>(
+            lookups.Where(m => m.Groups[2].Success).Select(m => m.Groups[1].Value), StringComparer.Ordinal);
 
         var defined = new HashSet<string>(StringComparer.Ordinal);
         // This shared dialect generator is compiled directly, outside CUDA/Kernels.
@@ -144,12 +160,19 @@ public sealed class CudaKernelLookupIntegrityTests
             // they occur in an actual GetKernelNames return table.
             foreach (string name in RegisteredKernelNames(src))
                 defined.Add(name);
+            // A table built in code (a loop over head-size variants, CudaGatedDeltaNetKernels) is not a literal the
+            // pattern above can read: ask the compiled class itself for the names its module registers.
+            if (declared.Success)
+                foreach (string name in InvokedKernelNames(declared.Groups[1].Value))
+                    defined.Add(name);
         }
 
         Assert.NotEmpty(lookedUp);
         Assert.NotEmpty(defined);
 
-        var dangling = lookedUp.Where(n => !defined.Contains(n)).OrderBy(n => n, StringComparer.Ordinal).ToList();
+        var dangling = lookedUp.Where(n => !defined.Contains(n))
+            .Concat(lookedUpPrefixes.Where(prefix => !defined.Any(d => d.StartsWith(prefix + "_", StringComparison.Ordinal))))
+            .Distinct(StringComparer.Ordinal).OrderBy(n => n, StringComparer.Ordinal).ToList();
         var unexpected = dangling.Where(n => !KnownDangling.Contains(n)).ToList();
 
         Assert.True(unexpected.Count == 0,

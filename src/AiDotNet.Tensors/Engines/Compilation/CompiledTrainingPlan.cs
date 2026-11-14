@@ -10355,8 +10355,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             // The alias views of a pooled target read its new array (a host read of a view, a host-path op on it).
             if (aliasTargets is not null)
-                foreach (var (view, target) in aliasTargets)
-                    if (indexOf.TryGetValue(target, out int t) && pooled[t]) RepointAliasView(view, target);
+                foreach (var alias in aliasTargets)
+                    if (indexOf.TryGetValue(alias.Value, out int t) && pooled[t]) RepointAliasView(alias.Key, alias.Value);
         }
 
         // Everything still a placeholder (unpooled, or pooling not modeled for this plan) gets an array of its own.
@@ -10394,8 +10394,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         long pooledBytes = capacity.Sum(c => (long)c) * esz;
         Console.Error.WriteLine($"[GRAD-POOL] {allGrads.Count} gradients; {capacity.Count} shared arrays hold the pooled ones in {pooledBytes / 1048576.0:F1} MB");
-        foreach (var (reason, (n, bytes)) in reasons)
-            Console.Error.WriteLine($"[GRAD-POOL]   {reason}: {n} gradients, {bytes / 1048576.0:F1} MB");
+        foreach (var entry in reasons)
+            Console.Error.WriteLine($"[GRAD-POOL]   {entry.Key}: {entry.Value.Count} gradients, {entry.Value.Bytes / 1048576.0:F1} MB");
     }
 
     /// <summary>
@@ -10584,8 +10584,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         using var own = new Tensor<T>((int[])tensor._shape.Clone());
         tensor.RebindStorageFrom(own);
         if (aliases is not null)
-            foreach (var (view, target) in aliases)
-                if (ReferenceEquals(target, tensor)) RepointAliasView(view, tensor);
+            foreach (var alias in aliases)
+                if (ReferenceEquals(alias.Value, tensor)) RepointAliasView(alias.Key, tensor);
         return 1;
     }
 
