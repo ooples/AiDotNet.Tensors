@@ -1361,7 +1361,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
         _convolutionModule = CompileKernelModule(device, CudaConvolutionKernels.GetSource(), "convolution_kernels", CudaConvolutionKernels.GetKernelNames());
         _fusedConvolutionModule = CompileKernelModule(device, CudaFusedConvolutionKernels.GetSource(), "fused_convolution_kernels", CudaFusedConvolutionKernels.GetKernelNames());
-        _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource(), "pooling_kernels", CudaPoolingKernels.GetKernelNames());
+        _poolingModule = CompileKernelModule(device, CudaPoolingKernels.GetSource() + KernelSourceResources.Read("CudaPoolingFlat.c"), "pooling_kernels",
+            System.Linq.Enumerable.ToArray(System.Linq.Enumerable.Concat(CudaPoolingKernels.GetKernelNames(), new[] { "maxpool2d_flat", "avgpool2d_flat" })));
         _normalizationModule = CompileKernelModule(device, CudaNormalizationKernels.GetSource(), "normalization_kernels", CudaNormalizationKernels.GetKernelNames());
         _neuralNetModule = CompileKernelModule(device, CudaNeuralNetKernels.GetSource(), "neuralnet_kernels", CudaNeuralNetKernels.GetKernelNames());
 
@@ -8459,10 +8460,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 kernelH, kernelW, strideH, strideW, padH, padW))
             return;
 
+        using var _ = PushContext();
+        // A plane narrower or shorter than the 16x16 block (2x2 and 1x1 outputs in VGG) idles most of every block:
+        // one thread per output cell instead.
+        if ((outHeight < 16 || outWidth < 16) && _kernelCache.TryGetValue("maxpool2d_flat", out var flatKernel))
+        {
+            IntPtr fin = input.Handle, fout = output.Handle, fidx = indices?.Handle ?? IntPtr.Zero;
+            int fsave = indices is not null ? 1 : 0;
+            void** fargs = stackalloc void*[16];
+            fargs[0] = &fin; fargs[1] = &fout; fargs[2] = &fidx; fargs[3] = &batch; fargs[4] = &channels;
+            fargs[5] = &inHeight; fargs[6] = &inWidth; fargs[7] = &outHeight; fargs[8] = &outWidth;
+            fargs[9] = &kernelH; fargs[10] = &kernelW; fargs[11] = &strideH; fargs[12] = &strideW;
+            fargs[13] = &padH; fargs[14] = &padW; fargs[15] = &fsave;
+            long cells = (long)batch * channels * outHeight * outWidth;
+            LaunchKernel(flatKernel, (uint)Math.Min((cells + 255) / 256, 65535L * 16), 256, fargs);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("maxpool2d", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: maxpool2d");
 
-        using var _ = PushContext();
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
@@ -8636,10 +8653,25 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int strideH, int strideW, int padH, int padW,
         bool countIncludePad)
     {
+        using var _ = PushContext();
+        int countPad = countIncludePad ? 1 : 0;
+        // Planes smaller than the 16x16 block: one thread per output cell (see MaxPool2D).
+        if ((outHeight < 16 || outWidth < 16) && _kernelCache.TryGetValue("avgpool2d_flat", out var flatKernel))
+        {
+            IntPtr fin = input.Handle, fout = output.Handle;
+            void** fargs = stackalloc void*[15];
+            fargs[0] = &fin; fargs[1] = &fout; fargs[2] = &batch; fargs[3] = &channels;
+            fargs[4] = &inHeight; fargs[5] = &inWidth; fargs[6] = &outHeight; fargs[7] = &outWidth;
+            fargs[8] = &kernelH; fargs[9] = &kernelW; fargs[10] = &strideH; fargs[11] = &strideW;
+            fargs[12] = &padH; fargs[13] = &padW; fargs[14] = &countPad;
+            long cells = (long)batch * channels * outHeight * outWidth;
+            LaunchKernel(flatKernel, (uint)Math.Min((cells + 255) / 256, 65535L * 16), 256, fargs);
+            return;
+        }
+
         if (!_kernelCache.TryGetValue("avgpool2d", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: avgpool2d");
 
-        using var _ = PushContext();
         const int blockSize = 16;
         uint gridX = (uint)((outWidth + blockSize - 1) / blockSize);
         uint gridY = (uint)((outHeight + blockSize - 1) / blockSize);
@@ -8647,7 +8679,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
-        int countPad = countIncludePad ? 1 : 0;
         // Kernel signature has 15 parameters: input, output, the 12 shape/stride/pad ints, AND
         // countIncludePad. The original 14-slot stackalloc dropped the countIncludePad slot, so
         // cuLaunchKernel read garbage stack memory for parameter 15 — a 0xC0000005 access violation
