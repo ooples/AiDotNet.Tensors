@@ -2378,6 +2378,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     private void MaterializeDeferredStorage()
     {
+        // A probe output is a shape-only stand-in for a value the probe never computes. An op that reaches for
+        // its storage directly (bypassing the lazy-realization check) would otherwise read zeros and execute
+        // eagerly against them, so the probe aborts exactly as a realization would.
+        if (GraphMode.IsProbe && LazySource is ILazyNode probeNode && !probeNode.IsRealized)
+            throw new ObjectiveProbeAbortedException(probeNode.OpName);
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         lock (System.Threading.LazyInitializer.EnsureInitialized(ref _deferredLock)!)
         {

@@ -162,6 +162,7 @@ internal sealed class LazyNode<T> : ILazyNode
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
+        if (GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
 
         // Mark as realized BEFORE executing to prevent re-entrant auto-materialization.
         // The output tensor's AsSpan()/AsWritableSpan() checks LazySource.IsRealized —
