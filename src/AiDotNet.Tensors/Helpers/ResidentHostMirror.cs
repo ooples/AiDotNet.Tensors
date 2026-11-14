@@ -44,9 +44,9 @@ internal static class ResidentHostMirror
                 // nothing to contribute; its host slice is already the value. One such member must not abort the
                 // host read for every other view on the array.
                 if (t._gpuBuffer is not { } gpuBuffer || gpuBuffer.Handle == IntPtr.Zero || t._gpuBackend is not { } gpuBackend) continue;
-                if (typeof(T) == typeof(float) && t._storageOffset == 0 && array.Length >= gpuBuffer.Size && t.Length >= gpuBuffer.Size)
+                if (array is float[] floatArray && t._storageOffset == 0 && floatArray.Length >= gpuBuffer.Size && t.Length >= gpuBuffer.Size)
                 {
-                    try { gpuBackend.DownloadBuffer(gpuBuffer, (float[])(object)array); }
+                    try { gpuBackend.DownloadBuffer(gpuBuffer, floatArray); }
                     catch (ObjectDisposedException) { continue; }
                     continue;
                 }

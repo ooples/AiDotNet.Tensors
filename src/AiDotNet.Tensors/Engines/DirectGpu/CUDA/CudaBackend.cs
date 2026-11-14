@@ -580,6 +580,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     [ThreadStatic]
     private static IntPtr _threadCurrentContext;
+    internal static IntPtr ThreadCurrentContextForTests => _threadCurrentContext;
 
     private bool _isAvailable;
 
@@ -5575,7 +5576,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 4L * Math.Max(1, ComputeUnits) / outerSize));
             int chunkLen = (int)(((long)reduceSize + chunks - 1) / chunks);
             chunks = (int)(((long)reduceSize + chunkLen - 1) / chunkLen);
-            using var partial = AllocateStreamOrderedScratchBuffer(outerSize * chunks);
+            // sum_axis_rows_split writes one partial per (row, chunk) block: the whole buffer.
+            using var partial = AllocateStreamOrderedScratchBufferUninitialized(outerSize * chunks);
             using (PushContext())
             {
                 IntPtr inPtr = A.Handle, partialPtr = partial.Handle;
@@ -19340,6 +19342,62 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         GC.SuppressFinalize(this);
     }
 
+    internal static bool TryPushDisposeContext(IntPtr cudaContext)
+    {
+        if (cudaContext == IntPtr.Zero)
+            return false;
+        try
+        {
+            if (CudaNativeBindings.cuCtxGetCurrent(out var currentContext) == CudaResult.Success
+                && currentContext == cudaContext)
+            {
+                _threadCurrentContext = cudaContext;
+                return false;
+            }
+
+            if (CuBlasNative.cuCtxPushCurrent(cudaContext) == 0)
+            {
+                _threadCurrentContext = cudaContext;
+                return true;
+            }
+        }
+        catch (DllNotFoundException)
+        {
+            // Suppress context-push errors if the native CUDA library is unavailable.
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // Suppress context-push errors if the driver entry point is unavailable.
+        }
+        return false;
+    }
+
+    private static void PopDisposeContext(IntPtr disposedContext)
+    {
+        try
+        {
+            CuBlasNative.cuCtxPopCurrent(out _);
+            _threadCurrentContext = CudaNativeBindings.cuCtxGetCurrent(out var activeContext) == CudaResult.Success
+                && activeContext != disposedContext
+                ? activeContext
+                : IntPtr.Zero;
+        }
+        catch (DllNotFoundException)
+        {
+            _threadCurrentContext = IntPtr.Zero;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _threadCurrentContext = IntPtr.Zero;
+        }
+    }
+
+    internal static void ClearThreadCurrentContext(IntPtr disposedContext)
+    {
+        if (_threadCurrentContext == disposedContext)
+            _threadCurrentContext = IntPtr.Zero;
+    }
+
     private void Dispose(bool disposing)
     {
         if (_disposed)
@@ -19418,23 +19476,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Ensure this backend's CUDA context is current on the disposing thread before draining events,
         // freeing staged/pinned buffers, or destroying stream/module handles (a multi-GPU caller may have
         // switched the thread to another device's context prior to Dispose).
-        bool pushedDisposeContext = false;
-        if (_cudaContext != IntPtr.Zero && _threadCurrentContext != _cudaContext)
+        IntPtr disposeContext = _cudaContext;
+        bool pushedDisposeContext = TryPushDisposeContext(disposeContext);
+        try
         {
-            try
-            {
-                if (CuBlasNative.cuCtxPushCurrent(_cudaContext) == 0)
-                {
-                    _threadCurrentContext = _cudaContext;
-                    pushedDisposeContext = true;
-                }
-            }
-            catch
-            {
-                // Suppress context-push errors if the CUDA driver is already tearing down.
-            }
-        }
-
         DrainDeferredFrees(blockOldest: true);
 
         // Direct-PTX modules borrow this backend's context and stream. Unload
@@ -19838,19 +19883,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         UnloadRemainingModules();
-
-        if (pushedDisposeContext)
-        {
-            try
-            {
-                CuBlasNative.cuCtxPopCurrent(out var previousContext);
-                _threadCurrentContext = previousContext;
-            }
-            catch
-            {
-                _threadCurrentContext = IntPtr.Zero;
-            }
         }
+        finally
+        {
+        if (pushedDisposeContext)
+            PopDisposeContext(disposeContext);
 
         if (_cudaContext != IntPtr.Zero)
         {
@@ -19864,7 +19901,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 RemoveContextHolder(context, _cuDevice);
                 _cudaContext = IntPtr.Zero;
             }
-            if (_threadCurrentContext == context) _threadCurrentContext = IntPtr.Zero;
+            ClearThreadCurrentContext(context);
+        }
         }
 
         GC.SuppressFinalize(this);
