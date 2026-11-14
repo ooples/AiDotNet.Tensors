@@ -140,6 +140,9 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
         if (SymbolEqualityComparer.Default.Equals(method.ContainingType, engine)) return true;
         var type = method.ContainingType;
         if (type is null || !type.AllInterfaces.Contains(engine, SymbolEqualityComparer.Default)) return false;
+        if (method.ExplicitInterfaceImplementations.Any(m =>
+                SymbolEqualityComparer.Default.Equals(m.ContainingType?.OriginalDefinition, engine)))
+            return true;
         foreach (var impl in engine.GetMembers(method.Name).OfType<IMethodSymbol>()
                      .Select(member => type.FindImplementationForInterfaceMember(member))
                      .OfType<IMethodSymbol>())
@@ -181,7 +184,7 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
             || property.ContainingType?.ContainingNamespace?.ToDisplayString() != TensorNamespace)
             return;
         var body = Root(reference);
-        if (Classify(reference, body, depth: 0) == Use.Read)
+        if (Classify(reference, body, context.ContainingSymbol, depth: 0) == Use.Read)
             context.ReportDiagnostic(Diagnostic.Create(WritableAccessorForRead, reference.Syntax.GetLocation(),
                 reference.Syntax.ToString()));
     }
@@ -196,7 +199,7 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
     }
 
     // How the value of `value` (a Memory<T>/Span<T>-like expression) is used: Read only when every path is a proven read.
-    private static Use Classify(IOperation value, IOperation body, int depth)
+    private static Use Classify(IOperation value, IOperation body, ISymbol? containingSymbol, int depth)
     {
         if (depth > 8) return Use.Write;
         var parent = value.Parent;
@@ -205,13 +208,13 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
         {
             case IConversionOperation conversion:
                 if (IsReadOnlyMemoryLike(conversion.Type)) return Use.Read;
-                return Classify(conversion, body, depth + 1);
+                return Classify(conversion, body, containingSymbol, depth + 1);
 
             case IArgumentOperation argument:
                 if (argument.Parameter is null) return Use.Write;
                 if (IsReadOnlyMemoryLike(argument.Parameter.Type)) return Use.Read;
                 if (argument.Parent is IInvocationOperation reinterpret && IsMemoryReinterpret(reinterpret.TargetMethod))
-                    return Classify(reinterpret, body, depth + 1);
+                    return Classify(reinterpret, body, containingSymbol, depth + 1);
                 return Use.Write;
 
             case IPropertyReferenceOperation member when ReferenceEquals(member.Instance, value):
@@ -221,16 +224,16 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
                     case "IsEmpty":
                         return Use.Read;
                     case "Span":
-                        return Classify(member, body, depth + 1);
+                        return Classify(member, body, containingSymbol, depth + 1);
                 }
-                if (member.Property.IsIndexer) return ElementUse(member);
+                if (member.Property.IsIndexer) return ElementUse(member, containingSymbol);
                 return Use.Write;
 
             case IInvocationOperation call when ReferenceEquals(call.Instance, value):
                 switch (call.TargetMethod.Name)
                 {
                     case "Slice":
-                        return Classify(call, body, depth + 1);
+                        return Classify(call, body, containingSymbol, depth + 1);
                     case "ToArray":
                     case "ToString":
                         return Use.Read;
@@ -241,18 +244,18 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
                 return Use.Write;
 
             case IVariableInitializerOperation initializer when initializer.Parent is IVariableDeclaratorOperation declarator:
-                return LocalUses(declarator.Symbol, body, depth);
+                return LocalUses(declarator.Symbol, body, containingSymbol, depth);
 
             case ISimpleAssignmentOperation assignment when ReferenceEquals(assignment.Value, value)
                                                            && assignment.Target is ILocalReferenceOperation local:
-                return LocalUses(local.Local, body, depth);
+                return LocalUses(local.Local, body, containingSymbol, depth);
 
             default:
                 return Use.Write;
         }
     }
 
-    private static Use ElementUse(IOperation element)
+    private static Use ElementUse(IOperation element, ISymbol? containingSymbol)
     {
         var parent = element.Parent;
         switch (parent)
@@ -264,6 +267,8 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
             case IVariableInitializerOperation init
                 when init.Parent is IVariableDeclaratorOperation d && d.Symbol.RefKind != RefKind.None:
                 return Use.Write;
+            case IReturnOperation ret when ReferenceEquals(ret.ReturnedValue, element) && IsWritableRefReturn(ret, containingSymbol):
+                return Use.Write;
             // A field or property of a struct element: `span[0].Value = v` writes through the span.
             case IMemberReferenceOperation member when ReferenceEquals(member.Instance, element):
                 return MayMutateThrough(element.Type);
@@ -271,6 +276,26 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
                 return MayMutateThrough(element.Type);
             default: return Use.Read;
         }
+    }
+
+    private static bool IsWritableRefReturn(IReturnOperation ret, ISymbol? containingSymbol)
+    {
+        for (IOperation? op = ret.Parent; op is not null; op = op.Parent)
+        {
+            switch (op)
+            {
+                case ILocalFunctionOperation localFn:
+                    return localFn.Symbol.RefKind == RefKind.Ref;
+                case IAnonymousFunctionOperation anonFn:
+                    return anonFn.Symbol.RefKind == RefKind.Ref;
+            }
+        }
+        return containingSymbol switch
+        {
+            IMethodSymbol method => method.RefKind == RefKind.Ref,
+            IPropertySymbol property => property.RefKind == RefKind.Ref,
+            _ => false,
+        };
     }
 
     // A member of a mutable struct element can write through the span; built-in numeric, bool and char elements and
@@ -281,7 +306,7 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
             ? Use.Write
             : Use.Read;
 
-    private static Use LocalUses(ILocalSymbol local, IOperation body, int depth)
+    private static Use LocalUses(ILocalSymbol local, IOperation body, ISymbol? containingSymbol, int depth)
     {
         if (local.RefKind != RefKind.None) return Use.Write;
         bool any = false;
@@ -290,7 +315,7 @@ public sealed class EngineGraphSafetyAnalyzer : DiagnosticAnalyzer
                                  && !(r.Parent is ISimpleAssignmentOperation a && ReferenceEquals(a.Target, r))))
         {
             any = true;
-            if (Classify(reference, body, depth + 1) == Use.Write) return Use.Write;
+            if (Classify(reference, body, containingSymbol, depth + 1) == Use.Write) return Use.Write;
         }
         return any ? Use.Read : Use.Write;
     }

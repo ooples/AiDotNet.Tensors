@@ -14799,7 +14799,7 @@ KERNEL VARIANTS (A/B testing):
         public int Size => Volatile.Read(ref _size);
         public int Capacity => Buffer.Length;
         public long SizeInBytes => (long)Size * sizeof(float);
-        public IntPtr Handle => Buffer.Handle;
+        public IntPtr Handle => IsReleased ? IntPtr.Zero : Buffer.Handle;
 
         // The DeviceMemoryReclaim epoch of this buffer's current charge (set at each allocation or pool hit).
         internal long ReclaimEpoch = -1;
@@ -14891,23 +14891,30 @@ KERNEL VARIANTS (A/B testing):
 
         public void Dispose()
         {
-            if (_returnToPool == null)
+            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(DisposeCore))
+                return;
+
+            DisposeCore();
+        }
+
+        private void DisposeCore()
+        {
+            if (_returnToPool is not { } returnToPool)
             {
-                Release();
+                ReleaseCore();
                 return;
             }
 
-            if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
+            if (Interlocked.CompareExchange(ref _poolState, 2, 0) != 0)
                 return;
 
+            GC.SuppressFinalize(this);
             // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back.
+            // Hand the device buffer to the pool under a fresh wrapper (one lease, one wrapper, matching the finalizer
+            // and CudaGpuBuffer.DetachForPool) so any stale holder of this wrapper stays permanently released even
+            // after TryRent reuses the underlying OpenCL buffer.
             DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float), ReclaimEpoch);
-            _memory.OnReturned();
-
-            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))
-                return;
-
-            _returnToPool(this);
+            returnToPool(Pooled(Buffer, returnToPool, _memory.TransferToLease()));
         }
     }
 

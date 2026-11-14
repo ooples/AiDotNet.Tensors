@@ -471,13 +471,22 @@ public class StftGradientTests
                 var loss = cpu.ReduceSum(cpu.TensorAdd(cpu.TensorMultiply(mag, aFloat), cpu.TensorMultiply(phase, bFloat)), null);
                 cpuFloatGrads = tape.ComputeGradients(loss, new[] { xFloat, wFloat });
             }
-            using (var tape = new GradientTape<float>())
+            bool previousThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            try
             {
-                gpuEngine.STFT(xFloat, NFft, Hop, wFloat, center: true, out Tensor<float> mag, out Tensor<float> phase);
-                var loss = gpuEngine.ReduceSum(gpuEngine.TensorAdd(gpuEngine.TensorMultiply(mag, aFloat), gpuEngine.TensorMultiply(phase, bFloat)), null);
-                for (int i = 0; i < mag.Length; i++) mag[i] = 999f;
-                for (int i = 0; i < phase.Length; i++) phase[i] = -2.5f;
-                gpuFloatGrads = tape.ComputeGradients(loss, new[] { xFloat, wFloat });
+                using (var tape = new GradientTape<float>())
+                {
+                    gpuEngine.STFT(xFloat, NFft, Hop, wFloat, center: true, out Tensor<float> mag, out Tensor<float> phase);
+                    var loss = gpuEngine.ReduceSum(gpuEngine.TensorAdd(gpuEngine.TensorMultiply(mag, aFloat), gpuEngine.TensorMultiply(phase, bFloat)), null);
+                    for (int i = 0; i < mag.Length; i++) mag[i] = 999f;
+                    for (int i = 0; i < phase.Length; i++) phase[i] = -2.5f;
+                    gpuFloatGrads = tape.ComputeGradients(loss, new[] { xFloat, wFloat });
+                }
+            }
+            finally
+            {
+                DirectGpuTensorEngine.ThrowOnGpuKernelFallback = previousThrowOnFallback;
             }
             for (int i = 0; i < xFloat.Length; i++)
                 Assert.True(Math.Abs(gpuFloatGrads[xFloat][i] - cpuFloatGrads[xFloat][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuFloatGrads[xFloat][i])),
@@ -566,7 +575,78 @@ public class StftGradientTests
             }
         }
     }
+
+    [Fact]
+    public void PoolReuse_DoesNotReviveDisposedHipWrapper()
+    {
+#pragma warning disable SYSLIB0050
+        var hipOwner = (AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend)
+            System.Runtime.Serialization.FormatterServices.GetUninitializedObject(
+                typeof(AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend));
+#pragma warning restore SYSLIB0050
+        GC.SuppressFinalize(hipOwner);
+
+        using var pool = new AiDotNet.Tensors.Engines.DirectGpu.GpuBufferPool<AiDotNet.Tensors.Engines.DirectGpu.HIP.HipGpuBuffer>(16, 1 << 20);
+        var first = new AiDotNet.Tensors.Engines.DirectGpu.HIP.HipGpuBuffer(
+            IntPtr.Zero, 64, hipOwner, returned => pool.Return(returned));
+        Assert.False(first.IsReleased);
+
+        first.Dispose();
+        Assert.True(first.IsReleased);
+
+        Assert.True(pool.TryRent(64, out var reRented));
+        var second = reRented ?? throw new InvalidOperationException("Expected rented HipGpuBuffer.");
+        Assert.NotSame(first, second);
+        Assert.False(second.IsReleased);
+        // The stale reference from the previous lease must stay released even after the pool re-rents the buffer.
+        Assert.True(first.IsReleased);
+        second.Release();
+    }
 #endif
+
+    [Fact]
+    public void CreateGraph_TinyFloatSignalAndStrictShapePolicy_ProducesExactFiniteGradients()
+    {
+        var engine = new CpuEngine();
+
+        // 1e-30f squared underflows float32 to zero without power-of-two scaling in PolarOfCartesian / RecordedComplexMagnitude.
+        var tinyX = new Tensor<float>(new float[] { 1e-30f, 0f, 0f, 0f }, new[] { 1, 4 });
+        var unitW = new Tensor<float>(new float[] { 1f, 1f, 1f, 1f }, new[] { 4 });
+        Tensor<float> plainGx;
+        using (var tape = new GradientTape<float>())
+        {
+            engine.STFT(tinyX, nFft: 4, hopLength: 4, window: unitW, center: false, out Tensor<float> mag, out Tensor<float> _);
+            plainGx = tape.ComputeGradients(engine.ReduceSum(mag, null), new[] { tinyX })[tinyX];
+        }
+        using (var tape = new GradientTape<float>())
+        {
+            engine.STFT(tinyX, nFft: 4, hopLength: 4, window: unitW, center: false, out Tensor<float> mag, out Tensor<float> _);
+            var grads = tape.ComputeGradients(engine.ReduceSum(mag, null), new[] { tinyX, unitW }, createGraph: true);
+            var gx = grads[tinyX];
+            for (int i = 0; i < gx.Length; i++)
+            {
+                Assert.False(float.IsNaN(gx[i]) || float.IsInfinity(gx[i]), $"tiny float createGraph dL/dx[{i}] = {gx[i]}");
+                Assert.Equal(plainGx[i], gx[i], 5);
+            }
+            // Each of the 3 non-negative bins [DC, k=1, Nyquist] has Re = 1e-30, Im = 0; summing cos(2*pi*k*i/4) over k=0,1,2 gives [3, 0, 1, 0].
+            Assert.Equal(3f, gx[0], 5);
+            Assert.Equal(0f, gx[1], 5);
+            Assert.Equal(1f, gx[2], 5);
+            Assert.Equal(0f, gx[3], 5);
+        }
+
+        // 1D waveform [8], nFft = 4, hopLength = 2 under ShapePolicy.Strict() must broadcast window [1, 1, 4] against frames [1, 3, 4].
+        var x1d = new Tensor<float>(new[] { 8 });
+        for (int i = 0; i < x1d.Length; i++) x1d[i] = 0.2f * (i + 1);
+        using (ShapePolicy.Strict())
+        using (var tape = new GradientTape<float>())
+        {
+            engine.STFT(x1d, nFft: 4, hopLength: 2, window: unitW, center: false, out Tensor<float> mag, out Tensor<float> _);
+            var grads = tape.ComputeGradients(engine.ReduceSum(mag, null), new[] { x1d, unitW }, createGraph: true);
+            Assert.Equal(8, grads[x1d].Length);
+            Assert.Equal(4, grads[unitW].Length);
+        }
+    }
 
     [SkippableFact]
     public void DirectGpuPowerOfTwoFftFamily_TapeAndCompiledTrainingGradients_MatchCpu()

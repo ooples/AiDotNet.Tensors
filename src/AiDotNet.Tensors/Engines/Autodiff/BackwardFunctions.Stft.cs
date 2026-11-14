@@ -142,6 +142,7 @@ internal static partial class BackwardFunctions<T>
         var magnitude = polar.Tensor(polar.Magnitude);
         var mask = polar.Tensor(polar.Mask);
         var fill = polar.Tensor(polar.Fill);
+        var scale = polar.Tensor(polar.Scale);
         var emptyCos = polar.Tensor(polar.EmptyCos);
         var emptySin = polar.Tensor(polar.EmptySin);
         DifferentiableOps.RecordBinary("ComplexMagnitude", magnitude, re, im,
@@ -149,12 +150,17 @@ internal static partial class BackwardFunctions<T>
             {
                 var r = ins[0];
                 var i = ins[1];
-                var squared = eng.TensorAdd(eng.TensorAdd(eng.TensorMultiply(r, r), eng.TensorMultiply(i, i)), fill);
+                // Pre-scale nonzero bins by a detached power-of-two constant so u² + v² stays near [1, 8] without
+                // float32 underflow (e.g. 1e-30f) or overflow (e.g. 1e30f); u / sqrt(u² + v²) == r / sqrt(r² + i²)
+                // identically as a function of (r, i), preserving derivatives of every order.
+                var u = eng.TensorMultiply(r, scale);
+                var v = eng.TensorMultiply(i, scale);
+                var squared = eng.TensorAdd(eng.TensorAdd(eng.TensorMultiply(u, u), eng.TensorMultiply(v, v)), fill);
                 var reciprocal = eng.TensorDivide(mask, eng.TensorSqrt(squared));
                 DifferentiableOps.AccumulateGrad(grads, r,
-                    eng.TensorMultiply(g, eng.TensorAdd(eng.TensorMultiply(r, reciprocal), emptyCos)), eng);
+                    eng.TensorMultiply(g, eng.TensorAdd(eng.TensorMultiply(u, reciprocal), emptyCos)), eng);
                 DifferentiableOps.AccumulateGrad(grads, i,
-                    eng.TensorMultiply(g, eng.TensorAdd(eng.TensorMultiply(i, reciprocal), emptySin)), eng);
+                    eng.TensorMultiply(g, eng.TensorAdd(eng.TensorMultiply(v, reciprocal), emptySin)), eng);
             });
         return magnitude;
     }
@@ -164,9 +170,9 @@ internal static partial class BackwardFunctions<T>
     /// <see cref="PhaseGradientMagnitudeFloor"/>, as the first-order analysis adjoint's are.
     /// </summary>
     /// <remarks>
-    /// The derivative <c>(-im, re)/|C|²</c> is computed over <c>re² + im² + (1 - mask)</c>, which is never zero, so the
-    /// floored bins divide nothing by zero before the mask zeroes them (a zero mask times an infinite quotient would
-    /// still be NaN).
+    /// The derivative <c>(-im, re)/|C|²</c> is computed over scaled <c>u² + v² + (1 - mask)</c>, which is never zero
+    /// and never overflows float32, so the floored bins divide nothing by zero before the mask zeroes them (a zero mask
+    /// times an infinite quotient would still be NaN).
     /// </remarks>
     internal static Tensor<T> RecordedComplexPhase(Tensor<T> re, Tensor<T> im)
     {
@@ -175,16 +181,20 @@ internal static partial class BackwardFunctions<T>
         var mask = polar.Tensor(polar.Mask);
         var negativeMask = polar.Tensor(polar.NegativeMask);
         var fill = polar.Tensor(polar.Fill);
+        var scale = polar.Tensor(polar.Scale);
         DifferentiableOps.RecordBinary("ComplexPhase", phase, re, im,
             (g, ins, _, _, eng, grads) =>
             {
                 var r = ins[0];
                 var i = ins[1];
-                var squared = eng.TensorAdd(eng.TensorAdd(eng.TensorMultiply(r, r), eng.TensorMultiply(i, i)), fill);
+                var u = eng.TensorMultiply(r, scale);
+                var v = eng.TensorMultiply(i, scale);
+                var squared = eng.TensorAdd(eng.TensorAdd(eng.TensorMultiply(u, u), eng.TensorMultiply(v, v)), fill);
+                var scaledG = eng.TensorMultiply(g, scale);
                 DifferentiableOps.AccumulateGrad(grads, r,
-                    eng.TensorMultiply(g, eng.TensorMultiply(i, eng.TensorDivide(negativeMask, squared))), eng);
+                    eng.TensorMultiply(scaledG, eng.TensorMultiply(v, eng.TensorDivide(negativeMask, squared))), eng);
                 DifferentiableOps.AccumulateGrad(grads, i,
-                    eng.TensorMultiply(g, eng.TensorMultiply(r, eng.TensorDivide(mask, squared))), eng);
+                    eng.TensorMultiply(scaledG, eng.TensorMultiply(u, eng.TensorDivide(mask, squared))), eng);
             });
         return phase;
     }
@@ -195,7 +205,7 @@ internal static partial class BackwardFunctions<T>
         {
             Shape = shape;
             Magnitude = new T[length]; Phase = new T[length]; Mask = new T[length]; NegativeMask = new T[length];
-            Fill = new T[length]; EmptyCos = new T[length]; EmptySin = new T[length];
+            Fill = new T[length]; Scale = new T[length]; EmptyCos = new T[length]; EmptySin = new T[length];
         }
 
         private int[] Shape { get; }
@@ -205,6 +215,7 @@ internal static partial class BackwardFunctions<T>
         public T[] Mask { get; }
         public T[] NegativeMask { get; }
         public T[] Fill { get; }
+        public T[] Scale { get; }
         // (cos p, sin p) of the reported phase where the bin is at or below the floor, else 0.
         public T[] EmptyCos { get; }
         public T[] EmptySin { get; }
@@ -222,14 +233,33 @@ internal static partial class BackwardFunctions<T>
         for (int k = 0; k < r.Length; k++)
         {
             double x = ops.ToDouble(r[k]), y = ops.ToDouble(i[k]);
-            double m = Math.Sqrt(x * x + y * y);
+            double maxAbs = Math.Max(Math.Abs(x), Math.Abs(y));
+            // Compute hypot without double overflow/underflow either.
+            double m;
+            if (maxAbs == 0.0 || double.IsInfinity(maxAbs) || double.IsNaN(maxAbs))
+            {
+                m = maxAbs;
+            }
+            else
+            {
+                double nx = x / maxAbs, ny = y / maxAbs;
+                m = maxAbs * Math.Sqrt(nx * nx + ny * ny);
+            }
             double p = Math.Atan2(y, x);
             bool live = m > floor;
+            double s = 1.0;
+            if (live && maxAbs > 0.0 && !double.IsInfinity(maxAbs) && !double.IsNaN(maxAbs))
+            {
+                int exp = (int)Math.Floor(Math.Log(maxAbs) / 0.6931471805599453);
+                int shift = exp < -126 ? 126 : exp > 126 ? -126 : -exp;
+                s = Math.Pow(2.0, shift);
+            }
             values.Magnitude[k] = ops.FromDouble(m);
             values.Phase[k] = ops.FromDouble(p);
             values.Mask[k] = ops.FromDouble(live ? 1.0 : 0.0);
             values.NegativeMask[k] = ops.FromDouble(live ? -1.0 : 0.0);
             values.Fill[k] = ops.FromDouble(live ? 0.0 : 1.0);
+            values.Scale[k] = ops.FromDouble(s);
             values.EmptyCos[k] = ops.FromDouble(live ? 0.0 : Math.Cos(p));
             values.EmptySin[k] = ops.FromDouble(live ? 0.0 : Math.Sin(p));
         }
@@ -266,7 +296,9 @@ internal static partial class BackwardFunctions<T>
         var flat = engine.Reshape(waveform, new[] { batch, length });
         var gathered = engine.TensorIndexSelect(flat, new Tensor<int>(indices, new[] { indices.Length }), 1);
         var frames = engine.Reshape(gathered, new[] { batch, numFrames, nFft });
-        var windowed = engine.TensorMultiply(frames, engine.Reshape(window, new[] { 1, 1, nFft }));
+        var windowed = engine.TensorMultiply(
+            frames,
+            engine.TensorBroadcastTo(engine.Reshape(window, new[] { 1, 1, nFft }), frames._shape));
 
         var re = engine.TensorPermute(engine.TensorMatMul(windowed, DftBasis(nFft, numFreqs, imaginary: false)), new[] { 0, 2, 1 });
         var im = engine.TensorPermute(engine.TensorMatMul(windowed, DftBasis(nFft, numFreqs, imaginary: true)), new[] { 0, 2, 1 });

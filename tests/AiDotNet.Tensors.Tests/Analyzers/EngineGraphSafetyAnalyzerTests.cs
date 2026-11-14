@@ -64,6 +64,7 @@ namespace AiDotNet.Tensors.Engines
         private static Memory<float> AsFloatMemory<T>(Memory<T> m) => default;
         private static float ReadAll(ReadOnlyMemory<float> m) => 0f;
         private static void Consume(Memory<float> m) { }
+        private static ref T FirstWritable<T>(Tensor<T> t) => ref t.DataUnmarked.Span[0];
         private Tensor<Cell> _cells;
         public virtual T TensorMaxValue<T>(Tensor<T> x) { /*MAX*/ return default; }
         public virtual T TensorSum<T>(Tensor<T> x) { /*SUM*/ return default; }
@@ -73,9 +74,10 @@ namespace AiDotNet.Tensors.Engines
         public T Helper<T>(Tensor<T> x) => default;   // not an IEngine member
     }
 
-    public class DirectGpuTensorEngine : CpuEngine
+    public class DirectGpuTensorEngine : CpuEngine, IEngine
     {
         public override T TensorMaxValue<T>(Tensor<T> x) { /*GPUMAX*/ return default; }
+        T IEngine.TensorSum<T>(Tensor<T> x) { /*GPUSUM*/ return default; }
     }
 }
 ";
@@ -83,11 +85,12 @@ namespace AiDotNet.Tensors.Engines
     // Fills the stubs' marker comments (an unfilled marker is the rule-satisfying default) and analyzes the result.
     // TensorIsSameSize reads only shapes and is marked [HostValueFromMetadata] unless a case asks otherwise.
     private static ImmutableArray<Diagnostic> Analyze(string? max = null, string? gpuMax = null, string? conv = null,
-        bool markSameSize = true)
+        bool markSameSize = true, string? gpuSum = null)
     {
         string source = Stubs
             .Replace("/*MAX*/", max ?? "BeginHostScalarRead(x);")
             .Replace("/*GPUMAX*/", gpuMax ?? "BeginHostScalarRead(x);")
+            .Replace("/*GPUSUM*/", gpuSum ?? "BeginHostScalarRead(x);")
             .Replace("/*SUM*/", "BeginHostScalarRead(x);")
             .Replace("/*SAME*/", "")
             .Replace("/*CONV*/", conv ?? "");
@@ -133,6 +136,14 @@ namespace AiDotNet.Tensors.Engines
     }
 
     [Fact]
+    public void ExplicitInterfaceHostValueWithoutBoundary_IsReported()
+    {
+        var hit = Assert.Single(Analyze(gpuSum: "var n = x.Length;"));
+        Assert.Equal("TENS0040", hit.Id);
+        Assert.Contains("IEngine.TensorSum", LineOf(hit), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ShapeOnlyPredicate_IsReportedUntilMarked()
     {
         var hit = Assert.Single(Analyze(markSameSize: false));
@@ -173,6 +184,8 @@ namespace AiDotNet.Tensors.Engines
     [InlineData("System.ReadOnlySpan<T> s = kernel.DataUnmarked.Span; var v = s[0];")]
     [InlineData("var s = kernel.DataUnmarked.Span; var v = s[0];")]
     [InlineData("kernel.DataUnmarked.Span.CopyTo(output.DataUnmarked.Span);")]   // the source of a copy
+    [InlineData("ref readonly T Ro() => ref kernel.DataUnmarked.Span[0]; var v = Ro();")]
+    [InlineData("T ByVal() => kernel.DataUnmarked.Span[0]; var v = ByVal();")]
     public void WritableAccessorOnlyRead_IsReported(string body)
     {
         var hit = Assert.Single(Analyze(conv: body));
@@ -187,6 +200,8 @@ namespace AiDotNet.Tensors.Engines
     [InlineData("Consume(AsFloatMemory(output.DataUnmarked));")]                          // a writable argument
     [InlineData("var m = output.DataUnmarked; var h = m.Pin(); h.Dispose();")]           // a pin may write
     [InlineData("_cells.DataUnmarked.Span[0].Value = 1f;")]                               // a struct element's field
+    [InlineData("ref T Slot() => ref output.DataUnmarked.Span[0]; Slot() = default;")]    // a writable ref return
+    [InlineData("FirstWritable(output) = default;")]                                      // helper returning ref T
     public void WritableAccessorWritten_IsNotReported(string body)
     {
         Assert.Empty(Analyze(conv: body));

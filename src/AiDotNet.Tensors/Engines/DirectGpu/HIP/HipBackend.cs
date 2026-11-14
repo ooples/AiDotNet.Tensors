@@ -13148,28 +13148,30 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     public void Dispose()
     {
         if (TryParkForExport(Dispose)) return;
-        if (_returnToPool == null)
+        if (_returnToPool is not { } returnToPool)
         {
             Release();
             return;
         }
 
-        if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
+        if (Interlocked.CompareExchange(ref _poolState, 2, 0) != 0)
             return;
 
+        GC.SuppressFinalize(this);
         // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back. AllocateBuffer
         // charged a pooled buffer its size (pool hit or hipMalloc); without the credit a TensorScope's frees still counted
-        // toward a forced collection.
+        // toward a forced collection. Return the device pointer under a fresh wrapper (one lease, one wrapper) so any stale
+        // holder of this wrapper stays permanently released even after TryRent reuses the pooled memory.
         DeviceMemoryReclaim.OnDeviceRelease(SizeInBytes, TakeReclaimEpoch());
-        _memory.OnReturned();
+        var lease = Pooled(Handle, Capacity, OwningBackend, returnToPool, _memory.TransferToLease());
         try
         {
-            _returnToPool(this);
+            returnToPool(lease);
         }
         catch (Exception)
         {
             // If returning to pool fails for any reason, release directly
-            Release();
+            lease.Release();
         }
     }
 }
