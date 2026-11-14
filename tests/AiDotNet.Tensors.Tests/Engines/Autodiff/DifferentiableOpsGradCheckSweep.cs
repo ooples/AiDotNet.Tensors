@@ -699,7 +699,9 @@ public partial class DifferentiableOpsGradCheckSweep
 
     /// <summary>
     /// Invokes the op and returns what the sweeps differentiate: its returned tensor or, for an op whose results are
-    /// all out tensors, Σ_j (1 + 0.37·j)·sum(out_j), so an error in one output's gradient cannot cancel another's.
+    /// all out tensors, Σ_j Σ_e w_j[e]·out_j[e] with weights that differ per output and per element. A plain sum would
+    /// seed every element alike, which for a transform checks a single adjoint direction (an FFT's only the DC bin's),
+    /// and equal output weights would let an error in one output's gradient cancel another's.
     /// Auxiliary out results of a tensor-returning op (a norm's mean and variance, a max's indices) are statistics, not
     /// differentiated outputs, as torch marks them.
     /// </summary>
@@ -715,11 +717,20 @@ public partial class DifferentiableOpsGradCheckSweep
         for (int i = 0; i < ps.Length; i++)
         {
             if (!IsTensorOut(ps[i]) || call[i] is not Tensor<T> output) continue;
-            var term = engine.TensorMultiplyScalar(engine.ReduceSum(output, null),
-                MathHelper.GetNumericOperations<T>().FromDouble(1.0 + 0.37 * j++));
+            var term = engine.ReduceSum(engine.TensorMultiply(output, OutputWeights<T>(output._shape, j++)), null);
             total = total is null ? term : engine.TensorAdd(total, term);
         }
         return total ?? throw new InvalidOperationException($"{m.Name} wrote no out tensor.");
+    }
+
+    // Nonuniform, deterministic weights for out result j: no two elements and no two outputs share a weight pattern.
+    private static Tensor<T> OutputWeights<T>(int[] shape, int j)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var weights = new Tensor<T>((int[])shape.Clone());
+        for (int e = 0; e < weights.Length; e++)
+            weights[e] = ops.FromDouble(1.0 + 0.37 * j + 0.29 * Math.Sin(1.7 * e + 0.9 * j));
+        return weights;
     }
 
     /// <summary>The tensor arguments a gradient can flow to: every tensor argument except the out slots.</summary>

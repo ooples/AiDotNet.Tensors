@@ -232,12 +232,14 @@ public class StftGradientTests
 
         foreach (var (name, leaf) in new[] { ("x", x), ("w", window) })
         {
+            // graph[x] reaches both leaves: the window through the analysis, the waveform through the recorded
+            // magnitude node's backward, which multiplies by the recorded real and imaginary parts even at empty bins.
+            Assert.True(second.TryGetValue(leaf, out var s), $"center={center}: no second-order gradient reached {name}");
             for (int i = 0; i < leaf.Length; i++)
             {
                 Assert.True(Math.Abs(graph[leaf][i] - plain[leaf][i]) <= 1e-12 * Math.Max(1, Math.Abs(plain[leaf][i])),
                     $"center={center}, dL/d{name}[{i}]: create-graph {graph[leaf][i]:R}, first-order {plain[leaf][i]:R}");
-                if (second.TryGetValue(leaf, out var s))
-                    Assert.True(!double.IsNaN(s[i]) && !double.IsInfinity(s[i]), $"center={center}, second order d/d{name}[{i}] is {s[i]:R}");
+                Assert.True(!double.IsNaN(s[i]) && !double.IsInfinity(s[i]), $"center={center}, second order d/d{name}[{i}] is {s[i]:R}");
             }
         }
     }
@@ -306,5 +308,36 @@ public class StftGradientTests
         for (int i = 0; i < w.Length; i++)
             Assert.True(Math.Abs(compiledGrad[i] - eagerGrad[i]) <= 1e-10 * Math.Max(1, Math.Abs(eagerGrad[i])),
                 $"center={center}, dL/dw[{i}]: compiled {compiledGrad[i]:R}, tape {eagerGrad[i]:R}");
+    }
+
+    [Theory]
+    [InlineData(0, false)]   // DC of a constant negative frame: phase π
+    [InlineData(4, true)]    // Nyquist of an alternating frame whose Nyquist coefficient is negative: phase π
+    public void PhaseGradient_AtTheRealBins_IsExactlyZero(int bin, bool alternating)
+    {
+        // DC and the even-length Nyquist bin are real for a real frame, so their phase is 0 or π whatever the input and
+        // its gradient is zero. The float forward stores π rounded, whose sine is about -8.7e-8; seeding the adjoint from
+        // it and dividing by a magnitude of 8e-9 gave a waveform gradient of about 10.9 per sample.
+        const int n = 8;
+        var engine = new CpuEngine();
+        var x = new Tensor<float>(new[] { 1, n });
+        for (int i = 0; i < n; i++) x[i] = -1e-9f * (alternating && i % 2 == 1 ? -1f : 1f);
+        var window = new Tensor<float>(new[] { n });
+        for (int i = 0; i < n; i++) window[i] = 1f;
+
+        Dictionary<Tensor<float>, Tensor<float>> grads;
+        using (var tape = new GradientTape<float>())
+        {
+            engine.STFT(x, n, n, window, false, out Tensor<float> _, out Tensor<float> phase);
+            Assert.True(Math.Abs(Math.Abs(phase[bin]) - Math.PI) < 1e-6, $"bin {bin} phase {phase[bin]:R}, expected ±π");
+            var seed = new Tensor<float>((int[])phase._shape.Clone());
+            seed[bin] = 1f;
+            grads = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(phase, seed), null), new[] { x, window });
+        }
+
+        Assert.True(grads.TryGetValue(x, out var gx), "no waveform gradient was recorded");
+        for (int i = 0; i < n; i++) Assert.Equal(0f, gx[i]);
+        Assert.True(grads.TryGetValue(window, out var gw), "no window gradient was recorded");
+        for (int i = 0; i < n; i++) Assert.Equal(0f, gw[i]);
     }
 }

@@ -25,6 +25,13 @@ public enum NoGradientReason
     LowPrecisionKernel,
 }
 
+/// <summary>Why an op in <see cref="OpRegistry.NonDifferentiableOps"/> cannot be driven by the audit.</summary>
+public enum NotAuditableReason
+{
+    /// <summary>Its valid inputs have a structure neither the argument synthesizer nor a case table entry builds.</summary>
+    NoSynthesizableInput,
+}
+
 /// <summary>
 /// Audits <see cref="OpRegistry.NonDifferentiableOps"/> against the ops themselves.
 /// </summary>
@@ -40,7 +47,8 @@ public enum NoGradientReason
 /// out result for an op with no return) at a few elements of each tensor input. A derivative that is nonzero and stable
 /// under halving the step is a smooth dependence: the op is differentiable and must record a backward, unless
 /// <see cref="NoGradientBy"/> says why not. Comparisons, indicators, rounding, integer and index ops have a zero
-/// derivative at generic points and pass; an op whose output varies between identical calls is reported, not audited.
+/// derivative at generic points and pass. An op that varies between identical calls fails unless it is a listed random
+/// draw, and an op the audit cannot invoke fails unless <see cref="NotAuditable"/> says why.
 /// </para>
 /// </remarks>
 public partial class DifferentiableOpsGradCheckSweep
@@ -67,6 +75,12 @@ public partial class DifferentiableOpsGradCheckSweep
         ["TensorRandintLike"] = NoGradientReason.RandomDraw,
     };
 
+    /// <summary>
+    /// Ops the audit cannot invoke, each with its reason. Every other op it fails to drive fails the audit: an op that
+    /// is never invoked is never verified, so an unexplained skip would let a wrong classification pass.
+    /// </summary>
+    internal static readonly Dictionary<string, NotAuditableReason> NotAuditable = new(StringComparer.Ordinal);
+
     [Fact]
     public void EveryNonDifferentiableOp_HasNoSmoothDerivative()
     {
@@ -74,6 +88,7 @@ public partial class DifferentiableOpsGradCheckSweep
         var exemptedAndSmooth = new HashSet<string>(StringComparer.Ordinal);
         var exemptedAndAudited = new HashSet<string>(StringComparer.Ordinal);
         var notDriven = new List<string>();
+        var drivenButExcluded = new HashSet<string>(StringComparer.Ordinal);
         var nondeterministic = new List<string>();
         int audited = 0;
 
@@ -85,16 +100,23 @@ public partial class DifferentiableOpsGradCheckSweep
             if (!OpRegistry.NonDifferentiableOps.Contains(name)) continue;
             MethodInfo m;
             try { m = def.MakeGenericMethod(typeof(double)); }
-            catch (ArgumentException) { notDriven.Add($"{name}: cannot bind <double>"); continue; }
+            catch (ArgumentException) { if (!NotAuditable.ContainsKey(name)) notDriven.Add($"{name}: cannot bind <double>"); continue; }
 
             var args = DriveArgs(m, name);
-            if (args is null) { notDriven.Add($"{name}|{ParamFingerprint(m)}: no valid invocation"); continue; }
+            if (args is null)
+            {
+                if (!NotAuditable.ContainsKey(name)) notDriven.Add($"{name}|{ParamFingerprint(m)}: no valid invocation");
+                continue;
+            }
+            if (NotAuditable.ContainsKey(name)) drivenButExcluded.Add(name);
 
             var inputs = InputTensors<double>(m, args);
             if (inputs.Length == 0) continue; // nothing to depend on (a creation op given only sizes)
             if (Evaluate(m, args) is not { } f0 || !(Evaluate(m, args) is { } f1 && f0.Equals(f1)))
             {
-                nondeterministic.Add($"{name}|{ParamFingerprint(m)}");
+                // Only a random draw may vary between identical calls; anything else varying is a defect of its own.
+                if (!(NoGradientBy.TryGetValue(name, out var reason) && reason == NoGradientReason.RandomDraw))
+                    nondeterministic.Add($"{name}|{ParamFingerprint(m)}");
                 continue;
             }
 
@@ -119,6 +141,14 @@ public partial class DifferentiableOpsGradCheckSweep
             + "them silently gets no gradient. Record a backward and move each to DifferentiableOps, or add it to "
             + "NoGradientBy with its reason:\n" + string.Join("\n", smooth.OrderBy(x => x)));
         Assert.True(stale.Count == 0, "NoGradientBy entries with no smooth dependence (remove them): " + string.Join(", ", stale));
+        Assert.True(notDriven.Count == 0,
+            $"{notDriven.Count} op(s) in OpRegistry.NonDifferentiableOps were never invoked, so their classification is "
+            + "unverified. Add a case table entry that drives each, or list it in NotAuditable with its reason:\n"
+            + string.Join("\n", notDriven.OrderBy(x => x)));
+        Assert.True(nondeterministic.Count == 0,
+            "Ops that vary between identical calls but are not listed as a RandomDraw: " + string.Join(", ", nondeterministic.OrderBy(x => x)));
+        Assert.True(drivenButExcluded.Count == 0,
+            "NotAuditable entries the audit can drive (remove them): " + string.Join(", ", drivenButExcluded.OrderBy(x => x)));
     }
 
     private object[]? DriveArgs(MethodInfo m, string name)
