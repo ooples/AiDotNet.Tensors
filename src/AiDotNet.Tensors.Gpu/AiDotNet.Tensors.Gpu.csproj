@@ -36,7 +36,7 @@
     <!-- 0.102.x is this package's version scheme (NOT the NVIDIA CUDA toolkit
          version). The previous 12.5.0 pin never existed on nuget.org, which
          broke restore for this meta-package and every consumer of it. -->
-    <PackageReference Include="AiDotNet.Native.CUDA" Version="0.102.13" />
+    <PackageReference Include="AiDotNet.Native.CUDA" Version="0.150.0" />
   </ItemGroup>
 
   <ItemGroup>
