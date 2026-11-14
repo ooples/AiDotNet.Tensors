@@ -100,7 +100,7 @@ public class CompletedStepLrScheduleTests
         Assert.Throws<InvalidDataException>(() => cp.ToSchedule());
 
         var seq = LrSchedule.Sequential(new[] { LrSchedule.Constant(1), LrSchedule.Polynomial(1, 5) }, new[] { 3 }).TryCaptureCheckpoint()!;
-        var truncated = new FusedLrScheduleCheckpoint(seq.Kind, seq.Doubles, seq.Ints[..^1]);
+        var truncated = new FusedLrScheduleCheckpoint(seq.Kind, seq.Doubles, seq.Ints.Take(seq.Ints.Length - 1).ToArray());
         Assert.Throws<InvalidDataException>(() => truncated.ToSchedule());
 
         var nan = LrSchedule.Polynomial(1, 5).TryCaptureCheckpoint()!;

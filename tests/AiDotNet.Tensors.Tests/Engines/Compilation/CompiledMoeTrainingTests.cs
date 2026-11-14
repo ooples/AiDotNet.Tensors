@@ -58,11 +58,11 @@ public class CompiledMoeTrainingTests : IDisposable
         public Tensor<float>[] Parameters => new[] { Router, W1, W3, W2 };
         private readonly bool _readMidTrace;
 
-        public Model(IEngine engine, bool readMidTrace = false)
+        public Model(IEngine engine, bool readMidTrace = false, bool hostBias = false)
         {
             _readMidTrace = readMidTrace;
             if (engine is DirectGpuTensorEngine)
-                foreach (var t in Parameters.Append(Bias)) t.Gpu();
+                foreach (var t in hostBias ? Parameters : Parameters.Concat(new[] { Bias })) t.Gpu();
         }
 
         /// <summary>The training forward: route, run the experts, nudge the bias toward balance, return the loss.</summary>
@@ -105,9 +105,9 @@ public class CompiledMoeTrainingTests : IDisposable
     }
 
     private static (double[] Losses, float[][] Weights, float[] Bias, bool Replayed) TrainCompiled(IEngine e, bool capture,
-        bool readMidTrace = false)
+        bool readMidTrace = false, bool hopThreads = false, bool hostBias = false)
     {
-        var m = new Model(e, readMidTrace);
+        var m = new Model(e, readMidTrace, hostBias);
         ICompiledTrainingPlan<float> plan;
         Feed(m.X, m.Y, 0);
         using (var scope = GraphMode.EnableTraining(m.Parameters))
@@ -124,7 +124,19 @@ public class CompiledMoeTrainingTests : IDisposable
             for (int s = 0; s < Steps; s++)
             {
                 if (s > 0) Feed(m.X, m.Y, s);
-                losses[s] = plan.Step().ToArray()[0];
+                if (!hopThreads) { losses[s] = plan.Step().ToArray()[0]; continue; }
+                // An async training loop resumes on another pool thread after an await: each step here runs on a new
+                // thread, one after another.
+                double stepLoss = double.NaN;
+                Exception? failure = null;
+                var worker = new System.Threading.Thread(() =>
+                {
+                    try { stepLoss = plan.Step().ToArray()[0]; } catch (Exception ex) { failure = ex; }
+                });
+                worker.Start();
+                worker.Join();
+                if (failure is not null) throw new InvalidOperationException("step " + s + " failed", failure);
+                losses[s] = stepLoss;
             }
             var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
@@ -171,9 +183,11 @@ public class CompiledMoeTrainingTests : IDisposable
     }
 
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Gpu_CompiledMoePlan_TrainsLikeTheEagerTape(bool capture)
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(true, false, true)]
+    public void Gpu_CompiledMoePlan_TrainsLikeTheEagerTape(bool capture, bool hopThreads, bool hostBias)
     {
         DirectGpuTensorEngine? gpu = null;
         try
@@ -195,8 +209,11 @@ public class CompiledMoeTrainingTests : IDisposable
             }
             var eager = TrainEager(gpu!);
             AssertNotVacuous(eager);
-            var compiled = TrainCompiled(gpu!, capture);
-            AssertSameTraining(capture ? "gpu-captured" : "gpu", eager, (compiled.Losses, compiled.Weights, compiled.Bias), 1e-4);
+            // A host-only bias (HreLm's router keeps its bias on the host): the in-place nudge took the host path and the
+            // MoE re-uploaded the bias inside the capture, so the plan never captured.
+            var compiled = TrainCompiled(gpu!, capture, hopThreads: hopThreads, hostBias: hostBias);
+            AssertSameTraining(capture ? (hopThreads ? "gpu-captured-hopping" : "gpu-captured") : "gpu", eager, (compiled.Losses, compiled.Weights, compiled.Bias), 1e-4);
+            // A thread change between steps is not a second trainer: it used to turn capture off for the engine's life.
             if (capture) Assert.True(compiled.Replayed, "the captured plan is not replaying a graph after warm-up");
         }
     }

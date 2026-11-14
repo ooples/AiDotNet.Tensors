@@ -5717,23 +5717,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Whole-step CUDA-graph capture assumes nothing else uses this engine's GPU while a step records: its warm-up, pre-pass
     // and capture share the engine's device caches and stream with any other thread's work, so a second thread training
     // on the same engine corrupted captured steps and faulted the context (CUDA 700; concurrent GPU Autoformer,
-    // AiDotNet#1804). PyTorch states the same rule for torch.cuda.graph. So capture is for an engine one thread trains
-    // on: the first compiled step's thread owns it, and once another thread steps, no plan on the engine captures again.
+    // AiDotNet#1804). PyTorch states the same rule for torch.cuda.graph. So capture is for an engine one training uses:
+    // the first compiled step's thread and plan own it, and once another thread steps a different plan, no plan on the
+    // engine captures again.
+    // A thread change alone is not a second trainer: an async training loop resumes on whichever pool thread finishes
+    // its await (AiModelBuilder's streaming loop after each validation), and its steps never overlap. That hop turned
+    // capture off for good, and the HreLm transformer trained at 230 ms/step with validation against 57 without.
     private int _compiledStepThread;
+    private long _compiledStepPlan;
     private volatile bool _compiledStepsFromSeveralThreads;
     private readonly object _graphCaptureGate = new();
 
     /// <summary>
-    /// Records that the calling thread runs a compiled training step on this engine. A thread other than the first marks
-    /// the engine shared, after waiting out any capture in progress (<see cref="EnterGraphCaptureExclusion"/>), so no capture
-    /// can be recording while that thread's GPU work starts.
+    /// Records that the calling thread runs a compiled training step of plan <paramref name="planId"/> on this engine.
+    /// The owner's thread may change plans (a recompile) and the owner's plan may change threads (an async loop's
+    /// continuation): ownership follows. A different plan on a different thread marks the engine shared, after waiting
+    /// out any capture in progress (<see cref="EnterGraphCaptureExclusion"/>), so no capture can be recording while that
+    /// thread's GPU work starts.
     /// </summary>
-    internal void NoteCompiledStepThread()
+    internal void NoteCompiledStepThread(long planId)
     {
+        if (_compiledStepsFromSeveralThreads) return;
         int thread = Environment.CurrentManagedThreadId;
-        int owner = System.Threading.Interlocked.CompareExchange(ref _compiledStepThread, thread, 0);
-        if (owner == 0 || owner == thread || _compiledStepsFromSeveralThreads) return;
-        lock (_graphCaptureGate) _compiledStepsFromSeveralThreads = true;
+        if (System.Threading.Volatile.Read(ref _compiledStepThread) == thread
+            && System.Threading.Interlocked.Read(ref _compiledStepPlan) == planId) return;
+        lock (_graphCaptureGate)
+        {
+            if (_compiledStepsFromSeveralThreads) return;
+            if (_compiledStepThread == 0 || _compiledStepThread == thread || _compiledStepPlan == planId)
+            {
+                System.Threading.Volatile.Write(ref _compiledStepThread, thread);
+                System.Threading.Interlocked.Exchange(ref _compiledStepPlan, planId);
+                return;
+            }
+            _compiledStepsFromSeveralThreads = true;
+        }
     }
 
     /// <summary>

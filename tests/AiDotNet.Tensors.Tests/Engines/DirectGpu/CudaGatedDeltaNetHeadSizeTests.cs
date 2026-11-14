@@ -93,7 +93,7 @@ public sealed class CudaGatedDeltaNetHeadSizeTests
                         if (det && previous is not null)
                             for (int g = 0; g < 5; g++)
                                 for (int i = 0; i < results[g].Length; i++)
-                                    Assert.True(BitConverter.SingleToInt32Bits(previous[g][i]) == BitConverter.SingleToInt32Bits(results[g][i]),
+                                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(previous[g][i]) == TestHelpers.MathCompat.SingleToInt32Bits(results[g][i]),
                                         $"deterministic {names[g]}[{i}]: {previous[g][i]:R} then {results[g][i]:R}");
                         if (det) previous = results;
                     }

@@ -98,6 +98,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private long _pingPongClaimEpochSeen = -1;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
+    // Identifies this plan to the engine's single-trainer capture rule (DirectGpuTensorEngine.NoteCompiledStepThread).
+    private static long s_nextPlanId;
+    private readonly long _planId = System.Threading.Interlocked.Increment(ref s_nextPlanId);
     /// <summary>Set when <see cref="TryRunResidentBody"/> threw; later steps use StepEager.</summary>
     private bool _residentStepFailed;
     private bool _graphEvictionSuspended;   // eviction suspended for the graph lifetime (resumed on Dispose)
@@ -724,6 +727,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         GraphCaptureFailureReason = reason;
         System.Diagnostics.Trace.TraceWarning(
             "CUDA graph capture of the compiled training step failed; this plan trains without graph replay from now on. " + reason);
+        if (s_graphStepDiagnosticsEnabled)
+        {
+            try
+            {
+                System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"),
+                    "[GRAPHSTEP-DIAG] CAPTURE-FAILED " + reason + System.Environment.NewLine);
+            }
+            catch { /* diagnostic only */ }
+        }
     }
 
     /// <summary>Keeps THIS plan's captured SGD update in place (one step graph): the oracle for the ping-pong update.</summary>
@@ -843,12 +855,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private List<(Tensor<T> State, T[] Values)> SnapshotInPlaceState()
     {
         var saved = new List<(Tensor<T> State, T[] Values)>();
-        if (_forwardSteps is null) return saved;
-        foreach (var state in _forwardSteps.Where(IsInPlaceState).Select(step => step.OutputBuffer)
-                     .Distinct(ReferenceEqualityComparer<Tensor<T>>.Instance))
-            saved.Add((state, state.ToArray()));
+        foreach (var state in InPlaceStateTensors()) saved.Add((state, state.ToArray()));
         return saved;
     }
+
+    /// <summary>Every tensor the forward updates in place (see <see cref="IsInPlaceState"/>), once each.</summary>
+    private Tensor<T>[] InPlaceStateTensors()
+        => _inPlaceStateTensors ??= _forwardSteps is null
+            ? Array.Empty<Tensor<T>>()
+            : _forwardSteps.Where(IsInPlaceState).Select(step => step.OutputBuffer)
+                .Distinct(ReferenceEqualityComparer<Tensor<T>>.Instance).ToArray();
+
+    private Tensor<T>[]? _inPlaceStateTensors;
 
     /// <summary>
     /// Writes <see cref="SnapshotInPlaceState"/>'s values back. A state the pre-pass left bound to a device buffer gets
@@ -3814,7 +3832,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Taking it only once the engine was seen shared left a race: a step that read "not shared" kept running
         // unlocked beside the first step of the thread that made it shared. Uncontended, the lock costs nothing.
         var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
-        gpuEngine?.NoteCompiledStepThread();
+        gpuEngine?.NoteCompiledStepThread(_planId);
         if (gpuEngine is null) return StepLocked();
         lock (gpuEngine.CompiledStepLock) return StepLocked();
     }
@@ -4525,6 +4543,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 de.EnsureResidentInput(leaf);
                 if (leaf._gpuBuffer is { } bound) _ownedLeafBuffers[leaf] = bound;
             }
+        // The same for state the forward updates in place (a router's selection bias nudged from its loads, a running
+        // statistic). It is its own node's output, so it is not an external leaf, and nothing else gives it a buffer:
+        // a host-only state took the in-place op's host path (a download inside the capture), and the next step's
+        // reader re-uploaded it there, so HreLm's moe-g never captured (CUDA 900, "weight upload"). Bound here, the
+        // update runs on the device and every replay reads and writes the one buffer the graph bakes in.
+        if (de is not null && !IsCapturing())
+            foreach (var state in InPlaceStateTensors())
+                if (state._gpuBuffer is null && !Array.Exists(_parameters, p => ReferenceEquals(p, state)))
+                    de.EnsureResidentInput(state);
         _preForwardParamTransform?.Invoke();
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
