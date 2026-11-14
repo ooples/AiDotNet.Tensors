@@ -4454,9 +4454,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>
     /// Whether a device plan pools the gradients that alias views point at (an add's, a reshape's or a channel-bias add's
-    /// output gradient) with the other liveness-pooled gradients. On by default; tests compare both.
+    /// output gradient) with the other liveness-pooled gradients. On by default; AIDOTNET_GPU_POOL_ALIAS_GRADS=0 turns it
+    /// off; tests compare both.
     /// </summary>
-    internal static bool PoolAliasTargetGradients { get; set; } = true;
+    internal static bool PoolAliasTargetGradients { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_POOL_ALIAS_GRADS") != "0";
 
     /// <summary>Test hook: the device buffers this plan's step scratch holds now (kept slots, transient arena, free leases).</summary>
     internal int ScratchBufferCount => _scratchPool?.BufferCount ?? 0;
