@@ -167,4 +167,99 @@ public class CompiledGradientPoolingTests
                     $"parameter {i}[{j}]: eager {expected[j]}, pooled {pooled[i][j]}");
         }
     }
+    // Reshape chains and residual adds: the gradients of their inputs view their outputs' gradient buffers (alias views).
+    // On a device plan those viewed buffers are pooled too, with every read through a view counted as a use of the buffer.
+    private static Tensor<float> AliasForward(IEngine engine, Tensor<float> input, Tensor<float>[] p)
+    {
+        var h = engine.Tanh(engine.TensorMatMul(input, p[0]));                                   // [4, 8]
+        var folded = engine.Tanh(engine.Reshape(h, new[] { 2, 16 }));                             // reshape alias
+        var back = engine.Reshape(engine.Reshape(folded, new[] { 32 }), new[] { 4, 8 });          // chain of reshapes
+        var residual = engine.TensorAdd(back, engine.Tanh(engine.TensorMatMul(back, p[1])));     // multi-consumer add
+        var residual2 = engine.TensorAdd(residual, engine.Tanh(engine.TensorMatMul(residual, p[2])));
+        var z = engine.Tanh(engine.TensorMatMul(engine.Reshape(engine.Reshape(residual2, new[] { 32 }), new[] { 4, 8 }), p[3]));
+        return engine.ReduceSum(engine.TensorMultiply(z, z), null);
+    }
+
+    private static float[][] RunCompiledOnDevice(DirectGpuTensorEngine engine, Tensor<float> input, bool pooling, out int pooledCount,
+        out int aliasViews)
+    {
+        string? previous = Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_VIEWS");
+        Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_VIEWS", pooling ? null : "0");
+        try
+        {
+            var ps = new[] { Filled(new[] { 8, 8 }, 31, 0.8f), Filled(new[] { 8, 8 }, 32, 0.8f), Filled(new[] { 8, 8 }, 33, 0.8f), Filled(new[] { 8, 8 }, 34, 0.8f) };
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(ps))
+            {
+                AliasForward(engine, input, ps);
+                plan = scope.CompileTraining(ps);
+            }
+            using (plan)
+            {
+                var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+                pooledCount = concrete.PooledGradientCount;
+                aliasViews = concrete.PoolableAliasViewCount;
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+                // Enough steps for the uncaptured runs, the step-graph capture and its replays.
+                const int steps = 6;
+                var result = new float[ps.Length * steps][];
+                for (int step = 0; step < steps; step++)
+                {
+                    plan.Step();
+                    for (int i = 0; i < ps.Length; i++)
+                    {
+                        var grad = ps[i].Grad;
+                        Assert.True(grad is not null, $"parameter {i} step {step}: no gradient");
+                        result[step * ps.Length + i] = grad is null ? Array.Empty<float>() : grad.ToArray();
+                    }
+                }
+                return result;
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_VIEWS", previous);
+        }
+    }
+
+    [SkippableFact]
+    public void DevicePlan_PoolsTheBuffersAliasViewsRead_AndKeepsGradientsBitForBit()
+    {
+        var prior = AiDotNetEngine.Current;
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        bool resolved = gpu is not null && gpu.IsGpuAvailable;
+        if (!resolved && string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GPU tests required (AIDOTNET_REQUIRE_GPU_TESTS=1) but no GPU backend resolved.");
+        Skip.IfNot(resolved, "GPU backend did not resolve.");
+        try
+        {
+            AiDotNetEngine.Current = gpu!;
+            var input = Filled(new[] { 4, 8 }, 3, 2f);
+            var pooled = RunCompiledOnDevice(gpu!, input, pooling: true, out int pooledCount, out int aliasViews);
+            var unpooled = RunCompiledOnDevice(gpu!, input, pooling: false, out int unpooledCount, out _);
+            Assert.True(pooledCount > 0, "no gradient was pooled, so this test proves nothing");
+            Assert.True(aliasViews > 0, "no alias view reads a pooled buffer, so this test proves nothing");
+            Assert.Equal(0, unpooledCount);
+            for (int k = 0; k < pooled.Length; k++)
+                Assert.Equal(unpooled[k], pooled[k]);
+
+            var cpu = new CpuEngine();
+            var eagerParams = new[] { Filled(new[] { 8, 8 }, 31, 0.8f), Filled(new[] { 8, 8 }, 32, 0.8f), Filled(new[] { 8, 8 }, 33, 0.8f), Filled(new[] { 8, 8 }, 34, 0.8f) };
+            using var tape = new GradientTape<float>();
+            var grads = tape.ComputeGradients(AliasForward(cpu, input, eagerParams), sources: eagerParams);
+            for (int i = 0; i < eagerParams.Length; i++)
+            {
+                var expected = grads[eagerParams[i]].ToArray();
+                for (int j = 0; j < expected.Length; j++)
+                    Assert.True(Math.Abs(expected[j] - pooled[i][j]) <= 1e-3f * (1f + Math.Abs(expected[j])),
+                        $"parameter {i}[{j}]: CPU eager {expected[j]}, device pooled {pooled[i][j]}");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+            gpu?.Dispose();
+        }
+    }
 }

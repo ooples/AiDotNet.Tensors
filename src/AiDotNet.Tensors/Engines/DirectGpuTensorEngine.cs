@@ -6384,6 +6384,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
     }
 
+    /// <summary>
+    /// A resident result created without a host array (<see cref="Tensor{T}.CreateGpuResident"/>) on step scratch:
+    /// <see cref="BindResidentBuffer"/> arms downloads by host array, so this arms the deferred download by the tensor's
+    /// vector instead (as <c>DeferTensorResult</c> does) without taking ownership of the buffer, which the step's scratch
+    /// pool owns. Nothing is allocated on the host unless something reads it there. ViT's uncaptured steps allocated (and
+    /// zeroed) 110 MB of never-read host arrays per step for these outputs, most of the process's peak resident set.
+    /// </summary>
+    private static void ArmLazyResidentDownload<T>(Tensor<T> tensor, IGpuBuffer buffer, IDirectGpuBackend backend)
+    {
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;   // array-backed: BindResidentBuffer armed it
+        var capturedBuffer = buffer;
+        var capturedBackend = backend;
+        Helpers.HostSync.Register(tensor.DataVector, obj =>
+        {
+            var vec = (LinearAlgebra.VectorBase<T>)obj;
+            var converted = DirectGpuEngine.FromFloatArray<T>(capturedBackend.DownloadBuffer(capturedBuffer));
+            if (converted.Length == vec.Length)
+            {
+                vec.MaterializeBacking(converted);
+            }
+            else
+            {
+                var logical = new T[vec.Length];
+                Array.Copy(converted, logical, Math.Min(converted.Length, logical.Length));
+                vec.MaterializeBacking(logical);
+            }
+        });
+    }
+
     private ActivationCacheEntry? RekeyActivationCacheForResidentBinding<T>(
         Tensor<T> tensor,
         object arrayKey,
@@ -9308,7 +9337,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var wBuf = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
             using var bBuf = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
             int[] outShape = (int[])input.Shape._dims.Clone(); outShape[^1] = N;
-            var outTensor = new Tensor<T>(new T[(long)M * N], outShape);
+            // On the pooled step the output lives in step scratch and no host array is needed (see ArmLazyResidentDownload).
+            var outTensor = ScratchPoolingActive ? Tensor<T>.CreateGpuResident(outShape, backend.DeviceType)
+                : new Tensor<T>(new T[(long)M * N], outShape);
             var outBuf = GetOrCreateResidentBuffer(backend, outTensor, M * N, fullyWritten: true);   // GEMM with beta 0
             if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < (long)M * K
                 || wBuf.Buffer.Handle == System.IntPtr.Zero || wBuf.Buffer.Size < (long)K * N
@@ -9331,6 +9362,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             ResidentSyncCheck("FusedLinear");
             BindResidentBuffer(outTensor, outBuf, backend);
+            ArmLazyResidentDownload(outTensor, outBuf, backend);
             result = outTensor;
             return true;
         }

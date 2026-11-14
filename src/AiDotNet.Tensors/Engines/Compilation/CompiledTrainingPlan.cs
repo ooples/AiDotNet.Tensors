@@ -302,6 +302,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             DetachDeviceBinding(grad);
             using (var own = new Tensor<T>((int[])grad._shape.Clone()))
                 grad.RebindStorageFrom(own);
+            ViewsFollowRoot(grad);
         }
         _pooledGradients = null;
         _deferredZeroByAction = null;
@@ -309,6 +310,26 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _pooledGradDeviceBuffers = null;
         _pooledGradZeroAtStart = null;
         _cachedGradArrays = null;   // rebound, and the first eager step then zeroes every gradient
+    }
+
+    // Alias gradient views whose root is pooled (view -> root); see AliasReshapeViewGradients.
+    private Dictionary<Tensor<T>, Tensor<T>>? _viewGradRoots;
+
+    /// <summary>Test hook: how many alias gradient views read a buffer gradient pooling may share.</summary>
+    internal int PoolableAliasViewCount => _viewGradRoots?.Count ?? 0;
+
+    /// <summary>An unpooled root's alias views drop the shared device buffer and view the root's new array.</summary>
+    private void ViewsFollowRoot(Tensor<T> root)
+    {
+        if (_viewGradRoots is null) return;
+        foreach (var pair in _viewGradRoots)
+        {
+            if (!ReferenceEquals(pair.Value, root)) continue;
+            var view = pair.Key;
+            DetachDeviceBinding(view);
+            using (var fresh = root.ReshapeViewUnrecorded(view._shape))
+                view.RebindStorageFrom(fresh);
+        }
     }
 
     /// <summary>Gives pooled gradient <paramref name="index"/> an array of its own, leaving the other tenants of its array
@@ -320,6 +341,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         DetachDeviceBinding(grad);
         using (var own = new Tensor<T>((int[])grad._shape.Clone()))
             grad.RebindStorageFrom(own);
+        ViewsFollowRoot(grad);
         pooled[index] = false;
         _cachedGradArrays = null;   // rebound
     }
@@ -1747,13 +1769,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<Tensor<T>> allGrads,
         bool staticReverseBackward,
         out List<(Tensor<T> View, Tensor<T> Target)>? deviceAliases,
-        Func<Tensor<T>, Tensor<T>>? remainingGradient = null)
+        Func<Tensor<T>, Tensor<T>>? remainingGradient,
+        out Dictionary<Tensor<T>, Tensor<T>>? poolableViewRoots)
     {
         deviceAliases = null;
+        poolableViewRoots = null;
         // The buffer each aliased gradient is ultimately a view of.
         var rootOf = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         bool device = engine.SupportsGpu || engine.Is<Engines.DirectGpuTensorEngine>();
         HashSet<CompiledStep<T>>? aliased = null;
+        // On a device plan the buffers the views alias are placeholders too, so gradient pooling can share them: the GPU
+        // step binds each view to its target's device buffer after pooling binds the targets, and the compile re-points
+        // each view's host storage at its root once pooling settles the roots (RebindViewGradients). On ViT these
+        // buffers were 150 MB of the step's device and host footprint, all live at once. The host plan keeps them as
+        // arrays of their own: its specialized builders pin a view's array while the backward is built.
+        bool poolRoots = device && remainingGradient is not null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
         // With AIDOTNET_COMPILED_INPUT_GRADS the external leaves publish .Grad from the backward that writes them. An
         // aliased leaf's gradient is a view written by no backward (the add's is skipped), so its .Grad would never be
@@ -1784,7 +1814,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             if (!gradMap.TryGetValue(output, out var outputGrad))
             {
-                outputGrad = TensorAllocator.RentUninitialized<T>(output._shape);
+                outputGrad = poolRoots ? remainingGradient!(output) : TensorAllocator.RentUninitialized<T>(output._shape);
                 gradMap[output] = outputGrad;
                 allGrads.Add(outputGrad);
             }
@@ -1844,6 +1874,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             AliasMultiConsumerPassThroughs(forwardSteps, parameterSet, device, gradMap, dropped, rootOf, ref deviceAliases);
         if (dropped.Count > 0)
             allGrads.RemoveAll(g => dropped.Contains(g));
+        if (poolRoots && rootOf.Count > 0) poolableViewRoots = rootOf;
         return aliased;
     }
 
@@ -9291,6 +9322,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             t_gradPlaceholders = null;
+            t_gradViewRoots = null;
             t_requestedInputGradientLeaves = null;
             t_requestedInputGradientSteps = null;
         }
@@ -9459,8 +9491,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Gradient pooling: every gradient starts as a placeholder view of one shared scratch array, so building
         // the backward does not materialize a buffer per traced tensor (the gradients were the largest part of a CPU
         // training plan's footprint). Once the backward is built, PoolGradientBuffers gives gradients with disjoint
-        // lifetimes shared arrays and every other gradient an array of its own. Reshape-aliased gradients keep real
-        // buffers (an alias view could not follow a re-pointed target) and are never pooled. On a GPU engine the
+        // lifetimes shared arrays and every other gradient an array of its own. An alias view itself is never a tenant;
+        // on a host plan the buffer it views keeps an array of its own, on a device plan that buffer is pooled with the
+        // view's uses counted as its own and the view re-pointed after (AliasReshapeViewGradients). On a GPU engine the
         // tenants of one array share one device buffer too (BindPooledGradientsResident): a GPU DenseNet-121 step held
         // 3.7 GB of per-tensor gradient buffers on the device, past the card, so the driver paged to host memory.
         // AIDOTNET_COMPILED_GRAD_VIEWS=0 turns it off.
@@ -9468,6 +9501,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && (engine.SupportsGpu ? typeof(T) == typeof(float) : typeof(T) == typeof(float) || typeof(T) == typeof(double))
             && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_VIEWS") != "0";
         HashSet<Tensor<T>>? gradPlaceholders = null;
+        // Alias gradient views whose root buffer gradient pooling may re-point (device plans; see AliasReshapeViewGradients).
+        Dictionary<Tensor<T>, Tensor<T>>? viewGradRoots = null;
         if (useGradPool)
         {
             gradPoolReZeroByPosition = BuildPooledGradMap(allTensors, forwardSteps, parameters,
@@ -9496,8 +9531,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool staticReverseBackward = engine.SupportsGpu
                 && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
             aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, allTensors, parameters, consumerCount, engine, gradMap, allGrads,
-                staticReverseBackward, out aliasedGradViews, placeholderGradient);
+                staticReverseBackward, out aliasedGradViews, placeholderGradient, out viewGradRoots);
             if (gradPlaceholders is not null) t_gradPlaceholders = gradPlaceholders;
+            t_gradViewRoots = viewGradRoots;
         }
 
         // #1624 prototype: quantify how much the per-traced-tensor gradient buffer
@@ -10245,11 +10281,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
                 (deferredZeroByAction, pooledGradients) = PoolGradientBuffers(backwardActions, actionCoverage, forwardSteps,
-                    gradMap, allGrads, parameters, lossOutput, gradPlaceholders);
+                    gradMap, allGrads, parameters, lossOutput, gradPlaceholders, viewGradRoots);
+                RebindViewGradients(viewGradRoots);
             }
             finally
             {
                 t_gradPlaceholders = null;   // pooling settled every placeholder; Compile clears it again on a throw
+                t_gradViewRoots = null;
             }
         }
         // BIND EVERY FORWARD OUTPUT'S LIVE BACKING BEFORE THE PLAN RUNS.
@@ -10328,6 +10366,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan._pooledGradients = pooledGradients;
+            plan._viewGradRoots = pooledGradients is null ? null : viewGradRoots;
             plan._deferredZeroByAction = deferredZeroByAction;
             plan._deferredZeroPending = pooledGradients is null ? null : new bool[pooledGradients.Length];
             plan._backwardStepKinds = backwardStepNames.ToArray();
@@ -10508,7 +10547,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static (int[][]? Schedule, bool[]? Pooled) PoolGradientBuffers(
         List<Action<IEngine>> backwardActions, List<int[]?> coverage, List<CompiledStep<T>> forwardSteps,
         Dictionary<Tensor<T>, Tensor<T>> gradMap, List<Tensor<T>> allGrads, Tensor<T>[] parameters, Tensor<T> lossOutput,
-        HashSet<Tensor<T>> placeholders)
+        HashSet<Tensor<T>> placeholders, Dictionary<Tensor<T>, Tensor<T>>? viewRoots = null)
     {
         int count = allGrads.Count, actions = backwardActions.Count;
         var pooled = new bool[count];
@@ -10528,8 +10567,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var readBeforeWrite = new bool[count];
             for (int g = 0; g < count; g++) { firstWrite[g] = None; lastUse[g] = -1; }
             var actionWrites = new HashSet<int>();
-            // The pooled index of a tensor's gradient, or None when it has no gradient being pooled.
-            int GradIndex(Tensor<T> t) => gradMap.TryGetValue(t, out var grad) && indexOf.TryGetValue(grad, out int i) ? i : None;
+            // The pooled index of a tensor's gradient, or None when it has no gradient being pooled. A gradient that views
+            // another's buffer is a use of that buffer: its reads and writes extend the root's lifetime.
+            int GradIndex(Tensor<T> t)
+            {
+                if (!gradMap.TryGetValue(t, out var grad)) return None;
+                if (viewRoots is not null && viewRoots.TryGetValue(grad, out var root)) grad = root;
+                return indexOf.TryGetValue(grad, out int i) ? i : None;
+            }
             for (int a = 0; a < actions; a++)
             {
                 // Writes first: a fused action (a conv epilogue chain) writes and reads its internal gradients itself, in
@@ -10732,6 +10777,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Gradient buffers still backed by the shared compile-time placeholder (gradient pooling, PoolGradientBuffers).
     // Set only while a plan's backward is being built on this thread.
     [ThreadStatic] private static HashSet<Tensor<T>>? t_gradPlaceholders;
+    // Alias gradient views (view -> the root buffer it views) whose roots may be placeholders; same lifetime.
+    [ThreadStatic] private static Dictionary<Tensor<T>, Tensor<T>>? t_gradViewRoots;
+
+    /// <summary>
+    /// Points each alias gradient view's host storage at its root's final storage: views were cut from the root while it
+    /// was still a placeholder, and pooling (or materialization) has since re-pointed the root.
+    /// </summary>
+    private static void RebindViewGradients(Dictionary<Tensor<T>, Tensor<T>>? viewRoots)
+    {
+        if (viewRoots is null) return;
+        foreach (var pair in viewRoots)
+            using (var fresh = pair.Value.ReshapeViewUnrecorded(pair.Key._shape))
+                pair.Key.RebindStorageFrom(fresh);
+    }
 
     /// <summary>
     /// A builder that fetches a gradient's array while the backward is being built captures that array for good, so a
@@ -10741,7 +10800,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static int MaterializeIfGradPlaceholder(Tensor<T> tensor)
     {
         var placeholders = t_gradPlaceholders;
-        if (placeholders is null || !placeholders.Remove(tensor)) return 0;
+        if (placeholders is null) return 0;
+        // A view of a placeholder root: the root gets its own array (and stays out of pooling) and the view follows it.
+        if (t_gradViewRoots is { } viewRoots && viewRoots.TryGetValue(tensor, out var root))
+        {
+            int made = MaterializeIfGradPlaceholder(root);
+            if (made != 0)
+                using (var fresh = root.ReshapeViewUnrecorded(tensor._shape))
+                    tensor.RebindStorageFrom(fresh);
+            return made;
+        }
+        if (!placeholders.Remove(tensor)) return 0;
         using var own = new Tensor<T>((int[])tensor._shape.Clone());
         tensor.RebindStorageFrom(own);
         return 1;
