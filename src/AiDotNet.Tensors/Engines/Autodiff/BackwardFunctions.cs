@@ -12057,7 +12057,7 @@ internal static partial class BackwardFunctions<T>
             {
                 var re = RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength);
                 var im = RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength);
-                return e.TensorSqrt(e.TensorAdd(e.TensorMultiply(re, re), e.TensorMultiply(im, im)));
+                return RecordedComplexMagnitude(re, im);
             });
 
     /// <summary>
@@ -12102,9 +12102,9 @@ internal static partial class BackwardFunctions<T>
             Tensor<T> window,
             int origLength)
         => TryCompositeBackward(gradOutput, new[] { waveform }, engine, grads, e =>
-            e.TensorAtan2(
-                RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength),
-                RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength)));
+            RecordedComplexPhase(
+                RecordedStftPart(e, waveform, imaginary: false, nFft, hopLength, window, origLength),
+                RecordedStftPart(e, waveform, imaginary: true, nFft, hopLength, window, origLength)));
 
     /// <summary>
     /// Adjoint of <c>RFFT</c>: maps a gradient shaped like the interleaved one-sided spectrum back
@@ -12686,8 +12686,9 @@ internal static partial class BackwardFunctions<T>
     private const double PhaseGradientMagnitudeFloor = 1e-12;
 
     /// <summary>
-    /// Shared adjoint of a one-sided STFT analysis with <c>center: true</c>: maps a gradient shaped
-    /// like the spectrogram back onto the waveform, for either reported output.
+    /// Shared adjoint of a one-sided STFT analysis, centred or not: maps a gradient shaped like the
+    /// spectrogram back onto the waveform, for either reported output, and, when
+    /// <paramref name="windowGradient"/> is given, accumulates the window's gradient into it.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -12711,13 +12712,16 @@ internal static partial class BackwardFunctions<T>
     /// </remarks>
     private static Tensor<T> StftAnalysisAdjoint(
         Tensor<T> gradient, Tensor<T>? magnitude, Tensor<T> phase, StftAdjointTarget target,
-        int nFft, int hopLength, Tensor<T> window, int origLength, int[] waveformShape)
+        int nFft, int hopLength, Tensor<T> window, int origLength, int[] waveformShape, bool center = true,
+        Tensor<T>? windowGradientSignal = null, double[]? windowGradient = null)
     {
         var gradMagnitude = gradient;
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = nFft / 2 + 1;
         int numFrames = gradMagnitude._shape[^1];
-        int padAmount = nFft / 2;                 // analysed with center: true
+        // center: true analysed the reflection-padded signal; center: false the signal itself, so there is nothing
+        // to fold back and the overlap-add lands on the waveform directly.
+        int padAmount = center ? nFft / 2 : 0;
         int paddedLength = origLength + 2 * padAmount;
         int batchSize = gradMagnitude.Length / (numFreqs * numFrames);
 
@@ -12746,6 +12750,11 @@ internal static partial class BackwardFunctions<T>
         using var resultDataLease = result.LeaseArray();
         var resultData = resultDataLease.Array;
         var padded = new double[paddedLength];
+        // The window gradient reads the analysed (padded) signal: dL/dw[i] = Σ_frames dL/df[i] · xPadded[start + i].
+        double[] analysed = windowGradient is null ? Array.Empty<double>() : new double[paddedLength];
+        double[] signal = windowGradient is not null && windowGradientSignal is not null
+            ? SignalAsDoubles(windowGradientSignal)
+            : Array.Empty<double>();
 
         // Hoisted out of the frame loop: one pair per (batch, frame) would churn thousands of
         // short-lived vectors on long audio. Reused across frames, and fully rewritten each
@@ -12758,6 +12767,7 @@ internal static partial class BackwardFunctions<T>
         for (int b = 0; b < batchSize; b++)
         {
             Array.Clear(padded, 0, padded.Length);
+            if (windowGradient is not null) FillAnalysedSignal(signal, b, origLength, padAmount, analysed);
             int specOffset = b * numFreqs * numFrames;
 
             for (int frame = 0; frame < numFrames; frame++)
@@ -12786,8 +12796,12 @@ internal static partial class BackwardFunctions<T>
                     }
                     else
                     {
+                        // DC and the even-length Nyquist bin are real for a real frame: their phase is 0 or π,
+                        // piecewise constant, so its gradient is exactly zero. Seeding them from the stored phase
+                        // would turn the rounding of a stored π (sin ≠ 0) into a gradient scaled by 1/|C|.
                         double binMagnitude = numOps.ToDouble(magnitudeData[binIndex]);
-                        double reciprocal = binMagnitude > PhaseGradientMagnitudeFloor
+                        bool realBin = k == 0 || 2 * k == nFft;
+                        double reciprocal = !realBin && binMagnitude > PhaseGradientMagnitudeFloor
                             ? g / binMagnitude
                             : 0.0;
                         seedReal = -reciprocal * sinPhase;
@@ -12805,8 +12819,9 @@ internal static partial class BackwardFunctions<T>
                 int start = frame * hopLength;
                 for (int i = 0; i < nFft; i++)
                 {
-                    padded[start + i] +=
-                        numOps.ToDouble(frameGrad[i]) * numOps.ToDouble(windowData[i]);
+                    double frameGradient = numOps.ToDouble(frameGrad[i]);
+                    padded[start + i] += frameGradient * numOps.ToDouble(windowData[i]);
+                    if (windowGradient is not null) windowGradient[i] += frameGradient * analysed[start + i];
                 }
             }
 

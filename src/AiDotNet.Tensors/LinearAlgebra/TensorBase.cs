@@ -2920,6 +2920,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private protected void EnsureMaterialized()
     {
+        RealizeLazySource();
+
+        EnsureStorageResident();
+    }
+
+    /// <summary>
+    /// Computes this tensor's pending lazy node, if any, without touching where its storage lives (deferred, streamed
+    /// or device-resident storage is left as it is). An inference trace records the read as a host escape.
+    /// </summary>
+    internal void RealizeLazySource()
+    {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (LazySource is ILazyNode node && !node.IsRealized)
         {
@@ -2928,12 +2939,6 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             if (GraphMode.IsInferenceTrace) GraphMode.Current?.MarkHostEscape(node);
             node.Realize(node.RecordingEngine);
         }
-
-        // Deferred storage: shape was known at construction, the buffer was not created. Gated on
-        // the immutable _storageDeferred flag (NOT the mutable Lifetime hint, which a caller can
-        // flip), so a normal tensor pays one predictable branch. This runs FIRST because a deferred
-        // weight may also be streaming-tagged, and it has to exist before the pool can page it.
-        EnsureStorageResident();
     }
 
     /// <summary>
@@ -2943,6 +2948,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     private protected void EnsureStorageResident()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
+        // Deferred storage: shape was known at construction, the buffer was not created. Gated on
+        // the immutable _storageDeferred flag (NOT the mutable Lifetime hint, which a caller can
+        // flip), so a normal tensor pays one predictable branch. This runs FIRST because a deferred
+        // weight may also be streaming-tagged, and it has to exist before the pool can page it.
         if (_storageDeferred && !_deferredReady)
             MaterializeDeferredStorage();
 

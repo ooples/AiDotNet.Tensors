@@ -80,7 +80,7 @@ internal static class OpRegistry
         // Activations
         "ReLU", "Sigmoid", "Tanh", "GELU", "LeakyReLU", "Swish", "Mish",
         "Softplus", "SELU", "ELU", "HardSigmoid", "HardSwish", "ReLU6",
-        "Softmax", "LogSoftmax",
+        "Softmax", "LogSoftmax", "TensorSoftmaxRows",
         "GLU", "Sparsemax", "TaylorSoftmax",
 
         // Shape
@@ -119,6 +119,7 @@ internal static class OpRegistry
 
         // Scatter/Gather
         "Gather", "Scatter", "ScatterAdd", "ScatterMean", "ScatterMax", "ScatterSoftmax",
+        "TensorScatter", "TensorTopK",
         "TensorIndexSelect", "TensorMaskedFill", "TensorMaskedSelect",
 
         // Parity-210 movement / cumulative / clamp
@@ -257,6 +258,12 @@ internal static class OpRegistry
         // Audio element-wise / linear ops — backward wired.
         "Spectrogram", "AmplitudeToDB", "ComputeDeltas", "Resample",
         "ISTFT", "StftPhase",
+        // STFT records one edge per out result (magnitude, phase) whose inputs are the waveform and the window
+        // (BackwardFunctions<T>.StftMagnitudeBackward / StftPhaseOutputBackward), as torch.stft is differentiable.
+        "STFT",
+        // The complex transforms record one edge per out part, each with both input parts as inputs; the backward is
+        // the adjoint transform (BackwardFunctions<T>.FftBackward), as torch.fft.fft/ifft/fft2/ifft2 are differentiable.
+        "FFT", "IFFT", "FFT2D", "IFFT2D",
 
         // Mel spectrogram — |STFT|^2, mel filterbank matmul and the optional dB conversion are
         // all differentiable, so the op records one node with BackwardFunctions<T>.
@@ -337,8 +344,6 @@ internal static class OpRegistry
         // In-place mutation semantics
         "TensorSetSlice",
 
-        // Discrete selection
-        "TensorTopK", "TensorScatter",
         // Shape-splitting — each split output is a differentiable slice, but
         // the multi-tensor return type is currently treated as
         // non-differentiable at the tape level.
@@ -419,16 +424,10 @@ internal static class OpRegistry
         // transpose of overlap-add synthesis, derived there in full.
         "GriffinLim",
 
-        // Raw transforms that emit their outputs through `out` parameters. These are
-        // deliberately NOT recorded: they are primitives that the recorded ops above are built
-        // from (Spectrogram and MelSpectrogram call STFT internally and record a single node
-        // with a proper adjoint), and their out-parameter signatures cannot flow through the
-        // Record* helpers, which key on a returned tensor.
-        //
-        // They were previously in NO registry set at all: TapeCompletenessTests only inspected
-        // methods whose RETURN type is a tensor, so nothing ever required them to be classified.
-        // AllTensorOutParameterMethods_AreClassified now closes that hole.
-        "STFT", "FFT", "IFFT", "FFT2D", "IFFT2D", "FFTND",
+        // Ops that write their results into caller tensors. The FFT family and STFT once sat here on the claim that
+        // out-parameter results cannot flow through the Record* helpers, which was false: each out result records as its
+        // own edge. DifferentiableOpsGradCheckSweep.EveryNonDifferentiableOp_HasNoSmoothDerivative finite-differences
+        // every op in this set and fails for one whose output moves smoothly with its input.
         "GroupNormInto", "ProjectGaussians3DTo2D",
 
         // Real/complex conversions (CpuEngine.TorchComplex); TensorAngle of a real input is piecewise constant,
@@ -452,7 +451,6 @@ internal static class OpRegistry
         "NativeBispectrum", "NativeTrispectrum",
         "NativeBatchedCavityForward",
         "NativeMfccFeatures", "NativeWidebandFeatures", "NativePacFeatures",
-        "TensorSoftmaxRows",
 
         // Rounding (non-differentiable, STE would need explicit annotation)
         "TensorFloor", "TensorCeiling", "TensorRound",
@@ -505,10 +503,6 @@ internal static class OpRegistry
 
         // Image codec — byte-level I/O, not meaningfully differentiable.
         "ImageDecode",
-
-        // InterpolateByScale is a pure delegator to Interpolate (which is
-        // in DifferentiableOps) — it performs no recording of its own.
-        "InterpolateByScale",
     };
 
     /// <summary>
@@ -518,6 +512,8 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // InterpolateByScale delegates directly to Interpolate (in DifferentiableOps), which records.
+        "InterpolateByScale",
         // Advanced indexing (TensorTake) and grouped GEMM (narrow / matmul / concat): composed from recorded ops
         "TensorIndex", "TensorGroupedMatMul",
         // Conv, inference batch norm and activation: recorded as the unfused ops under a tape, folded otherwise (#1432)

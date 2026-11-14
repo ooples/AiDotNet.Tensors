@@ -46,6 +46,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             // Audio/FFT audit
             "parity210_reflect_pad_1d","parity210_stft_mag_phase","parity210_phase_vocoder",
             "parity210_build_spectrum","parity210_istft_from_spectrum","parity210_istft_normalize",
+            "parity210_stft_backward_frames","parity210_stft_backward_signal","parity210_stft_backward_window",
             // Logical/detection/geometry/misc audit
             "parity210_logical_op","parity210_logical_not","parity210_shifted_diff","parity210_masks_to_boxes",
             "parity210_pairwise_iou","parity210_histogramdd","parity210_gridsample_backward_input","parity210_gridsample_backward_grid",
@@ -1266,6 +1267,6 @@ extern ""C"" __global__ void parity210_rwkv7_forward(const float* __restrict__ R
         }
     }
 }
-";
+" + KernelSourceResources.Read("Spectral.stft_backward.cuda.c");
     }
 }
