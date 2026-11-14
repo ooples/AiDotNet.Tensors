@@ -146,6 +146,19 @@ public sealed class CudaKernelLookupIntegrityTests
                 defined.Add(name);
         }
 
+        // Kernel sources shipped as embedded resources (Engines/DirectGpu/KernelSources) count only when
+        // CudaBackend actually compiles them via KernelSourceResources.Read("...").
+        string embeddedDir = Path.Combine(cuda, "..", "KernelSources");
+        foreach (Match resourceMatch in Regex.Matches(backend, @"KernelSourceResources\.Read\(\s*""([^""]+)""\s*\)"))
+        {
+            string resourceFile = Path.Combine(embeddedDir, resourceMatch.Groups[1].Value);
+            Assert.True(File.Exists(resourceFile),
+                $"CudaBackend compiles embedded kernel resource '{resourceMatch.Groups[1].Value}', which is missing at '{resourceFile}'.");
+            string embeddedSrc = File.ReadAllText(resourceFile);
+            foreach (Match m in Regex.Matches(embeddedSrc, @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\("))
+                defined.Add(m.Groups[1].Value);
+        }
+
         Assert.NotEmpty(lookedUp);
         Assert.NotEmpty(defined);
 
