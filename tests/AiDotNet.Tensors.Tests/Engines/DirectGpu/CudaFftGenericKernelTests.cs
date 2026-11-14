@@ -460,7 +460,10 @@ public class CudaFftGenericKernelTests
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
-        Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");
+        Skip.IfNot(backend.FftElementTypeHardwareSupported(type), $"This device's compute capability has no {type} storage.");
+        // Supported hardware with an unbuilt module is a compile defect (#1549 hid one behind a skip), not a skip.
+        Assert.True(backend.SupportsFftElementType(type),
+            $"CUDA {type} generic FFT module failed to compile: {backend.FftElementTypeCompileError(type)}");
 
         const int batch = 2;
         int count = batch * n;
@@ -639,7 +642,10 @@ public class CudaFftGenericKernelTests
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA backend is not available.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
-        Skip.IfNot(backend.SupportsFftElementType(type), $"CUDA {type} FFT storage is unavailable.");
+        Skip.IfNot(backend.FftElementTypeHardwareSupported(type), $"This device's compute capability has no {type} storage.");
+        // Supported hardware with an unbuilt module is a compile defect (#1549 hid one behind a skip), not a skip.
+        Assert.True(backend.SupportsFftElementType(type),
+            $"CUDA {type} generic FFT module failed to compile: {backend.FftElementTypeCompileError(type)}");
 
         const int batch = 65_536; // MaxGridDimY (65,535) + 1: blockIdx.y == 0 must stride onto b == 65,535
         int count = batch * n;
