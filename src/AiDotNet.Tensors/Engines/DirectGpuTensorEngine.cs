@@ -7452,6 +7452,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         base.TensorMultiplyScalarInPlace(a, scalar);
     }
 
+    /// <summary><c>running = keep * running + batchScale * batch</c> in one in-place launch (see
+    /// <see cref="RunningStatistics"/>); false -- nothing launched -- when the caller must compose it.</summary>
+    internal bool TryRunningStatisticUpdate<T>(Tensor<T> running, Tensor<T> batch, T keep, T batchScale)
+    {
+        if (IsRecordingInPlace<T>() || !running.IsContiguous || !batch.IsContiguous || running.Length != batch.Length)
+            return false;
+        float k = ToFloatScalar(keep), s = ToFloatScalar(batchScale);
+        if (typeof(T) == typeof(float) && TryGetBackend(out var backend)
+            && ResolveResidentBufferNoUpload(backend, running, running.Length, includePersistentWeightCache: false) is null)
+        {
+            // First touch of a host-backed statistic: the in-place binary path would download its result every call
+            // (it binds only an operand that is already resident). The unary in-place scale uploads and binds it, as the
+            // composed update's first op did; from then on each update is the single resident AddScaled below.
+            if (!TryRunUnaryInPlace(running, (be, buf, size) => be.Scale(buf, buf, k, size))) return false;
+            if (!TryRunBinaryInPlace(running, batch, (be, a, b, size) => be.AddScaled(a, b, a, 1f, s, size)))
+                base.TensorAddInPlace(running, TensorMultiplyScalar(batch, batchScale));   // already scaled: finish here
+            return true;
+        }
+        return TryRunBinaryInPlace(running, batch, (be, a, b, size) => be.AddScaled(a, b, a, k, s, size));
+    }
+
     void IEngine.TensorMultiplyScalarInto<T>(Tensor<T> dest, Tensor<T> a, T scalar)
     {
         if (TryRunScalarInto(dest, a, scalar,

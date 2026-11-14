@@ -380,6 +380,230 @@ BN_REG_ENTRY(2, true, true, _addrelu)
 BN_REG_ENTRY(4, true, true, _addrelu)
 BN_REG_ENTRY(8, true, true, _addrelu)
 
+// ---- Split batch norm (training) for channel slices too large for the register-resident variant ----
+// A slice of batch * spatial elements (spatial % 4 == 0) is cut into `splits` chunks of float4s; grid (channels, splits).
+// Two launches per direction: a reduce writes each chunk's partial sums to `partials`, and an apply merges the channel's
+// partials (in double) and writes its own chunk. Every element is read twice and written once, from many blocks per
+// channel instead of one block looping over the whole slice (the generic kernels: one block of 256 threads per channel,
+// scalar loads and a div/mod per element, plus separate ReLU-backward and inverse-std launches).
+// The forward's sums are shifted by the channel's first element, so the variance does not cancel catastrophically when
+// the mean is large against the spread.
+__device__ __forceinline__ void bn_split_range(int batch, int spatial, int splits, int& s4, int& begin, int& end)
+{
+    s4 = spatial >> 2;
+    const int units = batch * s4;
+    const int chunk = (units + splits - 1) / splits;
+    begin = blockIdx.y * chunk;
+    end = min(units, begin + chunk);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_split_stats(const float* __restrict__ input,
+    float* __restrict__ partials, int batch, int channels, int spatial, int splits)
+{
+    __shared__ float red[32];
+    const int c = blockIdx.x;
+    int s4, begin, end;
+    bn_split_range(batch, spatial, splits, s4, begin, end);
+    const float shift = input[(long long)c * spatial];
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int q = begin + threadIdx.x; q < end; q += blockDim.x)
+    {
+        const int b = q / s4;
+        const float4 v = reinterpret_cast<const float4*>(input + ((long long)b * channels + c) * spatial)[q - b * s4];
+        const float a = v.x - shift, bb = v.y - shift, cc = v.z - shift, d = v.w - shift;
+        s1 += (a + bb) + (cc + d);
+        s2 += (a * a + bb * bb) + (cc * cc + d * d);
+    }
+    s1 = bn_block_sum(s1, red);
+    s2 = bn_block_sum(s2, red);
+    if (threadIdx.x == 0)
+    {
+        float* p = partials + ((long long)c * splits + blockIdx.y) * 3;
+        p[0] = (float)(max(end - begin, 0) * 4); p[1] = s1; p[2] = s2;
+    }
+}
+
+// Merges a channel's `splits` partials of `width` floats each with the block's first warp; lane sums in double.
+__device__ __forceinline__ void bn_split_merge(const float* __restrict__ partials, int c, int splits, int width,
+    double* out)
+{
+    if (threadIdx.x < 32)
+    {
+        double acc[3] = { 0.0, 0.0, 0.0 };
+        for (int i = threadIdx.x; i < splits; i += 32)
+        {
+            const float* p = partials + ((long long)c * splits + i) * width;
+            for (int k = 0; k < width; k++) acc[k] += (double)p[k];
+        }
+        for (int k = 0; k < width; k++)
+        {
+            double v = acc[k];
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, o);
+            if (threadIdx.x == 0) out[k] = v;
+        }
+    }
+    __syncthreads();
+}
+
+template <bool RELU, bool RES>
+__device__ __forceinline__ void bn_fwd_split_apply(const float* __restrict__ input, const float* __restrict__ residual,
+    float* __restrict__ output, const float* __restrict__ gamma, const float* __restrict__ beta,
+    float* __restrict__ saveMean, float* __restrict__ saveVar, const float* __restrict__ partials,
+    int batch, int channels, int spatial, float epsilon, int splits)
+{
+    __shared__ double stats[3];
+    const int c = blockIdx.x;
+    bn_split_merge(partials, c, splits, 3, stats);
+    const double n = stats[0], m = stats[1] / n;
+    const double varD = stats[2] / n - m * m;
+    const float mean = (float)((double)input[(long long)c * spatial] + m);
+    const float var = (float)(varD > 0.0 ? varD : 0.0);
+    if (blockIdx.y == 0 && threadIdx.x == 0) { saveMean[c] = mean; saveVar[c] = var; }
+    const float inv = rsqrtf(var + epsilon), g = gamma[c], bt = beta[c];
+    int s4, begin, end;
+    bn_split_range(batch, spatial, splits, s4, begin, end);
+    for (int q = begin + threadIdx.x; q < end; q += blockDim.x)
+    {
+        const int b = q / s4;
+        const long long row = ((long long)b * channels + c) * spatial;
+        const float4 v = reinterpret_cast<const float4*>(input + row)[q - b * s4];
+        float4 y;
+        y.x = bn_affine(v.x, mean, inv, g, bt);
+        y.y = bn_affine(v.y, mean, inv, g, bt);
+        y.z = bn_affine(v.z, mean, inv, g, bt);
+        y.w = bn_affine(v.w, mean, inv, g, bt);
+        if (RES)
+        {
+            const float4 r = reinterpret_cast<const float4*>(residual + row)[q - b * s4];
+            y.x += r.x; y.y += r.y; y.z += r.z; y.w += r.w;
+        }
+        if (RELU) { y.x = fmaxf(y.x, 0.0f); y.y = fmaxf(y.y, 0.0f); y.z = fmaxf(y.z, 0.0f); y.w = fmaxf(y.w, 0.0f); }
+        reinterpret_cast<float4*>(output + row)[q - b * s4] = y;
+    }
+}
+
+// MODE 0: no mask; 1: masked where maskSource (the ReLU output) is not positive; 2: masked where the rebuilt
+// pre-activation bn_affine(x) is not positive (maskSource is beta). The masked, summed output gradient of element q.
+template <int MODE>
+__device__ __forceinline__ float4 bn_split_dy(const float* __restrict__ gradOutput, const float* __restrict__ gradOutput2,
+    const float* __restrict__ maskSource, long long row, int q, float4 x, float mean, float inv, float g, int c)
+{
+    float4 dy = reinterpret_cast<const float4*>(gradOutput + row)[q];
+    if (gradOutput2 != nullptr)
+    {
+        const float4 d2 = reinterpret_cast<const float4*>(gradOutput2 + row)[q];
+        dy.x = dy.x + d2.x; dy.y = dy.y + d2.y; dy.z = dy.z + d2.z; dy.w = dy.w + d2.w;
+    }
+    if (MODE == 1)
+    {
+        const float4 o = reinterpret_cast<const float4*>(maskSource + row)[q];
+        dy.x = o.x > 0.0f ? dy.x : 0.0f; dy.y = o.y > 0.0f ? dy.y : 0.0f;
+        dy.z = o.z > 0.0f ? dy.z : 0.0f; dy.w = o.w > 0.0f ? dy.w : 0.0f;
+    }
+    else if (MODE == 2)
+    {
+        const float bt = maskSource[c];
+        dy.x = bn_affine(x.x, mean, inv, g, bt) > 0.0f ? dy.x : 0.0f;
+        dy.y = bn_affine(x.y, mean, inv, g, bt) > 0.0f ? dy.y : 0.0f;
+        dy.z = bn_affine(x.z, mean, inv, g, bt) > 0.0f ? dy.z : 0.0f;
+        dy.w = bn_affine(x.w, mean, inv, g, bt) > 0.0f ? dy.w : 0.0f;
+    }
+    return dy;
+}
+
+template <int MODE>
+__device__ __forceinline__ void bn_bwd_split_reduce(const float* __restrict__ gradOutput,
+    const float* __restrict__ maskSource, const float* __restrict__ gradOutput2, const float* __restrict__ input,
+    const float* __restrict__ gamma, const float* __restrict__ saveMean, const float* __restrict__ saveVar,
+    float* __restrict__ partials, int batch, int channels, int spatial, float epsilon, int splits)
+{
+    __shared__ float red[32];
+    const int c = blockIdx.x;
+    const float mean = saveMean[c], inv = rsqrtf(saveVar[c] + epsilon), g = gamma[c];
+    int s4, begin, end;
+    bn_split_range(batch, spatial, splits, s4, begin, end);
+    float sdy = 0.0f, sdyx = 0.0f;
+    for (int q = begin + threadIdx.x; q < end; q += blockDim.x)
+    {
+        const int b = q / s4;
+        const long long row = ((long long)b * channels + c) * spatial;
+        const float4 x = reinterpret_cast<const float4*>(input + row)[q - b * s4];
+        const float4 dy = bn_split_dy<MODE>(gradOutput, gradOutput2, maskSource, row, q - b * s4, x, mean, inv, g, c);
+        sdy += (dy.x + dy.y) + (dy.z + dy.w);
+        sdyx += (dy.x * ((x.x - mean) * inv) + dy.y * ((x.y - mean) * inv))
+              + (dy.z * ((x.z - mean) * inv) + dy.w * ((x.w - mean) * inv));
+    }
+    sdy = bn_block_sum(sdy, red);
+    sdyx = bn_block_sum(sdyx, red);
+    if (threadIdx.x == 0)
+    {
+        float* p = partials + ((long long)c * splits + blockIdx.y) * 2;
+        p[0] = sdy; p[1] = sdyx;
+    }
+}
+
+template <int MODE, bool RES>
+__device__ __forceinline__ void bn_bwd_split_apply(const float* __restrict__ gradOutput,
+    const float* __restrict__ maskSource, const float* __restrict__ gradOutput2, float* __restrict__ gradResidual,
+    const float* __restrict__ input, const float* __restrict__ gamma, const float* __restrict__ saveMean,
+    const float* __restrict__ saveVar, float* __restrict__ gradInput, float* __restrict__ gradGamma,
+    float* __restrict__ gradBeta, const float* __restrict__ partials, int batch, int channels, int spatial,
+    float epsilon, int splits)
+{
+    __shared__ double sums[3];
+    const int c = blockIdx.x;
+    bn_split_merge(partials, c, splits, 2, sums);
+    const float sumDy = (float)sums[0], sumDyXhat = (float)sums[1];
+    if (blockIdx.y == 0 && threadIdx.x == 0) { gradGamma[c] = sumDyXhat; gradBeta[c] = sumDy; }
+    const float mean = saveMean[c], inv = rsqrtf(saveVar[c] + epsilon), g = gamma[c];
+    const float invN = 1.0f / (float)(batch * spatial);
+    const float sumDxhat = g * sumDy, sumDxhatXhat = g * sumDyXhat;
+    int s4, begin, end;
+    bn_split_range(batch, spatial, splits, s4, begin, end);
+    for (int q = begin + threadIdx.x; q < end; q += blockDim.x)
+    {
+        const int b = q / s4;
+        const long long row = ((long long)b * channels + c) * spatial;
+        const float4 x = reinterpret_cast<const float4*>(input + row)[q - b * s4];
+        const float4 dy = bn_split_dy<MODE>(gradOutput, gradOutput2, maskSource, row, q - b * s4, x, mean, inv, g, c);
+        if (RES) reinterpret_cast<float4*>(gradResidual + row)[q - b * s4] = dy;
+        float4 r;
+        r.x = inv * (dy.x * g - invN * (sumDxhat + ((x.x - mean) * inv) * sumDxhatXhat));
+        r.y = inv * (dy.y * g - invN * (sumDxhat + ((x.y - mean) * inv) * sumDxhatXhat));
+        r.z = inv * (dy.z * g - invN * (sumDxhat + ((x.z - mean) * inv) * sumDxhatXhat));
+        r.w = inv * (dy.w * g - invN * (sumDxhat + ((x.w - mean) * inv) * sumDxhatXhat));
+        reinterpret_cast<float4*>(gradInput + row)[q - b * s4] = r;
+    }
+}
+
+#define BN_SPLIT_FWD_ENTRY(RELU, RES, SUFFIX) \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_fwd##SUFFIX##_split(const float* input, \
+    const float* residual, float* output, const float* gamma, const float* beta, float* saveMean, float* saveVar, \
+    const float* partials, int batch, int channels, int spatial, float epsilon, int splits) \
+{ bn_fwd_split_apply<RELU, RES>(input, residual, output, gamma, beta, saveMean, saveVar, partials, batch, channels, \
+    spatial, epsilon, splits); }
+BN_SPLIT_FWD_ENTRY(false, false, )
+BN_SPLIT_FWD_ENTRY(true, false, _relu)
+BN_SPLIT_FWD_ENTRY(true, true, _addrelu)
+
+#define BN_SPLIT_BWD_ENTRY(MODE, RES, SUFFIX) \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd##SUFFIX##_split_reduce(const float* gradOutput, \
+    const float* maskSource, const float* gradOutput2, const float* input, const float* gamma, const float* saveMean, \
+    const float* saveVar, float* partials, int batch, int channels, int spatial, float epsilon, int splits) \
+{ bn_bwd_split_reduce<MODE>(gradOutput, maskSource, gradOutput2, input, gamma, saveMean, saveVar, partials, batch, \
+    channels, spatial, epsilon, splits); } \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd##SUFFIX##_split_apply(const float* gradOutput, \
+    const float* maskSource, const float* gradOutput2, float* gradResidual, const float* input, const float* gamma, \
+    const float* saveMean, const float* saveVar, float* gradInput, float* gradGamma, float* gradBeta, \
+    const float* partials, int batch, int channels, int spatial, float epsilon, int splits) \
+{ bn_bwd_split_apply<MODE, RES>(gradOutput, maskSource, gradOutput2, gradResidual, input, gamma, saveMean, saveVar, \
+    gradInput, gradGamma, gradBeta, partials, batch, channels, spatial, epsilon, splits); }
+BN_SPLIT_BWD_ENTRY(0, false, )
+BN_SPLIT_BWD_ENTRY(1, false, _relu)
+BN_SPLIT_BWD_ENTRY(2, false, _relumask)
+BN_SPLIT_BWD_ENTRY(1, true, _addrelu)
+
 // Layer Normalization forward pass
 // 1 block per batch element, 256 threads parallel reduce across normalizedSize
 extern ""C"" __global__ __launch_bounds__(256) void layernorm_forward(
@@ -1166,6 +1390,11 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "batchnorm_bwd_relumask_reg1", "batchnorm_bwd_relumask_reg2", "batchnorm_bwd_relumask_reg4", "batchnorm_bwd_relumask_reg8",
                 "batchnorm_fwd_addrelu_reg1", "batchnorm_fwd_addrelu_reg2", "batchnorm_fwd_addrelu_reg4", "batchnorm_fwd_addrelu_reg8",
                 "batchnorm_bwd_addrelu_reg1", "batchnorm_bwd_addrelu_reg2", "batchnorm_bwd_addrelu_reg4", "batchnorm_bwd_addrelu_reg8",
+                "batchnorm_split_stats", "batchnorm_fwd_split", "batchnorm_fwd_relu_split", "batchnorm_fwd_addrelu_split",
+                "batchnorm_bwd_split_reduce", "batchnorm_bwd_split_apply",
+                "batchnorm_bwd_relu_split_reduce", "batchnorm_bwd_relu_split_apply",
+                "batchnorm_bwd_relumask_split_reduce", "batchnorm_bwd_relumask_split_apply",
+                "batchnorm_bwd_addrelu_split_reduce", "batchnorm_bwd_addrelu_split_apply",
                 "layernorm_forward",
                 "layernorm_backward",
                 "layernorm_grad_params",

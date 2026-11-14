@@ -73,6 +73,40 @@ public class BatchNormRegisterPortTests
     }
 #endif
 
+    // batch, channels, spatial, x scale, x offset: CUDA slices over the register variant's 8192 elements, which take the split
+    // variant -- 65536 (DenseNet's first block at batch 64: 16 chunks), 16384, a ragged 12300 (the last chunk short), a
+    // 131072 slice capped at 128 chunks, and a mean 500x its spread (the shifted sums keep the variance from cancelling).
+    public static readonly TheoryData<int, int, int, double, double> CudaSplitShapes = new()
+    {
+        { 64, 3, 1024, 2.0, 0.3 },
+        { 64, 5, 256, 2.0, 0.3 },
+        { 3, 4, 4100, 2.0, 0.3 },
+        { 32, 2, 4096, 2.0, 0.3 },
+        { 16, 3, 1024, 0.3, 150.0 },
+    };
+
+    [SkippableTheory]
+    [MemberData(nameof(CudaSplitShapes))]
+    public void Cuda_split_batchnorm_matches_the_cpu_batchnorm(int batch, int channels, int spatial, double xScale, double xOffset)
+    {
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
+        long before = System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches);
+        Check(backend, batch, channels, spatial, xScale, xOffset);
+        // 3 forwards + 6 backwards (plain, relu read, relu rebuilt x2, add+relu x2), every one through the split kernels.
+        Assert.Equal(9, System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches) - before);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void Cuda_register_batchnorm_matches_the_cpu_batchnorm(int batch, int channels, int spatial)
+    {
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
+        Skip.If(spatial % 4 != 0, "The CUDA register variant reads float4 rows (spatial % 4 == 0).");
+        Check(backend, batch, channels, spatial);
+    }
+
     /// <summary>The HIP module compiles as CUDA C++ under NVRTC (the dialect has nothing HIP-specific), on any CUDA box.</summary>
     [SkippableFact]
     public void Hip_register_batchnorm_module_compiles_as_cuda_cxx()
@@ -97,11 +131,11 @@ public class BatchNormRegisterPortTests
 
     private const float Epsilon = 1e-5f;
 
-    private void Check(IDirectGpuBackend backend, int batch, int channels, int spatial)
+    private void Check(IDirectGpuBackend backend, int batch, int channels, int spatial, double xScale = 2.0, double xOffset = 0.3)
     {
         var bn = Assert.IsAssignableFrom<IBatchNormVarianceBackend>(backend);
         int n = batch * channels * spatial;
-        var x = Random(n, 1, 2.0, 0.3);
+        var x = Random(n, 1, xScale, xOffset);
         var residual = Random(n, 2, 1.0, 0.0);
         var gamma = Random(channels, 3, 1.0, 1.0);
         var beta = Random(channels, 4, 0.5, 0.0);

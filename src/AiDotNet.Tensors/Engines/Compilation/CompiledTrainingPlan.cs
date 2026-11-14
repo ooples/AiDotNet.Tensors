@@ -3473,6 +3473,42 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_stepprof.txt");
     private static readonly bool _profileStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_PROFILE_STEP") == "1" || s_stepProf;
+    // AIDOTNET_STEP_PROF_SYNC=1 (with AIDOTNET_STEP_PROF or AIDOTNET_PROFILE_STEP, and an uncaptured step:
+    // AIDOTNET_CUDA_GRAPH_STEP=0 AIDOTNET_COMPILED_RESIDENT_STEP=0) drains the GPU stream before and after each
+    // timed forward action and backward delegate, so each per-op time is that op's device time instead of its
+    // asynchronous enqueue time. Serializing the stream changes the step's overall time; read the per-op split,
+    // not the total.
+    private static readonly bool s_stepProfSync =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_STEP_PROF_SYNC") == "1";
+    private static int s_residentProfSteps;
+    private static long ProfElapsedUs(long start) =>
+        (long)((System.Diagnostics.Stopwatch.GetTimestamp() - start) * (1_000_000.0 / System.Diagnostics.Stopwatch.Frequency));
+    private long[] EnsureResidentProfArrays(int fwdCount, int bwdCount)
+    {
+        if (_profFwdUs is null || _profFwdUs.Length != fwdCount)
+        {
+            _profFwdUs = new long[fwdCount];
+            var names = new string[fwdCount];
+            var actionToStep = ActionToStepIndex;
+            for (int i = 0; i < fwdCount; i++)
+            {
+                int idx = actionToStep is not null && i < actionToStep.Length ? actionToStep[i] : i;
+                names[i] = _forwardSteps is not null && idx >= 0 && idx < _forwardSteps.Length ? _forwardSteps[idx].OpName : $"#{i}";
+            }
+            _profFwdNames = names;
+            _profFwdAllocBytes = null;
+        }
+        if (_profPerStepUs is null || _profPerStepUs.Length != bwdCount)
+        {
+            _profPerStepUs = new long[bwdCount];
+            _profBwdAllocBytes = null;
+        }
+        return _profFwdUs;
+    }
+    private static void ProfSync(IEngine engine)
+    {
+        if (s_stepProfSync && engine.TryGet<DirectGpuTensorEngine>(out var gpu)) gpu.SynchronizeStream();
+    }
     private static long _profForwardUs, _profGradZeroUs, _profBackwardUs, _profOptimUs;
     private static int _profStepCount;
     private static long[]? _profPerStepUs;
@@ -4083,6 +4119,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     ran = true;
                     _residentBodyRanLast = true;
+                    if (s_stepProf && _profFwdUs is not null && ++s_residentProfSteps % StepProfDumpInterval == 0)
+                        DumpPerOpProfile(s_residentProfSteps);
                     RefreshLossFromCapturedGraph(gte);
                     RegularizeAndClipGradients();   // in the order the eager and graph steps use
                     CommitHostOptimizerGradients();
@@ -4530,10 +4568,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
         // index buffer) is captured. _graphEagerFwd is 0 in capture mode (no eager prefix).
         bool capDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && IsCapturing();
+        // AIDOTNET_STEP_PROF=1 with AIDOTNET_CUDA_GRAPH_STEP=0: time each forward action and backward delegate of the
+        // uncaptured resident body (add AIDOTNET_STEP_PROF_SYNC=1 for device time), dumped to <AIDOTNET_STEP_PROF_PATH>.ops.txt.
+        bool residentProf = s_stepProf && !IsCapturing();
+        long[]? resFwdUs = residentProf ? EnsureResidentProfArrays(fwd.Length, _backwardActions.Length) : null;
         for (int i = _graphEagerFwd; i < fwd.Length; i++)
         {
             de?.SetCurrentScratchAction(i);   // pool this forward action's transient scratch by (i, local)
+            long rs = 0;
+            if (resFwdUs is not null) { ProfSync(engine); rs = System.Diagnostics.Stopwatch.GetTimestamp(); }
             fwd[i](engine);
+            if (resFwdUs is not null) { ProfSync(engine); resFwdUs[i] += ProfElapsedUs(rs); }
             if (capDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
             {
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
@@ -4641,7 +4686,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
+                long rb = 0;
+                if (residentProf) { ProfSync(engine); rb = System.Diagnostics.Stopwatch.GetTimestamp(); }
                 bwd[i](engine);
+                if (residentProf) { ProfSync(engine); _profPerStepUs![i] += ProfElapsedUs(rb); }
                 de?.EndScratchAction();
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
@@ -4895,8 +4943,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 for (int i = 0; i < fwd.Length; i++)
                 {
                     long ai = ProfAllocatedBytes();
+                    ProfSync(engine);
                     long si = System.Diagnostics.Stopwatch.GetTimestamp();
                     fwd[i](engine);
+                    ProfSync(engine);
                     perFwd[i] += (long)((System.Diagnostics.Stopwatch.GetTimestamp() - si) * tickToUsF);
                     perFwdAlloc[i] += ProfAllocatedBytes() - ai;
                 }
@@ -5099,7 +5149,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 long si = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (_gradPoolReZeroByStep != null) ApplyGradPoolReZero(i, gradArrays);
                 if (_deferredZeroByAction != null) ApplyDeferredZero(i, gradArrays);
+                ProfSync(engine);
+                si = System.Diagnostics.Stopwatch.GetTimestamp();
                 bwd[i](engine);
+                ProfSync(engine);
                 long ei = System.Diagnostics.Stopwatch.GetTimestamp();
                 perStep[i] += (long)((ei - si) * tickToUsLocal);
                 perStepAlloc[i] += ProfAllocatedBytes() - ai;
@@ -5210,7 +5263,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     System.IO.File.AppendAllText(StepProfDumpPath,
                         $"[STEPPROF] steps={sc} avgUs/step fwd={f / sc} gradZero={gz / sc} bwd={b / sc} opt={o / sc} total={(f + gz + b + o) / sc}"
                         + gcPart + System.Environment.NewLine);
-                    if (sc % (StepProfDumpInterval * 10) == 0) DumpPerOpProfile(sc);
+                    DumpPerOpProfile(sc);
                 }
                 catch { }
             }
