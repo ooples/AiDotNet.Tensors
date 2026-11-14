@@ -4691,7 +4691,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"In-place broadcast add cannot resize its target: {FormatShape(a._shape)} " +
                 $"+= {FormatShape(b._shape)} broadcasts to {FormatShape(result._shape)}.", nameof(b));
         using var resultDataKeep4 = new KeepAliveScope(result);
-        result.DataUnmarked.Span.CopyTo(aSpan);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(aSpan);
     }
 
     /// <summary>
@@ -5349,7 +5349,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorMatMul(a, b);
         using var resultDataKeep5 = new KeepAliveScope(result);
         using var destinationDataKeep13 = new KeepAliveScope(destination);
-        result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
     }
 
     /// <inheritdoc/>
@@ -5569,7 +5569,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             using var resultDataKeep6 = new KeepAliveScope(result);
             using var destinationDataKeep16 = new KeepAliveScope(destination);
-            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
+            result.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5595,7 +5595,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             using var resultDataKeep7 = new KeepAliveScope(result);
             using var destinationDataKeep17 = new KeepAliveScope(destination);
-            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
+            result.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5687,7 +5687,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             using var resultDataKeep8 = new KeepAliveScope(result);
             using var destinationDataKeep18 = new KeepAliveScope(destination);
-            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
+            result.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5773,7 +5773,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorBroadcastMultiply(a, b);
         using var resultDataKeep9 = new KeepAliveScope(result);
         using var destinationDataKeep19 = new KeepAliveScope(destination);
-        try { result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
+        try { result.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
         finally { TensorAllocator.Return(result); }
     }
 
@@ -5807,7 +5807,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorBroadcastAdd(a, b);
         using var resultDataKeep10 = new KeepAliveScope(result);
         using var destinationDataKeep20 = new KeepAliveScope(destination);
-        try { result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
+        try { result.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
         finally { TensorAllocator.Return(result); }
     }
 
@@ -45499,7 +45499,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     $"Destination length ({destination.Length}) must equal FusedLinear result length ({result.Length}).");
             using var resultDataKeep64 = new KeepAliveScope(result);
             using var destinationDataKeep46 = new KeepAliveScope(destination);
-            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
+            result.ReadOnlyDataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {

@@ -7616,7 +7616,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).Sigmoid(input);
         using var resultDataKeep1 = new KeepAliveScope(result);
         using var destDataKeep1 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
@@ -7748,7 +7748,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).ReLU(input);
         using var resultDataKeep2 = new KeepAliveScope(result);
         using var destDataKeep2 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     /// <summary>GPU-resident elementwise log into the destination's stable buffer (the cross-entropy loss's log
@@ -8294,7 +8294,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).TensorMatMul(a, b);
         using var resultDataKeep3 = new KeepAliveScope(result);
         using var destDataKeep3 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
