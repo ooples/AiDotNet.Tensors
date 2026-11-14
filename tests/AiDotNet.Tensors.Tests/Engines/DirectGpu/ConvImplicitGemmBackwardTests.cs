@@ -62,7 +62,7 @@ public sealed class ConvImplicitGemmBackwardTests
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
-        Skip.If(route is "engine_x3" or "engine_tf32" && !backend.ConvTensorCoresAvailable, "TF32 mma needs sm_80+.");
+        Skip.If(route is "engine_x3" or "engine_tf32" && !backend.ConvTensorCoresAvailable, "TF32 mma requires sm_80+.");
         double tolerance = route == "engine_tf32" ? 2e-3 : 1e-5;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (w + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
@@ -133,7 +133,7 @@ public sealed class ConvImplicitGemmBackwardTests
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
-        Skip.If(route is "engine_x3" or "engine_tf32" && !backend.ConvTensorCoresAvailable, "TF32 mma needs sm_80+.");
+        Skip.If(route is "engine_x3" or "engine_tf32" && !backend.ConvTensorCoresAvailable, "TF32 mma requires sm_80+.");
         double tolerance = route == "engine_tf32" ? 2e-3 : 1e-5;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (w + 2 * pW - dW * (kW - 1) - 1) / sW + 1;

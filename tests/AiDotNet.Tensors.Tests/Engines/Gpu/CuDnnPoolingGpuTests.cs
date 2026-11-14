@@ -74,9 +74,7 @@ public class CuDnnPoolingGpuTests
                     CuDnnNative.CudnnPoolingMode.AverageCountExcludePadding,
                     CuDnnNative.CudnnDataType.Half));
 
-            if (ex is InvalidOperationException &&
-                (ex.Message.Contains("NotSupported", StringComparison.Ordinal)
-                 || ex.Message.Contains("ArchMismatch", StringComparison.Ordinal)))
+            if (CuDnnUnsupported.Is(ex))
                 return;
             Assert.Null(ex);
         }

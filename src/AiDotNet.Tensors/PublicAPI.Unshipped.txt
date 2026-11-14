@@ -594,3 +594,4 @@ AiDotNet.Tensors.Engines.Compilation.FusedOptimizerExtras.VelocityIncludesLearni
 AiDotNet.Tensors.Engines.Compilation.FusedOptimizerExtras.VelocityIncludesLearningRate.init -> void
 AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseDeviceActivationsAtLastUse.get -> bool
 AiDotNet.Tensors.Engines.Autodiff.GradientTapeOptions.ReleaseDeviceActivationsAtLastUse.init -> void
+AiDotNet.Tensors.Engines.DirectGpu.HIP.AmdGpuArchitecture.MI350 = 8 -> AiDotNet.Tensors.Engines.DirectGpu.HIP.AmdGpuArchitecture

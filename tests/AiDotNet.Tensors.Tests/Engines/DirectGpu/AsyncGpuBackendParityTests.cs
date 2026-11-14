@@ -44,7 +44,7 @@ public sealed class AsyncGpuBackendParityTests
                 expectedFused[i * N + j] = Math.Max(s + bias[j], 0);
             }
 
-        var stream = async.CreateStream(GpuStreamType.Compute);
+        using var stream = async.CreateStream(GpuStreamType.Compute);
         using var bufA = backend.AllocateBuffer(M * K);
         using var bufB = async.AllocateBufferAsync(b, stream);
         using var bufBias = backend.AllocateBuffer(bias);
@@ -98,7 +98,7 @@ public sealed class AsyncGpuBackendParityTests
         using var backend = new OpenClBackend();
         Skip.IfNot(backend.IsAvailable, "OpenCL is not available.");
         var async = Assert.IsAssignableFrom<IAsyncGpuBackend>(backend);
-        var stream = async.CreateStream(GpuStreamType.Compute);
+        using var stream = async.CreateStream(GpuStreamType.Compute);
         var a = Values(M * K, 1);
         using var buffer = backend.AllocateBuffer(M * K);
         async.UploadBufferAsync(a, buffer, stream);

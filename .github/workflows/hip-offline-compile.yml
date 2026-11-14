@@ -1,0 +1,43 @@
+name: HIP Offline Compile Gate
+
+# Compiles the HIP kernel sources for AMD targets WITHOUT an AMD GPU.
+#
+# hiprtc compiles these sources at runtime on the user's device, and no CI lane runs on AMD hardware, so a source
+# that does not compile for a target ships unnoticed: the MFMA GEMM module once used an intrinsic that does not exist
+# (__builtin_amdgcn_mfma_f32_32x32x8f32), which failed the module on every CDNA GPU and left the HIP backend
+# unavailable there. clang compiles HIP device code for any AMD target on an ordinary ubuntu runner, so this gate
+# compiles every self-contained HIP source for CDNA (gfx908, gfx90a, gfx942, gfx950) and RDNA (gfx1030, gfx1100), and
+# requires the MFMA GEMM module to emit v_mfma instructions on the CDNA targets.
+
+on:
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel
+  # point. ci.yml's changes job applies this workflow's path filter (hip-offline-compile in
+  # .github/ci-path-filters.yml).
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: hip-offline-compile-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hip-offline-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # clang-20 targets gfx950; libamdhip64-dev provides the HIP headers hiprtc includes implicitly.
+      - name: Install clang and the HIP headers
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang-20 libamdhip64-dev
+          clang-20 --version | head -1
+
+      - name: Compile every HIP kernel source for CDNA and RDNA targets
+        run: python3 scripts/ci/check-hip-kernels-offline.py --clang clang-20 --rocm-path /usr

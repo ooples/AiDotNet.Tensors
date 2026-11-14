@@ -185,6 +185,17 @@ ptx-spectral:
     - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxSpectralCubinTool.cs'
     - 'tests/AiDotNet.Tensors.Benchmarks/DirectPtxCubinToolCore.cs'
 
+hip-offline-compile:
+  # hip-offline-compile.yml
+  pull_request:
+    - '.github/workflows/hip-offline-compile.yml'
+    - 'scripts/ci/check-hip-kernels-offline.py'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/HIP/**'
+  push:
+    - '.github/workflows/hip-offline-compile.yml'
+    - 'scripts/ci/check-hip-kernels-offline.py'
+    - 'src/AiDotNet.Tensors/Engines/DirectGpu/HIP/**'
+
 evolution-lifecycle:
   # evolution-lifecycle.yml
   pull_request:
