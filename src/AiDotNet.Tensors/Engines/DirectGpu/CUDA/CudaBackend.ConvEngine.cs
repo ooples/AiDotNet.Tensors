@@ -15,6 +15,13 @@ public sealed partial class CudaBackend
     // Engine K tile (CE_BK in CudaConvolutionKernels).
     private const int ConvEngineTileK = 8;
 
+    // Split-K block target per SM for the weight gradient (#2561). Its output tile grid is tiny (Cout x Cin*kH*kW)
+    // against a K of batch*H*W, so two blocks per SM left the SMs latency-bound: DenseNet-121's 128->32 3x3 at 16x16,
+    // batch 64, on an RTX 1000 Ada went 696 -> 142 us at four (eight, sixteen and thirty-two gained nothing more).
+    // AIDOTNET_CE_WGRAD_BLOCKS_PER_SM overrides it.
+    private static readonly int s_wgradBlocksPerSm =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_CE_WGRAD_BLOCKS_PER_SM"), out var b) && b > 0 ? b : 4;
+
     private IGpuBuffer? _convFpropPartials;
 
     // #1335: the engine's inner product. FMA = SIMT fp32; X3 = 3xTF32 on the Tensor Cores (fp32-level accuracy);
@@ -57,7 +64,7 @@ public sealed partial class CudaBackend
     /// than eight K tiles. kPerSplit is a multiple of the K tile.
     /// </summary>
     private void ConvEnginePlan(long columns, int rows, long kTotal,
-        out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit)
+        out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit, int blocksPerSm = 2)
     {
         int sms = Math.Max(1, _multiProcessorCount);
         tile = 128;
@@ -74,7 +81,7 @@ public sealed partial class CudaBackend
         if (tiles < sms)
         {
             long maxSplits = Math.Max(1, kTotal / (8L * ConvEngineTileK));
-            splits = (int)Math.Min(maxSplits, (2L * sms + tiles - 1) / tiles);
+            splits = (int)Math.Min(maxSplits, ((long)blocksPerSm * sms + tiles - 1) / tiles);
         }
         kPerSplit = (int)(((kTotal + splits - 1) / splits + ConvEngineTileK - 1) / ConvEngineTileK * ConvEngineTileK);
         splits = (int)((kTotal + kPerSplit - 1) / kPerSplit);
@@ -163,7 +170,7 @@ public sealed partial class CudaBackend
             || (long)batch * inChannels * inHeight * inWidth > int.MaxValue
             || (long)batch * outChannels * outHeight * outWidth > int.MaxValue)
             return false;
-        ConvEnginePlan(p, outChannels, kTotal, out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit);
+        ConvEnginePlan(p, outChannels, kTotal, out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit, s_wgradBlocksPerSm);
         if (!_kernelCache.TryGetValue((tile == 128 ? "conv2d_wgrad_ce128" : "conv2d_wgrad_ce64") + ConvMainloopSuffix(mainloop),
                 out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
