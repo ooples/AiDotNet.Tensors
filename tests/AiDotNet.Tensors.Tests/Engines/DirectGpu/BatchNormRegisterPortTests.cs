@@ -93,8 +93,9 @@ public class BatchNormRegisterPortTests
         Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
         long before = System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches);
         Check(backend, batch, channels, spatial, xScale, xOffset);
-        // 3 forwards + 6 backwards (plain, relu read, relu rebuilt x2, add+relu x2), every one through the split kernels.
-        Assert.Equal(9, System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches) - before);
+        // 3 forwards + 10 backwards (plain x2, relu read x2, relu rebuilt x3, add+relu x3, each form also accumulating),
+        // every one through the split kernels.
+        Assert.Equal(13, System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches) - before);
     }
 
     [SkippableTheory]
@@ -141,6 +142,7 @@ public class BatchNormRegisterPortTests
         var beta = Random(channels, 4, 0.5, 0.0);
         var dy = Random(n, 5, 1.0, 0.0);
         var dy2 = Random(n, 6, 1.0, 0.0);
+        var priorDx = Random(n, 7, 1.0, 0.0);
         using var bx = backend.AllocateBuffer(x);
         using var bres = backend.AllocateBuffer(residual);
         using var bg = backend.AllocateBuffer(gamma);
@@ -154,6 +156,7 @@ public class BatchNormRegisterPortTests
         using var bdg = backend.AllocateBuffer(channels);
         using var bdb = backend.AllocateBuffer(channels);
         using var bdr = backend.AllocateBuffer(n);
+        using var bprior = backend.AllocateBuffer(priorDx);
         string label = $"N{batch} C{channels} S{spatial}";
         var (refMean, refVar) = Statistics(x, batch, channels, spatial);
 
@@ -171,6 +174,8 @@ public class BatchNormRegisterPortTests
             if (!relu)
             {
                 RunBackward("bwd plain", reluOutput: null, residualGrad: false, rebuild: false, second: false, mask: null);
+                RunBackward("bwd plain +acc", reluOutput: null, residualGrad: false, rebuild: false, second: false, mask: null,
+                    accumulate: true);
                 continue;
             }
             var mask = new bool[n];
@@ -179,27 +184,36 @@ public class BatchNormRegisterPortTests
             {
                 RunBackward("bwd add+relu", by, residualGrad: true, rebuild: false, second: false, mask);
                 RunBackward("bwd add+relu +dy2", by, residualGrad: true, rebuild: false, second: true, mask);
+                RunBackward("bwd add+relu +acc", by, residualGrad: true, rebuild: false, second: false, mask, accumulate: true);
             }
             else
             {
                 RunBackward("bwd relu read", by, residualGrad: false, rebuild: false, second: false, mask);
                 RunBackward("bwd relu rebuilt", by, residualGrad: false, rebuild: true, second: false, mask);
                 RunBackward("bwd relu rebuilt +dy2", by, residualGrad: false, rebuild: true, second: true, mask);
+                RunBackward("bwd relu read +acc", by, residualGrad: false, rebuild: false, second: false, mask, accumulate: true);
+                RunBackward("bwd relu rebuilt +dy2 +acc", by, residualGrad: false, rebuild: true, second: true, mask,
+                    accumulate: true);
             }
         }
 
-        void RunBackward(string form, IGpuBuffer? reluOutput, bool residualGrad, bool rebuild, bool second, bool[]? mask)
+        // accumulate: the input gradient is added to what the destination holds (an accumulator with this step's
+        // gradient already in it), so the destination starts at priorDx and must end at priorDx + dX.
+        void RunBackward(string form, IGpuBuffer? reluOutput, bool residualGrad, bool rebuild, bool second, bool[]? mask,
+            bool accumulate = false)
         {
-            backend.Fill(bdx, float.NaN, n);
+            if (accumulate) backend.Copy(bprior, bdx, n);
+            else backend.Fill(bdx, float.NaN, n);
             backend.Fill(bdg, float.NaN, channels);
             backend.Fill(bdb, float.NaN, channels);
             if (residualGrad) backend.Fill(bdr, float.NaN, n);
             Assert.True(bn.TryBatchNormBackwardFromVariance(bdy, bx, bg, bmean, bvar, bdx, bdg, bdb, batch, channels, spatial,
-                Epsilon, reluOutput, residualGrad ? bdr : null, rebuild ? bb : null, second ? bdy2 : null),
+                Epsilon, reluOutput, residualGrad ? bdr : null, rebuild ? bb : null, second ? bdy2 : null, accumulate),
                 $"the backward refused {form} {label}");
             backend.Synchronize();
             var (dx, dgamma, dbeta, dres) = BackwardReference(x, dy, second ? dy2 : null, mask, gamma, refMean, refVar,
                 batch, channels, spatial);
+            if (accumulate) for (int i = 0; i < n; i++) dx[i] += priorDx[i];
             Compare($"{form} dX {label}", dx, backend.DownloadBuffer(bdx));
             Compare($"{form} dGamma {label}", dgamma, backend.DownloadBuffer(bdg));
             Compare($"{form} dBeta {label}", dbeta, backend.DownloadBuffer(bdb));

@@ -97,7 +97,7 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
     private unsafe bool TryBatchNormSplitBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput, IGpuBuffer? gradResidual,
-        bool rebuildMask, IGpuBuffer? beta, IGpuBuffer? gradOutput2)
+        bool rebuildMask, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput)
     {
         int splits = BatchNormSplitCount(batch, channels, spatial);
         string prefix = gradResidual is not null ? "batchnorm_bwd_addrelu_split" : reluOutput is null ? "batchnorm_bwd_split"
@@ -113,17 +113,17 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
                 pdy2 = gradOutput2?.Handle ?? IntPtr.Zero, pgr = gradResidual?.Handle ?? IntPtr.Zero, px = input.Handle,
                 pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle, pdx = gradInput.Handle,
                 pdg = gradGamma.Handle, pdb = gradBeta.Handle, pp = partials.Handle;
-            int b = batch, c = channels, s = spatial, n = splits;
+            int b = batch, c = channels, s = spatial, n = splits, acc = accumulateGradInput ? 1 : 0;
             float eps = epsilon;
             void** reduceArgs = stackalloc void*[13];
             reduceArgs[0] = &pdy; reduceArgs[1] = &pms; reduceArgs[2] = &pdy2; reduceArgs[3] = &px; reduceArgs[4] = &pg;
             reduceArgs[5] = &pm; reduceArgs[6] = &pv; reduceArgs[7] = &pp; reduceArgs[8] = &b; reduceArgs[9] = &c;
             reduceArgs[10] = &s; reduceArgs[11] = &eps; reduceArgs[12] = &n;
             LaunchKernel2D(reduce, (uint)channels, (uint)splits, 1, 256, 1, reduceArgs);
-            void** args = stackalloc void*[17];
+            void** args = stackalloc void*[18];
             args[0] = &pdy; args[1] = &pms; args[2] = &pdy2; args[3] = &pgr; args[4] = &px; args[5] = &pg; args[6] = &pm;
             args[7] = &pv; args[8] = &pdx; args[9] = &pdg; args[10] = &pdb; args[11] = &pp; args[12] = &b; args[13] = &c;
-            args[14] = &s; args[15] = &eps; args[16] = &n;
+            args[14] = &s; args[15] = &eps; args[16] = &n; args[17] = &acc;
             LaunchKernel2D(apply, (uint)channels, (uint)splits, 1, 256, 1, args);
         }
         System.Threading.Interlocked.Increment(ref BatchNormSplitLaunches);
@@ -161,10 +161,23 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         return true;
     }
 
-    unsafe bool IBatchNormVarianceBackend.TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
+    bool IBatchNormVarianceBackend.TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
         IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput, IGpuBuffer? gradResidual,
-        IGpuBuffer? beta, IGpuBuffer? gradOutput2)
+        IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput)
+        => BatchNormBackwardFromVariance(gradOutput, input, gamma, saveMean, saveVariance, gradInput, gradGamma, gradBeta,
+            batch, channels, spatial, epsilon, reluOutput, gradResidual, beta, gradOutput2, accumulateGradInput);
+
+    /// <summary>
+    /// The training BatchNorm backward of <see cref="IBatchNormVarianceBackend"/>; with
+    /// <paramref name="accumulateGradInput"/> the input gradient is added to <paramref name="gradInput"/>'s contents in
+    /// the same pass instead of overwriting them (#2561: a DenseNet feature map's gradient already holds the
+    /// concatenation's slice when its BatchNorm's backward runs, so a separate add pass re-read and rewrote it).
+    /// </summary>
+    private unsafe bool BatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
+        IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
+        IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput, IGpuBuffer? gradResidual,
+        IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput)
     {
         // BN -> ReLU without a residual: rebuild the mask from x (one activation read fewer) when beta is supplied.
         bool rebuildMask = s_batchNormMaskFromInput && reluOutput is not null && gradResidual is null && beta is not null
@@ -177,7 +190,8 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
             && (gradOutput2 is null || gradOutput2.Size >= n)
             && (gradResidual is null || (reluOutput is not null && gradResidual.Size >= n)))
             return TryBatchNormSplitBackward(gradOutput, input, gamma, saveMean, saveVariance, gradInput, gradGamma,
-                gradBeta, batch, channels, spatial, epsilon, reluOutput, gradResidual, rebuildMask, beta, gradOutput2);
+                gradBeta, batch, channels, spatial, epsilon, reluOutput, gradResidual, rebuildMask, beta, gradOutput2,
+                accumulateGradInput);
         if (k4 == 0 || channels <= 0 || !IsAvailable || gradOutput.Size < n || input.Size < n || gradInput.Size < n
             || gamma.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
             || gradGamma.Size < channels || gradBeta.Size < channels || (reluOutput is not null && reluOutput.Size < n)
@@ -191,13 +205,13 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         IntPtr pro = rebuildMask ? beta!.Handle : reluOutput?.Handle ?? IntPtr.Zero, pgr = gradResidual?.Handle ?? IntPtr.Zero;
         IntPtr pdy = gradOutput.Handle, px = input.Handle, pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle,
             pdx = gradInput.Handle, pdg = gradGamma.Handle, pdb = gradBeta.Handle;
-        int b = batch, c = channels, s = spatial;
+        int b = batch, c = channels, s = spatial, acc = accumulateGradInput ? 1 : 0;
         float eps = epsilon;
         IntPtr pdy2 = gradOutput2?.Handle ?? IntPtr.Zero;
-        void** args = stackalloc void*[15];
+        void** args = stackalloc void*[16];
         args[0] = &pdy; args[1] = &pro; args[2] = &pgr; args[3] = &px; args[4] = &pg; args[5] = &pm; args[6] = &pv;
         args[7] = &pdx; args[8] = &pdg; args[9] = &pdb; args[10] = &b; args[11] = &c; args[12] = &s; args[13] = &eps;
-        args[14] = &pdy2;
+        args[14] = &pdy2; args[15] = &acc;
         LaunchKernel(kernel, (uint)channels, (uint)threads, args);
         if (rebuildMask) System.Threading.Interlocked.Increment(ref BatchNormMaskFromInputLaunches);
         return true;

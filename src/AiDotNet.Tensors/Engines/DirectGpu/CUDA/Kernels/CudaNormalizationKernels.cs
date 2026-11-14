@@ -277,7 +277,7 @@ __device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput,
     float* __restrict__ gradResidual, const float* __restrict__ input,
     const float* __restrict__ gamma, const float* __restrict__ saveMean, const float* __restrict__ saveVar,
     float* __restrict__ gradInput, float* __restrict__ gradGamma, float* __restrict__ gradBeta,
-    int batch, int channels, int spatial, float epsilon, const float* __restrict__ gradOutput2)
+    int batch, int channels, int spatial, float epsilon, const float* __restrict__ gradOutput2, int accumulate)
 {
     __shared__ float red[32];
     const int c = blockIdx.x, tid = threadIdx.x, s4 = spatial >> 2, n4 = batch * s4;
@@ -338,7 +338,9 @@ __device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput,
             r.y = inv * (dy[k].y * g - invN * (sumDxhat + ((x[k].y - mean) * inv) * sumDxhatXhat));
             r.z = inv * (dy[k].z * g - invN * (sumDxhat + ((x[k].z - mean) * inv) * sumDxhatXhat));
             r.w = inv * (dy[k].w * g - invN * (sumDxhat + ((x[k].w - mean) * inv) * sumDxhatXhat));
-            reinterpret_cast<float4*>(gradInput + ((long long)b * channels + c) * spatial)[q - b * s4] = r;
+            float4* dst = reinterpret_cast<float4*>(gradInput + ((long long)b * channels + c) * spatial) + (q - b * s4);
+            if (accumulate) { const float4 o = *dst; r.x += o.x; r.y += o.y; r.z += o.z; r.w += o.w; }
+            *dst = r;
         }
     }
 }
@@ -352,9 +354,9 @@ extern ""C"" __global__ __launch_bounds__(256) void batchnorm_fwd##SUFFIX##_reg#
 extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd##SUFFIX##_reg##K4(const float* gradOutput, \
     const float* reluOutput, float* gradResidual, const float* input, const float* gamma, const float* saveMean, \
     const float* saveVar, float* gradInput, float* gradGamma, float* gradBeta, int batch, int channels, int spatial, \
-    float epsilon, const float* gradOutput2) \
+    float epsilon, const float* gradOutput2, int accumulate) \
 { bn_bwd_reg<K4, RELU, RES>(gradOutput, reluOutput, gradResidual, input, gamma, saveMean, saveVar, gradInput, \
-    gradGamma, gradBeta, batch, channels, spatial, epsilon, gradOutput2); }
+    gradGamma, gradBeta, batch, channels, spatial, epsilon, gradOutput2, accumulate); }
 BN_REG_ENTRY(1, false, false, )
 BN_REG_ENTRY(2, false, false, )
 BN_REG_ENTRY(4, false, false, )
@@ -368,9 +370,9 @@ BN_REG_ENTRY(8, true, false, _relu)
 extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd_relumask_reg##K4(const float* gradOutput, \
     const float* beta, float* gradResidual, const float* input, const float* gamma, const float* saveMean, \
     const float* saveVar, float* gradInput, float* gradGamma, float* gradBeta, int batch, int channels, int spatial, \
-    float epsilon, const float* gradOutput2) \
+    float epsilon, const float* gradOutput2, int accumulate) \
 { bn_bwd_reg<K4, true, false, true>(gradOutput, beta, gradResidual, input, gamma, saveMean, saveVar, gradInput, \
-    gradGamma, gradBeta, batch, channels, spatial, epsilon, gradOutput2); }
+    gradGamma, gradBeta, batch, channels, spatial, epsilon, gradOutput2, accumulate); }
 BN_REG_MASK_ENTRY(1)
 BN_REG_MASK_ENTRY(2)
 BN_REG_MASK_ENTRY(4)
@@ -549,7 +551,7 @@ __device__ __forceinline__ void bn_bwd_split_apply(const float* __restrict__ gra
     const float* __restrict__ input, const float* __restrict__ gamma, const float* __restrict__ saveMean,
     const float* __restrict__ saveVar, float* __restrict__ gradInput, float* __restrict__ gradGamma,
     float* __restrict__ gradBeta, const float* __restrict__ partials, int batch, int channels, int spatial,
-    float epsilon, int splits)
+    float epsilon, int splits, int accumulate)
 {
     __shared__ double sums[3];
     const int c = blockIdx.x;
@@ -573,7 +575,9 @@ __device__ __forceinline__ void bn_bwd_split_apply(const float* __restrict__ gra
         r.y = inv * (dy.y * g - invN * (sumDxhat + ((x.y - mean) * inv) * sumDxhatXhat));
         r.z = inv * (dy.z * g - invN * (sumDxhat + ((x.z - mean) * inv) * sumDxhatXhat));
         r.w = inv * (dy.w * g - invN * (sumDxhat + ((x.w - mean) * inv) * sumDxhatXhat));
-        reinterpret_cast<float4*>(gradInput + row)[q - b * s4] = r;
+        float4* dst = reinterpret_cast<float4*>(gradInput + row) + (q - b * s4);
+        if (accumulate) { const float4 o = *dst; r.x += o.x; r.y += o.y; r.z += o.z; r.w += o.w; }
+        *dst = r;
     }
 }
 
@@ -596,9 +600,9 @@ extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd##SUFFIX##_spli
 extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd##SUFFIX##_split_apply(const float* gradOutput, \
     const float* maskSource, const float* gradOutput2, float* gradResidual, const float* input, const float* gamma, \
     const float* saveMean, const float* saveVar, float* gradInput, float* gradGamma, float* gradBeta, \
-    const float* partials, int batch, int channels, int spatial, float epsilon, int splits) \
+    const float* partials, int batch, int channels, int spatial, float epsilon, int splits, int accumulate) \
 { bn_bwd_split_apply<MODE, RES>(gradOutput, maskSource, gradOutput2, gradResidual, input, gamma, saveMean, saveVar, \
-    gradInput, gradGamma, gradBeta, partials, batch, channels, spatial, epsilon, splits); }
+    gradInput, gradGamma, gradBeta, partials, batch, channels, spatial, epsilon, splits, accumulate); }
 BN_SPLIT_BWD_ENTRY(0, false, )
 BN_SPLIT_BWD_ENTRY(1, false, _relu)
 BN_SPLIT_BWD_ENTRY(2, false, _relumask)

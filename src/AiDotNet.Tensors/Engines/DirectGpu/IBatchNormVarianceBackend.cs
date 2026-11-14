@@ -36,5 +36,6 @@ internal interface IBatchNormVarianceBackend
     bool TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer saveMean,
         IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput = null, IGpuBuffer? gradResidual = null,
-        IGpuBuffer? beta = null, IGpuBuffer? gradOutput2 = null);
+        IGpuBuffer? beta = null, IGpuBuffer? gradOutput2 = null, bool accumulateGradInput = false);
 }
+
