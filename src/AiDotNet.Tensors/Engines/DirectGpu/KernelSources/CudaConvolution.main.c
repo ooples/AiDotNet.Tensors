@@ -1,0 +1,1575 @@
+
+#include <math.h>
+
+// ===========================================================================
+// CONVOLUTION KERNELS
+// ===========================================================================
+
+// Im2Col transformation for efficient convolution via GEMM
+extern "C" __global__ __launch_bounds__(256) void im2col(
+    const float* __restrict__ input, float* __restrict__ output,
+    int batch, int channels, int height, int width,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, int outH, int outW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalPatches = batch * outH * outW;
+    if (idx >= totalPatches) return;
+
+    int b = idx / (outH * outW);
+    int rem = idx % (outH * outW);
+    int oh = rem / outW;
+    int ow = rem % outW;
+
+    int patchSize = channels * kernelH * kernelW;
+
+    // Output is [batch, C*kH*kW, L] (L = outH*outW), matching CpuEngine.Unfold. This kernel wrote
+    //     float* outPtr = output + idx * patchSize;  outPtr[(c*kernelH+kh)*kernelW+kw] = val;
+    // which is the TRANSPOSED [batch, L, C*kH*kW] layout, so GPU columns came out permuted vs the CPU
+    // convention. OpenCL fixed this; CUDA never got the fix (same #775 drift class as the SELU >=,
+    // nll_loss int*, and cross_entropy_backward misses in this branch). col2im below reads this layout
+    // back and carried the identical transposition, so the two were self-consistent and only diverged
+    // from CPU -- which is why Unfold/Fold looked plausible on GPU while disagreeing with CpuEngine.
+    int L = outH * outW;
+    int s = oh * outW + ow;
+
+    for (int c = 0; c < channels; c++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            for (int kw = 0; kw < kernelW; kw++) {
+                int ih = oh * strideH - padH + kh * dilationH;
+                int iw = ow * strideW - padW + kw * dilationW;
+
+                float val = 0.0f;
+                if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
+                    val = input[((b * channels + c) * height + ih) * width + iw];
+                }
+
+                int colRow = (c * kernelH + kh) * kernelW + kw;
+                output[(b * patchSize + colRow) * L + s] = val;
+            }
+        }
+    }
+}
+
+// Col2Im transformation for convolution backward pass
+extern "C" __global__ __launch_bounds__(256) void col2im(
+    const float* __restrict__ input, float* __restrict__ output,
+    int batch, int channels, int height, int width,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, int outH, int outW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalSize = batch * channels * height * width;
+    if (idx >= totalSize) return;
+
+    int b = idx / (channels * height * width);
+    int rem1 = idx % (channels * height * width);
+    int c = rem1 / (height * width);
+    int rem2 = rem1 % (height * width);
+    int ih = rem2 / width;
+    int iw = rem2 % width;
+
+    float sum = 0.0f;
+    int patchSize = channels * kernelH * kernelW;
+
+    for (int kh = 0; kh < kernelH; kh++) {
+        for (int kw = 0; kw < kernelW; kw++) {
+            int oh_base = ih + padH - kh * dilationH;
+            int ow_base = iw + padW - kw * dilationW;
+
+            if (oh_base % strideH == 0 && ow_base % strideW == 0) {
+                int oh = oh_base / strideH;
+                int ow = ow_base / strideW;
+
+                if (oh >= 0 && oh < outH && ow >= 0 && ow < outW) {
+                    // Input is [batch, C*kH*kW, L] (L = outH*outW patches), matching CpuEngine.Fold:
+                    // flat = b*patchSize*L + colIdx*L + s. The old index (patchIdx*patchSize + colIdx)
+                    // assumed the transposed [batch, L, C*kH*kW] layout im2col used to write above.
+                    int L = outH * outW;
+                    int s = oh * outW + ow;
+                    int colIdx = (c * kernelH + kh) * kernelW + kw;
+                    sum += input[(b * patchSize + colIdx) * L + s];
+                }
+            }
+        }
+    }
+
+    output[idx] = sum;
+}
+
+// Direct Conv2D kernel
+extern "C" __global__ __launch_bounds__(256) void conv2d_direct(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi)
+{
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int oc = blockIdx.z % outChannels;
+    int b = blockIdx.z / outChannels;
+
+    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
+
+    float sum = 0.0f;
+
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            for (int kw = 0; kw < kernelW; kw++) {
+                int ih = oh * strideH - padH + kh * dilationH;
+                int iw = ow * strideW - padW + kw * dilationW;
+
+                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                    float kernelVal = kernel[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
+                    sum += inVal * kernelVal;
+                }
+            }
+        }
+    }
+
+    // The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
+    float r = sum;
+    if (epi & 1) r += bias[oc];
+    if ((epi & 2) && r < 0.0f) r = 0.0f;
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
+}
+
+// Conv2D backward pass for input gradients
+__device__ __forceinline__ void conv2d_backward_input_at(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ gradInput,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, int gridStrideZ)
+{
+    int iw = blockIdx.x * blockDim.x + threadIdx.x;
+    int ih = blockIdx.y * blockDim.y + threadIdx.y;
+    int ic = gridStrideZ % inChannels;
+    int b = gridStrideZ / inChannels;
+
+    if (iw >= inWidth || ih >= inHeight || b >= batch) return;
+
+    float sum = 0.0f;
+
+    for (int oc = 0; oc < outChannels; oc++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            for (int kw = 0; kw < kernelW; kw++) {
+                int oh_base = ih + padH - kh * dilationH;
+                int ow_base = iw + padW - kw * dilationW;
+
+                if (oh_base % strideH == 0 && ow_base % strideW == 0) {
+                    int oh = oh_base / strideH;
+                    int ow = ow_base / strideW;
+
+                    if (oh >= 0 && oh < outHeight && ow >= 0 && ow < outWidth) {
+                        float gradVal = gradOutput[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                        float kernelVal = kernel[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
+                        sum += gradVal * kernelVal;
+                    }
+                }
+            }
+        }
+    }
+
+    gradInput[((b * inChannels + ic) * inHeight + ih) * inWidth + iw] = sum;
+}
+extern "C" __global__ __launch_bounds__(256) void conv2d_backward_input(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ gradInput,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * inChannels; gridStrideZ += gridDim.z)
+        conv2d_backward_input_at(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, gridStrideZ);
+}
+
+// Conv2D backward pass for kernel gradients
+extern "C" __global__ __launch_bounds__(256) void conv2d_backward_kernel(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ gradKernel,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW)
+{
+    // One thread per gradKernel element over a flat 1D grid. Mapping outChannels * inChannels onto
+    // gridDim.z failed to launch once the product passed 65,535 (any 256x256 or wider conv layer), and
+    // 16x16 blocks over a 3x3 kernel left 247 of every 256 threads idle.
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)outChannels * inChannels * kernelH * kernelW;
+    if (idx >= total) return;
+    int kw = (int)(idx % kernelW);
+    int kh = (int)((idx / kernelW) % kernelH);
+    int ic = (int)((idx / ((long)kernelW * kernelH)) % inChannels);
+    int oc = (int)(idx / ((long)kernelW * kernelH * inChannels));
+
+    float sum = 0.0f;
+
+    for (int b = 0; b < batch; b++) {
+        for (int oh = 0; oh < outHeight; oh++) {
+            for (int ow = 0; ow < outWidth; ow++) {
+                int ih = oh * strideH - padH + kh * dilationH;
+                int iw = ow * strideW - padW + kw * dilationW;
+
+                if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                    float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                    float gradVal = gradOutput[((b * outChannels + oc) * outHeight + oh) * outWidth + ow];
+                    sum += inVal * gradVal;
+                }
+            }
+        }
+    }
+
+    gradKernel[idx] = sum;
+}
+
+// Depthwise Conv2D
+__device__ __forceinline__ void depthwise_conv2d_at(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int kernelH, int kernelW,
+    int strideH, int strideW, int padH, int padW, int gridStrideZ)
+{
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = gridStrideZ % channels;
+    int b = gridStrideZ / channels;
+
+    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
+
+    float sum = 0.0f;
+
+    for (int kh = 0; kh < kernelH; kh++) {
+        for (int kw = 0; kw < kernelW; kw++) {
+            int ih = oh * strideH - padH + kh;
+            int iw = ow * strideW - padW + kw;
+
+            if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                float inVal = input[((b * channels + c) * inHeight + ih) * inWidth + iw];
+                float kernelVal = kernel[(c * kernelH + kh) * kernelW + kw];
+                sum += inVal * kernelVal;
+            }
+        }
+    }
+
+    output[((b * channels + c) * outHeight + oh) * outWidth + ow] = sum;
+}
+extern "C" __global__ __launch_bounds__(256) void depthwise_conv2d(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
+    int batch, int channels, int inHeight, int inWidth,
+    int outHeight, int outWidth, int kernelH, int kernelW,
+    int strideH, int strideW, int padH, int padW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * channels; gridStrideZ += gridDim.z)
+        depthwise_conv2d_at(input, kernel, output, batch, channels, inHeight, inWidth, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, gridStrideZ);
+}
+
+// Transposed Conv2D (deconvolution) with output padding support
+__device__ __forceinline__ void conv_transpose2d_at(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+    int outputPadH, int outputPadW, int gridStrideZ)
+{
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int oc = gridStrideZ % outChannels;
+    int b = gridStrideZ / outChannels;
+
+    if (ow >= outWidth || oh >= outHeight || b >= batch) return;
+
+    float sum = 0.0f;
+
+    // Output padding shifts which output pixels receive contributions
+    // Effective output position accounting for output padding
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            for (int kw = 0; kw < kernelW; kw++) {
+                int ih_base = oh + padH - kh;
+                int iw_base = ow + padW - kw;
+
+                if (ih_base % strideH == 0 && iw_base % strideW == 0) {
+                    int ih = ih_base / strideH;
+                    int iw = iw_base / strideW;
+
+                    if (ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                        float inVal = input[((b * inChannels + ic) * inHeight + ih) * inWidth + iw];
+                        float kernelVal = kernel[((ic * outChannels + oc) * kernelH + kh) * kernelW + kw];
+                        sum += inVal * kernelVal;
+                    }
+                }
+            }
+        }
+    }
+
+    output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = sum;
+}
+extern "C" __global__ __launch_bounds__(256) void conv_transpose2d(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+    int outputPadH, int outputPadW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels; gridStrideZ += gridDim.z)
+        conv_transpose2d_at(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputPadH, outputPadW, gridStrideZ);
+}
+
+// Transposed Conv2D backward pass for input gradients
+// dL/dX = conv2d(dL/dY, W) - essentially a regular convolution
+extern "C" __global__ __launch_bounds__(256) void conv_transpose2d_backward_input(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ gradInput,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+    int outputPadH, int outputPadW, int totalInput)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalInput) return;
+
+    // Decompose linear index into (b, ic, ih, iw)
+    int iw = idx % inWidth;
+    int ih = (idx / inWidth) % inHeight;
+    int ic = (idx / (inWidth * inHeight)) % inChannels;
+    int b = idx / (inWidth * inHeight * inChannels);
+
+    // Effective output dimensions excluding output padding
+    // Output padding adds zeros at the end that don't receive any contributions from input
+
+    float sum = 0.0f;
+
+    // For transposed conv backward w.r.t input, we convolve gradOutput with kernel
+    for (int oc = 0; oc < outChannels; oc++) {
+        for (int kh = 0; kh < kernelH; kh++) {
+            for (int kw = 0; kw < kernelW; kw++) {
+                // Output position that this input element contributed to
+                int oh = ih * strideH - padH + kh;
+                int ow = iw * strideW - padW + kw;
+
+                // Every output row, the output-padding ones included: the forward writes them too (the adjoint of
+                // ConvTranspose2D is Conv2D over the whole gradOutput, as on the CPU engine).
+                if (oh >= 0 && oh < outHeight && ow >= 0 && ow < outWidth) {
+                    int goIdx = ((b * outChannels + oc) * outHeight + oh) * outWidth + ow;
+                    // Kernel layout: [inChannels, outChannels, kernelH, kernelW]
+                    int kIdx = ((ic * outChannels + oc) * kernelH + kh) * kernelW + kw;
+                    sum += gradOutput[goIdx] * kernel[kIdx];
+                }
+            }
+        }
+    }
+
+    gradInput[idx] = sum;
+}
+
+// Transposed Conv2D backward pass for kernel gradients
+// dL/dW[ic,oc,kh,kw] = sum over batch and positions of input[b,ic,ih,iw] * gradOutput[b,oc,oh,ow]
+extern "C" __global__ __launch_bounds__(256) void conv_transpose2d_backward_kernel(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ gradKernel,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+    int outputPadH, int outputPadW, int totalKernel)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalKernel) return;
+
+    // Decompose linear index into (ic, oc, kh, kw)
+    int kw = idx % kernelW;
+    int kh = (idx / kernelW) % kernelH;
+    int oc = (idx / (kernelW * kernelH)) % outChannels;
+    int ic = idx / (kernelW * kernelH * outChannels);
+
+    // Effective output dimensions excluding output padding
+    // Output padding adds zeros at the end that don't receive any contributions from input
+
+    float sum = 0.0f;
+
+    // Accumulate gradient over batch and spatial positions
+    for (int b = 0; b < batch; b++) {
+        for (int ih = 0; ih < inHeight; ih++) {
+            for (int iw = 0; iw < inWidth; iw++) {
+                // Output position that this input+kernel contributed to
+                int oh = ih * strideH - padH + kh;
+                int ow = iw * strideW - padW + kw;
+
+                // Every output row, the output-padding ones included: the forward writes them too (the adjoint of
+                // ConvTranspose2D is Conv2D over the whole gradOutput, as on the CPU engine).
+                if (oh >= 0 && oh < outHeight && ow >= 0 && ow < outWidth) {
+                    int inIdx = ((b * inChannels + ic) * inHeight + ih) * inWidth + iw;
+                    int goIdx = ((b * outChannels + oc) * outHeight + oh) * outWidth + ow;
+                    sum += input[inIdx] * gradOutput[goIdx];
+                }
+            }
+        }
+    }
+
+    gradKernel[idx] = sum;
+}
+
+// ===========================================================================
+// SHARED-MEMORY TILED CONV2D
+// Each block computes a TILE_OUT x TILE_OUT tile of output for one (batch, outChannel).
+// Input tile (including halo) is loaded into shared memory for reuse across threads.
+// ===========================================================================
+#define TILE_OUT 16
+
+__device__ __forceinline__ void conv2d_tiled_at(
+    const float* input, const float* weight, float* output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi, int gridStrideZ)
+{
+    // Block handles one (batch, outChannel) pair for a TILE_OUT x TILE_OUT output region
+    int tileRow = blockIdx.y * TILE_OUT;
+    int tileCol = blockIdx.x * TILE_OUT;
+    int oc = gridStrideZ % outChannels;
+    int b  = gridStrideZ / outChannels;
+
+    int tx = threadIdx.x; // 0..TILE_OUT-1
+    int ty = threadIdx.y; // 0..TILE_OUT-1
+
+    int oh = tileRow + ty;
+    int ow = tileCol + tx;
+
+    // Effective kernel footprint with dilation
+    int effKH = (kernelH - 1) * dilationH + 1;
+    int effKW = (kernelW - 1) * dilationW + 1;
+
+    // Input tile dimensions (output tile * stride + kernel footprint - stride)
+    int tileInH = TILE_OUT * strideH + effKH - strideH;
+    int tileInW = TILE_OUT * strideW + effKW - strideW;
+
+    // Dynamic shared memory for one input channel tile
+    extern __shared__ float smem[];
+
+    float sum = 0.0f;
+
+    for (int ic = 0; ic < inChannels; ic++) {
+        // Load input tile into shared memory cooperatively
+        int inRowStart = tileRow * strideH - padH;
+        int inColStart = tileCol * strideW - padW;
+
+        int tilesPerThread = (tileInH * tileInW + TILE_OUT * TILE_OUT - 1) / (TILE_OUT * TILE_OUT);
+        int tid = ty * TILE_OUT + tx;
+
+        for (int t = 0; t < tilesPerThread; t++) {
+            int idx = tid + t * TILE_OUT * TILE_OUT;
+            if (idx < tileInH * tileInW) {
+                int sy = idx / tileInW;
+                int sx = idx % tileInW;
+                int iy = inRowStart + sy;
+                int ix = inColStart + sx;
+                float val = 0.0f;
+                if (iy >= 0 && iy < inHeight && ix >= 0 && ix < inWidth) {
+                    val = input[((b * inChannels + ic) * inHeight + iy) * inWidth + ix];
+                }
+                smem[idx] = val;
+            }
+        }
+        __syncthreads();
+
+        // Compute convolution from shared memory
+        if (oh < outHeight && ow < outWidth) {
+            for (int kh = 0; kh < kernelH; kh++) {
+                for (int kw = 0; kw < kernelW; kw++) {
+                    int sy = ty * strideH + kh * dilationH;
+                    int sx = tx * strideW + kw * dilationW;
+                    float inVal = smem[sy * tileInW + sx];
+                    float wVal = weight[((oc * inChannels + ic) * kernelH + kh) * kernelW + kw];
+                    sum += inVal * wVal;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (oh < outHeight && ow < outWidth) {
+        // The convolution's epilogue: epi bit 0 adds bias[oc], bit 1 applies ReLU (r < 0 is false for NaN, which passes).
+        float r = sum;
+        if (epi & 1) r += bias[oc];
+        if ((epi & 2) && r < 0.0f) r = 0.0f;
+        output[((b * outChannels + oc) * outHeight + oh) * outWidth + ow] = r;
+    }
+}
+extern "C" __global__ __launch_bounds__(256) void conv2d_tiled(
+    const float* input, const float* weight, float* output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW,
+    int padH, int padW, int dilationH, int dilationW, const float* __restrict__ bias, int epi)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels; gridStrideZ += gridDim.z)
+        {
+            conv2d_tiled_at(input, weight, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, epi, gridStrideZ);
+            // Shared memory is reused by the next index; no thread may overwrite it while another still reads it.
+            __syncthreads();
+        }
+}
+
+// ===========================================================================
+// WINOGRAD F(2x2, 3x3) CONVOLUTION
+// For 3x3 kernels with stride=1. Each 4x4 input tile produces a 2x2 output tile.
+// 16 multiplies per tile instead of 36 = 2.25x compute reduction.
+// ===========================================================================
+
+// Winograd input transform: d = B^T * tile * B (4x4 -> 4x4)
+// B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]]
+__device__ __forceinline__ void winograd_input_transform(const float tile[4][4], float d[4][4])
+{
+    // temp = B^T * tile (rows)
+    float tmp[4][4];
+    for (int j = 0; j < 4; j++) {
+        tmp[0][j] = tile[0][j] - tile[2][j];
+        tmp[1][j] = tile[1][j] + tile[2][j];
+        tmp[2][j] = -tile[1][j] + tile[2][j];
+        tmp[3][j] = tile[1][j] - tile[3][j];
+    }
+    // d = tmp * B (cols)
+    for (int i = 0; i < 4; i++) {
+        d[i][0] = tmp[i][0] - tmp[i][2];
+        d[i][1] = tmp[i][1] + tmp[i][2];
+        d[i][2] = -tmp[i][1] + tmp[i][2];
+        d[i][3] = tmp[i][1] - tmp[i][3];
+    }
+}
+
+// Winograd filter transform: G * g * G^T (3x3 -> 4x4)
+// G = [[1,0,0],[0.5,0.5,0.5],[0.5,-0.5,0.5],[0,0,1]]
+__device__ __forceinline__ void winograd_filter_transform(const float g[3][3], float u[4][4])
+{
+    float tmp[4][3];
+    for (int j = 0; j < 3; j++) {
+        tmp[0][j] = g[0][j];
+        tmp[1][j] = 0.5f * (g[0][j] + g[1][j] + g[2][j]);
+        tmp[2][j] = 0.5f * (g[0][j] - g[1][j] + g[2][j]);
+        tmp[3][j] = g[2][j];
+    }
+    for (int i = 0; i < 4; i++) {
+        u[i][0] = tmp[i][0];
+        u[i][1] = 0.5f * (tmp[i][0] + tmp[i][1] + tmp[i][2]);
+        u[i][2] = 0.5f * (tmp[i][0] - tmp[i][1] + tmp[i][2]);
+        u[i][3] = tmp[i][2];
+    }
+}
+
+// Winograd output transform: A^T * m * A (4x4 -> 2x2)
+// A^T = [[1,1,1,0],[0,1,-1,-1]]
+__device__ __forceinline__ void winograd_output_transform(const float m[4][4], float out2x2[2][2])
+{
+    float tmp[2][4];
+    for (int j = 0; j < 4; j++) {
+        tmp[0][j] = m[0][j] + m[1][j] + m[2][j];
+        tmp[1][j] = m[1][j] - m[2][j] - m[3][j];
+    }
+    out2x2[0][0] = tmp[0][0] + tmp[0][1] + tmp[0][2];
+    out2x2[0][1] = tmp[0][1] - tmp[0][2] - tmp[0][3];
+    out2x2[1][0] = tmp[1][0] + tmp[1][1] + tmp[1][2];
+    out2x2[1][1] = tmp[1][1] - tmp[1][2] - tmp[1][3];
+}
+
+// Winograd F(2x2, 3x3) convolution kernel
+// Each thread handles one 2x2 output tile for one (batch, outChannel) pair.
+extern "C" __global__ __launch_bounds__(256) void conv2d_winograd_f2x2_3x3(
+    const float* input, const float* weight, float* output,
+    int batch, int inChannels, int inHeight, int inWidth,
+    int outChannels, int outHeight, int outWidth,
+    int padH, int padW)
+{
+    // Number of 2x2 output tiles
+    int tilesH = (outHeight + 1) / 2;
+    int tilesW = (outWidth + 1) / 2;
+
+    int tileIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalTiles = batch * outChannels * tilesH * tilesW;
+    if (tileIdx >= totalTiles) return;
+
+    // Decode tile index
+    int tw = tileIdx % tilesW;
+    int th = (tileIdx / tilesW) % tilesH;
+    int oc = (tileIdx / (tilesW * tilesH)) % outChannels;
+    int b  = tileIdx / (tilesW * tilesH * outChannels);
+
+    // Output position (top-left of 2x2 tile)
+    int outRow = th * 2;
+    int outCol = tw * 2;
+
+    // Accumulate Winograd products across input channels
+    float acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            acc[i][j] = 0.0f;
+
+    for (int ic = 0; ic < inChannels; ic++) {
+        // Load 4x4 input tile
+        float tile[4][4];
+        int inRow = outRow - padH;
+        int inCol = outCol - padW;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                int r = inRow + i;
+                int c = inCol + j;
+                tile[i][j] = (r >= 0 && r < inHeight && c >= 0 && c < inWidth)
+                    ? input[((b * inChannels + ic) * inHeight + r) * inWidth + c]
+                    : 0.0f;
+            }
+        }
+
+        // Load 3x3 filter
+        float g[3][3];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                g[i][j] = weight[((oc * inChannels + ic) * 3 + i) * 3 + j];
+
+        // Transform
+        float d[4][4], u[4][4];
+        winograd_input_transform(tile, d);
+        winograd_filter_transform(g, u);
+
+        // Elementwise multiply-accumulate
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                acc[i][j] += d[i][j] * u[i][j];
+    }
+
+    // Output transform
+    float out2x2[2][2];
+    winograd_output_transform(acc, out2x2);
+
+    // Write 2x2 output tile
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            int r = outRow + i;
+            int c = outCol + j;
+            if (r < outHeight && c < outWidth) {
+                output[((b * outChannels + oc) * outHeight + r) * outWidth + c] = out2x2[i][j];
+            }
+        }
+    }
+}
+
+// Conv3D for volumetric data
+__device__ __forceinline__ void conv3d_direct_at(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
+    int batch, int inChannels, int inDepth, int inHeight, int inWidth,
+    int outChannels, int outDepth, int outHeight, int outWidth,
+    int kernelD, int kernelH, int kernelW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW,
+    int dilationD, int dilationH, int dilationW, int gridStrideZ)
+{
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int od = gridStrideZ % outDepth;
+    int oc = (gridStrideZ / outDepth) % outChannels;
+    int b = gridStrideZ / (outDepth * outChannels);
+
+    if (ow >= outWidth || oh >= outHeight || od >= outDepth || b >= batch) return;
+
+    float sum = 0.0f;
+
+    for (int ic = 0; ic < inChannels; ic++) {
+        for (int kd = 0; kd < kernelD; kd++) {
+            for (int kh = 0; kh < kernelH; kh++) {
+                for (int kw = 0; kw < kernelW; kw++) {
+                    int id = od * strideD - padD + kd * dilationD;
+                    int ih = oh * strideH - padH + kh * dilationH;
+                    int iw = ow * strideW - padW + kw * dilationW;
+
+                    if (id >= 0 && id < inDepth && ih >= 0 && ih < inHeight && iw >= 0 && iw < inWidth) {
+                        float inVal = input[(((b * inChannels + ic) * inDepth + id) * inHeight + ih) * inWidth + iw];
+                        float kernelVal = kernel[(((oc * inChannels + ic) * kernelD + kd) * kernelH + kh) * kernelW + kw];
+                        sum += inVal * kernelVal;
+                    }
+                }
+            }
+        }
+    }
+
+    output[(((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow] = sum;
+}
+extern "C" __global__ __launch_bounds__(256) void conv3d_direct(
+    const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ output,
+    int batch, int inChannels, int inDepth, int inHeight, int inWidth,
+    int outChannels, int outDepth, int outHeight, int outWidth,
+    int kernelD, int kernelH, int kernelW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW,
+    int dilationD, int dilationH, int dilationW)
+{
+    // gridDim.z is capped at 65535; the host clamps it and this loop covers the rest.
+    for (int gridStrideZ = blockIdx.z; gridStrideZ < batch * outChannels * outDepth; gridStrideZ += gridDim.z)
+        conv3d_direct_at(input, kernel, output, batch, inChannels, inDepth, inHeight, inWidth, outChannels, outDepth, outHeight, outWidth, kernelD, kernelH, kernelW, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, gridStrideZ);
+}
+
+// #775: Trilinear interpolation of a [D,H,W,C] grid at [P,3] positions -> [P,C]. One thread per output
+// element (n,c). CUDA mirror of the OpenCL trilinear_interpolate kernel.
+extern "C" __global__ __launch_bounds__(256) void trilinear_interpolate(
+    const float* __restrict__ grid,
+    const float* __restrict__ positions,
+    float* __restrict__ output,
+    int D, int H, int W, int C,
+    int P, float upperEps)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= P * C) return;
+    int c = idx % C;
+    int n = idx / C;
+    float z = fmaxf(0.0f, fminf((float)(D - 1) - upperEps, positions[n * 3 + 0]));
+    float y = fmaxf(0.0f, fminf((float)(H - 1) - upperEps, positions[n * 3 + 1]));
+    float x = fmaxf(0.0f, fminf((float)(W - 1) - upperEps, positions[n * 3 + 2]));
+    int z0 = (int)floorf(z), y0 = (int)floorf(y), x0 = (int)floorf(x);
+    int z1 = min(z0 + 1, D - 1), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+    float fz = z - z0, fy = y - y0, fx = x - x0;
+    float w000 = (1 - fz) * (1 - fy) * (1 - fx), w001 = (1 - fz) * (1 - fy) * fx;
+    float w010 = (1 - fz) * fy * (1 - fx),       w011 = (1 - fz) * fy * fx;
+    float w100 = fz * (1 - fy) * (1 - fx),       w101 = fz * (1 - fy) * fx;
+    float w110 = fz * fy * (1 - fx),             w111 = fz * fy * fx;
+    output[n * C + c] =
+        w000 * grid[(((z0 * H + y0) * W + x0) * C) + c] + w001 * grid[(((z0 * H + y0) * W + x1) * C) + c] +
+        w010 * grid[(((z0 * H + y1) * W + x0) * C) + c] + w011 * grid[(((z0 * H + y1) * W + x1) * C) + c] +
+        w100 * grid[(((z1 * H + y0) * W + x0) * C) + c] + w101 * grid[(((z1 * H + y0) * W + x1) * C) + c] +
+        w110 * grid[(((z1 * H + y1) * W + x0) * C) + c] + w111 * grid[(((z1 * H + y1) * W + x1) * C) + c];
+}
+
+// #775: Trilinear-interpolate backward w.r.t. the grid. GATHER form (one thread per grid cell,
+// deterministic, no atomics): the 8-corner weight factorizes per axis. CUDA mirror of OpenCL.
+extern "C" __global__ __launch_bounds__(256) void trilinear_interpolate_backward(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ positions,
+    float* __restrict__ gradGrid,
+    int D, int H, int W, int C,
+    int P, float upperEps)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= D * H * W * C) return;
+    int c = idx % C;
+    int gx = (idx / C) % W;
+    int gy = (idx / (C * W)) % H;
+    int gz = idx / (C * W * H);
+    float sum = 0.0f;
+    for (int n = 0; n < P; n++) {
+        float z = fmaxf(0.0f, fminf((float)(D - 1) - upperEps, positions[n * 3 + 0]));
+        float y = fmaxf(0.0f, fminf((float)(H - 1) - upperEps, positions[n * 3 + 1]));
+        float x = fmaxf(0.0f, fminf((float)(W - 1) - upperEps, positions[n * 3 + 2]));
+        int z0 = (int)floorf(z), y0 = (int)floorf(y), x0 = (int)floorf(x);
+        int z1 = min(z0 + 1, D - 1), y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+        float fz = z - z0, fy = y - y0, fx = x - x0;
+        float wz = (gz == z0 ? (1.0f - fz) : 0.0f) + (gz == z1 ? fz : 0.0f);
+        if (wz == 0.0f) continue;
+        float wy = (gy == y0 ? (1.0f - fy) : 0.0f) + (gy == y1 ? fy : 0.0f);
+        if (wy == 0.0f) continue;
+        float wx = (gx == x0 ? (1.0f - fx) : 0.0f) + (gx == x1 ? fx : 0.0f);
+        sum += wz * wy * wx * gradOutput[n * C + c];
+    }
+    gradGrid[idx] = sum;
+}
+
+// #775: ConvTranspose3D forward (NCDHW), weights [inC,outC,kD,kH,kW]. GATHER over output elements.
+// CUDA mirror of the OpenCL conv_transpose3d kernel.
+extern "C" __global__ __launch_bounds__(256) void conv_transpose3d(
+    const float* __restrict__ input,
+    const float* __restrict__ weights,
+    float* __restrict__ output,
+    int N, int inC, int iD, int iH, int iW,
+    int outC, int outD, int outH, int outW,
+    int kD, int kH, int kW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * outC * outD * outH * outW) return;
+    int ow = idx % outW;
+    int oh = (idx / outW) % outH;
+    int od = (idx / (outW * outH)) % outD;
+    int oc = (idx / (outW * outH * outD)) % outC;
+    int n = idx / (outW * outH * outD * outC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int td = od + padD - kd;
+        if (td < 0 || (td % strideD) != 0) continue;
+        int id = td / strideD;
+        if (id < 0 || id >= iD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int th = oh + padH - kh;
+            if (th < 0 || (th % strideH) != 0) continue;
+            int ih = th / strideH;
+            if (ih < 0 || ih >= iH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = ow + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int iw = tw / strideW;
+                if (iw < 0 || iw >= iW) continue;
+                for (int ic = 0; ic < inC; ic++) {
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    output[idx] = sum;
+}
+
+// #775: ConvTranspose3D backward w.r.t. input. GATHER over gradInput. CUDA mirror of OpenCL.
+extern "C" __global__ __launch_bounds__(256) void conv_transpose3d_backward_input(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ weights,
+    float* __restrict__ gradInput,
+    int N, int inC, int iD, int iH, int iW,
+    int outC, int outD, int outH, int outW,
+    int kD, int kH, int kW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * inC * iD * iH * iW) return;
+    int iw = idx % iW;
+    int ih = (idx / iW) % iH;
+    int id = (idx / (iW * iH)) % iD;
+    int ic = (idx / (iW * iH * iD)) % inC;
+    int n = idx / (iW * iH * iD * inC);
+    float sum = 0.0f;
+    for (int kd = 0; kd < kD; kd++) {
+        int od = id * strideD - padD + kd;
+        if (od < 0 || od >= outD) continue;
+        for (int kh = 0; kh < kH; kh++) {
+            int oh = ih * strideH - padH + kh;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int ow = iw * strideW - padW + kw;
+                if (ow < 0 || ow >= outW) continue;
+                for (int oc = 0; oc < outC; oc++) {
+                    sum += gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow]
+                         * weights[((((ic * outC + oc) * kD + kd) * kH + kh) * kW + kw)];
+                }
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: ConvTranspose3D backward w.r.t. weights. GATHER over gradWeights [inC,outC,kD,kH,kW]. CUDA mirror.
+extern "C" __global__ __launch_bounds__(256) void conv_transpose3d_backward_weights(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ input,
+    float* __restrict__ gradWeights,
+    int N, int inC, int iD, int iH, int iW,
+    int outC, int outD, int outH, int outW,
+    int kD, int kH, int kW,
+    int strideD, int strideH, int strideW,
+    int padD, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= inC * outC * kD * kH * kW) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int kd = (idx / (kW * kH)) % kD;
+    int oc = (idx / (kW * kH * kD)) % outC;
+    int ic = idx / (kW * kH * kD * outC);
+    float sum = 0.0f;
+    for (int n = 0; n < N; n++) {
+        for (int id = 0; id < iD; id++) {
+            int od = id * strideD - padD + kd;
+            if (od < 0 || od >= outD) continue;
+            for (int ih = 0; ih < iH; ih++) {
+                int oh = ih * strideH - padH + kh;
+                if (oh < 0 || oh >= outH) continue;
+                for (int iw = 0; iw < iW; iw++) {
+                    int ow = iw * strideW - padW + kw;
+                    if (ow < 0 || ow >= outW) continue;
+                    sum += input[(((n * inC + ic) * iD + id) * iH + ih) * iW + iw]
+                         * gradOutput[(((n * outC + oc) * outD + od) * outH + oh) * outW + ow];
+                }
+            }
+        }
+    }
+    gradWeights[idx] = sum;
+}
+
+// #775: SpiralConv (mesh conv). Per (vertex, out-channel): gather spiralLength neighbour features and
+// matmul with weights [outC, inC*spiralLength] + bias. Invalid neighbour -> 0. CUDA mirror of OpenCL.
+extern "C" __global__ __launch_bounds__(256) void spiral_conv(
+    const float* __restrict__ vertexFeatures,
+    const int* __restrict__ spiralIndices,
+    const float* __restrict__ weights,
+    const float* __restrict__ biases,
+    float* __restrict__ output,
+    int V, int inC, int spiralLength, int outC)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= V * outC) return;
+    int oc = idx % outC;
+    int v = idx / outC;
+    int gatheredSize = inC * spiralLength;
+    float sum = biases[oc];
+    for (int s = 0; s < spiralLength; s++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        int gatherOffset = s * inC;
+        for (int c = 0; c < inC; c++) {
+            sum += vertexFeatures[neighborIdx * inC + c] * weights[oc * gatheredSize + gatherOffset + c];
+        }
+    }
+    output[idx] = sum;
+}
+
+// #775: SpiralConv backward w.r.t. vertex features. GATHER over gradVertexFeatures [V,inC]. CUDA mirror.
+extern "C" __global__ __launch_bounds__(256) void spiral_conv_backward_input(
+    const float* __restrict__ gradOutput,
+    const int* __restrict__ spiralIndices,
+    const float* __restrict__ weights,
+    float* __restrict__ gradVertexFeatures,
+    int V, int inC, int spiralLength, int outC)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= V * inC) return;
+    int ic = idx % inC;
+    int nbr = idx / inC;
+    int gatheredSize = inC * spiralLength;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        for (int s = 0; s < spiralLength; s++) {
+            if (spiralIndices[v * spiralLength + s] != nbr) continue;
+            for (int oc = 0; oc < outC; oc++) {
+                sum += gradOutput[v * outC + oc] * weights[oc * gatheredSize + s * inC + ic];
+            }
+        }
+    }
+    gradVertexFeatures[idx] = sum;
+}
+
+// #775: SpiralConv backward w.r.t. weights. GATHER over gradWeights [outC, inC*spiralLength]. CUDA mirror.
+extern "C" __global__ __launch_bounds__(256) void spiral_conv_backward_weights(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ vertexFeatures,
+    const int* __restrict__ spiralIndices,
+    float* __restrict__ gradWeights,
+    int V, int inC, int spiralLength, int outC)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gatheredSize = inC * spiralLength;
+    if (idx >= outC * gatheredSize) return;
+    int g = idx % gatheredSize;
+    int oc = idx / gatheredSize;
+    int s = g / inC;
+    int ic = g % inC;
+    float sum = 0.0f;
+    for (int v = 0; v < V; v++) {
+        int neighborIdx = spiralIndices[v * spiralLength + s];
+        if (neighborIdx < 0 || neighborIdx >= V) continue;
+        sum += gradOutput[v * outC + oc] * vertexFeatures[neighborIdx * inC + ic];
+    }
+    gradWeights[idx] = sum;
+}
+
+// #775: Depthwise Conv2D backward w.r.t. input (NCHW, oc = ic*M + m). GATHER over gradInput. CUDA mirror.
+extern "C" __global__ __launch_bounds__(256) void depthwise_conv2d_backward_input(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ weights,
+    float* __restrict__ gradInput,
+    int N, int inC, int H, int W,
+    int M, int outH, int outW,
+    int kH, int kW,
+    int strideH, int strideW, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * inC * H * W;
+    if (idx >= total) return;
+    int iw = idx % W;
+    int ih = (idx / W) % H;
+    int ic = (idx / (W * H)) % inC;
+    int b = idx / (W * H * inC);
+    int outC = inC * M;
+    float sum = 0.0f;
+    for (int m = 0; m < M; m++) {
+        int oc = ic * M + m;
+        for (int kh = 0; kh < kH; kh++) {
+            int t = ih + padH - kh;
+            if (t < 0 || (t % strideH) != 0) continue;
+            int oh = t / strideH;
+            if (oh < 0 || oh >= outH) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int tw = iw + padW - kw;
+                if (tw < 0 || (tw % strideW) != 0) continue;
+                int ow = tw / strideW;
+                if (ow < 0 || ow >= outW) continue;
+                sum += weights[(oc * kH + kh) * kW + kw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradInput[idx] = sum;
+}
+
+// #775: Depthwise Conv2D backward w.r.t. weights (NCHW). Gathers per gradKernel element (no race). CUDA mirror.
+extern "C" __global__ __launch_bounds__(256) void depthwise_conv2d_backward_weights(
+    const float* __restrict__ gradOutput,
+    const float* __restrict__ input,
+    float* __restrict__ gradKernel,
+    int N, int inC, int H, int W,
+    int M, int outH, int outW,
+    int kH, int kW,
+    int strideH, int strideW, int padH, int padW)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int outC = inC * M;
+    int total = outC * kH * kW;
+    if (idx >= total) return;
+    int kw = idx % kW;
+    int kh = (idx / kW) % kH;
+    int oc = idx / (kW * kH);
+    int ic = oc / M;
+    float sum = 0.0f;
+    for (int b = 0; b < N; b++) {
+        for (int oh = 0; oh < outH; oh++) {
+            int ih = oh * strideH - padH + kh;
+            if (ih < 0 || ih >= H) continue;
+            for (int ow = 0; ow < outW; ow++) {
+                int iw = ow * strideW - padW + kw;
+                if (iw < 0 || iw >= W) continue;
+                sum += input[((b * inC + ic) * H + ih) * W + iw]
+                     * gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+            }
+        }
+    }
+    gradKernel[idx] = sum;
+}
+
+// #1313: Conv2D weight gradient as an implicit GEMM, without an im2col buffer.
+//   dW[co, p] = sum over k = (b, oh, ow) of dY[b, co, oh, ow] * X[b, ci, oh*sH - pH + kh*dH, ow*sW - pW + kw*dW]
+// with p = (ci, kh, kw) and X zero outside the input: C[M = Cout, N = P] = A[M, K] * B[K, N], K = batch * outH * outW.
+// A block owns a 64 x 64 tile of C (4 x 4 per thread) over the K range [z * kPerSplit, (z + 1) * kPerSplit); both
+// operand tiles go through padded shared memory, and the B tile is gathered from X with the convolution's index
+// arithmetic, consecutive lanes on consecutive output positions so the loads coalesce. Each split writes its own
+// slice of partials ([split][Cout][P]); conv2d_wgrad_splitk_reduce adds the slices in split order, so the result
+// does not depend on scheduling. With one split the block writes dW directly.
+#define WG_BM 64
+#define WG_BN 64
+#define WG_BK 16
+extern "C" __global__ __launch_bounds__(256) void conv2d_wgrad_implicit_gemm(
+    const float* __restrict__ input, const float* __restrict__ gradOutput, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    // Two buffers each: the next K tile's global loads go to registers while this tile's FMAs run.
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
+    const int L = outH * outW, P = inC * kH * kW, K = batch * L, khw = kH * kW;
+    const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
+    const int kBegin = blockIdx.z * kPerSplit;
+    const int kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+
+    // Loader lanes: element e = tid + 256 * r of a 16 x 64 tile, k = e % 16 (fastest), m or n = e / 16.
+    const int lk = tid & 15, lc = tid >> 4;   // lc in [0, 16); the four loads cover columns lc, lc + 16, lc + 32, lc + 48
+    int bci[4], bkh[4], bkw[4];
+    bool bValid[4];
+    #pragma unroll
+    for (int r = 0; r < 4; r++)
+    {
+        int p = n0 + lc + 16 * r;
+        bValid[r] = p < P;
+        int pp = bValid[r] ? p : 0;
+        bci[r] = pp / khw;
+        int rem = pp - bci[r] * khw;
+        bkh[r] = rem / kW;
+        bkw[r] = rem - bkh[r] * kW;
+    }
+
+    float ra[4], rb[4];
+    auto load = [&](int k0)
+    {
+        int k = k0 + lk;
+        bool kIn = k < kEnd;
+        int b = 0, oh = 0, ow = 0;
+        if (kIn) { b = k / L; int l = k - b * L; oh = l / outW; ow = l - oh * outW; }
+        const float* dyRow = gradOutput + (long long)b * outC * L + oh * outW + ow;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            ra[r] = (kIn && m < outC) ? dyRow[(long long)m * L] : 0.0f;
+            float x = 0.0f;
+            if (kIn && bValid[r])
+            {
+                int ih = oh * sH - pH + bkh[r] * dH;
+                int iw = ow * sW - pW + bkw[r] * dW;
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                    x = input[(((long long)b * inC + bci[r]) * H + ih) * W + iw];
+            }
+            rb[r] = x;
+        }
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][lk][lc + 16 * r] = rb[r];
+        }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    if (kBegin < kEnd)
+    {
+        load(kBegin);
+        store(0);
+        __syncthreads();
+    }
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < kEnd;
+        if (more) load(k0 + WG_BK);
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        if (more)
+        {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    float* slice = out + (long long)blockIdx.z * outC * P;
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+        int m = m0 + ty * 4 + i;
+        if (m >= outC) continue;
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            int n = n0 + tx * 4 + j;
+            if (n < P) slice[(long long)m * P + n] = acc[i][j];
+        }
+    }
+}
+
+// Adds the split-K slices of conv2d_wgrad_implicit_gemm in split order: dW[i] = sum over z of partials[z][i].
+extern "C" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce(
+    const float* __restrict__ partials, float* __restrict__ gradKernel, int count, int splits)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float sum = 0.0f;
+    for (int z = 0; z < splits; z++) sum += partials[(long long)z * count + i];
+    gradKernel[i] = sum;
+}
+
+// The dgrad engine's weight layout: wt[tap][co][ci] = w[co][ci][tap] (tap = kh * kW + kw).
+extern "C" __global__ __launch_bounds__(256) void conv2d_dgrad_weight_tapmajor(
+    const float* __restrict__ w, float* __restrict__ wt, int outC, int inC, int khw)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= outC * inC * khw) return;
+    int tap = i % khw, ci = (i / khw) % inC, co = i / (khw * inC);
+    wt[((long long)tap * outC + co) * inC + ci] = w[i];
+}
+
+// Sums the phase input gradient's split-K slices in split order: pixel (ih, iw) belongs to phase
+// ((ih + pH) mod sH, (iw + pW) mod sW), which has ceil(outC * taps / kPerSplit) slices (see conv2d_dgrad_ce_body).
+extern "C" __global__ __launch_bounds__(256) void conv2d_dgrad_phase_reduce(
+    const float* __restrict__ partials, float* __restrict__ gradInput, int count, int H, int W,
+    int outC, int kH, int kW, int sH, int sW, int pH, int pW, int kPerSplit)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    int iw = i % W, ih = (i / W) % H;
+    int rh = (ih + pH) % sH, rw = (iw + pW) % sW;
+    int units = max(1, (outC * ((kH - rh + sH - 1) / sH) * ((kW - rw + sW - 1) / sW) + kPerSplit - 1) / kPerSplit);
+    float sum = 0.0f;
+    for (int z = 0; z < units; z++) sum += partials[(long long)z * count + i];
+    gradInput[i] = sum;
+}
+
+// #1313: Conv2D input gradient as an implicit GEMM, without the col buffer and col2im scatter.
+//   dX[b, ci, ih, iw] = sum over k = (co, kh, kw) of W[co, ci, kh, kw] * dY[b, co, oh, ow],
+//   oh = (ih + pH - kh*dH) / sH and ow = (iw + pW - kw*dW) / sW when both divide exactly and land inside dY.
+// C[M = Cin, N = batch * H * W] = A[M, K] * B[K, N], K = Cout * kH * kW. Same tiling as conv2d_wgrad_implicit_gemm
+// (64 x 64 per block, 4 x 4 per thread, BK = 16); the B loader puts consecutive lanes on consecutive input pixels, so
+// each lane's (b, ih, iw) is fixed for the whole K loop and dY reads coalesce along a row. Split-K slices are written
+// in dX's layout to out + z * batch * Cin * H * W and summed in order by conv2d_wgrad_splitk_reduce.
+extern "C" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    __shared__ __align__(16) float As[WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[WG_BK][WG_BN + 4];
+    const int HW = H * W, N = batch * HW, khw = kH * kW, K = outC * khw, P = inC * khw, L = outH * outW;
+    const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
+    const int kBegin = blockIdx.z * kPerSplit;
+    const int kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+
+    // A loader: k = k0 + (tid & 15), rows m = m0 + (tid >> 4) + 16 * r.
+    const int lk = tid & 15, lc = tid >> 4;
+    // B loader: one input pixel n per lane, rows k = k0 + (tid >> 6) + 4 * r.
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / HW; int hw = n - nb * HW; int ih = hw / W; ihp = ih + pH; iwp = hw - ih * W + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        int ka = k0 + lk;
+        bool kaIn = ka < kEnd;
+        int aco = 0, at = 0;
+        if (kaIn) { aco = ka / khw; at = ka - aco * khw; }
+        const float* wRow = kernel + (long long)aco * P + at;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            As[lk][lc + 16 * r] = (kaIn && m < inC) ? wRow[(long long)m * khw] : 0.0f;
+        }
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int kr = bkRow + 4 * r, kb = k0 + kr;
+            float v = 0.0f;
+            if (nIn && kb < kEnd)
+            {
+                int co = kb / khw, t = kb - co * khw;
+                int kh = t / kW, kw = t - kh * kW;
+                int th = ihp - kh * dH, tw = iwp - kw * dW;
+                if (th >= 0 && tw >= 0)
+                {
+                    int oh = th / sH, ow = tw / sW;
+                    if (oh * sH == th && ow * sW == tw && oh < outH && ow < outW)
+                        v = dyBatch[(long long)co * L + oh * outW + ow];
+                }
+            }
+            Bs[kr][bn] = v;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        __syncthreads();
+    }
+
+    float* slice = out + (long long)blockIdx.z * batch * inC * HW;
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        int nn = n0 + tx * 4 + j;
+        if (nn >= N) continue;
+        int b = nn / HW, hw = nn - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC) col[(long long)m * HW] = acc[i][j];
+        }
+    }
+}
+
+// #1313: conv2d_dgrad_implicit_gemm for Cout % 16 == 0 (every ResNet-style layer), with K ordered (kh, kw, co):
+// k = t * Cout + co, t = kh * kW + kw. A 16-wide K tile then shares one kernel tap, so each lane checks its pixel's
+// source position once per tile instead of once per element, and (t, co0) advance by addition: the K loop has no
+// integer division. Unit stride is its own instantiation (no remainder test). Output columns go out as float4 when
+// H * W is a multiple of 4. Split-K slices as in the generic kernel.
+template <bool UNIT>
+__device__ __forceinline__ void conv2d_dgrad_c16_body(float (*As)[WG_BK][WG_BM + 4], float (*Bs)[WG_BK][WG_BN + 4],
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    const int HW = H * W, N = batch * HW, khw = kH * kW, K = outC * khw, P = inC * khw, L = outH * outW;
+    const int m0 = blockIdx.y * WG_BM, n0 = blockIdx.x * WG_BN;
+    const int kBegin = blockIdx.z * kPerSplit;
+    const int kEnd = min(K, kBegin + kPerSplit);
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int lk = tid & 15, lc = tid >> 4;
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / HW; int hw = n - nb * HW; int ih = hw / W; ihp = ih + pH; iwp = hw - ih * W + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    // Tile state: tap t = (kh, kw) and first output channel co0 of the tile at k0 (kBegin is a multiple of 16).
+    int t = kBegin / outC, co0 = kBegin - t * outC;
+    int kh = t / kW, kw = t - kh * kW;
+
+    // Global -> register loads of one K tile; the stores to shared memory happen after the next compute, so the loads
+    // of tile i + 1 are in flight while tile i's FMAs run (two shared buffers, one barrier per tile).
+    float ra[4], rb[4];
+    auto load = [&]()
+    {
+        const float* wRow = kernel + (long long)(co0 + lk) * P + t;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            ra[r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+        }
+        int th = ihp - kh * dH, tw = iwp - kw * dW;
+        int oh = th, ow = tw;
+        bool valid = nIn && th >= 0 && tw >= 0;
+        if (!UNIT && valid)
+        {
+            oh = th / sH; ow = tw / sW;
+            valid = oh * sH == th && ow * sW == tw;
+        }
+        valid = valid && oh < outH && ow < outW;
+        const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            rb[r] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][bkRow + 4 * r][bn] = rb[r];
+        }
+    };
+    auto advance = [&]()
+    {
+        co0 += WG_BK;
+        if (co0 == outC) { co0 = 0; t++; if (++kw == kW) { kw = 0; kh++; } }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    if (kBegin < kEnd)
+    {
+        load();
+        store(0);
+        __syncthreads();
+    }
+    for (int k0 = kBegin; k0 < kEnd; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < kEnd;
+        if (more) { advance(); load(); }
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        if (more)
+        {
+            // The other buffer was last read in the previous iteration, before its closing barrier.
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    float* slice = out + (long long)blockIdx.z * batch * inC * HW;
+    int nn = n0 + tx * 4;
+    if ((HW & 3) == 0)
+    {
+        // Four consecutive pixels of one image plane, 16-byte aligned.
+        if (nn >= N) return;
+        int b = nn / HW, hw = nn - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC)
+                *reinterpret_cast<float4*>(col + (long long)m * HW) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        }
+        return;
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        if (nn + j >= N) continue;
+        int b = (nn + j) / HW, hw = nn + j - b * HW;
+        float* col = slice + (long long)b * inC * HW + hw;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int m = m0 + ty * 4 + i;
+            if (m < inC) col[(long long)m * HW] = acc[i][j];
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c16(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW, int dH, int dW, int kPerSplit)
+{
+    // Declared here, not in the body, so the two instantiations share one allocation. Two buffers each (prefetch).
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
+    if (sH == 1 && sW == 1)
+        conv2d_dgrad_c16_body<true>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
+            kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
+    else
+        conv2d_dgrad_c16_body<false>(As, Bs, gradOutput, kernel, out, batch, inC, H, W, outC, outH, outW,
+            kH, kW, sH, sW, pH, pW, dH, dW, kPerSplit);
+}
+// #1313: strided input gradient by sub-pixel (phase) decomposition, for Cout % 16 == 0, unit dilation and kH >= sH,
+// kW >= sW. Input pixels split into sH * sW phases by (ih + pH) mod sH and (iw + pW) mod sW; in phase (rh, rw) only the
+// taps kh = rh, rh + sH, ... and kw = rw, rw + sW, ... reach an output position, and every one of them does. So each
+// phase is a dense GEMM C[Cin, pixels of the phase] over K = Cout * (its taps), with no zero-filled gathers: the generic
+// kernel at stride 2 spends three quarters of its B tile on taps that miss. blockIdx.z is the phase; no split-K, the
+// phases write disjoint pixels of dX directly. K is ordered (tap row, tap column, co) as in the _c16 kernel.
+extern "C" __global__ __launch_bounds__(256) void conv2d_dgrad_implicit_gemm_c16_phase(
+    const float* __restrict__ gradOutput, const float* __restrict__ kernel, float* __restrict__ out,
+    int batch, int inC, int H, int W, int outC, int outH, int outW,
+    int kH, int kW, int sH, int sW, int pH, int pW)
+{
+    __shared__ __align__(16) float As[2][WG_BK][WG_BM + 4];
+    __shared__ __align__(16) float Bs[2][WG_BK][WG_BN + 4];
+    const int rh = blockIdx.z / sW, rw = blockIdx.z - rh * sW;
+    // First input row / column of the phase: (ih + pH) % sH == rh.
+    const int ih0 = ((rh - pH) % sH + sH) % sH, iw0 = ((rw - pW) % sW + sW) % sW;
+    const int Hp = ih0 < H ? (H - ih0 + sH - 1) / sH : 0, Wp = iw0 < W ? (W - iw0 + sW - 1) / sW : 0;
+    const int plane = Hp * Wp, N = batch * plane;
+    const int n0 = blockIdx.x * WG_BN;
+    if (n0 >= N) return;
+    const int tapsH = (kH - rh + sH - 1) / sH, tapsW = (kW - rw + sW - 1) / sW;
+    const int K = outC * tapsH * tapsW, HW = H * W, L = outH * outW, khw = kH * kW, P = inC * khw;
+    const int m0 = blockIdx.y * WG_BM;
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const int lk = tid & 15, lc = tid >> 4;
+    const int bn = tid & 63, bkRow = tid >> 6;
+    const int n = n0 + bn;
+    const bool nIn = n < N;
+    int nb = 0, ihp = 0, iwp = 0;
+    if (nIn) { nb = n / plane; int q = n - nb * plane; int i = q / Wp; ihp = ih0 + i * sH + pH; iwp = iw0 + (q - i * Wp) * sW + pW; }
+    const float* dyBatch = gradOutput + (long long)nb * outC * L;
+
+    int co0 = 0, kh = rh, kw = rw;
+    float ra[4], rb[4];
+    auto load = [&]()
+    {
+        const float* wRow = kernel + (long long)(co0 + lk) * P + kh * kW + kw;
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int m = m0 + lc + 16 * r;
+            ra[r] = m < inC ? wRow[(long long)m * khw] : 0.0f;
+        }
+        // (ihp - kh) is a multiple of sH by construction; only the edges can fall outside dY.
+        int oh = (ihp - kh) / sH, ow = (iwp - kw) / sW;
+        bool valid = nIn && ihp >= kh && iwp >= kw && oh < outH && ow < outW;
+        const float* src = dyBatch + (long long)(co0 + bkRow) * L + (valid ? oh * outW + ow : 0);
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+            rb[r] = valid ? src[(long long)(4 * r) * L] : 0.0f;
+    };
+    auto store = [&](int buf)
+    {
+        #pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            As[buf][lk][lc + 16 * r] = ra[r];
+            Bs[buf][bkRow + 4 * r][bn] = rb[r];
+        }
+    };
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+
+    int buf = 0;
+    load();
+    store(0);
+    __syncthreads();
+    for (int k0 = 0; k0 < K; k0 += WG_BK)
+    {
+        bool more = k0 + WG_BK < K;
+        if (more)
+        {
+            co0 += WG_BK;
+            if (co0 == outC) { co0 = 0; kw += sW; if (kw >= kW) { kw = rw; kh += sH; } }
+            load();
+        }
+        #pragma unroll
+        for (int kk = 0; kk < WG_BK; kk++)
+        {
+            float4 a = *reinterpret_cast<const float4*>(&As[buf][kk][ty * 4]);
+            float4 bv = *reinterpret_cast<const float4*>(&Bs[buf][kk][tx * 4]);
+            float av[4] = { a.x, a.y, a.z, a.w }, bw[4] = { bv.x, bv.y, bv.z, bv.w };
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                #pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] += av[i] * bw[j];
+        }
+        if (more)
+        {
+            store(buf ^ 1);
+            __syncthreads();
+            buf ^= 1;
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        int nn = n0 + tx * 4 + j;
+        if (nn >= N) continue;
+        int b = nn / plane, q = nn - b * plane, i = q / Wp;
+        float* col = out + (long long)b * inC * HW + (ih0 + i * sH) * W + iw0 + (q - i * Wp) * sW;
+        #pragma unroll
+        for (int i2 = 0; i2 < 4; i2++)
+        {
+            int m = m0 + ty * 4 + i2;
+            if (m < inC) col[(long long)m * HW] = acc[i2][j];
+        }
+    }
+}
+
