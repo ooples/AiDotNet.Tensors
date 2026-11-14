@@ -200,6 +200,7 @@ extern ""C"" __global__ void softmax_rows(
         n = half;
     }
     maxVal = sdata[0];
+    __syncthreads();
 
     // Step 2: exp and sum
     float sumExp = 0.0f;

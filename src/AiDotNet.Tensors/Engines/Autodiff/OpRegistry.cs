@@ -522,6 +522,8 @@ internal static class OpRegistry
         "TensorIndex", "TensorGroupedMatMul",
         // Conv, inference batch norm and activation: recorded as the unfused ops under a tape, folded otherwise (#1432)
         "FusedConv2DBatchNorm",
+        // Pre-activated convolutions: recorded as batch norm, ReLU and the (batch-norm-folded) convolution under a tape
+        "BatchNormActivationConv2D", "BatchNormActivationConv2DBatchNorm",
         // Composed from recorded ops (reparameterized normal, constant masks, reshape/permute, matmul, conv, scatter_reduce)
         "TensorNormal", "TensorAlphaDropout", "TensorFeatureAlphaDropout", "TensorChannelDropout",
         "TensorBilinear", "TensorChannelShuffle", "TensorPixelUnshuffle", "TensorLocalResponseNorm",

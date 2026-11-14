@@ -402,6 +402,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     }
     __syncthreads();
     maxVal = smem[0];
+    __syncthreads();
 
     // Pass 2: exp(x - max) and sum (in FP32)
     float sumVal = 0.0f;
