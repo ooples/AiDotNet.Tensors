@@ -123,6 +123,23 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         return result;
     }
 
+    [SkippableTheory]
+    [InlineData(16, 32, 64, 1, 31)]   // a GRU's last timestep: one strided gather, float4-aligned rows
+    [InlineData(5, 7, 3, 1, 6)]       // rows off the float4 grid
+    [InlineData(3, 4, 5, 0, 2)]       // leading axis: a single contiguous run
+    [InlineData(2, 3, 4, 2, 1)]       // innermost axis: unit-length rows
+    public void IEngineTensorSliceAxis_StridedGather_MatchesCpu(int d0, int d1, int d2, int axis, int index)
+    {
+        SkipIfNoDirectGpu();
+        var data = new float[d0 * d1 * d2];
+        for (int i = 0; i < data.Length; i++) data[i] = i * 0.25f - 3f;
+        var cpu = new CpuEngine();
+        var expected = cpu.TensorSliceAxis(new Tensor<float>((float[])data.Clone(), [d0, d1, d2]), axis, index);
+        var actual = ((IEngine)Gpu).TensorSliceAxis(new Tensor<float>((float[])data.Clone(), [d0, d1, d2]), axis, index);
+        Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
+        Assert.Equal(expected.ToArray(), actual.ToArray());
+    }
+
     [SkippableFact]
     public void EagerResidentBinary_ReuploadsVersionBumpedInput()
     {

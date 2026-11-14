@@ -29344,8 +29344,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             var input = UploadTensorRaw(backend, tensor);
             output = backend.AllocateBuffer(total);
-            for (int o = 0; o < outer; o++)
-                backend.Copy(input, (o * axisSize + index) * inner, output, o * inner, inner);
+            if (outer > 1 && tensor.Rank <= RectSliceLimits.MaxRank && backend is IRectSliceKernels rect)
+            {
+                // One strided gather instead of a copy per outer row: a GRU's last-timestep slice at batch 64 was 64
+                // device copies (600 us of a 900 us inference); CUDA collapses this to a single row-copy launch.
+                var start = new int[tensor.Rank];
+                var length = (int[])tensor.Shape._dims.Clone();
+                start[axis] = index;
+                length[axis] = 1;
+                rect.RectSlice(input, output, tensor.Shape._dims, start, length, scatter: false);
+            }
+            else
+            {
+                for (int o = 0; o < outer; o++)
+                    backend.Copy(input, (o * axisSize + index) * inner, output, o * inner, inner);
+            }
 
             var outShape = new int[tensor.Rank - 1];
             for (int d = 0, od = 0; d < tensor.Rank; d++)
