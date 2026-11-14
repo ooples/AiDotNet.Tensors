@@ -11,19 +11,29 @@ internal enum GraphTraceKind : byte
 }
 
 /// <summary>
-/// Type-safe reasons an IEngine contract cannot currently be represented by a homogeneous,
-/// fixed-shape inference plan.
+/// Type-safe reasons an IEngine contract cannot currently be represented by a compiled graph plan. Carried by
+/// <see cref="GraphCaptureNotSupportedException"/> so a caller can decide, by reason, whether to fall back to eager
+/// execution.
 /// </summary>
-internal enum GraphCaptureLimitation : byte
+public enum GraphCaptureLimitation : byte
 {
+    /// <summary>The output shape depends on runtime tensor values.</summary>
     DataDependentOutputShape,
+    /// <summary>An operand cannot be represented as a homogeneous plan input.</summary>
     HeterogeneousInput,
+    /// <summary>The result cannot be represented as a homogeneous plan output.</summary>
     HeterogeneousOutput,
+    /// <summary>The operation mixes element types the plan format cannot carry.</summary>
     MixedElementTypes,
+    /// <summary>The operation reads tensor data on the host (or returns a host value) instead of recording a node.</summary>
     HostBoundary,
+    /// <summary>The operation mutates state a replay would not reproduce.</summary>
     Stateful,
+    /// <summary>The operation has no backward the training plan could replay.</summary>
     MissingBackwardContract,
+    /// <summary>The trace recorded no compilable operation.</summary>
     NoCompilableOperations,
+    /// <summary>A returned output is not rooted in the recorded graph.</summary>
     UnrootedOutput
 }
 
@@ -31,7 +41,7 @@ internal enum GraphCaptureLimitation : byte
 /// Identifies an intentional fail-closed graph-capture rejection without conflating it with an
 /// operation's ordinary <see cref="NotSupportedException"/> failures.
 /// </summary>
-internal sealed class GraphCaptureNotSupportedException : NotSupportedException
+public sealed class GraphCaptureNotSupportedException : NotSupportedException
 {
     internal GraphCaptureNotSupportedException(
         string operationName,
@@ -42,8 +52,11 @@ internal sealed class GraphCaptureNotSupportedException : NotSupportedException
         Limitation = limitation;
     }
 
-    internal string OperationName { get; }
-    internal GraphCaptureLimitation Limitation { get; }
+    /// <summary>The engine operation that refused capture.</summary>
+    public string OperationName { get; }
+
+    /// <summary>Why the operation cannot be captured.</summary>
+    public GraphCaptureLimitation Limitation { get; }
 }
 
 /// <summary>

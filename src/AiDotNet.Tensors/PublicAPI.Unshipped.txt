@@ -569,3 +569,16 @@ override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorGatherRows<T>(AiDo
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorScatterRowsInPlace<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! table, AiDotNet.Tensors.LinearAlgebra.Tensor<long>! rows, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! source) -> void
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLinearFilter<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! x, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? zi = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.TensorLinearFilterGuarded<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! x, AiDotNet.Tensors.LinearAlgebra.Tensor<T>? zi, double maxAbs) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.DataDependentOutputShape = 0 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.HeterogeneousInput = 1 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.HeterogeneousOutput = 2 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.MixedElementTypes = 3 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.HostBoundary = 4 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.Stateful = 5 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.MissingBackwardContract = 6 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.NoCompilableOperations = 7 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation.UnrootedOutput = 8 -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureNotSupportedException
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureNotSupportedException.Limitation.get -> AiDotNet.Tensors.Engines.Compilation.GraphCaptureLimitation
+AiDotNet.Tensors.Engines.Compilation.GraphCaptureNotSupportedException.OperationName.get -> string!
