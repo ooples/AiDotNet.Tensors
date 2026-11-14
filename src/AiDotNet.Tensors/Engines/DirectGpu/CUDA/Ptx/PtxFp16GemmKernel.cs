@@ -224,6 +224,10 @@ internal sealed class PtxFp16GemmKernel : IDisposable
 
     private static string EmitTensorCoreM16N16K32(int ccMajor, int ccMinor)
     {
+        // cp.async and mma.sync.m16n8k16 with f32 accumulation are sm_80 instructions: ptxas rejects them below.
+        if (ccMajor < 8)
+            throw new PlatformNotSupportedException(
+                $"The FP16 M16N16K32 Tensor-Core specialization uses cp.async and needs sm_80+, not sm_{ccMajor}{ccMinor}.");
         var ptx = new StringBuilder(8_192);
         PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");

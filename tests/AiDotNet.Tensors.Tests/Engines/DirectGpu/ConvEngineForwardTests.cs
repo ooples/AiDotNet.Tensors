@@ -48,7 +48,7 @@ public sealed class ConvEngineForwardTests
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA is not available.");
         using var backend = CudaBackend.CreateOrThrow();
-        Skip.If(mainloop != CudaBackend.ConvMainloopFma && !backend.ConvTensorCoresAvailable, "TF32 mma needs sm_80+.");
+        Skip.If(mainloop != CudaBackend.ConvMainloopFma && !backend.ConvTensorCoresAvailable, "TF32 mma requires sm_80+.");
         // FMA and 3xTF32 must hold the fp32 bound; plain TF32 rounds each product's operands to a 10-bit mantissa.
         double tolerance = mainloop == CudaBackend.ConvMainloopTf32 ? 2e-3 : 1e-5;
         int outH = (h + 2 * pH - dH * (kH - 1) - 1) / sH + 1;

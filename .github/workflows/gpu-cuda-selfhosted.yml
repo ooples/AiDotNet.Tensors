@@ -200,9 +200,12 @@ jobs:
         & $report | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
         # Always stale: cuDNN trees of versions this workflow no longer pins (the cuDNN step names the current one).
+        # Likewise CUDA runtime header trees (the "CUDA headers for NVRTC" step names the current one).
         $current = 'cudnn-9.26.1.1'
         Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Directory -Filter 'cudnn-*' -ErrorAction SilentlyContinue |
           Where-Object Name -ne $current | ForEach-Object { Write-Output "Removing stale $($_.Name)"; Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+        Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Directory -Filter 'cuda-headers-*' -ErrorAction SilentlyContinue |
+          Where-Object Name -ne 'cuda-headers-13.2.86' | ForEach-Object { Write-Output "Removing stale $($_.Name)"; Remove-Item -LiteralPath $_.FullName -Recurse -Force }
 
         if ((Free-Gb) -lt $minFreeGb) {
           # Regenerable, in order of cost to rebuild: the torch compile cache and NuGet's HTTP cache.
@@ -384,6 +387,42 @@ jobs:
         if (-not $dll) { Write-Output "::error::cudnn64_9.dll is not in the cuDNN archive."; exit 1 }
         $dll.DirectoryName | Out-File -Append -FilePath $env:GITHUB_PATH
         "cuDNN: $version (CUDA 13) at $($dll.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+    # The FP16 kernel module (#include <cuda_fp16.h>) compiles through NVRTC, which brings <nv/target> and the C++
+    # headers itself but not CUDA's own: CudaBackend looks for them through AIDOTNET_CUDA_INCLUDE, CUDA_PATH or a
+    # toolkit under Program Files. A runner with only NVRTC and cuBLAS on PATH (gtx1660ti-cuda, 11-13) found none, so the
+    # whole FP16 module failed to compile and its conv tests skipped with "conv2d_direct_fp16hw not compiled". A runner
+    # with its own headers keeps them; any other gets NVIDIA's public CUDA runtime redistributable (headers only), fetched
+    # once into the workspace and checked against the SHA-256 in NVIDIA's manifest, like cuDNN above.
+    - name: CUDA headers for NVRTC
+      run: |
+        function Has-Fp16Header([string] $dir) { $dir -and (Test-Path -LiteralPath (Join-Path $dir 'cuda_fp16.h')) }
+        $cudaPath = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { [Environment]::GetEnvironmentVariable('CUDA_PATH', 'Machine') }
+        $toolkit = Get-ChildItem "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA" -Directory -Filter 'v*' -ErrorAction SilentlyContinue |
+          Sort-Object Name | Select-Object -Last 1
+        $own = @($env:AIDOTNET_CUDA_INCLUDE, $(if ($cudaPath) { Join-Path $cudaPath 'include' }),
+                 $(if ($toolkit) { Join-Path $toolkit.FullName 'include' })) | Where-Object { Has-Fp16Header $_ } | Select-Object -First 1
+        if ($own) { "CUDA headers: the runner's own at $own" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY; exit 0 }
+
+        $version = '13.2.86'   # cuda_cudart in redistrib_13.2.2.json
+        $sha256 = '024e0c1055343d9d2a7d35c90fb7695db14cc2f05bb962198eb18b92c73b32be'
+        $root = Join-Path $env:GITHUB_WORKSPACE "cuda-headers-$version"
+        if (-not ((Test-Path (Join-Path $root 'ok')) -and (Get-ChildItem $root -Recurse -Filter cuda_fp16.h -ErrorAction SilentlyContinue | Select-Object -First 1))) {
+          $zip = Join-Path $env:RUNNER_TEMP 'cuda-cudart.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-$version-archive.zip"
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sha256) { Write-Output "::error::CUDA runtime archive SHA-256 mismatch."; exit 1 }
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Force $root | Out-Null
+          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $root
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::Extracting the CUDA runtime headers failed."; exit 1 }
+          Remove-Item $zip
+          New-Item -ItemType File (Join-Path $root 'ok') | Out-Null
+        }
+        $header = Get-ChildItem $root -Recurse -Filter cuda_fp16.h | Select-Object -First 1
+        if (-not $header) { Write-Output "::error::cuda_fp16.h is not in the CUDA runtime archive."; exit 1 }
+        "AIDOTNET_CUDA_INCLUDE=$($header.DirectoryName)" | Out-File -Append -FilePath $env:GITHUB_ENV
+        "CUDA headers: runtime redistributable $version at $($header.DirectoryName)" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
 
     - name: Check the lane selects every GPU test class
       if: ${{ !inputs.ratchets_only && matrix.arch != 'pr-models' }}

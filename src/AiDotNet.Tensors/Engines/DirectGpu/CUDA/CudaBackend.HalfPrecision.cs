@@ -393,7 +393,7 @@ public sealed partial class CudaBackend : IFp16ConvBatchedGemmBackend
             gradCHalf.Handle, CuBlasNative.CUDA_R_16F, N,
             betaPtr,
             gradAOut.Handle, outType, K,
-            CuBlasNative.CUBLAS_COMPUTE_32F, 0);
+            CuBlasNative.CUBLAS_COMPUTE_32F, CuBlasNative.CUBLAS_GEMM_DEFAULT);
         if (sA == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
         CuBlasNative.CheckCublasStatus(sA, "cublasGemmEx(MatMulBackwardFp16Fused gradA)");
@@ -406,7 +406,7 @@ public sealed partial class CudaBackend : IFp16ConvBatchedGemmBackend
             aHalf.Handle, CuBlasNative.CUDA_R_16F, K,
             betaPtr,
             gradBOut.Handle, outType, N,
-            CuBlasNative.CUBLAS_COMPUTE_32F, 0);
+            CuBlasNative.CUBLAS_COMPUTE_32F, CuBlasNative.CUBLAS_GEMM_DEFAULT);
         if (sB == AiDotNet.Tensors.Engines.CublasStatus.NotSupported)
             throw new NotSupportedException($"FP16 Tensor-Core GEMM not supported on this device (cc {_ccMajor}.{_ccMinor}).");
         CuBlasNative.CheckCublasStatus(sB, "cublasGemmEx(MatMulBackwardFp16Fused gradB)");
