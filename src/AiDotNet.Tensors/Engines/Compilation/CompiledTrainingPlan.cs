@@ -4461,6 +4461,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     internal static bool LeaseBackwardScratch { get; set; } = Environment.GetEnvironmentVariable("AIDOTNET_GPU_SCRATCH_LEASES") != "0";
 
+    /// <summary>
+    /// Whether a plan that captures its step as a device graph leases its backward scratch too (the assignment repeats run
+    /// to run, so the graph bakes in the settled one). AIDOTNET_GPU_SCRATCH_LEASES_CAPTURE=0 keeps a slot per backward
+    /// output for a capturing plan, as before.
+    /// </summary>
+    internal static bool LeaseBackwardScratchUnderCapture { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_SCRATCH_LEASES_CAPTURE") != "0";
+
     /// <summary>Test hook: the device buffers this plan's step scratch holds now (kept slots, transient arena, free leases).</summary>
     internal int ScratchBufferCount => _scratchPool?.BufferCount ?? 0;
 
@@ -4491,9 +4499,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var outerScratchPool = redirectEngine is not null
             ? Engines.DirectGpuTensorEngine.EnterScratchPool(_scratchPool ??= redirectEngine.CreateScratchPool())
             : null;
-        // Backward outputs are leased for their action only where no graph capture bakes in their addresses: on a
-        // backend without capture, or for a plan that does not capture its step (disabled, ineligible, or failed).
-        bool leaseBackwardOutputs = redirectEngine is not null && LeaseBackwardScratch && !MayCaptureStepGraph(backend);
+        // Backward outputs are leased for their action (a buffer reused by later actions) rather than kept for the plan's
+        // life. Under a step capture too: the same actions lease the same sizes in the same order every run, so the
+        // capture records the assignment the eager runs settled, and a capture backend never trims or forgets a pooled
+        // buffer (below), so no address a graph baked in is freed. Keeping a slot per backward output made a captured
+        // step's footprint the sum of its backward outputs: MobileNetV2 b64 held 357 MB of device memory, 255 MB leased.
+        bool leaseBackwardOutputs = redirectEngine is not null && LeaseBackwardScratch
+                                    && (LeaseBackwardScratchUnderCapture || !MayCaptureStepGraph(backend));
         if (_scratchPool is { } leasingPool)
             leasingPool.FirstLeasedAction = leaseBackwardOutputs ? _forwardActions.Length : int.MaxValue;
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;

@@ -22,7 +22,7 @@ public class CompiledGpuScratchLeaseTests
         return t;
     }
 
-    private static (float[] Parameters, long ScratchBytes) Train(IEngine engine, int steps)
+    private static (float[] Parameters, long ScratchBytes) Train(IEngine engine, int steps, bool capture = false)
     {
         // Identical residual blocks h += ReLU(BatchNorm(Conv(h))): each convolution's input gradient is the second
         // contribution to h's gradient (the add passes it the first), so it is written to scratch and added, never
@@ -51,7 +51,7 @@ public class CompiledGpuScratchLeaseTests
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.001f);
             // A captured step graph bakes in its scratch addresses, so a capturing plan keeps its slots (CUDA captures
             // by default): both arms run uncaptured, where leasing applies on every backend.
-            if (plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
+            if (!capture && plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
             for (int s = 0; s < steps; s++) plan.Step();
             long bytes = plan is CompiledTrainingPlan<float> compiled ? compiled.ScratchBufferBytes : -1;
             var all = new System.Collections.Generic.List<float>();
@@ -96,6 +96,44 @@ public class CompiledGpuScratchLeaseTests
             finally
             {
                 CompiledTrainingPlan<float>.LeaseBackwardScratch = previous;
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void Leased_backward_scratch_under_a_captured_step_graph_trains_identically_and_holds_fewer_bytes()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        bool previous = CompiledTrainingPlan<float>.LeaseBackwardScratchUnderCapture;
+        using (gpu)
+        {
+            try
+            {
+                // Enough steps for the plan to capture its step and replay the graph many times: a lease assignment the
+                // capture baked in that a later run reassigned or freed would corrupt the replayed steps.
+                const int steps = 16;
+                CompiledTrainingPlan<float>.LeaseBackwardScratchUnderCapture = false;
+                var kept = Train(gpu, steps, capture: true);
+                long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
+                CompiledTrainingPlan<float>.LeaseBackwardScratchUnderCapture = true;
+                var leased = Train(gpu, steps, capture: true);
+                Skip.If(CompiledTrainingPlan<float>.GraphReplayCount == replaysBefore,
+                    "This backend did not capture the step, so there is no graph to bake in a lease.");
+
+                Assert.Equal(kept.Parameters, leased.Parameters);
+                Assert.True(leased.ScratchBytes > 0 && leased.ScratchBytes < kept.ScratchBytes,
+                    $"leased plan holds {leased.ScratchBytes} scratch bytes, kept plan {kept.ScratchBytes}");
+            }
+            finally
+            {
+                CompiledTrainingPlan<float>.LeaseBackwardScratchUnderCapture = previous;
             }
         }
     }

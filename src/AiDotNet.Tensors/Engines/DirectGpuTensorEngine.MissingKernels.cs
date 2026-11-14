@@ -1584,9 +1584,9 @@ public partial class DirectGpuTensorEngine
             using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.NormalizationParams);
             using var bufMean = GetWeightBufferPreferResident(backend, mean, PersistentTensorRole.NormalizationParams);
             using var bufVar = GetWeightBufferPreferResident(backend, variance, PersistentTensorRole.NormalizationParams);
-            bufOut = AllocateOutputBuffer(backend, x.Length);
-            using var bufSaveMean = AllocateOutputBuffer(backend, channels);
-            using var bufSaveInvVar = AllocateOutputBuffer(backend, channels);
+            bufOut = AllocateFullyWrittenOutputBuffer(backend, x.Length);
+            using var bufSaveMean = AllocateFullyWrittenOutputBuffer(backend, channels);
+            using var bufSaveInvVar = AllocateFullyWrittenOutputBuffer(backend, channels);
             // One pass: normalize with the running statistics and apply the activation (batchnorm_relu and kin).
             if (!backend.TryFusedBatchNormActivation(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                     bufMean.Buffer, bufVar.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer,
@@ -1653,11 +1653,13 @@ public partial class DirectGpuTensorEngine
             using var bufBeta = GetWeightBufferPreferResident(backend, beta, PersistentTensorRole.NormalizationParams);
             using var bufMean = GetWeightBufferPreferResident(backend, mean, PersistentTensorRole.NormalizationParams);
             using var bufVar = GetWeightBufferPreferResident(backend, variance, PersistentTensorRole.NormalizationParams);
-            bufOut = AllocateOutputBuffer(backend, x.Length);
+            bufOut = AllocateFullyWrittenOutputBuffer(backend, x.Length);
             // saveMean/saveInvVar are training-only outputs; the inference path ignores them but
-            // the kernel signature requires the buffers, so hand it scratch of size [channels].
-            using var bufSaveMean = AllocateOutputBuffer(backend, channels);
-            using var bufSaveInvVar = AllocateOutputBuffer(backend, channels);
+            // the kernel signature requires the buffers, so hand it scratch of size [channels]. Inference writes every
+            // output element and never reads the save buffers, so none of the three is zero-filled first: each fill was a
+            // driver call of its own (~5 us on WDDM), three per batch norm, a sixth of a MobileNetV2 b1 predict.
+            using var bufSaveMean = AllocateFullyWrittenOutputBuffer(backend, channels);
+            using var bufSaveInvVar = AllocateFullyWrittenOutputBuffer(backend, channels);
             backend.BatchNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, bufSaveMean.Buffer, bufSaveInvVar.Buffer,
                 batch, channels, spatial, (float)epsilon, 0.1f, /*training:*/ false);
