@@ -6832,7 +6832,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16
                     && e.Buffer.Handle != System.IntPtr.Zero && e.Buffer.Size >= need)
                     return new OwnedBuffer(e.Buffer, ownsBuffer: false);
-            if (t.IsContiguous)
+            // Only a compiled resident step needs the persistent route: there a non-resident operand is a stable
+            // constant, and a per-step upload would break capture. Outside one (the recording pass, eager calls) a
+            // host-only operand is usually an activation computed on the host. Keeping it in the persistent weight
+            // cache held a copy for the rest of the process: ViT's six MLP hidden activations, 73 MB of training VRAM.
+            // Registered parameters still reach the persistent cache through GetOrAllocateBuffer.
+            if (t.IsContiguous && ResidentStepActive)
                 return GetWeightBufferPreferResident(backend, t, PersistentTensorRole.Weights);
         }
         return GetOrAllocateContiguousInputBuffer(backend, t);
