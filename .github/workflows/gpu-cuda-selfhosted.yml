@@ -115,13 +115,15 @@ jobs:
     # requests' GPU suites; a runner registered before the split carries no architecture label and picks up no job until
     # relabelled (see the header for how).
     runs-on: ${{ fromJSON(matrix.arch == 'pr' && '["self-hosted","gpu","cuda","cuda-pr"]' || matrix.arch == 'pr-models' && '["self-hosted","gpu","cuda","sm86"]' || format('["self-hosted","gpu","cuda","{0}"]', matrix.arch)) }}
-    # pr and sm75/sm89: setup (up to 20 minutes), both suite parts at their full watchdogs with the diagnostics between
-    # them (about 5 minutes), and the 30-minute reserve: 20 + 140 + 5 + 90 + 30 = 285 on the slowest cuda-pr runner,
-    # 270 elsewhere. A DirectGpu overrun then still leaves the second part its whole watchdog, so it keeps its TRX.
+    # pr and sm75/sm89: setup (up to 20 minutes), the quiet-GPU wait at its cap (15 on pr, 30 on sm75/sm89), both suite
+    # parts at their full watchdogs with the diagnostics between them (about 5 minutes), and the 30-minute reserve:
+    # 20 + 15 + 140 + 5 + 90 + 30 = 300 on the slowest cuda-pr runner, 20 + 30 + 130 + 5 + 85 + 30 = 300 on sm75/sm89.
+    # A DirectGpu overrun then still leaves the second part its whole watchdog, so it keeps its TRX.
     # pr-models: setup and the model families (about 18 minutes, bounded at 26).
-    # sm86: setup (20), the suite parts (115 + 50) with diagnostics (5), torch interop (5), the model families (26) and
-    # the nightly ratchet (360): 581, so 600.
-    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || matrix.arch == 'pr-models' && 60 || 600 }}
+    # sm86: setup (20), the quiet-GPU wait before the suites (60), the suite parts (115 + 50) with diagnostics (5), torch
+    # interop (5), the model families (26), the quiet-GPU wait before the timings (60) and the nightly ratchet (360):
+    # 701, so 720.
+    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || matrix.arch == 'pr-models' && 60 || 720 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -226,10 +228,21 @@ jobs:
     - name: Record the GPU and driver
       id: gpu
       run: |
-        $gpu = nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
+        # A runner on a multi-GPU machine is pinned to its card by CUDA_VISIBLE_DEVICES=<GPU UUID> in its .env. CUDA
+        # honours that; nvidia-smi does not, so every nvidia-smi call in this job selects the card with -i
+        # $env:NVSMI_GPU. Only a single UUID is unambiguous (nvidia-smi's index order is PCI bus order, CUDA's default
+        # is fastest-first), so anything else is refused rather than measuring the wrong card.
+        $pin = "$env:CUDA_VISIBLE_DEVICES".Trim()
+        $smiSelect = @()
+        if ($pin) {
+          if ($pin -notmatch '^GPU-[0-9a-fA-F-]+$') { Write-Output "::error::CUDA_VISIBLE_DEVICES='$pin': pin a runner with one GPU UUID (nvidia-smi -L)."; exit 1 }
+          $smiSelect = @('-i', $pin)
+          "NVSMI_GPU=$pin" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
+        }
+        $gpu = nvidia-smi @smiSelect --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader
         if ($LASTEXITCODE -ne 0) { Write-Output "::error::nvidia-smi failed: this runner has no usable NVIDIA driver."; exit 1 }
-        "Runner GPU: $gpu" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
-        $cap = "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1)".Trim()
+        "Runner GPU: $gpu$(if ($pin) { " (pinned: $pin)" })" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+        $cap = "$(nvidia-smi @smiSelect --query-gpu=compute_cap --format=csv,noheader | Select-Object -First 1)".Trim()
         if ($cap -notmatch '^\d+\.\d+$') { Write-Output "::error::nvidia-smi reported no compute capability ('$cap')."; exit 1 }
         "sm=sm$($cap -replace '\.', '')" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_OUTPUT
 
@@ -414,7 +427,7 @@ jobs:
         SUITE_WATCHDOG_DIRECTGPU_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '115' || matrix.arch == 'pr' && '140' || '130' }}
         SUITE_WATCHDOG_REST_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '50' || matrix.arch == 'pr' && '90' || '85' }}
         # Must equal the job's timeout-minutes.
-        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 290 || 600 }}
+        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || 720 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
@@ -443,12 +456,13 @@ jobs:
         # clocks_event_reasons; older ones only accept clocks_throttle_reasons.
         $samples = "${{ runner.temp }}/trx"
         $reasons = 'clocks_event_reasons.active'
+        $smiSelect = if ($env:NVSMI_GPU) { "-i $env:NVSMI_GPU " } else { '' }
         nvidia-smi --query-gpu=$reasons --format=csv,noheader 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { $reasons = 'clocks_throttle_reasons.active' }
         $gpuFields = "timestamp,utilization.gpu,memory.used,clocks.sm,clocks.max.sm,temperature.gpu,power.draw,$reasons"
         $samplers = @(
-          (Start-Process nvidia-smi -ArgumentList "--query-gpu=$gpuFields --format=csv -l 30 -f `"$samples/gpu-samples.csv`"" -NoNewWindow -PassThru),
-          (Start-Process nvidia-smi -ArgumentList "--query-compute-apps=timestamp,pid,process_name,used_memory --format=csv -l 30 -f `"$samples/gpu-processes.csv`"" -NoNewWindow -PassThru))
+          (Start-Process nvidia-smi -ArgumentList "$smiSelect--query-gpu=$gpuFields --format=csv -l 30 -f `"$samples/gpu-samples.csv`"" -NoNewWindow -PassThru),
+          (Start-Process nvidia-smi -ArgumentList "$smiSelect--query-compute-apps=timestamp,pid,process_name,used_memory --format=csv -l 30 -f `"$samples/gpu-processes.csv`"" -NoNewWindow -PassThru))
         # This run's processes: the tree under dotnet test, walked at every wait slice so the sampled process ids can be
         # told apart from another workload's, which may also be a dotnet or a testhost. Ids, parents and names only (a
         # command line could carry a credential).
@@ -783,8 +797,8 @@ jobs:
     # The CUDA step-time ratchets: each network's ours/PyTorch step ratio on this machine class may not rise above the
     # one recorded in parity/head-to-head-baseline.json. PyTorch compiles each network in every mode for up to an hour
     # (the runner's RunnerTimeout), far past a pull request's budget and the 15-minute hang blame, so they run nightly
-    # and on dispatch on the RTX 3080 only (the SM86 job's limit is 600 minutes for it: at most about 217 minutes
-    # before this step, 360 in it, and the upload). They run only after every earlier step passed, so a red night does
+    # and on dispatch on the RTX 3080 only (the SM86 job's limit is 720 minutes for it: at most about 337 minutes
+    # before this step, counting both quiet-GPU waits, 360 in it, and the upload). They run only after every earlier step passed, so a red night does
     # not hold the shared runner for hours more. A deferral (no baseline for the machine class, a torch that cannot reach
     # the device) fails the step, and so does a missing network: each of the nine must report a pass or a failure.
     - name: Wait for a quiet GPU before the timings
