@@ -1195,10 +1195,11 @@ kernel void sparse_optimizer_serial(
         if (operation == 0u) { if (a > 0.0f) g += a * value; parameter[i] = value - learningRate * g; }
         else if (operation == 1u) { if (b > 0.0f) g += b * value; float velocity = a * state1[i] + g; state1[i] = velocity; parameter[i] = value - learningRate * velocity; }
         else if (operation == 2u || operation == 3u) {
-            float original = value; if (operation == 3u && d > 0.0f) original -= learningRate * d * original;
+            float original = value;
+            if (operation == 2u && d > 0.0f) g += d * value;
+            if (operation == 3u && d > 0.0f) original -= learningRate * d * original;
             float m = a * state1[i] + (1.0f - a) * g, v = b * state2[i] + (1.0f - b) * g * g; state1[i] = m; state2[i] = v;
             float update = learningRate * (m / correction1) / (sqrt(v / correction2) + c);
-            if (operation == 2u && d > 0.0f) update += learningRate * d * value;
             parameter[i] = original - update;
         }
         else if (operation == 4u) { if (c > 0.0f) g += c * value; float average = a * state1[i] + (1.0f - a) * g * g; state1[i] = average; parameter[i] = value - learningRate * g / (sqrt(average) + b); }

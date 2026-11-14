@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.DevicePrimitives;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -11,6 +12,36 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// </summary>
 internal sealed class CudaPinnedBufferPool : IDisposable
 {
+    private const uint CU_MEMHOSTALLOC_PORTABLE = 1;
+
+    [DllImport("nvcuda", EntryPoint = "cuMemHostAlloc")]
+    private static extern CudaResult cuMemHostAllocWin(out IntPtr pp, ulong bytesize, uint flags);
+
+    [DllImport("libcuda.so.1", EntryPoint = "cuMemHostAlloc")]
+    private static extern CudaResult cuMemHostAllocLinux(out IntPtr pp, ulong bytesize, uint flags);
+
+    private static CudaResult AllocatePortablePinnedHost(out IntPtr ptr, ulong byteSize)
+    {
+        try
+        {
+            var res = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? cuMemHostAllocWin(out ptr, byteSize, CU_MEMHOSTALLOC_PORTABLE)
+                : cuMemHostAllocLinux(out ptr, byteSize, CU_MEMHOSTALLOC_PORTABLE);
+            if (res == CudaResult.Success)
+                return res;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // Fall back to cuMemAllocHost_v2 on drivers without cuMemHostAlloc.
+        }
+        catch (DllNotFoundException)
+        {
+            // Fall back to CuBlasNative.cuMemAllocHost so standard loader diagnostics apply.
+        }
+
+        return CuBlasNative.cuMemAllocHost(out ptr, byteSize);
+    }
+
     // Stacks, not ConcurrentBags: a bag's per-thread lists live in a ThreadLocal, which the GC finalizes with an abandoned
     // backend, and the deferred Dispose of that backend then threw ObjectDisposedException instead of freeing the blocks.
     private readonly ConcurrentDictionary<int, ConcurrentStack<IntPtr>> _buckets = new();
@@ -28,8 +59,10 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         if (_buckets.TryGetValue(bucketSize, out var bag) && bag.TryPop(out var ptr))
             return ptr;
 
-        var result = CuBlasNative.cuMemAllocHost(out ptr, (ulong)bucketSize);
-        CuBlasNative.CheckCudaResult(result, "cuMemAllocHost");
+        // Allocate with CU_MEMHOSTALLOC_PORTABLE so pinned staging slots remain page-locked and DMA-accessible
+        // even when a host thread switches between multiple CUDA device contexts (e.g., GPU 0 <-> GPU 1).
+        var result = AllocatePortablePinnedHost(out ptr, (ulong)bucketSize);
+        CuBlasNative.CheckCudaResult(result, "cuMemHostAlloc(portable)");
         // Publish allocation to the unified GPU memory ledger so a
         // memory_snapshot during a training step lists this pinned-host
         // bucket alongside CUDA caching-allocator + workspace allocs.

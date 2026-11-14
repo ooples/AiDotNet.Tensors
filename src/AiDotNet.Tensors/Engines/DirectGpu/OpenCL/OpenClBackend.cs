@@ -1684,7 +1684,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
         {
+            if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            if (destination is null) throw new ArgumentNullException(nameof(destination));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
+            if (openClBuffer.Handle == IntPtr.Zero)
+                throw new ObjectDisposedException(nameof(buffer), "GPU buffer was released before its download.");
+            if (destination.Length < openClBuffer.Size)
+                throw new ArgumentException("Destination array is too small.", nameof(destination));
+            if (openClBuffer.Size == 0) return;
             GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.OpenCl);
             openClBuffer.Download(destination);
         }
@@ -9204,6 +9211,8 @@ KERNEL VARIANTS (A/B testing):
         {
             if (data is null) throw new ArgumentNullException(nameof(data));
             if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            if (buffer.Handle == IntPtr.Zero)
+                throw new ObjectDisposedException(nameof(buffer));
             if (data.Length > buffer.Size)
                 throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({buffer.Size}).", nameof(data));
             if (data.Length == 0) return;

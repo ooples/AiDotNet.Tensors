@@ -43,9 +43,15 @@ internal static class ResidentHostMirror
                 // A member bound to a pooled scratch buffer that was since released (ClearActionScratchPool) has
                 // nothing to contribute; its host slice is already the value. One such member must not abort the
                 // host read for every other view on the array.
-                if (t._gpuBuffer!.Handle == IntPtr.Zero) continue;
+                if (t._gpuBuffer is not { } gpuBuffer || gpuBuffer.Handle == IntPtr.Zero || t._gpuBackend is not { } gpuBackend) continue;
+                if (typeof(T) == typeof(float) && t._storageOffset == 0 && array.Length >= gpuBuffer.Size && t.Length >= gpuBuffer.Size)
+                {
+                    try { gpuBackend.DownloadBuffer(gpuBuffer, (float[])(object)array); }
+                    catch (ObjectDisposedException) { continue; }
+                    continue;
+                }
                 float[] floats;
-                try { floats = t._gpuBackend!.DownloadBuffer(t._gpuBuffer!); }
+                try { floats = gpuBackend.DownloadBuffer(gpuBuffer); }
                 catch (ObjectDisposedException) { continue; }
                 var values = DirectGpuEngine.FromFloatArray<T>(floats);
                 Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
@@ -130,8 +136,8 @@ internal static class ResidentHostMirror
     /// </summary>
     internal static bool ArmDownload<T>(Tensor<T> tensor)
     {
-        if (Attach(tensor) is not { } key) return false;
-        HostSync.Register(key, tensor._gpuMaterializerCallback!);
+        if (Attach(tensor) is not { } key || tensor._gpuMaterializerCallback is not { } callback) return false;
+        HostSync.Register(key, callback);
         return true;
     }
 }

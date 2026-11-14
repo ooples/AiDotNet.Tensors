@@ -1712,9 +1712,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
         var hipBuffer = (HipGpuBuffer)buffer;
+        if (hipBuffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer), "GPU buffer was released before its download.");
+        if (destination.Length < hipBuffer.Size)
+            throw new ArgumentException("Destination array is too small.", nameof(destination));
+        if (hipBuffer.Size == 0) return;
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Hip);
-        var size = (UIntPtr)(hipBuffer.Size * sizeof(float));
+        var size = (UIntPtr)((ulong)hipBuffer.Size * sizeof(float));
 
         fixed (float* destPtr = destination)
         {
@@ -5939,13 +5946,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     /// <inheritdoc/>
-    public void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
+    public unsafe void UploadBufferInPlace(float[] data, IGpuBuffer buffer)
     {
         if (data is null) throw new ArgumentNullException(nameof(data));
-        // A float buffer holds the raw IEEE bits, so the int path's byte-exact hipMemcpy writes the same bytes.
-        var bits = new int[data.Length];
-        Buffer.BlockCopy(data, 0, bits, 0, data.Length * sizeof(float));
-        UploadIntBufferInPlace(bits, buffer);
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (data.Length > buffer.Size)
+            throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({buffer.Size}).", nameof(data));
+        if (buffer.Handle == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(buffer));
+        if (data.Length == 0) return;
+        GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Hip);
+
+        fixed (float* dataPtr = data)
+        {
+            var result = HipNativeBindings.hipMemcpy(
+                buffer.Handle,
+                (IntPtr)dataPtr,
+                (UIntPtr)((ulong)data.Length * sizeof(float)),
+                HipMemcpyKind.HostToDevice);
+            HipNativeBindings.CheckError(result, "hipMemcpy H2D (in-place float upload)");
+        }
     }
 
     public unsafe IGpuBuffer AllocateIntBuffer(int[] data)
