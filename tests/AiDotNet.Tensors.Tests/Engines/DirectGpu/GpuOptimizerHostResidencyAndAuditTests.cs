@@ -1420,4 +1420,114 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
             AssertClose(src2.ToArray(), destination.ToArray(), 1e-6f, "StateTensorCopy.SecondAfterHostRead");
         });
     }
+
+    [Fact]
+    public void TryAliasResidentOutput_ClearsDestOwnershipAndStorageCertification_PreventingBorrowedBufferHijack()
+    {
+        string? prevEnv = Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS");
+        Environment.SetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS", "none");
+        var directGpu = new DirectGpuEngine();
+        Environment.SetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS", prevEnv);
+
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.CreateCompressedMoment(state);
+        var backendField = typeof(DirectGpuEngine).GetField("_backend", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Field _backend not found.");
+        var availField = typeof(DirectGpuEngine).GetField("_isAvailable", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Field _isAvailable not found.");
+        backendField.SetValue(directGpu, backend);
+        availField.SetValue(directGpu, true);
+
+        using var engine = new DirectGpuTensorEngine(directGpu);
+        IEngine gpuEng = engine;
+
+        WithEngine(engine, () =>
+        {
+            var src = HostTensor(new[] { 10f, 20f, 30f, 40f });
+            var srcBuf = new MockGpuBuffer(new[] { 10f, 20f, 30f, 40f });
+            engine.BindResidentBuffer(src, srcBuf, backend, isDeviceModified: true);
+
+            // 1. Direct _ownsGpuBuffer destination (CreateStateTensor): aliasing must clear _ownsGpuBuffer and dispose superseded buffer.
+            var destOwned = GpuOptimizer.CreateStateTensor(new[] { 4 });
+            var oldOwnedBuf = Assert.IsType<MockGpuBuffer>(destOwned.TryGetGpuBuffer());
+            Assert.True(destOwned._ownsGpuBuffer);
+            Assert.False(destOwned._storage.OwnsGpuBuffer(oldOwnedBuf));
+
+            engine.BeginGraphLifetime();
+            try
+            {
+                using (engine.EnterCompiledCapturePath())
+                {
+                    DirectGpuTensorEngine.CopyResultInto(engine, src, destOwned);
+                }
+            }
+            finally
+            {
+                engine.EndGraphLifetime();
+            }
+
+            Assert.False(destOwned._ownsGpuBuffer);
+            Assert.Equal(1, oldOwnedBuf.DisposeCount);
+            Assert.Same(srcBuf, destOwned.TryGetGpuBuffer());
+            AssertClose(new[] { 10f, 20f, 30f, 40f }, destOwned.ToArray(), 1e-6f, "AliasedDestOwned.Read");
+
+            // Once HostSync has been consumed by ToArray(), destOwned must NOT certify the borrowed srcBuf as live/owned:
+            // copying new host data into destOwned must fall back to host rather than overwriting srcBuf in place,
+            // and disposing destOwned must NOT dispose srcBuf.
+            var replacement = HostTensor(new[] { 1f, 2f, 3f, 4f });
+            gpuEng.TensorCopy(replacement, destOwned);
+            AssertClose(new[] { 10f, 20f, 30f, 40f }, backend.DownloadBuffer(srcBuf), 1e-6f, "BorrowedSrcBuf.UntouchedByCopy");
+            destOwned.Dispose();
+            Assert.Equal(0, srcBuf.DisposeCount);
+
+            // 2. Storage-owned destination (AttachGpuBufferOwner) with both RefCount == 1 and shared view RefCount > 1:
+            var destStorageSingle = HostTensor(new[] { 5f, 6f, 7f, 8f });
+            var storageBuf1 = new MockGpuBuffer(new[] { 5f, 6f, 7f, 8f });
+            destStorageSingle._storage.AttachGpuBufferOwner(storageBuf1);
+            destStorageSingle._gpuBuffer = storageBuf1;
+            destStorageSingle._gpuBackend = backend;
+            Assert.True(destStorageSingle._storage.OwnsGpuBuffer(storageBuf1));
+            Assert.False(destStorageSingle._storage.OwnsGpuBuffer(srcBuf));
+
+            var destStorageShared = HostTensor(new[] { 9f, 10f, 11f, 12f });
+            var storageBuf2 = new MockGpuBuffer(new[] { 9f, 10f, 11f, 12f });
+            destStorageShared._storage.AttachGpuBufferOwner(storageBuf2);
+            destStorageShared._gpuBuffer = storageBuf2;
+            destStorageShared._gpuBackend = backend;
+            using var sharedView = destStorageShared.Reshape(new[] { 2, 2 });
+            Assert.True(destStorageShared._storage.RefCount > 1);
+
+            engine.BeginGraphLifetime();
+            try
+            {
+                using (engine.EnterCompiledCapturePath())
+                {
+                    DirectGpuTensorEngine.CopyResultInto(engine, src, destStorageSingle);
+                    DirectGpuTensorEngine.CopyResultInto(engine, src, destStorageShared);
+                }
+            }
+            finally
+            {
+                engine.EndGraphLifetime();
+            }
+
+            Assert.Equal(1, storageBuf1.DisposeCount);
+            Assert.False(destStorageSingle._storage.HasGpuBufferOwner);
+            Assert.False(destStorageSingle._storage.OwnsGpuBuffer(srcBuf));
+
+            // Shared storage keeps storageBuf2 alive for sharedView, while OwnsGpuBuffer(srcBuf) returns false!
+            Assert.Equal(0, storageBuf2.DisposeCount);
+            Assert.True(destStorageShared._storage.OwnsGpuBuffer(storageBuf2));
+            Assert.False(destStorageShared._storage.OwnsGpuBuffer(srcBuf));
+
+            _ = destStorageShared.ToArray();
+            gpuEng.TensorCopy(replacement, destStorageShared);
+            AssertClose(new[] { 10f, 20f, 30f, 40f }, backend.DownloadBuffer(srcBuf), 1e-6f, "BorrowedSrcBuf.UntouchedBySharedStorageCopy");
+
+            destStorageSingle.Dispose();
+            destStorageShared.Dispose();
+            Assert.Equal(0, srcBuf.DisposeCount);
+            srcBuf.Dispose();
+        });
+    }
 }

@@ -19308,9 +19308,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 return true;
             }
         }
-        catch (Exception)
+        catch (DllNotFoundException)
         {
-            // Suppress context-push errors if the CUDA driver is already tearing down.
+            // Suppress context-push errors if the native CUDA library is unavailable.
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // Suppress context-push errors if the driver entry point is unavailable.
         }
         return false;
     }
@@ -19322,7 +19326,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.cuCtxPopCurrent(out var previousContext);
             _threadCurrentContext = previousContext;
         }
-        catch (Exception)
+        catch (DllNotFoundException)
+        {
+            _threadCurrentContext = IntPtr.Zero;
+        }
+        catch (EntryPointNotFoundException)
         {
             _threadCurrentContext = IntPtr.Zero;
         }

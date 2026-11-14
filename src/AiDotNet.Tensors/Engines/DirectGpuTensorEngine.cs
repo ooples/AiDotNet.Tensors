@@ -2219,7 +2219,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
         if (tensor.IsGpuResident) return true;
-        if ((tensor._ownsGpuBuffer || tensor._storage.HasGpuBufferOwner) && ReferenceEquals(tensor._gpuBackend, backend)) return true;
+        if ((tensor._ownsGpuBuffer || tensor._storage.OwnsGpuBuffer(tensor._gpuBuffer)) && ReferenceEquals(tensor._gpuBackend, backend)) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
         // A device-owned binding (an optimizer state, a resident step buffer, a parameter updated on the device) is
         // not a cache entry: its storage has a pending download FROM the device, so the device copy is the current
@@ -2394,6 +2394,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 removed = taken;
         }
         removed?.Dispose();
+    }
+
+    private static void ReleaseSupersededOwnedBuffer(IGpuBuffer buffer, IDirectGpuBackend? ownerBackend, bool capturing)
+    {
+        if (StepScratchPool.IsPooled(buffer)) return;
+        if (!capturing)
+        {
+            if (ownerBackend is IQueuedBufferRelease queued)
+                queued.ReleaseAfterQueuedWork(buffer);
+            else
+                buffer.Dispose();
+        }
+        else if (!Gpu.GpuBufferReleaseDeferral.TryDefer(buffer.Dispose))
+        {
+            buffer.Dispose();
+        }
     }
 
     private void InvalidateActivationCacheEntry(object key)
@@ -4044,7 +4060,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (param._gpuBufferVersion == param.GpuCacheVersion)
             {
-                if (paramArray is null || param._ownsGpuBuffer || param._storage.HasGpuBufferOwner)
+                if (paramArray is null || param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf))
                     return existingBuf;
                 if (paramArray.Length == param.Length)
                 {
@@ -4081,7 +4097,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         return existingBuf;
                 }
             }
-            else if (param._ownsGpuBuffer || param._storage.HasGpuBufferOwner || param._device != TensorDevice.CPU)
+            else if (param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf) || param._device != TensorDevice.CPU)
             {
                 try
                 {
@@ -4859,10 +4875,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // keyed by its storage) is never read again: from here dest borrows srcBuf every step. Left in the cache it
         // lived as long as dest's storage, the plan's lifetime: 3 GB of trace-time results on DenseNet-121. Released
         // only outside a stream capture, so the pre-residency pass frees them and a capture frees nothing.
-        if (!(backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing()))
+        bool streamCapturing = backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing();
+        if (!streamCapturing)
         {
             ReleaseSupersededActivation(destArr, srcBuf);
             ReleaseSupersededActivation(dest.DataVector, srcBuf);
+            if (dest._storage.RefCount == 1 && dest._storage.HasGpuBufferOwner && !dest._storage.OwnsGpuBuffer(srcBuf))
+            {
+                var prevStorageBackend = dest._gpuBackend;
+                dest._storage.DisposeGpuBufferOwner(owner =>
+                {
+                    if (ReferenceEquals(owner, srcBuf)) return;
+                    if (owner is IGpuBuffer gpuOwner)
+                        ReleaseSupersededOwnedBuffer(gpuOwner, prevStorageBackend, capturing: false);
+                    else
+                        owner.Dispose();
+                });
+            }
+        }
+        if (dest._ownsGpuBuffer)
+        {
+            var prevOwned = dest._gpuBuffer;
+            var prevBackend = dest._gpuBackend;
+            dest._ownsGpuBuffer = false;
+            if (prevOwned is not null && !ReferenceEquals(prevOwned, srcBuf))
+                ReleaseSupersededOwnedBuffer(prevOwned, prevBackend, streamCapturing);
         }
 
         // Borrow src's buffer: consumers resolve dest via the _gpuBuffer fast path. We do NOT add a second
