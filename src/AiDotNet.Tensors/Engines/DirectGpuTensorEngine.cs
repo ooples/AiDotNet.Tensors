@@ -7995,7 +7995,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).Sigmoid(input);
         using var resultDataKeep1 = new KeepAliveScope(result);
         using var destDataKeep1 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
@@ -8127,7 +8127,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).ReLU(input);
         using var resultDataKeep2 = new KeepAliveScope(result);
         using var destDataKeep2 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     /// <summary>GPU-resident elementwise log into the destination's stable buffer (the cross-entropy loss's log
@@ -8673,7 +8673,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).TensorMatMul(a, b);
         using var resultDataKeep3 = new KeepAliveScope(result);
         using var destDataKeep3 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
@@ -9237,6 +9237,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSum<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
@@ -9249,6 +9250,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMaxValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
@@ -9261,6 +9263,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMinValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
@@ -15672,15 +15675,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.FFT<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.FFT(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank == 0
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.FFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
         }
 
         int n = inputReal.Shape._dims[^1];
-        if ((n & (n - 1)) != 0) // Not power of 2
+        if (n < 2 || (n & (n - 1)) != 0) // Non-power-of-two or length <= 1
         {
             base.FFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15708,6 +15721,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("FFT", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Forward);
         }
         catch
         {
@@ -15721,15 +15735,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.IFFT<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.IFFT(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank == 0
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.IFFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
         }
 
         int n = inputReal.Shape._dims[^1];
-        if ((n & (n - 1)) != 0)
+        if (n < 2 || (n & (n - 1)) != 0)
         {
             base.IFFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15757,6 +15781,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("IFFT", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Inverse);
         }
         catch
         {
@@ -15770,8 +15795,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.FFT2D<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.FFT2D(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Rank < 2 || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank < 2
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.FFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15780,7 +15815,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int height = inputReal.Shape._dims[^2];
         int width = inputReal.Shape._dims[^1];
 
-        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        if (height < 2 || width < 2 || (height & (height - 1)) != 0 || (width & (width - 1)) != 0)
         {
             base.FFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15808,6 +15843,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("FFT2D", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Forward2D);
         }
         catch
         {
@@ -15821,8 +15857,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.IFFT2D<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.IFFT2D(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Rank < 2 || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank < 2
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.IFFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15831,7 +15877,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int height = inputReal.Shape._dims[^2];
         int width = inputReal.Shape._dims[^1];
 
-        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        if (height < 2 || width < 2 || (height & (height - 1)) != 0 || (width & (width - 1)) != 0)
         {
             base.IFFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15859,6 +15905,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("IFFT2D", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Inverse2D);
         }
         catch
         {
@@ -15879,8 +15926,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> magnitudeOut,
         out Tensor<T> phaseOut)
     {
+        // Any graph trace goes through CpuEngine.STFT, which captures it (an inference kernel, or one training node per
+        // output) and replays on this engine with the trace suspended, landing on the device path below.
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft)
+        // The device kernel computes in float. A taped call in any other precision trains on the CPU path, whose
+        // forward is exact in T, so its recorded gradient matches the function the loss actually sees.
+        if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
             return;
@@ -15894,7 +15951,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int paddedLength = signalLength + 2 * pad;
             int numFrames = (paddedLength - nFft) / hopLength + 1;
             int numFreqs = nFft / 2 + 1;
-            if (numFrames <= 0)
+            // Reflection padding of pad = nFft / 2 samples requires signalLength > pad (same guard as CpuEngine.STFT);
+            // otherwise e.g. signalLength = 4, nFft = 16 has numFrames > 0 and ReflectPad1d would read out of bounds.
+            if ((center && signalLength <= pad) || numFrames <= 0)
             {
                 base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
                 return;
@@ -15925,11 +15984,104 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             phaseOut = DeferTensorResult<T>(backend, phaseBuffer.Buffer, outputLength, outputShape);
             magnitudeBuffer.RelinquishOwnership();
             phaseBuffer.RelinquishOwnership();
+            RecordStftTapeEdges(input, nFft, hopLength, window, center, magnitudeOut, phaseOut);
         }
         catch
         {
             if (ThrowOnGpuKernelFallback) throw;
             base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
+        }
+    }
+
+    /// <summary>
+    /// The first-order STFT backward on the device: the waveform gradient and the window gradient of one output's seed
+    /// (<see cref="Autodiff.BackwardFunctions{T}.StftMagnitudeBackward"/> and its phase sibling), with the same analysis
+    /// adjoint as the host kernel. Returns false, computing nothing, where the host path must run: non-float data, no
+    /// backend, an active graph trace, or a window that is not <paramref name="nFft"/> long.
+    /// </summary>
+    internal bool TryStftBackward<T>(Tensor<T> gradient, Tensor<T> magnitude, Tensor<T> phase, bool phaseTarget,
+        Tensor<T> waveform, Tensor<T> window, int nFft, int hopLength, bool center,
+        out Tensor<T>? gradWaveform, out Tensor<T>? gradWindow)
+    {
+        gradWaveform = null;
+        gradWindow = null;
+        using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend))
+            return false;
+
+        // A pure recording deferred scope has queued, not run, the work that produces these operands. These kernels
+        // are not recorded, so launching them would run them now, ahead of their producers; the host adjoint would
+        // download the same unwritten buffers. A scope executes once, so nothing can run the producers first here:
+        // refuse rather than return a gradient computed from uninitialised memory.
+        // This holds for every element type, since the host adjoint of a double STFT reads the same buffers.
+        if (backend is Gpu.RecordingGpuBackend { IsRecording: true, ExecuteWhileRecording: false })
+            throw new InvalidOperationException(
+                "The STFT backward cannot run inside a deferred scope that records without executing: its operands "
+                + "are not computed until the scope executes. Compute the gradient after DeferredScope.Execute(), or "
+                + "set GpuExecutionOptions.ExecuteEagerlyWhileRecording.");
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
+            || waveform.Rank == 0 || gradient.Rank < 2 || window.Length != nFft || nFft <= 0 || hopLength <= 0)
+            return false;
+
+        int length = waveform.Shape._dims[^1];
+        int numFreqs = nFft / 2 + 1;
+        int numFrames = gradient.Shape._dims[^1];
+        int batch = length == 0 ? 0 : waveform.Length / length;
+        int pad = center ? nFft / 2 : 0;
+        long padded = (long)length + 2L * pad;
+        long batchFrames = (long)batch * numFrames;
+        if (batch <= 0 || numFrames <= 0 || batchFrames > int.MaxValue
+            || (center ? length <= pad : length < nFft)
+            || 2L * padded > int.MaxValue || hopLength > padded
+            || padded < nFft || (long)(numFrames - 1) * hopLength + nFft > padded
+            || batchFrames * numFreqs != gradient.Length
+            || batchFrames * nFft > int.MaxValue
+            || magnitude.Length != gradient.Length || phase.Length != gradient.Length)
+            return false;
+
+        // The kernels are queued when this returns, so every temporary they read is released only after that work
+        // (CUDA's legacy allocator would otherwise hand the memory to another stream while they still use it).
+        OwnedBuffer gradBuffer = default, magnitudeBuffer = default, phaseBuffer = default, waveformBuffer = default,
+            windowBuffer = default, frameGradBuffer = default, signalGradBuffer = default, windowGradBuffer = default;
+        bool handedOff = false;
+        try
+        {
+            gradBuffer = GetOrAllocateBuffer(backend, gradient);
+            magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
+            phaseBuffer = GetOrAllocateBuffer(backend, phase);
+            waveformBuffer = GetOrAllocateBuffer(backend, waveform);
+            windowBuffer = GetOrAllocateBuffer(backend, window);
+            frameGradBuffer = AllocateFullyWrittenOutputBuffer(backend, (int)(batchFrames * nFft));
+            signalGradBuffer = AllocateFullyWrittenOutputBuffer(backend, waveform.Length);
+            windowGradBuffer = AllocateFullyWrittenOutputBuffer(backend, nFft);
+            backend.StftBackwardFrames(gradBuffer.Buffer, magnitudeBuffer.Buffer, phaseBuffer.Buffer, frameGradBuffer.Buffer,
+                batch, nFft, numFrames, numFreqs, phaseTarget ? 1 : 0);
+            backend.StftBackwardSignal(frameGradBuffer.Buffer, windowBuffer.Buffer, signalGradBuffer.Buffer,
+                batch, length, pad, nFft, hopLength, numFrames);
+            backend.StftBackwardWindow(frameGradBuffer.Buffer, waveformBuffer.Buffer, windowGradBuffer.Buffer,
+                batch, length, pad, nFft, hopLength, numFrames);
+            gradWaveform = DeferTensorResult<T>(backend, signalGradBuffer.Buffer, waveform.Length, waveform.Shape.ToArray());
+            gradWindow = DeferTensorResult<T>(backend, windowGradBuffer.Buffer, nFft, window.Shape.ToArray());
+            signalGradBuffer.RelinquishOwnership();
+            windowGradBuffer.RelinquishOwnership();
+            handedOff = true;
+            return true;
+        }
+        finally
+        {
+            if (!handedOff)
+            {
+                signalGradBuffer.DisposeAfterQueuedUse(backend);
+                windowGradBuffer.DisposeAfterQueuedUse(backend);
+                gradWaveform = null;
+                gradWindow = null;
+            }
+            frameGradBuffer.DisposeAfterQueuedUse(backend);
+            windowBuffer.DisposeAfterQueuedUse(backend);
+            waveformBuffer.DisposeAfterQueuedUse(backend);
+            phaseBuffer.DisposeAfterQueuedUse(backend);
+            magnitudeBuffer.DisposeAfterQueuedUse(backend);
+            gradBuffer.DisposeAfterQueuedUse(backend);
         }
     }
 
@@ -16024,6 +16176,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> window,
         bool powerToDb)
     {
+        // Any graph trace goes through CpuEngine.MelSpectrogram, which captures it and replays on this engine.
+        if (Compilation.GraphMode.IsActive)
+            return base.MelSpectrogram(input, sampleRate, nFft, hopLength, nMels, fMin, fMax, window, powerToDb);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0)
         {
@@ -16032,8 +16187,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            ((IEngine)this).STFT(input, nFft, hopLength, window, center: true,
-                out var magnitude, out var phase);
+            // Without a tape: this override records its own MelSpectrogram edge, and STFT's edges would double it.
+            Tensor<T> magnitude, phase;
+            using (new Autodiff.NoGradScope<T>())
+                ((IEngine)this).STFT(input, nFft, hopLength, window, center: true, out magnitude, out phase);
             // `phase` is retained (it used to be discarded via `_ = phase`) because
             // MelSpectrogramBackward needs it to rebuild the complex spectrum when propagating the
             // gradient back through |STFT|.
@@ -29012,6 +29169,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSumOfSquares<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         // Composed from IDirectGpuBackend.DotProduct(x, x, scalarOut, n), which all 6 backends implement without
         // materializing a full-length squares buffer on device (except WebGPU whose DotProduct composes internally);
@@ -30558,6 +30716,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMean<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
         if (ShouldReduceOnDevice(input) && TryGetBackend(out var b))
         {

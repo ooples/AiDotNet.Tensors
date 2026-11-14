@@ -205,6 +205,12 @@ void main() {
 
 }";
 
+    public static string StftBackwardFrames => KernelSourceResources.Read("Spectral.stft_backward_frames.glsl");
+
+    public static string StftBackwardSignal => KernelSourceResources.Read("Spectral.stft_backward_signal.glsl");
+
+    public static string StftBackwardWindow => KernelSourceResources.Read("Spectral.stft_backward_window.glsl");
+
     public static string IstftNormalize => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float result[]; };

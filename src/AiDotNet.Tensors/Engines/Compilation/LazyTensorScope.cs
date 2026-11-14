@@ -397,14 +397,23 @@ internal sealed class LazyTensorScope : IDisposable
     }
 
     /// <summary>
-    /// The first traced node whose value the forward read on the host during this trace, or null. An inference plan
-    /// cannot represent what the forward computed from that read, so compiling refuses the trace.
+    /// What the forward first read on the host during this trace (a traced operation whose value it read, or an
+    /// engine operation that returned a host value), or null. An inference plan cannot represent what the forward
+    /// computed from that read, so compiling refuses the trace.
     /// </summary>
-    internal ILazyNode? HostEscape { get; private set; }
+    internal string? HostEscape { get; private set; }
 
     internal void MarkHostEscape(ILazyNode node)
     {
-        HostEscape ??= node;
+        HostEscape ??= $"the value of traced operation {node.OpType}";
+    }
+
+    // An engine operation that returns a host value (TensorSum, TensorVecDot, ...) read its operand on the host, so
+    // whatever the forward computes from that value would replay as the trace-time constant, even when the operand is
+    // a plan input whose values change on every replay.
+    internal void MarkHostEscape(string operationName)
+    {
+        HostEscape ??= $"the result of {operationName}";
     }
 
     /// <summary>The engine the recorded nodes replay on.</summary>

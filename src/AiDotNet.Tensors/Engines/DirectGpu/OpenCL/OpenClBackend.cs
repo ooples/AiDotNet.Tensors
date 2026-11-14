@@ -14752,6 +14752,13 @@ KERNEL VARIANTS (A/B testing):
         public void PhaseVocoder(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer newMag, IGpuBuffer newPhase, int leading, int numFrames, int numFreqs, int outFrames, float rate) { if (_context == null) return; var k = _kernelCache["phase_vocoder"]; k.SetArg(0, ((DirectOpenClGpuBuffer)mag).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)phase).Buffer.Handle); k.SetArg(2, ((DirectOpenClGpuBuffer)newMag).Buffer.Handle); k.SetArg(3, ((DirectOpenClGpuBuffer)newPhase).Buffer.Handle); k.SetArg(4, leading); k.SetArg(5, numFrames); k.SetArg(6, numFreqs); k.SetArg(7, outFrames); k.SetArg(8, rate); int total = leading * numFreqs; k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total)); }
         public void BuildSpectrum(IGpuBuffer mag, IGpuBuffer phase, IGpuBuffer specRe, IGpuBuffer specIm, int batch, int numFreqs, int numFrames, int nFft) { if (_context == null) return; var k = _kernelCache["build_spectrum"]; k.SetArg(0, ((DirectOpenClGpuBuffer)mag).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)phase).Buffer.Handle); k.SetArg(2, ((DirectOpenClGpuBuffer)specRe).Buffer.Handle); k.SetArg(3, ((DirectOpenClGpuBuffer)specIm).Buffer.Handle); k.SetArg(4, batch); k.SetArg(5, numFreqs); k.SetArg(6, numFrames); k.SetArg(7, nFft); int total = batch * numFrames; k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total)); }
         public void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center) { if (_context == null) return; var k = _kernelCache["istft_from_spectrum"]; k.SetArg(0, ((DirectOpenClGpuBuffer)specRe).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)specIm).Buffer.Handle); k.SetArg(2, ((DirectOpenClGpuBuffer)window).Buffer.Handle); k.SetArg(3, ((DirectOpenClGpuBuffer)result).Buffer.Handle); k.SetArg(4, ((DirectOpenClGpuBuffer)windowSum).Buffer.Handle); k.SetArg(5, batch); k.SetArg(6, numFrames); k.SetArg(7, nFft); k.SetArg(8, hop); k.SetArg(9, outputLength); k.SetArg(10, center); int total = batch * outputLength; k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total)); }
+        private static DirectOpenClGpuBuffer RequireLiveStftBuffer(IGpuBuffer buffer) =>
+            buffer is DirectOpenClGpuBuffer ocl && !ocl.IsReleased && ocl.Handle != IntPtr.Zero
+                ? ocl
+                : throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
+        public void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget) { if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available"); int total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget); var g = RequireLiveStftBuffer(grad); var m = RequireLiveStftBuffer(magnitude); var p = RequireLiveStftBuffer(phase); var fg = RequireLiveStftBuffer(frameGrad); var k = _kernelCache["stft_backward_frames"]; k.SetArg(0, g.Buffer.Handle); k.SetArg(1, m.Buffer.Handle); k.SetArg(2, p.Buffer.Handle); k.SetArg(3, fg.Buffer.Handle); k.SetArg(4, batch); k.SetArg(5, nFft); k.SetArg(6, numFrames); k.SetArg(7, numFreqs); k.SetArg(8, phaseTarget); k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total)); }
+        public void StftBackwardSignal(IGpuBuffer frameGrad, IGpuBuffer window, IGpuBuffer gradSignal, int batch, int length, int pad, int nFft, int hop, int numFrames) { if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available"); int total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames); var fg = RequireLiveStftBuffer(frameGrad); var w = RequireLiveStftBuffer(window); var gs = RequireLiveStftBuffer(gradSignal); var k = _kernelCache["stft_backward_signal"]; k.SetArg(0, fg.Buffer.Handle); k.SetArg(1, w.Buffer.Handle); k.SetArg(2, gs.Buffer.Handle); k.SetArg(3, batch); k.SetArg(4, length); k.SetArg(5, pad); k.SetArg(6, nFft); k.SetArg(7, hop); k.SetArg(8, numFrames); k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total)); }
+        public void StftBackwardWindow(IGpuBuffer frameGrad, IGpuBuffer signal, IGpuBuffer gradWindow, int batch, int length, int pad, int nFft, int hop, int numFrames) { if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available"); int total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames); var fg = RequireLiveStftBuffer(frameGrad); var s = RequireLiveStftBuffer(signal); var gw = RequireLiveStftBuffer(gradWindow); var k = _kernelCache["stft_backward_window"]; k.SetArg(0, fg.Buffer.Handle); k.SetArg(1, s.Buffer.Handle); k.SetArg(2, gw.Buffer.Handle); k.SetArg(3, batch); k.SetArg(4, length); k.SetArg(5, pad); k.SetArg(6, nFft); k.SetArg(7, hop); k.SetArg(8, numFrames); k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total)); }
         public void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total) { if (_context == null) return; var k = _kernelCache["istft_normalize"]; k.SetArg(0, ((DirectOpenClGpuBuffer)result).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)windowSum).Buffer.Handle); k.SetArg(2, total); k.Execute1D(total, CalculateOptimalWorkGroupSize1D(total)); }
         public void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) { if (_context == null) return; var k = _kernelCache["histogramdd"]; k.SetArg(0, ((DirectOpenClGpuBuffer)samples).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)hist).Buffer.Handle); k.SetArg(2, ((DirectOpenClGpuBuffer)bins).Buffer.Handle); k.SetArg(3, ((DirectOpenClGpuBuffer)mins).Buffer.Handle); k.SetArg(4, ((DirectOpenClGpuBuffer)maxs).Buffer.Handle); k.SetArg(5, n); k.SetArg(6, d); k.Execute1D(n, CalculateOptimalWorkGroupSize1D(n)); }
         public void MasksToBoxes(IGpuBuffer masks, IGpuBuffer output, int n, int h, int w) { if (_context == null) return; var k = _kernelCache["masks_to_boxes"]; k.SetArg(0, ((DirectOpenClGpuBuffer)masks).Buffer.Handle); k.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle); k.SetArg(2, n); k.SetArg(3, h); k.SetArg(4, w); k.Execute1D(n, CalculateOptimalWorkGroupSize1D(n)); }
@@ -14786,12 +14793,13 @@ KERNEL VARIANTS (A/B testing):
         internal readonly DirectOpenClBuffer Buffer;
         private readonly Action<DirectOpenClGpuBuffer>? _returnToPool;
         private int _poolState;
+        internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
         private int _size;
 
         public int Size => Volatile.Read(ref _size);
         public int Capacity => Buffer.Length;
         public long SizeInBytes => (long)Size * sizeof(float);
-        public IntPtr Handle => Buffer.Handle;
+        public IntPtr Handle => IsReleased ? IntPtr.Zero : Buffer.Handle;
 
         // The DeviceMemoryReclaim epoch of this buffer's current charge (set at each allocation or pool hit).
         internal long ReclaimEpoch = -1;
@@ -14834,7 +14842,18 @@ KERNEL VARIANTS (A/B testing):
                 DeviceMemoryReclaim.OnDeviceFinalized((long)Size * sizeof(float), ReclaimEpoch);
                 var pooledBuffer = Buffer;
                 var memory = _memory.TransferToLease();
-                PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool, memory)));
+                PendingFrees.Enqueue(() =>
+                {
+                    var lease = Pooled(pooledBuffer, returnToPool, memory);
+                    try
+                    {
+                        returnToPool(lease);
+                    }
+                    catch (Exception)
+                    {
+                        lease.ReleaseCore();
+                    }
+                });
                 return;
             }
             if (Interlocked.Exchange(ref _poolState, 2) == 2) return;
@@ -14883,23 +14902,38 @@ KERNEL VARIANTS (A/B testing):
 
         public void Dispose()
         {
-            if (_returnToPool == null)
+            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(DisposeCore))
+                return;
+
+            DisposeCore();
+        }
+
+        private void DisposeCore()
+        {
+            if (_returnToPool is not { } returnToPool)
             {
-                Release();
+                ReleaseCore();
                 return;
             }
 
-            if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
+            if (Interlocked.CompareExchange(ref _poolState, 2, 0) != 0)
                 return;
 
+            GC.SuppressFinalize(this);
             // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back.
+            // Hand the device buffer to the pool under a fresh wrapper (one lease, one wrapper, matching the finalizer
+            // and CudaGpuBuffer.DetachForPool) so any stale holder of this wrapper stays permanently released even
+            // after TryRent reuses the underlying OpenCL buffer.
             DeviceMemoryReclaim.OnDeviceRelease((long)Size * sizeof(float), ReclaimEpoch);
-            _memory.OnReturned();
-
-            if (GpuBufferReleaseDeferral.IsActive && GpuBufferReleaseDeferral.TryDefer(() => _returnToPool(this)))
-                return;
-
-            _returnToPool(this);
+            var lease = Pooled(Buffer, returnToPool, _memory.TransferToLease());
+            try
+            {
+                returnToPool(lease);
+            }
+            catch (Exception)
+            {
+                lease.ReleaseCore();
+            }
         }
     }
 

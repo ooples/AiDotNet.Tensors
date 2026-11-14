@@ -8876,6 +8876,51 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
+    private static bool IsReleased(IGpuBuffer buffer) =>
+        buffer.Handle == IntPtr.Zero || (buffer is HipGpuBuffer hip && hip.IsReleased);
+
+    public unsafe void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_backward_frames");
+        int __total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
+        if (IsReleased(grad) || IsReleased(magnitude) || IsReleased(phase) || IsReleased(frameGrad))
+            throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = grad.Handle; IntPtr la1 = magnitude.Handle; IntPtr la2 = phase.Handle; IntPtr la3 = frameGrad.Handle; int la4 = batch; int la5 = nFft; int la6 = numFrames; int la7 = numFreqs; int la8 = phaseTarget;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        if (_stream != IntPtr.Zero)
+            HipNativeBindings.CheckError(HipNativeBindings.hipStreamSynchronize(_stream), "hipStreamSynchronize (STFT backward)");
+    }
+    public unsafe void StftBackwardSignal(IGpuBuffer frameGrad, IGpuBuffer window, IGpuBuffer gradSignal, int batch, int length, int pad, int nFft, int hop, int numFrames)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_backward_signal");
+        int __total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
+        if (IsReleased(frameGrad) || IsReleased(window) || IsReleased(gradSignal))
+            throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = frameGrad.Handle; IntPtr la1 = window.Handle; IntPtr la2 = gradSignal.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        if (_stream != IntPtr.Zero)
+            HipNativeBindings.CheckError(HipNativeBindings.hipStreamSynchronize(_stream), "hipStreamSynchronize (STFT backward)");
+    }
+    public unsafe void StftBackwardWindow(IGpuBuffer frameGrad, IGpuBuffer signal, IGpuBuffer gradWindow, int batch, int length, int pad, int nFft, int hop, int numFrames)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_backward_window");
+        int __total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
+        if (IsReleased(frameGrad) || IsReleased(signal) || IsReleased(gradWindow))
+            throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = frameGrad.Handle; IntPtr la1 = signal.Handle; IntPtr la2 = gradWindow.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        if (_stream != IntPtr.Zero)
+            HipNativeBindings.CheckError(HipNativeBindings.hipStreamSynchronize(_stream), "hipStreamSynchronize (STFT backward)");
+    }
     public unsafe void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total)
     {
         var kernel = ResolveParity210Kernel("parity210_istft_normalize");
@@ -12833,6 +12878,9 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal HipBackend OwningBackend { get; }
     private readonly Action<HipGpuBuffer>? _returnToPool;
     private int _poolState;
+    // 0 while rented, 1 while pooled, 2 once freed. Release and pool return keep Handle and Size nonzero.
+    internal bool IsReleased =>
+        Volatile.Read(ref _poolState) != 0 || (_viewParent is HipGpuBuffer parent && parent.IsReleased);
     private readonly IGpuBuffer? _viewParent;
     private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
     // Device memory another library owns (a DLPack import): never pooled or freed here; releasing the buffer waits for
@@ -13100,28 +13148,30 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     public void Dispose()
     {
         if (TryParkForExport(Dispose)) return;
-        if (_returnToPool == null)
+        if (_returnToPool is not { } returnToPool)
         {
             Release();
             return;
         }
 
-        if (Interlocked.CompareExchange(ref _poolState, 1, 0) != 0)
+        if (Interlocked.CompareExchange(ref _poolState, 2, 0) != 0)
             return;
 
+        GC.SuppressFinalize(this);
         // Disposed by its owner, not abandoned to the finalizer: no collection is needed to get it back. AllocateBuffer
         // charged a pooled buffer its size (pool hit or hipMalloc); without the credit a TensorScope's frees still counted
-        // toward a forced collection.
+        // toward a forced collection. Return the device pointer under a fresh wrapper (one lease, one wrapper) so any stale
+        // holder of this wrapper stays permanently released even after TryRent reuses the pooled memory.
         DeviceMemoryReclaim.OnDeviceRelease(SizeInBytes, TakeReclaimEpoch());
-        _memory.OnReturned();
+        var lease = Pooled(Handle, Capacity, OwningBackend, returnToPool, _memory.TransferToLease());
         try
         {
-            _returnToPool(this);
+            returnToPool(lease);
         }
         catch (Exception)
         {
             // If returning to pool fails for any reason, release directly
-            Release();
+            lease.Release();
         }
     }
 }

@@ -98,6 +98,12 @@ struct P { batch: i32, numFreqs: i32, numFrames: i32, nFft: i32 };
   for (var k = 1; k < pc.numFreqs - 1; k = k + 1) { let dst = pc.nFft - k; if (dst >= 0 && dst < pc.nFft && k < pc.nFft) { specRe[specOff + dst] = specRe[specOff + k]; specIm[specOff + dst] = -specIm[specOff + k]; } }
 }";
 
+    public static string StftBackwardFrames => KernelSourceResources.Read("Spectral.stft_backward_frames.wgsl");
+
+    public static string StftBackwardSignal => KernelSourceResources.Read("Spectral.stft_backward_signal.wgsl");
+
+    public static string StftBackwardWindow => KernelSourceResources.Read("Spectral.stft_backward_window.wgsl");
+
     public static string IstftNormalize => @"
 @group(0) @binding(0) var<storage, read_write> resultb : array<f32>;
 @group(0) @binding(1) var<storage, read> windowSum : array<f32>;

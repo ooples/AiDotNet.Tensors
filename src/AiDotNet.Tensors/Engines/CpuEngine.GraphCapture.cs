@@ -10,6 +10,23 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <summary>
+    /// Prepares an operand of an operation that returns a host value (a scalar, a bool, a count) rather than a tensor.
+    /// A training plan can only replay recorded nodes, so a host value computed while tracing would be frozen into the
+    /// plan as a constant; worse, a lazy operand that has not been computed yet would be read as whatever its buffer
+    /// held (all-zero gradients, NaN). Training and compatibility traces therefore fail closed, so the caller falls
+    /// back to eager execution. An inference trace records the host escape, whether or not the operand is lazy (a plan
+    /// input's values change on every replay too), so compiling it refuses the trace; the operand is materialized
+    /// before its storage is read, so the traced forward itself still computes the right value.
+    /// </summary>
+    private protected static void BeginHostScalarRead<T>(Tensor<T> operand, [CallerMemberName] string operationName = "")
+    {
+        if (operand is null) return; // the operation reports its own null argument
+        GraphMode.ThrowIfNonInferenceUnsupported(GraphCaptureLimitation.HostBoundary, operationName);
+        if (GraphMode.IsInferenceTrace) GraphMode.Current?.MarkHostEscape(operationName);
+        operand.RealizeLazySource();
+    }
+
+    /// <summary>
     /// Captures a value-dependent unary comparison in any graph kind. Comparison
     /// results are forward-only masks: they must be recomputed on every replay,
     /// but gradients do not flow through the discontinuous predicate itself.
