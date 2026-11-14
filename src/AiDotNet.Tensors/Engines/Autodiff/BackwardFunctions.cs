@@ -12091,6 +12091,67 @@ internal static partial class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
     }
 
+    /// <summary>
+    /// Backward of the magnitude output of <c>IEngine.STFT</c>, for either <c>center</c>. The same analysis adjoint as
+    /// <see cref="SpectrogramBackward"/>, seeded from the saved phase.
+    /// </summary>
+    internal static void StftMagnitudeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var waveform = inputs[0];
+        RequireSavedState(nameof(StftMagnitudeBackward), savedState, 6);
+        int nFft = SavedInt(nameof(StftMagnitudeBackward), savedState, 0, "nFft");
+        int hopLength = SavedInt(nameof(StftMagnitudeBackward), savedState, 1, "hopLength");
+        var window = SavedTensor(nameof(StftMagnitudeBackward), savedState, 2, "window");
+        var phase = SavedTensor(nameof(StftMagnitudeBackward), savedState, 3, "phase");
+        int origLength = SavedInt(nameof(StftMagnitudeBackward), savedState, 4, "origLength");
+        bool center = SavedBool(nameof(StftMagnitudeBackward), savedState, 5, "center");
+
+        if (CreatesGraph)
+        {
+            // The recorded linear analysis behind the create-graph path frames the centred signal only.
+            if (!center) throw new NotSupportedException("A create-graph backward through STFT requires center: true.");
+            if (SpectrogramBackwardCreateGraph(gradOutput, waveform, engine, grads, nFft, hopLength, window, origLength))
+                return;
+        }
+
+        var result = StftAnalysisAdjoint(
+            gradOutput, magnitude: null, phase, StftAdjointTarget.Magnitude,
+            nFft, hopLength, window, origLength, waveform._shape, center);
+        DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
+    }
+
+    /// <summary>
+    /// Backward of the phase output of <c>IEngine.STFT</c>, for either <c>center</c>. The same analysis adjoint as
+    /// <see cref="StftPhaseBackward"/>, scaled by the saved magnitudes.
+    /// </summary>
+    internal static void StftPhaseOutputBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var waveform = inputs[0];
+        RequireSavedState(nameof(StftPhaseOutputBackward), savedState, 6);
+        int nFft = SavedInt(nameof(StftPhaseOutputBackward), savedState, 0, "nFft");
+        int hopLength = SavedInt(nameof(StftPhaseOutputBackward), savedState, 1, "hopLength");
+        var window = SavedTensor(nameof(StftPhaseOutputBackward), savedState, 2, "window");
+        var magnitude = SavedTensor(nameof(StftPhaseOutputBackward), savedState, 3, "magnitude");
+        int origLength = SavedInt(nameof(StftPhaseOutputBackward), savedState, 4, "origLength");
+        bool center = SavedBool(nameof(StftPhaseOutputBackward), savedState, 5, "center");
+
+        if (CreatesGraph)
+        {
+            if (!center) throw new NotSupportedException("A create-graph backward through STFT requires center: true.");
+            if (StftPhaseBackwardCreateGraph(gradOutput, waveform, engine, grads, nFft, hopLength, window, origLength))
+                return;
+        }
+
+        var result = StftAnalysisAdjoint(
+            gradOutput, magnitude, output, StftAdjointTarget.Phase,
+            nFft, hopLength, window, origLength, waveform._shape, center);
+        DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
+    }
+
     // The create-graph path of StftPhaseBackward, kept out of it so its first-order path allocates no closure.
     private static bool StftPhaseBackwardCreateGraph(
             Tensor<T> gradOutput,
@@ -12711,13 +12772,15 @@ internal static partial class BackwardFunctions<T>
     /// </remarks>
     private static Tensor<T> StftAnalysisAdjoint(
         Tensor<T> gradient, Tensor<T>? magnitude, Tensor<T> phase, StftAdjointTarget target,
-        int nFft, int hopLength, Tensor<T> window, int origLength, int[] waveformShape)
+        int nFft, int hopLength, Tensor<T> window, int origLength, int[] waveformShape, bool center = true)
     {
         var gradMagnitude = gradient;
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = nFft / 2 + 1;
         int numFrames = gradMagnitude._shape[^1];
-        int padAmount = nFft / 2;                 // analysed with center: true
+        // center: true analysed the reflection-padded signal; center: false the signal itself, so there is nothing
+        // to fold back and the overlap-add lands on the waveform directly.
+        int padAmount = center ? nFft / 2 : 0;
         int paddedLength = origLength + 2 * padAmount;
         int batchSize = gradMagnitude.Length / (numFreqs * numFrames);
 

@@ -15502,9 +15502,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> magnitudeOut,
         out Tensor<T> phaseOut)
     {
-        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
-        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
-        Compilation.GraphMode.ThrowIfNonInferenceUnsupported(Compilation.GraphCaptureLimitation.HostBoundary);
+        // Any graph trace goes through CpuEngine.STFT, which captures it (an inference kernel, or one training node per
+        // output) and replays on this engine with the trace suspended, landing on the device path below.
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft)
         {
@@ -15551,6 +15555,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             phaseOut = DeferTensorResult<T>(backend, phaseBuffer.Buffer, outputLength, outputShape);
             magnitudeBuffer.RelinquishOwnership();
             phaseBuffer.RelinquishOwnership();
+            RecordStftTapeEdges(input, nFft, hopLength, window, center, magnitudeOut, phaseOut);
         }
         catch
         {
@@ -15650,9 +15655,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> window,
         bool powerToDb)
     {
-        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
-        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
-        Compilation.GraphMode.ThrowIfNonInferenceUnsupported(Compilation.GraphCaptureLimitation.HostBoundary);
+        // Any graph trace goes through CpuEngine.MelSpectrogram, which captures it and replays on this engine.
+        if (Compilation.GraphMode.IsActive)
+            return base.MelSpectrogram(input, sampleRate, nFft, hopLength, nMels, fMin, fMax, window, powerToDb);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0)
         {
@@ -15661,8 +15666,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            ((IEngine)this).STFT(input, nFft, hopLength, window, center: true,
-                out var magnitude, out var phase);
+            // Without a tape: this override records its own MelSpectrogram edge, and STFT's edges would double it.
+            Tensor<T> magnitude, phase;
+            using (new Autodiff.NoGradScope<T>())
+                ((IEngine)this).STFT(input, nFft, hopLength, window, center: true, out magnitude, out phase);
             // `phase` is retained (it used to be discarded via `_ = phase`) because
             // MelSpectrogramBackward needs it to rebuild the complex spectrum when propagating the
             // gradient back through |STFT|.

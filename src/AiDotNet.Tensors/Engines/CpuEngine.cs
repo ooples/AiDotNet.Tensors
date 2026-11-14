@@ -46812,6 +46812,22 @@ public partial class CpuEngine : ITensorLevelEngine
         outputImag = outImag;
     }
 
+    /// <summary>
+    /// Records the tape edges of an eager STFT: one per output, so a loss over the magnitude, the phase or both
+    /// reaches the waveform through the analysis adjoint (the windowed overlap-add of the unnormalised inverse DFT of
+    /// the per-bin seed, folded back through the reflection padding when <paramref name="center"/>).
+    /// </summary>
+    private protected static void RecordStftTapeEdges<T>(Tensor<T> input, int nFft, int hopLength, Tensor<T> window,
+        bool center, Tensor<T> magnitude, Tensor<T> phase)
+    {
+        if (!DifferentiableOps.IsRecording<T>()) return;
+        int origLength = input._shape[^1];
+        DifferentiableOps.RecordUnary("STFTMagnitude", magnitude, input, BackwardFunctions<T>.StftMagnitudeBackward,
+            new object[] { nFft, hopLength, window, phase, origLength, center });
+        DifferentiableOps.RecordUnary("STFTPhase", phase, input, BackwardFunctions<T>.StftPhaseOutputBackward,
+            new object[] { nFft, hopLength, window, magnitude, origLength, center });
+    }
+
     /// <inheritdoc/>
     public void STFT<T>(
         Tensor<T> input,
@@ -46824,9 +46840,20 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (window == null) throw new ArgumentNullException(nameof(window));
-        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
-        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
-        GraphMode.ThrowIfNonInferenceUnsupported(GraphCaptureLimitation.HostBoundary);
+        // A training (or compatibility) trace records one replayable node per output; each node's backward re-runs this
+        // op under a tape, so the compiled gradient is the eager one recorded below.
+        if (TryRecordCompiledOp("STFTMagnitude", new Tensor<T>?[] { input, window },
+                e => { e.STFT(input, nFft, hopLength, window, center, out Tensor<T> m, out Tensor<T> _); return m; },
+                out var magnitudeNode))
+        {
+            if (!TryRecordCompiledOp("STFTPhase", new Tensor<T>?[] { input, window },
+                    e => { e.STFT(input, nFft, hopLength, window, center, out Tensor<T> _, out Tensor<T> p); return p; },
+                    out var phaseNode))
+                throw new InvalidOperationException("STFT recorded its magnitude node but not its phase node.");
+            magnitudeOut = magnitudeNode;
+            phaseOut = phaseNode;
+            return;
+        }
         if (GraphMode.IsInferenceTrace)
         {
             Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
@@ -46980,6 +47007,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         magnitudeOut = magOut;
         phaseOut = phOut;
+        RecordStftTapeEdges(input, nFft, hopLength, window, center, magOut, phOut);
     }
 
     /// <inheritdoc/>
@@ -47191,9 +47219,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (window == null) throw new ArgumentNullException(nameof(window));
-        // This runs eagerly on the host instead of recording a lazy node, so a training trace would freeze the result (or
-        // an uncomputed lazy input) into the plan as a constant. Fail closed; the caller falls back to eager.
-        GraphMode.ThrowIfNonInferenceUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryRecordCompiledOp("MelSpectrogram", new Tensor<T>?[] { input, window },
+                e => e.MelSpectrogram(input, sampleRate, nFft, hopLength, nMels, fMin, fMax, window, powerToDb),
+                out var melNode))
+            return melNode;
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
                 new[] { input, window },
@@ -47205,7 +47234,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Compute STFT. The phase is retained (it used to be discarded) because the backward
         // needs it to reconstruct the complex spectrum for the magnitude adjoint.
-        STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var phase);
+        // Without a tape here: this op records its own edge below, and STFT's own edges would count the gradient twice.
+        Tensor<T> magnitude, phase;
+        using (new NoGradScope<T>())
+            STFT(input, nFft, hopLength, window, center: true, out magnitude, out phase);
         int origLength = input._shape[^1];
 
         // Convert to power spectrum (magnitude squared)
