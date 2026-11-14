@@ -3431,7 +3431,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IGpuBuffer? output = null;
         try
         {
-            output = AllocateBuffer(M * N);
+            output = AllocateBufferUninitialized(M * N);
             lt.MatmulFused(
                 aDev: B.Handle, m: N, k: K, transA: false,
                 bDev: A.Handle, n: M, transB: false,

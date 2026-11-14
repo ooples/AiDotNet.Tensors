@@ -299,7 +299,7 @@ public sealed partial class CudaBackend
             return null;
         }
 
-        IGpuBuffer output = AllocateBuffer(checked(m * n));
+        IGpuBuffer output = AllocateBufferUninitialized(checked(m * n));
         if (TryDirectPtxFusedLinearTiled(
             input, weights, bias, output, m, k, n, activation,
             DirectPtxLinearWeightLayout.InputMajor))

@@ -433,6 +433,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private long _activationCacheTimestamp = 0;
 
+    // Keys added to the activation cache, newest last, each with the cache timestamp when it was added, so a drop of
+    // the entries created after a snapshot visits only those keys instead of copying the whole cache (the copy was 9%
+    // of a GPU ViT b1 forward, one per attention layer). Overwritten slots fall off; RecentActivationEntriesAfter
+    // scans the full cache when its window reaches past the oldest slot.
+    private const int RecentActivationKeyRingSize = 4096;
+    private readonly object?[] _recentActivationKeys = new object?[RecentActivationKeyRingSize];
+    private readonly long[] _recentActivationKeyTimes = new long[RecentActivationKeyRingSize];
+    private long _recentActivationKeyWrites;
+
+    private void LogRecentActivationKey(object key)
+    {
+        int slot = (int)((System.Threading.Interlocked.Increment(ref _recentActivationKeyWrites) - 1) & (RecentActivationKeyRingSize - 1));
+        // Time first, so a reader that sees the key sees a time no older than the key's insert.
+        System.Threading.Volatile.Write(ref _recentActivationKeyTimes[slot], System.Threading.Interlocked.Read(ref _activationCacheTimestamp));
+        System.Threading.Volatile.Write(ref _recentActivationKeys[slot], key);
+    }
+
     // Eviction-suspend depth (#226 race fix). A training step (compiled-plan StepEager,
     // or an eager forward+backward) is ATOMIC: every forward activation it caches is
     // consumed by its own backward. The within-step VRAM-pressure eviction used to
@@ -2726,7 +2743,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // vector over it share one -- or an earlier result). That entry keeps its buffer; this buffer stays owned by
         // whoever holds it (the result tensor, its pending download) and is freed with them. Disposing it here, as the
         // old cache did, could free a buffer a pending download still reads.
-        _activationCache.TryAdd(cacheKey, entry);
+        if (_activationCache.TryAdd(cacheKey, entry)) LogRecentActivationKey(cacheKey);
     }
 
     /// <summary>
@@ -3194,6 +3211,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // PR #638 diag: cumulative count of activation entries this drop has freed (AIDOTNET_MHA_DIAG reads it).
     internal static long s_dropFreedTotal;
 
+    // The cache entries that can have been created after `snapshot`: walks the ring back from the newest key until it
+    // has passed the snapshot (a run of slots logged at or before it -- concurrent inserts can log slightly out of
+    // order), or returns the whole cache if the ring no longer reaches back that far. A key logged twice comes back
+    // twice; callers filter on the entry's timestamp and their second TryRemove fails. Under _activationCacheLock.
+    private KeyValuePair<object, ActivationCacheEntry>[] RecentActivationEntriesAfter(long snapshot)
+    {
+        const int PassedRun = 64;
+        long writes = System.Threading.Interlocked.Read(ref _recentActivationKeyWrites);
+        long first = writes - RecentActivationKeyRingSize;
+        var found = new List<KeyValuePair<object, ActivationCacheEntry>>();
+        int passed = 0;
+        for (long w = writes - 1; ; w--)
+        {
+            if (w < 0) break;
+            if (w < first) return _activationCache.ToArray();
+            int slot = (int)(w & (RecentActivationKeyRingSize - 1));
+            var key = System.Threading.Volatile.Read(ref _recentActivationKeys[slot]);
+            if (System.Threading.Volatile.Read(ref _recentActivationKeyTimes[slot]) <= snapshot)
+            {
+                if (++passed >= PassedRun) break;
+                continue;
+            }
+            passed = 0;
+            if (key is not null && _activationCache.TryGetValue(key, out var entry) && entry.Timestamp > snapshot)
+                found.Add(new KeyValuePair<object, ActivationCacheEntry>(key, entry));
+        }
+        return found.ToArray();
+    }
+
     internal void DropTransientActivationsCreatedAfter(long snapshot, object? keepKey, bool allThreads = false)
     {
         if (allThreads)
@@ -3211,7 +3257,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_activationCacheLock)
         {
             if (_activationCache.IsEmpty) return;
-            var entries = _activationCache.ToArray();
+            var entries = RecentActivationEntriesAfter(snapshot);
             for (int i = 0; i < entries.Length; i++)
             {
                 if (entries[i].Value.Timestamp <= snapshot) continue;            // pre-existing — keep
@@ -6095,7 +6141,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             owner.HostVersion = hostVersion;
 
-            if (!_activationCache.TryAdd(arrayKey, owner))
+            if (_activationCache.TryAdd(arrayKey, owner)) LogRecentActivationKey(arrayKey);
+            else
             {
                 // Concurrent mutation is not expected while the engine lock is held, but restore
                 // both original owners if it occurs so accounting and lifetime remain conservative.

@@ -8911,7 +8911,7 @@ public partial class DirectGpuTensorEngine
         int rows = cols == 0 ? 0 : x.Length / cols;
         var c = x.IsContiguous ? x : x.Contiguous();
         using var inBuf = GetOrAllocateBuffer(backend, c);
-        var outBuf = AllocateOutputBuffer(backend, x.Length);
+        var outBuf = AllocateFullyWrittenOutputBuffer(backend, x.Length);
         backend.SoftmaxRows(inBuf.Buffer, outBuf.Buffer, rows, cols);
         var result = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, (int[])x._shape.Clone());
         outBuf.RelinquishOwnership();
@@ -9031,14 +9031,24 @@ public partial class DirectGpuTensorEngine
                 Tensor<T>? headsOut = TryShortAttentionOnDevice(q2d.Reshape(new[] { B, S, D }), k2d.Reshape(new[] { B, S, D }),
                     v2d.Reshape(new[] { B, S, D }), B, H, S, S, d, 1.0 / System.Math.Sqrt(d), causal: false, causalOffset: 0,
                     new[] { B, S, D });
-                bool shortAttention = headsOut is not null;
                 // Composed when the scores fit the budget, and also past it when the backend declines its fused kernel
                 // for this size (IFusedAttentionPreference: the portable fused kernels lose to the composed form until
                 // the scores are 64M elements). Declining there sent the shape to the per-(batch, head) loop instead.
-                bool fusedDeclined = backend is DirectGpu.CUDA.IFusedAttentionPreference fusedPreference
-                    && !fusedPreference.PrefersFusedAttention(B, H, S, S, d);
+                // A backend that prefers its fused kernel at this size runs it first, whether or not the scores fit: CUDA's
+                // native kernel is one launch where the composed form is eight with their allocations, and a GPU ViT
+                // forward is launch-bound (b1 1.30 -> 1.01 ms, b16 3.35 -> 2.39 ms best of three on an RTX 1000 Ada).
+                bool fusedPreferred = backend is DirectGpu.CUDA.IFusedAttentionPreference fusedPreference
+                    && fusedPreference.PrefersFusedAttention(B, H, S, S, d);
+                bool fusedDeclined = backend is DirectGpu.CUDA.IFusedAttentionPreference && !fusedPreferred;
+                if (headsOut is null && fusedPreferred)
+                    headsOut = TryFusedAttentionOnDevice("MultiHeadAttentionForward", q2d.Reshape(new[] { B, S, D }),
+                        k2d.Reshape(new[] { B, S, D }), v2d.Reshape(new[] { B, S, D }), null, B, H, S, S, d,
+                        interleaved: true, 1.0 / System.Math.Sqrt(d), 0.0, causal: false, causalOffset: 0,
+                        new[] { B, S, D });
+                bool composed = false;
                 if (headsOut is null && ((long)B * H * S * S <= MhaBatchedScoreElementBudget || fusedDeclined))
                 {
+                    composed = true;
                     var qhB = ReshapePermuteHeads(backend, q2d, B, S, H, d);                                    // [B*H, S, d]
                     var khT = PermuteResidentGpu(backend, k2d.Reshape(new[] { B, S, H, d }), new[] { 0, 2, 3, 1 })
                         .Reshape(new[] { B * H, d, S });                                                       // [B*H, d, S]
@@ -9048,7 +9058,7 @@ public partial class DirectGpuTensorEngine
                     headsOut = PermuteResidentGpu(backend, BatchMatMul(attnB, vhB).Reshape(new[] { B, H, S, d }),
                         new[] { 0, 2, 1, 3 });                                                                 // [B, S, H, d]
                 }
-                else if (headsOut is null)
+                else if (headsOut is null && !fusedPreferred)
                 {
                     headsOut = TryFusedAttentionOnDevice("MultiHeadAttentionForward", q2d.Reshape(new[] { B, S, D }),
                         k2d.Reshape(new[] { B, S, D }), v2d.Reshape(new[] { B, S, D }), null, B, H, S, S, d,
@@ -9061,10 +9071,10 @@ public partial class DirectGpuTensorEngine
                     var batchedProj = TensorMatMul(headsOut.Reshape(new[] { B * S, D }), outWeight);
                     var batchedResult = batchedProj.Reshape(new[] { B, S, D });
                     // The route is tapeless. The composed attention leaves intermediates on BLAS pool threads, so
-                    // it drops every thread's and synchronizes the device first. The short kernel leaves only this
-                    // thread's (the projections), which the per-thread drop frees in queue order with no device
-                    // sync: a sync per attention layer made the drop 38% of a GPU ViT b32 forward.
-                    DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: !shortAttention);
+                    // it drops every thread's and synchronizes the device first. The short and fused kernels leave
+                    // only this thread's (the projections), which the per-thread drop frees in queue order with no
+                    // device sync: a sync per attention layer made the drop 38% of a GPU ViT b32 forward.
+                    DropTransientActivationsCreatedAfter(actSnapshot, batchedProj.DataVector, allThreads: composed);
                     if (s_mhaDiag) MhaDiag(tapeActive: false);
                     return batchedResult;
                 }
@@ -9393,7 +9403,7 @@ public partial class DirectGpuTensorEngine
     {
         var src = tensor.IsContiguous ? tensor : tensor.Contiguous();
         using var bufIn = GetOrAllocateBuffer(backend, src);
-        var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+        var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
         var kernelShape = physicalInputShape ?? src.Shape._dims;
         backend.Permute(bufIn.Buffer, bufOut.Buffer, kernelShape, axes);
         var outShape = resultShape ?? new int[kernelShape.Length];
