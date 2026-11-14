@@ -634,7 +634,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
                     HipMfmaKernel.GetMfmaSource(), "mfma_gemm", ref _mfmaModule, HipMfmaKernel.GetMfmaKernelNames());
                 if (mfmaFailure is not null)
                 {
-                    Console.WriteLine($"[HipBackend] MFMA GEMM module failed to compile; using portable GEMM: {mfmaFailure.Message}");
+                    // CompileKernelModule already recorded the failure (KernelCompilationFailures); this only notes
+                    // the fallback, through the same Debug trace the other optional modules use.
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[HipBackend] MFMA GEMM module failed to compile; using portable GEMM: {mfmaFailure.Message}");
                 }
             }
 
