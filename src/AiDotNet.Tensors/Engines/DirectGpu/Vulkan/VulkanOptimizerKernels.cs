@@ -79,7 +79,7 @@ void main(){if(gl_GlobalInvocationID.x!=0u)return;float bc1=vk_bias_correction(p
     for(uint k=0u;k<nnz;++k){int decoded=decodeIndex(indices[k]);if(decoded<0)continue;uint i=uint(decoded);float g=values[k];
         if(operation==0u){if(p0>0.0)g+=p0*param[i];param[i]-=learningRate*g;}
         else if(operation==1u){if(p1>0.0)g+=p1*param[i];float value=p0*state1[i]+g;state1[i]=value;param[i]-=learningRate*value;}
-        else if(operation==2u||operation==3u){float original=param[i];if(operation==3u&&p3>0.0)original-=learningRate*p3*original;float m=p0*state1[i]+(1.0-p0)*g,v=p1*state2[i]+(1.0-p1)*g*g;state1[i]=m;state2[i]=v;float update=learningRate*(m/bc1)/(sqrt(v/bc2)+p2);if(operation==2u&&p3>0.0)update+=learningRate*p3*param[i];param[i]=original-update;}
+        else if(operation==2u||operation==3u){float original=param[i];if(operation==2u&&p3>0.0)g+=p3*original;if(operation==3u&&p3>0.0)original-=learningRate*p3*original;float m=p0*state1[i]+(1.0-p0)*g,v=p1*state2[i]+(1.0-p1)*g*g;state1[i]=m;state2[i]=v;float update=learningRate*(m/bc1)/(sqrt(v/bc2)+p2);param[i]=original-update;}
         else if(operation==4u){if(p2>0.0)g+=p2*param[i];float sq=p0*state1[i]+(1.0-p0)*g*g;state1[i]=sq;param[i]-=learningRate*g/(sqrt(sq)+p1);}
         else if(operation==5u){if(p1>0.0)g+=p1*param[i];float accum=state1[i]+g*g;state1[i]=accum;param[i]-=learningRate*g/(sqrt(accum)+p0);}
         else if(operation==6u){if(p1>0.0)g+=p1*param[i];float old=state1[i],value=p0*old+g;state1[i]=value;param[i]-=learningRate*((1.0+p0)*value-p0*old);}
