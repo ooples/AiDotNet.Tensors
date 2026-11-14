@@ -83,9 +83,10 @@ internal sealed class StepScratchPool
 
     /// <summary>
     /// The first compiled action whose output slots are leased (<see cref="Lease"/>) rather than kept for the plan's life,
-    /// or <see cref="int.MaxValue"/> when none are. The plan sets it to its first backward action on a backend without
-    /// graph capture: a backward output is consumed inside the action that writes it, and keeping every one of them
-    /// for the plan's life made a GPU step's footprint the sum of its backward outputs, not the most live at once.
+    /// or <see cref="int.MaxValue"/> when none are. The plan sets it to its first backward action: a backward output is
+    /// consumed inside the action that writes it, and keeping every one of them for the plan's life made a GPU step's
+    /// footprint the sum of its backward outputs, not the most live at once. A captured step graph bakes in the
+    /// assignment of the run it recorded; it is replayed in stream order, so the reuse it recorded stays valid.
     /// </summary>
     internal int FirstLeasedAction { get; set; } = int.MaxValue;
 
@@ -95,6 +96,13 @@ internal sealed class StepScratchPool
     private readonly List<(long Key, IGpuBuffer Buffer)> _leases = new();
     // Buffers leased since the last TrimUnleased: a free buffer outside it served no lease in the last run.
     private readonly HashSet<IGpuBuffer> _leasedThisRun = new();
+
+    /// <summary>
+    /// How many slots have been pinned so far. Pins only grow. A captured step graph bakes in the lease assignment of
+    /// the run it recorded, so a pin first seen after that run means the graph may have handed the slot's buffer to a
+    /// later action while it was still live. The plan compares this count against the one at capture and re-captures.
+    /// </summary>
+    internal int PinnedCount => _pinned.Count;
 
     /// <summary>Whether slot <paramref name="key"/> of the running action is leased.</summary>
     internal bool Leases(long key) => Action >= FirstLeasedAction && !_pinned.Contains(key);
