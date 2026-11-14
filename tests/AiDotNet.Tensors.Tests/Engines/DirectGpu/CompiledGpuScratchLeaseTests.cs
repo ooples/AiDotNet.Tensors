@@ -218,4 +218,94 @@ public class CompiledGpuScratchLeaseTests
             }
         }
     }
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Lent_forward_slots_train_identically(bool capture)
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        bool previous = CompiledTrainingPlan<float>.LendForwardSlots;
+        using (gpu)
+        {
+            try
+            {
+                // A dense block's features are dead once the backward has passed them; lending their slots to the
+                // backward's leases must not change a single value, captured or not. (How much it saves depends on the
+                // sizes: DenseNet-121 b64 needs 1 new backward buffer instead of 5. StepScratchPool_lends_... below
+                // checks the mechanism itself.)
+                const int steps = 16;
+                CompiledTrainingPlan<float>.LendForwardSlots = false;
+                var kept = TrainDenseBlocks(gpu, steps, capture);
+                CompiledTrainingPlan<float>.LendForwardSlots = true;
+                var lent = TrainDenseBlocks(gpu, steps, capture);
+
+                Assert.Equal(kept.Parameters, lent.Parameters);
+                Assert.True(lent.ScratchBytes > 0 && lent.ScratchBytes <= kept.ScratchBytes,
+                    $"lending plan holds {lent.ScratchBytes} scratch bytes, plan without {kept.ScratchBytes}");
+            }
+            finally
+            {
+                CompiledTrainingPlan<float>.LendForwardSlots = previous;
+            }
+        }
+    }
+    [SkippableFact]
+    public void StepScratchPool_lends_a_dead_forward_slot_to_a_lease_and_takes_it_back()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        using (gpu)
+        {
+            var backend = Assert.IsAssignableFrom<AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend>(gpu.GetBackend());
+            var pool = gpu.CreateScratchPool();
+            pool.FirstLeasedAction = 2;
+            long forwardKey = 0L << 32;
+            var forwardSlot = backend.AllocateBuffer(256);
+            pool.Slots[forwardKey] = forwardSlot;
+            pool.Keys[forwardSlot] = forwardKey;
+            pool.Track(forwardSlot);
+
+            // Backward action 2: the forward slot is lent, and a lease of its size takes it instead of allocating.
+            pool.Begin(2);
+            pool.Lend(new System.Collections.Generic.List<(long, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer)> { (forwardKey, forwardSlot) });
+            long backwardKey = (2L << 32) | 0;
+            Assert.True(pool.Leases(backwardKey));
+            Assert.Same(forwardSlot, pool.Lease(backwardKey, backend, 256));
+            pool.EndLeases(null);
+
+            // After the backward the slot is its forward key's again and off the free list: the next lease allocates.
+            pool.WithdrawLent();
+            Assert.Same(forwardSlot, pool.Slots[forwardKey]);
+            Assert.Equal(forwardKey, pool.Keys[forwardSlot]);
+            pool.Begin(3);
+            var fresh = pool.Lease((3L << 32) | 0, backend, 200);   // fits only a buffer of 200 to 400 elements
+            Assert.NotSame(forwardSlot, fresh);
+            pool.EndLeases(null);
+
+            // A lent slot that escapes its lease (a parked gradient) becomes the backward slot's for good; its forward key
+            // lets go of it, so the next forward allocates rather than sharing one buffer between the two.
+            pool.Begin(2);
+            pool.Lend(new System.Collections.Generic.List<(long, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer)> { (forwardKey, forwardSlot) });
+            var leased = pool.Lease(backwardKey, backend, 256);
+            Assert.Same(forwardSlot, leased);
+            pool.EndLeases(new System.Collections.Generic.HashSet<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer> { leased });
+            pool.WithdrawLent();
+            Assert.Same(forwardSlot, pool.Slots[backwardKey]);
+            Assert.False(pool.Slots.ContainsKey(forwardKey));
+            pool.Release();
+        }
+    }
 }

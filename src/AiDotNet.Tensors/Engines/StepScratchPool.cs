@@ -176,6 +176,13 @@ internal sealed class StepScratchPool
         {
             if (escaped is not null && escaped.Contains(buffer))
             {
+                // A lent forward slot that escaped its lease becomes this slot's for good: its forward slot takes a new
+                // buffer on the next run (a buffer cannot be both, or a later lease could take it while it is pinned).
+                if (_lent.TryGetValue(buffer, out long forwardKey))
+                {
+                    _lent.Remove(buffer);
+                    if (Slots.TryGetValue(forwardKey, out var bound) && ReferenceEquals(bound, buffer)) Slots.Remove(forwardKey);
+                }
                 _pinned.Add(key);
                 Slots[key] = buffer;
             }
@@ -185,6 +192,37 @@ internal sealed class StepScratchPool
             }
         }
         _leases.Clear();
+    }
+
+    // Forward slots lent to the free list for the rest of the backward (Lend), by buffer, with their forward key; withdrawn
+    // when it ends.
+    private readonly Dictionary<IGpuBuffer, long> _lent = new(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
+
+    /// <summary>
+    /// Lends forward slots no later backward action reads to the free list, so the backward's leases reuse them. Each
+    /// stays its slot's: <see cref="WithdrawLent"/> takes it back before the next forward writes it. A slot no longer
+    /// bound to the buffer the schedule recorded is skipped.
+    /// </summary>
+    internal void Lend(List<(long Key, IGpuBuffer Buffer)> slots)
+    {
+        foreach (var (key, buffer) in slots)
+        {
+            if (!Slots.TryGetValue(key, out var bound) || !ReferenceEquals(bound, buffer) || buffer.Handle == IntPtr.Zero)
+                continue;
+            if (_lent.ContainsKey(buffer)) continue;
+            _free.Add(buffer);
+            _lent[buffer] = key;
+        }
+    }
+
+    /// <summary>Takes every lent forward slot back off the free list (one a lease still holds ended with its action).</summary>
+    internal void WithdrawLent()
+    {
+        if (_lent.Count == 0) return;
+        _free.RemoveAll(_lent.ContainsKey);
+        // A lease names its slot in Keys; the buffer is its forward slot's again.
+        foreach (var (buffer, key) in _lent) Keys[buffer] = key;
+        _lent.Clear();
     }
 
     /// <summary>Returns the forward leases due at or before <paramref name="action"/> to the free list.</summary>

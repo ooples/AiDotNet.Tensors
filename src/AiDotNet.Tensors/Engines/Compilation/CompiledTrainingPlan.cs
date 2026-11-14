@@ -2236,6 +2236,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _forwardActions = rebuiltForward.ToArray();
         _forwardOutputLeases = null;   // planned over the original actions
+        _lendSchedule = null;
         _isFrozenWeights = true;
         // Installing host-only forward specializations makes the action set unsafe for
         // CUDA-graph capture (they'd freeze under replay); the forward delegates also
@@ -4342,6 +4343,102 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Dictionary<int, int>? _forwardOutputLeases;
 
     /// <summary>
+    /// The last backward action that reads each forward tensor, for the tensors a step may lend once that action ends
+    /// (<see cref="PlanLastBackwardReads"/>); null when lending is not modeled.
+    /// </summary>
+    private Dictionary<Tensor<T>, int>? _lastBackwardReads;
+
+    /// <summary>Per backward action, the forward slots lent to the backward's leases once it ends; built on first use.</summary>
+    private List<(long Key, Engines.DirectGpu.IGpuBuffer Buffer)>?[]? _lendSchedule;
+
+    /// <summary>
+    /// Lends a forward output's slot to the backward's leases once the last backward action that reads it has run.
+    /// On by default; <c>AIDOTNET_GPU_LEND_FORWARD_SLOTS=0</c> keeps every forward slot to itself all step.
+    /// </summary>
+    internal static bool LendForwardSlots { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_LEND_FORWARD_SLOTS") != "0";
+
+    /// <summary>
+    /// For every tensor a backward action reads (a covered step's inputs, output and saved tensors), the last action
+    /// that reads it. A forward output is dead after that action: the backward runs in reverse, so no later action
+    /// reads it, and the next step's forward writes it before reading it. Excluded, as tensors read after the step or
+    /// before the forward: parameters, the loss, requested input-gradient leaves and every saved tensor (a training
+    /// batch norm's statistics feed its running-statistics update). Null unless every backward action reports the steps
+    /// it covers.
+    /// </summary>
+    private static Dictionary<Tensor<T>, int>? PlanLastBackwardReads(int actions, List<int[]?> coverage,
+        List<CompiledStep<T>> forwardSteps, Tensor<T>[] parameters, Tensor<T> lossOutput)
+    {
+        if (typeof(T) != typeof(float) || !LendForwardSlots || coverage.Count != actions || coverage.Any(c => c is null))
+            return null;
+        var lastRead = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        void Read(Tensor<T>? t, int a)
+        {
+            if (t is null) return;
+            lastRead[t] = lastRead.TryGetValue(t, out int prior) ? Math.Max(prior, a) : a;
+        }
+        for (int a = 0; a < actions; a++)
+            foreach (int s in coverage[a]!)
+            {
+                var step = forwardSteps[s];
+                Read(step.OutputBuffer, a);
+                foreach (var input in step.Inputs) Read(input, a);
+                if (step.SavedState is { } state)
+                    foreach (var item in state)
+                        if (item is Tensor<T> t) Read(t, a);
+            }
+        // Kept out as never-lendable: marked with -1, so a buffer bound to one of them is never lent.
+        foreach (var p in parameters) lastRead[p] = -1;
+        lastRead[lossOutput] = -1;
+        foreach (var leaf in RequestedInputGradientLeaves(forwardSteps)) lastRead[leaf] = -1;
+        foreach (var step in forwardSteps)
+            if (step.SavedState is { } state)
+                foreach (var item in state)
+                    if (item is Tensor<T> t) lastRead[t] = -1;
+        return lastRead;
+    }
+
+    /// <summary>
+    /// The lend schedule over the forward slots as bound now: a slot's buffer is lent after the last backward action
+    /// that reads any tensor bound to it. A buffer that also backs a tensor outside the model (never read by a backward,
+    /// or never-lendable) is not lent.
+    /// </summary>
+    private List<(long Key, Engines.DirectGpu.IGpuBuffer Buffer)>?[] BuildLendSchedule(Engines.StepScratchPool pool,
+        int forwardActionCount, int backwardActionCount)
+    {
+        var schedule = new List<(long, Engines.DirectGpu.IGpuBuffer)>?[backwardActionCount];
+        var lastByBuffer = new Dictionary<Engines.DirectGpu.IGpuBuffer, int>(
+            Autodiff.ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
+        void Bind(Tensor<T>? t)
+        {
+            if (t is null || t.TryGetGpuBuffer() is not { } buffer) return;
+            int last = _lastBackwardReads!.TryGetValue(t, out int a) ? a : -1;
+            lastByBuffer[buffer] = lastByBuffer.TryGetValue(buffer, out int prior)
+                ? (prior < 0 || last < 0 ? -1 : Math.Max(prior, last))
+                : last;
+        }
+        if (_forwardSteps is { } steps)
+            foreach (var step in steps)
+            {
+                Bind(step.OutputBuffer);
+                foreach (var input in step.Inputs) Bind(input);
+                if (step.SavedState is { } state)
+                    foreach (var item in state)
+                        if (item is Tensor<T> t) Bind(t);
+            }
+        foreach (var p in _parameters) Bind(p);
+        Bind(_lossOutput);
+        foreach (var (buffer, last) in lastByBuffer)
+        {
+            if (last < 0 || last >= backwardActionCount || !pool.Keys.TryGetValue(buffer, out long key)) continue;
+            if ((int)(key >> 32) >= forwardActionCount || !pool.Slots.TryGetValue(key, out var slot)
+                || !ReferenceEquals(slot, buffer)) continue;
+            (schedule[last] ??= new List<(long, Engines.DirectGpu.IGpuBuffer)>()).Add((key, buffer));
+        }
+        return schedule;
+    }
+
+    /// <summary>
     /// Leases forward outputs that nothing reads after their last forward consumer (<see cref="PlanForwardOutputLeases"/>).
     /// On by default; <c>AIDOTNET_GPU_FORWARD_LEASES=0</c> keeps every forward output for the whole step.
     /// </summary>
@@ -4790,6 +4887,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool bwdDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && IsCapturing();
         var bwdNames = ProfBackwardStepNames;
         Autodiff.DifferentiableOps.GradWriteGeneration = gradWriteGeneration;
+        // Forward slots lent to the backward's leases as they die (BuildLendSchedule): same order every run, so a capture
+        // records the assignment the eager runs settled.
+        var lendPool = de is not null && _lastBackwardReads is not null && _scratchPool is { FirstLeasedAction: < int.MaxValue } lp
+                       && _checkpointing is null
+            ? lp
+            : null;
+        var lend = lendPool is not null ? _lendSchedule ??= BuildLendSchedule(lendPool, fwd.Length, bwd.Length) : null;
         try
         {
             for (int i = 0; i < bwd.Length; i++)
@@ -4801,6 +4905,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bwd[i](engine);
                 if (residentProf) { ProfSync(engine); _profPerStepUs![i] += ProfElapsedUs(rb); }
                 de?.EndScratchAction();
+                if (lend is not null && lend[i] is { } dead) lendPool!.Lend(dead);
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
                     string nm = i < bwdNames.Length ? bwdNames[i] : "?";
@@ -4813,6 +4918,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             Autodiff.DifferentiableOps.GradWriteGeneration = 0;
+            lendPool?.WithdrawLent();   // the next forward writes them again
         }
         CommitReplacedParameterGradients(engine);
         // An uncaptured run executed the backward for real, so it knows which buffers nothing wrote; later steps
@@ -10204,7 +10310,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             storageLeases = null;
             plan._liveGradientMap = gradMap;
             if (fp16HeteroOrder is null)
+            {
                 plan._forwardOutputLeases = PlanForwardOutputLeases(forwardSteps, genericActionOfStep, lossOutput);
+                plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
+                    parameters, lossOutput);
+            }
             plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
