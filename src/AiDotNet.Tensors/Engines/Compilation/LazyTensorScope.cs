@@ -538,6 +538,8 @@ internal sealed class LazyTensorScope : IDisposable
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters)
     {
         EnsureTrainingParametersPrepared(parameters);
+        // Signed before compilation, which may rewrite the node list (fusion, DCE).
+        ClosureObjectiveGuard<T>.OnCompileTraining(_nodes, parameters);
         return CompilePlan(
             () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null));
     }
@@ -549,6 +551,8 @@ internal sealed class LazyTensorScope : IDisposable
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters, Tensor<T> explicitLoss)
     {
         EnsureTrainingParametersPrepared(parameters);
+        // Signed before compilation, which may rewrite the node list (fusion, DCE).
+        ClosureObjectiveGuard<T>.OnCompileTraining(_nodes, parameters);
         return CompilePlan(
             () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss));
     }
