@@ -2219,6 +2219,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
         if (tensor.IsGpuResident) return true;
+        if ((tensor._ownsGpuBuffer || tensor._storage.HasGpuBufferOwner) && ReferenceEquals(tensor._gpuBackend, backend)) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
         // A device-owned binding (an optimizer state, a resident step buffer, a parameter updated on the device) is
         // not a cache entry: its storage has a pending download FROM the device, so the device copy is the current
@@ -3052,7 +3053,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             tensor._storage.DisposeGpuBufferOwner(owner =>
             {
-                if (!ReferenceEquals((object)owner, (object)buffer))
+                if (!ReferenceEquals(owner, buffer))
                 {
                     if (afterQueuedWork && owner is IGpuBuffer otherGpu && tensor._gpuBackend is IQueuedBufferRelease otherQueued)
                         otherQueued.ReleaseAfterQueuedWork(otherGpu);
@@ -3060,7 +3061,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         owner.Dispose();
                 }
             });
-            if (ReferenceEquals((object?)tensor._gpuBuffer, (object)buffer))
+            if (ReferenceEquals(tensor._gpuBuffer, buffer))
             {
                 tensor._gpuBuffer = null;
                 tensor._ownsGpuBuffer = false;
@@ -3917,7 +3918,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             lock (_activationCacheLock)
             {
                 if (_activationCache.TryGetValue(cachedArr, out var actEntry)
-                    && ReferenceEquals((object?)actEntry.Backend, (object)backend)
+                    && ReferenceEquals(actEntry.Backend, backend)
                     && actEntry.HostVersion == source.GpuCacheVersion
                     && !actEntry.IsFp16
                     && actEntry.Buffer.Handle != IntPtr.Zero
@@ -4038,7 +4039,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (param._storageOffset != 0) return null;
         var paramArray = param.GetBackingArrayForCacheLookupUnsafe();
-        if (param._gpuBuffer is { } existingBuf && existingBuf.Handle != IntPtr.Zero && ReferenceEquals((object?)param._gpuBackend, (object)be)
+        if (param._gpuBuffer is { } existingBuf && existingBuf.Handle != IntPtr.Zero && ReferenceEquals(param._gpuBackend, be)
             && existingBuf.Size >= param.Length)
         {
             if (param._gpuBufferVersion == param.GpuCacheVersion)
@@ -4051,7 +4052,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     lock (_persistentBufferLock)
                     {
                         if (_persistentBufferCache.TryGetValue(paramArray, out var cached)
-                            && ReferenceEquals((object?)cached.Buffer, (object)existingBuf))
+                            && ReferenceEquals(cached.Buffer, existingBuf))
                         {
                             isPersistent = true;
                         }
@@ -4061,7 +4062,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             lock (_activationCacheLock)
                             {
                                 if (_activationCache.TryGetValue(paramArray, out var actEntry)
-                                    && ReferenceEquals((object?)actEntry.Buffer, (object)existingBuf))
+                                    && ReferenceEquals(actEntry.Buffer, existingBuf))
                                     removedActivation = _activationCache.TryRemove(paramArray, out _);
                             }
                             if (removedActivation)
@@ -4098,7 +4099,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         lock (_persistentBufferLock)
                         {
                             if (_persistentBufferCache.TryGetValue(paramArray, out var cached)
-                                && ReferenceEquals((object?)cached.Buffer, (object)existingBuf))
+                                && ReferenceEquals(cached.Buffer, existingBuf))
                             {
                                 cached.Version = param.GpuCacheVersion;
                                 _persistentWeightHostVersion[paramArray] = param.GpuCacheVersion;
@@ -4126,7 +4127,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     lock (_activationCacheLock)
                     {
                         if (_activationCache.TryGetValue(paramArray, out var actEntry)
-                            && ReferenceEquals((object?)actEntry.Buffer, (object)owned.Buffer))
+                            && ReferenceEquals(actEntry.Buffer, owned.Buffer))
                             removedActivation = _activationCache.TryRemove(paramArray, out _);
                     }
                     if (removedActivation)
@@ -4290,7 +4291,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Keyed on the backing array, not this Tensor object: the optimizer and the layer can hold different
         // wrappers over the same storage, and only the one the optimizer updated has its device buffer bound.
         object? arr = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (arr is null && typeof(T) == typeof(float) && TryGetFlatParameterView((Tensor<float>)(object)tensor) is { } flatView)
+        if (arr is null && tensor is Tensor<float> floatTensor && TryGetFlatParameterView(floatTensor) is { } flatView)
             arr = flatView.Flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
         return arr is not null && Helpers.HostSync.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
     }
