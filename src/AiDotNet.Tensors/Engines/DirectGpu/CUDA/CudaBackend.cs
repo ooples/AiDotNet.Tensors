@@ -1311,6 +1311,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Kernels for lookups that previously resolved to nothing (copy_2d_strided, squash,
         // squash_backward, var_axis). Each threw kernel-not-found on every call; where the caller had a
         // catch that degraded silently to the CPU. See CudaMissingLookupKernels.
+        // Bias + activation applied in place after a GEMM (one pass instead of bias_add, then the activation into a
+        // second buffer). Its source is an embedded resource: the string-literal heap is at its cap (CS8103).
+        CompileKernelModule(device, KernelSourceResources.Read("CudaBiasActivation.c"), "bias_activation_kernels",
+            new[] { "bias_act_inplace" });
+
         CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
             Kernels.CudaMissingLookupKernels.GetKernelNames());
 
@@ -2738,7 +2743,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _profile = CudaDispatchPolicy.Scope(
             "MatMul",
             useVendor: true);
-        var output = AllocateBuffer(M * N);
+        // Gemm with beta = 0 writes every element and never reads C (the contract ExecutePlannedGemm relies on too),
+        // so the output skips the zero fill.
+        var output = AllocateBufferUninitialized(M * N);
         Gemm(A, B, output, M, N, K, 1.0f, 0.0f);
         return output;
     }
@@ -3494,6 +3501,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var fused = TryGemmBiasFusedEpilogue(A, B, bias, M, N, K, CublasLtEpilogue.GELUBias);
         if (fused is not null) return fused;
 
+        // The GEMM on its tuned route, then bias + GELU in one in-place pass. GemmBias then Gelu made three passes over
+        // the output and a second buffer: 90 us against 60 us for the GEMM alone on a ViT MLP's [1040 x 192] x
+        // [192 x 768] (RTX 1000 Ada).
+        if (_kernelCache.TryGetValue("bias_act_inplace", out var biasAct))
+        {
+            var result = MatMul(A, B, M, N, K);
+            try
+            {
+                LaunchBiasActivationInPlace(biasAct, result, bias, M, N, act: 1);
+                return result;
+            }
+            catch
+            {
+                result.Dispose();
+                throw;
+            }
+        }
+
         IGpuBuffer? temp = null;
         IGpuBuffer? output = null;
         try
@@ -3567,7 +3592,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             A, B, bias, M, K, N, DirectPtxLinearActivation.None);
         if (directPtx is not null) return directPtx;
         var output = MatMul(A, B, M, N, K);
-        ApplyBiasInPlace(output, bias, M, N);
+        if (_kernelCache.TryGetValue("bias_act_inplace", out var biasAct))
+            LaunchBiasActivationInPlace(biasAct, output, bias, M, N, act: 0);
+        else
+            ApplyBiasInPlace(output, bias, M, N);
         return output;
     }
 
@@ -6427,6 +6455,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         uint sharedBytes = (uint)(blockSize * sizeof(float));
         LaunchKernelWithSharedMem(kernel, grid, (uint)blockSize, sharedBytes, args);
+    }
+
+    // data[r, c] = act(data[r, c] + bias[c]) in place (the bias_activation_kernels module); act 0 none, 1 GELU.
+    private unsafe void LaunchBiasActivationInPlace(IntPtr kernel, IGpuBuffer data, IGpuBuffer bias, int rows, int cols, int act)
+    {
+        using var _ = PushContext();
+        IntPtr dataPtr = data.Handle;
+        IntPtr biasPtr = bias.Handle;
+        int r = rows, c = cols;
+        int vec4 = (cols & 3) == 0 && ((long)dataPtr & 15) == 0 && ((long)biasPtr & 15) == 0 ? 1 : 0;
+        long work = vec4 == 1 ? (long)rows * cols / 4 : (long)rows * cols;
+        uint grid = (uint)Math.Max(1, Math.Min((work + DefaultBlockSize - 1) / DefaultBlockSize, 65535));
+        void** args = stackalloc void*[6];
+        args[0] = &dataPtr;
+        args[1] = &biasPtr;
+        args[2] = &r;
+        args[3] = &c;
+        args[4] = &vec4;
+        args[5] = &act;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     private unsafe void ApplyBiasInPlace(IGpuBuffer data, IGpuBuffer bias, int rows, int cols)

@@ -9010,6 +9010,16 @@ public partial class DirectGpuTensorEngine
                 if (s_mhaDiag) MhaDiag(tapeActive: false);
                 return packedResult;
             }
+            // The same with the backend's fused kernel (CUDA), reading the packed projections through views.
+            if (mask is null && !IsTapeActive<T>()
+                && TryPackedFusedSelfAttention(input2d, qWeight, kWeight, vWeight, B, H, S, d, 1.0 / System.Math.Sqrt(d)) is { } fusedHeads)
+            {
+                var fusedProj = TensorMatMul(fusedHeads.Reshape(new[] { B * S, D }), outWeight);
+                var fusedResult = fusedProj.Reshape(new[] { B, S, D });
+                DropTransientActivationsCreatedAfter(actSnapshot, fusedProj.DataVector, allThreads: false);
+                if (s_mhaDiag) MhaDiag(tapeActive: false);
+                return fusedResult;
+            }
             // Q/K/V projections on the GPU (2-D GEMM), [B*S, D] each.
             var q2d = TensorMatMul(input2d, qWeight);
             var k2d = TensorMatMul(input2d, kWeight);

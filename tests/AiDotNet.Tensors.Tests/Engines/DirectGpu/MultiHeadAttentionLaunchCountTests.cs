@@ -67,8 +67,10 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
         long largeLaunches = Launches(large);
         _output.WriteLine($"b1: {smallLaunches} launches, b16: {largeLaunches} launches");
 
-        // The per-(batch, head) loop took about 7 launches per pair: 28 at b1 and 448 at b16.
-        Assert.True(largeLaunches <= smallLaunches,
+        // The per-(batch, head) loop took about 7 launches per pair: 28 at b1 and 448 at b16. A constant allowance
+        // covers the GEMMs, whose route (and so its counted launches) is chosen per shape: the packed [D x 3D]
+        // projection measured 2 counted launches at b1 and 3 at b16.
+        Assert.True(largeLaunches <= smallLaunches + 2,
             $"b16 took {largeLaunches} launches against {smallLaunches} at b1; the per-head loop is back.");
 
         var actual = engine.MultiHeadAttentionForward(large, qW, kW, vW, oW, Heads).ToArray();
