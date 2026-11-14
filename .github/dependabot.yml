@@ -21,11 +21,6 @@ updates:
     labels:
       - dependencies
       - nuget
-    ignore:
-      # AiDotNet.Evolution 0.9.x slowed the CUDA model families on the RTX 3080 (DenseNet121's training step went
-      # from 1.7-1.9 s to 7.9-235 s; #1736's bisect runs 43528599277 and 43528621800). Held at 0.7.0 until it is fixed.
-      - dependency-name: "AiDotNet.Evolution*"
-        versions: ["0.9.x"]
     commit-message:
       prefix: deps
       include: scope
