@@ -4547,21 +4547,8 @@ public partial class CpuEngine
         var lazy = TryRecordLazyUnary("TensorI0", tensor,
             eng => eng.TensorI0(tensor), BackwardFunctions<T>.I0Backward);
         if (lazy != null) return lazy;
-        var result = ElementwiseUnary(tensor, x => {
-            var ops = MathHelper.GetNumericOperations<T>();
-            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            double halfX = xd / 2.0;
-            double halfSq = halfX * halfX;
-            double term = 1.0;
-            double sum = 1.0;
-            for (int k = 1; k < 25; k++)
-            {
-                term *= halfSq / (k * k);
-                sum += term;
-                if (term < 1e-16) break;
-            }
-            return ops.FromDouble(sum);
-        }, "TensorI0");
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = ElementwiseUnary(tensor, x => ops.FromDouble(SpecialFunctions.BesselI(0, ops.ToDouble(x))), "TensorI0");
         DifferentiableOps.RecordUnary("TensorI0", result, tensor, BackwardFunctions<T>.I0Backward);
         return result;
     }
@@ -4572,21 +4559,8 @@ public partial class CpuEngine
         var lazy = TryRecordLazyUnary("TensorI1", tensor,
             eng => eng.TensorI1(tensor), BackwardFunctions<T>.I1Backward);
         if (lazy != null) return lazy;
-        var result = ElementwiseUnary(tensor, x => {
-            var ops = MathHelper.GetNumericOperations<T>();
-            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            double halfX = xd / 2.0;
-            double halfSq = halfX * halfX;
-            double term = 1.0;
-            double sum = 1.0;
-            for (int k = 1; k < 25; k++)
-            {
-                term *= halfSq / (k * (k + 1));
-                sum += term;
-                if (term < 1e-16) break;
-            }
-            return ops.FromDouble(halfX * sum);
-        }, "TensorI1");
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = ElementwiseUnary(tensor, x => ops.FromDouble(SpecialFunctions.BesselI(1, ops.ToDouble(x))), "TensorI1");
         DifferentiableOps.RecordUnary("TensorI1", result, tensor, BackwardFunctions<T>.I1Backward);
         return result;
     }
@@ -4597,24 +4571,8 @@ public partial class CpuEngine
         var lazy = TryRecordLazyUnary("TensorI0e", tensor,
             eng => eng.TensorI0e(tensor), BackwardFunctions<T>.I0eBackward);
         if (lazy != null) return lazy;
-        var result = ElementwiseUnary(tensor, x => {
-            // I₀ with exponential scaling: e^(-|x|) · I₀(x). Safe for large x
-            // where I₀ overflows.
-            var ops = MathHelper.GetNumericOperations<T>();
-            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            double absX = System.Math.Abs(xd);
-            double halfX = xd / 2.0;
-            double halfSq = halfX * halfX;
-            double term = 1.0;
-            double sum = 1.0;
-            for (int k = 1; k < 25; k++)
-            {
-                term *= halfSq / (k * k);   // I₀ has (k!)² denominator ⇒ k·k per step
-                sum += term;
-                if (term < 1e-16 * sum) break;
-            }
-            return ops.FromDouble(System.Math.Exp(-absX) * sum);
-        }, "TensorI0e");
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = ElementwiseUnary(tensor, x => ops.FromDouble(SpecialFunctions.BesselIScaled(0, ops.ToDouble(x))), "TensorI0e");
         DifferentiableOps.RecordUnary("TensorI0e", result, tensor, BackwardFunctions<T>.I0eBackward);
         return result;
     }
@@ -4625,22 +4583,8 @@ public partial class CpuEngine
         var lazy = TryRecordLazyUnary("TensorI1e", tensor,
             eng => eng.TensorI1e(tensor), BackwardFunctions<T>.I1eBackward);
         if (lazy != null) return lazy;
-        var result = ElementwiseUnary(tensor, x => {
-            var ops = MathHelper.GetNumericOperations<T>();
-            double xd = System.Convert.ToDouble(x, System.Globalization.CultureInfo.InvariantCulture);
-            double absX = System.Math.Abs(xd);
-            double halfX = xd / 2.0;
-            double halfSq = halfX * halfX;
-            double term = 1.0;
-            double sum = 1.0;
-            for (int k = 1; k < 25; k++)
-            {
-                term *= halfSq / (k * (k + 1));
-                sum += term;
-                if (term < 1e-16 * sum) break;
-            }
-            return ops.FromDouble(System.Math.Exp(-absX) * halfX * sum);
-        }, "TensorI1e");
+        var ops = MathHelper.GetNumericOperations<T>();
+        var result = ElementwiseUnary(tensor, x => ops.FromDouble(SpecialFunctions.BesselIScaled(1, ops.ToDouble(x))), "TensorI1e");
         DifferentiableOps.RecordUnary("TensorI1e", result, tensor, BackwardFunctions<T>.I1eBackward);
         return result;
     }
