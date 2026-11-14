@@ -15648,7 +15648,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int numFrames = gradient.Shape._dims[^1];
         int batch = length == 0 ? 0 : waveform.Length / length;
         int pad = center ? nFft / 2 : 0;
+        long padded = (long)length + 2L * pad;
         if (batch <= 0 || numFrames <= 0 || (center ? length <= pad : length < nFft)
+            || 2L * padded > int.MaxValue || hopLength > padded
             || gradient.Length != batch * numFreqs * numFrames
             || magnitude.Length != gradient.Length || phase.Length != gradient.Length)
             return false;

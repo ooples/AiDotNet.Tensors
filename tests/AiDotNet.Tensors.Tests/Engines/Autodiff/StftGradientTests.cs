@@ -485,8 +485,88 @@ public class StftGradientTests
             for (int i = 0; i < wFloat.Length; i++)
                 Assert.True(Math.Abs(gpuFloatGrads[wFloat][i] - cpuFloatGrads[wFloat][i]) <= 1e-4f * Math.Max(1f, Math.Abs(cpuFloatGrads[wFloat][i])),
                     $"float dL/dw[{i}]: gpu {gpuFloatGrads[wFloat][i]}, cpu {cpuFloatGrads[wFloat][i]}");
+
+            // Single-frame STFT with hopLength > padded length (valid 1-frame analysis) must fall back cleanly to the
+            // host adjoint instead of throwing ArgumentOutOfRangeException inside RequireStftSignal.
+            var xLargeHop = new Tensor<float>(new[] { 1, 8 });
+            for (int i = 0; i < xLargeHop.Length; i++) xLargeHop[i] = 0.25f * (i + 1) - 0.7f;
+            var wLargeHop = new Tensor<float>(new[] { 4 });
+            for (int i = 0; i < wLargeHop.Length; i++) wLargeHop[i] = 0.4f + 0.1f * i;
+            Dictionary<Tensor<float>, Tensor<float>> cpuLargeHopGrads, gpuLargeHopGrads;
+            using (var tape = new GradientTape<float>())
+            {
+                cpu.STFT(xLargeHop, nFft: 4, hopLength: 16, window: wLargeHop, center: false, out Tensor<float> mag, out Tensor<float> _);
+                cpuLargeHopGrads = tape.ComputeGradients(cpu.ReduceSum(mag, null), new[] { xLargeHop, wLargeHop });
+            }
+            using (var tape = new GradientTape<float>())
+            {
+                gpuEngine.STFT(xLargeHop, nFft: 4, hopLength: 16, window: wLargeHop, center: false, out Tensor<float> mag, out Tensor<float> _);
+                gpuLargeHopGrads = tape.ComputeGradients(gpuEngine.ReduceSum(mag, null), new[] { xLargeHop, wLargeHop });
+            }
+            for (int i = 0; i < xLargeHop.Length; i++)
+                Assert.True(Math.Abs(gpuLargeHopGrads[xLargeHop][i] - cpuLargeHopGrads[xLargeHop][i]) <= 1e-5f * Math.Max(1f, Math.Abs(cpuLargeHopGrads[xLargeHop][i])),
+                    $"large-hop dL/dx[{i}]: gpu {gpuLargeHopGrads[xLargeHop][i]}, cpu {cpuLargeHopGrads[xLargeHop][i]}");
+            for (int i = 0; i < wLargeHop.Length; i++)
+                Assert.True(Math.Abs(gpuLargeHopGrads[wLargeHop][i] - cpuLargeHopGrads[wLargeHop][i]) <= 1e-5f * Math.Max(1f, Math.Abs(cpuLargeHopGrads[wLargeHop][i])),
+                    $"large-hop dL/dw[{i}]: gpu {gpuLargeHopGrads[wLargeHop][i]}, cpu {cpuLargeHopGrads[wLargeHop][i]}");
         }
     }
+
+#if NETCOREAPP
+    [SkippableFact]
+    public void ReleasedOrPooledGpuStftBuffers_ThrowObjectDisposedException_BeforeLaunch()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend.");
+            var backend = gpu.GetBackend() ?? throw new InvalidOperationException("Expected non-null DirectGpu backend.");
+            using var live = backend.AllocateBuffer(64);
+            var disposed = backend.AllocateBuffer(64);
+            disposed.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() =>
+                backend.StftBackwardFrames(disposed, live, live, live, batch: 1, nFft: 8, numFrames: 2, numFreqs: 5, phaseTarget: 0));
+            Assert.Throws<ObjectDisposedException>(() =>
+                backend.StftBackwardSignal(live, disposed, live, batch: 1, length: 12, pad: 0, nFft: 8, hop: 4, numFrames: 2));
+            Assert.Throws<ObjectDisposedException>(() =>
+                backend.StftBackwardWindow(live, live, disposed, batch: 1, length: 12, pad: 0, nFft: 8, hop: 4, numFrames: 2));
+
+            if (backend is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)
+            {
+                var raw = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.CudaGpuBuffer)backend.AllocateBuffer(64);
+                var pooledLease = raw.DetachForPool()
+                    ?? throw new InvalidOperationException("Expected DetachForPool to return a pooled lease.");
+                try
+                {
+                    Assert.NotEqual(IntPtr.Zero, pooledLease.Handle);
+                    Assert.True(pooledLease.IsReleased);
+                    Assert.Throws<ObjectDisposedException>(() =>
+                        backend.StftBackwardFrames(pooledLease, live, live, live, batch: 1, nFft: 8, numFrames: 2, numFreqs: 5, phaseTarget: 0));
+                    Assert.Throws<ObjectDisposedException>(() =>
+                        backend.StftBackwardSignal(pooledLease, live, live, batch: 1, length: 12, pad: 0, nFft: 8, hop: 4, numFrames: 2));
+                    Assert.Throws<ObjectDisposedException>(() =>
+                        backend.StftBackwardWindow(pooledLease, live, live, batch: 1, length: 12, pad: 0, nFft: 8, hop: 4, numFrames: 2));
+
+                    var pooledView = ((AiDotNet.Tensors.Engines.DirectGpu.IGpuBufferViews)backend).TryCreateView(pooledLease, 0, 64)
+                        ?? throw new InvalidOperationException("Expected CUDA view over non-zero pooled handle.");
+                    Assert.Throws<ObjectDisposedException>(() =>
+                        backend.StftBackwardFrames(pooledView, live, live, live, batch: 1, nFft: 8, numFrames: 2, numFreqs: 5, phaseTarget: 0));
+                }
+                finally
+                {
+                    pooledLease.Release();
+                }
+            }
+        }
+    }
+#endif
 
     [SkippableFact]
     public void DirectGpuPowerOfTwoFftFamily_TapeAndCompiledTrainingGradients_MatchCpu()

@@ -14017,12 +14017,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
+    private static bool IsReleased(IGpuBuffer buffer)
+    {
+        while (buffer is IGpuBufferViewSource view) buffer = view.ViewParent;
+        return buffer.Handle == IntPtr.Zero || (buffer is CudaGpuBuffer cuda && cuda.IsReleased);
+    }
+
     public unsafe void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget)
     {
         var kernel = ResolveParity210Kernel("parity210_stft_backward_frames");
         using var _ = PushContext();
         int __total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
-        if (grad.Handle == IntPtr.Zero || magnitude.Handle == IntPtr.Zero || phase.Handle == IntPtr.Zero || frameGrad.Handle == IntPtr.Zero)
+        if (IsReleased(grad) || IsReleased(magnitude) || IsReleased(phase) || IsReleased(frameGrad))
             throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = grad.Handle; IntPtr la1 = magnitude.Handle; IntPtr la2 = phase.Handle; IntPtr la3 = frameGrad.Handle; int la4 = batch; int la5 = nFft; int la6 = numFrames; int la7 = numFreqs; int la8 = phaseTarget;
@@ -14035,7 +14041,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var kernel = ResolveParity210Kernel("parity210_stft_backward_signal");
         using var _ = PushContext();
         int __total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
-        if (frameGrad.Handle == IntPtr.Zero || window.Handle == IntPtr.Zero || gradSignal.Handle == IntPtr.Zero)
+        if (IsReleased(frameGrad) || IsReleased(window) || IsReleased(gradSignal))
             throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = frameGrad.Handle; IntPtr la1 = window.Handle; IntPtr la2 = gradSignal.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
@@ -14048,7 +14054,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var kernel = ResolveParity210Kernel("parity210_stft_backward_window");
         using var _ = PushContext();
         int __total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
-        if (frameGrad.Handle == IntPtr.Zero || signal.Handle == IntPtr.Zero || gradWindow.Handle == IntPtr.Zero)
+        if (IsReleased(frameGrad) || IsReleased(signal) || IsReleased(gradWindow))
             throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = frameGrad.Handle; IntPtr la1 = signal.Handle; IntPtr la2 = gradWindow.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
@@ -20827,6 +20833,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private readonly bool _allocatedDuringCapture; // a graph-owned allocation: its free belongs in the capture
         private readonly long _contextGeneration = 0; // the context registration this memory belongs to
         private int _poolState;
+        internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
         private int _size;
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
         private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory

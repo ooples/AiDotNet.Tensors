@@ -8856,11 +8856,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(kernel, gsz, DefaultBlockSize, args);
         Synchronize();
     }
+    private static bool IsReleased(IGpuBuffer buffer) =>
+        buffer.Handle == IntPtr.Zero || (buffer is HipGpuBuffer hip && hip.IsReleased);
+
     public unsafe void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget)
     {
         var kernel = ResolveParity210Kernel("parity210_stft_backward_frames");
         int __total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
-        if (grad.Handle == IntPtr.Zero || magnitude.Handle == IntPtr.Zero || phase.Handle == IntPtr.Zero || frameGrad.Handle == IntPtr.Zero)
+        if (IsReleased(grad) || IsReleased(magnitude) || IsReleased(phase) || IsReleased(frameGrad))
             throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = grad.Handle; IntPtr la1 = magnitude.Handle; IntPtr la2 = phase.Handle; IntPtr la3 = frameGrad.Handle; int la4 = batch; int la5 = nFft; int la6 = numFrames; int la7 = numFreqs; int la8 = phaseTarget;
@@ -8874,7 +8877,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         var kernel = ResolveParity210Kernel("parity210_stft_backward_signal");
         int __total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
-        if (frameGrad.Handle == IntPtr.Zero || window.Handle == IntPtr.Zero || gradSignal.Handle == IntPtr.Zero)
+        if (IsReleased(frameGrad) || IsReleased(window) || IsReleased(gradSignal))
             throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = frameGrad.Handle; IntPtr la1 = window.Handle; IntPtr la2 = gradSignal.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
@@ -8888,7 +8891,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         var kernel = ResolveParity210Kernel("parity210_stft_backward_window");
         int __total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
-        if (frameGrad.Handle == IntPtr.Zero || signal.Handle == IntPtr.Zero || gradWindow.Handle == IntPtr.Zero)
+        if (IsReleased(frameGrad) || IsReleased(signal) || IsReleased(gradWindow))
             throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
         uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr la0 = frameGrad.Handle; IntPtr la1 = signal.Handle; IntPtr la2 = gradWindow.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
@@ -12855,6 +12858,9 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal HipBackend OwningBackend { get; }
     private readonly Action<HipGpuBuffer>? _returnToPool;
     private int _poolState;
+    // 0 while rented, 1 while pooled, 2 once freed. Release and pool return keep Handle and Size nonzero.
+    internal bool IsReleased =>
+        Volatile.Read(ref _poolState) != 0 || (_viewParent is HipGpuBuffer parent && parent.IsReleased);
     private readonly IGpuBuffer? _viewParent;
     private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
     // Device memory another library owns (a DLPack import): never pooled or freed here; releasing the buffer waits for
