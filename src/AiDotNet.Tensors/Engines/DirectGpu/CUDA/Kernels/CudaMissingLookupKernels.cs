@@ -38,6 +38,42 @@ extern ""C"" __global__ __launch_bounds__(256) void copy_2d_strided(
 }
 
 // ===========================================================================
+// copy_rows / copy_rows4 -- rows x cols elements from rows srcStride apart into rows dstStride apart (both base
+// pointers already offset to the first element). The 2-D form of every concatenate input copy and of the channel
+// slices a concatenate's backward gathers; copy_rows4 moves float4s when the columns, strides and bases allow it.
+// Grid: x over columns (grid-stride), y over rows (the host chunks rows by 65535).
+// ===========================================================================
+extern ""C"" __global__ __launch_bounds__(256) void copy_rows(
+    const float* __restrict__ src, float* __restrict__ dst, int rows, int cols, int srcStride, int dstStride)
+{
+    int row = blockIdx.y;
+    if (row >= rows) return;
+    const float* s = src + (long long)row * srcStride;
+    float* d = dst + (long long)row * dstStride;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < cols; c += gridDim.x * blockDim.x) d[c] = s[c];
+}
+extern ""C"" __global__ __launch_bounds__(256) void copy_rows4(
+    const float4* __restrict__ src, float4* __restrict__ dst, int rows, int cols4, int srcStride4, int dstStride4)
+{
+    int row = blockIdx.y;
+    if (row >= rows) return;
+    const float4* s = src + (long long)row * srcStride4;
+    float4* d = dst + (long long)row * dstStride4;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < cols4; c += gridDim.x * blockDim.x) d[c] = s[c];
+}
+// concat_rows2_4: row r of dst = row r of a (ca float4s) then row r of b (cb); one launch for a two-input concatenate.
+extern ""C"" __global__ __launch_bounds__(256) void concat_rows2_4(
+    const float4* __restrict__ a, int ca, const float4* __restrict__ b, int cb, float4* __restrict__ dst, int rows)
+{
+    long long w = ca + cb, n = (long long)rows * w;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+    {
+        long long r = i / w; int c = (int)(i - r * w);
+        dst[i] = c < ca ? a[r * ca + c] : b[r * cb + c - ca];
+    }
+}
+
+// ===========================================================================
 // squash — Squash(input, output, numCapsules, capsuleDim, epsilon)
 // Regularized capsule squash used by CpuEngine.TensorSquash:
 //     r2 = sum(x^2);  norm = sqrt(r2);  a = r2 / ((1 + r2) * (norm + epsilon));  out = a * x.
@@ -225,6 +261,9 @@ extern ""C"" __global__ __launch_bounds__(256) void csr_segmented_stddev(
         public static string[] GetKernelNames() => new[]
         {
             "copy_2d_strided",
+            "copy_rows",
+            "copy_rows4",
+            "concat_rows2_4",
             "squash",
             "squash_backward",
             "var_axis",

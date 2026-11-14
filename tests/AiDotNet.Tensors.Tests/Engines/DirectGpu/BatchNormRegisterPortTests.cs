@@ -73,6 +73,53 @@ public class BatchNormRegisterPortTests
     }
 #endif
 
+    // batch, channels, spatial, x scale, x offset: CUDA slices over the register variant's 8192 elements, which take the split
+    // variant -- 65536 (DenseNet's first block at batch 64: 16 chunks), 16384, a ragged 12300 (the last chunk short), a
+    // 131072 slice capped at 128 chunks, and a mean 500x its spread (the shifted sums keep the variance from cancelling).
+    public static readonly TheoryData<int, int, int, double, double> CudaSplitShapes = new()
+    {
+        { 64, 3, 1024, 2.0, 0.3 },
+        { 64, 5, 256, 2.0, 0.3 },
+        { 3, 4, 4100, 2.0, 0.3 },
+        { 32, 2, 4096, 2.0, 0.3 },
+        { 16, 3, 1024, 0.3, 150.0 },
+    };
+
+    [SkippableTheory]
+    [MemberData(nameof(CudaSplitShapes))]
+    public void Cuda_split_batchnorm_matches_the_cpu_batchnorm(int batch, int channels, int spatial, double xScale, double xOffset)
+    {
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
+        long before = System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches);
+        Check(backend, batch, channels, spatial, xScale, xOffset);
+        // 3 forwards + 10 backwards (plain x2, relu read x2, relu rebuilt x3, add+relu x3, each form also accumulating),
+        // every one through the split kernels.
+        Assert.Equal(13, System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches) - before);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void Cuda_register_batchnorm_matches_the_cpu_batchnorm(int batch, int channels, int spatial)
+    {
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
+        Skip.If(spatial % 4 != 0, "The CUDA register variant reads float4 rows (spatial % 4 == 0).");
+        Check(backend, batch, channels, spatial);
+    }
+
+    [Fact]
+    public void WebGpu_register_batchnorm_wgsl_backward_includes_grad_input_accumulate_mode()
+    {
+        foreach (int k in BatchNormRegisterKernelTemplate.PerThread)
+        {
+            string wgsl = AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBatchNormRegisterKernels.SourceFor(
+                BatchNormRegisterKernelTemplate.BackwardName(k));
+            Assert.Contains("(pm.mode & 16) != 0", wgsl);
+            Assert.Contains("dxv + dxout[idx]", wgsl);
+        }
+    }
+
     /// <summary>The HIP module compiles as CUDA C++ under NVRTC (the dialect has nothing HIP-specific), on any CUDA box.</summary>
     [SkippableFact]
     public void Hip_register_batchnorm_module_compiles_as_cuda_cxx()
@@ -97,16 +144,17 @@ public class BatchNormRegisterPortTests
 
     private const float Epsilon = 1e-5f;
 
-    private void Check(IDirectGpuBackend backend, int batch, int channels, int spatial)
+    private void Check(IDirectGpuBackend backend, int batch, int channels, int spatial, double xScale = 2.0, double xOffset = 0.3)
     {
         var bn = Assert.IsAssignableFrom<IBatchNormVarianceBackend>(backend);
         int n = batch * channels * spatial;
-        var x = Random(n, 1, 2.0, 0.3);
+        var x = Random(n, 1, xScale, xOffset);
         var residual = Random(n, 2, 1.0, 0.0);
         var gamma = Random(channels, 3, 1.0, 1.0);
         var beta = Random(channels, 4, 0.5, 0.0);
         var dy = Random(n, 5, 1.0, 0.0);
         var dy2 = Random(n, 6, 1.0, 0.0);
+        var priorDx = Random(n, 7, 1.0, 0.0);
         using var bx = backend.AllocateBuffer(x);
         using var bres = backend.AllocateBuffer(residual);
         using var bg = backend.AllocateBuffer(gamma);
@@ -120,6 +168,7 @@ public class BatchNormRegisterPortTests
         using var bdg = backend.AllocateBuffer(channels);
         using var bdb = backend.AllocateBuffer(channels);
         using var bdr = backend.AllocateBuffer(n);
+        using var bprior = backend.AllocateBuffer(priorDx);
         string label = $"N{batch} C{channels} S{spatial}";
         var (refMean, refVar) = Statistics(x, batch, channels, spatial);
 
@@ -137,6 +186,8 @@ public class BatchNormRegisterPortTests
             if (!relu)
             {
                 RunBackward("bwd plain", reluOutput: null, residualGrad: false, rebuild: false, second: false, mask: null);
+                RunBackward("bwd plain +acc", reluOutput: null, residualGrad: false, rebuild: false, second: false, mask: null,
+                    accumulate: true);
                 continue;
             }
             var mask = new bool[n];
@@ -145,27 +196,36 @@ public class BatchNormRegisterPortTests
             {
                 RunBackward("bwd add+relu", by, residualGrad: true, rebuild: false, second: false, mask);
                 RunBackward("bwd add+relu +dy2", by, residualGrad: true, rebuild: false, second: true, mask);
+                RunBackward("bwd add+relu +acc", by, residualGrad: true, rebuild: false, second: false, mask, accumulate: true);
             }
             else
             {
                 RunBackward("bwd relu read", by, residualGrad: false, rebuild: false, second: false, mask);
                 RunBackward("bwd relu rebuilt", by, residualGrad: false, rebuild: true, second: false, mask);
                 RunBackward("bwd relu rebuilt +dy2", by, residualGrad: false, rebuild: true, second: true, mask);
+                RunBackward("bwd relu read +acc", by, residualGrad: false, rebuild: false, second: false, mask, accumulate: true);
+                RunBackward("bwd relu rebuilt +dy2 +acc", by, residualGrad: false, rebuild: true, second: true, mask,
+                    accumulate: true);
             }
         }
 
-        void RunBackward(string form, IGpuBuffer? reluOutput, bool residualGrad, bool rebuild, bool second, bool[]? mask)
+        // accumulate: the input gradient is added to what the destination holds (an accumulator with this step's
+        // gradient already in it), so the destination starts at priorDx and must end at priorDx + dX.
+        void RunBackward(string form, IGpuBuffer? reluOutput, bool residualGrad, bool rebuild, bool second, bool[]? mask,
+            bool accumulate = false)
         {
-            backend.Fill(bdx, float.NaN, n);
+            if (accumulate) backend.Copy(bprior, bdx, n);
+            else backend.Fill(bdx, float.NaN, n);
             backend.Fill(bdg, float.NaN, channels);
             backend.Fill(bdb, float.NaN, channels);
             if (residualGrad) backend.Fill(bdr, float.NaN, n);
             Assert.True(bn.TryBatchNormBackwardFromVariance(bdy, bx, bg, bmean, bvar, bdx, bdg, bdb, batch, channels, spatial,
-                Epsilon, reluOutput, residualGrad ? bdr : null, rebuild ? bb : null, second ? bdy2 : null),
+                Epsilon, reluOutput, residualGrad ? bdr : null, rebuild ? bb : null, second ? bdy2 : null, accumulate),
                 $"the backward refused {form} {label}");
             backend.Synchronize();
             var (dx, dgamma, dbeta, dres) = BackwardReference(x, dy, second ? dy2 : null, mask, gamma, refMean, refVar,
                 batch, channels, spatial);
+            if (accumulate) for (int i = 0; i < n; i++) dx[i] += priorDx[i];
             Compare($"{form} dX {label}", dx, backend.DownloadBuffer(bdx));
             Compare($"{form} dGamma {label}", dgamma, backend.DownloadBuffer(bdg));
             Compare($"{form} dBeta {label}", dbeta, backend.DownloadBuffer(bdb));

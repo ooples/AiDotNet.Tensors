@@ -32,6 +32,7 @@ public sealed class OpParityFixture : IDisposable
     private readonly List<string> _report = new();
     private readonly object _lock = new();
     private readonly bool _prevAllowTF32;
+    private readonly bool _prevConvTF32;
 
     public OpParityFixture()
     {
@@ -39,6 +40,9 @@ public sealed class OpParityFixture : IDisposable
         // other test collections that may run afterwards and rely on the process-wide default.
         _prevAllowTF32 = CudaDispatchPolicy.AllowTF32;
         CudaDispatchPolicy.AllowTF32 = false;
+        // Convolutions too (TF32 by default, as PyTorch's cuDNN convolutions).
+        _prevConvTF32 = CudaDispatchPolicy.ConvReducedPrecisionTF32;
+        CudaDispatchPolicy.ConvReducedPrecisionTF32 = false;
         Cpu = new CpuEngine();
         Gpu = new DirectGpuTensorEngine();
         GpuReady = Gpu.IsGpuAvailable;
@@ -77,6 +81,7 @@ public sealed class OpParityFixture : IDisposable
     {
         Gpu?.Dispose();
         CudaDispatchPolicy.AllowTF32 = _prevAllowTF32;
+        CudaDispatchPolicy.ConvReducedPrecisionTF32 = _prevConvTF32;
         lock (_lock)
         {
             if (_report.Count == 0) return;

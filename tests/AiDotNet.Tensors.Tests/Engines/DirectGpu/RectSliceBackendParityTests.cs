@@ -22,6 +22,11 @@ public sealed class RectSliceBackendParityTests
         (new[] { 10 }, new[] { 3 }, new[] { 4 }),
         (new[] { 3, 5, 7, 4 }, new[] { 1, 0, 2, 1 }, new[] { 2, 5, 3, 2 }),
         (new[] { 2, 3, 2, 3, 4 }, new[] { 0, 0, 0, 0, 0 }, new[] { 2, 3, 2, 3, 4 }),
+        // Rows of contiguous runs (the CUDA strided row copy): an NCHW channel slice with float4-aligned runs and
+        // offsets, the same slice with runs and offsets off the float4 grid, and unit axes around a merged run.
+        (new[] { 3, 6, 4, 4 }, new[] { 0, 2, 0, 0 }, new[] { 3, 3, 4, 4 }),
+        (new[] { 3, 6, 3, 3 }, new[] { 0, 1, 0, 0 }, new[] { 3, 4, 3, 3 }),
+        (new[] { 4, 1, 5, 6 }, new[] { 2, 0, 1, 0 }, new[] { 1, 1, 3, 6 }),
     };
 
     private static void Check(IDirectGpuBackend backend)
@@ -70,6 +75,49 @@ public sealed class RectSliceBackendParityTests
             for (int i = 0; i < full; i++)
                 Assert.Equal(expected[i], scattered[i]);
         }
+    }
+
+    [SkippableFact]
+    public void Cuda_RectSlice_MatchesCpu()
+    {
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "No CUDA driver.");
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend unavailable.");
+        Check(backend);
+    }
+
+    [SkippableFact]
+    public void Cuda_RectSlice_RejectsStartOverflowAndReleasedBuffers_WithoutCorruptingContext()
+    {
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "No CUDA driver.");
+        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend unavailable.");
+        var slicer = (IRectSliceKernels)backend;
+
+        using var fullBuf = backend.AllocateBuffer(new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f });
+        using var sliceBuf = backend.AllocateBuffer(new float[4]);
+
+        // start + length wraps negative in 32-bit signed arithmetic; must reject before touching the driver.
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            slicer.RectSlice(fullBuf, sliceBuf, new[] { 8 }, new[] { int.MaxValue }, new[] { 2 }, scatter: false));
+
+        // Released full/slice buffers with non-zero baseOffset (TryCollapseToRows path) and general N-D path must
+        // throw ObjectDisposedException instead of dereferencing IntPtr.Zero + baseOffset * sizeof(float).
+        var releasedFull = backend.AllocateBuffer(new float[8]);
+        releasedFull.Dispose();
+        Assert.Throws<ObjectDisposedException>(() =>
+            slicer.RectSlice(releasedFull, sliceBuf, new[] { 8 }, new[] { 3 }, new[] { 4 }, scatter: false));
+        Assert.Throws<ObjectDisposedException>(() =>
+            slicer.RectSlice(releasedFull, sliceBuf, new[] { 2, 2, 2 }, new[] { 0, 1, 0 }, new[] { 2, 1, 2 }, scatter: false));
+
+        var releasedSlice = backend.AllocateBuffer(new float[4]);
+        releasedSlice.Dispose();
+        Assert.Throws<ObjectDisposedException>(() =>
+            slicer.RectSlice(fullBuf, releasedSlice, new[] { 8 }, new[] { 2 }, new[] { 4 }, scatter: false));
+
+        // Verify the shared primary CUDA context remains healthy after all rejected calls.
+        slicer.RectSlice(fullBuf, sliceBuf, new[] { 8 }, new[] { 2 }, new[] { 4 }, scatter: false);
+        Assert.Equal(new float[] { 3f, 4f, 5f, 6f }, backend.DownloadBuffer(sliceBuf));
     }
 
     [SkippableFact]

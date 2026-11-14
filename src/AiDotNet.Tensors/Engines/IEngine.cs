@@ -5508,6 +5508,32 @@ public partial interface IEngine
         FusedActivationType activation);
 
     /// <summary>
+    /// A pre-activated convolution: <c>activation(conv2d(relu(batchnorm(input)), kernel) + bias)</c>, the batch norm
+    /// with its running statistics, as DenseNet's pre-activation layers compute. The same values as
+    /// <see cref="BatchNormInference{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, FusedActivationType)"/>
+    /// with ReLU followed by <see cref="FusedConv2D{T}"/>, which a backend may compute with the batch norm and ReLU
+    /// applied as the convolution loads its input, so the normalized activation is never written. Under a gradient tape
+    /// or graph capture it records the unfused ops.
+    /// </summary>
+    Tensor<T> BatchNormActivationConv2D<T>(
+        Tensor<T> input, Tensor<T> preGamma, Tensor<T> preBeta, Tensor<T> preMean, Tensor<T> preVariance, double preEpsilon,
+        Tensor<T> kernel, Tensor<T>? bias,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        FusedActivationType activation);
+
+    /// <summary>
+    /// <see cref="BatchNormActivationConv2D{T}"/> with a batch norm after the convolution, folded into it as
+    /// <see cref="FusedConv2DBatchNorm{T}"/> folds it: <c>activation(batchnorm2(conv2d(relu(batchnorm1(input)), kernel) +
+    /// bias))</c>, both batch norms with their running statistics.
+    /// </summary>
+    Tensor<T> BatchNormActivationConv2DBatchNorm<T>(
+        Tensor<T> input, Tensor<T> preGamma, Tensor<T> preBeta, Tensor<T> preMean, Tensor<T> preVariance, double preEpsilon,
+        Tensor<T> kernel, Tensor<T>? bias,
+        Tensor<T> gamma, Tensor<T> beta, Tensor<T> runningMean, Tensor<T> runningVariance, double epsilon,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        FusedActivationType activation);
+
+    /// <summary>
     /// Performs a fused 3D convolution: output = activation(conv3d(input, kernel) + bias).
     /// Combines convolution, bias addition, and activation into a single optimized operation.
     /// </summary>

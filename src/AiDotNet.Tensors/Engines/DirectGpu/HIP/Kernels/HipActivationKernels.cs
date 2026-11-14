@@ -149,6 +149,7 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* input, 
     if (tid == 0) smem[0] = localMax;
     __syncthreads();
     float maxVal = smem[0];
+    __syncthreads();
 
     // Phase 2: Compute sum of exp(x - max)
     float localSum = 0.0f;

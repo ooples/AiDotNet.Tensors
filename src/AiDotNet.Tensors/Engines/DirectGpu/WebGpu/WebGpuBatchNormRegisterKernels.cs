@@ -131,14 +131,16 @@ fn NAME(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: 
     if (t == 0) { dprm[c] = sumDyXhat; dprm[pm.channels + c] = sumDy; }
     let sumDxhat = g * sumDy;
     let sumDxhatXhat = g * sumDyXhat;
-    for (var k = 0; k < KPT; k = k + 1) {
-        let e = t + k * 256;
-        if (e < n) {
-            let b = e / pm.spatial;
-            let idx = (b * pm.channels + c) * pm.spatial + (e - b * pm.spatial);
-            dxout[idx] = inv * (dv[k] * g - invCount * (sumDxhat + ((xv[k] - mean) * inv) * sumDxhatXhat));
+        for (var k = 0; k < KPT; k = k + 1) {
+            let e = t + k * 256;
+            if (e < n) {
+                let b = e / pm.spatial;
+                let idx = (b * pm.channels + c) * pm.spatial + (e - b * pm.spatial);
+                var dxv = inv * (dv[k] * g - invCount * (sumDxhat + ((xv[k] - mean) * inv) * sumDxhatXhat));
+                if ((pm.mode & 16) != 0) { dxv = dxv + dxout[idx]; }
+                dxout[idx] = dxv;
+            }
         }
-    }
 }
 ";
 

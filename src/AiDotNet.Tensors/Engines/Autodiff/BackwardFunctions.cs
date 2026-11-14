@@ -2049,13 +2049,25 @@ internal static partial class BackwardFunctions<T>
         var epsilon = (double)savedState[2];
         Tensor<T> gradInput, gradGamma, gradBeta;
         var parked = TakeParkedGradient(engine, output);
-        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
-            && gpu.TryBatchNormReluBackward(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon,
-                out var fusedGamma, out var fusedBeta, MaskFromInput(savedState) ? inputs[2] : null, parked) is { } fusedInput)
+        Tensor<T>? intoInput = null;
+        bool addInput = false;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
+            intoInput = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out addInput);
+        if (gpu is not null
+            && gpu.TryBatchNormReluBackwardCore(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon, false,
+                MaskFromInput(savedState) ? inputs[2] : null, parked, intoInput, addInput) is { } fused)
         {
-            gradInput = fusedInput;
-            gradGamma = fusedGamma!;
-            gradBeta = fusedBeta!;
+            if (intoInput is not null && ReferenceEquals(fused.GradInput, intoInput))
+            {
+                // The input gradient landed in (or was added to) its accumulator in the kernel.
+                DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], intoInput);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], fused.GradGamma, engine);
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], fused.GradBeta, engine);
+                return;
+            }
+            gradInput = fused.GradInput;
+            gradGamma = fused.GradGamma;
+            gradBeta = fused.GradBeta;
         }
         else
         {

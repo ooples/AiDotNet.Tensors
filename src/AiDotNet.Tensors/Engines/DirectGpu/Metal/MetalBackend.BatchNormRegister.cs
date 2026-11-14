@@ -73,8 +73,8 @@ public sealed partial class MetalBackend : IBatchNormVarianceBackend
     bool IBatchNormVarianceBackend.TryBatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
         IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput,
-        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2)
+        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput)
         => BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
             saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, reluOutput,
-            gradResidual, beta, gradOutput2, unpacked: true);
+            gradResidual, beta, gradOutput2, unpacked: true, accumulateGradInput: accumulateGradInput);
 }

@@ -9,7 +9,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
         // second order) has a deterministic reference. Its designed gradient (the temperature-1 softmax relaxation)
         // is recorded under create-graph all the same; FusedActivationRecordedParityTests pins it.
         const string gumbel = "Gumbel-Softmax epilogue: stochastic forward (fresh noise per call)";
-        foreach (var op in new[] { "FusedLinear", "FusedConv2D", "FusedConv3D", "FusedConvTranspose2D", "FusedConv2DBatchNorm", "FusedBatchNorm" })
+        foreach (var op in new[] { "FusedLinear", "FusedConv2D", "FusedConv3D", "FusedConvTranspose2D", "FusedConv2DBatchNorm", "BatchNormActivationConv2D", "BatchNormActivationConv2DBatchNorm", "FusedBatchNorm" })
             NotSecondOrderCheckableVariants[$"{op}|activation=GumbelSoftmax"] = gumbel;
     }
 }

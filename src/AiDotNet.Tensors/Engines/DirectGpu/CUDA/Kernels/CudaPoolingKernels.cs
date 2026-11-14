@@ -302,8 +302,17 @@ __device__ __forceinline__ void avgpool2d_backward_at(
 
     float sum = 0.0f;
 
-    for (int oh = 0; oh < outHeight; oh++) {
-        for (int ow = 0; ow < outWidth; ow++) {
+    // Only the windows that can cover (ih, iw): hStart <= ih < hStart + kernelH with hStart = oh * strideH - padH, so
+    // oh in [ceil((ih + padH - kernelH + 1) / strideH), floor((ih + padH) / strideH)] (clamped to the output). Visiting
+    // every output position made each thread's work proportional to the whole output plane (256 windows tested per
+    // element for a 2x2 pool from 32x32), measured as 3.4 ms per DenseNet transition backward against a 0.1 ms copy.
+    // The order of the summed terms is unchanged (ascending oh, then ow).
+    const int ohLo = max(0, (ih + padH - kernelH + strideH) / strideH);
+    const int ohHi = min(outHeight - 1, (ih + padH) / strideH);
+    const int owLo = max(0, (iw + padW - kernelW + strideW) / strideW);
+    const int owHi = min(outWidth - 1, (iw + padW) / strideW);
+    for (int oh = ohLo; oh <= ohHi; oh++) {
+        for (int ow = owLo; ow <= owHi; ow++) {
             int hStart = oh * strideH - padH;
             int wStart = ow * strideW - padW;
             int hEnd = hStart + kernelH;

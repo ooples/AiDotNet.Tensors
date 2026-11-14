@@ -15,10 +15,17 @@ public sealed partial class CudaBackend
     // Engine K tile (CE_BK in CudaConvolutionKernels).
     private const int ConvEngineTileK = 8;
 
+    // Split-K block target per SM for the weight gradient (#2561). Its output tile grid is tiny (Cout x Cin*kH*kW)
+    // against a K of batch*H*W, so two blocks per SM left the SMs latency-bound: DenseNet-121's 128->32 3x3 at 16x16,
+    // batch 64, on an RTX 1000 Ada went 696 -> 142 us at four (eight, sixteen and thirty-two gained nothing more).
+    // AIDOTNET_CE_WGRAD_BLOCKS_PER_SM overrides it.
+    private static readonly int s_wgradBlocksPerSm =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_CE_WGRAD_BLOCKS_PER_SM"), out var b) && b > 0 ? b : 4;
+
     private IGpuBuffer? _convFpropPartials;
 
     // #1335: the engine's inner product. FMA = SIMT fp32; X3 = 3xTF32 on the Tensor Cores (fp32-level accuracy);
-    // TF32 = plain TF32 (explicit reduced-precision opt-in, CudaDispatchPolicy.ConvReducedPrecisionTF32).
+    // TF32 = plain TF32 (the default on Ampere+ as in PyTorch; CudaDispatchPolicy.ConvReducedPrecisionTF32).
     internal const int ConvMainloopFma = 0, ConvMainloop3xTf32 = 1, ConvMainloopTf32 = 2;
 
     private static string ConvMainloopSuffix(int mainloop) => mainloop switch
@@ -41,7 +48,7 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// The mainloop the engine runs outside the tuned slots (the fixed fallback chain and the per-route entry points):
-    /// plain TF32 under the explicit opt-in on Ampere+, else FP32 FMA (see ConvEngineMainloopsInOrder for why 3xTF32 is
+    /// plain TF32 under CudaDispatchPolicy.ConvReducedPrecisionTF32 (default) on Ampere+, else FP32 FMA (see ConvEngineMainloopsInOrder for why 3xTF32 is
     /// not the default yet). Settable for tests and the benchmark.
     /// </summary>
     internal int ConvEngineMainloop
@@ -57,7 +64,7 @@ public sealed partial class CudaBackend
     /// than eight K tiles. kPerSplit is a multiple of the K tile.
     /// </summary>
     private void ConvEnginePlan(long columns, int rows, long kTotal,
-        out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit)
+        out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit, int blocksPerSm = 2)
     {
         int sms = Math.Max(1, _multiProcessorCount);
         tile = 128;
@@ -74,7 +81,7 @@ public sealed partial class CudaBackend
         if (tiles < sms)
         {
             long maxSplits = Math.Max(1, kTotal / (8L * ConvEngineTileK));
-            splits = (int)Math.Min(maxSplits, (2L * sms + tiles - 1) / tiles);
+            splits = (int)Math.Min(maxSplits, ((long)blocksPerSm * sms + tiles - 1) / tiles);
         }
         kPerSplit = (int)(((kTotal + splits - 1) / splits + ConvEngineTileK - 1) / ConvEngineTileK * ConvEngineTileK);
         splits = (int)((kTotal + kPerSplit - 1) / kPerSplit);
@@ -87,7 +94,16 @@ public sealed partial class CudaBackend
     internal unsafe bool TryConv2DForwardEngine(in CudaConv2DArgs a) => TryConv2DForwardEngine(a, ConvEngineMainloop);
 
     internal unsafe bool TryConv2DForwardEngine(in CudaConv2DArgs a, int mainloop)
+        => TryConv2DForwardEngine(a, mainloop, fuseEpilogue: false, out _);
+
+    /// <summary>
+    /// The engine convolution. With <paramref name="fuseEpilogue"/>, the bias and activation of <paramref name="a"/> are
+    /// applied in the output store when one launch covers K (<paramref name="epilogueApplied"/>); otherwise the caller runs
+    /// them. An input prologue (<see cref="CudaConv2DArgs.PreScale"/>) is always applied, or nothing is launched.
+    /// </summary>
+    internal unsafe bool TryConv2DForwardEngine(in CudaConv2DArgs a, int mainloop, bool fuseEpilogue, out bool epilogueApplied)
     {
+        epilogueApplied = false;
         if (mainloop != ConvMainloopFma && !ConvTensorCoresAvailable) return false;
         if (a.Batch <= 0 || a.OutHeight <= 0 || a.OutWidth <= 0 || a.OutChannels <= 0) return false;
         long columns = (long)a.Batch * a.OutHeight * a.OutWidth;
@@ -104,6 +120,11 @@ public sealed partial class CudaBackend
         bool tapUniform = a.InChannels % ConvEngineTileK == 0;
         string name = (tile == 128 ? "conv2d_fprop_ig128_" : "conv2d_fprop_ig64_") + (tapUniform ? "tap" : "gen")
                       + ConvMainloopSuffix(mainloop);
+        // The kernels' four trailing arguments: the epilogue's bias and flags (0 with split-K: the partials are
+        // summed after, or when the activation is not one the output store fuses) and the prologue's per-input-channel
+        // scale and shift (null: none).
+        bool canFuseEpilogue = fuseEpilogue && splits == 1 && ConvEpilogue.Fuses(a.Activation);
+        int epiFlags = canFuseEpilogue ? a.EpilogueFlags : 0;
         if (!_kernelCache.TryGetValue(name, out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
         if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
@@ -121,13 +142,17 @@ public sealed partial class CudaBackend
         int batch = a.Batch, inC = a.InChannels, inH = a.InHeight, inW = a.InWidth, outC = a.OutChannels;
         int outH = a.OutHeight, outW = a.OutWidth, kH = a.KernelH, kW = a.KernelW, sH = a.StrideH, sW = a.StrideW;
         int pH = a.PadH, pW = a.PadW, dH = a.DilationH, dW = a.DilationW;
-        void** args = stackalloc void*[19];
+        IntPtr biasPtr = canFuseEpilogue && a.Bias is not null ? a.Bias.Handle : IntPtr.Zero;
+        IntPtr scalePtr = a.PreScale?.Handle ?? IntPtr.Zero, shiftPtr = a.PreShift?.Handle ?? IntPtr.Zero;
+        void** args = stackalloc void*[23];
         args[0] = &xPtr; args[1] = &wPtr; args[2] = &outPtr;
         args[3] = &batch; args[4] = &inC; args[5] = &inH; args[6] = &inW;
         args[7] = &outC; args[8] = &outH; args[9] = &outW;
         args[10] = &kH; args[11] = &kW; args[12] = &sH; args[13] = &sW;
         args[14] = &pH; args[15] = &pW; args[16] = &dH; args[17] = &dW; args[18] = &kPerSplit;
+        args[19] = &biasPtr; args[20] = &epiFlags; args[21] = &scalePtr; args[22] = &shiftPtr;
         LaunchKernel3D(gemm, (uint)tilesN, (uint)tilesM, (uint)splits, (uint)DefaultBlockSize, 1, 1, args, 0);
+        epilogueApplied = canFuseEpilogue || (a.Bias is null && a.Activation == FusedActivationType.None);
 
         if (splits > 1)
         {
@@ -163,7 +188,7 @@ public sealed partial class CudaBackend
             || (long)batch * inChannels * inHeight * inWidth > int.MaxValue
             || (long)batch * outChannels * outHeight * outWidth > int.MaxValue)
             return false;
-        ConvEnginePlan(p, outChannels, kTotal, out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit);
+        ConvEnginePlan(p, outChannels, kTotal, out int tile, out int tilesN, out int tilesM, out int splits, out int kPerSplit, s_wgradBlocksPerSm);
         if (!_kernelCache.TryGetValue((tile == 128 ? "conv2d_wgrad_ce128" : "conv2d_wgrad_ce64") + ConvMainloopSuffix(mainloop),
                 out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;

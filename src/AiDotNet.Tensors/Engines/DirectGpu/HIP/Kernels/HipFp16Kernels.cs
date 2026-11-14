@@ -409,6 +409,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     }
     __syncthreads();
     maxVal = smem[0];
+    __syncthreads();
 
     float sumVal = 0.0f;
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
