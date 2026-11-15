@@ -2936,9 +2936,9 @@ public class DirectPtxScientificTests
             var ngpExp = new float[ngpPts * ngpStride];
             for (int np = 0; np < ngpPts; np++)
                 for (int f = 0; f < ngpFpl; f++)
-                    ngpExp[np * ngpStride + ngpLoff + f] = NgpEncodeOracle(ngpPos, ngpTbl, np, f, ngpRes, ngpTable, ngpFpl);
+                    ngpExp[np * ngpStride + ngpLoff + f] = NgpEncodeOracle(ngpPos, ngpTbl, np, f, ngpRes - 1f, 0.5f, ngpRes, ngpTable, ngpFpl);
             using (var pb = backend.AllocateBuffer(ngpPos)) using (var tb = backend.AllocateBuffer(ngpTbl)) using (var o = backend.AllocateBuffer(ngpPts * ngpStride))
-            { backend.HashGridEncodeLevel(pb, tb, o, ngpPts, ngpRes, ngpTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode"); AssertVectorClose(backend.DownloadBuffer(o), ngpExp, 3e-3f, "instant-ngp-hash-encode route"); }
+            { backend.HashGridEncodeLevel(pb, tb, o, ngpPts, ngpRes - 1f, 0.5f, ngpRes, ngpTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode"); AssertVectorClose(backend.DownloadBuffer(o), ngpExp, 3e-3f, "instant-ngp-hash-encode route"); }
 
             // Instant-NGP hash encode backward. cells = tableSize*fpl. Smaller tableSize (256) so cells = 512.
             const int ngpbPts = 64, ngpbTable = 256;
@@ -2949,10 +2949,10 @@ public class DirectPtxScientificTests
             for (int gid = 0; gid < ngpbTblGrad.Length; gid++)
             {
                 int entry = gid / ngpFpl, f = gid % ngpFpl;
-                ngpbTblGrad[gid] = NgpBackwardOracle(ngpbPos, ngpbGrad, entry, f, ngpbPts, ngpRes, ngpbTable, ngpFpl, ngpLoff, ngpStride);
+                ngpbTblGrad[gid] = NgpBackwardOracle(ngpbPos, ngpbGrad, entry, f, ngpbPts, ngpRes - 1f, 0.5f, ngpRes, ngpbTable, ngpFpl, ngpLoff, ngpStride);
             }
             using (var pb = backend.AllocateBuffer(ngpbPos)) using (var gb = backend.AllocateBuffer(ngpbGrad)) using (var tg = backend.AllocateBuffer(ngpbTable * ngpFpl))
-            { backend.HashGridEncodeLevelBackward(pb, gb, tg, ngpbPts, ngpRes, ngpbTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode-backward"); AssertVectorClose(backend.DownloadBuffer(tg), ngpbTblGrad, 3e-3f, "instant-ngp-hash-encode-backward route"); }
+            { backend.HashGridEncodeLevelBackward(pb, gb, tg, ngpbPts, ngpRes - 1f, 0.5f, ngpRes, ngpbTable, ngpFpl, ngpLoff, ngpStride); n = AssertDispatched(n, "instant-ngp-hash-encode-backward"); AssertVectorClose(backend.DownloadBuffer(tg), ngpbTblGrad, 3e-3f, "instant-ngp-hash-encode-backward route"); }
 
             // Uniform mesh Laplacian. cells = V*V = 16*16 = 256. Faces are int32.
             const int mlFaces = 40, mlVerts = 16;

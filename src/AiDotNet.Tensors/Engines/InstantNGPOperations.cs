@@ -29,8 +29,8 @@ public static class InstantNGPOperations
     // closed unit cube: identical to tiny-cuda-nn on its whole domain [0, 1], and well defined outside it.
     internal const float PositionClampMax = 1f;
 
-    // The relative distance within which N_min * b^l counts as the integer the paper's real arithmetic gives.
-    private const double PaperIntegerTolerance = 1e-9;
+    // Binary64 unit roundoff. The level-dependent bound covers exponentiation and multiplication rounding.
+    private const double DoubleUnitRoundoff = 1.1102230246251565e-16;
 
     /// <summary>One level's grid: <c>pos = x * Scale + PositionOffset</c>, with <c>GridResolution</c> vertices per axis.</summary>
     internal readonly struct HashGridLevel
@@ -203,8 +203,7 @@ public static class InstantNGPOperations
             var table = hashTables[level];
             if (table is null)
                 throw new ArgumentException($"Hash table {level} is null.", nameof(hashTables));
-            if (table._shape.Length == 0 || table._shape[0] <= 0 ||
-                table.Length < (long)table._shape[0] * featuresPerLevel)
+            if (table._shape.Length != 2 || table._shape[0] <= 0 || table._shape[1] != featuresPerLevel)
                 throw new ArgumentException(
                     $"Hash table {level} must be [tableSize, featuresPerLevel] with a positive tableSize.",
                     nameof(hashTables));
@@ -254,7 +253,7 @@ public static class InstantNGPOperations
                 // rounding error of an integer it is that integer; otherwise it is floored.
                 double cells = baseResolution * Math.Pow(perLevelScale, level);
                 double nearest = Math.Round(cells);
-                scale = (float)(Math.Abs(cells - nearest) <= PaperIntegerTolerance * nearest ? nearest : Math.Floor(cells));
+                scale = (float)(Math.Abs(cells - nearest) <= 8.0 * (level + 2.0) * DoubleUnitRoundoff * Math.Abs(nearest) ? nearest : Math.Floor(cells));
                 positionOffset = 0f;
                 break;
             }
@@ -262,7 +261,7 @@ public static class InstantNGPOperations
                 throw new ArgumentOutOfRangeException(nameof(alignment), alignment, "Unknown hash-grid alignment.");
         }
 
-        if (!(scale >= 0f) || scale > MaxGridScale)
+        if (float.IsNaN(scale) || scale < 0f || scale > MaxGridScale)
             throw new ArgumentOutOfRangeException(
                 nameof(perLevelScale),
                 $"Level {level} has grid scale {scale}, outside [0, {MaxGridScale}]; lower the base resolution, " +
@@ -309,11 +308,11 @@ public static class InstantNGPOperations
     /// </summary>
     internal static void HashGridAxis(float coordinate, HashGridLevel level, out uint cell, out float fraction)
     {
-        float x = !(coordinate > 0f) ? 0f : (coordinate >= PositionClampMax ? PositionClampMax : coordinate);
+        float x = float.IsNaN(coordinate) || coordinate <= 0f ? 0f : (coordinate >= PositionClampMax ? PositionClampMax : coordinate);
         float position = FusedMultiplyAdd(level.Scale, x, level.PositionOffset);
         float floor = (float)Math.Floor(position);
         cell = (uint)(int)floor;
-        fraction = (float)(position - floor);
+        fraction = position - floor;
     }
 
     /// <summary>
