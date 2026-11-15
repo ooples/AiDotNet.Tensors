@@ -220,6 +220,86 @@ public sealed partial class CudaBackend
         return matches;
     }
 
+    /// <summary>
+    /// "bytes -> kernel" for every memset node of <paramref name="graph"/>: the kernel that depends on the zero-fill (an
+    /// accumulating GEMM, a split-K reduction, our own scratch consumer), or "after kernel" when nothing depends on it.
+    /// Diagnostics only; an introspection call that fails leaves that part of the entry as "?".
+    /// </summary>
+    private static string? DescribeMemsetNodes(IntPtr graph)
+    {
+        ulong count = 0;
+        if (CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref count) != CudaResult.Success || count == 0) return null;
+        var nodes = new IntPtr[count];
+        if (CudaNativeBindings.cuGraphGetNodesArray(graph, nodes, ref count) != CudaResult.Success) return null;
+        var parts = new System.Collections.Generic.List<string>();
+        IntPtr scratch = System.Runtime.InteropServices.Marshal.AllocHGlobal(256);
+        try
+        {
+            for (ulong i = 0; i < count; i++)
+            {
+                if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) != CudaResult.Success || t != 2) continue;
+                string bytes = "?";
+                if (CudaNativeBindings.cuGraphMemsetNodeGetParams(nodes[i], scratch) == CudaResult.Success)
+                {
+                    long elementSize = System.Runtime.InteropServices.Marshal.ReadInt32(scratch, 20);
+                    long width = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, 24);
+                    long height = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, 32);
+                    bytes = (elementSize * width * Math.Max(1, height)).ToString(System.Globalization.CultureInfo.InvariantCulture) + "B";
+                }
+
+                string? consumer = NeighbourKernelName(nodes[i], scratch, dependents: true);
+                parts.Add(consumer is not null
+                    ? bytes + " -> " + consumer
+                    : bytes + " after " + (NeighbourKernelName(nodes[i], scratch, dependents: false) ?? "?"));
+            }
+        }
+        finally
+        {
+            System.Runtime.InteropServices.Marshal.FreeHGlobal(scratch);
+        }
+
+        return parts.Count == 0 ? null : string.Join("; ", parts);
+    }
+
+    /// <summary>The name of the first kernel node among <paramref name="node"/>'s dependents (or dependencies).</summary>
+    private static string? NeighbourKernelName(IntPtr node, IntPtr scratch, bool dependents)
+    {
+        try
+        {
+            ulong n = 0;
+            var rc = dependents
+                ? CudaNativeBindings.cuGraphNodeGetDependentNodes(node, null, ref n)
+                : CudaNativeBindings.cuGraphNodeGetDependencies(node, null, ref n);
+            if (rc != CudaResult.Success || n == 0) return null;
+            var neighbours = new IntPtr[n];
+            rc = dependents
+                ? CudaNativeBindings.cuGraphNodeGetDependentNodes(node, neighbours, ref n)
+                : CudaNativeBindings.cuGraphNodeGetDependencies(node, neighbours, ref n);
+            if (rc != CudaResult.Success) return null;
+            for (ulong j = 0; j < n; j++)
+            {
+                if (CudaNativeBindings.cuGraphNodeGetType(neighbours[j], out int t) != CudaResult.Success || t != 0) continue;
+                if (CudaNativeBindings.cuGraphKernelNodeGetParams(neighbours[j], scratch) != CudaResult.Success) return "kernel";
+                IntPtr func = System.Runtime.InteropServices.Marshal.ReadIntPtr(scratch, 0);
+                try
+                {
+                    return CudaNativeBindings.cuFuncGetName(out var name, func) == CudaResult.Success && name != IntPtr.Zero
+                        ? System.Runtime.InteropServices.Marshal.PtrToStringAnsi(name) ?? "kernel"
+                        : "kernel";
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    return "kernel";
+                }
+            }
+            return null;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Test hook: runs inside EnterCapture's setup, where a CUDA setup call can fail.</summary>
     internal static Action? TestHookCaptureSetup;
 
@@ -358,6 +438,7 @@ public sealed partial class CudaBackend
         LastCaptureKernelNodeCount = CountNodes(graph, nodeType: 0); // CU_GRAPH_NODE_TYPE_KERNEL
         LastCaptureMemcpyNodeCount = CountNodes(graph, nodeType: 1); // CU_GRAPH_NODE_TYPE_MEMCPY
         LastCaptureMemsetNodeCount = CountNodes(graph, nodeType: 2); // CU_GRAPH_NODE_TYPE_MEMSET
+        string? lastMemsetSources = LastCaptureMemsetNodeCount > 0 ? DescribeMemsetNodes(graph) : null;
         { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})");
           // Node-type breakdown (KERNEL/MEMCPY/MEMSET/MEM_ALLOC/MEM_FREE/…) — tells us how much of the chain is
           // fusable kernels vs memcpy/alloc overhead. Only when capture-debug is on.
@@ -394,7 +475,7 @@ public sealed partial class CudaBackend
         CompleteDirectPtxCapturePinTracking(directPtxPins, graphExec);
         GcDiag("capture+instantiate SUCCEEDED");
         t_lastCaptureNodeCounts = new GraphNodeCounts(LastCaptureKernelNodeCount, LastCaptureMemcpyNodeCount,
-            LastCaptureMemsetNodeCount);
+            LastCaptureMemsetNodeCount, lastMemsetSources);
         return graphExec;
     }
 

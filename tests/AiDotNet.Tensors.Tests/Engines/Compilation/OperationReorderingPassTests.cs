@@ -156,6 +156,9 @@ public sealed class OperationReorderingPassTests
         public int[] OutputShape { get; } = [1];
         public bool IsRealized { get; set; }
         public int TopologicalIndex { get; set; }
+        public long RecordOrder { get; set; }
+        public ILazyNode? PriorWriter => null;
+        public bool WritesInPlace => false;
         public int ConsumerCount { get; set; }
         public IEngine RecordingEngine { get; set; } = null!;
         public void Realize(IEngine engine) { }

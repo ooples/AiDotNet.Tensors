@@ -402,4 +402,48 @@ public class LrScheduleTests
             FusedLrScheduleKind.LinearWarmupDecay, new[] { 0.01 }, new[] { 5 });
         Assert.Throws<System.IO.InvalidDataException>(() => bad.ToSchedule());
     }
+
+    // AiDotNet's WarmupStableDecayScheduler stepped per batch: batch N runs at the rate after N - 1 completed steps.
+    private static double EagerWsd(int t, double lr, int warmup, int decayStart, int decaySteps, StableDecayShape shape, double endLr)
+    {
+        if (t < warmup) return lr * t / warmup;
+        if (t < decayStart) return lr;
+        if (decaySteps == 0) return endLr;
+        double p = System.Math.Min(1.0, (double)(t - decayStart) / decaySteps);
+        double f = shape == StableDecayShape.Cosine ? (1 + System.Math.Cos(System.Math.PI * p)) / 2
+            : shape == StableDecayShape.OneMinusSqrt ? 1 - System.Math.Sqrt(p) : 1 - p;
+        return endLr + (lr - endLr) * f;
+    }
+
+    [Theory]
+    [InlineData(StableDecayShape.Linear, 10, 50, 30, 0.0)]
+    [InlineData(StableDecayShape.Cosine, 10, 50, 30, 1e-5)]
+    [InlineData(StableDecayShape.OneMinusSqrt, 0, 0, 40, 2e-5)]
+    [InlineData(StableDecayShape.Linear, 5, 20, 0, 3e-5)]
+    public void WarmupStableDecay_MatchesTheEagerBatchSequence_BitForBit(StableDecayShape shape, int warmup, int decayStart, int decaySteps, double endLr)
+    {
+        var s = LrSchedule.WarmupStableDecay(3e-4, warmup, decayStart, decaySteps, shape, endLr);
+        var checkpoint = s.TryCaptureCheckpoint();
+        Assert.NotNull(checkpoint);
+        if (checkpoint is null) return;
+        var restored = checkpoint.ToSchedule();
+        for (int step = 1; step <= 120; step++)
+        {
+            double expected = EagerWsd(step - 1, 3e-4, warmup, decayStart, decaySteps, shape, endLr);
+            Assert.Equal(System.BitConverter.DoubleToInt64Bits(expected), System.BitConverter.DoubleToInt64Bits(s.GetLr(step)));
+            Assert.Equal(System.BitConverter.DoubleToInt64Bits(expected), System.BitConverter.DoubleToInt64Bits(restored.GetLr(step)));
+        }
+        Assert.Equal(0.0, LrSchedule.WarmupStableDecay(1.0, 4, 8, 4).GetLr(1));
+        Assert.Equal(endLr, s.GetLr(decayStart + decaySteps + 50), 15);
+    }
+
+    [Fact]
+    public void WarmupStableDecay_RejectsInvalidArguments()
+    {
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.WarmupStableDecay(1.0, -1, 0, 1));
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.WarmupStableDecay(1.0, 10, 5, 1));
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.WarmupStableDecay(1.0, 0, 0, -1));
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.WarmupStableDecay(1.0, 0, 0, 1, (StableDecayShape)7));
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => LrSchedule.WarmupStableDecay(1.0, 0, 0, 1, endLr: 2.0));
+    }
 }

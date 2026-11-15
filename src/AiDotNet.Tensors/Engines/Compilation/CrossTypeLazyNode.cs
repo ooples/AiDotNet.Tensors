@@ -32,6 +32,9 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     public int[] OutputShape { get; }
     public bool IsRealized { get; set; }
     public int TopologicalIndex { get; set; } = -1;
+    public long RecordOrder { get; set; }
+    public ILazyNode? PriorWriter => null;
+    public bool WritesInPlace => false;
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
@@ -94,7 +97,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
         try
         {
             // Realize input first if it's also lazy
-            if (Input is { LazySource: ILazyNode inputNode } && !inputNode.IsRealized)
+            if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { IsRealized: false } inputNode)
                 inputNode.Realize(engine);
 
             Execute(engine, Output);
@@ -114,7 +117,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
 
     public ILazyNode[] GetInputNodes()
     {
-        if (Input?.LazySource is ILazyNode node)
+        if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { } node)
             return new[] { node };
         return Array.Empty<ILazyNode>();
     }
