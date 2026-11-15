@@ -85,6 +85,45 @@ public class LazyInPlaceReaderOrderingTests
     }
 
     [Fact]
+    public void A_nested_scopes_write_runs_after_the_enclosing_scopes_pending_reader()
+    {
+        // The inner scope realizes x *= 2 when it closes; the outer scope's reader of x was still pending and read the
+        // written value, because the write only looked for readers among its own scope's nodes.
+        var engine = new CpuEngine();
+        var x = Values(1f, 3f);
+        Tensor<float> r;
+        using (GraphMode.Enable())
+        {
+            r = engine.TensorMultiplyScalar(x, 1f);           // reads x = [1, 3]
+            using (GraphMode.Enable())
+                engine.TensorMultiplyScalarInPlace(x, 2f);    // then x *= 2, realized as the inner scope closes
+            Assert.Equal(new[] { 1f, 3f }, r.ToArray());
+        }
+        Assert.Equal(new[] { 2f, 6f }, x.ToArray());
+    }
+
+    [Fact]
+    public void A_write_after_a_long_trace_orders_only_the_readers_since_the_targets_producer()
+    {
+        // The scan stops at the target's prior producer; a reader recorded before that producer is not an earlier reader
+        // of this write (it read the producer's predecessor), and the readers after it still are.
+        var engine = new CpuEngine();
+        var x = Values(1f, 3f);
+        Tensor<float> before, after;
+        using (GraphMode.Enable())
+        {
+            before = engine.TensorMultiplyScalar(x, 1f);      // reads x = [1, 3]
+            engine.TensorMultiplyScalarInPlace(x, 2f);        // x = [2, 6]
+            for (int i = 0; i < 64; i++) engine.TensorAddScalar(Values(0f), 1f);
+            after = engine.TensorMultiplyScalar(x, 1f);       // reads x = [2, 6]
+            engine.TensorMultiplyScalarInPlace(x, 5f);        // x = [10, 30]
+            Assert.Equal(new[] { 10f, 30f }, x.ToArray());
+            Assert.Equal(new[] { 2f, 6f }, after.ToArray());
+            Assert.Equal(new[] { 1f, 3f }, before.ToArray());
+        }
+    }
+
+    [Fact]
     public void A_fusable_reader_of_a_later_written_tensor_still_reads_it_before_the_write()
     {
         // MatMul + bias Add + ReLU fuses into one linear node. The Add reads the bias before bias *= 2; the fused node

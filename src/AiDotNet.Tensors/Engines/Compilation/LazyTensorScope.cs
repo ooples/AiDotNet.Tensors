@@ -339,17 +339,28 @@ internal sealed class LazyTensorScope : IDisposable
         // Every node that read the target since its prior producer must run before this write: an in-place write of
         // another tensor that reads it (y += x before x *= 2), a reader of a view sharing its storage (copy(view(x))),
         // and a cross-type reader. Only the target's own chain of writes is ordered by the prior-producer edge instead.
+        // Enclosing scopes count too: a nested scope realizes its write when it closes, before the enclosing scope's
+        // pending readers of the target run. Record order is process-wide and grows along each scope's list, so each
+        // list is scanned from its end and stops at the prior producer instead of walking the whole trace.
         long since = prevProducer?.RecordOrder ?? 0;
         var readers = new List<ILazyNode>();
-        foreach (var recorded in _nodes)
-        {
-            if (recorded.RecordOrder <= since) continue;
-            if (recorded is LazyNode<T> { WritesInPlace: true } writer && ReferenceEquals(writer.Output, target)) continue;
-            if (recorded.ReadsStorageOf(target)) readers.Add(recorded);
-        }
+        for (var scope = this; scope is not null; scope = scope._parent)
+            CollectReadersSince(scope._nodes, target, since, readers);
         node.SetEarlierReaders(readers.ToArray());
         target.LazySource = node;
         AddNode(node);
+    }
+
+    private static void CollectReadersSince<T>(List<ILazyNode> nodes, Tensor<T> target, long since, List<ILazyNode> readers)
+    {
+        for (int i = nodes.Count - 1; i >= 0; i--)
+        {
+            var recorded = nodes[i];
+            if (recorded.RecordOrder <= since) break;
+            if (recorded.IsRealized) continue;
+            if (recorded is LazyNode<T> { WritesInPlace: true } writer && ReferenceEquals(writer.Output, target)) continue;
+            if (recorded.ReadsStorageOf(target)) readers.Add(recorded);
+        }
     }
 
     /// <summary>Records a variadic operation as a lazy node.</summary>
