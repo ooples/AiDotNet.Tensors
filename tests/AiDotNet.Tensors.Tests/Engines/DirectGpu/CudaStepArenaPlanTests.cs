@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -108,6 +109,50 @@ public sealed class CudaStepArenaPlanTests
         Assert.Equal(1, arena.PoolFallbacks);
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static WeakReference RecordAndDrop(CudaStepArena arena, int size)
+        => new(RecordedAllocation(arena, size));
+
+    [Fact]
+    public void A_recorded_buffer_dropped_undisposed_is_not_kept_alive_by_the_arena()
+    {
+        // The record was keyed by the buffer, so a buffer dropped without being disposed stayed reachable from the arena:
+        // its finalizer could not run, and its memory stayed out until the next step or the backend's dispose.
+        using var arena = NewArena();
+        TrainingStep.Begin();
+        Assert.Null(arena.TryRent(64));   // warm-up
+        TrainingStep.End();
+        TrainingStep.Begin();
+        var dropped = RecordAndDrop(arena, 64);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Assert.False(dropped.IsAlive, "the arena's record kept a dropped buffer alive");
+        TrainingStep.End();
+        GC.KeepAlive(arena);
+    }
+
+    [Fact]
+    public void A_replay_that_races_the_arenas_dispose_never_hands_out_freed_memory()
+    {
+        // Dispose ran between the replay's read of the block pointer and its live count: it saw nothing live, freed the
+        // block, and the replay handed out a slot over the freed memory.
+        int freed = 0;
+        var arena = new CudaStepArena(IntPtr.Zero, 0, _ => FakeBlock, ptr =>
+        {
+            Assert.Equal(FakeBlock, ptr);
+            Interlocked.Increment(ref freed);
+        });
+        WarmUpAndRecordSequentialTemporaries(arena, 1, 64);
+        TrainingStep.Begin();
+        arena.BeforeSlotGoesLiveForTests = arena.Dispose;
+        var slot = arena.TryRent(64);
+        TrainingStep.End();
+        Assert.Null(slot);
+        Assert.Equal(1, freed);   // freed once, by the dispose, and not again by the undone slot
+        Assert.Equal(0, arena.SlotHits);
+    }
+
     [Fact]
     public void Another_threads_allocation_does_not_drop_the_owners_pending_record()
     {
@@ -147,16 +192,22 @@ public sealed class CudaStepArenaPlanTests
     [Fact]
     public void Only_one_thread_claims_an_unowned_arena()
     {
+        // Both threads read the arena as unowned before either claims it (the barrier holds each between the read and the
+        // claim), the interleaving where a read-then-write claim let both own it. Only one claim may win.
         using var arena = NewArena();
-        const int threads = 8;
-        using var start = new ManualResetEventSlim(false);
+        const int threads = 2;
+        using var bothRead = new Barrier(threads);
+        bool barrierTimedOut = false;
+        arena.BeforeClaimForTests = () =>
+        {
+            if (!bothRead.SignalAndWait(TimeSpan.FromSeconds(30))) barrierTimedOut = true;
+        };
         var workers = new List<Thread>();
         for (int t = 0; t < threads; t++)
         {
             var worker = new Thread(() =>
             {
                 TrainingStep.Begin();
-                start.Wait();
                 arena.TryRent(64);
                 arena.TryRent(64);   // a second call is the thread's second allocation of its warm-up step
                 TrainingStep.End();
@@ -171,8 +222,8 @@ public sealed class CudaStepArenaPlanTests
             workers.Add(worker);
             worker.Start();
         }
-        start.Set();
         foreach (var worker in workers) worker.Join();
+        Assert.False(barrierTimedOut, "a thread never reached the claim: the interleaving was not forced");
 
         // Exactly one thread's recording reached the arena: the owner's. A second claimant would have recorded too.
         var recordedField = typeof(CudaStepArena).GetField("_sizes", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)

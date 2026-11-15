@@ -43,7 +43,10 @@ internal sealed class CudaStepArena : IDisposable
     private readonly List<int> _sizes = new();
     private readonly List<long> _allocatedAt = new();
     private readonly List<long> _returnedAt = new();
-    private readonly Dictionary<CudaBackend.CudaGpuBuffer, int> _recorded = new(Autodiff.ReferenceEqualityComparer<CudaBackend.CudaGpuBuffer>.Instance);
+    // Keyed by device pointer, not by buffer: a buffer key kept a buffer its caller dropped undisposed reachable, so its
+    // finalizer never ran and its memory stayed out for as long as the arena kept recording. A pool pointer names one
+    // live buffer at a time, and its entry goes when the buffer is returned.
+    private readonly Dictionary<IntPtr, int> _recorded = new();
     private long _clock;
     private int _pendingRecord = -1;
 
@@ -198,8 +201,14 @@ internal sealed class CudaStepArena : IDisposable
         _pendingRecord = -1;
         if (pending < 0) return;
         lock (_lock)
-            if (pending < _sizes.Count) _recorded[buffer] = pending;
+            if (pending < _sizes.Count && buffer.RawDevicePointer is var ptr && ptr != IntPtr.Zero) _recorded[ptr] = pending;
     }
+
+    /// <summary>Test seam: runs on a claiming thread after it read the arena as unowned and before it claims it.</summary>
+    internal Action? BeforeClaimForTests;
+
+    /// <summary>Test seam: runs in a replay after the slot is claimed and before it counts as live in its block.</summary>
+    internal Action? BeforeSlotGoesLiveForTests;
 
     private bool OwnedByThisThread(bool claim)
     {
@@ -207,6 +216,7 @@ internal sealed class CudaStepArena : IDisposable
         int owner = Volatile.Read(ref _thread);
         if (owner == thread) return true;
         if (!claim || owner != -1) return false;
+        BeforeClaimForTests?.Invoke();
         int prior = Interlocked.CompareExchange(ref _thread, thread, -1);
         return prior == -1 || prior == thread;
     }
@@ -217,9 +227,10 @@ internal sealed class CudaStepArena : IDisposable
         if (_mode != Mode.Recording) return;
         lock (_lock)
         {
-            if (_recorded.TryGetValue(buffer, out int index))
+            var ptr = buffer.RawDevicePointer;
+            if (ptr != IntPtr.Zero && _recorded.TryGetValue(ptr, out int index))
             {
-                _recorded.Remove(buffer);
+                _recorded.Remove(ptr);
                 if (index < _returnedAt.Count) _returnedAt[index] = _clock++;
             }
         }
@@ -255,7 +266,23 @@ internal sealed class CudaStepArena : IDisposable
         if (offset < 0 || blockPtr == IntPtr.Zero) { PoolFallbacks++; return null; }
         // A live slot sharing this one's memory outlived its recorded lifetime: never alias it.
         if (!block.TryClaim(i, offset, offset + plan.Bytes[i])) { PoolFallbacks++; return null; }
+        BeforeSlotGoesLiveForTests?.Invoke();
         Interlocked.Increment(ref block.Live);
+        // Dispose may have run on another thread since the pointer was read: it marks the block disposed, then frees it
+        // if nothing is live. Both sides fence, so either it saw this slot live and left the block, or this sees the mark:
+        // then the slot is undone, and the block freed here when this was all that held it.
+        if (Volatile.Read(ref block.ArenaDisposed) != 0 || Volatile.Read(ref block.Ptr) == IntPtr.Zero)
+        {
+            Interlocked.Exchange(ref block.SlotLive[i], 0);
+            block.Release(i);
+            if (Interlocked.Decrement(ref block.Live) == 0 && Volatile.Read(ref block.ArenaDisposed) != 0)
+            {
+                var ptr = Interlocked.Exchange(ref block.Ptr, IntPtr.Zero);
+                if (ptr != IntPtr.Zero) _freeBlock(ptr);
+            }
+            PoolFallbacks++;
+            return null;
+        }
         SlotHits++;
         return CudaBackend.CudaGpuBuffer.ForArenaSlot(_context, new IntPtr(blockPtr.ToInt64() + offset), size, block, i);
     }

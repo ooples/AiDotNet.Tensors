@@ -21003,6 +21003,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private readonly long _contextGeneration = 0; // the context registration this memory belongs to
         private int _poolState;
         internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
+
+        /// <summary>The device pointer as it is, without <see cref="Handle"/>'s capture pin: a key that does not hold the buffer.</summary>
+        internal IntPtr RawDevicePointer => Volatile.Read(ref _devicePtr);
         private int _size;
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
         private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
