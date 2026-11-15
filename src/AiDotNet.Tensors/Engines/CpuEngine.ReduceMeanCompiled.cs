@@ -43,8 +43,10 @@ public partial class CpuEngine
             ReduceMeanBackwardCompiledFloat, new object[] { shape });
         // Values at trace time, as the generic node had; outside the trace, so reading the traced input is the op's
         // own work, not a host read by the objective.
-        using (GraphMode.SuspendRecording())
-            ReduceMeanForwardFloat(input, result, shape);
+        // A probe trace never computes: its values are shape-only (LayerNorm's recorder skips the same way).
+        if (!GraphMode.IsProbe)
+            using (GraphMode.SuspendRecording())
+                ReduceMeanForwardFloat(input, result, shape);
         return result;
     }
 
