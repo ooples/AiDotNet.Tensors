@@ -9372,12 +9372,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (reader.ReadInt32() != OptimizerStateMagic)
                 throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
             int version = reader.ReadInt32();
-            // Version 3 wrote the hyperparameters as float; it is still read, so state exported before they became
-            // double imports unchanged (with the float-rounded values it was saved with).
-            if (version != OptimizerStateVersion && version != SingleHyperparameterOptimizerStateVersion)
+            // Version 3 wrote the hyperparameters as float, and versions 3 and 4 have no velocity flag. Both are
+            // still read, so state exported before either change imports unchanged (with the float-rounded values
+            // and the velocity rule it was saved with).
+            if (version != OptimizerStateVersion && version != NoVelocityFlagOptimizerStateVersion
+                && version != SingleHyperparameterOptimizerStateVersion)
                 throw new InvalidDataException(
                     $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
-            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader, doubleHyperparameters: version >= OptimizerStateVersion);
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader,
+                doubleHyperparameters: version >= NoVelocityFlagOptimizerStateVersion,
+                hasVelocityIncludesLearningRate: version >= OptimizerStateVersion);
         }
         catch (EndOfStreamException ex)
         {
@@ -9395,7 +9399,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // 3: the extras gained AMSGrad's decoupled-decay switch (format 8), bias-correction switch (format 9) and exact
     //    betas (format 10). Each also changed this payload's layout without a bump, so "version 2" names more than
     //    one layout and a reader cannot tell which it holds: every version 2 payload is rejected, never misread.
-    private const int OptimizerStateVersion = 4;
+    // 4: beta1, beta2, epsilon and weight decay became double (format 11).
+    // 5: the extras gained VelocityIncludesLearningRate (format 14).
+    private const int OptimizerStateVersion = 5;
+    private const int NoVelocityFlagOptimizerStateVersion = 4;
     private const int SingleHyperparameterOptimizerStateVersion = 3;
 
     /// <inheritdoc/>

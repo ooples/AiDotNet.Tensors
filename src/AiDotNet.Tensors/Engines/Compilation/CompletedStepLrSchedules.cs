@@ -55,7 +55,7 @@ internal abstract class CompletedStepLr : LrSchedule
     /// Rebuilds a schedule of this family from its checkpoint through the public factory, so a restored schedule
     /// passes the same validation as a new one and runs the same code.
     /// </summary>
-    internal static LrSchedule Restore(FusedLrScheduleKind kind, double[] d, int[] i)
+    internal static LrSchedule Restore(FusedLrScheduleKind kind, double[] d, int[] i, int depth = 0)
     {
         try
         {
@@ -69,7 +69,7 @@ internal abstract class CompletedStepLr : LrSchedule
                 FusedLrScheduleKind.CosineWarmRestarts => new CosineWarmRestartsLr(d[0], i[0], i[1], d[1]),
                 FusedLrScheduleKind.OneCycleWithAnneal => new OneCycleWithAnnealLr(d[0], i[0], d[1], d[2], d[3], (OneCycleAnneal)i[1]),
                 FusedLrScheduleKind.CyclicRange => new CyclicRangeLr(d[0], d[1], i[0], i[1], (CyclicLrMode)i[2], d[2]),
-                FusedLrScheduleKind.Sequential => SequentialLr.FromCheckpoint(d, i),
+                FusedLrScheduleKind.Sequential => SequentialLr.FromCheckpoint(d, i, depth),
                 FusedLrScheduleKind.CosineAnnealingHold => new CosineAnnealingHoldLr(d[0], i[0], d[1]),
                 _ => throw new System.IO.InvalidDataException($"Serialized LR schedule kind {kind} is not a completed-step schedule."),
             };
@@ -236,7 +236,8 @@ internal sealed class NoamHoldAnnealingLr : CompletedStepLr
     {
         double trainingStep = t + 1.0;
         if (trainingStep < _warmup) return _peak * trainingStep / _warmup;
-        if (trainingStep < _warmup + _hold) return _peak;
+        // In double: warmup + hold can exceed int.MaxValue, and an int sum would wrap negative and skip the hold.
+        if (trainingStep < (double)_warmup + _hold) return _peak;
         double decayStep = trainingStep - _hold;
         return _peak * System.Math.Pow(_warmup / decayStep, _decayRate);
     }
@@ -268,10 +269,19 @@ internal sealed class CosineWarmRestartsLr : CompletedStepLr
     {
         long accumulated = 0;
         double currentPeriod = _t0;
-        while (accumulated + currentPeriod <= t)
+        if (_tMult == 1)
         {
-            accumulated += (long)currentPeriod;
-            currentPeriod *= _tMult;
+            // Fixed-length periods: the restart loop below would take t / t0 iterations per call, O(N^2) over a run.
+            accumulated = (long)(t / _t0) * _t0;
+        }
+        else
+        {
+            // Periods grow geometrically, so this runs O(log t) times.
+            while (accumulated + currentPeriod <= t)
+            {
+                accumulated += (long)currentPeriod;
+                currentPeriod *= _tMult;
+            }
         }
         double position = t - accumulated;
         double cosine = System.Math.Cos(System.Math.PI * position / currentPeriod);
@@ -347,9 +357,10 @@ internal sealed class CyclicRangeLr : CompletedStepLr
 
     internal override double RateAfter(int t)
     {
-        int cycleLength = _up + _down;
-        int cycle = t / cycleLength;
-        int position = t % cycleLength;
+        // In long: both phase lengths can pass validation while their sum exceeds int.MaxValue.
+        long cycleLength = (long)_up + _down;
+        long cycle = t / cycleLength;
+        long position = t % cycleLength;
         double scale = position < _up
             ? (double)position / _up
             : 1.0 - (double)(position - _up) / _down;
@@ -392,8 +403,11 @@ internal sealed class CosineAnnealingHoldLr : CompletedStepLr
 }
 
 /// <summary>
-/// Runs schedule k after milestone k - 1: the first schedule from the start, each later one from its own step 1 again,
-/// as the eager sequential scheduler steps only its active child.
+/// Runs schedule k after milestone k - 1, as the eager <c>SequentialLRScheduler</c> stepped per batch. The eager
+/// scheduler steps only its active child, and it steps the new child once in the same call that switches to it. So
+/// optimizer step milestone + 1 still runs the earlier child after milestone completed steps, and step milestone + 2
+/// runs the new child after one completed step of its own (its <c>GetLr(2)</c>). The child's own start rate,
+/// <c>GetLr(1)</c>, is never used. That is the eager sequence, which the fused one must equal bit for bit.
 /// </summary>
 internal sealed class SequentialLr : LrSchedule
 {
@@ -441,8 +455,14 @@ internal sealed class SequentialLr : LrSchedule
         return new FusedLrScheduleCheckpoint(FusedLrScheduleKind.Sequential, doubles.ToArray(), ints.ToArray());
     }
 
-    internal static SequentialLr FromCheckpoint(double[] d, int[] i)
+    /// <summary>Deepest nesting of Sequential schedules a checkpoint may hold. Each level costs stack frames on restore,
+    /// so an unbounded crafted payload could overflow the stack, which cannot be caught.</summary>
+    internal const int MaxCheckpointNestingDepth = 32;
+
+    internal static SequentialLr FromCheckpoint(double[] d, int[] i, int depth)
     {
+        if (depth >= MaxCheckpointNestingDepth)
+            throw new ArgumentOutOfRangeException(nameof(depth), $"Sequential schedules nest deeper than {MaxCheckpointNestingDepth} levels.");
         int count = i[0];
         if (count <= 0 || count > i.Length) throw new ArgumentOutOfRangeException(nameof(i), "Bad sequential schedule count.");
         var milestones = i.Skip(1).Take(count - 1).ToArray();
@@ -455,7 +475,7 @@ internal sealed class SequentialLr : LrSchedule
             ip += 3;
             if (nd < 0 || ni < 0 || ip + ni > i.Length || dp + nd > d.Length)
                 throw new ArgumentOutOfRangeException(nameof(i), "Sequential child payload overruns the checkpoint.");
-            children[k] = new FusedLrScheduleCheckpoint(kind, d.Skip(dp).Take(nd).ToArray(), i.Skip(ip).Take(ni).ToArray()).ToSchedule();
+            children[k] = new FusedLrScheduleCheckpoint(kind, d.Skip(dp).Take(nd).ToArray(), i.Skip(ip).Take(ni).ToArray()).ToSchedule(depth + 1);
             ip += ni; dp += nd;
         }
         if (ip != i.Length || dp != d.Length) throw new ArgumentOutOfRangeException(nameof(i), "Sequential checkpoint has trailing data.");
