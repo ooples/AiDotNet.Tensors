@@ -54,12 +54,32 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             }
         }
 
+        // An in-place write and the earlier readers of its target are never fused: the write's ordering edge names those
+        // readers, and a fused node that replaced one (recorded at order 0, so it resolved the target's producer to the
+        // later write) ran after the write and read the updated value. Patterns skip every node in the set they are
+        // handed, so the blocked nodes start in it and are told apart from fused-away ones below.
+        var blocked = new HashSet<ILazyNode>();
+        foreach (var node in nodes)
+        {
+            // Already run (a nested scope's write realized it as its earlier reader): a fused replacement would be a new,
+            // unrealized node that recomputes from inputs the write has since changed.
+            if (node.IsRealized) blocked.Add(node);
+            if (node is not IInPlaceReadOrdering ordered || ordered.EarlierReaders.Count == 0) continue;
+            blocked.Add(node);
+            foreach (var reader in ordered.EarlierReaders) blocked.Add(reader);
+        }
+
         var result = new List<ILazyNode>(nodes.Count);
-        var removed = new HashSet<ILazyNode>();
+        var removed = new HashSet<ILazyNode>(blocked);
         var patterns = FusionPatternRegistry.Patterns;
 
         for (int i = 0; i < nodes.Count; i++)
         {
+            if (blocked.Contains(nodes[i]))
+            {
+                result.Add(nodes[i]);
+                continue;
+            }
             if (removed.Contains(nodes[i]))
                 continue;
 

@@ -91,6 +91,9 @@ public class CompletedStepLrScheduleTests
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.NoamHoldAnnealing(1.0, 0, 0, 0.5));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.CosineWarmRestarts(1.0, 5, 0));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.OneCycleWithAnneal(1.0, 10, 1.0));
+        // Valid factors whose quotient overflows: the starting rate would be infinite.
+        Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.OneCycleWithAnneal(1.0, 10, 0.3, double.Epsilon, 1e4, OneCycleAnneal.Cosine));
+        Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.OneCycleWithAnneal(1.0, 10, 0.3, 1e-200, 1e-200, OneCycleAnneal.Linear));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.Cyclic(1.0, 0.5, 2, 2, CyclicLrMode.Triangular));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.Sequential(new[] { LrSchedule.Constant(1) }, new[] { 3 }));
     }
@@ -139,6 +142,109 @@ public class CompletedStepLrScheduleTests
     {
         var s = LrSchedule.Sequential(new LrSchedule[] { new Custom(), LrSchedule.Constant(1) }, new[] { 3 });
         Assert.Null(s.TryCaptureCheckpoint());
+    }
+
+    [Fact]
+    public void NoamHoldAnnealing_HoldEndingPastIntMax_HoldsThePeak()
+    {
+        // warmup + hold = 10 + int.MaxValue wrapped negative in int, so the hold was skipped and the decay ratio
+        // warmup / (trainingStep - hold) went negative: Pow(negative, 0.5) = NaN.
+        var s = LrSchedule.NoamHoldAnnealing(1.0, 10, int.MaxValue, 0.5);
+        foreach (int step in new[] { 10, 11, 1_000, int.MaxValue })
+            Assert.Equal(1.0, s.GetLr(step));
+        Assert.Equal(0.5, s.GetLr(5));   // still on the warmup ramp: 5 / 10
+    }
+
+    [Fact]
+    public void CosineWarmRestarts_FixedPeriod_IsClosedFormAndFastAtLargeSteps()
+    {
+        // tMult = 1 (the default) walked every period from 0: t / t0 iterations per call, so 1000 steps near int.MaxValue
+        // with t0 = 1 took ~2e12 iterations. The closed form must also equal the per-period formula.
+        const double lr0 = 0.1, etaMin = 1e-4;
+        foreach (int t0 in new[] { 1, 7 })
+        {
+            var s = LrSchedule.CosineWarmRestarts(lr0, t0, 1, etaMin);
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            for (int step = int.MaxValue - 999; step > 0 && step <= int.MaxValue; step++)
+            {
+                int completed = step - 1;
+                double position = completed % t0;
+                double expected = etaMin + 0.5 * (lr0 - etaMin) * (1 + Math.Cos(Math.PI * position / t0));
+                Assert.Equal(BitConverter.DoubleToInt64Bits(Math.Max(etaMin, expected)), BitConverter.DoubleToInt64Bits(s.GetLr(step)));
+                if (step == int.MaxValue) break;
+            }
+            watch.Stop();
+            Assert.True(watch.ElapsedMilliseconds < 5_000, $"t0={t0}: 1000 large steps took {watch.ElapsedMilliseconds} ms");
+            for (int step = 1; step <= 50; step++)
+            {
+                double position = (step - 1) % t0;
+                double expected = etaMin + 0.5 * (lr0 - etaMin) * (1 + Math.Cos(Math.PI * position / t0));
+                Assert.Equal(BitConverter.DoubleToInt64Bits(step == 1 ? lr0 : Math.Max(etaMin, expected)),
+                    BitConverter.DoubleToInt64Bits(s.GetLr(step)));
+            }
+        }
+    }
+
+    [Fact]
+    public void Cyclic_CycleLongerThanIntMax_ReachesThePeak()
+    {
+        // up + down = 3e9 wrapped negative in int, which corrupted the cycle position (GetLr returned ~0.1367).
+        var s = LrSchedule.Cyclic(0.0, 1.0, 1_500_000_000, 1_500_000_000, CyclicLrMode.Triangular);
+        Assert.Equal(1.0, s.GetLr(1_500_000_001));                // 1.5e9 completed steps: the peak
+        Assert.Equal(0.5, s.GetLr(750_000_001));                  // half way up
+        Assert.Equal(1.0 - 1.0 / 1_500_000_000, s.GetLr(1_500_000_002));   // first step down
+    }
+
+    [Fact]
+    public void Sequential_MatchesTheEagerSequentialScheduler_StepForStep()
+    {
+        // Transcription of AiDotNet's SequentialLRScheduler driven per batch: the optimizer reads CurrentLearningRate,
+        // then calls Step(), which advances the step, switches child while step > milestone, and steps the active child.
+        // A completed-step child holds GetLr(k + 1) after k of its own steps.
+        var children = new[] { LrSchedule.Polynomial(1.0, 10), LrSchedule.MultiStep(0.5, new[] { 2 }, 0.1), LrSchedule.CosineAnnealing(0.2, 5) };
+        int[] milestones = { 4, 9 };
+        var fused = LrSchedule.Sequential(children, milestones);
+
+        int current = 0, index = 0;
+        var childSteps = new int[children.Length];
+        double rate = children[0].GetLr(1);
+        for (int step = 1; step <= 40; step++)
+        {
+            Assert.True(BitConverter.DoubleToInt64Bits(rate) == BitConverter.DoubleToInt64Bits(fused.GetLr(step)),
+                $"step {step}: eager {rate:R}, fused {fused.GetLr(step):R}");
+            current++;
+            while (index < milestones.Length && current > milestones[index]) index++;
+            childSteps[index]++;
+            rate = children[index].GetLr(childSteps[index] + 1);
+        }
+    }
+
+    [Fact]
+    public void Sequential_DeeplyNestedCheckpoint_RestoresOncePerLevel()
+    {
+        // ToSchedule validated (one full restore) and then restored again, at every level: 2^depth leaf builds. At depth
+        // 30 that is ~1e9 rebuilds; once per level it is instant.
+        LrSchedule s = LrSchedule.Polynomial(0.1, 20);
+        for (int d = 0; d < 30; d++) s = LrSchedule.Sequential(new[] { s }, Array.Empty<int>());
+        var checkpoint = s.TryCaptureCheckpoint() ?? throw new InvalidOperationException("no checkpoint");
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var restored = checkpoint.ToSchedule();
+        watch.Stop();
+        Assert.True(watch.ElapsedMilliseconds < 5_000, $"restoring 30 nested levels took {watch.ElapsedMilliseconds} ms");
+        for (int step = 1; step <= 30; step++)
+            Assert.Equal(BitConverter.DoubleToInt64Bits(s.GetLr(step)), BitConverter.DoubleToInt64Bits(restored.GetLr(step)));
+    }
+
+    [Fact]
+    public void Sequential_CheckpointNestedPastTheLimit_IsRejectedAsInvalidData()
+    {
+        // Each level costs stack frames on restore, and a stack overflow cannot be caught: a crafted payload nesting
+        // without bound must fail as invalid data instead.
+        LrSchedule s = LrSchedule.Constant(0.1);
+        for (int d = 0; d < 40; d++) s = LrSchedule.Sequential(new[] { s }, Array.Empty<int>());
+        var checkpoint = s.TryCaptureCheckpoint() ?? throw new InvalidOperationException("no checkpoint");
+        Assert.Throws<InvalidDataException>(() => checkpoint.ToSchedule());
+        Assert.Throws<InvalidDataException>(() => checkpoint.Validate());
     }
 
     private sealed class Custom : LrSchedule

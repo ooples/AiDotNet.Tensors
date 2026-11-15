@@ -121,7 +121,7 @@ internal static class DeviceMemoryReclaim
     [ThreadStatic] private static int t_scopedScratchDepth;
 
     /// <summary>Whether this thread is inside <see cref="EnterScopedScratch"/>.</summary>
-    internal static bool InScopedScratch => t_scopedScratchDepth != 0;
+    internal static bool InScopedScratch => t_scopedScratchDepth > 0;
 
     /// <summary>
     /// Device allocations this thread makes until the scope is disposed are not charged toward the reclaim collections.
@@ -133,12 +133,28 @@ internal static class DeviceMemoryReclaim
     internal static ScopedScratchScope EnterScopedScratch()
     {
         t_scopedScratchDepth++;
-        return default;
+        return new ScopedScratchScope(new ScopeToken());
+    }
+
+    internal sealed class ScopeToken
+    {
+        internal int Exited;
     }
 
     internal readonly struct ScopedScratchScope : IDisposable
     {
-        public void Dispose() => t_scopedScratchDepth--;
+        // Each entered scope leaves once. A copy disposed again, or a default handle, must not decrement another
+        // scope's depth: an inner scope disposed twice ended its enclosing scope too, and a depth driven negative read as
+        // scoped scratch for every later allocation on the thread.
+        private readonly ScopeToken? _token;
+
+        internal ScopedScratchScope(ScopeToken token) => _token = token;
+
+        public void Dispose()
+        {
+            if (_token is null || System.Threading.Interlocked.Exchange(ref _token.Exited, 1) != 0) return;
+            if (t_scopedScratchDepth > 0) t_scopedScratchDepth--;
+        }
     }
 
     // Set by a collection that ran inside an open tape. What the tape still held survived it and was promoted, so the
@@ -197,7 +213,7 @@ internal static class DeviceMemoryReclaim
     /// too, which only brings a collection slightly earlier, never later.</returns>
     internal static long OnDeviceAllocation(long bytes)
     {
-        if (t_scopedScratchDepth != 0) return -1;   // never garbage: see EnterScopedScratch (epoch -1: no credit either)
+        if (t_scopedScratchDepth > 0) return -1;   // never garbage: see EnterScopedScratch (epoch -1: no credit either)
         long epoch = Volatile.Read(ref s_collectionEpoch);
         Interlocked.Increment(ref s_allocationsSinceCollection);
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);

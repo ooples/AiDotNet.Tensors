@@ -208,7 +208,33 @@ public sealed partial class CudaBackend
     /// <summary>Memcpy nodes in the most recent step capture: each is a device copy replayed every step.</summary>
     internal int LastCaptureMemcpyNodeCount { get; private set; }
 
-    private static int CountNodes(IntPtr graph, int nodeType)
+    // CUgraphNodeType values (cuda.h) this file reads.
+    private enum GraphNodeType
+    {
+        Kernel = 0,     // CU_GRAPH_NODE_TYPE_KERNEL
+        Memcpy = 1,     // CU_GRAPH_NODE_TYPE_MEMCPY
+        Memset = 2,     // CU_GRAPH_NODE_TYPE_MEMSET
+        MemAlloc = 10,  // CU_GRAPH_NODE_TYPE_MEM_ALLOC
+        MemFree = 11,   // CU_GRAPH_NODE_TYPE_MEM_FREE
+    }
+
+    // The node-type histogram of the capture-debug trace covers types 0 .. NodeTypeHistogramSize - 1.
+    private const int NodeTypeHistogramSize = 16;
+
+    // CUDA_MEMSET_NODE_PARAMS (cuda.h, 64-bit): CUdeviceptr dst; size_t pitch; unsigned int value;
+    // unsigned int elementSize; size_t width; size_t height.
+    private const int MemsetParamsElementSizeOffset = 8 + 8 + 4;                    // after dst, pitch, value
+    private const int MemsetParamsWidthOffset = MemsetParamsElementSizeOffset + 4;  // after elementSize
+    private const int MemsetParamsHeightOffset = MemsetParamsWidthOffset + 8;       // after width
+
+    // CUDA_KERNEL_NODE_PARAMS starts with its CUfunction.
+    private const int KernelParamsFunctionOffset = 0;
+
+    // One host buffer receives either parameter block from the driver (the memset block is 40 bytes): room for the
+    // larger, with headroom for the kernel block's later versions (v2 adds a kernel and a context handle to v1).
+    private const int NodeParamsScratchBytes = 256;
+
+    private static int CountNodes(IntPtr graph, GraphNodeType nodeType)
     {
         ulong count = 0;
         if (CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref count) != CudaResult.Success || count == 0) return 0;
@@ -216,7 +242,7 @@ public sealed partial class CudaBackend
         if (CudaNativeBindings.cuGraphGetNodesArray(graph, nodes, ref count) != CudaResult.Success) return 0;
         int matches = 0;
         for (ulong i = 0; i < count; i++)
-            if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) == CudaResult.Success && t == nodeType) matches++;
+            if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) == CudaResult.Success && t == (int)nodeType) matches++;
         return matches;
     }
 
@@ -232,18 +258,18 @@ public sealed partial class CudaBackend
         var nodes = new IntPtr[count];
         if (CudaNativeBindings.cuGraphGetNodesArray(graph, nodes, ref count) != CudaResult.Success) return null;
         var parts = new System.Collections.Generic.List<string>();
-        IntPtr scratch = System.Runtime.InteropServices.Marshal.AllocHGlobal(256);
+        IntPtr scratch = System.Runtime.InteropServices.Marshal.AllocHGlobal(NodeParamsScratchBytes);
         try
         {
             for (ulong i = 0; i < count; i++)
             {
-                if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) != CudaResult.Success || t != 2) continue;
+                if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) != CudaResult.Success || t != (int)GraphNodeType.Memset) continue;
                 string bytes = "?";
                 if (CudaNativeBindings.cuGraphMemsetNodeGetParams(nodes[i], scratch) == CudaResult.Success)
                 {
-                    long elementSize = System.Runtime.InteropServices.Marshal.ReadInt32(scratch, 20);
-                    long width = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, 24);
-                    long height = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, 32);
+                    long elementSize = System.Runtime.InteropServices.Marshal.ReadInt32(scratch, MemsetParamsElementSizeOffset);
+                    long width = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, MemsetParamsWidthOffset);
+                    long height = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, MemsetParamsHeightOffset);
                     bytes = (elementSize * width * Math.Max(1, height)).ToString(System.Globalization.CultureInfo.InvariantCulture) + "B";
                 }
 
@@ -278,9 +304,9 @@ public sealed partial class CudaBackend
             if (rc != CudaResult.Success) return null;
             for (ulong j = 0; j < n; j++)
             {
-                if (CudaNativeBindings.cuGraphNodeGetType(neighbours[j], out int t) != CudaResult.Success || t != 0) continue;
+                if (CudaNativeBindings.cuGraphNodeGetType(neighbours[j], out int t) != CudaResult.Success || t != (int)GraphNodeType.Kernel) continue;
                 if (CudaNativeBindings.cuGraphKernelNodeGetParams(neighbours[j], scratch) != CudaResult.Success) return "kernel";
-                IntPtr func = System.Runtime.InteropServices.Marshal.ReadIntPtr(scratch, 0);
+                IntPtr func = System.Runtime.InteropServices.Marshal.ReadIntPtr(scratch, KernelParamsFunctionOffset);
                 try
                 {
                     return CudaNativeBindings.cuFuncGetName(out var name, func) == CudaResult.Success && name != IntPtr.Zero
@@ -305,6 +331,12 @@ public sealed partial class CudaBackend
 
     /// <summary>Test hook: runs on the capturing thread right after the step capture opens.</summary>
     internal static Action? TestHookInsideCapture;
+
+    /// <summary>
+    /// Test hook: runs on the capturing thread after the gate is released and the graph's nodes are counted, before the
+    /// counts are described: where another thread's capture can overwrite the LastCapture* telemetry.
+    /// </summary>
+    internal static Action? TestHookAfterCaptureCounted;
 
     /// <summary>Call right after cuStreamEndCapture, so the queued releases are not captured.</summary>
     private void ExitCapture()
@@ -434,11 +466,18 @@ public sealed partial class CudaBackend
         // Diagnostic: how many kernel/memory nodes did the capture actually record? A near-empty graph means
         // the forward's ops were short-circuited (e.g. served from the activation cache) during capture, so
         // replay reproduces a frozen output that ignores refreshed inputs.
-        LastCaptureFreeNodeCount = CountNodes(graph, nodeType: 11); // CU_GRAPH_NODE_TYPE_MEM_FREE
-        LastCaptureKernelNodeCount = CountNodes(graph, nodeType: 0); // CU_GRAPH_NODE_TYPE_KERNEL
-        LastCaptureMemcpyNodeCount = CountNodes(graph, nodeType: 1); // CU_GRAPH_NODE_TYPE_MEMCPY
-        LastCaptureMemsetNodeCount = CountNodes(graph, nodeType: 2); // CU_GRAPH_NODE_TYPE_MEMSET
-        string? lastMemsetSources = LastCaptureMemsetNodeCount > 0 ? DescribeMemsetNodes(graph) : null;
+        // Counted into locals: another thread can capture on this backend once ExitCapture released the gate, and it
+        // overwrites the LastCapture* telemetry; this graph's description and node counts must come from this graph.
+        int freeNodes = CountNodes(graph, GraphNodeType.MemFree);
+        int kernelNodes = CountNodes(graph, GraphNodeType.Kernel);
+        int memcpyNodes = CountNodes(graph, GraphNodeType.Memcpy);
+        int memsetNodes = CountNodes(graph, GraphNodeType.Memset);
+        LastCaptureFreeNodeCount = freeNodes;
+        LastCaptureKernelNodeCount = kernelNodes;
+        LastCaptureMemcpyNodeCount = memcpyNodes;
+        LastCaptureMemsetNodeCount = memsetNodes;
+        TestHookAfterCaptureCounted?.Invoke();
+        string? lastMemsetSources = memsetNodes > 0 ? DescribeMemsetNodes(graph) : null;
         { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})");
           // Node-type breakdown (KERNEL/MEMCPY/MEMSET/MEM_ALLOC/MEM_FREE/…) — tells us how much of the chain is
           // fusable kernels vs memcpy/alloc overhead. Only when capture-debug is on.
@@ -447,10 +486,13 @@ public sealed partial class CudaBackend
               var nodes = new IntPtr[nodeCount]; ulong n2 = nodeCount;
               if (CudaNativeBindings.cuGraphGetNodesArray(graph, nodes, ref n2) == CudaResult.Success)
               {
-                  var counts = new int[16];
+                  var counts = new int[NodeTypeHistogramSize];
                   for (ulong i = 0; i < nodeCount; i++)
-                      if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) == CudaResult.Success && t >= 0 && t < 16) counts[t]++;
-                  GcDiag($"node types: KERNEL={counts[0]} MEMCPY={counts[1]} MEMSET={counts[2]} MEM_ALLOC={counts[10]} MEM_FREE={counts[11]} (other={nodeCount - (ulong)(counts[0] + counts[1] + counts[2] + counts[10] + counts[11])})");
+                      if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) == CudaResult.Success && t >= 0 && t < NodeTypeHistogramSize) counts[t]++;
+                  int kernel = counts[(int)GraphNodeType.Kernel], memcpy = counts[(int)GraphNodeType.Memcpy];
+                  int memset = counts[(int)GraphNodeType.Memset], alloc = counts[(int)GraphNodeType.MemAlloc];
+                  int free = counts[(int)GraphNodeType.MemFree];
+                  GcDiag($"node types: KERNEL={kernel} MEMCPY={memcpy} MEMSET={memset} MEM_ALLOC={alloc} MEM_FREE={free} (other={nodeCount - (ulong)(kernel + memcpy + memset + alloc + free)})");
               }
           }
         }
@@ -474,8 +516,7 @@ public sealed partial class CudaBackend
 
         CompleteDirectPtxCapturePinTracking(directPtxPins, graphExec);
         GcDiag("capture+instantiate SUCCEEDED");
-        t_lastCaptureNodeCounts = new GraphNodeCounts(LastCaptureKernelNodeCount, LastCaptureMemcpyNodeCount,
-            LastCaptureMemsetNodeCount, lastMemsetSources);
+        t_lastCaptureNodeCounts = new GraphNodeCounts(kernelNodes, memcpyNodes, memsetNodes, lastMemsetSources);
         return graphExec;
     }
 

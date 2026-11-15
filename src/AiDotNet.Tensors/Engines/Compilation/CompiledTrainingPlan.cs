@@ -499,9 +499,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
 
@@ -734,7 +732,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"),
                     "[GRAPHSTEP-DIAG] CAPTURE-FAILED " + reason + System.Environment.NewLine);
             }
-            catch { /* diagnostic only */ }
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                // The diagnostic file is optional; the failure itself was traced above.
+                System.Diagnostics.Trace.TraceWarning("Could not write the graph-step diagnostic file: " + ex.GetType().Name);
+            }
         }
     }
 
@@ -3883,6 +3885,78 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         lock (gpuEngine.CompiledStepLock) return StepLocked();
     }
 
+    /// <summary>
+    /// Runs only this plan's optimizer update, with its L2 term and gradient clipping, on gradients computed outside it,
+    /// for a step the plan cannot replay (an objective that reads its own forward on the host that step). The optimizer
+    /// state (moments, step count, schedule position) stays in the plan, so the run continues as an eager optimizer
+    /// that saw the same gradients would, and later steps replay the plan again. A trained parameter with no entry in
+    /// <paramref name="gradients"/> gets a zero gradient, as one the plan's backward does not reach does. False when no
+    /// optimizer is configured.
+    /// </summary>
+    /// <remarks>Not for Schedule-Free SGD (or any optimizer with a pre-forward weight transform): its update takes the
+    /// gradient at the point the plan writes into the weights before its own forward (y), which a forward run outside
+    /// the plan never sees, so the update would treat a gradient taken at x as one taken at y. Such a plan throws
+    /// <see cref="NotSupportedException"/> instead of updating silently wrong.</remarks>
+    /// <param name="gradients">Each trained parameter's gradient, keyed by the parameter tensor (by reference).</param>
+    internal bool TryApplyGradients(IReadOnlyDictionary<Tensor<T>, Tensor<T>> gradients)
+    {
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (_optimizerUpdate is null) return false;
+        if (_preForwardParamTransform is not null)
+            throw new NotSupportedException(
+                "This plan's optimizer evaluates its gradient at weights it writes before its own forward (Schedule-Free "
+                + "SGD), so it cannot apply gradients computed outside the plan.");
+        var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
+        gpuEngine?.NoteCompiledStepThread(_planId);
+        if (gpuEngine is null) return ApplyGradientsLocked(gradients);
+        lock (gpuEngine.CompiledStepLock) return ApplyGradientsLocked(gradients);
+    }
+
+    private bool ApplyGradientsLocked(IReadOnlyDictionary<Tensor<T>, Tensor<T>> gradients)
+    {
+        ResolvePingPongClaims(force: false);
+        lock (_stepSync)
+        {
+            // An update captured into the step graph owns the device step count (the step I/O's applied count) and, for
+            // ping-pong SGD, may hold the current weights in the second buffer set. The update below runs the eager
+            // optimizer on the plan's own buffers and advances _optimizerStep: retire the captured graph first, which
+            // copies the current weights back and lands the device count, so this update starts from both and the next
+            // capture re-seeds from what it leaves.
+            if (_capturedOptimizer is not null) InvalidateCapturedStepGraph();
+            UploadHostWrittenParameters();
+            using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
+            using var graphModeSuspension = GraphMode.SuspendRecording();
+            for (int p = 0; p < _gradients.Length; p++)
+            {
+                var slot = _gradients[p];
+                if (slot is null) continue;
+                var values = new T[slot.Length];
+                if (gradients.TryGetValue(_parameters[p], out var gradient) && gradient is not null)
+                {
+                    if (gradient.Length != slot.Length)
+                        throw new ArgumentException(
+                            $"Parameter {p}'s gradient has {gradient.Length} elements; the parameter has {slot.Length}.",
+                            nameof(gradients));
+                    gradient.CopyLogicalTo(values);
+                }
+                slot.CopyFromArray(values);
+                // After a device step the optimizer reads the gradient's device buffer (and a host array it bound
+                // before that buffer took over), not the host copy just written: put the same values there and mark it
+                // current, so both copies hold this step's gradient.
+                if (values is float[] floats && slot._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero
+                    && slot._gpuBackend is { } backend && buffer.Size >= slot.Length && slot.IsContiguous)
+                {
+                    backend.UploadBufferInPlace(floats, buffer);
+                    slot._gpuBufferVersion = slot.GpuCacheVersion;
+                }
+            }
+            RegularizeAndClipGradients();
+            CommitHostOptimizerGradients();
+            InvokeOptimizerUpdate();
+        }
+        return true;
+    }
+
     private Tensor<T> StepLocked()
     {
         ResolvePingPongClaims(force: false);
@@ -4535,7 +4609,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             lastRead[t] = lastRead.TryGetValue(t, out int prior) ? Math.Max(prior, a) : a;
         }
         for (int a = 0; a < actions; a++)
-            foreach (int s in coverage[a]!)
+            foreach (int s in coverage[a] ?? Array.Empty<int>())   // none is null (checked above)
             {
                 var step = forwardSteps[s];
                 Read(step.OutputBuffer, a);
@@ -5090,7 +5164,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bwd[i](engine);
                 if (resBwdUs is not null) { ProfSync(engine); resBwdUs[i] += ProfElapsedUs(rb); }
                 de?.EndScratchAction();
-                if (lend is not null && lend[i] is { } dead) lendPool!.Lend(dead);
+                if (lendPool is not null && lend is not null && lend[i] is { } dead) lendPool.Lend(dead);
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
                     string nm = i < bwdNames.Length ? bwdNames[i] : "?";
@@ -5103,8 +5177,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             Autodiff.DifferentiableOps.GradWriteGeneration = 0;
-            // End any open backward lease BEFORE withdrawing lent forward slots: if a backward action threw while
-            // holding a lent forward buffer, EndScratchAction must settle _leases while _lent still tracks it.
+            // Settle a failed action's leases before withdrawing any lent forward slots.
             de?.EndScratchAction();
             lendPool?.WithdrawLent();   // the next forward writes them again
         }
@@ -6210,17 +6283,37 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Moment state starts at zero on the device; allocating and uploading a host zero array
     // adds LOH/GC pressure and a full transfer for every parameter and every optimizer slot.
     // One gradient-sized scratch per backend for the learning-rate-in-velocity momentum update (see
-    // FusedOptimizerExtras.VelocityIncludesLearningRate). Grown on demand; owned by _gpuOptimizerBuffers.
+    // FusedOptimizerExtras.VelocityIncludesLearningRate). Sized once to the backend's largest parameter, so it never grows
+    // a step at a time and never leaves a superseded buffer allocated; owned by _gpuOptimizerBuffers.
     private readonly Dictionary<Engines.DirectGpu.IDirectGpuBackend, Engines.DirectGpu.IGpuBuffer> _lrVelocityScratch
         = new(ReferenceEqualityComparer<Engines.DirectGpu.IDirectGpuBackend>.Instance);
 
-    private Engines.DirectGpu.IGpuBuffer LearningRateVelocityScratch(Engines.DirectGpu.IDirectGpuBackend backend, int length)
+    // Every path that frees the optimizer's device state goes through here: the scratch cache names a buffer in that list,
+    // and a cached entry left behind handed the next momentum update a released buffer to scale into.
+    private void DisposeGpuOptimizerBuffers()
+    {
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
+    }
+
+    /// <summary>The optimizer's device buffers (moments, scratch) currently allocated; for tests.</summary>
+    internal int GpuOptimizerBufferCount => _gpuOptimizerBuffers.Count;
+
+    private Engines.DirectGpu.IGpuBuffer LearningRateVelocityScratch(
+        Engines.DirectGpu.IDirectGpuBackend backend, int length, int[] lengths,
+        Engines.DirectGpu.IGpuBuffer?[] gpuParam, Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends)
     {
         if (_lrVelocityScratch.TryGetValue(backend, out var scratch) && scratch.Size >= length) return scratch;
-        var grown = AllocateGpuOptimizerState(backend, length);
-        _gpuOptimizerBuffers.Add(grown);
-        _lrVelocityScratch[backend] = grown;
-        return grown;
+        int size = length;
+        for (int p = 0; p < lengths.Length && p < gpuParam.Length && p < gpuBackends.Length; p++)
+            if (gpuParam[p] is not null && ReferenceEquals(gpuBackends[p], backend)) size = Math.Max(size, lengths[p]);
+        var sized = AllocateGpuOptimizerState(backend, size);
+        if (scratch is not null && _gpuOptimizerBuffers.Remove(scratch)) scratch.Dispose();
+        _gpuOptimizerBuffers.Add(sized);
+        _lrVelocityScratch[backend] = sized;
+        return sized;
     }
 
     internal static Engines.DirectGpu.IGpuBuffer AllocateGpuOptimizerState(
@@ -6261,9 +6354,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // first bring them back to the shared buffers.
         ResolvePingPongClaims(force: true);
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // A captured step graph holds kernel nodes wired to the OLD optimizer state
@@ -7289,7 +7380,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 {
                                     // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
                                     // weight decay lr*wd is exactly that, without a new backend entry point.
-                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
+                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len, lengths, gpuParam, gpuBackends);
                                     gpuBe.Scale(gradBuf, scaledGrad, lr, len);
                                     gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, momentumBuf,
                                         1f, b1, wd * lr, len);
@@ -7727,9 +7818,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
         // See ConfigureOptimizerFloat for the rationale.
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // Drop any captured step graph wired to the old optimizer state (see
@@ -8169,7 +8258,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 {
                                     // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
                                     // weight decay lr*wd is exactly that, without a new backend entry point.
-                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
+                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len, lengths, gpuParam, gpuBackends);
                                     gpuBe.Scale(gradBuf, scaledGrad, lr, len);
                                     gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, momentumBuf,
                                         1f, b1, wd * lr, len);
@@ -8394,9 +8483,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
@@ -8609,9 +8696,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
@@ -8911,9 +8996,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Releases the configured fused optimizer so the plan steps without one, as before configuration.</summary>
     private void ClearFusedOptimizer()
     {
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _capturedOptimizerFactory = null;
@@ -9372,12 +9455,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (reader.ReadInt32() != OptimizerStateMagic)
                 throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
             int version = reader.ReadInt32();
-            // Version 3 wrote the hyperparameters as float; it is still read, so state exported before they became
-            // double imports unchanged (with the float-rounded values it was saved with).
-            if (version != OptimizerStateVersion && version != SingleHyperparameterOptimizerStateVersion)
+            // Version 3 wrote the hyperparameters as float, and versions 3 and 4 have no velocity flag. Both are
+            // still read, so state exported before either change imports unchanged (with the float-rounded values
+            // and the velocity rule it was saved with).
+            if (version != OptimizerStateVersion && version != NoVelocityFlagOptimizerStateVersion
+                && version != SingleHyperparameterOptimizerStateVersion)
                 throw new InvalidDataException(
                     $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
-            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader, doubleHyperparameters: version >= OptimizerStateVersion);
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader,
+                doubleHyperparameters: version >= NoVelocityFlagOptimizerStateVersion,
+                hasVelocityIncludesLearningRate: version >= OptimizerStateVersion);
         }
         catch (EndOfStreamException ex)
         {
@@ -9395,7 +9482,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // 3: the extras gained AMSGrad's decoupled-decay switch (format 8), bias-correction switch (format 9) and exact
     //    betas (format 10). Each also changed this payload's layout without a bump, so "version 2" names more than
     //    one layout and a reader cannot tell which it holds: every version 2 payload is rejected, never misread.
-    private const int OptimizerStateVersion = 4;
+    // 4: beta1, beta2, epsilon and weight decay became double (format 11).
+    // 5: the extras gained VelocityIncludesLearningRate (format 14).
+    private const int OptimizerStateVersion = 5;
+    private const int NoVelocityFlagOptimizerStateVersion = 4;
     private const int SingleHyperparameterOptimizerStateVersion = 3;
 
     /// <inheritdoc/>
@@ -10846,7 +10936,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return (result, pooled);
     }
     /// <summary>
-    /// AIDOTNET_GRAD_POOL_DIAG=1: why each gradient is or is not pooled, by count and bytes, on stderr. The unpooled ones
+    /// AIDOTNET_GRAD_POOL_DIAG=1: why each gradient is or is not pooled, by count and bytes, through the engine log
+    /// (<see cref="AiDotNetEngine.Logger"/>). The unpooled ones
     /// each hold an array (and on a GPU a device buffer) of their own for the plan's life.
     /// </summary>
     private static void TraceGradientPooling(List<int> tenants, List<int> capacity, List<Tensor<T>> allGrads,
@@ -10872,9 +10963,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Add(reason, grad.Length);
         }
         long pooledBytes = capacity.Sum(c => (long)c) * esz;
-        Console.Error.WriteLine($"[GRAD-POOL] {allGrads.Count} gradients; {capacity.Count} shared arrays hold the pooled ones in {pooledBytes / 1048576.0:F1} MB");
+        AiDotNetEngine.LogDiagnostic($"[GRAD-POOL] {allGrads.Count} gradients; {capacity.Count} shared arrays hold the pooled ones in {pooledBytes / 1048576.0:F1} MB");
         foreach (var entry in reasons)
-            Console.Error.WriteLine($"[GRAD-POOL]   {entry.Key}: {entry.Value.Count} gradients, {entry.Value.Bytes / 1048576.0:F1} MB");
+            AiDotNetEngine.LogDiagnostic($"[GRAD-POOL]   {entry.Key}: {entry.Value.Count} gradients, {entry.Value.Bytes / 1048576.0:F1} MB");
     }
 
     /// <summary>

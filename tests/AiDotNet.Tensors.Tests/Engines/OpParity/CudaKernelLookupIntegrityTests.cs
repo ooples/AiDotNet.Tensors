@@ -100,6 +100,16 @@ public sealed class CudaKernelLookupIntegrityTests
         return method?.Invoke(null, null) as string[] ?? Array.Empty<string>();
     }
 
+    // The suffixes a "prefix" + variant lookup can append, from the selector the backend calls; null for an unknown family.
+    private static IEnumerable<string>? ReachableSuffixes(string prefix)
+    {
+        if (prefix.StartsWith("gated_delta_scan_", StringComparison.Ordinal))
+            return Enumerable.Range(1, AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
+                .Select(AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedDeltaNetKernels.Variant)
+                .Distinct(StringComparer.Ordinal).ToList();
+        return null;
+    }
+
     [Fact]
     public void EveryCudaKernelLookupHasADefinition()
     {
@@ -183,8 +193,12 @@ public sealed class CudaKernelLookupIntegrityTests
         Assert.NotEmpty(lookedUp);
         Assert.NotEmpty(defined);
 
+        // Every variant a family can select must be defined, not just one of them: a family holding only _r1 would pass
+        // an "any member" check while headDim = 256 selects _r8. A family with no known selector is itself reported.
         var dangling = lookedUp.Where(n => !defined.Contains(n))
-            .Concat(lookedUpPrefixes.Where(prefix => !defined.Any(d => d.StartsWith(prefix + "_", StringComparison.Ordinal))))
+            .Concat(lookedUpPrefixes.SelectMany(prefix => ReachableSuffixes(prefix) is { } suffixes
+                ? suffixes.Select(suffix => prefix + suffix).Where(name => !defined.Contains(name))
+                : new[] { prefix + " (a lookup family with no known variant selector: add it to ReachableSuffixes)" }))
             .Distinct(StringComparer.Ordinal).OrderBy(n => n, StringComparer.Ordinal).ToList();
         var unexpected = dangling.Where(n => !KnownDangling.Contains(n)).ToList();
 

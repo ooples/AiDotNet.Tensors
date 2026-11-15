@@ -35,6 +35,11 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     public long RecordOrder { get; set; }
     public ILazyNode? PriorWriter => null;
     public bool WritesInPlace => false;
+
+    /// <inheritdoc />
+    public bool ReadsStorageOf(object tensor)
+        => tensor is Tensor<TIn> target && Input is not null
+            && (ReferenceEquals(Input, target) || Input.SharesStorageWith(target));
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
@@ -97,10 +102,24 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
         try
         {
             // Realize input first if it's also lazy
-            if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { IsRealized: false } inputNode)
+            var latest = Input?.LazySource;
+            var asOf = LazyNodeOrder.ProducerAsOf(latest, RecordOrder);
+            if (asOf is { IsRealized: false } inputNode)
                 inputNode.Realize(engine);
 
-            Execute(engine, Output);
+            // Execute with the input showing its producer as of this node, as LazyNode does: a read of the input
+            // auto-realizes its LazySource, which for a tensor written in place later in the trace is that later write,
+            // so this node would have read the written value and the plan would run the write a second time.
+            var shown = latest is not null && !ReferenceEquals(asOf, latest) ? Input : null;
+            if (shown is not null) shown.LazySource = asOf;
+            try
+            {
+                Execute(engine, Output);
+            }
+            finally
+            {
+                if (shown is not null) shown.LazySource = latest;
+            }
         }
         catch
         {
