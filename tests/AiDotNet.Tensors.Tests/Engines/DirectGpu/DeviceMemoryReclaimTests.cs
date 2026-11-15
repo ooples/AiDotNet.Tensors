@@ -465,6 +465,20 @@ public sealed class DeviceMemoryReclaimTests
         Assert.False(DeviceMemoryReclaim.InScopedScratch);
     }
 
+    [Fact]
+    public void An_inner_scratch_scope_disposed_twice_leaves_its_enclosing_scope_open()
+    {
+        using (DeviceMemoryReclaim.EnterScopedScratch())
+        {
+            var inner = DeviceMemoryReclaim.EnterScopedScratch();
+            inner.Dispose();
+            inner.Dispose();                                  // the depth went from 2 to 0: the outer scope ended too
+            default(DeviceMemoryReclaim.ScopedScratchScope).Dispose();
+            Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        }
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
+    }
+
     [SkippableFact]
     public void Vulkan_AbandonedBuffer_IsFreedByTheNextAllocation()
     {

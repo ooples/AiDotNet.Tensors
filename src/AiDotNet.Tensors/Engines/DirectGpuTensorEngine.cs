@@ -19582,10 +19582,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (slot.Buffer is null || slot.Capacity < n)
             {
+                // Both allocated before either is published: a staging array that failed to allocate left the slot with
+                // the new buffer and capacity but the old, shorter array, and every retry overran it.
+                var buffer = backend.AllocateIntBuffer(n);
+                int[]? staging = null;
+                try { staging = new int[n]; }
+                finally
+                {
+                    if (staging is null) buffer.Dispose();
+                }
                 slot.Buffer?.Dispose();
-                slot.Buffer = backend.AllocateIntBuffer(n);
+                slot.Buffer = buffer;
                 slot.Capacity = n;
-                slot.Host = new int[n];
+                slot.Host = staging;
             }
             target = slot.Buffer;
             host = slot.Host;

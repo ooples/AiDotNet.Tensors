@@ -61,6 +61,9 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
         var blocked = new HashSet<ILazyNode>();
         foreach (var node in nodes)
         {
+            // Already run (a nested scope's write realized it as its earlier reader): a fused replacement would be a new,
+            // unrealized node that recomputes from inputs the write has since changed.
+            if (node.IsRealized) blocked.Add(node);
             if (node is not IInPlaceReadOrdering ordered || ordered.EarlierReaders.Count == 0) continue;
             blocked.Add(node);
             foreach (var reader in ordered.EarlierReaders) blocked.Add(reader);

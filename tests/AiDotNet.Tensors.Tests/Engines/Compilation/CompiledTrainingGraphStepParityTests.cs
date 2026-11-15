@@ -2567,7 +2567,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     public void A_capture_reports_its_own_node_counts_when_another_thread_captures_after_it()
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
-        using (gpu)
+        // A worker still capturing when its wait times out must not find the engine and buffers disposed under it: they
+        // are disposed only once the worker is known to be done (and the test fails on the hang).
+        bool workerHung = false;
+        AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer? a = null, b = null;
+        try
         {
             using var op = gpu.EnterGpuOp();
             var maybeCuda = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
@@ -2576,20 +2580,27 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda = maybeCuda;
             var engine = gpu;
             var capture = (AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture)cuda;
-            using var a = cuda.AllocateBuffer(new float[256]);
-            using var b = cuda.AllocateBuffer(new float[256]);
-            void Large() { for (int k = 0; k < 4; k++) cuda.Scale(a, b, 1.5f, 256); }
-            void Small() => cuda.Scale(b, a, 0.5f, 256);
+            var bufferA = cuda.AllocateBuffer(new float[256]);
+            a = bufferA;
+            var bufferB = cuda.AllocateBuffer(new float[256]);
+            b = bufferB;
+            void Large() { for (int k = 0; k < 4; k++) cuda.Scale(bufferA, bufferB, 1.5f, 256); }
+            void Small() => cuda.Scale(bufferB, bufferA, 0.5f, 256);
 
-            int Kernels(Action body)
+            // The two reference captures establish that this device captures at all (a skip otherwise); the
+            // instrumented capture is the operation under test, so its failure fails the test.
+            int Kernels(Action body, bool instrumented)
             {
                 var graph = cuda.CaptureGraph(body);
-                Skip.If(graph == IntPtr.Zero, "capture failed: " + capture.LastCaptureFailure);
+                if (instrumented)
+                    Assert.True(graph != IntPtr.Zero, "the instrumented capture failed: " + capture.LastCaptureFailure);
+                else
+                    Skip.If(graph == IntPtr.Zero, "capture failed: " + capture.LastCaptureFailure);
                 int kernels = capture.LastCaptureNodeCounts?.Kernel ?? -1;
                 cuda.DestroyCapturedGraph(graph);
                 return kernels;
             }
-            int largeAlone = Kernels(Large), smallAlone = Kernels(Small);
+            int largeAlone = Kernels(Large, instrumented: false), smallAlone = Kernels(Small, instrumented: false);
             Assert.NotEqual(largeAlone, smallAlone);   // otherwise the overwrite could not show
 
             int otherThreadCaptures = 0;
@@ -2609,18 +2620,32 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                         if (graph != IntPtr.Zero) cuda.DestroyCapturedGraph(graph);
                     }
                     catch (Exception ex) { otherFailure = ex; }
-                });
+                }) { IsBackground = true };   // a hung worker must not keep the test process alive
                 other.Start();
-                if (!other.Join(TimeSpan.FromSeconds(60))) otherFailure = new TimeoutException("the other capture hung");
+                if (!other.Join(TimeSpan.FromSeconds(60)))
+                {
+                    workerHung = true;
+                    otherFailure = new TimeoutException("the other capture hung");
+                }
             };
             int reported;
-            try { reported = Kernels(Large); }
+            try { reported = Kernels(Large, instrumented: true); }
             finally { AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookAfterCaptureCounted = null; }
 
+            Assert.False(workerHung, "the other thread's capture never finished");
             Assert.Null(otherFailure);
             Assert.Equal(1, otherThreadCaptures);
             Assert.Equal(smallAlone, cuda.LastCaptureKernelNodeCount);   // the other capture did overwrite the telemetry
             Assert.Equal(largeAlone, reported);
+        }
+        finally
+        {
+            if (!workerHung)
+            {
+                a?.Dispose();
+                b?.Dispose();
+                gpu.Dispose();
+            }
         }
     }
 

@@ -124,6 +124,31 @@ public class LazyInPlaceReaderOrderingTests
     }
 
     [Fact]
+    public void A_fusable_chain_realized_by_a_nested_write_is_not_recomputed_by_the_outer_scope()
+    {
+        // The inner bias *= 2 realizes the outer Add (its earlier reader) when the inner scope closes. The outer compile
+        // then fused MatMul + Add + ReLU into a new, unrealized node, which recomputed from the doubled bias.
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 2f, 0.5f, 3f, 1f, 2f }, new[] { 2, 3 });
+        var weights = new Tensor<float>(new[] { 0.5f, 1f, 1f, 0.25f, 2f, 0.5f }, new[] { 3, 2 });
+        var hostBias = new[] { 1f, 2f };
+        var expected = engine.ReLU(engine.TensorAdd(engine.TensorMatMul(input, weights), Values(hostBias))).ToArray();
+        var bias = Values(hostBias);
+        Tensor<float> result;
+        using (GraphMode.Enable())
+        {
+            result = engine.ReLU(engine.TensorAdd(engine.TensorMatMul(input, weights), bias));
+            using (GraphMode.Enable())
+                engine.TensorMultiplyScalarInPlace(bias, 2f);
+        }
+        var actual = result.ToArray();
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),
+                $"relu(x w + b)[{i}] = {actual[i]}, expected {expected[i]} (recomputed from the written bias)");
+        Assert.Equal(new[] { 2f, 4f }, bias.ToArray());
+    }
+
+    [Fact]
     public void A_fusable_reader_of_a_later_written_tensor_still_reads_it_before_the_write()
     {
         // MatMul + bias Add + ReLU fuses into one linear node. The Add reads the bias before bias *= 2; the fused node

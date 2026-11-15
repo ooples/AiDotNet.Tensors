@@ -133,15 +133,26 @@ internal static class DeviceMemoryReclaim
     internal static ScopedScratchScope EnterScopedScratch()
     {
         t_scopedScratchDepth++;
-        return default;
+        return new ScopedScratchScope(new ScopeToken());
+    }
+
+    internal sealed class ScopeToken
+    {
+        internal int Exited;
     }
 
     internal readonly struct ScopedScratchScope : IDisposable
     {
-        // A scope disposed twice (or a default one) must not leave the depth negative: every later allocation on the
-        // thread would read as scoped scratch and go uncharged for good.
+        // Each entered scope leaves once. A copy disposed again, or a default handle, must not decrement another
+        // scope's depth: an inner scope disposed twice ended its enclosing scope too, and a depth driven negative read as
+        // scoped scratch for every later allocation on the thread.
+        private readonly ScopeToken? _token;
+
+        internal ScopedScratchScope(ScopeToken token) => _token = token;
+
         public void Dispose()
         {
+            if (_token is null || System.Threading.Interlocked.Exchange(ref _token.Exited, 1) != 0) return;
             if (t_scopedScratchDepth > 0) t_scopedScratchDepth--;
         }
     }
