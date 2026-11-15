@@ -87,6 +87,49 @@ public sealed class CompiledRetainedOutputTests : IDisposable
         }
     }
 
+    // A host plan pools forward-only outputs by forward liveness (PoolForwardOnlyOutputs): an add read only by adds
+    // shares its array with a later one. The undeclared plan proves this graph pools; the declared output must keep
+    // its own array, or it holds a later add's values once the step returns.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Declared_output_is_not_pooled_with_later_forward_only_outputs(bool declare)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        const int length = 1 << 16;
+        var input = new Tensor<float>([length]);
+        var parameter = new Tensor<float>([length]);
+        parameter.AsWritableSpan().Fill(0.25f);
+        Tensor<float> first;
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(new[] { parameter }))
+        {
+            first = engine.TensorAdd(input, parameter);
+            if (declare) GradientRecording.RetainOutput(first);
+            var second = engine.TensorAdd(first, input);
+            var third = engine.TensorAdd(second, input);
+            var fourth = engine.TensorAdd(third, input);
+            engine.ReduceSum(fourth, null);
+            plan = scope.CompileTraining(new[] { parameter });
+        }
+        using (plan)
+        {
+            if (!declare)
+            {
+                Assert.True(plan.PooledForwardOutputCount > 0, "this graph no longer pools: the declared case proves nothing");
+                return;
+            }
+            for (int step = 1; step <= 3; step++)
+            {
+                input.AsWritableSpan().Fill(step);
+                input.IncrementVersion();
+                Assert.Equal(length * (4f * step + 0.25f), plan.Step().ToArray()[0], length * 1e-3f);
+                foreach (float value in first.ToArray()) Assert.Equal(step + 0.25f, value);
+            }
+        }
+    }
+
     [Fact]
     public void Declared_matmul_result_remains_observable_across_linear_activation_fusion()
     {
