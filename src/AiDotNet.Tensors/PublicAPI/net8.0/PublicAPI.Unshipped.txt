@@ -107,3 +107,13 @@ override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.DepthwiseConv2DBatchNorm
 *REMOVED*AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.HashGridEncodeLevelBackward(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! positions, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! outputGradient, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! tableGradient, int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride) -> void
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.HashGridEncodeLevel(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! positions, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! hashTable, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int numPoints, float scale, float positionOffset, int gridResolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride) -> void
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.HashGridEncodeLevelBackward(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! positions, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! outputGradient, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! tableGradient, int numPoints, float scale, float positionOffset, int gridResolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride) -> void
+AiDotNet.Tensors.Engines.CsrGraph
+AiDotNet.Tensors.Engines.CsrGraph.ColumnIndices.get -> int[]!
+AiDotNet.Tensors.Engines.CsrGraph.CsrGraph(int nodeCount, int[]! rowPointers, int[]! columnIndices) -> void
+AiDotNet.Tensors.Engines.CsrGraph.EdgeCount.get -> int
+AiDotNet.Tensors.Engines.CsrGraph.EveryRowHasEdge.get -> bool
+AiDotNet.Tensors.Engines.CsrGraph.NodeCount.get -> int
+AiDotNet.Tensors.Engines.CsrGraph.RowPointers.get -> int[]!
+static AiDotNet.Tensors.Engines.CsrGraph.FromDenseAdjacency<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! adjacency) -> AiDotNet.Tensors.Engines.CsrGraph?
+AiDotNet.Tensors.Engines.IEngine.GraphAttentionCsr<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! transformed, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! attention, AiDotNet.Tensors.Engines.CsrGraph! graph, double negativeSlope = 0.2, double dropoutRate = 0, System.Random? dropoutRandom = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+virtual AiDotNet.Tensors.Engines.CpuEngine.GraphAttentionCsr<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! transformed, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! attention, AiDotNet.Tensors.Engines.CsrGraph! graph, double negativeSlope = 0.2, double dropoutRate = 0, System.Random? dropoutRandom = null) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
