@@ -275,6 +275,9 @@ internal sealed class CompiledDelegateChain<T>
                     DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                     if (stepScope is not null)
                     {
+                        if (step.Backward.Method.DeclaringType != typeof(BackwardFunctions<T>))
+                            foreach (var published in grads.Values)
+                                if (published is not null) stepScope.Keep(published);
                         foreach (var input in step.Inputs)
                             if (input is not null && grads.TryGetValue(input, out var inputGrad) && inputGrad is not null)
                                 stepScope.Keep(inputGrad);
@@ -294,7 +297,8 @@ internal sealed class CompiledDelegateChain<T>
                 }
 
                 recycler?.AfterStep(grads, step.Output, i);
-                gpuRelease?.AfterCompletedStep(grads, step.Output, i);
+                gpuRelease?.AfterCompletedStep(grads, step.Output, i, step.Inputs,
+                    step.Backward.Method.DeclaringType != typeof(BackwardFunctions<T>));
             }
         }
         finally
@@ -335,7 +339,9 @@ internal sealed class DeviceGradientReleaser<T>
 {
     private readonly HashSet<object> _kept;
     private readonly HashSet<Tensor<T>> _repeated = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
-    private readonly HashSet<object> _live = new(ReferenceEqualityComparer<object>.Instance);
+    private readonly Dictionary<object, int> _aliases = new(ReferenceEqualityComparer<object>.Instance);
+    private readonly Dictionary<Tensor<T>, object> _entries = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+    private bool _initialized;
     private readonly HashSet<Tensor<T>> _keepKeys = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
     internal DeviceGradientReleaser(BackwardStep<T>[] steps, int count, HashSet<object> protectedStorages, Tensor<T> loss,
@@ -357,21 +363,60 @@ internal sealed class DeviceGradientReleaser<T>
             if (step.Inputs is { } inputs)
                 foreach (var input in inputs)
                     if (input is not null) _kept.Add(input.StorageIdentity);
-            if (step.SavedState is { } saved)
-                foreach (var item in saved)
-                    if (item is Tensor<T> tensor) _kept.Add(tensor.StorageIdentity);
+            var visitor = new SavedStorageVisitor(_kept);
+            SavedStateTensorTraversal.Visit(step.SavedState, ref visitor);
         }
     }
+
+    private struct SavedStorageVisitor : ISavedStateTensorVisitor
+    {
+        private readonly HashSet<object> _storages;
+        internal SavedStorageVisitor(HashSet<object> storages) => _storages = storages;
+        public void Visit(ITensorStorageLeaseSource tensor)
+        {
+            if (tensor is Tensor<T> typed) _storages.Add(typed.StorageIdentity);
+        }
+    }
+
+    private void Update(Tensor<T> key, Tensor<T>? value)
+    {
+        if (_entries.TryGetValue(key, out var previous))
+        {
+            if (value is not null && ReferenceEquals(previous, value.StorageIdentity)) return;
+            if (--_aliases[previous] == 0) _aliases.Remove(previous);
+            _entries.Remove(key);
+        }
+        if (value is null) return;
+        object storage = value.StorageIdentity;
+        _entries[key] = storage;
+        _aliases.TryGetValue(storage, out int count);
+        _aliases[storage] = count + 1;
+    }
+
+    internal void Observe(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T>[] inputs, bool opaque)
+    {
+        // Built-in backwards publish only input gradients. Custom/checkpoint delegates receive a plain
+        // Dictionary and can mutate arbitrary keys, so reconcile those conservatively.
+        if (!_initialized || opaque)
+        {
+            _entries.Clear();
+            _aliases.Clear();
+            foreach (var pair in grads) Update(pair.Key, pair.Value);
+            _initialized = true;
+        }
+        else
+            foreach (var input in inputs)
+                if (input is not null) Update(input, grads.TryGetValue(input, out var value) ? value : null);
+    }
+
 
     internal void AfterStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> consumed, DirectGpuTensorEngine engine)
     {
         if (_keepKeys.Contains(consumed) || _repeated.Contains(consumed) || !grads.TryGetValue(consumed, out var gradient) || gradient is null) return;
         if (gradient.LazySource is not null || _kept.Contains(gradient.StorageIdentity)) return;
-        _live.Clear();
-        foreach (var pair in grads)
-            if (!ReferenceEquals(pair.Key, consumed) && pair.Value is not null) _live.Add(pair.Value.StorageIdentity);
-        if (_live.Contains(gradient.StorageIdentity)) return;
+        if (_aliases.TryGetValue(gradient.StorageIdentity, out int aliases) && aliases > 1) return;
         grads.Remove(consumed);
+        Update(consumed, null);
         engine.ReleaseDeadDeviceStorage(gradient, afterQueuedWork: true);
     }
 }

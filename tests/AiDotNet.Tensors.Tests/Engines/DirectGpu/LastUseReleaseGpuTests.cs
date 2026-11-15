@@ -187,10 +187,9 @@ public sealed class LastUseReleaseGpuTests
     [SkippableTheory]
     [InlineData(true)]
     [InlineData(false)]
-    public void A_tapes_dispose_frees_an_unretained_intermediate_and_Retain_keeps_one(bool retain)
+    public void A_default_tapes_dispose_keeps_a_caller_held_intermediate(bool retain)
     {
-        // The step-end contract the last-use tests read around: dispose frees what the step produced, as PyTorch frees
-        // an unreferenced CUDA tensor, unless Retain kept it.
+        // Default tapes preserve caller-held tensors. Early invalidation requires the explicit last-use option.
         using var gpu = new DirectGpuTensorEngine();
         Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
         AutoRetainProbe.ResetForTests();
@@ -204,8 +203,7 @@ public sealed class LastUseReleaseGpuTests
             if (retain) tape.Retain(y);
             tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(y, w), null), new[] { x });
         }
-        if (retain) Assert.Equal(Sigmoid(host.ToArray()), y.ToArray(), new FloatTolerance(1e-5f));
-        else Assert.Throws<InvalidOperationException>(() => y.ToArray());
+        Assert.Equal(Sigmoid(host.ToArray()), y.ToArray(), new FloatTolerance(1e-5f));
     }
 
     [SkippableFact]

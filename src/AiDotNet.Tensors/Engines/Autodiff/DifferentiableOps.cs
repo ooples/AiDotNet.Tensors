@@ -382,6 +382,9 @@ internal static class DifferentiableOps
         if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
+        // Inside a trace the op ran eagerly and only the tape saw it, so the trace's plan cannot replay it (see
+        // LazyTensorScope.TapeRecordedOp).
+        if (Compilation.GraphMode.Current is { } traceScope) traceScope.TapeRecordedOp ??= opName;
         // Note: we always record during forward passes even when a compiled backward exists.
         // This ensures GradFn is set on outputs (needed for createGraph: true) and the tape
         // is populated as a fallback. The compiled backward is used at ComputeGradients time
@@ -476,6 +479,9 @@ internal static class DifferentiableOps
         if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
+        // Inside a trace the op ran eagerly and only the tape saw it, so the trace's plan cannot replay it (see
+        // LazyTensorScope.TapeRecordedOp).
+        if (Compilation.GraphMode.Current is { } traceScope) traceScope.TapeRecordedOp ??= opName;
         ref var slot = ref tape.RecordSlot(out bool accepted);
         if (!accepted) return;
         // Dispatch the backward to wherever the data actually lives. This is the single funnel every
@@ -538,6 +544,9 @@ internal static class DifferentiableOps
         if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
+        // Inside a trace the op ran eagerly and only the tape saw it, so the trace's plan cannot replay it (see
+        // LazyTensorScope.TapeRecordedOp).
+        if (Compilation.GraphMode.Current is { } traceScope) traceScope.TapeRecordedOp ??= opName;
         ref var slot = ref tape.RecordSlot(out bool accepted);
         if (!accepted) return;
         // Dispatch the backward to wherever the data actually lives. This is the single funnel every

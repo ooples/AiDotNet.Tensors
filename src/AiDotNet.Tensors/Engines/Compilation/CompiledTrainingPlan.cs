@@ -305,6 +305,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             DetachDeviceBinding(grad);
             using (var own = new Tensor<T>((int[])grad._shape.Clone()))
                 grad.RebindStorageFrom(own);
+            if (_aliasedGradViews is not null)
+                foreach (var alias in _aliasedGradViews)
+                    if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
         }
         _pooledGradients = null;
         _deferredZeroByAction = null;
@@ -323,6 +326,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         DetachDeviceBinding(grad);
         using (var own = new Tensor<T>((int[])grad._shape.Clone()))
             grad.RebindStorageFrom(own);
+        if (_aliasedGradViews is not null)
+            foreach (var alias in _aliasedGradViews)
+                if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
         pooled[index] = false;
         _cachedGradArrays = null;   // rebound
     }

@@ -530,8 +530,10 @@ internal sealed class GpuBackwardRelease<T>
     internal void ReleaseAfterStep(int step)
         => _plan?.ReleaseAfterStep(step, _engine, _protectedStorages);
 
-    internal void AfterCompletedStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> stepOutput, int step)
+    internal void AfterCompletedStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> stepOutput, int step,
+        Tensor<T>[] inputs, bool opaque)
     {
+        _gradientReleaser?.Observe(grads, inputs, opaque);
         _gradientReleaser?.AfterStep(grads, stepOutput, _engine);
         _plan?.ReleaseAfterStep(step, _engine, _protectedStorages);
     }

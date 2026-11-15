@@ -39104,7 +39104,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // copy of the output first. Writing the output's host array in place left its device copy
                         // from the previous step looking current, so on a GPU engine every consumer kept reading the
                         // first step's embeddings (measured: an int-id compiled plan diverged from the CPU at step 2).
-                        var gathered = new Tensor<TValue>(output._shape);
+                        var gathered = eng.Is<DirectGpuTensorEngine>() ? new Tensor<TValue>(output._shape) : output;
                         using var outDataLocalLease = gathered.LeaseArray();
                         var outDataLocal = outDataLocalLease.Array;
                         for (int i = 0; i < n; i++)
@@ -39119,7 +39119,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             int dstOff = i * capturedDim;
                             Array.Copy(embDataLocal, srcOff, outDataLocal, dstOff, capturedDim);
                         }
-                        DirectGpuTensorEngine.CopyResultInto(eng, gathered, output);
+                        if (!ReferenceEquals(gathered, output)) DirectGpuTensorEngine.CopyResultInto(eng, gathered, output);
                     },
                     BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
                     new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim, capturedIndices });
@@ -44224,16 +44224,19 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> MultiresolutionHashEncoding<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
-        int featuresPerLevel)
+        int baseResolution,
+        double perLevelScale,
+        int featuresPerLevel,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn)
     {
-        if (positions == null) throw new ArgumentNullException(nameof(positions));
-        if (hashTables == null) throw new ArgumentNullException(nameof(hashTables));
+        // Validated before tracing, so a bad argument fails here rather than when the plan replays.
+        InstantNGPOperations.ValidateHashEncodingArguments(positions, hashTables, featuresPerLevel);
+        InstantNGPOperations.ComputeHashGridLevels(hashTables.Length, baseResolution, perLevelScale, alignment);
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
                 new[] { positions }.Concat(hashTables).ToArray(),
                 engine => engine.MultiresolutionHashEncoding(
-                    positions, hashTables, resolutions, featuresPerLevel));
+                    positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, alignment));
 
         // A training trace records the encoding as one node whose backward scatters the feature gradient into every
         // level's table, so a compiled training plan replays it on each step's positions and trains the tables
@@ -44245,7 +44248,6 @@ public partial class CpuEngine : ITensorLevelEngine
             scope.BindEngineIfUnset(this);
             var capturedPositions = positions;
             var capturedTables = (Tensor<T>[])hashTables.Clone();
-            var capturedResolutions = (int[])resolutions.Clone();
             int levels = capturedTables.Length;
             return scope.RecordVariadic(
                 LazyNodeType.Custom,
@@ -44255,7 +44257,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 (eng, output) =>
                 {
                     var result = eng.MultiresolutionHashEncoding(
-                        capturedPositions, capturedTables, capturedResolutions, featuresPerLevel);
+                        capturedPositions, capturedTables, baseResolution, perLevelScale, featuresPerLevel, alignment);
                     DirectGpuTensorEngine.CopyResultInto(eng, result, output);
                 },
                 (gradOutput, inputs, _, _, eng, grads) =>
@@ -44263,26 +44265,28 @@ public partial class CpuEngine : ITensorLevelEngine
                     var tables = new Tensor<T>[inputs.Length - 1];
                     Array.Copy(inputs, 1, tables, 0, tables.Length);
                     var tableGradients = eng.MultiresolutionHashEncodingBackward(
-                        inputs[0], tables, capturedResolutions, featuresPerLevel, gradOutput);
+                        inputs[0], tables, baseResolution, perLevelScale, featuresPerLevel, gradOutput, alignment);
                     for (int level = 0; level < tables.Length; level++)
                         DifferentiableOps.AccumulateGrad(grads, tables[level], tableGradients[level], eng);
                 });
         }
 
         return InstantNGPOperations.MultiresolutionHashEncoding(
-            positions, hashTables, resolutions, featuresPerLevel);
+            positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, alignment);
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T>[] MultiresolutionHashEncodingBackward<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
+        int baseResolution,
+        double perLevelScale,
         int featuresPerLevel,
-        Tensor<T> outputGradient)
+        Tensor<T> outputGradient,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn)
     {
         return InstantNGPOperations.MultiresolutionHashEncodingBackward(
-            positions, hashTables, resolutions, featuresPerLevel, outputGradient);
+            positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, outputGradient, alignment);
     }
 
     /// <inheritdoc/>

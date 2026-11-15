@@ -83,10 +83,15 @@ public class ProgramOperationReplaySweepTests : IDisposable
                     IEnumerable<Tensor<double>> ts => ts.Select(Substitute).ToArray(),
                     _ => arg
                 };
-                // An op that writes its results to out tensors (FFT, STFT) returns nothing: replay what the gradient
-                // sweeps differentiate, a weighted sum over every out tensor.
-                return new[] { DifferentiableOpsGradCheckSweep.InvokeOutput<double>(AiDotNetEngine.Current, method,
-                    args.Select(SubstituteArg).ToArray()) };
+                var callArgs = args.Select(SubstituteArg).ToArray();
+                var returned = method.Invoke(AiDotNetEngine.Current, callArgs);
+                var outputs = new List<Tensor<double>>();
+                if (returned is Tensor<double> primary) outputs.Add(primary);
+                var parameterInfo = method.GetParameters();
+                for (int i = 0; i < parameterInfo.Length; i++)
+                    if (parameterInfo[i].IsOut && callArgs[i] is Tensor<double> output) outputs.Add(output);
+                Assert.NotEmpty(outputs);
+                return outputs.ToArray();
             }
             try
             {
@@ -112,13 +117,17 @@ public class ProgramOperationReplaySweepTests : IDisposable
                     new TraceOptions { InferDynamicDimensions = false, Verify = !structuredRois });
                 Assert.NotEmpty(program.Nodes);
                 var changed = originals.Select(x => Copy(x, changed: true)).ToArray();
-                var expected = Copy(Forward(changed.Select(x => Copy(x)).ToArray())[0]);
-                Equal(expected, program.Run(changed.Select(x => Copy(x)).ToArray())[0]);
+                var expected = Forward(changed.Select(x => Copy(x)).ToArray()).Select(x => Copy(x)).ToArray();
+                var replayed = program.Run(changed.Select(x => Copy(x)).ToArray());
+                Assert.Equal(expected.Length, replayed.Length);
+                for (int i = 0; i < expected.Length; i++) Equal(expected[i], replayed[i]);
                 using var stream = new MemoryStream();
                 new ProgramPackage(program).Save(stream);
                 stream.Position = 0;
                 var loaded = ProgramPackage.Load(stream).Program;
-                Equal(expected, loaded.Run(changed.Select(x => Copy(x)).ToArray())[0]);
+                var loadedOutputs = loaded.Run(changed.Select(x => Copy(x)).ToArray());
+                Assert.Equal(expected.Length, loadedOutputs.Length);
+                for (int i = 0; i < expected.Length; i++) Equal(expected[i], loadedOutputs[i]);
                 tested++;
             }
             catch (Exception ex)

@@ -53,18 +53,30 @@ public partial class CpuEngine
         if (backwardForward is not null) BindCaptures(scope, backwardForward, operands);
 
         Tensor<T> traced;
-        GraphMode.SetCurrent(null);
-        var restore = SaveOperandWrites(operands);
-        try
+        var position = scope.NodeCount;
+        var shapeKey = CompiledOpShapeCache.Supports(opName)
+            ? ObjectiveSignature.BuildShapeKey(opName, this, operands, forward) : null;
+        if (scope.IsProbe)
         {
-            RealizeOperands(operands);
-            using (new NoGradScope<T>())
-                traced = OwnedOutput(forward(this));
+            if (shapeKey is null) throw new ObjectiveProbeAbortedException(opName + " (shape cache unsupported)");
+            traced = scope.CompiledOpShapes.Lookup<T>(position, shapeKey, opName, out _);
         }
-        finally
+        else
         {
-            restore();
-            GraphMode.SetCurrent(scope);
+            GraphMode.SetCurrent(null);
+            try
+            {
+                var restore = SaveOperandWrites(operands);
+                try
+                {
+                    RealizeOperands(operands);
+                    using (new NoGradScope<T>())
+                        traced = OwnedOutput(forward(this));
+                }
+                finally { restore(); }
+            }
+            finally { GraphMode.SetCurrent(scope); }
+            if (shapeKey is not null) scope.CompiledOpShapes.Remember(position, shapeKey, traced._shape);
         }
 
         result = scope.RecordMaterializedVariadic(LazyNodeType.Custom, opName, operands.ToArray(), traced,
@@ -174,22 +186,37 @@ public partial class CpuEngine
 
         Tensor<T> traced;
         TAux tracedAux;
-        GraphMode.SetCurrent(null);
-        var restore = SaveOperandWrites(operands);
-        try
+        var position = scope.NodeCount;
+        var shapeKey = CompiledOpShapeCache.Supports(opName) && typeof(TAux) == typeof(Tensor<int>)
+            ? ObjectiveSignature.BuildShapeKey(opName, this, operands, forward) : null;
+        if (scope.IsProbe)
         {
-            RealizeOperands(operands);
-            using (new NoGradScope<T>())
-            {
-                var (r, a) = forward(this);
-                traced = OwnedOutput(r);
-                tracedAux = a;
-            }
+            if (shapeKey is null) throw new ObjectiveProbeAbortedException(opName + " (auxiliary shape cache unsupported)");
+            traced = scope.CompiledOpShapes.Lookup<T>(position, shapeKey, opName, out var auxiliaryShape);
+            if (auxiliaryShape is null) throw new ObjectiveProbeAbortedException(opName + " (missing auxiliary shape)");
+            tracedAux = (TAux)(object)Tensor<int>.CreateDeferred(auxiliaryShape);
         }
-        finally
+        else
         {
-            restore();
-            GraphMode.SetCurrent(scope);
+            GraphMode.SetCurrent(null);
+            try
+            {
+                var restore = SaveOperandWrites(operands);
+                try
+                {
+                    RealizeOperands(operands);
+                    using (new NoGradScope<T>())
+                    {
+                        var (r, a) = forward(this);
+                        traced = OwnedOutput(r);
+                        tracedAux = a;
+                    }
+                }
+                finally { restore(); }
+            }
+            finally { GraphMode.SetCurrent(scope); }
+            if (shapeKey is not null && tracedAux is Tensor<int> indices)
+                scope.CompiledOpShapes.Remember(position, shapeKey, traced._shape, indices._shape);
         }
 
         aux = tracedAux;
@@ -201,7 +228,15 @@ public partial class CpuEngine
                 refreshAux(eng, a, tracedAux);
             },
             backward ?? BackwardFunctions<T>.ReplayUnderTape(eng => forward(eng).Result));
-        if (tracedAux is not null) scope.RegisterAuxiliaryOutput(tracedAux, result);
+        if (tracedAux is not null)
+        {
+            scope.RegisterAuxiliaryOutput(tracedAux, result);
+            if (tracedAux is Tensor<int> indices && result.LazySource is LazyNode<T> node)
+            {
+                node.AuxiliaryOutput = indices;
+                if (scope.IsProbe) indices.LazySource = node;
+            }
+        }
         return true;
     }
 

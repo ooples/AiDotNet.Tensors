@@ -49,36 +49,33 @@ internal static class SavedStateTensorTraversal
     internal static void Visit<TVisitor>(object[]? savedState, ref TVisitor visitor)
         where TVisitor : struct, ISavedStateTensorVisitor
     {
-        if (savedState is null) return;
-        VisitValues(savedState, ref visitor);
-    }
-
-    private static void VisitValues<TVisitor>(IReadOnlyList<object> values, ref TVisitor visitor)
-        where TVisitor : struct, ISavedStateTensorVisitor
-    {
-        for (int i = 0; i < values.Count; i++)
-            VisitValue(values[i], ref visitor);
-    }
-
-    private static void VisitValue<TVisitor>(object? value, ref TVisitor visitor)
-        where TVisitor : struct, ISavedStateTensorVisitor
-    {
-        if (value is ITensorStorageLeaseSource tensor)
+        if (savedState is null || savedState.Length == 0) return;
+        var pending = new Stack<object>();
+        var seen = new HashSet<object>(Engines.Autodiff.ReferenceEqualityComparer<object>.Instance);
+        pending.Push(savedState);
+        while (pending.Count != 0)
         {
-            visitor.Visit(tensor);
-            return;
+            var value = pending.Pop();
+            if (value is ITensorStorageLeaseSource tensor)
+            {
+                visitor.Visit(tensor);
+                continue;
+            }
+            if (!seen.Add(value)) continue;
+            // Explicit worklist avoids stack overflow for both cycles and deeply nested state.
+            if (value is Array array && array.GetType().GetElementType() is { IsValueType: false })
+            {
+                foreach (var item in array)
+                    if (item is not null) pending.Push(item);
+            }
+            else if (value is ISavedStateTensorContainer container)
+            {
+                foreach (var item in container.SavedStateValues)
+                    if (item is not null) pending.Push(item);
+            }
         }
-
-        // Tensor<T>[] is covariant with object[]; primitive arrays are not and are skipped.
-        if (value is object[] nested)
-        {
-            VisitValues(nested, ref visitor);
-            return;
-        }
-
-        if (value is ISavedStateTensorContainer container)
-            VisitValues(container.SavedStateValues, ref visitor);
     }
+
 }
 
 /// <summary>A type-erased, independently disposable reference to one tensor storage.</summary>

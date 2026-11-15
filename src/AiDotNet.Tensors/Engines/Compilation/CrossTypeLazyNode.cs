@@ -25,8 +25,19 @@ internal delegate Tensor<TIn>? CrossTypeBackwardFunction<TIn, TOut>(
 /// <see cref="BackwardFn"/>, the differentiable FP32↔FP16 cast that bridges the two grad spaces in
 /// mixed-precision (#555) training.
 /// </summary>
-internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
+internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNode
 {
+    Type ISignableLazyNode.OutputElementType => typeof(TOut);
+    object ISignableLazyNode.OutputTensor => Output;
+    int ISignableLazyNode.SignatureInputCount => 1;
+    object? ISignableLazyNode.GetSignatureInput(int index) => index == 0 ? Input : null;
+    Delegate ISignableLazyNode.ExecuteDelegate => Execute;
+    Delegate? ISignableLazyNode.BackwardDelegate => BackwardFn;
+    object[]? ISignableLazyNode.SavedStateObjects => SavedState;
+    bool ISignableLazyNode.ReplaysHostStateFlag => false;
+    object? ISignableLazyNode.AuxiliaryOutput => null;
+    public bool RecordedInProbe { get; set; }
+
     public LazyNodeType OpType { get; }
     public string OpName { get; }
     public int[] OutputShape { get; }
@@ -84,6 +95,8 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
+        if (RecordedInProbe || GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
+        if (GraphMode.Current is { IsProbe: false, TraceKind: GraphTraceKind.Training } tracing) tracing.HostReadOp ??= OpName;
         IsRealized = true; // Set BEFORE executing to prevent re-entrant recursion
 
         // Issue #238: the Execute delegate re-invokes the engine op (e.g.,

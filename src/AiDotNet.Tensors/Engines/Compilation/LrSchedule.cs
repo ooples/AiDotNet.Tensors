@@ -220,10 +220,8 @@ public abstract class LrSchedule
         => new CyclicRangeLr(lrBase, lrMax, stepSizeUp, stepSizeDown, mode, gamma);
 
     /// <summary>
-    /// Runs <paramref name="schedules"/>[0] from the start and schedules[k] once more than milestones[k - 1] steps have
-    /// completed. Image of <c>AiDotNet.LearningRateSchedulers.SequentialLRScheduler</c> stepped per batch: that
-    /// scheduler steps a child once in the call that switches to it, so a later child's first rate is its
-    /// <c>GetLr(2)</c>, the rate after one completed step of its own.
+    /// Runs <paramref name="schedules"/>[0] from the start and selects schedules[k] after milestones[k - 1]
+    /// steps have completed. Each newly selected child starts at <c>GetLr(1)</c>; no child rate is skipped.
     /// </summary>
     public static LrSchedule Sequential(System.Collections.Generic.IReadOnlyList<LrSchedule> schedules, System.Collections.Generic.IReadOnlyList<int> milestones)
         => new SequentialLr(schedules, milestones);
