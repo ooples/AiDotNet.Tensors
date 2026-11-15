@@ -235,7 +235,9 @@ internal sealed class ClosureObjectiveGuard<T>
         {
             // An op that cannot trace without data (or the objective's own failure, which the eager step will
             // surface): either way this step cannot replay a plan.
-            reason = $"the objective could not be probed ({ex.GetType().Name}: {ex.Message})";
+            // Name where it threw: an op that indexes a value the storage-free probe never computes shows up here.
+            var site = ex.TargetSite is { } method ? $" in {method.DeclaringType?.Name}.{method.Name}" : "";
+            reason = $"the objective could not be probed ({ex.GetType().Name}{site}: {ex.Message})";
             return ClosureGuardResult.Aborted;
         }
 
