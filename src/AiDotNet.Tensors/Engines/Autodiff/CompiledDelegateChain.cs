@@ -222,6 +222,10 @@ internal sealed class CompiledDelegateChain<T>
         // On the GPU, bundle protected storages, last-use activation release, and dead intermediate-gradient release.
         var gpuRelease = GpuBackwardRelease<T>.BeginChain(
             engine, _storageReleasePlan, _steps, _count, loss, sources, retainedTensors);
+        // Every gradient key a step writes, so its step scope keeps each one: an opaque backward (a checkpoint segment)
+        // writes the gradients of leaves that are not among the step's inputs, and releasing those left freed device
+        // buffers in grads.
+        var stepWrites = gpuRelease is not null ? new List<Tensor<T>>() : null;
         try
         {
             // Inside the try, so End runs (and the thread's recycler guard and arena issue log close) if this throws.
@@ -255,6 +259,12 @@ internal sealed class CompiledDelegateChain<T>
                 // contributions it summed into an input's gradient) are dead once it returns: free them now, stream
                 // ordered, as PyTorch's refcount frees them, instead of leaving them to the GC.
                 var stepScope = gpuRelease?.BeginStepScope();
+                var outerWrites = DifferentiableOps.BackwardStepGradientWrites<T>.Current;
+                if (stepScope is not null && stepWrites is not null)
+                {
+                    stepWrites.Clear();
+                    DifferentiableOps.BackwardStepGradientWrites<T>.Current = stepWrites;
+                }
                 try
                 {
                     step.Backward(gradOutput, step.Inputs, step.Output,
@@ -265,9 +275,17 @@ internal sealed class CompiledDelegateChain<T>
                     DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                     if (stepScope is not null)
                     {
+                        DifferentiableOps.BackwardStepGradientWrites<T>.Current = outerWrites;
                         foreach (var input in step.Inputs)
                             if (input is not null && grads.TryGetValue(input, out var inputGrad) && inputGrad is not null)
                                 stepScope.Keep(inputGrad);
+                        if (stepWrites is not null)
+                        {
+                            foreach (var written in stepWrites)
+                                if (grads.TryGetValue(written, out var writtenGrad) && writtenGrad is not null)
+                                    stepScope.Keep(writtenGrad);
+                            stepWrites.Clear();
+                        }
                         stepScope.Dispose();
                     }
                 }

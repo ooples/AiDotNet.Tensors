@@ -1120,11 +1120,24 @@ public sealed class GradientTape<T> : IDisposable
             throw new InvalidOperationException(
                 "This tape's first backward handed its forward activations back to the arena "
                 + "(GradientTapeOptions.ReleaseActivationsDuringBackward), so it cannot run another backward.");
+        if (_freedDeviceActivationsAtLastUse)
+            throw new InvalidOperationException(
+                "This tape's backward freed its GPU intermediates at their last use "
+                + "(GradientTapeOptions.ReleaseDeviceActivationsAtLastUse), so it cannot run another backward over them. "
+                + "Set StreamingGraphRetention = StreamingGraphRetentionMode.RetainUntilTapeDisposal to keep the graph "
+                + "for another backward, as PyTorch's retain_graph=True keeps its saved tensors.");
         Dictionary<Tensor<T>, Tensor<T>> grads;
-        bool outerReleaseScope = ReleaseScope.Enter(_options.ReleaseDeviceActivationsAtLastUse);
+        // A tape that keeps its graph for another backward (RetainUntilTapeDisposal) must keep the activations that graph
+        // reads: freeing at last use, or closing a probe window between two walks of the same graph, would free storages
+        // the next walk still reads.
+        bool freeAtLastUse = _options.ReleaseDeviceActivationsAtLastUse && _releaseStreamingActivations;
+        bool outerReleaseScope = ReleaseScope.Enter(freeAtLastUse);
         try
         {
             grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
+            // A create-graph backward frees nothing (BackwardStorageReleasePlan skips it), so the tape stays usable.
+            if (freeAtLastUse && !createGraph && !DifferentiableOps._isBackwardCreateGraph && _engine.Is<DirectGpuTensorEngine>())
+                _freedDeviceActivationsAtLastUse = true;
         }
         finally
         {
@@ -1186,6 +1199,10 @@ public sealed class GradientTape<T> : IDisposable
 
     // Non-leaf gradients handed back by a backward with no sources: freed at this tape's dispose.
     private List<Tensor<T>>? _nonLeafGradients;
+
+    // Set once a backward on a GPU engine freed (or quarantined, on a probe run) intermediates at their last use: the
+    // graph's activations are gone, so another backward over it would fail part-way through.
+    private bool _freedDeviceActivationsAtLastUse;
 
     private HashSet<Tensor<T>> EntryOutputs()
     {
@@ -3324,7 +3341,18 @@ public sealed class GradientTape<T> : IDisposable
         if (_nonLeafGradients is { } nonLeafGradients && _engine.TryGet<DirectGpuTensorEngine>(out var nonLeafEngine))
         {
             _nonLeafGradients = null;
-            foreach (var gradient in nonLeafGradients) nonLeafEngine.ReleaseDeadDeviceStorage(gradient, afterQueuedWork: true);
+            foreach (var gradient in nonLeafGradients)
+            {
+                // Retain(gradient) after backward keeps it readable, as it does any tensor: spare it here, and hold it out
+                // of the arena's reuse like the other results handed to the caller.
+                var array = gradient.GetBackingArrayForCacheLookupUnsafe();
+                if (Helpers.HostSync.IsRetained(gradient.DataVector) || (array is not null && Helpers.HostSync.IsRetained(array)))
+                {
+                    HoldOverStepBoundary(gradient);
+                    continue;
+                }
+                nonLeafEngine.ReleaseDeadDeviceStorage(gradient, afterQueuedWork: true);
+            }
         }
 
         // Issue #283 fix: invalidate ONLY this tape's forward-recorded

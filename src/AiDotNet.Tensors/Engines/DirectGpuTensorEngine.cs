@@ -2558,6 +2558,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // materializes the view's logical layout.
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             return GetOrAllocateBuffer(backend, tensor);
+        // As GetOrAllocateBuffer: a released intermediate fails loudly instead of handing out a buffer the pool may have
+        // re-rented, and a device read of a quarantined one is reported to the probe. The resident and activation-cache
+        // returns below never reach GetOrAllocateBuffer, so a post-backward read through here (IEngine.ReduceSum on the
+        // innermost axis) left its producer unretained, and the next run freed what this consumer still read.
+        ThrowIfReleased(tensor);
+        if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
 
         int hostVersion = tensor.GpuCacheVersion;
         // Fast path: tensor has a GPU buffer from a previous GPU operation, and

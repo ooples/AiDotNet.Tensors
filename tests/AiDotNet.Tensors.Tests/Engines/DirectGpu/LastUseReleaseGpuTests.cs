@@ -28,14 +28,17 @@ public sealed class LastUseReleaseGpuTests
     private static readonly GradientTapeOptions OptIn = new() { ReleaseDeviceActivationsAtLastUse = true };
 
     // y = sigmoid(x); loss = sum(y * w): y is an intermediate whose last backward use is the multiply's backward.
+    // afterBackward runs once backward has finished, while the tape is still open: a tape's dispose frees the step's
+    // intermediates anyway (Retain keeps one past it), so reads that test the last-use release happen before it.
     private static Tensor<float> Step(IEngine engine, Tensor<float> x, Tensor<float> w, bool readAfterBackward,
-        out float[]? read, bool optIn = true)
+        out float[]? read, bool optIn = true, Action<Tensor<float>>? afterBackward = null)
     {
         using var tape = new GradientTape<float>(optIn ? OptIn : null);
         var y = engine.Sigmoid(x);
         var loss = engine.ReduceSum(engine.TensorMultiply(y, w), null);
         tape.ComputeGradients(loss, new[] { x });
         read = readAfterBackward ? y.ToArray() : null;
+        afterBackward?.Invoke(y);
         return y;
     }
 
@@ -148,10 +151,15 @@ public sealed class LastUseReleaseGpuTests
         var x2 = gpu.UploadToGpu(new Tensor<float>(Enumerable.Range(0, 44).Select(i => (float)Math.Cos(i * 0.3)).ToArray(), new[] { 4, 11 }), GpuTensorRole.General);
         var w2 = gpu.UploadToGpu(new Tensor<float>(Enumerable.Range(0, 44).Select(i => (float)Math.Sin(i * 0.2)).ToArray(), new[] { 4, 11 }), GpuTensorRole.General);
 
-        var y = Step(gpu, x, w, readAfterBackward: false, out _, optIn);
-        OtherGraphStep(gpu, x2, w2, optIn);
-        OtherGraphStep(gpu, x2, w2, optIn);
-        Assert.Equal(Sigmoid(host.ToArray()), y.ToArray(), new FloatTolerance(1e-5f));
+        float[]? held = null;
+        Step(gpu, x, w, readAfterBackward: false, out _, optIn, afterBackward: y =>
+        {
+            OtherGraphStep(gpu, x2, w2, optIn);
+            OtherGraphStep(gpu, x2, w2, optIn);
+            held = y.ToArray();
+        });
+        Assert.NotNull(held);
+        if (held is not null) Assert.Equal(Sigmoid(host.ToArray()), held, new FloatTolerance(1e-5f));
     }
 
     [SkippableFact]
@@ -164,10 +172,190 @@ public sealed class LastUseReleaseGpuTests
         var x = gpu.UploadToGpu(host, GpuTensorRole.General);
         var w = gpu.UploadToGpu(Input(12), GpuTensorRole.General);
         Step(gpu, x, w, readAfterBackward: false, out _, optIn: false);
-        var y = Step(gpu, x, w, readAfterBackward: false, out _, optIn: false);   // past where an opted-in tape frees
-        Step(gpu, x, w, readAfterBackward: false, out _, optIn: false);
-        Assert.Equal(Sigmoid(host.ToArray()), y.ToArray(), new FloatTolerance(1e-5f));
+        float[]? held = null;
+        // Past where an opted-in tape frees y, and across a later step of the same graph.
+        Step(gpu, x, w, readAfterBackward: false, out _, optIn: false, afterBackward: y =>
+        {
+            Step(gpu, x, w, readAfterBackward: false, out _, optIn: false);
+            held = y.ToArray();
+        });
+        Assert.NotNull(held);
+        if (held is not null) Assert.Equal(Sigmoid(host.ToArray()), held, new FloatTolerance(1e-5f));
         Assert.Equal(0, AutoRetainProbe.OpenWindowCount);   // and a default tape never probes
+    }
+
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void A_tapes_dispose_frees_an_unretained_intermediate_and_Retain_keeps_one(bool retain)
+    {
+        // The step-end contract the last-use tests read around: dispose frees what the step produced, as PyTorch frees
+        // an unreferenced CUDA tensor, unless Retain kept it.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var host = Input(17);
+        var x = gpu.UploadToGpu(host, GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(18), GpuTensorRole.General);
+        Tensor<float> y;
+        using (var tape = new GradientTape<float>())
+        {
+            y = gpu.Sigmoid(x);
+            if (retain) tape.Retain(y);
+            tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(y, w), null), new[] { x });
+        }
+        if (retain) Assert.Equal(Sigmoid(host.ToArray()), y.ToArray(), new FloatTolerance(1e-5f));
+        else Assert.Throws<InvalidOperationException>(() => y.ToArray());
+    }
+
+    [SkippableFact]
+    public void A_retained_graph_runs_backward_twice_with_the_same_gradients()
+    {
+        // StreamingGraphRetention = RetainUntilTapeDisposal keeps the graph for another backward. With the opt-in, the
+        // second walk read activations the first walk had freed at their last use.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var x = gpu.UploadToGpu(Input(19), GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(20), GpuTensorRole.General);
+        var options = new GradientTapeOptions
+        {
+            Persistent = true,
+            ReleaseDeviceActivationsAtLastUse = true,
+            StreamingGraphRetention = StreamingGraphRetentionMode.RetainUntilTapeDisposal,
+        };
+        for (int run = 0; run < 3; run++)   // the probe run and two after it
+        {
+            using var tape = new GradientTape<float>(options);
+            var y = gpu.Sigmoid(x);
+            var loss = gpu.ReduceSum(gpu.TensorMultiply(y, w), null);
+            var first = tape.ComputeGradients(loss, new[] { x })[x].ToArray();
+            var second = tape.ComputeGradients(loss, new[] { x })[x].ToArray();
+            Assert.Equal(first, second, new FloatTolerance(1e-6f));
+        }
+    }
+
+    [SkippableFact]
+    public void A_second_backward_after_freeing_at_last_use_throws_a_clear_error()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var x = gpu.UploadToGpu(Input(21), GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(22), GpuTensorRole.General);
+        for (int run = 0; run < 2; run++)   // on the probe run (quarantined) and after it (freed)
+        {
+            using var tape = new GradientTape<float>(
+                new GradientTapeOptions { Persistent = true, ReleaseDeviceActivationsAtLastUse = true });
+            var y = gpu.Sigmoid(x);
+            var loss = gpu.ReduceSum(gpu.TensorMultiply(y, w), null);
+            tape.ComputeGradients(loss, new[] { x });
+            var error = Assert.Throws<InvalidOperationException>(() => tape.ComputeGradients(loss, new[] { x }));
+            Assert.Contains("RetainUntilTapeDisposal", error.Message);
+        }
+    }
+
+    [SkippableFact]
+    public void A_retained_non_leaf_gradient_survives_the_tapes_dispose()
+    {
+        // A backward with no sources hands back non-leaf gradients and frees them at dispose; Retain(gradient) must keep
+        // one, as it keeps any tensor.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var hostW = Input(24);
+        var x = gpu.UploadToGpu(Input(23), GpuTensorRole.General);
+        var w = gpu.UploadToGpu(hostW, GpuTensorRole.General);
+        Tensor<float>? gradY = null;
+        using (var tape = new GradientTape<float>())
+        {
+            var y = gpu.Sigmoid(x);
+            var grads = tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(y, w), null));
+            if (grads.TryGetValue(y, out var g)) gradY = g;
+            if (gradY is not null) tape.Retain(gradY);
+        }
+        Assert.NotNull(gradY);
+        if (gradY is not null) Assert.Equal(hostW.ToArray(), gradY.ToArray(), new FloatTolerance(1e-6f));   // d/dy = w
+    }
+
+    [SkippableFact]
+    public void A_reduction_read_on_the_probe_run_keeps_the_intermediate_on_later_runs()
+    {
+        // ReduceSum on the innermost axis reads its input through UploadTensor, whose resident return skipped the probe:
+        // the producer stayed unretained and the next run freed what this read still needed.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var host = new Tensor<float>(Enumerable.Range(0, 4 * 13).Select(i => (float)Math.Sin(i * 0.41)).ToArray(), new[] { 4, 13 });
+        var x = gpu.UploadToGpu(host, GpuTensorRole.General);
+        var w = gpu.UploadToGpu(new Tensor<float>(
+            Enumerable.Range(0, 4 * 13).Select(i => (float)Math.Cos(i * 0.23)).ToArray(), new[] { 4, 13 }), GpuTensorRole.General);
+        var s = Sigmoid(host.ToArray());
+        var expected = Enumerable.Range(0, 4).Select(r => Enumerable.Range(0, 13).Sum(c => s[r * 13 + c])).ToArray();
+        for (int run = 0; run < 3; run++)
+        {
+            float[]? rowSums = null;
+            Step(gpu, x, w, readAfterBackward: false, out _, afterBackward: y => rowSums = gpu.ReduceSum(y, new[] { 1 }).ToArray());
+            Assert.NotNull(rowSums);
+            if (rowSums is not null) Assert.Equal(expected, rowSums, new FloatTolerance(1e-5f));
+        }
+    }
+
+    [SkippableFact]
+    public void Graphs_whose_shapes_hashed_alike_each_get_their_own_probe()
+    {
+        // [1, 32] and [2, 1] folded to one 31-based shape hash, so the second graph's first run counted as already
+        // probed: it freed y at its last use, and a read after backward threw instead of being recorded.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        Tensor<float> Make(int[] shape, double phase) => gpu.UploadToGpu(new Tensor<float>(
+            Enumerable.Range(0, shape[0] * shape[1]).Select(i => (float)Math.Sin(i * 0.3 + phase)).ToArray(), shape),
+            GpuTensorRole.General);
+        var xa = Make(new[] { 1, 32 }, 0);
+        var wa = Make(new[] { 1, 32 }, 1);
+        var xb = Make(new[] { 2, 1 }, 2);
+        var wb = Make(new[] { 2, 1 }, 3);
+        Step(gpu, xa, wa, readAfterBackward: false, out _);   // spend graph A's probe without a read
+        Step(gpu, xa, wa, readAfterBackward: false, out _);
+        // Graph B's first run is its own probe: the read after backward succeeds.
+        Step(gpu, xb, wb, readAfterBackward: true, out var read);
+        Assert.NotNull(read);
+        if (read is not null) Assert.Equal(Sigmoid(xb.ToArray()), read, new FloatTolerance(1e-5f));
+    }
+
+    [SkippableFact]
+    public void A_checkpoint_segments_parameter_gradient_survives_its_step_scope()
+    {
+        // A checkpoint segment's backward writes the gradient of w, which is not among that step's inputs. The step
+        // scope kept only the inputs' gradients and freed the rest, leaving a released buffer in grads[w].
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var hostX = Input(25);
+        var hostW = Input(26);
+        (float[] Dx, float[] Dw) Run(IEngine engine, Tensor<float> x, Tensor<float> w)
+        {
+            using var tape = new GradientTape<float>(engine is CpuEngine ? null : OptIn);
+            var stem = engine.Sigmoid(x);
+            var segmentOut = GradientCheckpointing<float>.CheckpointSegments(
+                new Func<Tensor<float>, Tensor<float>>[] { t => engine.TensorMultiply(t, w), t => engine.Sigmoid(t) },
+                stem,
+                segmentParameters: new System.Collections.Generic.IReadOnlyList<Tensor<float>>[] { new[] { w } },
+                segmentSize: 2);
+            var loss = engine.ReduceSum(engine.TensorMultiply(segmentOut, w), null);
+            var grads = tape.ComputeGradients(loss, new[] { x, w });
+            return (grads[x].ToArray(), grads[w].ToArray());
+        }
+        var truth = Run(new CpuEngine(), hostX, hostW);
+        var gx = gpu.UploadToGpu(hostX, GpuTensorRole.General);
+        var gw = gpu.UploadToGpu(hostW, GpuTensorRole.General);
+        for (int run = 0; run < 3; run++)   // the probe run and two that free at last use
+        {
+            var got = Run(gpu, gx, gw);
+            Assert.Equal(truth.Dw, got.Dw, new FloatTolerance(1e-4f));
+            Assert.Equal(truth.Dx, got.Dx, new FloatTolerance(1e-4f));
+        }
     }
 
     [SkippableFact]

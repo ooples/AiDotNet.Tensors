@@ -21,13 +21,21 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// output read after that graph's own next backward run, or through a path that bypasses the engine's buffer lookup)
 /// throws the precise <see cref="LastUseReleaseNote"/> error, which names the producer and the Retain call to add.</para>
 /// </summary>
+/// <remarks>
+/// Producer keys and graph signatures are compared by value (<see cref="ProducerKey"/>, <see cref="GraphSignature"/>):
+/// a hash alone let two different graphs share a signature, so one graph's probe was spent on another.
+/// </remarks>
 internal static class AutoRetainProbe
 {
+    // One per quarantined storage, shared by every quarantine of that storage that is open: the same storage can be
+    // freed under two producer keys in one window (a view's producer and its base's), and a read of it must keep it for
+    // all of them. A per-entry probe rebound the storage to the newest key, so the older entry still released storage
+    // that had been read.
     private sealed class Probe
     {
-        internal readonly long Key;
+        internal readonly List<object> Keys = new();   // under s_lock
+        internal int OpenQuarantines;                  // under s_lock
         internal volatile bool Hit;
-        internal Probe(long key) => Key = key;
     }
 
     // Weak: a quarantine must not keep a storage its owner dropped (that one goes back to the collector's reclaim).
@@ -49,10 +57,11 @@ internal static class AutoRetainProbe
         internal bool IsAlive => Vector.TryGetTarget(out _);
     }
 
-    private static readonly ConcurrentDictionary<long, byte> s_retained = new();
-    private static readonly HashSet<long> s_probedGraphs = new();
+    // Keyed by value (ProducerKey / GraphSignature implement equality).
+    private static readonly ConcurrentDictionary<object, byte> s_retained = new();
+    private static readonly HashSet<object> s_probedGraphs = new();
     private static readonly ConditionalWeakTable<object, Probe> s_quarantined = new();
-    private static readonly Dictionary<long, List<Quarantined>> s_windows = new();   // per graph signature
+    private static readonly Dictionary<object, List<Quarantined>> s_windows = new();   // per graph signature
     private static readonly object s_lock = new();
     private static volatile bool s_active;
 
@@ -60,10 +69,10 @@ internal static class AutoRetainProbe
     internal static bool Active => s_active;
 
     /// <summary>Whether a probe saw this producer's output read after backward.</summary>
-    internal static bool IsRetained(long key) => !s_retained.IsEmpty && s_retained.ContainsKey(key);
+    internal static bool IsRetained(object key) => !s_retained.IsEmpty && s_retained.ContainsKey(key);
 
     /// <summary>Retains a producer whose released output something tried to read.</summary>
-    internal static void Retain(long key) => s_retained.TryAdd(key, 0);
+    internal static void Retain(object key) => s_retained.TryAdd(key, 0);
 
     /// <summary>Producers retained so far (tests and diagnostics).</summary>
     internal static int RetainedCount => s_retained.Count;
@@ -79,8 +88,9 @@ internal static class AutoRetainProbe
     /// what nothing read), drops quarantined storages of other graphs that nothing holds any more, and returns true the
     /// first time this graph runs backward: that run probes instead of freeing.
     /// </summary>
-    internal static bool BeginRun(long graphSignature)
+    internal static bool BeginRun(object graphSignature)
     {
+        if (graphSignature is null) throw new ArgumentNullException(nameof(graphSignature));
         List<Quarantined>? closing = null;
         bool probe;
         lock (s_lock)
@@ -88,13 +98,18 @@ internal static class AutoRetainProbe
             if (s_windows.Count != 0)
             {
                 if (s_windows.TryGetValue(graphSignature, out closing)) s_windows.Remove(graphSignature);
-                List<long>? empty = null;
+                List<object>? empty = null;
                 foreach (var pair in s_windows)
                 {
-                    pair.Value.RemoveAll(q => !q.IsAlive);
-                    if (pair.Value.Count == 0) (empty ??= new List<long>()).Add(pair.Key);
+                    var dead = pair.Value.FindAll(q => !q.IsAlive);
+                    if (dead.Count != 0)
+                    {
+                        Forget(dead);
+                        pair.Value.RemoveAll(q => !q.IsAlive);
+                    }
+                    if (pair.Value.Count == 0) (empty ??= new List<object>()).Add(pair.Key);
                 }
-                if (empty is not null) foreach (long key in empty) s_windows.Remove(key);
+                if (empty is not null) foreach (var key in empty) s_windows.Remove(key);
                 if (closing is not null) Forget(closing);
                 s_active = s_windows.Count != 0;
             }
@@ -125,11 +140,16 @@ internal static class AutoRetainProbe
     /// Keeps a storage the probe run of <paramref name="graphSignature"/> would free until that graph's next backward
     /// run; <paramref name="release"/> frees it then unless something read it.
     /// </summary>
-    internal static void Quarantine(long graphSignature, object vector, object? array, long key, Action release)
+    internal static void Quarantine(object graphSignature, object vector, object? array, object key, Action release)
     {
-        var probe = new Probe(key);
+        if (graphSignature is null) throw new ArgumentNullException(nameof(graphSignature));
+        if (key is null) throw new ArgumentNullException(nameof(key));
         lock (s_lock)
         {
+            // A storage already quarantined shares its probe: a read keeps it for every key it is quarantined under.
+            if (!s_quarantined.TryGetValue(vector, out var probe)
+                && !(array is not null && s_quarantined.TryGetValue(array, out probe)))
+                probe = new Probe();
             s_quarantined.Remove(vector);
             s_quarantined.Add(vector, probe);
             if (array is not null)
@@ -137,6 +157,9 @@ internal static class AutoRetainProbe
                 s_quarantined.Remove(array);
                 s_quarantined.Add(array, probe);
             }
+            probe.Keys.Add(key);
+            probe.OpenQuarantines++;
+            if (probe.Hit) s_retained.TryAdd(key, 0);   // already read after this backward: keep it under this key too
             if (!s_windows.TryGetValue(graphSignature, out var window))
                 s_windows.Add(graphSignature, window = new List<Quarantined>());
             window.Add(new Quarantined(probe, vector, array, release));
@@ -144,23 +167,30 @@ internal static class AutoRetainProbe
         }
     }
 
-    /// <summary>A storage is being read (device lookup or host download): if quarantined, retain its producer.</summary>
+    /// <summary>A storage is being read (device lookup or host download): if quarantined, retain its producers.</summary>
     internal static void NoteAccess(object key)
     {
-        if (s_quarantined.TryGetValue(key, out var probe) && !probe.Hit)
+        if (!s_quarantined.TryGetValue(key, out var probe) || probe.Hit) return;
+        lock (s_lock)
         {
+            if (probe.Hit) return;
             probe.Hit = true;
-            s_retained.TryAdd(probe.Key, 0);
+            foreach (var producer in probe.Keys) s_retained.TryAdd(producer, 0);
         }
     }
 
-    // Under s_lock.
+    // Under s_lock. A storage's mapping goes only when no open quarantine shares its probe any more.
     private static void Forget(List<Quarantined> window)
     {
         foreach (var q in window)
         {
-            if (q.Vector.TryGetTarget(out var vector)) s_quarantined.Remove(vector);
-            if (q.Array is not null && q.Array.TryGetTarget(out var array)) s_quarantined.Remove(array);
+            if (--q.Probe.OpenQuarantines > 0) continue;
+            if (q.Vector.TryGetTarget(out var vector)
+                && s_quarantined.TryGetValue(vector, out var mapped) && ReferenceEquals(mapped, q.Probe))
+                s_quarantined.Remove(vector);
+            if (q.Array is not null && q.Array.TryGetTarget(out var array)
+                && s_quarantined.TryGetValue(array, out var mappedArray) && ReferenceEquals(mappedArray, q.Probe))
+                s_quarantined.Remove(array);
         }
     }
 
