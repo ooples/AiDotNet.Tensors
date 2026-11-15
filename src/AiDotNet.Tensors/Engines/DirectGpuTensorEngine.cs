@@ -19495,6 +19495,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         internal IGpuBuffer? Buffer;
         internal int Capacity;
+        // The host staging for this slot's uploads, exactly Capacity long: one array shared by every lookup outlived a
+        // larger lookup, and its full length was more than a smaller lookup's buffer holds, so the upload threw.
+        internal int[] Host = System.Array.Empty<int>();
         internal System.Action? Refresh;
     }
 
@@ -19504,7 +19507,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private readonly List<WeakReference<EmbeddingIndexSlot>> _embIndexSlotList = new();
     private readonly object _embIndexLock = new();
 
-    private int[]? _embIndexScratch;             // host int[] scratch for TIndex→int conversion (long/int tokens)
 
     /// <summary>The index slot of the lookup identified by <paramref name="lookupKey"/>, created on first use.</summary>
     /// <param name="lookupKey">An object the forward and the backward of one lookup both hold, and no other lookup
@@ -19575,6 +19577,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend)) return;
         var slot = GetEmbeddingIndexSlot(lookupKey);
         IGpuBuffer target;
+        int[] host;
         lock (_embIndexLock)
         {
             if (slot.Buffer is null || slot.Capacity < n)
@@ -19582,18 +19585,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 slot.Buffer?.Dispose();
                 slot.Buffer = backend.AllocateIntBuffer(n);
                 slot.Capacity = n;
+                slot.Host = new int[n];
             }
             target = slot.Buffer;
+            host = slot.Host;
         }
-        if (_embIndexScratch is null || _embIndexScratch.Length < n) _embIndexScratch = new int[n];
         using var rawLease = indices.LeaseArray();
         var raw = rawLease.Array;
         // Typed fast paths avoid boxing every token each step (Convert.ToInt32((object)x) on ~B*ctx elements
         // per step is heavy GC pressure). Token indices are int or long in practice.
-        if (raw is int[] ir) System.Array.Copy(ir, _embIndexScratch, n);
-        else if (raw is long[] lr) { for (int i = 0; i < n; i++) _embIndexScratch[i] = (int)lr[i]; }
-        else { for (int i = 0; i < n; i++) _embIndexScratch[i] = System.Convert.ToInt32((object)raw[i]!); }
-        backend.UploadIntBufferInPlace(_embIndexScratch, target);
+        if (raw is int[] ir) System.Array.Copy(ir, host, n);
+        else if (raw is long[] lr) { for (int i = 0; i < n; i++) host[i] = (int)lr[i]; }
+        else { for (int i = 0; i < n; i++) host[i] = System.Convert.ToInt32((object)raw[i]!); }
+        backend.UploadIntBufferInPlace(host, target);
     }
 
     /// <summary>On-device embedding gather straight into the output's GPU buffer — CUDA-graph-CAPTURABLE. Resolves

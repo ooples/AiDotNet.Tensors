@@ -683,6 +683,28 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The host staging array was shared by every lookup and only grew: after a larger lookup it was longer than a
+    /// smaller lookup's index buffer, and uploading it whole threw.
+    /// </summary>
+    [SkippableFact]
+    public void A_smaller_embedding_lookup_after_a_larger_one_uploads_its_indices()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            var larger = new Tensor<int>(new[] { 0, 1, 2, 3, 4, 5, 6, 7 }, new[] { 8 });
+            var smaller = new Tensor<int>(new[] { 2, 0, 1 }, new[] { 3 });
+            object largerKey = new object(), smallerKey = new object();
+            gpu.UploadEmbeddingIndices(larger, 8, largerKey);
+            gpu.UploadEmbeddingIndices(smaller, 3, smallerKey);
+            var slot = gpu.GetEmbeddingIndexSlot(smallerKey);
+            Assert.Equal(3, slot.Capacity);
+            Assert.Equal(new[] { 2, 0, 1 }, slot.Host);
+            GC.KeepAlive(largerKey);
+        }
+    }
+
     private static (double[] Losses, float[][] Weights, bool Replayed, float[][] Gathered) TrainTwoEmbeddings(IEngine engine, bool capture, bool floatIndices)
     {
         const int vocab = 40;
