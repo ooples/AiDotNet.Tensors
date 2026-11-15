@@ -67,11 +67,11 @@ public class ClosureObjectiveHostLossTests
         var x = Filled(5, 6, 2);
         var parameters = new[] { w };
 
-        // No tape: the custom backward is not even recorded; the loss is still a host value no traced op produced.
+        // No tape: the custom backward is not even recorded. The read of the traced product is the first refusal.
         var (guard, reason) = CompileGuarded(() => HostLoss(engine, x, w), parameters);
         _out.WriteLine(reason);
         Assert.Null(guard);
-        Assert.Contains("loss is not computed by a traced op", reason);
+        Assert.Contains("reads 'TensorMatMul' on the host while it is traced", reason);
 
         // Under a tape (an eager training step around the trace): the custom record itself is named.
         using (new GradientTape<float>())
@@ -81,6 +81,25 @@ public class ClosureObjectiveHostLossTests
             Assert.Null(guard);
             Assert.Contains("records 'HostSquaredSum' on the gradient tape", reason);
         }
+    }
+
+    // EmformerRNNT's shape: the host loss feeds a traced op (a mean over rows), so the loss is a traced node's output,
+    // but that node's only input is a host leaf.
+    [Fact]
+    public void Traced_scaling_of_a_host_loss_records_no_guard()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(6, 4, 7);
+        var parameters = new[] { w };
+        var host = new Tensor<float>(new[] { 1 });
+        host[0] = 3f;
+        var (guard, reason) = CompileGuarded(() => engine.TensorMultiplyScalar(host, 0.5f), parameters);
+        Assert.Null(guard);
+        Assert.Contains("reaches no trained parameter", reason);
+
+        // The same through a view of the parameter does reach it.
+        (guard, reason) = CompileGuarded(() => engine.ReduceSum(engine.Reshape(w, new[] { 24 })), parameters);
+        Assert.True(guard is not null, reason);
     }
 
     [Fact]
@@ -131,5 +150,27 @@ public class ClosureObjectiveHostLossTests
             }, parameters);
             Assert.True(guard is not null, reason);
         }
+    }
+
+    // Ops that compute values at trace time (CPU LayerNorm runs its forward as it records, reading its traced input)
+    // are not host reads by the objective: a probe of the same objective traces from shapes alone.
+    [Fact]
+    public void LayerNorm_over_a_traced_input_still_records_a_guard()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(6, 8, 9);
+        var x = Filled(5, 6, 10);
+        var gamma = new Tensor<float>(new[] { 8 });
+        var beta = new Tensor<float>(new[] { 8 });
+        for (int i = 0; i < 8; i++) gamma[i] = 1f;
+        var parameters = new[] { w, gamma, beta };
+        Func<Tensor<float>> objective = () =>
+        {
+            var y = engine.LayerNorm(engine.TensorMatMul(x, w), gamma, beta, 1e-5, out _, out _);
+            return engine.ReduceSum(engine.TensorMultiply(y, y));
+        };
+        var (guard, reason) = CompileGuarded(objective, parameters);
+        Assert.True(guard is not null, reason);
+        Assert.Equal(ClosureGuardResult.Matched, guard!.TryRebind(objective, parameters, out _));
     }
 }

@@ -80,15 +80,21 @@ public partial class CpuEngine
                 }
             },
             LayerNormBackwardCompiledFloat, new object[] { stats, shape });
-        // Values at trace time too, as the generic node had: code between ops may read them.
-        if (!probe) Forward(result);
+        // Values at trace time too, as the generic node had: code between ops may read them. Computed outside the
+        // trace, so reading the traced input here is the op's own work, not a host read by the objective.
+        if (!probe)
+            using (GraphMode.SuspendRecording())
+                Forward(result);
         mean = meanT;
         variance = varT;
         return result;
     }
 
+    // An unrealized traced value is checked from its layout alone: fetching its backing would compute it mid-trace.
     private static bool IsZeroOffsetContiguous(Tensor<float> t) =>
-        t.IsContiguous && t.GetCpuBackingForStridedRead(out int off) is not null && off == 0;
+        t.IsContiguous && (t.LazySource is { IsRealized: false }
+            ? t.StorageOffset == 0
+            : t.GetCpuBackingForStridedRead(out int off) is not null && off == 0);
 
     /// <summary>
     /// The per-row mean and variance a compiled LayerNorm node writes in its forward and reads in its backward: this

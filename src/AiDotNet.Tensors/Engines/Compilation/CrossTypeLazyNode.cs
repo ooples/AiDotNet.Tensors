@@ -89,6 +89,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     {
         if (IsRealized) return;
         if (GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
+        if (GraphMode.Current is { IsProbe: false, TraceKind: GraphTraceKind.Training } tracing) tracing.HostReadOp ??= OpName;
         IsRealized = true; // Set BEFORE executing to prevent re-entrant recursion
 
         // Issue #238: the Execute delegate re-invokes the engine op (e.g.,

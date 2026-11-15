@@ -100,6 +100,11 @@ internal sealed class ClosureObjectiveGuard<T>
             recording.Reason = signature.UnsignableReason;
             return;
         }
+        if (DisconnectedReason(scope, explicitLoss, parameters) is { } disconnected)
+        {
+            recording.Reason = disconnected;
+            return;
+        }
 
         recording.Guard = new ClosureObjectiveGuard<T>(signature, leaves);
         recording.Reason = null;
@@ -215,6 +220,11 @@ internal sealed class ClosureObjectiveGuard<T>
                 return ClosureGuardResult.Unsignable;
             }
             signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves);
+            if (signature.Signable && DisconnectedReason(scope, loss, parameters) is { } disconnected)
+            {
+                reason = disconnected;
+                return ClosureGuardResult.Unsignable;
+            }
         }
         catch (ObjectiveProbeAbortedException ex)
         {
@@ -248,11 +258,55 @@ internal sealed class ClosureObjectiveGuard<T>
     {
         if (scope.TapeRecordedOp is { } op)
             return $"the objective records '{op}' on the gradient tape, outside the trace (a custom backward a plan cannot replay)";
+        if (scope.HostReadOp is { } read)
+            return $"the objective reads '{read}' on the host while it is traced";
         if (loss is null) return null;
+        bool traced = false;
         if (loss.LazySource is { } source)
             foreach (var node in scope.Nodes)
-                if (ReferenceEquals(node, source)) return null;
-        return "the objective's loss is not computed by a traced op (a value computed on the host, say)";
+                if (ReferenceEquals(node, source)) { traced = true; break; }
+        return traced ? null : "the objective's loss is not computed by a traced op (a value computed on the host, say)";
+    }
+
+    /// <summary>Why a signable trace still cannot train: its loss reaches no parameter; null when it does.</summary>
+    private static string? DisconnectedReason(LazyTensorScope scope, Tensor<T>? loss, Tensor<T>[] parameters)
+        => loss is not null && parameters.Length > 0 && !ReachesParameter(scope.Nodes, loss, parameters)
+            ? "the objective's loss reaches no trained parameter through traced ops (a loss computed on the host and then scaled, say)"
+            : null;
+
+    /// <summary>
+    /// Whether <paramref name="loss"/> depends on any of <paramref name="parameters"/> through the traced nodes: a walk
+    /// from the loss back through each node's inputs, where an input that shares a parameter's storage (the parameter
+    /// or a view of it) is a hit, and an input no node produced is a leaf.
+    /// </summary>
+    private static bool ReachesParameter(IReadOnlyList<ILazyNode> nodes, Tensor<T> loss, Tensor<T>[] parameters)
+    {
+        var paramStorage = new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+        foreach (var p in parameters)
+            if (p is ISignatureTensor st) paramStorage.Add(st.SignatureStorageIdentity);
+        // Every node that writes a tensor (an in-place op writes one an earlier node produced): all are its producers.
+        var producerOf = new Dictionary<object, List<ISignableLazyNode>>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+        foreach (var node in nodes)
+            if (node is ISignableLazyNode signable)
+            {
+                if (!producerOf.TryGetValue(signable.OutputTensor, out var writers))
+                    producerOf[signable.OutputTensor] = writers = new List<ISignableLazyNode>(1);
+                writers.Add(signable);
+            }
+        var visited = new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+        var pending = new Stack<object>();
+        pending.Push(loss);
+        while (pending.Count > 0)
+        {
+            var t = pending.Pop();
+            if (!visited.Add(t)) continue;
+            if (t is ISignatureTensor st && paramStorage.Contains(st.SignatureStorageIdentity)) return true;
+            if (!producerOf.TryGetValue(t, out var producers)) continue;
+            foreach (var producer in producers)
+                for (int i = 0; i < producer.SignatureInputCount; i++)
+                    if (producer.GetSignatureInput(i) is { } input) pending.Push(input);
+        }
+        return false;
     }
 
     private sealed class Recording : IDisposable
