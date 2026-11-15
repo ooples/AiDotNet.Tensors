@@ -184,6 +184,7 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
     {
         if (IsRealized) return;
         if (GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
+        if (GraphMode.Current is { IsProbe: false, TraceKind: GraphTraceKind.Training } tracing) tracing.HostReadOp ??= OpName;
 
         // Mark as realized BEFORE executing to prevent re-entrant auto-materialization.
         // The output tensor's AsSpan()/AsWritableSpan() checks LazySource.IsRealized —

@@ -41,7 +41,10 @@ public partial class CpuEngine
                 }
             },
             ReduceMeanBackwardCompiledFloat, new object[] { shape });
-        ReduceMeanForwardFloat(input, result, shape);   // values at trace time, as the generic node had
+        // Values at trace time, as the generic node had; outside the trace, so reading the traced input is the op's
+        // own work, not a host read by the objective.
+        using (GraphMode.SuspendRecording())
+            ReduceMeanForwardFloat(input, result, shape);
         return result;
     }
 

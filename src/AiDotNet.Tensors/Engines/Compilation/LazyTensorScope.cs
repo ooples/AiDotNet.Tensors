@@ -477,6 +477,13 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal string? TapeRecordedOp { get; set; }
 
+    /// <summary>
+    /// The first traced op whose output was computed while this training scope was still tracing (a host read such as
+    /// <c>ToArray()</c> of a traced value), or null. A probe of the same objective aborts at that read, so a closure
+    /// objective that does this is unsignable (<see cref="ClosureObjectiveGuard{T}"/>).
+    /// </summary>
+    internal string? HostReadOp { get; set; }
+
     // Process-wide, so record order also holds between nodes of nested or successive traces.
     private static long s_recordOrder;
 
