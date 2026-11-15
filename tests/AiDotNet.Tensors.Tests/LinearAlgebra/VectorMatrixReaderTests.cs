@@ -18,6 +18,18 @@ public class VectorMatrixReaderTests
 
     private static Matrix<double> M(double[,] values) => new Matrix<double>(values);
 
+    [Fact]
+    public void GetSubVector_EmptySliceAtTheEnd_IsValid_AndPastTheEndThrows()
+    {
+        // "Everything after the first" on a one-element vector is the empty slice at index Length, as
+        // VectorBase.GetSubVector and Span.Slice allow; Vector<T> used to reject it.
+        var single = V(4);
+        Assert.Empty(single.GetSubVector(1, single.Length - 1).ToArray());
+        Assert.Empty(((VectorBase<double>)single).GetSubVector(1, 0).ToArray());
+        Assert.Throws<ArgumentOutOfRangeException>(() => single.GetSubVector(2, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => single.GetSubVector(1, 1));
+    }
+
     private static double[] Flat(MatrixBase<double> m)
     {
         var flat = new double[m.Rows * m.Columns];
