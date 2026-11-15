@@ -48,10 +48,15 @@ public class DepthwiseConv2DBatchNormTests
     [MemberData(nameof(Shapes))]
     public void EqualsDepthwiseThenBatchNorm_BitForBit(int batch, int channels, int size, int stride, bool channelBlocks)
     {
+#if NET5_0_OR_GREATER
         int previousMaxWidth = DepthwiseConv3x3.s_channelBlockMaxWidth;
         int previousMaxWidth1 = DepthwiseConv3x3.s_channelBlockMaxWidthStride1;
         DepthwiseConv3x3.s_channelBlockMaxWidth = channelBlocks ? int.MaxValue : 0;
         DepthwiseConv3x3.s_channelBlockMaxWidthStride1 = channelBlocks ? int.MaxValue : 0;
+#else
+        // The channel-blocked AVX2 kernels exist only on .NET 5+; here both cases run the scalar path.
+        _ = channelBlocks;
+#endif
         try
         {
             var engine = new CpuEngine();
@@ -71,17 +76,21 @@ public class DepthwiseConv2DBatchNormTests
                     .ToArray();
                 Assert.Equal(expected.Length, actual.Length);
                 for (int i = 0; i < expected.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i])
+                    Assert.True(Bits(expected[i]) == Bits(actual[i])
                         || (float.IsNaN(expected[i]) && float.IsNaN(actual[i])),
                         $"{activation} [{i}]: unfused {expected[i]}, fused {actual[i]}");
             }
         }
         finally
         {
+#if NET5_0_OR_GREATER
             DepthwiseConv3x3.s_channelBlockMaxWidth = previousMaxWidth;
             DepthwiseConv3x3.s_channelBlockMaxWidthStride1 = previousMaxWidth1;
+#endif
         }
     }
+
+    private static int Bits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
 
     [Fact]
     public void UnderATape_RecordsTheUnfusedOps()
