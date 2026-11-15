@@ -3847,6 +3847,64 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         lock (gpuEngine.CompiledStepLock) return StepLocked();
     }
 
+    /// <summary>
+    /// Runs only this plan's optimizer update, with its L2 term and gradient clipping, on gradients computed outside it,
+    /// for a step the plan cannot replay (an objective that reads its own forward on the host that step). The optimizer
+    /// state (moments, step count, schedule position) stays in the plan, so the run continues as an eager optimizer
+    /// that saw the same gradients would, and later steps replay the plan again. A trained parameter with no entry in
+    /// <paramref name="gradients"/> gets a zero gradient, as one the plan's backward does not reach does. False when no
+    /// optimizer is configured.
+    /// </summary>
+    /// <param name="gradients">Each trained parameter's gradient, keyed by the parameter tensor (by reference).</param>
+    internal bool TryApplyGradients(IReadOnlyDictionary<Tensor<T>, Tensor<T>> gradients)
+    {
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (_optimizerUpdate is null) return false;
+        var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
+        gpuEngine?.NoteCompiledStepThread(_planId);
+        if (gpuEngine is null) return ApplyGradientsLocked(gradients);
+        lock (gpuEngine.CompiledStepLock) return ApplyGradientsLocked(gradients);
+    }
+
+    private bool ApplyGradientsLocked(IReadOnlyDictionary<Tensor<T>, Tensor<T>> gradients)
+    {
+        ResolvePingPongClaims(force: false);
+        lock (_stepSync)
+        {
+            UploadHostWrittenParameters();
+            using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
+            using var graphModeSuspension = GraphMode.SuspendRecording();
+            for (int p = 0; p < _gradients.Length; p++)
+            {
+                var slot = _gradients[p];
+                if (slot is null) continue;
+                var values = new T[slot.Length];
+                if (gradients.TryGetValue(_parameters[p], out var gradient) && gradient is not null)
+                {
+                    if (gradient.Length != slot.Length)
+                        throw new ArgumentException(
+                            $"Parameter {p}'s gradient has {gradient.Length} elements; the parameter has {slot.Length}.",
+                            nameof(gradients));
+                    gradient.CopyLogicalTo(values);
+                }
+                slot.CopyFromArray(values);
+                // After a device step the optimizer reads the gradient's device buffer (and a host array it bound
+                // before that buffer took over), not the host copy just written: put the same values there and mark it
+                // current, so both copies hold this step's gradient.
+                if (typeof(T) == typeof(float) && slot._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero
+                    && slot._gpuBackend is { } backend && buffer.Size >= slot.Length && slot.IsContiguous)
+                {
+                    backend.UploadBufferInPlace((float[])(object)values, buffer);
+                    slot._gpuBufferVersion = slot.GpuCacheVersion;
+                }
+            }
+            RegularizeAndClipGradients();
+            CommitHostOptimizerGradients();
+            InvokeOptimizerUpdate();
+        }
+        return true;
+    }
+
     private Tensor<T> StepLocked()
     {
         ResolvePingPongClaims(force: false);
