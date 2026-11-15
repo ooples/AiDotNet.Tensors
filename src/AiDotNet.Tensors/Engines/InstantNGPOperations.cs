@@ -24,8 +24,13 @@ public static class InstantNGPOperations
     // The largest grid scale a level may have, so that every grid coordinate is an exact float and fits in an int.
     internal const float MaxGridScale = 16777216f;
 
-    // Positions are clamped to [0, PositionClampMax] before scaling, on every backend.
-    internal const float PositionClampMax = 0.999999f;
+    // Positions are clamped to [0, PositionClampMax] before scaling, on every backend, and NaN maps to 0. tiny-cuda-nn's
+    // kernel_grid does not clamp at all (encodings/grid.h passes positions_in straight to pos_fract), so the clamp is the
+    // closed unit cube: identical to tiny-cuda-nn on its whole domain [0, 1], and well defined outside it.
+    internal const float PositionClampMax = 1f;
+
+    // The relative distance within which N_min * b^l counts as the integer the paper's real arithmetic gives.
+    private const double PaperIntegerTolerance = 1e-9;
 
     /// <summary>One level's grid: <c>pos = x * Scale + PositionOffset</c>, with <c>GridResolution</c> vertices per axis.</summary>
     internal readonly struct HashGridLevel
@@ -48,7 +53,7 @@ public static class InstantNGPOperations
     /// Performs the multiresolution hash encoding of Instant-NGP (Müller et al. 2022), matching tiny-cuda-nn's
     /// GridEncoding with a hash grid, three input dimensions and linear interpolation.
     /// </summary>
-    /// <param name="positions">Positions <c>[N, 3]</c> in the unit cube; each coordinate is clamped to [0, 0.999999].</param>
+    /// <param name="positions">Positions <c>[N, 3]</c> in the unit cube; each coordinate is clamped to [0, 1], NaN to 0.</param>
     /// <param name="hashTables">One table <c>[T_l, featuresPerLevel]</c> per level, coarsest first.</param>
     /// <param name="baseResolution">N_min, the coarsest level's resolution (tiny-cuda-nn's <c>base_resolution</c>).</param>
     /// <param name="perLevelScale">b, the growth factor between levels (tiny-cuda-nn's <c>per_level_scale</c>), at least 1.</param>
@@ -231,19 +236,28 @@ public static class InstantNGPOperations
             case HashGridAlignment.TinyCudaNn:
             {
                 // grid_scale: exp2f(level * log2_per_level_scale) * base_resolution - 1.0f, all fp32, with the
-                // multiply-subtract contracted to an fma as nvcc does by default. The double product of two floats
-                // is exact, so one rounding to float reproduces the fma.
-                float log2PerLevelScale = (float)(Math.Log(perLevelScale) / Math.Log(2.0));
-                float exponent = (float)(level * log2PerLevelScale);
+                // multiply-subtract contracted to an fma as nvcc does by default. GridEncodingTemplated stores
+                // per_level_scale as a float (m_per_level_scale) and passes std::log2 of that float, so b is rounded
+                // to fp32 before the logarithm.
+                float perLevelScaleF = (float)perLevelScale;
+                float log2PerLevelScale = (float)(Math.Log(perLevelScaleF) / Math.Log(2.0));
+                float exponent = (float)level * log2PerLevelScale;
                 float levelScale = (float)Math.Pow(2.0, exponent);
-                scale = (float)((double)levelScale * baseResolution - 1.0);
+                scale = FusedMultiplyAdd(levelScale, (float)baseResolution, -1f);
                 positionOffset = 0.5f;
                 break;
             }
             case HashGridAlignment.Paper:
-                scale = (float)Math.Floor(baseResolution * Math.Pow(perLevelScale, level));
+            {
+                // Eq. 2, N_l = floor(N_min * b^l), is real arithmetic: with b from eq. 3, N_min * b^l is an integer at
+                // some levels (N_{L-1} = N_max), and double rounding can put it just below that integer. Within
+                // rounding error of an integer it is that integer; otherwise it is floored.
+                double cells = baseResolution * Math.Pow(perLevelScale, level);
+                double nearest = Math.Round(cells);
+                scale = (float)(Math.Abs(cells - nearest) <= PaperIntegerTolerance * nearest ? nearest : Math.Floor(cells));
                 positionOffset = 0f;
                 break;
+            }
             default:
                 throw new ArgumentOutOfRangeException(nameof(alignment), alignment, "Unknown hash-grid alignment.");
         }
@@ -296,11 +310,39 @@ public static class InstantNGPOperations
     internal static void HashGridAxis(float coordinate, HashGridLevel level, out uint cell, out float fraction)
     {
         float x = !(coordinate > 0f) ? 0f : (coordinate >= PositionClampMax ? PositionClampMax : coordinate);
-        // The double product of two floats is exact, so one rounding to float matches fmaf.
-        float position = (float)((double)level.Scale * x + level.PositionOffset);
+        float position = FusedMultiplyAdd(level.Scale, x, level.PositionOffset);
         float floor = (float)Math.Floor(position);
         cell = (uint)(int)floor;
         fraction = (float)(position - floor);
+    }
+
+    /// <summary>
+    /// <c>fmaf(a, b, c)</c>: <c>a * b + c</c> rounded once to fp32, as tiny-cuda-nn, the NVRTC kernels and PTX
+    /// <c>fma.rn.f32</c> compute it. Rounding <c>a * b + c</c> to double first and then to float is not enough: the
+    /// double sum is inexact once <c>a * b</c> is small next to <c>c</c>, and can land on a float tie the exact value is not on.
+    /// </summary>
+    internal static float FusedMultiplyAdd(float a, float b, float c)
+    {
+#if NETCOREAPP3_0_OR_GREATER
+        return MathF.FusedMultiplyAdd(a, b, c);
+#else
+        double product = (double)a * b;   // exact: two 24-bit significands
+        double sum = product + c;
+        // TwoSum (Knuth): sum + error == product + c exactly.
+        double virtualC = sum - product;
+        double error = (product - (sum - virtualC)) + (c - virtualC);
+        double rounded = (float)sum;
+        if (error != 0.0 && rounded != sum)
+        {
+            // Rounding sum to float is wrong only when sum is exactly halfway between two floats; the error then says
+            // which side the exact value is on. The other float is 2*sum - rounded, exact in double for a midpoint.
+            double other = 2.0 * sum - rounded;
+            if ((double)(float)other == other)
+                return (float)((error > 0.0) == (other > rounded) ? other : rounded);
+        }
+
+        return (float)rounded;
+#endif
     }
 
     /// <summary>

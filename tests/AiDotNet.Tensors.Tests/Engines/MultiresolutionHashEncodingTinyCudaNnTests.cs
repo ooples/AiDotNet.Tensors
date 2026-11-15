@@ -105,6 +105,72 @@ public class MultiresolutionHashEncodingTinyCudaNnTests
         Assert.Equal(23, paper.GridResolution);
     }
 
+    [Theory]
+    // tiny-cuda-nn keeps per_level_scale as a float (encodings/grid.h m_per_level_scale) and passes log2f of it, so
+    // grid_scale is exp2f(l * log2f((float)b)) * N_min - 1. Taking log2 of the double b gives 0.33333334 instead of
+    // 0.33333337 for b = 2^(1/3), hence scale 31 and R = 32 at level 3, and 29.554932 at level 2 of b = 128^(1/15).
+    [InlineData(3, 16, 1.2599210498948732, 31.0000038f, 33)]
+    [InlineData(2, 16, 1.3819128799677762, 29.5549297f, 31)]
+    public void LevelGeometry_TakesLog2OfTheFloatPerLevelScale(
+        int level, int baseResolution, double perLevelScale, float expectedScale, int expectedResolution)
+    {
+        var grid = InstantNGPOperations.ComputeHashGridLevel(level, baseResolution, perLevelScale, HashGridAlignment.TinyCudaNn);
+
+        Assert.True(grid.Scale == expectedScale, $"scale {grid.Scale:R}, tiny-cuda-nn {expectedScale:R}");
+        Assert.Equal(expectedResolution, grid.GridResolution);
+    }
+
+    [Fact]
+    public void PaperAlignment_GivesTheIntegerLevelThatRealArithmeticGives()
+    {
+        // b = exp(ln(4096 / 32) / 7) evaluates to 1.9999999999999998, so N_min * b^l falls just below 64, 128, ...
+        // 4096 in double; eq. 2's floor of the real product is the integer itself (N_{L-1} = N_max).
+        const double b = 1.9999999999999998;
+        Assert.True(32 * b < 64);
+        var level1 = InstantNGPOperations.ComputeHashGridLevel(1, 32, b, HashGridAlignment.Paper);
+        Assert.Equal(64f, level1.Scale);
+        Assert.Equal(65, level1.GridResolution);
+        Assert.Equal(4096f, InstantNGPOperations.ComputeHashGridLevel(7, 32, b, HashGridAlignment.Paper).Scale);
+
+        // N_min = 16, N_max = 4096, L = 16: the finest level is N_max.
+        double b16 = Math.Exp(Math.Log(4096.0 / 16.0) / 15.0);
+        Assert.Equal(4096f, InstantNGPOperations.ComputeHashGridLevel(15, 16, b16, HashGridAlignment.Paper).Scale);
+
+        // A level that is not an integer is still floored: 16 * 1.3819 = 22.1104.
+        Assert.Equal(22f, InstantNGPOperations.ComputeHashGridLevel(1, 16, 1.3819, HashGridAlignment.Paper).Scale);
+    }
+
+    [Theory]
+    // fmaf(scale, x, 0.5f), rounded once. (float)((double)scale * x + 0.5) double-rounds these to 0.501644254,
+    // 0.501079798 and 0.50147903: the double sum is inexact and lands on a float tie the exact value is not on.
+    [InlineData(16.0008984f, 0.000102761951f, 0.501644313f)]
+    [InlineData(16.0011921f, 6.74804687e-05f, 0.501079738f)]
+    [InlineData(16.0013943f, 9.24294363e-05f, 0.50147897f)]
+    public void GridPosition_IsOneFusedMultiplyAdd(float scale, float x, float expectedFraction)
+    {
+        Assert.True(InstantNGPOperations.FusedMultiplyAdd(scale, x, 0.5f) == expectedFraction);
+
+        InstantNGPOperations.HashGridAxis(x, new InstantNGPOperations.HashGridLevel(scale, 0.5f, 18), out uint cell, out float fraction);
+
+        Assert.Equal(0u, cell);
+        Assert.True(fraction == expectedFraction, $"fraction {fraction:R}, fmaf {expectedFraction:R}");
+    }
+
+    [Fact]
+    public void FarFace_IsEncodedAsTinyCudaNnDoes_WithoutPullingXBelowOne()
+    {
+        // tiny-cuda-nn's kernel_grid does not clamp: x = 1 on scale 4 is pos = 4.5, cell 4, fraction exactly 0.5, so every
+        // corner weighs 1/8. Clamping x to 0.999999 gave fraction 0.4999959 and weights 0.1250031 / 0.1249969.
+        // Corners (4|5)^3 of the dense 5^3 grid, x + 5y + 25z mod 128, in tiny-cuda-nn's corner order.
+        var positions = new Tensor<float>(new[] { 1f, 1f, 1f }, new[] { 1, 3 });
+        var table = OneHotCornerTable(128, new[] { 124, 125, 1, 2, 21, 22, 26, 27 });
+
+        var weights = new CpuEngine().MultiresolutionHashEncoding(positions, new[] { table }, 5, 2.0, 8).ToArray();
+
+        for (int c = 0; c < 8; c++)
+            Assert.True(Math.Abs(0.125 - weights[c]) < 1e-9, $"corner {c}: expected 0.125, got {weights[c]:R}");
+    }
+
     // One feature per corner: feature c is 1 only at corner c's entry, so output c is corner c's trilinear weight.
     private static Tensor<float> OneHotCornerTable(int tableSize, int[] cornerEntries)
     {
