@@ -221,4 +221,62 @@ public class ClosureObjectiveHostLossTests
         var (guard, reason) = CompileGuarded(objective, parameters);
         Assert.True(guard is not null, reason);
     }
+
+    // The Conformer-transducer family's LSTM: the compiled LstmSequenceTrain node keeps its training workspace (the
+    // transposed weights, gates and states its forward rewrites every step) in its closure. That is scratch, not
+    // configuration: the objective was declined as holding "a LstmTrainWorkspace, whose value cannot be compared".
+    [Fact]
+    public void Lstm_training_workspace_is_scratch_to_the_signature()
+    {
+        var engine = new CpuEngine();
+        int batch = 2, seq = 3, inF = 4, hidden = 5;
+        var x = Filled(batch * seq, inF, 15);
+        var proj = Filled(inF, inF, 16);
+        var wIh = Filled(4 * hidden, inF, 17);
+        var wHh = Filled(4 * hidden, hidden, 18);
+        var bIh = new Tensor<float>(new[] { 4 * hidden });
+        var bHh = new Tensor<float>(new[] { 4 * hidden });
+        var parameters = new[] { proj, wIh, wHh, bIh, bHh };
+        Func<Tensor<float>> objective = () =>
+        {
+            var input = engine.Reshape(engine.TensorMatMul(x, proj), new[] { batch, seq, inF });
+            var h = engine.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSequences: true);
+            return engine.ReduceSum(engine.TensorMultiply(h, h), null);
+        };
+        var (guard, reason) = CompileGuarded(objective, parameters);
+        Assert.True(guard is not null, reason);
+        var result = guard!.TryRebind(objective, parameters, out _);
+        Assert.True(result == ClosureGuardResult.Matched, guard.LastReason);
+    }
+
+    // An op that computes from its operands while it records (TensorMaskedFill and the rest of TryRecordCompiledOp)
+    // clears the ambient scope first, which hid the probe from the abort check: the probe then executed the upstream
+    // LayerNorm node on shape-only stand-ins and threw IndexOutOfRangeException from its kernel. A probe value is never
+    // computed, so the probe must abort as a read of that node instead.
+    [Fact]
+    public void A_probe_never_executes_a_node_an_eager_recorder_reads()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(6, 8, 19);
+        var x = Filled(5, 6, 20);
+        var gamma = new Tensor<float>(new[] { 8 });
+        var beta = new Tensor<float>(new[] { 8 });
+        for (int i = 0; i < 8; i++) gamma[i] = 1f;
+        var mask = new bool[5 * 8];
+        for (int i = 0; i < mask.Length; i += 3) mask[i] = true;
+        var parameters = new[] { w, gamma, beta };
+        Func<Tensor<float>> objective = () =>
+        {
+            var y = engine.LayerNorm(engine.TensorMatMul(x, w), gamma, beta, 1e-5, out _, out _);
+            var masked = engine.TensorMaskedFill(y, mask, 0f);
+            return engine.ReduceSum(engine.TensorMultiply(masked, masked), null);
+        };
+        var (guard, reason) = CompileGuarded(objective, parameters);
+        Assert.True(guard is not null, reason);
+        var result = guard!.TryRebind(objective, parameters, out _);
+        _out.WriteLine($"{result}: {guard.LastReason}");
+        Assert.NotEqual(ClosureGuardResult.Matched, result);
+        Assert.DoesNotContain("IndexOutOfRange", guard.LastReason ?? "");
+        Assert.Contains("LayerNorm", guard.LastReason ?? "");
+    }
 }

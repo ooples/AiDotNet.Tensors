@@ -92,6 +92,9 @@ internal sealed class LazyNode<T> : ILazyNode, ISignableLazyNode
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
+    /// <inheritdoc />
+    public bool RecordedInProbe { get; set; }
+
     /// <summary>Creates a unary lazy node (one input).</summary>
     public LazyNode(
         LazyNodeType opType,
@@ -178,7 +181,7 @@ internal sealed class LazyNode<T> : ILazyNode, ISignableLazyNode
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
-        if (GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
+        if (RecordedInProbe || GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
         if (GraphMode.Current is { IsProbe: false, TraceKind: GraphTraceKind.Training } tracing) tracing.HostReadOp ??= OpName;
 
         // Mark as realized BEFORE executing to prevent re-entrant auto-materialization.

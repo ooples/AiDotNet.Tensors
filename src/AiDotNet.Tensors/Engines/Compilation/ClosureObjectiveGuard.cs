@@ -236,7 +236,7 @@ internal sealed class ClosureObjectiveGuard<T>
             // An op that cannot trace without data (or the objective's own failure, which the eager step will
             // surface): either way this step cannot replay a plan.
             // Name where it threw: an op that indexes a value the storage-free probe never computes shows up here.
-            var site = ex.TargetSite is { } method ? $" in {method.DeclaringType?.Name}.{method.Name}" : "";
+            var site = ThrowSite(ex) is { } method ? $" in {method.DeclaringType?.Name}.{method.Name}" : "";
             reason = $"the objective could not be probed ({ex.GetType().Name}{site}: {ex.Message})";
             return ClosureGuardResult.Aborted;
         }
@@ -328,5 +328,18 @@ internal sealed class ClosureObjectiveGuard<T>
             _disposed = true;
             if (ReferenceEquals(_recording, this)) _recording = _parent;
         }
+    }
+
+    // The innermost frame outside the BCL: TargetSite is often a throw helper (ThrowHelpers.ThrowIndexOutOfRange...).
+    private static System.Reflection.MethodBase? ThrowSite(Exception ex)
+    {
+        var frames = new System.Diagnostics.StackTrace(ex, false).GetFrames();
+        if (frames is not null)
+            foreach (var frame in frames)
+                if (frame?.GetMethod() is { DeclaringType: { } type } method
+                    && type.Assembly != typeof(object).Assembly
+                    && !(type.Namespace ?? "").StartsWith("System", StringComparison.Ordinal))
+                    return method;
+        return ex.TargetSite;
     }
 }

@@ -47,6 +47,9 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
+    /// <inheritdoc />
+    public bool RecordedInProbe { get; set; }
+
     public readonly Tensor<TIn> Input;
     public readonly Tensor<TOut> Output;
     public readonly Action<IEngine, Tensor<TOut>> Execute;
@@ -88,7 +91,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
-        if (GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
+        if (RecordedInProbe || GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
         if (GraphMode.Current is { IsProbe: false, TraceKind: GraphTraceKind.Training } tracing) tracing.HostReadOp ??= OpName;
         IsRealized = true; // Set BEFORE executing to prevent re-entrant recursion
 

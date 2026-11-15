@@ -479,6 +479,7 @@ internal sealed class LazyTensorScope : IDisposable
         node.AddStorageLeases(_storageLeases);
         node.RecordingEngine = _engine;
         node.RecordOrder = System.Threading.Interlocked.Increment(ref s_recordOrder);
+        if (_isProbe && node is ISignableLazyNode signable) signable.RecordedInProbe = true;
         _nodes.Add(node);
     }
 

@@ -22,6 +22,12 @@ internal interface ISignableLazyNode : ILazyNode
     Delegate? BackwardDelegate { get; }
     object[]? SavedStateObjects { get; }
     bool ReplaysHostStateFlag { get; }
+
+    /// <summary>
+    /// Set when a probe trace recorded the node: its inputs and output are shape-only stand-ins, so realizing it
+    /// aborts the probe even where an engine op has cleared the ambient scope to compute eagerly.
+    /// </summary>
+    bool RecordedInProbe { get; set; }
 }
 
 /// <summary>
