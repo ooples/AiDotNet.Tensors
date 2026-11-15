@@ -335,6 +335,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // Forward outputs sharing arrays by forward liveness (PoolForwardOnlyOutputs).
     private int _pooledForwardOutputs;
+    private HashSet<Tensor<T>> _retainedOutputs = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
     /// <summary>Test hook: how many forward-only outputs share arrays under forward-output pooling.</summary>
     internal int PooledForwardOutputCount => _pooledForwardOutputs;
@@ -3936,7 +3937,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             ClearPlanBufferReleaseMarks();
             UploadHostWrittenParameters();
-            return StepCore();
+            var loss = StepCore();
+            // Graph replay runs no host code: re-arm declared outputs without downloading any activations.
+            if (_retainedOutputs.Count > 0 && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var outputEngine))
+                foreach (var output in _retainedOutputs)
+                    if (output._gpuBuffer is { } buffer && output._gpuBackend is { } backend)
+                        outputEngine.BindResidentBuffer(output, buffer, backend);
+            return loss;
         }
     }
 
@@ -4805,7 +4812,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// step of each forward action and the last reading action per step (-1 where none qualifies), or null.
     /// </summary>
     private static (int[] StepOfAction, int[] ReleaseAfter)? ForwardSpanLeasePlan(List<CompiledStep<T>> forwardSteps,
-        ForwardEmit[] emitKinds, Tensor<T>[] parameters, Tensor<T> lossOutput)
+        ForwardEmit[] emitKinds, Tensor<T>[] parameters, Tensor<T> lossOutput, HashSet<Tensor<T>> retainedOutputs)
     {
         // Tiny outputs stay kept: leasing them saves little and costs per-step bookkeeping.
         const int MinLeasedLength = 1 << 10;
@@ -4821,6 +4828,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var readers = new Dictionary<Tensor<T>, List<int>>(comparer);
         var producers = new Dictionary<Tensor<T>, int>(comparer);
         var unsafeTensors = new HashSet<Tensor<T>>(parameters, comparer) { lossOutput };
+        unsafeTensors.UnionWith(retainedOutputs);
         for (int i = 0; i < n; i++)
         {
             var step = forwardSteps[i];
@@ -5750,7 +5758,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // activation it was written into, and is recomputed next step: it is unbound whatever was released, as the
         // graph step does. In-place state keeps the only current value on the device; the loss was materialized.
         if (_forwardSteps != null)
-            foreach (var step in _forwardSteps.Where(s => !ReferenceEquals(s.OutputBuffer, _lossGradDest) && !IsInPlaceState(s)))
+            foreach (var step in _forwardSteps.Where(s => !ReferenceEquals(s.OutputBuffer, _lossGradDest) && !IsInPlaceState(s) && !_retainedOutputs.Contains(s.OutputBuffer)))
                 DetachDeviceBinding(step.OutputBuffer);
         if (released.Count == 0) return;
         // Everything else by device handle: a binding can be a different buffer object over the same memory.
@@ -5799,6 +5807,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 AddActivationCacheKeys(protect, entry);
         AddActivationCacheKeys(protect, _lossGradDest);
         AddActivationCacheKeys(protect, _lossGradSeed);
+        foreach (var output in _retainedOutputs) AddActivationCacheKeys(protect, output);
         // State an in-place step updates on the device lives across steps.
         if (_forwardSteps != null)
             foreach (var step in _forwardSteps.Where(s => IsInPlaceState(s))) AddActivationCacheKeys(protect, step.OutputBuffer);
@@ -9605,7 +9614,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? lastRecorded.Output
             : null;
 
-        var compiler = new LazyGraphCompiler(forTraining: true);
+        var retainedOutputs = scope.RetainedOutputClosure<T>();
+        var observableNodes = new HashSet<ILazyNode>(scope.Nodes.OfType<LazyNode<T>>()
+            .Where(node => retainedOutputs.Contains(node.Output)));
+        var compiler = new LazyGraphCompiler(forTraining: true, observableOutputs: observableNodes);
         var optimized = compiler.Compile(scope.Nodes);
 
         // Collect all forward steps
@@ -9673,6 +9685,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             if (hasFp16Nodes) fp16HeteroOrder = System.Linq.Enumerable.ToArray(optimized);
         }
+        if (retainedOutputs.Count > 0 && fp16HeteroOrder is not null)
+            throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
+
 
         // Map each tensor to its consumer count (how many backward steps write to it)
         var consumerCount = new Dictionary<Tensor<T>, int>();
@@ -9686,6 +9701,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     consumerCount[inp] = 1;
             }
         }
+        // External readers block forward fusion without changing gradient-writer counts.
+        var fusionConsumerCount = new Dictionary<Tensor<T>, int>(consumerCount);
+        foreach (var output in retainedOutputs)
+            fusionConsumerCount[output] = fusionConsumerCount.TryGetValue(output, out int readers) ? readers + 1 : 1;
 
         // Consumers that can write a tensor's gradient: steps with no backward (a training BatchNorm's batch-statistic
         // nodes, which read its output only to order themselves after it) write none. Only the backward's overwrite-or-
@@ -9743,7 +9762,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (useGradPool)
         {
             gradPoolReZeroByPosition = BuildPooledGradMap(allTensors, forwardSteps, parameters,
-                consumerCount, engine, gradMap, allGrads,
+                fusionConsumerCount, engine, gradMap, allGrads,
                 out decidedFusedSteps, out decidedSkippableReduceSum);
         }
         else
@@ -9818,7 +9837,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion
             && !preferGenericForGpu)
         {
-            TryFuseForwardBackward(forwardSteps, gradMap, consumerCount, engine,
+            TryFuseForwardBackward(forwardSteps, gradMap, fusionConsumerCount, engine,
                 fusedForwardActions, fusedBackwardActions, fusedStepIndices);
         }
 
@@ -9863,7 +9882,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // for it, incl. its skippable-ReduceSum, in the action coverage).
         if (typeof(T) == typeof(float) && !preferGenericForGpu)
         {
-            DetectAnalyticLossMatMulBackward(forwardSteps, consumerCount, gradMap,
+            DetectAnalyticLossMatMulBackward(forwardSteps, fusionConsumerCount, gradMap,
                 analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs,
                 skippableReduceSumForwardIndices, sharedRowSumCache, fusedStepIndices);
         }
@@ -9891,7 +9910,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (typeof(T) == typeof(float) && !useGradPool
             && Environment.GetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION") == "1")
         {
-            DetectMatMulSlicePrefixFusion(forwardSteps, consumerCount, gradMap,
+            DetectMatMulSlicePrefixFusion(forwardSteps, fusionConsumerCount, gradMap,
                 slicePrefixForwardSpecs, slicePrefixBackwardSpecs, consumedBySlicePrefix);
         }
 
@@ -9940,7 +9959,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (aliasedReshapeSteps is not null)
                 for (int stepIndex = 0; stepIndex < forwardSteps.Count; stepIndex++)
                     if (aliasedReshapeSteps.Contains(forwardSteps[stepIndex])) claimedElsewhere.Add(stepIndex);
-            DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap, requiresGradTensors,
+            DetectConvBiasActivationFusion(forwardSteps, fusionConsumerCount, gradMap, requiresGradTensors,
                 convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue, convEpilogueChains,
                 convEpilogueDeadInternals, claimedElsewhere);
         }
@@ -9960,7 +9979,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             fusedAway.UnionWith(analyticForwardSpecs.Keys);
             fusedAway.UnionWith(slicePrefixForwardSpecs.Keys);
             pooledForwardOutputs = PoolForwardOnlyOutputs(forwardSteps, parameters, explicitLoss, fusedAway,
-                consumedByConvEpilogue, convEpilogueChains);
+                consumedByConvEpilogue, convEpilogueChains, retainedOutputs);
         }
 
         // Track GCHandles for cleanup on Dispose
@@ -10593,6 +10612,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (fp16HeteroOrder is null)
                 plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
                     parameters, lossOutput);
+            plan._retainedOutputs = retainedOutputs;
+            if (plan._lastBackwardReads is { } lastReads)
+                foreach (var output in retainedOutputs) lastReads.Remove(output);
             plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
@@ -10613,7 +10635,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
             plan._pooledForwardOutputs = pooledForwardOutputs;
             if (typeof(T) == typeof(float) && engine.SupportsGpu && fp16HeteroOrder is null
-                && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput) is { } spans)
+                && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput, retainedOutputs) is { } spans)
             {
                 plan._spanStepOfAction = spans.StepOfAction;
                 plan._spanReleaseAfter = spans.ReleaseAfter;
@@ -10641,7 +10663,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private static int PoolForwardOnlyOutputs(List<CompiledStep<T>> forwardSteps, Tensor<T>[] parameters,
         Tensor<T>? explicitLoss, HashSet<int> fusedAway, HashSet<int> consumedByConvEpilogue,
-        Dictionary<int, int[]> convEpilogueChains)
+        Dictionary<int, int[]> convEpilogueChains, HashSet<Tensor<T>> retainedOutputs)
     {
         const int MinPooledLength = 1 << 16;
         int n = forwardSteps.Count;
@@ -10666,6 +10688,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var readers = new Dictionary<Tensor<T>, List<int>>(tensorComparer);
         var producers = new Dictionary<Tensor<T>, int>(tensorComparer);
         var unsafeTensors = new HashSet<Tensor<T>>(parameters, tensorComparer);
+        unsafeTensors.UnionWith(retainedOutputs);
         if (explicitLoss is not null) unsafeTensors.Add(explicitLoss);
         var storageUsers = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
         var seen = new HashSet<Tensor<T>>(tensorComparer);

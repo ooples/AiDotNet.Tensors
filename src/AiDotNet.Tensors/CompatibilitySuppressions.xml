@@ -1275,20 +1275,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.InstantNGPOperations.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
     <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
@@ -1457,20 +1443,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.InstantNGPOperations.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
     <Left>lib/net462/AiDotNet.Tensors.dll</Left>
     <Right>lib/net462/AiDotNet.Tensors.dll</Right>
@@ -1625,20 +1597,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.InstantNGPOperations.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
     <Left>lib/net471/AiDotNet.Tensors.dll</Left>
     <Right>lib/net471/AiDotNet.Tensors.dll</Right>
@@ -1787,20 +1745,6 @@
   <Suppression>
     <DiagnosticId>CP0002</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.CpuEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -1969,20 +1913,6 @@
   <Suppression>
     <DiagnosticId>CP0002</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.CpuEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncoding``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0002</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.DirectGpuTensorEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32[],System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>

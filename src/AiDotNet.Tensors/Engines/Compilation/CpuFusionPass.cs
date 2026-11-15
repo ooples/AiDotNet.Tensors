@@ -32,12 +32,18 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
     public string Name => "CpuFusion";
 
     private readonly bool _forTraining;
+    private readonly HashSet<ILazyNode>? _observableOutputs;
 
     /// <param name="forTraining">True when compiling a TRAINING plan: inference-only patterns (whose fused node has
     /// no backward) are skipped, so the matched ops keep their backward steps. Measured before this: a matmul by a
     /// sparse constant selection matrix was rewritten to FusedSparseLinear inside a training plan and every gradient
     /// upstream of it came out exactly zero (the compiled HRE attention never trained its Q/K/V projections).</param>
-    public CpuFusionPass(bool forTraining = false) => _forTraining = forTraining;
+    /// <param name="observableOutputs">Nodes whose outputs must remain independently observable after execution.</param>
+    public CpuFusionPass(bool forTraining = false, HashSet<ILazyNode>? observableOutputs = null)
+    {
+        _forTraining = forTraining;
+        _observableOutputs = observableOutputs;
+    }
 
     public List<ILazyNode> Run(List<ILazyNode> nodes)
     {
@@ -58,7 +64,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
         // readers, and a fused node that replaced one (recorded at order 0, so it resolved the target's producer to the
         // later write) ran after the write and read the updated value. Patterns skip every node in the set they are
         // handed, so the blocked nodes start in it and are told apart from fused-away ones below.
-        var blocked = new HashSet<ILazyNode>();
+        var blocked = _observableOutputs is null ? new HashSet<ILazyNode>() : new HashSet<ILazyNode>(_observableOutputs);
         foreach (var node in nodes)
         {
             // Already run (a nested scope's write realized it as its earlier reader): a fused replacement would be a new,

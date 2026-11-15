@@ -74,6 +74,54 @@ internal sealed class LazyTensorScope : IDisposable
         return true;
     }
 
+    private readonly HashSet<object> _retainedOutputs = new(ReferenceEqualityComparer<object>.Instance);
+
+    /// <summary>Declares an observable output while the forward is still being recorded.</summary>
+    internal void RetainOutput<T>(Tensor<T> output)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(LazyTensorScope));
+        if (_realized) throw new InvalidOperationException("Outputs must be retained before the trace is compiled or realized.");
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (_traceKind == GraphTraceKind.Inference)
+            throw new InvalidOperationException("RetainOutput requires a training trace.");
+        if (!_nodes.OfType<LazyNode<T>>().Any(node => ReferenceEquals(node.Output, output)))
+            throw new ArgumentException("The retained output must be produced by the active training trace.", nameof(output));
+        _retainedOutputs.Add(output);
+    }
+
+    /// <summary>
+    /// Outputs and their storage aliases whose values must survive the step. Shape/view operations can borrow their
+    /// input's device buffer even when their lazy output has separate storage during tracing, so close over both sides.
+    /// This changes lifetime only; the existing recorded in-place read/write ordering remains authoritative.
+    /// </summary>
+    internal HashSet<Tensor<T>> RetainedOutputClosure<T>()
+    {
+        var retained = new HashSet<Tensor<T>>(_retainedOutputs.OfType<Tensor<T>>(), ReferenceEqualityComparer<Tensor<T>>.Instance);
+        if (retained.Count != _retainedOutputs.Count)
+            throw new NotSupportedException("Retained outputs must have the compiled training plan's element type.");
+        if (retained.Count == 0) return retained;
+        var nodes = _nodes.OfType<LazyNode<T>>().ToArray();
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var node in nodes)
+            {
+                var inputs = node.GetInputsArray();
+                bool view = node.OpType is LazyNodeType.Reshape or LazyNodeType.Transpose
+                    or LazyNodeType.TensorPermute or LazyNodeType.Slice or LazyNodeType.Expand
+                    || node.OpName is "StopGradient" or "TensorStopGradient";
+                if (retained.Contains(node.Output) && view)
+                    foreach (var input in inputs) changed |= retained.Add(input);
+                if ((view && inputs.Any(retained.Contains))
+                    || retained.Any(output => ReferenceEquals(output._storage, node.Output._storage)))
+                    changed |= retained.Add(node.Output);
+            }
+        } while (changed);
+        return retained;
+    }
+
+
     /// <summary>Number of lazy operations recorded.</summary>
     internal int NodeCount => _nodes.Count;
 

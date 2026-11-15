@@ -7017,9 +7017,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={idxBuf.Size} impliedV={tableBuf.Size/embeddingDim}");
             backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
-            output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.GpuCacheVersion;
-            var oArr = output.GetBackingArrayForCacheLookupUnsafe();
-            if (oArr is not null && s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[oArr] = s_currentForwardOp;
+            // A device write must re-arm host synchronization as well as publishing its resident buffer.
+            BindResidentBuffer(output, outBuf, backend);
             return true;
         }
         catch (NotSupportedException eex) { GpuLaunchProbe.OnFallback("TryEmbeddingFromFloatIndicesResidentInto", eex); AliasDiag($"EmbFloat-resident FELLBACK n={numIndices} dim={embeddingDim}: {eex.GetType().Name}: {eex.Message}"); return false; }

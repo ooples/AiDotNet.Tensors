@@ -754,6 +754,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             var xa = floatIndices ? engine.TensorEmbeddingLookupFromFloatIndices(tableA, floatIdsA) : engine.TensorEmbeddingLookup<float, int>(tableA, idsA);
             var xb = floatIndices ? engine.TensorEmbeddingLookupFromFloatIndices(tableB, floatIdsB) : engine.TensorEmbeddingLookup<float, int>(tableB, idsB);
             gatheredA = xa;
+            AiDotNet.Tensors.Engines.Autodiff.GradientRecording.RetainOutput(xa);
             var x = engine.TensorAdd(xa, xb);
             var h = engine.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
             var pred = engine.FusedLinear(h, w2, b2, FusedActivationType.None);

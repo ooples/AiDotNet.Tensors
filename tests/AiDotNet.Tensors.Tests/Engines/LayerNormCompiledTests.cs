@@ -14,6 +14,57 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// </summary>
 public class LayerNormCompiledTests
 {
+    [Fact]
+    public void RecordingFloat_DefersForwardUntilAStatisticIsRead() => CheckDeferredStatistics<float>();
+
+    [Fact]
+    public void RecordingDouble_DefersForwardUntilAStatisticIsRead() => CheckDeferredStatistics<double>();
+
+    private static void CheckDeferredStatistics<T>()
+    {
+        T V(double value) => (T)Convert.ChangeType(value, typeof(T));
+        var engine = new CpuEngine();
+        var input = new Tensor<T>(new[] { V(1), V(3), V(5), V(9) }, new[] { 2, 2 });
+        var gamma = new Tensor<T>(new[] { V(1), V(1) }, new[] { 2 });
+        var beta = new Tensor<T>(new[] { V(0), V(0) }, new[] { 2 });
+        using var scope = GraphMode.Enable();
+        var upstream = engine.TensorAdd(input, input);
+        var result = engine.LayerNorm(upstream, gamma, beta, 1e-5, out var mean, out var variance);
+        Assert.False(upstream.LazySource!.IsRealized);
+        Assert.False(result.LazySource!.IsRealized);
+        Assert.False(mean.LazySource!.IsRealized);
+        Assert.False(variance.LazySource!.IsRealized);
+        // Out statistics are a real API: a host read must trigger their producer, rather than return zeros.
+        Assert.Equal(new[] { V(4), V(14) }, mean.ToArray());
+        Assert.Equal(new[] { V(4), V(16) }, variance.ToArray());
+        Assert.True(result.LazySource!.IsRealized);
+    }
+
+    [Fact]
+    public void CompiledDouble_StatisticConsumersObserveEachReplay()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { 1d, 3d, 5d, 9d }, new[] { 2, 2 });
+        var gamma = new Tensor<double>(new[] { 1d, 1d }, new[] { 2 });
+        var beta = new Tensor<double>(new[] { 0d, 0d }, new[] { 2 });
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var output = engine.LayerNorm(input, gamma, beta, 1e-5, out var mean, out var variance);
+            var loss = engine.TensorAdd(engine.ReduceSum(output, null),
+                engine.ReduceSum(engine.TensorAdd(mean, variance), null));
+            plan = scope.CompileTraining(new[] { input, gamma, beta }, loss);
+        }
+        using (plan)
+        {
+            Assert.Equal(14d, plan.Step().ToArray()[0], 10);
+            input.AsWritableSpan()[0] = 5d;
+            Assert.Equal(16d, plan.Step().ToArray()[0], 10);
+            // Statistics are detached outputs; the differentiable normalization still trains beta.
+            Assert.Equal(new[] { 2d, 2d }, plan.Gradients[2].ToArray());
+        }
+    }
+
     public static TheoryData<int[], int[]> Shapes => new()
     {
         // input shape, gamma shape
