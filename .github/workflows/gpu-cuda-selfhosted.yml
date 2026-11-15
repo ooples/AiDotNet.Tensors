@@ -140,6 +140,7 @@ jobs:
         FullyQualifiedName~Engines.DirectGpu|
         FullyQualifiedName~Engines.Autodiff|
         FullyQualifiedName~Engines.Compilation|
+        FullyQualifiedName~.BatchNormAffineFoldTests.|
           FullyQualifiedName~.ConvTransposeOutputPaddingBackwardTests.|
         FullyQualifiedName~Parity|
         FullyQualifiedName~GruSequence|
