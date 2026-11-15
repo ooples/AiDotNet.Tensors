@@ -250,6 +250,7 @@ public sealed partial class CudaBackend
 
     private void RunConvVariantIncumbent(in CudaConvVariantArgs a)
     {
+        if (TryTransposeAsConvolution(a)) return;
         switch (a.Variant)
         {
             case DeclaredConvVariant.DepthwiseForward:
@@ -281,6 +282,51 @@ public sealed partial class CudaBackend
                 break;
         }
     }
+
+    // A transposed convolution is the adjoint of an ordinary one: with the transposed output (outC channels,
+    // outH x outW) as that convolution's input, the transposed forward is its data gradient, the transposed data
+    // gradient its forward, and the transposed weight gradient its weight gradient with the operands traded. The
+    // [inC, outC, kH, kW] transposed kernel is already that convolution's [O, I, kH, kW] filter. Routing through the
+    // convolution entry points reaches their tuned slots (cuDNN, the TF32 implicit-GEMM tiles); the hand-written
+    // transposed kernels are one thread per output element with a gather over every input channel, which measured
+    // ~9 ms per sample on the 64x64 DCGAN generator (RTX 1000 Ada). False when the geometry is not that adjoint
+    // (an output padding the forward convolution cannot reproduce, a degenerate batch), leaving the incumbent.
+    private bool TryTransposeAsConvolution(in CudaConvVariantArgs a)
+    {
+        if (a.Variant is not (DeclaredConvVariant.TransposeForward or DeclaredConvVariant.TransposeBackwardData
+                or DeclaredConvVariant.TransposeBackwardWeights))
+            return false;
+        if (s_transposeAsConvDisabled || a.Batch <= 0 || a.StrideH <= 0 || a.StrideW <= 0) return false;
+        // The forward convolution from the transposed output must land exactly on the transposed input.
+        if ((a.OutHeight + 2 * a.PadH - a.KernelH) / a.StrideH + 1 != a.InHeight ||
+            (a.OutWidth + 2 * a.PadW - a.KernelW) / a.StrideW + 1 != a.InWidth ||
+            a.OutHeight + 2 * a.PadH < a.KernelH || a.OutWidth + 2 * a.PadW < a.KernelW)
+            return false;
+        switch (a.Variant)
+        {
+            case DeclaredConvVariant.TransposeForward:
+                // A = transposed input x [B, inC, H, W] (the convolution's output gradient), Output = y.
+                Conv2DBackwardInput(a.A, a.B, a.Output, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth,
+                    a.InChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
+                    1, 1);
+                return true;
+            case DeclaredConvVariant.TransposeBackwardData:
+                // A = dy [B, outC, outH, outW] (the convolution's input), Output = dx.
+                Conv2D(a.A, a.B, a.Output, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth,
+                    a.InChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
+                    1, 1);
+                return true;
+            default:
+                // A = x (the convolution's output gradient), B = dy (its input), Output = dW [inC, outC, kH, kW].
+                Conv2DBackwardKernel(a.B, a.A, a.Output, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth,
+                    a.InChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
+                    1, 1);
+                return true;
+        }
+    }
+
+    private static readonly bool s_transposeAsConvDisabled =
+        Environment.GetEnvironmentVariable("AIDOTNET_TRANSPOSE_AS_CONV") == "0";
 
     public void DepthwiseConv2D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
