@@ -1156,6 +1156,10 @@ public sealed class GradientTape<T> : IDisposable
             foreach (var tensor in EntryTensors()) forwardKept.Add(tensor.StorageIdentity);
         }
         bool outerReleaseScope = ReleaseScope.Enter(freeAtLastUse);
+        // The backward's temporaries never reach the caller, so the owned arena's escape quarantine skips them
+        // (TensorArena: a forward output kept past the tape must not be pooled while the caller still reads it).
+        var watchArena = _ownedArena;
+        watchArena?.SuspendEscapeWatch();
         try
         {
             grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
@@ -1165,6 +1169,7 @@ public sealed class GradientTape<T> : IDisposable
             // Consumed whether the walk finished or threw: steps before a failing one may already have freed what a
             // retry would read.
             if (consumesGraph) _freedDeviceActivationsAtLastUse = true;
+            watchArena?.ResumeEscapeWatch();
             ReleaseScope.Exit(outerReleaseScope);
             // Whether or not this backward used it, the forward is over: stop recording rentals into it.
             _activationLogArena?.TakeForwardActivationLog();
@@ -1262,7 +1267,13 @@ public sealed class GradientTape<T> : IDisposable
         var held = root._handedToCaller ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         held.Add(tensor);
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (array is not null) held.Add(array);
+        if (array is not null)
+        {
+            held.Add(array);
+            // A tape-owned arena keeps this buffer out of its pool until the caller drops the result, not just for
+            // one step: a gradient or loss kept across later tapes must keep its values (TensorArena's quarantine).
+            if (!root._options.ReleaseResultsAtDispose) root._ownedArena?.WatchIssued(array, tensor, tensor._storage);
+        }
     }
 
     // Activation keys of what the caller keeps past the tape (loss, returned gradients, Retain), owned by the

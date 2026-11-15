@@ -27,6 +27,10 @@ public sealed class ConvShortcutPairPlanTests : IClassFixture<DirectGpuTensorEng
         _out = output;
     }
 
+    // The pair kernel accumulates in fp32; the unfused plan's convolutions run TF32 by default (as PyTorch's cuDNN
+    // convolutions), ~1e-3 of the gradient scale from fp32. Strict when TF32 convolutions are off.
+    private static double Tolerance => AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 ? 2e-3 : 1e-4;
+
     private static Tensor<float> Make(int[] shape, int seed, float scale)
     {
         var rng = new Random(seed);
@@ -109,7 +113,7 @@ public sealed class ConvShortcutPairPlanTests : IClassFixture<DirectGpuTensorEng
                 {
                     double err = Math.Abs(a[i] - b[i]) / Math.Max(1e-6, scale);
                     worst = Math.Max(worst, err);
-                    Assert.True(err < 1e-4, $"step {st} {names[p]}[{i}]: unfused {a[i]} vs pair {b[i]} (max |grad| {scale})");
+                    Assert.True(err < Tolerance, $"step {st} {names[p]}[{i}]: unfused {a[i]} vs pair {b[i]} (max |grad| {scale})");
                 }
             }
         _out.WriteLine($"pair launches {onLaunches}; max |unfused - pair| / max|grad| = {worst:E2}");
@@ -220,7 +224,7 @@ public sealed class ConvShortcutPairPlanTests : IClassFixture<DirectGpuTensorEng
         foreach (var v in eager) eagerScale = Math.Max(eagerScale, Math.Abs(v));
         Assert.True(eagerScale > 0, "the eager input gradient is zero (test setup)");
         for (int i = 0; i < eager.Length; i++)
-            Assert.True(Math.Abs(eager[i] - fusedFirst[i]) / eagerScale < 1e-4,
+            Assert.True(Math.Abs(eager[i] - fusedFirst[i]) / eagerScale < Tolerance,
                 $"dX[{i}] at step one: eager {eager[i]} vs pair {fusedFirst[i]} (max |grad| {eagerScale})");
 
         Assert.Equal(0, offLaunches);
@@ -230,7 +234,7 @@ public sealed class ConvShortcutPairPlanTests : IClassFixture<DirectGpuTensorEng
         foreach (var v in unfused) scale = Math.Max(scale, Math.Abs(v));
         Assert.True(scale > 0, "the unfused input gradient is zero (test setup)");
         for (int i = 0; i < unfused.Length; i++)
-            Assert.True(Math.Abs(unfused[i] - fused[i]) / scale < 1e-4,
+            Assert.True(Math.Abs(unfused[i] - fused[i]) / scale < Tolerance,
                 $"dX[{i}]: unfused {unfused[i]} vs pair {fused[i]} (max |grad| {scale})");
     }
 }

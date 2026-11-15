@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -36,6 +37,12 @@ public sealed class TorchParityGpuCorrectnessTests : IClassFixture<GpuCpuCorrect
 
     private static float[] FlatI(Tensor<int> t) => t.ToArray().Select(v => (float)v).ToArray();
 
+    // Convolutions follow the CUDA convolution precision policy: TF32 by default, as PyTorch's cuDNN convolutions
+    // (CudaDispatchPolicy.ConvReducedPrecisionTF32), so their tolerance is the tuned slot's TF32 gate, else FP32's.
+    private const double ConvPolicy = -1;
+
+    private static double ConvTolerance => CudaDispatchPolicy.ConvReducedPrecisionTF32 ? 2e-3 : 1e-5;
+
     private static readonly Dictionary<string, (Func<IEngine, float[]> Run, double Tolerance)> Cases = new()
     {
         ["TensorArange"] = (e => Flat(e.TensorArange<float>(-1.5, 2.2, 0.5)), 0),
@@ -67,9 +74,9 @@ public sealed class TorchParityGpuCorrectnessTests : IClassFixture<GpuCpuCorrect
             W(new[] { 12 }, 7, 3, -10), ScalingRecipe.RowWise, W(new[] { 2, 4 }, 5, 2, -6), ScalingRecipe.RowWise,
             offsets: new Tensor<int>(new[] { 4, 12 }, new[] { 2 }))), 1e-5),
         ["TensorConvolution"] = (e => Flat(e.TensorConvolution(W(new[] { 1, 4, 3, 4 }, 23, 7, 11), W(new[] { 4, 3, 2, 3 }, 19, 5, 9), W(new[] { 6 }, 7, 3, 3),
-            new[] { 2, 1 }, new[] { 1, 0 }, new[] { 1, 2 }, transposed: true, outputPadding: new[] { 1, 0 }, groups: 2)), 1e-5),
+            new[] { 2, 1 }, new[] { 1, 0 }, new[] { 1, 2 }, transposed: true, outputPadding: new[] { 1, 0 }, groups: 2)), ConvPolicy),
         ["TensorConvTranspose1D"] = (e => Flat(e.TensorConvTranspose1D(W(new[] { 2, 3, 5 }, 23, 7, 11), W(new[] { 3, 2, 3 }, 19, 5, 9), 2, 1, 1)), 1e-5),
-        ["TensorConvTbc"] = (e => Flat(e.TensorConvTbc(W(new[] { 6, 2, 3 }, 23, 7, 11), W(new[] { 3, 3, 4 }, 19, 5, 9), W(new[] { 4 }, 7, 3, 3), 1)), 1e-5),
+        ["TensorConvTbc"] = (e => Flat(e.TensorConvTbc(W(new[] { 6, 2, 3 }, 23, 7, 11), W(new[] { 3, 3, 4 }, 19, 5, 9), W(new[] { 4 }, 7, 3, 3), 1)), ConvPolicy),
         ["TensorDiagonalScatter"] = (e => Flat(e.TensorDiagonalScatter(W(new[] { 3, 4 }, 13, 5, 6), W(new[] { 3 }, 7, 3, 3), 1)), 0),
         ["TensorAdaptiveAvgPool3D"] = (e => Flat(e.TensorAdaptiveAvgPool3D(W(new[] { 1, 2, 3, 4, 5 }, 127, 37, 60), new[] { 2, 3, 2 })), 1e-6),
         ["TensorAdaptiveMaxPool3D"] = (e => Flat(e.TensorAdaptiveMaxPool3D(W(new[] { 1, 2, 3, 4, 5 }, 127, 37, 60), new[] { 2, 3, 2 })), 0),
@@ -91,6 +98,7 @@ public sealed class TorchParityGpuCorrectnessTests : IClassFixture<GpuCpuCorrect
     {
         Skip.IfNot(_fixture.IsGpuReady, "No DirectGpu backend available on this system.");
         var (run, tolerance) = Cases[op];
+        if (tolerance == ConvPolicy) tolerance = ConvTolerance;
         var cpu = run(_fixture.Cpu);
         var gpu = run(_fixture.Gpu);
         Assert.Equal(cpu.Length, gpu.Length);

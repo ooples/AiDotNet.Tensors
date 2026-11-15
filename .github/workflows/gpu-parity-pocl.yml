@@ -52,15 +52,9 @@ jobs:
   gpu-parity-pocl:
     # Skip on the release-please Release PR and the release merge-commit push (mirrors build.yml).
     if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
-    # Overflow onto self-hosted Linux runners labelled `pocl`: the shards named in the repository variable
-    # POCL_SELF_HOSTED_SHARDS (comma-separated matrix names, e.g. op-forward-1,op-forward-2) run there instead of on a
-    # GitHub-hosted runner, so a queue of pull requests is not held by the hosted concurrency limit alone. Only for
-    # this repository's own branches: a fork's pull request always runs hosted (a self-hosted runner must not execute
-    # untrusted code). Clear the variable while those runners are offline, or the listed shards wait for them.
-    runs-on: >-
-      ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-          && contains(format(',{0},', vars.POCL_SELF_HOSTED_SHARDS), format(',{0},', matrix.name))
-          && fromJSON('["self-hosted","Linux","X64","pocl"]') || 'ubuntu-latest' }}
+    # POCL runs on hosted CPUs, so an offline self-hosted runner cannot strand required work.
+    # Keep every shard scheduled; device initialization and parity checks still fail on errors.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:

@@ -46068,7 +46068,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Applies activation through the engine's recorded activation methods (tape-aware).
     /// Uses ActivationRegistry dispatch — no switch statement, open/closed compliant.
     /// </summary>
-    private Tensor<T> ApplyActivationRecorded<T>(Tensor<T> tensor, FusedActivationType activation)
+    private protected Tensor<T> ApplyActivationRecorded<T>(Tensor<T> tensor, FusedActivationType activation)
     {
         var handler = ActivationRegistry.Get(activation);
         if (handler is null) return tensor;

@@ -917,6 +917,27 @@ extern ""C"" __global__ __launch_bounds__(256) void batchnorm_tanh(
     output[idx] = tanhf(x);
 }
 
+// Fused BatchNorm + ReLU6 (Inference): MobileNetV2's depthwise stage, whose batch norm cannot fold into the
+// convolution before it. Without it the activation ran on the host (a download, a scalar loop and an upload per call).
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_relu6(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ runningMean,
+    const float* __restrict__ runningVar,
+    int batch, int channels, int spatialSize, float epsilon)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalSize = batch * channels * spatialSize;
+    if (idx >= totalSize) return;
+
+    int c = (idx / spatialSize) % channels;
+    float invStd = rsqrtf(runningVar[c] + epsilon);
+    float x = gamma[c] * ((input[idx] - runningMean[c]) * invStd) + beta[c];
+    output[idx] = fminf(fmaxf(x, 0.0f), 6.0f);
+}
+
 // Fused Residual + BatchNorm + ReLU
 extern ""C"" __global__ __launch_bounds__(256) void residual_batchnorm_relu(
     const float* __restrict__ input,
@@ -1155,6 +1176,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_variance_kernel_deter
                 "batchnorm_gelu",
                 "batchnorm_sigmoid",
                 "batchnorm_tanh",
+                "batchnorm_relu6",
                 "residual_batchnorm_relu",
                 "lerp_fused",
                 "add_scaled",

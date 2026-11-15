@@ -70,6 +70,7 @@ public sealed partial class CudaBackend
         Release(ref _winogradWm);
         Release(ref _winogradWu);
         Release(ref _winogradWv);
+        DisposeBatchNormScratch();
     }
 
     private bool ConvGemmUsable()

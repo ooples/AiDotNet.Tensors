@@ -21,7 +21,9 @@ internal static class CudaConvWinogradKernels
     /// <c>wino_gemm_body&lt;BM, BN&gt;</c>, with no <c>extern "C"</c> entry point: every Winograd module (this one, and any
     /// other tile size) prepends it and instantiates its own entry points, so there is one GEMM definition.
     /// </summary>
-    public const string WinogradGemmCore = CudaConvolutionKernels.ConvEngineCore + @"
+    public static string WinogradGemmCore => CudaConvolutionKernels.ConvEngineCore + WinogradGemmTemplate;
+
+    private const string WinogradGemmTemplate = @"
 
 // Batched GEMM on the engine main loop: Cm[x][s] = A[x] (M x Kd, row-major) * B[x] (Kd x Nc, row-major) over the
 // reduction slice s of kPerSplit, x = blockIdx.z / splits, s = blockIdx.z % splits. One split: the plain batched GEMM.

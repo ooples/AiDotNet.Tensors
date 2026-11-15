@@ -24,8 +24,8 @@ name: GPU (CUDA, self-hosted)
 # pull request labelled `skip-gpu-ci` (for a change that cannot affect the GPU, such as comment-only edits to the
 # paths below; a title rule would also skip a combined pull request that carries GPU work); the nightly schedule
 # still covers main.
-# The model families come from AiDotNet master's parity harness; the repository variable AIDOTNET_HARNESS_REF points
-# the lane at another AiDotNet ref when a harness change needs testing before it merges.
+# Pin the downstream model harness to the reviewed source revision compatible with this Tensors API.
+# Build it against this checkout so integration does not depend on either package being released first.
 
 on:
   schedule:
@@ -155,6 +155,9 @@ jobs:
         FullyQualifiedName~.ResidentWeightInvalidationDeviceStateTests.|
         FullyQualifiedName~.CpuDoubleReductionTests.|
         FullyQualifiedName~.GpuEngineScalarReductionDispatchTests.|
+        FullyQualifiedName~.BatchNormActivationConv2DTests.|
+        FullyQualifiedName~.RunningStatisticsTests.|
+        FullyQualifiedName~.DepthwiseConv2DBatchNormTests.|
         FullyQualifiedName~.SoftmaxForwardGpuReproTests.|
         FullyQualifiedName~.TimeStretchStageDiffTests.|
         FullyQualifiedName~.EmptyBroadcastTests.|
@@ -351,8 +354,8 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: ooples/AiDotNet
-        # The parity harness's model families (ooples/AiDotNet#2381); AIDOTNET_HARNESS_REF overrides master.
-        ref: ${{ vars.AIDOTNET_HARNESS_REF || 'master' }}
+        # AiDotNet #2524: fractional hash-grid API migration and build-contract repairs.
+        ref: 687748a269ffd08594e4158b66cf6e237bc910d2
         path: aidn
         persist-credentials: false
 
@@ -366,7 +369,7 @@ jobs:
         $families = 'mlp','cnn','lstm','transformer','gru','resnet18','resnet50','vgg11','mobilenetv2','densenet121','vit'
         $missing = $families | Where-Object { $program -notmatch ('"' + $_ + '"\s*=>') }
         if ($missing) {
-          Write-Output "::error::The AiDotNet parity harness at '${{ vars.AIDOTNET_HARNESS_REF || 'master' }}' does not define: $($missing -join ', '). Set the repository variable AIDOTNET_HARNESS_REF to a ref that does, or unset it to use master."
+          Write-Output "::error::The pinned AiDotNet parity harness does not define: $($missing -join ', '). Update the pinned AiDotNet commit to a compatible harness revision."
           exit 1
         }
         "MODEL_FAMILIES=$($families -join ',')" | Out-File -Append -FilePath $env:GITHUB_ENV

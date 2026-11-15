@@ -42,7 +42,11 @@ public abstract class StepCountRatchetBase
             ? "cpu:" + (System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated ? "avx512"
                 : System.Runtime.Intrinsics.X86.Avx2.IsSupported ? "avx2" : "scalar")
             : "cuda:" + (gpu.GetBackend() is { } backend ? backend.DeviceName : "unknown")
-              + (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.UseCudnnForConv ? ":cudnn" : "");
+              + (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.UseCudnnForConv ? ":cudnn" : "")
+              // TF32 convolutions (the default, as PyTorch's cuDNN convolutions) select cuDNN's tensor-op algorithms, whose
+              // split reductions add their own kernel and memset nodes (ResNet-18 on an RTX 1000 Ada: 147 kernels and 5
+              // memsets in FP32, 175 and 17 in TF32), so the two precisions keep separate baselines too.
+              + (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 ? ":tf32" : "");
         string key = $"{network}:{device}";
         _output.WriteLine($"{key}: {counts.AllocatedBytesPerStep} bytes/step" +
             (counts.KernelNodes is { } k ? $", graph kernels {k}, memcpy {counts.MemcpyNodes}, memset {counts.MemsetNodes}" : "") +
@@ -126,7 +130,31 @@ public sealed class StepCountRatchetGpuTests : StepCountRatchetBase
     [InlineData("lstm")]
     [InlineData("transformer")]
     [InlineData("resnet18")]
-    public void CompiledStep_Cuda_CountsDoNotRise(string network)
+    public void CompiledStep_Cuda_CountsDoNotRise(string network) => RunCudaRatchet(network);
+
+    [SkippableTheory]
+    [Trait("Category", "PyTorchParityGpu")]
+    [InlineData("mlp")]
+    [InlineData("cnn")]
+    [InlineData("lstm")]
+    [InlineData("transformer")]
+    [InlineData("resnet18")]
+    public void CompiledStep_Cuda_Fp32_CountsDoNotRise(string network)
+    {
+        // Keep enforcing the existing FP32 budgets even when the default switches to TF32.
+        bool previous = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32;
+        try
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = false;
+            RunCudaRatchet(network); // Precision is selected before constructing the backend.
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = previous;
+        }
+    }
+
+    private void RunCudaRatchet(string network)
     {
         DirectGpuTensorEngine gpu;
         try { gpu = new DirectGpuTensorEngine(); }

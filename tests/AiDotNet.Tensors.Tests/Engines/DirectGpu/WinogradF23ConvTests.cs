@@ -54,7 +54,8 @@ public sealed class WinogradF23ConvTests : IClassFixture<DirectGpuTensorEngineTe
         using var yWin = cuda.AllocateBuffer(batch * outC * outSize * outSize);
         var refArgs = new CudaConv2DArgs(x, w, yRef, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
         var winArgs = new CudaConv2DArgs(x, w, yWin, batch, inC, size, size, outC, outSize, outSize, 3, 3, 1, 1, pad, pad, 1, 1);
-        Assert.True(cuda.TryConv2DForwardEngine(refArgs), "engine refused the reference shape");
+        // The FP32 mainloop: Winograd F(2,3) is FP32, the engine's default is TF32 (as PyTorch's cuDNN convolutions).
+        Assert.True(cuda.TryConv2DForwardEngine(refArgs, CudaBackend.ConvMainloopFma), "engine refused the reference shape");
         Assert.True(cuda.TryConv2DForwardWinogradF23(winArgs), "Winograd refused an admitted shape");
 
         var expected = cuda.DownloadBuffer(yRef);

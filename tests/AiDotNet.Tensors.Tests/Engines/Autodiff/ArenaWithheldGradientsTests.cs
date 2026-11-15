@@ -39,7 +39,8 @@ public class ArenaWithheldGradientsTests
                     var loss = engine.ReduceSum(engine.TensorMultiply(h, h), null);
                     gradient = tape.ComputeGradients(loss, new[] { w1, w2 })[w1];
                 }
-                Assert.True(WithheldCount() > 0, "The step must retain arena-backed gradients.");
+                // A caller's arena withholds them for a step; a tape-owned arena quarantines them while they are held.
+                Assert.True(RetainedCount() > 0, "The step must retain arena-backed gradients.");
                 var expected = gradient.ToArray();
 
                 // Neither an inference arena nor scratch rentals end the optimizer's use of these gradients.
@@ -62,6 +63,10 @@ public class ArenaWithheldGradientsTests
         thread.Join();
         if (failure is not null) throw new InvalidOperationException("Gradient lifetime regression failed.", failure);
     }
+
+    // What a finished step keeps out of the pool for its caller: the withheld list (a caller-owned arena's one-step
+    // hold) plus the escape quarantine (a tape-owned arena keeps each result until the caller drops it).
+    private static int RetainedCount() => WithheldCount() + TensorArena.QuarantinedCount;
 
     private static int WithheldCount()
     {
@@ -99,15 +104,18 @@ public class ArenaWithheldGradientsTests
 
             if (ownArenaPerStep)
             {
-                using var arena = TensorArena.Create();
-                Step();
+                using (TensorArena.Create()) Step();
+                counts[step] = WithheldCount();   // the arena's Dispose withholds the handed-over gradients
             }
             else
             {
+                // A tape-owned arena quarantines the step's buffers until nothing references them: once the previous
+                // step's results are collected, this step's Dispose moves them to the pool, leaving only its own.
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
                 Step();
+                counts[step] = RetainedCount();
             }
-
-            counts[step] = WithheldCount();
         }
 
         return counts;
@@ -131,11 +139,13 @@ public class ArenaWithheldGradientsTests
         if (failure is not null) throw new InvalidOperationException("The training steps threw.", failure);
 
         // One step's handed-over gradients may be withheld at a time; later steps must not add to them. A step hands
-        // over its two gradients (w1, w2), so that is the bound. The first step's count is not: only gradients the arena
+        // over its two gradients (w1, w2), so that is the bound for a caller's arena. The first step's count is not: only gradients the arena
         // itself issued are withheld, and whether it issues one depends on process-wide pool state that tests running
         // in parallel change, so an early step can withhold fewer (measured [1, 0, 2, 2, 2, 2] under a full run). The
         // leak this guards (AiDotNet#2322) adds a set per step: [2, 4, 6, ...].
-        const int gradientsPerStep = 2;
+        // A tape-owned arena also keeps the step's pooled forward buffers until they are collected: one step's worth
+        // (the steady count from the second step on), which must not grow.
+        int gradientsPerStep = callerArenaPerStep ? 2 : (counts is { Length: > 1 } ? counts[1] : 0);
         Assert.NotNull(counts);
         if (counts is null) return;
         // Not vacuous: a run that never withheld anything would pass the bound without testing it. The steady state

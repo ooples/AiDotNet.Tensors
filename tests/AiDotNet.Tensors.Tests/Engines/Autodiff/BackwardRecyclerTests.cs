@@ -251,6 +251,10 @@ public class BackwardRecyclerTests
             for (int step = 0; step < 5; step++)
             {
                 arena?.Reset();
+                // A pass with no arena creates no recycler, so it cannot clear the
+                // previous test's thread-local diagnostic counters itself.
+                BackwardRecycler<float>.LastPassReturned = 0;
+                BackwardRecycler<float>.LastPassForwardReturned = 0;
                 var g = Step(x, k1, k2, w, step, releaseActivations);
                 returned += BackwardRecycler<float>.LastPassReturned;
                 forwardReturned += BackwardRecycler<float>.LastPassForwardReturned;

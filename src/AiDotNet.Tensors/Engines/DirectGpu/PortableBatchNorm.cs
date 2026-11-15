@@ -72,7 +72,8 @@ internal static class PortableBatchNorm
     internal static bool TryBackward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
         IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput,
-        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool canRebuildMask = true, bool unpacked = false)
+        IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool canRebuildMask = true, bool unpacked = false,
+        bool accumulateGradInput = false)
     {
         long count = (long)batch * spatial, n = count * channels;
         int k = BatchNormRegisterKernelTemplate.VariantFor(count);
@@ -89,7 +90,7 @@ internal static class PortableBatchNorm
         if (unpacked)
         {
             int unpackedMode = (reluOutput is not null ? 1 : 0) | (gradResidual is not null ? 2 : 0) | (rebuildMask ? 4 : 0)
-                               | (gradOutput2 is not null ? 8 : 0);
+                               | (gradOutput2 is not null ? 8 : 0) | (accumulateGradInput ? 16 : 0);
             // A placeholder for an absent residual gradient: the kernel writes it only under mode bit 1.
             IGpuBuffer? absentResidual = null;
             IGpuBuffer residualBinding = gradResidual ?? (absentResidual = backend.AllocateBuffer(1));
@@ -110,7 +111,7 @@ internal static class PortableBatchNorm
         backend.Copy(saveMean, 0, prm, 2 * channels, channels);
         backend.Copy(saveVariance, 0, prm, 3 * channels, channels);
         int mode = (reluOutput is not null ? 1 : 0) | (gradResidual is not null ? 2 : 0) | (rebuildMask ? 4 : 0)
-                   | (gradOutput2 is not null ? 8 : 0);
+                   | (gradOutput2 is not null ? 8 : 0) | (accumulateGradInput ? 16 : 0);
         var mask = rebuildMask ? input : reluOutput ?? input;
         launch(BatchNormRegisterKernelTemplate.BackwardName(k), channels,
             new[] { gradOutput, mask, gradResidual ?? noResidual!, input, prm, gradInput, dprm, gradOutput2 ?? gradOutput },

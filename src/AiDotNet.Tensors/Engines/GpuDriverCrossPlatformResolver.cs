@@ -32,6 +32,13 @@ internal static class GpuDriverCrossPlatformResolver
         {
             if (_registered) return;
             _registered = true;
+            // Before the driver loads (it reads this at load/cuInit): load each kernel's code onto the device when it is
+            // first launched rather than every kernel of every module at module load, as PyTorch does by setting the same
+            // variable. Current drivers default to lazy; this pins it where the default is eager. The backend compiles
+            // dozens of kernel modules up front and a model launches a small fraction of their kernels: forced eager
+            // loading measured +620 MB device memory on VGG-11 training and +206 MB on ViT. An explicit setting wins.
+            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CUDA_MODULE_LOADING")))
+                Environment.SetEnvironmentVariable("CUDA_MODULE_LOADING", "LAZY");
             NativeLibraryResolverRegistry.Register(Resolve);
         }
     }
