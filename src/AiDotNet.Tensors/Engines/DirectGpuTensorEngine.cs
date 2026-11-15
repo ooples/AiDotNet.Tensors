@@ -184,7 +184,8 @@ internal sealed class ActivationCacheEntry : IDisposable
 
     public void Dispose()
     {
-        Buffer.Dispose();
+        // Compiled actions cache borrowed scratch outputs too. Only the plan's pool may release those buffers.
+        if (!StepScratchPool.IsPooled(Buffer)) Buffer.Dispose();
     }
 }
 

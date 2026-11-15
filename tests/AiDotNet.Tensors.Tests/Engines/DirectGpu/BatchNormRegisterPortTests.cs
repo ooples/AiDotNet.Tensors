@@ -104,7 +104,7 @@ public class BatchNormRegisterPortTests
     {
         using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
-        Skip.If(spatial % 4 != 0, "The CUDA register variant reads float4 rows (spatial % 4 == 0).");
+        Skip.If(spatial % 4 != 0, "Not applicable: CUDA register batchnorm requires float4 rows (spatial % 4 == 0).");
         Check(backend, batch, channels, spatial);
     }
 
