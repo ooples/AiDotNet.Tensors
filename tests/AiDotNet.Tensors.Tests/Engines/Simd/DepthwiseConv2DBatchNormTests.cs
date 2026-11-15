@@ -120,6 +120,78 @@ public class DepthwiseConv2DBatchNormTests
 
     private static int Bits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
 
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// The epilogue where there is no FMA (Arm64, x86 without FMA), forced here: the product and the sum round
+    /// separately and the clamp keeps a NaN, bit for bit what the scalar expression gives, and it stays in vector
+    /// registers. It used to copy every vector of outputs to a new array and build a vector from it: two heap
+    /// allocations per vector, 115 KB for the 64 KB result of the stride-1 case below.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void WithoutFma_TheEpilogueRoundsSeparately_AndAllocatesNothingPerVector(int stride)
+    {
+        bool previousFma = DepthwiseConv3x3.s_epilogueFma;
+        int previousMaxWidth = DepthwiseConv3x3.s_channelBlockMaxWidth;
+        int previousMaxWidth1 = DepthwiseConv3x3.s_channelBlockMaxWidthStride1;
+        DepthwiseConv3x3.s_epilogueFma = false;
+        DepthwiseConv3x3.s_channelBlockMaxWidth = 0;          // the channel-blocked kernels need FMA
+        DepthwiseConv3x3.s_channelBlockMaxWidthStride1 = 0;
+        try
+        {
+            var engine = new CpuEngine();
+            const int size = 128;
+            // One plane: a single task, so the work and its allocations are on this thread.
+            var x = Random(new[] { 1, 1, size, size }, 1, -2f, 2f);
+            x[5] = float.NaN;
+            var w = Random(new[] { 1, 1, 3, 3 }, 2, -1f, 1f);
+            var gamma = Random(new[] { 1 }, 3, 0.5f, 1.5f);
+            var beta = Random(new[] { 1 }, 4, -0.5f, 0.5f);
+            var mean = Random(new[] { 1 }, 5, -0.3f, 0.3f);
+            var variance = Random(new[] { 1 }, 6, 0.2f, 2f);
+            int[] s = { stride, stride }, p = { 1, 1 };
+            var plain = engine.DepthwiseConv2D(x, w, s, p).ToArray();
+            // NchwcBatchNorm.PackScaleBias.
+            const float epsilon = 1e-5f;
+            double scaleD = gamma[0] / Math.Sqrt((double)variance[0] + epsilon);
+            float scale = (float)scaleD, shift = beta[0] - (float)(scaleD * mean[0]);
+
+            foreach (var (activation, high) in new[] { (FusedActivationType.ReLU6, 6f), (FusedActivationType.ReLU, float.PositiveInfinity) })
+            {
+                engine.DepthwiseConv2DBatchNorm(x, w, s, p, gamma, beta, mean, variance, 1e-5, activation);   // scratch
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                var fused = engine.DepthwiseConv2DBatchNorm(x, w, s, p, gamma, beta, mean, variance, 1e-5, activation);
+                long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                var actual = fused.ToArray();
+
+                Assert.Equal(plain.Length, actual.Length);
+                bool sawNaN = false;
+                for (int i = 0; i < plain.Length; i++)
+                {
+                    float product = plain[i] * scale;
+                    float expected = product + shift;
+                    if (expected < 0f) expected = 0f;
+                    if (expected > high) expected = high;
+                    sawNaN |= float.IsNaN(expected);
+                    Assert.True(Bits(expected) == Bits(actual[i]) || (float.IsNaN(expected) && float.IsNaN(actual[i])),
+                        $"{activation} [{i}]: scalar {expected}, fused {actual[i]}");
+                }
+                Assert.True(sawNaN, "the NaN input reached no output");
+                long resultBytes = (long)actual.Length * sizeof(float);
+                Assert.True(allocated <= resultBytes + 8 * 1024,
+                    $"{activation}: {allocated} bytes allocated for a {resultBytes}-byte result");
+            }
+        }
+        finally
+        {
+            DepthwiseConv3x3.s_epilogueFma = previousFma;
+            DepthwiseConv3x3.s_channelBlockMaxWidth = previousMaxWidth;
+            DepthwiseConv3x3.s_channelBlockMaxWidthStride1 = previousMaxWidth1;
+        }
+    }
+#endif
+
     [Fact]
     public void UnderATape_RecordsTheUnfusedOps()
     {
