@@ -290,11 +290,15 @@ internal sealed class StepScratchPool
         }
     }
 
-    /// <summary>Takes every lent forward slot back off the free list (one a lease still holds ended with its action).</summary>
+    /// <summary>Takes every lent forward slot back off the free list, and back from a lease still holding one.</summary>
     internal void WithdrawLent()
     {
         if (_lent.Count == 0) return;
         _free.RemoveAll(_lent.ContainsKey);
+        // A backward action that threw has not ended its leases. Ending one that holds a lent buffer after this would
+        // put the buffer on the free list while its forward slot still binds it, so a later lease could take it before
+        // the forward output's last reader (and the next Lend would add a second copy): it is its forward slot's again.
+        _leases.RemoveAll(lease => _lent.ContainsKey(lease.Buffer));
         // A lease names its slot in Keys; the buffer is its forward slot's again.
         foreach (var entry in _lent) Keys[entry.Key] = entry.Value;
         _lent.Clear();

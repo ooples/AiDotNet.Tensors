@@ -5115,6 +5115,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             Autodiff.DifferentiableOps.GradWriteGeneration = 0;
+            // A backward action that threw skipped its EndScratchAction: end its leases first, the order the success
+            // path runs in, so a lent buffer it leased goes back to its forward slot below rather than the free list.
+            if (lendPool is not null) de?.EndScratchAction();
             lendPool?.WithdrawLent();   // the next forward writes them again
         }
         CommitReplacedParameterGradients(engine);

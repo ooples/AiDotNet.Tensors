@@ -315,4 +315,56 @@ public class CompiledGpuScratchLeaseTests
             pool.Release();
         }
     }
+
+    [SkippableFact]
+    public void A_lent_slot_leased_by_a_backward_action_that_threw_goes_back_to_its_forward_slot()
+    {
+        // The action threw after its lease, so the backward's finally withdrew the lent slots before the lease ended.
+        // Ending it afterwards put the buffer on the free list while the forward slot still bound it: the next lease
+        // took the forward output's buffer, and the next Lend added a second copy of it.
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        using (gpu)
+        {
+            var backend = Assert.IsAssignableFrom<AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend>(gpu.GetBackend());
+            var pool = gpu.CreateScratchPool();
+            pool.FirstLeasedAction = 2;
+            long forwardKey = 0L << 32;
+            var forwardSlot = backend.AllocateBuffer(256);
+            pool.Slots[forwardKey] = forwardSlot;
+            pool.Keys[forwardSlot] = forwardKey;
+            pool.Track(forwardSlot);
+
+            pool.Begin(2);
+            pool.Lend(new System.Collections.Generic.List<(long, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer)> { (forwardKey, forwardSlot) });
+            long backwardKey = (2L << 32) | 0;
+            Assert.Same(forwardSlot, pool.Lease(backwardKey, backend, 256));
+            pool.WithdrawLent();      // the finally, while the throwing action's lease is still open
+            pool.EndLeases(null);     // its EndScratchAction, late
+            Assert.Same(forwardSlot, pool.Slots[forwardKey]);
+            Assert.Equal(forwardKey, pool.Keys[forwardSlot]);
+
+            // The forward slot is not free: a lease of its size allocates.
+            pool.Begin(3);
+            Assert.NotSame(forwardSlot, pool.Lease((3L << 32) | 0, backend, 256));
+            pool.EndLeases(null);
+
+            // Lent again on the next backward, it is lent once: one lease takes it, the next does not.
+            pool.Begin(2);
+            pool.Lend(new System.Collections.Generic.List<(long, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer)> { (forwardKey, forwardSlot) });
+            int taken = 0;
+            for (int k = 0; k < 2; k++)
+                if (ReferenceEquals(forwardSlot, pool.Lease((2L << 32) | (uint)(k + 1), backend, 256))) taken++;
+            Assert.Equal(1, taken);
+            pool.EndLeases(null);
+            pool.WithdrawLent();
+            pool.Release();
+        }
+    }
 }

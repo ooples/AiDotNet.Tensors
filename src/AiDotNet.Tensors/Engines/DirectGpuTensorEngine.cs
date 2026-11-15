@@ -19621,9 +19621,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // CopyResultInto residency alias) resolves it via the _gpuBuffer fast path instead of re-uploading its
         // stale host data — this is the SOURCE of the forward residency chain that keeps the whole step
         // on-device for CUDA-graph capture. Without it, the first consumer re-uploads and the chain collapses.
-        output._gpuBuffer = outBuf;
-        output._gpuBackend = backend;
-        output._gpuBufferVersion = output.GpuCacheVersion;
+        // Bound as every resident op binds its output, which also arms the host download: setting the fields alone
+        // left a host read of the output with its previous contents (the gather wrote only the device).
+        BindResidentBuffer(output, outBuf, backend);
         return true;
     }
 

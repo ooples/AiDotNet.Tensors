@@ -673,10 +673,17 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 for (int i = 0; i < truth.Weights[p].Length; i++)
                     Assert.True(Math.Abs(truth.Weights[p][i] - onGpu.Weights[p][i]) <= 1e-5f,
                         $"param {p}[{i}]: GPU {onGpu.Weights[p][i]} != CPU {truth.Weights[p][i]}");
+            // A host read of a gathered embedding after each eager step: the device gather bound its output without
+            // arming the download, so the host saw the previous step's rows. (A replayed graph runs no gather op.)
+            if (!capture)
+                for (int s = 0; s < Steps; s++)
+                    for (int i = 0; i < truth.Gathered[s].Length; i++)
+                        Assert.True(Math.Abs(truth.Gathered[s][i] - onGpu.Gathered[s][i]) <= 1e-5f,
+                            $"step {s}: gathered[{i}] read {onGpu.Gathered[s][i]} on the host, CPU {truth.Gathered[s][i]}");
         }
     }
 
-    private static (double[] Losses, float[][] Weights, bool Replayed) TrainTwoEmbeddings(IEngine engine, bool capture, bool floatIndices)
+    private static (double[] Losses, float[][] Weights, bool Replayed, float[][] Gathered) TrainTwoEmbeddings(IEngine engine, bool capture, bool floatIndices)
     {
         const int vocab = 40;
         var idsA = new Tensor<int>([Batch]);
@@ -717,11 +724,13 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         }
 
         ICompiledTrainingPlan<float> plan;
+        Tensor<float> gatheredA;
         Feed(0);
         using (var scope = GraphMode.EnableTraining(parameters))
         {
             var xa = floatIndices ? engine.TensorEmbeddingLookupFromFloatIndices(tableA, floatIdsA) : engine.TensorEmbeddingLookup<float, int>(tableA, idsA);
             var xb = floatIndices ? engine.TensorEmbeddingLookupFromFloatIndices(tableB, floatIdsB) : engine.TensorEmbeddingLookup<float, int>(tableB, idsB);
+            gatheredA = xa;
             var x = engine.TensorAdd(xa, xb);
             var h = engine.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
             var pred = engine.FusedLinear(h, w2, b2, FusedActivationType.None);
@@ -734,16 +743,18 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             if (!capture) concrete.DisableGraphStep();
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 5e-2f);
             var losses = new double[Steps];
+            var gathered = new float[Steps][];
             for (int s = 0; s < Steps; s++)
             {
                 if (s > 0) Feed(s);
                 losses[s] = plan.Step().ToArray()[0];
+                gathered[s] = gatheredA.ToArray();
             }
             var execField = typeof(CompiledTrainingPlan<float>)
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
                 ?? throw new InvalidOperationException("_stepGraphExec field not found.");
             var exec = execField.GetValue(concrete) is IntPtr handle ? handle : IntPtr.Zero;
-            return (losses, parameters.Select(p => p.ToArray()).ToArray(), exec != IntPtr.Zero);
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), exec != IntPtr.Zero, gathered);
         }
     }
 
