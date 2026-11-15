@@ -506,14 +506,18 @@ public partial class DifferentiableOpsGradCheckSweep
     /// <remarks>
     /// Phase is only well conditioned where the magnitude is not near zero -- its derivative carries
     /// a 1/|C| factor -- and it is only finite-difference-checkable where the wrapped value stays
-    /// clear of the branch cut. Two incommensurate tones over a DC offset satisfy both, which
-    /// uniform noise in [0.35, 0.95] does not.
+    /// clear of the branch cut. Two tones and a chirp over a DC offset satisfy both, which uniform
+    /// noise in [0.35, 0.95] does not. At the sweeps' nFft = 16, hop = 4, centered Hann framing of
+    /// 64 samples, every bin's magnitude is at least 0.18 and every non-real bin's phase is at least
+    /// 0.035 from the cut. The two tones alone (0.6 + sin(0.37 i) + 0.4 cos(1.13 i)) left one bin at
+    /// magnitude 8.7e-5, where a float STFT's phase carries rounding error times 1/|C| ~ 1e4, so a GPU
+    /// tape and the CPU tape disagreed by 0.7% on the phase gradient without either being wrong.
     /// </remarks>
     private static Tensor<double> WellExcitedWaveform(int n)
     {
         var t = new Tensor<double>([n]);
         for (int i = 0; i < n; i++)
-            t[i] = 0.6 + Math.Sin(0.37 * i) + 0.4 * Math.Cos(1.13 * i);
+            t[i] = 0.6 + Math.Sin(0.71 * i) + 0.4 * Math.Cos(2.7 * i) + 0.3 * Math.Sin(0.23 * i * i);
         return t;
     }
 
