@@ -4243,8 +4243,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gte.ResumeActivationEviction();
                 if (ran)
                 {
-                    // Nothing is left pointing at a released buffer (DetachReleasedBindings): the forward outputs are
-                    // recomputed next step, and the loss is held by its readback.
+                    // Keep forward values readable without forcing a host download.
                     var released = new HashSet<Engines.DirectGpu.IGpuBuffer>(ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
                     gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false, released);
                     DetachReleasedBindings(released);
@@ -5757,8 +5756,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             evictGuard?.ResumeActivationEviction();
             // Release this step's dead transient activations/grads/scratch. The optimizer has already read
-            // _gradients; protect public gradient/seed/dest tensors, materialize only the returned loss, and
-            // discard unprotected scratch materializers so cleanup does not introduce step-ending DtoH traffic.
+            // _gradients; protect live gradients and forward values, materialize only the loss,
+            // and discard dead scratch without a blocking readback.
             if (stepActivationEngine is not null && stepActivationSnapshot >= 0)
             {
                 try
@@ -5794,12 +5793,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private void DetachReleasedBindings(HashSet<Engines.DirectGpu.IGpuBuffer> released)
     {
-        // A forward output borrows the buffer of the result it aliases (a StopGradient, a reshape) or keeps the
-        // activation it was written into, and is recomputed next step: it is unbound whatever was released, as the
-        // graph step does. In-place state keeps the only current value on the device; the loss was materialized.
-        if (_forwardSteps != null)
-            foreach (var step in _forwardSteps.Where(s => !ReferenceEquals(s.OutputBuffer, _lossGradDest) && !IsInPlaceState(s)))
-                DetachDeviceBinding(step.OutputBuffer);
         if (released.Count == 0) return;
         // Everything else by device handle: a binding can be a different buffer object over the same memory.
         var handles = new HashSet<IntPtr>(released.Select(buffer => buffer.Handle).Where(handle => handle != IntPtr.Zero));
@@ -5811,6 +5804,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_forwardSteps != null)
             foreach (var step in _forwardSteps)
             {
+                Detach(step.OutputBuffer);
                 foreach (var input in step.Inputs) Detach(input);
                 if (step.SavedState is { } saved)
                     foreach (var tensor in saved.OfType<Tensor<T>>()) Detach(tensor);
@@ -5847,9 +5841,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 AddActivationCacheKeys(protect, entry);
         AddActivationCacheKeys(protect, _lossGradDest);
         AddActivationCacheKeys(protect, _lossGradSeed);
-        // State an in-place step updates on the device lives across steps.
+        // Forward tensors can escape to callers. Keep their current device values and lazy downloads.
         if (_forwardSteps != null)
-            foreach (var step in _forwardSteps.Where(s => IsInPlaceState(s))) AddActivationCacheKeys(protect, step.OutputBuffer);
+            foreach (var step in _forwardSteps)
+            {
+                AddActivationCacheKeys(protect, step.OutputBuffer);
+                if (step.OutputBuffer._gpuBuffer is { } buffer) protect.Add(buffer);
+            }
         return protect;
     }
 

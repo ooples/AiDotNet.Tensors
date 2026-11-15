@@ -197,16 +197,24 @@ public sealed partial class CudaBackend
         }
     }
 
+    // Stop collecting pins before releasing the stream-capture gate. Instantiation
+    // still owns this set while another thread begins collecting its own pins.
+    private void SealDirectPtxCapturePinTracking(DirectPtxCapturePinSet pins)
+    {
+        lock (_directPtxLock)
+        {
+            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins))
+                throw new InvalidOperationException("The direct-PTX capture pin owner changed unexpectedly.");
+            _activeDirectPtxCapturePins = null;
+        }
+    }
+
     private void CompleteDirectPtxCapturePinTracking(
         DirectPtxCapturePinSet pins,
         IntPtr graphExec)
     {
         lock (_directPtxLock)
         {
-            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins))
-                throw new InvalidOperationException(
-                    "The direct-PTX CUDA graph capture pin owner changed unexpectedly.");
-            _activeDirectPtxCapturePins = null;
             if (pins.Count == 0) return;
             _directPtxGraphPins ??= new Dictionary<IntPtr, DirectPtxCapturePinSet>();
             // The driver can recycle a CUgraphExec address after cuGraphExecDestroy,
@@ -226,8 +234,7 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins)) return;
-            _activeDirectPtxCapturePins = null;
+            if (ReferenceEquals(_activeDirectPtxCapturePins, pins)) _activeDirectPtxCapturePins = null;
             pins.Release();
         }
     }
@@ -238,10 +245,6 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins))
-                throw new InvalidOperationException(
-                    "The direct-PTX CUDA graph update pin owner changed unexpectedly.");
-            _activeDirectPtxCapturePins = null;
             if (_directPtxGraphPins is not null &&
                 _directPtxGraphPins.TryGetValue(graphExec, out DirectPtxCapturePinSet? oldPins))
             {

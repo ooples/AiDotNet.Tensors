@@ -411,18 +411,15 @@ public sealed partial class CudaBackend
     {
         t_lastCaptureFailure = null;
         t_lastCaptureNodeCounts = null;
-        DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
-        try { EnterCapture(); }
-        catch
-        {
-            AbortDirectPtxCapturePinTracking(directPtxPins);
-            throw;
-        }
+        EnterCapture();
+        DirectPtxCapturePinSet directPtxPins;
+        try { directPtxPins = BeginDirectPtxCapturePinTracking(); }
+        catch { ExitCapture(); throw; }
         var rc = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
         if (rc != CudaResult.Success)
         {
-            ExitCapture();
             AbortDirectPtxCapturePinTracking(directPtxPins);
+            ExitCapture();
             GcDiag($"beginCapture FAILED rc={rc}");
             t_lastCaptureFailure = "cuStreamBeginCapture failed: " + rc;
             return IntPtr.Zero;
@@ -441,6 +438,7 @@ public sealed partial class CudaBackend
             { var st = ex.StackTrace?.Replace("\r", "").Replace("\n", " >> ") ?? ""; GcDiag($"launch() THREW {ex.GetType().Name}: {ex.Message} | {st.Substring(0, System.Math.Min(2500, st.Length))}"); }
             t_lastCaptureFailure = DescribeCaptureException(ex);
             CudaNativeBindings.cuStreamEndCapture(_stream, out var abortedGraph);
+            SealDirectPtxCapturePinTracking(directPtxPins);
             ExitCapture();
             if (abortedGraph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(abortedGraph);
             AbortDirectPtxCapturePinTracking(directPtxPins);
@@ -452,6 +450,7 @@ public sealed partial class CudaBackend
         }
 
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
+        SealDirectPtxCapturePinTracking(directPtxPins);
         ExitCapture();
         if (rc != CudaResult.Success || graph == IntPtr.Zero)
         {
@@ -596,18 +595,15 @@ public sealed partial class CudaBackend
     private bool TryUpdateCapturedGraphOnCurrentStream(IntPtr graphExec, Action relaunch)
     {
         t_lastCaptureFailure = null;
-        DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
-        try { EnterCapture(); }
-        catch
-        {
-            AbortDirectPtxCapturePinTracking(directPtxPins);
-            throw;
-        }
+        EnterCapture();
+        DirectPtxCapturePinSet directPtxPins;
+        try { directPtxPins = BeginDirectPtxCapturePinTracking(); }
+        catch { ExitCapture(); throw; }
         var beginRc = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
         if (beginRc != CudaResult.Success)
         {
-            ExitCapture();
             AbortDirectPtxCapturePinTracking(directPtxPins);
+            ExitCapture();
             t_lastCaptureFailure = "cuStreamBeginCapture failed: " + beginRc;
             return false;
         }
@@ -621,6 +617,7 @@ public sealed partial class CudaBackend
             t_lastCaptureFailure = DescribeCaptureException(ex);
             GcDiag("graph update relaunch() THREW " + ex.GetType().Name + ": " + ex.Message);
             CudaNativeBindings.cuStreamEndCapture(_stream, out var g);
+            SealDirectPtxCapturePinTracking(directPtxPins);
             ExitCapture();
             if (g != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(g);
             AbortDirectPtxCapturePinTracking(directPtxPins);
@@ -632,6 +629,7 @@ public sealed partial class CudaBackend
         }
 
         var endRc = CudaNativeBindings.cuStreamEndCapture(_stream, out var newGraph);
+        SealDirectPtxCapturePinTracking(directPtxPins);
         ExitCapture();
         if (endRc != CudaResult.Success || newGraph == IntPtr.Zero)
         {

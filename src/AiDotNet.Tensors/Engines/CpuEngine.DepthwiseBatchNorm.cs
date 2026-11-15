@@ -21,6 +21,11 @@ public partial class CpuEngine
         if (beta is null) throw new ArgumentNullException(nameof(beta));
         if (runningMean is null) throw new ArgumentNullException(nameof(runningMean));
         if (runningVariance is null) throw new ArgumentNullException(nameof(runningVariance));
+        ValidateDepthwiseGeometry(input._shape, kernel._shape, null, stride, padding, "output");
+        int channels = checked(input._shape[1] * kernel._shape[1]);
+        if (gamma.Length != channels || beta.Length != channels
+            || runningMean.Length != channels || runningVariance.Length != channels)
+            throw new ArgumentException("Batch normalization parameters must match the depthwise output channels.");
 
         if (typeof(T) == typeof(float) && !SupportsGpu && !IsRecordingPreActivatedConv<T>()
             && (activation == FusedActivationType.ReLU || activation == FusedActivationType.ReLU6)
@@ -29,7 +34,6 @@ public partial class CpuEngine
             && Simd.DepthwiseConv3x3.Applies(kernel._shape[1], kernel._shape[2], kernel._shape[3], stride[0], stride[1],
                 padding[0], padding[1]))
         {
-            ValidateDepthwiseGeometry(input._shape, kernel._shape, null, stride, padding, "output");
             return (Tensor<T>)(object)DepthwiseConv3x3BatchNormFloat((Tensor<float>)(object)input,
                 (Tensor<float>)(object)kernel, stride[0], (Tensor<float>)(object)gamma, (Tensor<float>)(object)beta,
                 (Tensor<float>)(object)runningMean, (Tensor<float>)(object)runningVariance, (float)epsilon,

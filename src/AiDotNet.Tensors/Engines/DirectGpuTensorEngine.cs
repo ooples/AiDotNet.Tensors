@@ -438,7 +438,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // of a GPU ViT b1 forward, one per attention layer). Overwritten slots fall off; RecentActivationEntriesAfter
     // scans the full cache when its window reaches past the oldest slot.
     private const int RecentActivationKeyRingSize = 4096;
-    private readonly object?[] _recentActivationKeys = new object?[RecentActivationKeyRingSize];
+    private readonly WeakReference<object>?[] _recentActivationKeys = new WeakReference<object>?[RecentActivationKeyRingSize];
     private readonly long[] _recentActivationKeyTimes = new long[RecentActivationKeyRingSize];
     private long _recentActivationKeyWrites;
 
@@ -447,7 +447,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int slot = (int)((System.Threading.Interlocked.Increment(ref _recentActivationKeyWrites) - 1) & (RecentActivationKeyRingSize - 1));
         // Time first, so a reader that sees the key sees a time no older than the key's insert.
         System.Threading.Volatile.Write(ref _recentActivationKeyTimes[slot], System.Threading.Interlocked.Read(ref _activationCacheTimestamp));
-        System.Threading.Volatile.Write(ref _recentActivationKeys[slot], key);
+        System.Threading.Volatile.Write(ref _recentActivationKeys[slot], new WeakReference<object>(key));
     }
 
     // Eviction-suspend depth (#226 race fix). A training step (compiled-plan StepEager,
@@ -3206,7 +3206,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
-                if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
+                if (protect is not null && (protect.Contains(entries[i].Key) || protect.Contains(entries[i].Value.Buffer)))
+                    continue; // a live tensor can borrow a buffer cached under another tensor's key
                 if (releasableOnly is not null && !releasableOnly(entries[i].Key)) continue; // predates the scope
                 if (mode == ActivationReleaseMode.Release && Helpers.HostSync.IsRetained(entries[i].Key))
                     continue; // the caller kept it past the tape (GradientTape.Retain / returned gradients)
@@ -3303,8 +3304,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 continue;
             }
             passed = 0;
-            if (key is not null && _activationCache.TryGetValue(key, out var entry) && entry.Timestamp > snapshot)
-                found.Add(new KeyValuePair<object, ActivationCacheEntry>(key, entry));
+            if (key is not null && key.TryGetTarget(out var target) && _activationCache.TryGetValue(target, out var entry) && entry.Timestamp > snapshot)
+                found.Add(new KeyValuePair<object, ActivationCacheEntry>(target, entry));
         }
         return found.ToArray();
     }
@@ -4990,11 +4991,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Host reads of dest (the loss scalar, a debug checksum, a host op) download from the borrowed buffer.
         var capturedBuf = srcBuf;
         var capturedBackend = backend;
+        Helpers.HostSync.Remove(destArr);
         Helpers.HostSync.Register(destArr, arr =>
         {
             float[] floatData = capturedBackend.DownloadBuffer(capturedBuf);
             var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
             System.Array.Copy(converted, (T[])arr, System.Math.Min(converted.Length, ((T[])arr).Length));
+            GC.KeepAlive(src); // keep the borrowed buffer's cache owner alive through the download
         });
         return true;
     }
@@ -6414,7 +6417,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int hostVersion = t.GpuCacheVersion;
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = hostVersion;
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
-        if (arr is null) return;
+        if (arr is null)
+        {
+            if (isDeviceModified) ArmLazyResidentDownload(t, buf, backend);
+            return;
+        }
 
         // A zero-allocation GPU result starts life with its activation-cache entry and deferred
         // materializer keyed by DataVector. Its first host access creates a backing array, but the
@@ -6491,6 +6498,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;   // array-backed: BindResidentBuffer armed it
         var capturedBuffer = buffer;
         var capturedBackend = backend;
+        Helpers.HostSync.Remove(tensor.DataVector);
         Helpers.HostSync.Register(tensor.DataVector, obj =>
         {
             var vec = (LinearAlgebra.VectorBase<T>)obj;
@@ -7093,9 +7101,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={idxBuf.Size} impliedV={tableBuf.Size/embeddingDim}");
             backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
-            output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.GpuCacheVersion;
-            var oArr = output.GetBackingArrayForCacheLookupUnsafe();
-            if (oArr is not null && s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[oArr] = s_currentForwardOp;
+            BindResidentBuffer(output, outBuf, backend);
             return true;
         }
         catch (NotSupportedException eex) { GpuLaunchProbe.OnFallback("TryEmbeddingFromFloatIndicesResidentInto", eex); AliasDiag($"EmbFloat-resident FELLBACK n={numIndices} dim={embeddingDim}: {eex.GetType().Name}: {eex.Message}"); return false; }
