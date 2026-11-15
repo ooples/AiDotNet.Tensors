@@ -470,7 +470,9 @@ public static class TensorAllocator
             if (arenaArray != null)
             {
                 var memory = new Memory<T>(arenaArray, 0, totalSize);
-                return Tensor<T>.FromMemory(memory, shape);
+                var issued = Tensor<T>.FromMemory(memory, shape);
+                arena.WatchIssued(arenaArray, issued, issued._storage);
+                return issued;
             }
             // Arena full — fall through to other tiers
         }

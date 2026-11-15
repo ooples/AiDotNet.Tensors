@@ -427,6 +427,7 @@ public sealed class TensorArena : IDisposable
     /// </remarks>
     public static void ClearPersistentPool()
     {
+        t_quarantine?.Clear();
         _persistent?.Clear();
         _carryPool?.Clear();
         _persistentReuseHits = 0;
@@ -1025,7 +1026,7 @@ public sealed class TensorArena : IDisposable
                 {
                     var array = (T[])returned.Pop();
                     _issueLog?.Add(new IssuedBuffer(array, -1, 0));
-                    return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(array, 0, totalSize), shape);
+                    return Watched(LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(array, 0, totalSize), shape), array);
                 }
                 int cursor = _tensorRingCursors![i];
                 // Skip wrappers a finished step handed to its caller (see ResetKeeping); they are still in use, and
@@ -1045,7 +1046,7 @@ public sealed class TensorArena : IDisposable
                 MarkIssued(newArr);
                 _ringBackingArrays.Add((typeof(T), totalSize, newArr));
                 TrackBackingBytes<T>(totalSize);
-                var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
+                var newTensor = Watched(LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape), newArr);
                 bucket.Add(newTensor);
                 _tensorRingCursors[i] = cursor + 1;
                 _issueLog?.Add(new IssuedBuffer(newArr, i, bucket.Count - 1));
@@ -1060,7 +1061,7 @@ public sealed class TensorArena : IDisposable
             MarkIssued(arr);
             _ringBackingArrays.Add((typeof(T), totalSize, arr));
             TrackBackingBytes<T>(totalSize);
-            var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
+            var tensor = Watched(LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape), arr);
             var newBucket = new List<object>(4) { tensor };
             int idx = _tensorRingCount++;
             _tensorRing[idx] = newBucket;
@@ -1084,7 +1085,7 @@ public sealed class TensorArena : IDisposable
         // the ring's contract that the caller writes every element first.
         var overflowArr = TryAllocateUninitialized<T>(totalSize);
         if (overflowArr is null) return null; // disposed
-        return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(overflowArr, 0, totalSize), shape);
+        return Watched(LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(overflowArr, 0, totalSize), shape), overflowArr);
     }
 
     // Hands out the ring wrapper at a bucket position again, under the requested shape and with no previous owner's
@@ -1107,8 +1108,8 @@ public sealed class TensorArena : IDisposable
             MarkIssued(replacementArray);
             _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
             TrackBackingBytes<T>(totalSize);
-            cached = LinearAlgebra.Tensor<T>.FromMemory(
-                new Memory<T>(replacementArray, 0, totalSize), shape);
+            cached = Watched(LinearAlgebra.Tensor<T>.FromMemory(
+                new Memory<T>(replacementArray, 0, totalSize), shape), replacementArray);
             bucket[position] = cached;
         }
 
@@ -1249,14 +1250,171 @@ public sealed class TensorArena : IDisposable
             foreach (var (type, size, arr) in previous) ReturnPersistent(type, size, arr);
     }
 
+    // ---------------------------------------------------------------------
+    // Escape quarantine for tape-owned arenas.
+    //
+    // A tape-owned arena is one the caller never opened: a top-level GradientTape creates it, so nothing tells the
+    // caller that the op outputs of its forward end with the tape. A hand-rolled loop that keeps a forward output past
+    // its tape still holds arena memory, and pooling that buffer on Dispose let a later tape rent it and overwrite the
+    // kept tensor (TapeOwnedArenaLifetimeTests at 64Ki+ elements). So a tape-owned arena records each wrapper its
+    // FORWARD issues (the tape suspends the watch around its backward, whose temporaries never reach the caller; the
+    // gradients it hands back keep their one-step hold, HoldOverStepBoundary), and on Dispose each such buffer waits
+    // here until that wrapper and the storage it had (shared by every view of it) have both been collected: only then
+    // does nothing read the buffer, and it joins the cross-arena pool. A buffer still referenced after
+    // MaxQuarantineSweeps arena lifetimes belongs to the caller; it leaves the quarantine and the GC owns it. Explicit
+    // arenas (a model base's step, Predict's per-call arena) scope their outputs and pool directly, as before. The weak
+    // references and their lists are recycled per thread, so a steady loop allocates none of this bookkeeping.
+    // ---------------------------------------------------------------------
+
+    private struct Quarantined
+    {
+        internal Type Type;
+        internal int Size;
+        internal Array Array;
+        internal List<WeakReference> Owners;
+        internal int Sweeps;
+    }
+
+    [ThreadStatic] private static List<Quarantined>? t_quarantine;
+    [ThreadStatic] private static Stack<WeakReference>? t_freeWeakRefs;
+    [ThreadStatic] private static Stack<List<WeakReference>>? t_freeOwnerLists;
+
+    // Wrappers this tape-owned arena's forward issued, per backing array (identity): the wrapper and its storage.
+    private Dictionary<Array, List<WeakReference>>? _watchedOwners;
+    private int _escapeWatchSuspended;
+
+    /// <summary>
+    /// Arena lifetimes a quarantined buffer may stay referenced before the caller is taken to own it (GC-owned from
+    /// then). Short, so the quarantine retains a few steps' buffers at most: a buffer the caller dropped is found dead at
+    /// the first sweep after a collection, and one the caller keeps longer is the caller's.
+    /// </summary>
+    private const int MaxQuarantineSweeps = 4;
+
+    // Per (type, size): buffers the newest arena quarantined this sweep, the most a sweep returns to the pool.
+    [ThreadStatic] private static Dictionary<(Type, int), int>? t_sweepNeed;
+
+    /// <summary>Most buffers held in quarantine on a thread; the oldest leave (GC-owned) beyond it.</summary>
+    private const int MaxQuarantined = 4096;
+
+    /// <summary>Buffers currently waiting in this thread's escape quarantine. Diagnostic.</summary>
+    internal static int QuarantinedCount => t_quarantine?.Count ?? 0;
+
+    /// <summary>Stops recording issued wrappers (a tape's backward); pair with <see cref="ResumeEscapeWatch"/>.</summary>
+    internal void SuspendEscapeWatch() => _escapeWatchSuspended++;
+
+    /// <summary>Resumes recording after <see cref="SuspendEscapeWatch"/>.</summary>
+    internal void ResumeEscapeWatch() => _escapeWatchSuspended--;
+
+    private LinearAlgebra.Tensor<T> Watched<T>(LinearAlgebra.Tensor<T> tensor, T[] array)
+    {
+        if (OwnedByTape && _escapeWatchSuspended == 0) Watch(array, tensor, tensor._storage);
+        return tensor;
+    }
+
+    /// <summary>
+    /// Records that <paramref name="owner"/> (and <paramref name="storage"/>, when it has one its views share) reads
+    /// <paramref name="array"/>, a buffer this arena issued: the allocators call it for the tensors, matrices and
+    /// vectors they wrap around a scratch array. A no-op except in a tape-owned arena's forward.
+    /// </summary>
+    internal void WatchIssued(Array array, object owner, object? storage = null)
+    {
+        if (OwnedByTape && _escapeWatchSuspended == 0) Watch(array, owner, storage);
+    }
+
+    private void Watch(Array array, object owner, object? storage)
+    {
+        var map = _watchedOwners ??= new Dictionary<Array, List<WeakReference>>(
+            Engines.Autodiff.ReferenceEqualityComparer<Array>.Instance);
+        if (!map.TryGetValue(array, out var owners))
+        {
+            var lists = t_freeOwnerLists;
+            map[array] = owners = lists is { Count: > 0 } ? lists.Pop() : new List<WeakReference>(2);
+        }
+        owners.Add(WeakTo(owner));
+        if (storage is not null) owners.Add(WeakTo(storage));
+    }
+
+    private static WeakReference WeakTo(object target)
+    {
+        var free = t_freeWeakRefs;
+        if (free is { Count: > 0 }) { var w = free.Pop(); w.Target = target; return w; }
+        return new WeakReference(target);
+    }
+
+    private static void Recycle(List<WeakReference> owners)
+    {
+        var free = t_freeWeakRefs ??= new Stack<WeakReference>();
+        foreach (var w in owners) { w.Target = null; free.Push(w); }
+        owners.Clear();
+        (t_freeOwnerLists ??= new Stack<List<WeakReference>>()).Push(owners);
+    }
+
+    private void ReturnOrQuarantine(Type type, int size, Array arr)
+    {
+        if (_watchedOwners is not null && _watchedOwners.TryGetValue(arr, out var owners))
+        {
+            _watchedOwners.Remove(arr);
+            if (!Persists(type, size)) { Recycle(owners); return; } // gen-0: the GC reclaims it once the caller lets go
+            (t_quarantine ??= new List<Quarantined>()).Add(
+                new Quarantined { Type = type, Size = size, Array = arr, Owners = owners });
+            return;
+        }
+        ReturnPersistentUnlessHeld(type, size, arr);
+    }
+
+    // Drops the bookkeeping of watched buffers Dispose did not pool or quarantine.
+    private void RecycleUnvisitedWatches()
+    {
+        if (_watchedOwners is null) return;
+        foreach (var kvp in _watchedOwners) Recycle(kvp.Value);
+        _watchedOwners = null;
+    }
+
+    // Moves quarantined buffers nothing references any more into the cross-arena pool; ages the rest. A collection
+    // frees many steps' buffers at once, so a sweep returns no more of a size than the newest arena quarantined (one
+    // step's use, the self-limit an arena's own Dispose has); the others are left to the GC.
+    private static void SweepQuarantine()
+    {
+        var q = t_quarantine;
+        if (q is null || q.Count == 0) return;
+        var need = t_sweepNeed ??= new Dictionary<(Type, int), int>();
+        need.Clear();
+        foreach (var entry in q)
+            if (entry.Sweeps == 0)
+                need[(entry.Type, entry.Size)] = need.TryGetValue((entry.Type, entry.Size), out int n) ? n + 1 : 1;
+        int keep = 0;
+        for (int i = 0; i < q.Count; i++)
+        {
+            var entry = q[i];
+            bool referenced = false;
+            foreach (var owner in entry.Owners)
+                if (owner.IsAlive) { referenced = true; break; }
+            if (!referenced)
+            {
+                Recycle(entry.Owners);
+                var key = (entry.Type, entry.Size);
+                if (need.TryGetValue(key, out int left) && left > 0)
+                {
+                    need[key] = left - 1;
+                    ReturnPersistent(entry.Type, entry.Size, entry.Array);
+                }
+                continue;
+            }
+            if (++entry.Sweeps > MaxQuarantineSweeps) { Recycle(entry.Owners); continue; } // the caller keeps it
+            q[keep++] = entry;
+        }
+        q.RemoveRange(keep, q.Count - keep);
+        if (q.Count > MaxQuarantined)
+        {
+            int drop = q.Count - MaxQuarantined;
+            for (int i = 0; i < drop; i++) Recycle(q[i].Owners);
+            q.RemoveRange(0, drop);
+        }
+    }
+
     // Returns an array to the cross-arena pool unless the finished step's caller still holds it.
     private void ReturnPersistentUnlessHeld(Type type, int size, Array arr)
     {
-        // A tape-owned arena is one the caller never opened, so nothing tells the caller its op outputs end with the
-        // tape: a forward output kept past the tape is still arena memory. Its buffers below PersistThresholdElems stay
-        // out of the pool (GC-owned) as before the LOH rule, so keeping such an output does not hand its storage to a
-        // later tape. Explicit arenas scope their outputs and pool every LOH-sized buffer.
-        if (OwnedByTape && size < PersistThresholdElems) return;
         if (_heldOver is not null && _heldOver.Contains(arr))
             (t_withheldFromPool ??= new List<(Type, int, Array)>()).Add((type, size, arr));
         else
@@ -1356,12 +1514,12 @@ public sealed class TensorArena : IDisposable
                 var (type, size) = kvp.Key;
                 var bucket = kvp.Value;
                 for (int i = 0; i < bucket.Count; i++)
-                    ReturnPersistentUnlessHeld(type, size, bucket[i]);
+                    ReturnOrQuarantine(type, size, bucket[i]);
             }
             for (int i = 0; i < _ringBackingArrays.Count; i++)
             {
                 var (type, size, arr) = _ringBackingArrays[i];
-                ReturnPersistentUnlessHeld(type, size, arr);
+                ReturnOrQuarantine(type, size, arr);
             }
             // Return the last boundary-carry buffer (#1824). By Dispose the final layer has
             // consumed it and the model output is a fresh detached copy, so the carry is dead.
@@ -1371,6 +1529,8 @@ public sealed class TensorArena : IDisposable
         if (System.Environment.GetEnvironmentVariable("AIDOTNET_ARENA_DIAG") == "1")
             System.Console.Error.WriteLine($"[ARENA-DISPOSE] pooled={( _previous is null || _poolWhenNested)} poolWhenNested={_poolWhenNested} prevNull={_previous is null} ringBackings={_ringBackingArrays.Count} poolBuckets={_pool.Count} peakMB={_peakBackingBytes / BytesPerMiB:F1} reuseHitsTotal={_persistentReuseHits}");
         _pendingCarryReturn = null;
+        RecycleUnvisitedWatches();
+        if (_previous is null) SweepQuarantine();
 
         _pool.Clear();
         _cursor.Clear();
