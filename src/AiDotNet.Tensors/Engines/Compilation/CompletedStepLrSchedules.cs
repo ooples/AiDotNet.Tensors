@@ -311,6 +311,9 @@ internal sealed class OneCycleWithAnnealLr : CompletedStepLr
         _annealSteps = totalSteps - _warmupSteps;
         _initialLr = lrMax / divFactor;
         _finalLr = _initialLr / finalDivFactor;
+        // Each factor alone can be valid while the quotient is not: lrMax / double.Epsilon overflows to infinity.
+        RequireRate(_initialLr, nameof(divFactor));
+        RequireRate(_finalLr, nameof(finalDivFactor));
     }
 
     protected override double Initial => _initialLr;

@@ -91,6 +91,9 @@ public class CompletedStepLrScheduleTests
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.NoamHoldAnnealing(1.0, 0, 0, 0.5));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.CosineWarmRestarts(1.0, 5, 0));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.OneCycleWithAnneal(1.0, 10, 1.0));
+        // Valid factors whose quotient overflows: the starting rate would be infinite.
+        Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.OneCycleWithAnneal(1.0, 10, 0.3, double.Epsilon, 1e4, OneCycleAnneal.Cosine));
+        Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.OneCycleWithAnneal(1.0, 10, 0.3, 1e-200, 1e-200, OneCycleAnneal.Linear));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.Cyclic(1.0, 0.5, 2, 2, CyclicLrMode.Triangular));
         Assert.Throws<ArgumentOutOfRangeException>(() => LrSchedule.Sequential(new[] { LrSchedule.Constant(1) }, new[] { 3 }));
     }
