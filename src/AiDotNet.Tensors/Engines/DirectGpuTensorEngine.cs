@@ -2243,6 +2243,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
         if (tensor.IsGpuResident) return true;
+        // A buffer the tensor owns (an optimizer state from TryCreateDeviceStateTensor) is neither a cache entry nor
+        // poolable, so no other tensor can hold it. Bound in sync with the host (isDeviceModified: false), it has no
+        // pending download yet; the caller's version check still rejects it after a host write.
+        if (tensor._ownsGpuBuffer) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
         // A device-owned binding (an optimizer state, a resident step buffer, a parameter updated on the device) is
         // not a cache entry: its storage has a pending download FROM the device, so the device copy is the current
