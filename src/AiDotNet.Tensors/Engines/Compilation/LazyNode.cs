@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// operation later (during Realize) or to fuse it with adjacent operations.
 /// </summary>
 /// <typeparam name="T">The numeric element type.</typeparam>
-internal sealed class LazyNode<T> : ILazyNode
+internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering
 {
     // ═══ Operation identity ═══
     public LazyNodeType OpType { get; }
@@ -61,6 +61,9 @@ internal sealed class LazyNode<T> : ILazyNode
     private ILazyNode[]? _earlierReaders;
 
     internal void SetEarlierReaders(ILazyNode[] readers) => _earlierReaders = readers.Length == 0 ? null : readers;
+
+    /// <inheritdoc />
+    public IReadOnlyList<ILazyNode> EarlierReaders => _earlierReaders ?? Array.Empty<ILazyNode>();
 
     /// <inheritdoc />
     public bool ReadsStorageOf(object tensor)

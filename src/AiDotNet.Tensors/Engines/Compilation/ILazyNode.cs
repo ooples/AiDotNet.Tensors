@@ -76,6 +76,13 @@ internal interface ILazyNode
     void AddStorageLeases(TensorStorageLeaseSet leases);
 }
 
+/// <summary>An in-place write ordered after the earlier readers of its target (see <c>LazyTensorScope.RecordInPlace</c>).</summary>
+internal interface IInPlaceReadOrdering
+{
+    /// <summary>The nodes that read the write's target before it was recorded; empty when none did.</summary>
+    IReadOnlyList<ILazyNode> EarlierReaders { get; }
+}
+
 /// <summary>Resolves a node's producers by record order.</summary>
 internal static class LazyNodeOrder
 {
