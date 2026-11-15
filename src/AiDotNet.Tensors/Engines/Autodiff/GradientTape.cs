@@ -1131,16 +1131,19 @@ public sealed class GradientTape<T> : IDisposable
         // reads: freeing at last use, or closing a probe window between two walks of the same graph, would free storages
         // the next walk still reads.
         bool freeAtLastUse = _options.ReleaseDeviceActivationsAtLastUse && _releaseStreamingActivations;
+        // A create-graph backward frees nothing (BackwardStorageReleasePlan skips it), so the tape stays usable.
+        bool consumesGraph = freeAtLastUse && !createGraph && !DifferentiableOps._isBackwardCreateGraph
+            && _engine.Is<DirectGpuTensorEngine>();
         bool outerReleaseScope = ReleaseScope.Enter(freeAtLastUse);
         try
         {
             grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
-            // A create-graph backward frees nothing (BackwardStorageReleasePlan skips it), so the tape stays usable.
-            if (freeAtLastUse && !createGraph && !DifferentiableOps._isBackwardCreateGraph && _engine.Is<DirectGpuTensorEngine>())
-                _freedDeviceActivationsAtLastUse = true;
         }
         finally
         {
+            // Consumed whether the walk finished or threw: steps before a failing one may already have freed what a
+            // retry would read.
+            if (consumesGraph) _freedDeviceActivationsAtLastUse = true;
             ReleaseScope.Exit(outerReleaseScope);
             // Whether or not this backward used it, the forward is over: stop recording rentals into it.
             _activationLogArena?.TakeForwardActivationLog();
@@ -1152,11 +1155,13 @@ public sealed class GradientTape<T> : IDisposable
         // so inside the release window) and the loss outlive the tape, for as long as the caller holds them.
         KeepAfterTape(loss);
         HoldOverStepBoundary(loss);
-        // Asked for every gradient (no sources), the caller is handed the non-leaf ones too. As PyTorch keeps no .grad
-        // on a non-leaf tensor it was not told to retain, those are freed when this tape is disposed, on the device and
-        // in stream order, instead of waiting for the GC; leaf gradients (parameters, inputs) and retained ones stay.
-        var nonLeaf = sources is null && !createGraph && seedOverride is null && _engine.Is<DirectGpuTensorEngine>()
-            && !DifferentiableOps._isBackwardCreateGraph ? EntryOutputs() : null;
+        // Asked for every gradient (no sources), the caller is handed the non-leaf ones too. On a tape that opted in to
+        // freeing device memory early (ReleaseDeviceActivationsAtLastUse), and as PyTorch keeps no .grad on a non-leaf
+        // tensor it was not told to retain, those are freed when this tape is disposed, on the device and in stream
+        // order, instead of waiting for the GC; leaf gradients (parameters, inputs) and retained ones stay. A default
+        // tape never invalidates a tensor its caller holds, so it keeps them all.
+        var nonLeaf = _options.ReleaseDeviceActivationsAtLastUse && sources is null && !createGraph && seedOverride is null
+            && _engine.Is<DirectGpuTensorEngine>() && !DifferentiableOps._isBackwardCreateGraph ? EntryOutputs() : null;
         HashSet<object>? keptStorage = null;
         List<Tensor<T>>? toRelease = null;
         foreach (var pair in grads)
@@ -2922,6 +2927,8 @@ public sealed class GradientTape<T> : IDisposable
         // The cached backward chain addresses the entries just dropped.
         _cachedDelegateChain?.Clear();
         _cachedDelegateChain = null;
+        // A fresh graph: the one whose intermediates were freed at their last use is gone with the entries.
+        _freedDeviceActivationsAtLastUse = false;
         // The next recording decides its own device: a persistent tape reused across steps must not keep the engine
         // the previous step's data resolved to.
         _sawGpuResidentData = false;

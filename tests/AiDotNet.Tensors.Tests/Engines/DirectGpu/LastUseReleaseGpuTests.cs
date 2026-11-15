@@ -255,11 +255,14 @@ public sealed class LastUseReleaseGpuTests
         }
     }
 
-    [SkippableFact]
-    public void A_retained_non_leaf_gradient_survives_the_tapes_dispose()
+    [SkippableTheory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    public void A_non_leaf_gradient_outlives_the_tape_unless_an_opted_in_tape_was_not_told_to_keep_it(bool optIn, bool retain)
     {
-        // A backward with no sources hands back non-leaf gradients and frees them at dispose; Retain(gradient) must keep
-        // one, as it keeps any tensor.
+        // A backward with no sources hands back non-leaf gradients. An opted-in tape frees them at dispose unless Retain
+        // kept one; a default tape never invalidates what its caller holds, so it keeps them (it freed them too).
         using var gpu = new DirectGpuTensorEngine();
         Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
         AutoRetainProbe.ResetForTests();
@@ -267,15 +270,76 @@ public sealed class LastUseReleaseGpuTests
         var x = gpu.UploadToGpu(Input(23), GpuTensorRole.General);
         var w = gpu.UploadToGpu(hostW, GpuTensorRole.General);
         Tensor<float>? gradY = null;
-        using (var tape = new GradientTape<float>())
+        using (var tape = new GradientTape<float>(optIn ? OptIn : null))
         {
             var y = gpu.Sigmoid(x);
             var grads = tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(y, w), null));
             if (grads.TryGetValue(y, out var g)) gradY = g;
-            if (gradY is not null) tape.Retain(gradY);
+            if (retain && gradY is not null) tape.Retain(gradY);
         }
         Assert.NotNull(gradY);
-        if (gradY is not null) Assert.Equal(hostW.ToArray(), gradY.ToArray(), new FloatTolerance(1e-6f));   // d/dy = w
+        if (gradY is null) return;
+        if (optIn && !retain) Assert.Throws<InvalidOperationException>(() => gradY.ToArray());
+        else Assert.Equal(hostW.ToArray(), gradY.ToArray(), new FloatTolerance(1e-6f));   // d/dy = w
+    }
+
+    [SkippableFact]
+    public void A_backward_that_throws_after_freeing_leaves_the_tape_consumed()
+    {
+        // A step after the first free threw, so the consumed flag (set after a finished walk) was never set: a retry
+        // walked the graph again over the freed intermediate.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var x = gpu.UploadToGpu(Input(33), GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(34), GpuTensorRole.General);
+        bool throwNow = false;
+        BackwardFunction<float> throwing = (gradOutput, inputs, output, saved, engine, accumulator) =>
+        {
+            if (throwNow) throw new NotSupportedException("injected backward failure");
+        };
+        for (int run = 0; run < 2; run++)   // the probe run, then one that frees
+        {
+            throwNow = run == 1;
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true, ReleaseDeviceActivationsAtLastUse = true });
+            // Recorded first, so its backward runs last: after the sigmoid's backward freed y.
+            var side = new Tensor<float>(new float[Shape[0] * Shape[1] * Shape[2]], Shape);
+            DifferentiableOps.RecordUnary("InjectedFailure", side, x, throwing);
+            var y = gpu.Sigmoid(x);
+            var loss = gpu.TensorAdd(gpu.ReduceSum(gpu.TensorMultiply(y, w), null), gpu.ReduceSum(side, null));
+            if (!throwNow)
+            {
+                tape.ComputeGradients(loss, new[] { x });
+                continue;
+            }
+            Assert.Throws<NotSupportedException>(() => tape.ComputeGradients(loss, new[] { x }));
+            var retry = Assert.Throws<InvalidOperationException>(() => tape.ComputeGradients(loss, new[] { x }));
+            Assert.Contains("RetainUntilTapeDisposal", retry.Message);
+        }
+    }
+
+    [SkippableFact]
+    public void A_reset_tape_records_and_runs_a_fresh_graph_after_freeing_the_last_one()
+    {
+        // Reset drops the consumed graph, but the consumed flag stayed set: the fresh graph's first backward threw.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var hostX = Input(35);
+        var hostW = Input(36);
+        var x = gpu.UploadToGpu(hostX, GpuTensorRole.General);
+        var w = gpu.UploadToGpu(hostW, GpuTensorRole.General);
+        var s = Sigmoid(hostX.ToArray());
+        var wArr = hostW.ToArray();
+        var expected = s.Select((si, i) => wArr[i] * si * (1f - si)).ToArray();   // d sum(w * sigmoid(x)) / dx
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true, ReleaseDeviceActivationsAtLastUse = true });
+        for (int graph = 0; graph < 3; graph++)
+        {
+            if (graph > 0) tape.Reset();
+            var y = gpu.Sigmoid(x);
+            var grads = tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(y, w), null), new[] { x });
+            Assert.Equal(expected, grads[x].ToArray(), new FloatTolerance(1e-5f));
+        }
     }
 
     [SkippableFact]
