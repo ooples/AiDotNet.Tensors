@@ -110,15 +110,15 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
             // Execute with the input showing its producer as of this node, as LazyNode does: a read of the input
             // auto-realizes its LazySource, which for a tensor written in place later in the trace is that later write,
             // so this node would have read the written value and the plan would run the write a second time.
-            bool shown = Input is not null && latest is not null && !ReferenceEquals(asOf, latest);
-            if (shown && Input is not null) Input.LazySource = asOf;
+            var shown = latest is not null && !ReferenceEquals(asOf, latest) ? Input : null;
+            if (shown is not null) shown.LazySource = asOf;
             try
             {
                 Execute(engine, Output);
             }
             finally
             {
-                if (shown && Input is not null) Input.LazySource = latest;
+                if (shown is not null) shown.LazySource = latest;
             }
         }
         catch

@@ -3903,10 +3903,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // After a device step the optimizer reads the gradient's device buffer (and a host array it bound
                 // before that buffer took over), not the host copy just written: put the same values there and mark it
                 // current, so both copies hold this step's gradient.
-                if (typeof(T) == typeof(float) && slot._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero
+                if (values is float[] floats && slot._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero
                     && slot._gpuBackend is { } backend && buffer.Size >= slot.Length && slot.IsContiguous)
                 {
-                    backend.UploadBufferInPlace((float[])(object)values, buffer);
+                    backend.UploadBufferInPlace(floats, buffer);
                     slot._gpuBufferVersion = slot.GpuCacheVersion;
                 }
             }
@@ -4571,7 +4571,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             lastRead[t] = lastRead.TryGetValue(t, out int prior) ? Math.Max(prior, a) : a;
         }
         for (int a = 0; a < actions; a++)
-            foreach (int s in coverage[a]!)
+            foreach (int s in coverage[a] ?? Array.Empty<int>())   // none is null (checked above)
             {
                 var step = forwardSteps[s];
                 Read(step.OutputBuffer, a);
@@ -5110,7 +5110,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 bwd[i](engine);
                 de?.EndScratchAction();
-                if (lend is not null && lend[i] is { } dead) lendPool!.Lend(dead);
+                if (lendPool is not null && lend is not null && lend[i] is { } dead) lendPool.Lend(dead);
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
                     string nm = i < bwdNames.Length ? bwdNames[i] : "?";
