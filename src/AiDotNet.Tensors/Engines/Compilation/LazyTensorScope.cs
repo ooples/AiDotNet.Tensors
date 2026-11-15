@@ -25,6 +25,8 @@ internal sealed class LazyTensorScope : IDisposable
     private readonly GraphTraceKind _traceKind;
     private readonly bool _isProbe;
 
+    internal CompiledOpShapeCache CompiledOpShapes { get; set; } = new();
+
     internal LazyTensorScope(
         LazyTensorScope? parent,
         GraphTraceKind traceKind = GraphTraceKind.Compatibility,

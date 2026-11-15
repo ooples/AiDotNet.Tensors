@@ -35,6 +35,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     Delegate? ISignableLazyNode.BackwardDelegate => BackwardFn;
     object[]? ISignableLazyNode.SavedStateObjects => SavedState;
     bool ISignableLazyNode.ReplaysHostStateFlag => false;
+    object? ISignableLazyNode.AuxiliaryOutput => null;
 
     public LazyNodeType OpType { get; }
     public string OpName { get; }

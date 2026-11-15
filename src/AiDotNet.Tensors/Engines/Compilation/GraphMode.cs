@@ -227,9 +227,10 @@ internal static class GraphMode
     /// <see cref="ObjectiveProbeAbortedException"/>. Parameters are not touched (no copy-on-write privatization),
     /// because a probe never writes anything. Dispose the scope to discard the trace.
     /// </summary>
-    internal static LazyTensorScope EnableProbe()
+    internal static LazyTensorScope EnableProbe(CompiledOpShapeCache? shapes = null)
     {
         var scope = new LazyTensorScope(_current, GraphTraceKind.Training, isProbe: true);
+        if (shapes is not null) scope.CompiledOpShapes = shapes;
         _current = scope;
         return scope;
     }

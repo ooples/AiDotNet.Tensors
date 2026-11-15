@@ -249,10 +249,7 @@ public class ClosureObjectiveHostLossTests
         Assert.True(result == ClosureGuardResult.Matched, guard.LastReason);
     }
 
-    // An op that computes from its operands while it records (TensorMaskedFill and the rest of TryRecordCompiledOp)
-    // clears the ambient scope first, which hid the probe from the abort check: the probe then executed the upstream
-    // LayerNorm node on shape-only stand-ins and threw IndexOutOfRangeException from its kernel. A probe value is never
-    // computed, so the probe must abort as a read of that node instead.
+    // The cache supplies MaskedFill's output shape without realizing the upstream LayerNorm on shape-only values.
     [Fact]
     public void A_probe_never_executes_a_node_an_eager_recorder_reads()
     {
@@ -275,8 +272,6 @@ public class ClosureObjectiveHostLossTests
         Assert.True(guard is not null, reason);
         var result = guard!.TryRebind(objective, parameters, out _);
         _out.WriteLine($"{result}: {guard.LastReason}");
-        Assert.NotEqual(ClosureGuardResult.Matched, result);
-        Assert.DoesNotContain("IndexOutOfRange", guard.LastReason ?? "");
-        Assert.Contains("LayerNorm", guard.LastReason ?? "");
+        Assert.True(result == ClosureGuardResult.Matched, guard.LastReason);
     }
 }

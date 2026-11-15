@@ -128,3 +128,30 @@ same as `CompiledTrainingPlan`'s.
 - Where the probe flag lives in `LazyTensorScope`, and how a shape-only tensor is represented.
 - The exact field-type allowlist for signing.
 - Whether leaf copies use the existing upload paths or a new device-to-device copy.
+
+## Shape cache for opaque CPU recorders
+
+`TryRecordCompiledOp` normally executes once during tracing to discover its output shape. Guarded probes instead
+use a snapshot of metadata collected by that same training trace. Each entry is scoped to the guard and node
+position and compares the operation name, engine type, element type, operand geometry, forward method and captured
+options through `ObjectiveSignature`. The cache retains shapes and signature tokens, never activation data or
+tensor references. It is not a process-wide cache.
+
+A matching entry creates a deferred output and records the usual delegates without realizing operands, saving
+persistent writes, or invoking the forward. The complete objective signature must still match before any leaf is
+rebound. A missing entry, changed options or unsupported recorder aborts the probe; it never runs a kernel to fill
+the cache. Standalone `Probe` calls without a seed still decline these operations.
+
+Only explicitly audited shape-stable operations opt in. Scatter operations that infer output size from index
+values remain unsupported, as do random/stateful recorders and host-array auxiliary outputs. New recorders require
+a shape-stability audit before joining the allowlist.
+
+Tensor-valued integer indices get separate deferred shapes and are classified as auxiliary node outputs in the
+objective signature, not external leaves. Their producers refresh the real indices during replay. Reading probe
+indices on the host aborts just like reading a primary output. Host arrays cannot enforce this read boundary and
+are deliberately not replaced by fabricated index arrays.
+
+Regression coverage includes changing batches with loss/SGD parity, changed padding options, no eager forward
+calls during cache hits or misses, pool/unpool with a changing winner, explicit host reads, unseeded probes,
+data-dependent scatter, and FFT/STFT/Where/BoxIou following computed inputs. Model-level replay and speed claims
+still require the separate AiDotNet audit.

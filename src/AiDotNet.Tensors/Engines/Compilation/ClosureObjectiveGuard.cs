@@ -23,11 +23,13 @@ internal sealed class ClosureObjectiveGuard<T>
     private static Recording? _recording;
 
     private readonly object[] _leaves;
+    private readonly CompiledOpShapeCache _shapes;
 
-    private ClosureObjectiveGuard(ObjectiveSignature signature, object[] leaves)
+    private ClosureObjectiveGuard(ObjectiveSignature signature, object[] leaves, CompiledOpShapeCache shapes)
     {
         Signature = signature;
         _leaves = leaves;
+        _shapes = shapes;
         foreach (var leaf in leaves)
             if (leaf is ISignatureTensor st && st.ElementType != typeof(T))
                 HasForeignLeaves = true;
@@ -106,7 +108,7 @@ internal sealed class ClosureObjectiveGuard<T>
             return;
         }
 
-        recording.Guard = new ClosureObjectiveGuard<T>(signature, leaves);
+        recording.Guard = new ClosureObjectiveGuard<T>(signature, leaves, scope.CompiledOpShapes.Snapshot());
         recording.Reason = null;
     }
 
@@ -130,7 +132,7 @@ internal sealed class ClosureObjectiveGuard<T>
     /// signature looks it up on <see cref="ClosureGuardResult.Mismatched"/>.</param>
     internal ClosureGuardResult TryRebind(Func<Tensor<T>> objective, Tensor<T>[] parameters, out ObjectiveSignature? probed)
     {
-        var result = Probe(objective, parameters, out probed, out var leaves, out string? reason);
+        var result = Probe(objective, parameters, out probed, out var leaves, out string? reason, _shapes);
         if (result != ClosureGuardResult.Matched || probed is null)
         {
             LastReason = reason;
@@ -203,7 +205,8 @@ internal sealed class ClosureObjectiveGuard<T>
         Tensor<T>[] parameters,
         out ObjectiveSignature? signature,
         out object[] leaves,
-        out string? reason)
+        out string? reason,
+        CompiledOpShapeCache? shapes = null)
     {
         if (objective is null) throw new ArgumentNullException(nameof(objective));
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
@@ -212,7 +215,7 @@ internal sealed class ClosureObjectiveGuard<T>
         leaves = Array.Empty<object>();
         try
         {
-            using var scope = GraphMode.EnableProbe();
+            using var scope = GraphMode.EnableProbe(shapes);
             var loss = objective();
             if (UnreplayableReason(scope, loss) is { } unreplayable)
             {

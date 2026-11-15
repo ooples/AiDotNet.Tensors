@@ -27,6 +27,9 @@ internal sealed class LazyNode<T> : ILazyNode, ISignableLazyNode
     Delegate? ISignableLazyNode.BackwardDelegate => BackwardFn;
     object[]? ISignableLazyNode.SavedStateObjects => SavedState;
     bool ISignableLazyNode.ReplaysHostStateFlag => ReplaysHostState;
+    internal object? AuxiliaryOutput { get; set; }
+    object? ISignableLazyNode.AuxiliaryOutput => AuxiliaryOutput;
+
 
     // ═══ Operation identity ═══
     public LazyNodeType OpType { get; }

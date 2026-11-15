@@ -22,6 +22,8 @@ internal interface ISignableLazyNode : ILazyNode
     Delegate? BackwardDelegate { get; }
     object[]? SavedStateObjects { get; }
     bool ReplaysHostStateFlag { get; }
+    object? AuxiliaryOutput { get; }
+
 
     /// <summary>
     /// Set when a probe trace recorded the node: its inputs and output are shape-only stand-ins, so realizing it
@@ -121,6 +123,27 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
         return new ObjectiveSignature(builder.Tokens.ToArray(), nodes.Count, reason);
     }
 
+    // Local shape lookup excludes tensor values, but compares geometry, dtype and captured options.
+    internal static ObjectiveSignature BuildShapeKey<T>(string opName, IEngine engine,
+        IReadOnlyList<Tensor<T>> inputs, Delegate forward)
+    {
+        var builder = new Builder(Array.Empty<object>());
+        builder.Tokens.Add(opName);
+        builder.Tokens.Add(engine.GetType());
+        builder.Tokens.Add(typeof(T));
+        string? reason = null;
+        foreach (var input in inputs)
+        {
+            var tensor = (ISignatureTensor)input;
+            builder.Tokens.Add(new ArrayToken(tensor.SignatureShape));
+            builder.Tokens.Add(new ArrayToken(tensor.SignatureStrides));
+            builder.Tokens.Add(tensor.SignatureOffset);
+            reason ??= builder.AddTensorReference(input, opName, "shape input");
+        }
+        reason ??= builder.AddDelegate(forward, opName, "shape forward", 0);
+        return new ObjectiveSignature(builder.Tokens.ToArray(), 0, reason);
+    }
+
     public bool Equals(ObjectiveSignature? other)
     {
         if (other is null) return false;
@@ -183,7 +206,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
         public override int GetHashCode() => unchecked(Index * 397 ^ OpName.GetHashCode());
     }
 
-    private enum RefClass : byte { Null, Node, Parameter, ParameterView, Leaf }
+    private enum RefClass : byte { Null, Node, Parameter, ParameterView, Leaf, AuxiliaryNode }
 
     private readonly struct TensorRef : IEquatable<TensorRef>
     {
@@ -280,6 +303,14 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             // From here on the output is this node: an in-place write re-classes its target, and a closure that
             // captures its own output (most do) must see it as this node, never as an external leaf.
             _classes[n.OutputTensor] = new TensorRef(RefClass.Node, index);
+            if (n.AuxiliaryOutput is ISignatureTensor auxiliary)
+            {
+                _classes[auxiliary] = new TensorRef(RefClass.AuxiliaryNode, index);
+                Tokens.Add(auxiliary.ElementType);
+                Tokens.Add(new ArrayToken(auxiliary.SignatureShape));
+            }
+            else Tokens.Add("no-auxiliary-tensor");
+
 
             string? reason = AddDelegate(n.ExecuteDelegate, n.OpName, "Execute", 0)
                              ?? AddDelegate(n.BackwardDelegate, n.OpName, "Backward", 0);
@@ -297,7 +328,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             return null;
         }
 
-        private string? AddTensorReference(object? tensor, string opName, string where)
+        internal string? AddTensorReference(object? tensor, string opName, string where)
         {
             if (tensor is null) { Tokens.Add(new TensorRef(RefClass.Null, 0)); return null; }
             if (_classes.TryGetValue(tensor, out var known)) { Tokens.Add(known); return null; }
@@ -329,7 +360,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             return null;
         }
 
-        private string? AddDelegate(Delegate? d, string opName, string where, int depth)
+        internal string? AddDelegate(Delegate? d, string opName, string where, int depth)
         {
             if (d is null) { Tokens.Add("no-delegate"); return null; }
             if (d.GetInvocationList().Length != 1)
