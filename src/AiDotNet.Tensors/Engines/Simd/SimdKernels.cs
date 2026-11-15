@@ -8189,7 +8189,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>
         /// SIMD-accelerated HardSwish backward for float.
-        /// d/dx[x*(x+3)/6] = (2x+3)/6 for -3 &lt;= x &lt;= 3, 0 for x &lt; -3, 1 for x &gt; 3
+        /// d/dx[x*(x+3)/6] = (2x+3)/6 for -3 &lt;= x &lt;= 3 (torch's hardswish_backward), 0 for x &lt; -3, 1 for x > 3
         /// </summary>
         [MethodImpl(Hot)]
         public static unsafe void HardSwishBackwardUnsafe(float* grad, float* input, float* output, int length)
@@ -8212,9 +8212,9 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var g = Avx.LoadVector256(grad + i);
                     // linear region: (2x+3)/6
                     var linear = Avx.Divide(Avx.Add(Avx.Multiply(vTwo, x), vThree), vSix);
-                    // mask: x > 3 => 1, x < -3 => 0, else linear
-                    var maskHigh = Avx.Compare(x, vPos3, FloatComparisonMode.OrderedGreaterThanNonSignaling);
-                    var maskLow = Avx.Compare(x, vNeg3, FloatComparisonMode.OrderedLessThanNonSignaling);
+                    // mask: x > 3 => 1, x < -3 => 0, else linear (the endpoints stay on the ramp)
+                    var maskHigh = Avx.Compare(x, vPos3, FloatComparisonMode.OrderedGreaterThanSignaling);
+                    var maskLow = Avx.Compare(x, vNeg3, FloatComparisonMode.OrderedLessThanSignaling);
                     var deriv = Avx.BlendVariable(linear, vOne, maskHigh);
                     deriv = Avx.BlendVariable(deriv, vZero, maskLow);
                     Avx.Store(output + i, Avx.Multiply(g, deriv));

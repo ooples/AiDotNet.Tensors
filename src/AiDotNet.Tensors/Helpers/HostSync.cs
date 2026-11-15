@@ -34,7 +34,8 @@ internal abstract class ReleaseNote
 {
     internal abstract string Describe();
 
-    /// <summary>Runs when something reads the released storage, just before the read throws.</summary>
+    /// <summary>Runs when something reads the released storage, just before the read throws. Each note decides what a
+    /// failed read records (a last-use release retains its producer for the graph's next run).</summary>
     internal abstract void OnRead();
 }
 

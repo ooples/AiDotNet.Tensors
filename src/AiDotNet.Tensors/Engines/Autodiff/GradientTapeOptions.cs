@@ -139,6 +139,11 @@ public sealed class GradientTapeOptions
     /// <see cref="GradientTape{T}.Retain(AiDotNet.Tensors.LinearAlgebra.Tensor{T})"/>. The loss, the sources and the
     /// returned gradients are never freed. On a CPU engine it does nothing (see
     /// <see cref="ReleaseActivationsDuringBackward"/>).</para>
+    /// <para>The graph's activations are gone after its backward, so a second backward on the same tape throws, as with
+    /// <see cref="ReleaseActivationsDuringBackward"/> (a create-graph backward frees nothing and does not count). A tape
+    /// whose <see cref="StreamingGraphRetention"/> is <see cref="StreamingGraphRetentionMode.RetainUntilTapeDisposal"/>
+    /// keeps its graph for another backward, so it does not free at last use, as PyTorch's <c>retain_graph=True</c>
+    /// keeps the saved tensors.</para>
     /// </remarks>
     public bool ReleaseDeviceActivationsAtLastUse { get; init; }
 

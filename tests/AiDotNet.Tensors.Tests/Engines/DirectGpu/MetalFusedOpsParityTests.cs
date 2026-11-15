@@ -140,7 +140,7 @@ public sealed class MetalFusedOpsParityTests
             double sp = Math.Log(1 + Math.Exp(v)), t = Math.Tanh(sp);
             return g[i] * (t + v * (1 - t * t) * Sig(v));
         }).ToArray(), Run(b, n, o => b.MishBackward(dg, dx, o, n)), 1e-4, "MishBackward");
-        Close(x.Select((v, i) => g[i] * (v <= -3 ? 0 : v >= 3 ? 1 : (2 * v + 3) / 6.0)).ToArray(), Run(b, n, o => b.HardswishBackward(dg, dx, o, n)), 1e-6, "HardswishBackward");
+        Close(x.Select((v, i) => g[i] * (v < -3 ? 0 : v > 3 ? 1 : (2 * v + 3) / 6.0)).ToArray(), Run(b, n, o => b.HardswishBackward(dg, dx, o, n)), 1e-6, "HardswishBackward");
 
         var t01 = Values(n, 13).Select(v => (v + 2f) / 4f).ToArray();   // targets in (0, 1)
         using var dt = b.AllocateBuffer(t01);

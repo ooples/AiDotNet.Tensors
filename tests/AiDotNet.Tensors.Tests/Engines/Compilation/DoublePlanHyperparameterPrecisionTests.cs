@@ -159,54 +159,69 @@ public class DoublePlanHyperparameterPrecisionTests
         }
     }
 
-    /// <summary>
-    /// Transcodes a current (version 4) optimizer-state export into version 3, which wrote beta1, beta2, epsilon and
-    /// weight decay, and the per-group weight decays, as float. The four values follow magic, version, hasCheckpoint
-    /// (bool), type (int), grouped (bool) and step (int). The group decays are the length-prefixed array holding
-    /// <paramref name="groupWeightDecays"/>, located by its exact bytes; null leaves the -1 marker, which both layouts share.
-    /// </summary>
-    private static byte[] ToVersion4(byte[] current)
-    {
-        Assert.Equal(5, BitConverter.ToInt32(current, 4));
-        using var reader = new System.IO.BinaryReader(new System.IO.MemoryStream(current));
-        // Header, presence/type/group/step, four double hyperparameters, moment settings and max norm.
-        reader.BaseStream.Position = 4 + 4 + 1 + 4 + 1 + 4 + 4 * 8 + 3 * 4 + 8;
-        for (int i = 0; i < 17; i++) reader.ReadSingle();
-        reader.ReadBoolean(); // Nesterov
-        reader.ReadSingle(); // FtrlBeta
-        reader.ReadInt32(); // LbfgsMemorySize
-        for (int i = 0; i < 3; i++) reader.ReadSingle();
-        for (int i = 0; i < 3; i++) reader.ReadBoolean();
-        for (int i = 0; i < 2; i++) if (reader.ReadBoolean()) reader.ReadDouble();
-        int flag = checked((int)reader.BaseStream.Position);
-        var legacy = new System.Collections.Generic.List<byte>(current);
-        legacy.RemoveAt(flag); // v4 has no VelocityIncludesLearningRate byte.
-        for (int i = 0; i < 4; i++) legacy[4 + i] = BitConverter.GetBytes(4)[i];
-        return legacy.ToArray();
-    }
-
     [Fact]
-    public void Version4_optimizer_state_without_velocity_flag_still_imports()
+    public void Optimizer_state_exported_before_the_velocity_flag_still_imports()
     {
         var (_, plan) = Compile();
         using (plan)
         {
             Configure(plan, OptimizerType.Adam);
             plan.Step();
-            plan.ImportOptimizerState(ToVersion4(plan.ExportOptimizerState()!));
-            var restored = Assert.IsType<CompiledTrainingPlan<double>>(plan).CaptureFusedOptimizerCheckpoint();
-            Assert.NotNull(restored);
-            Assert.False(restored!.Extras.VelocityIncludesLearningRate);
+            var typed = Assert.IsType<CompiledTrainingPlan<double>>(plan);
+            var saved = typed.CaptureFusedOptimizerCheckpoint() ?? throw new InvalidOperationException("no checkpoint");
+            byte[] current = plan.ExportOptimizerState() ?? throw new InvalidOperationException("no state");
+
+            // Version 4 is the current layout without the velocity flag. Reading the flag from it would take the first
+            // byte of the LR-schedule count, so the import would fail or restore the wrong schedules.
+            plan.ImportOptimizerState(WithoutVelocityFlag(current, version: 4));
+            var restored = typed.CaptureFusedOptimizerCheckpoint() ?? throw new InvalidOperationException("no checkpoint");
             Assert.Equal(B1, restored.Beta1);
+            Assert.Equal(Eps, restored.Epsilon);
             Assert.Equal(1, restored.OptimizerStep);
+            Assert.False(restored.Extras.VelocityIncludesLearningRate);
+            Assert.Equal(saved.Schedules.Length, restored.Schedules.Length);
+            for (int k = 0; k < saved.Schedules.Length; k++)
+            {
+                Assert.Equal(saved.Schedules[k].Kind, restored.Schedules[k].Kind);
+                Assert.Equal(saved.Schedules[k].Doubles, restored.Schedules[k].Doubles);
+                Assert.Equal(saved.Schedules[k].Ints, restored.Schedules[k].Ints);
+            }
+            Assert.Equal(saved.Parameters.Length, restored.Parameters.Length);
         }
     }
 
-    private static byte[] ToVersion3(byte[] current, double[]? groupWeightDecays)
+    /// <summary>
+    /// Offset of the VelocityIncludesLearningRate flag in a version 5 export: magic, version, hasCheckpoint (bool),
+    /// type, grouped (bool), step, four double hyperparameters, moment storage, int8 block, int8 minimum length, max
+    /// grad norm (double), then the extras: 17 floats, Nesterov (bool), FTRL beta, L-BFGS memory (int), trust radius,
+    /// ADMM rho, LAMB clip, LAMB / decoupled / AMSGrad switches (3 bools), two nullable doubles (bool + double each).
+    /// </summary>
+    private const int VelocityFlagOffset = 4 + 4 + 1 + 4 + 1 + 4 + (4 * 8) + 4 + 4 + 4 + 8
+        + (17 * 4) + 1 + 4 + 4 + 4 + 4 + 4 + 3 + (2 * 9);
+
+    /// <summary>Drops the velocity flag from a version 5 export and stamps <paramref name="version"/>.</summary>
+    private static byte[] WithoutVelocityFlag(byte[] current, int version)
     {
-        current = ToVersion4(current);
+        Assert.Equal(5, BitConverter.ToInt32(current, 4));
+        Assert.True(current[VelocityFlagOffset] <= 1, "the byte at the velocity-flag offset is not a bool");
+        var legacy = new System.Collections.Generic.List<byte>(current);
+        legacy.RemoveAt(VelocityFlagOffset);
+        byte[] v = BitConverter.GetBytes(version);
+        for (int b = 0; b < 4; b++) legacy[4 + b] = v[b];
+        return legacy.ToArray();
+    }
+
+    /// <summary>
+    /// Transcodes a current (version 5) optimizer-state export into version 3, which wrote beta1, beta2, epsilon and
+    /// weight decay, and the per-group weight decays, as float, and had no velocity flag. The four values follow magic,
+    /// version, hasCheckpoint (bool), type (int), grouped (bool) and step (int). The group decays are the
+    /// length-prefixed array holding <paramref name="groupWeightDecays"/>, located by its exact bytes; null leaves the -1
+    /// marker, which both layouts share.
+    /// </summary>
+    private static byte[] ToVersion3(byte[] export, double[]? groupWeightDecays)
+    {
         const int at = 4 + 4 + 1 + 4 + 1 + 4;
-        Assert.Equal(4, BitConverter.ToInt32(current, 4));
+        byte[] current = WithoutVelocityFlag(export, version: 4);
         var legacy = new System.Collections.Generic.List<byte>(current.Length);
         legacy.AddRange(new ArraySegment<byte>(current, 0, at));
         for (int b = 0; b < 4; b++) legacy[4 + b] = BitConverter.GetBytes(3)[b];

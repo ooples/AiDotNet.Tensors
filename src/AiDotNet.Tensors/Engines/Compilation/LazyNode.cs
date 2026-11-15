@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// operation later (during Realize) or to fuse it with adjacent operations.
 /// </summary>
 /// <typeparam name="T">The numeric element type.</typeparam>
-internal sealed class LazyNode<T> : ILazyNode, ISignableLazyNode
+internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLazyNode
 {
     Type ISignableLazyNode.OutputElementType => typeof(T);
     object ISignableLazyNode.OutputTensor => Output;
@@ -81,13 +81,18 @@ internal sealed class LazyNode<T> : ILazyNode, ISignableLazyNode
 
     internal void SetEarlierReaders(ILazyNode[] readers) => _earlierReaders = readers.Length == 0 ? null : readers;
 
-    /// <summary>Whether <paramref name="tensor"/> is one of the node's inputs.</summary>
-    internal bool Reads(Tensor<T> tensor)
+    /// <inheritdoc />
+    public IReadOnlyList<ILazyNode> EarlierReaders => _earlierReaders ?? Array.Empty<ILazyNode>();
+
+    /// <inheritdoc />
+    public bool ReadsStorageOf(object tensor)
     {
-        if (ReferenceEquals(Input0, tensor) || ReferenceEquals(Input1, tensor) || ReferenceEquals(Input2, tensor)) return true;
+        if (tensor is not Tensor<T> target) return false;
+        static bool Same(Tensor<T>? input, Tensor<T> t) => input is not null && (ReferenceEquals(input, t) || input.SharesStorageWith(t));
+        if (Same(Input0, target) || Same(Input1, target) || Same(Input2, target)) return true;
         if (InputsOverflow is not null)
             foreach (var input in InputsOverflow)
-                if (ReferenceEquals(input, tensor)) return true;
+                if (Same(input, target)) return true;
         return false;
     }
 

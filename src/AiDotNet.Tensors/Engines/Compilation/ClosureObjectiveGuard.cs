@@ -23,12 +23,14 @@ internal sealed class ClosureObjectiveGuard<T>
     private static Recording? _recording;
 
     private readonly object[] _leaves;
+    private readonly Tensor<T>[] _parameters;
     private readonly CompiledOpShapeCache _shapes;
 
-    private ClosureObjectiveGuard(ObjectiveSignature signature, object[] leaves, CompiledOpShapeCache shapes)
+    private ClosureObjectiveGuard(ObjectiveSignature signature, object[] leaves, Tensor<T>[] parameters, CompiledOpShapeCache shapes)
     {
         Signature = signature;
         _leaves = leaves;
+        _parameters = (Tensor<T>[])parameters.Clone();
         _shapes = shapes;
         foreach (var leaf in leaves)
             if (leaf is ISignatureTensor st && st.ElementType != typeof(T))
@@ -96,7 +98,8 @@ internal sealed class ClosureObjectiveGuard<T>
             return;
         }
 
-        var signature = ObjectiveSignature.Build(nodes, parameters, out var leaves);
+        var signature = ObjectiveSignature.Build(nodes, parameters, out var leaves,
+            explicitLoss ?? (nodes.Count > 0 ? (nodes[nodes.Count - 1] as ISignableLazyNode)?.OutputTensor : null));
         if (!signature.Signable)
         {
             recording.Reason = signature.UnsignableReason;
@@ -108,7 +111,7 @@ internal sealed class ClosureObjectiveGuard<T>
             return;
         }
 
-        recording.Guard = new ClosureObjectiveGuard<T>(signature, leaves, scope.CompiledOpShapes.Snapshot());
+        recording.Guard = new ClosureObjectiveGuard<T>(signature, leaves, parameters, scope.CompiledOpShapes.Snapshot());
         recording.Reason = null;
     }
 
@@ -132,6 +135,14 @@ internal sealed class ClosureObjectiveGuard<T>
     /// signature looks it up on <see cref="ClosureGuardResult.Mismatched"/>.</param>
     internal ClosureGuardResult TryRebind(Func<Tensor<T>> objective, Tensor<T>[] parameters, out ObjectiveSignature? probed)
     {
+        if (objective is null) throw new ArgumentNullException(nameof(objective));
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        probed = null;
+        if (parameters.Length != _parameters.Length || parameters.Where((p, i) => !ReferenceEquals(p, _parameters[i])).Any())
+        {
+            LastReason = "the parameters differ from those owned by the compiled plan";
+            return ClosureGuardResult.Mismatched;
+        }
         var result = Probe(objective, parameters, out probed, out var leaves, out string? reason, _shapes);
         if (result != ClosureGuardResult.Matched || probed is null)
         {
@@ -168,17 +179,30 @@ internal sealed class ClosureObjectiveGuard<T>
             return false;
         }
 
-        // Preflight the entire copy order: swapping existing leaves must not overwrite a later source.
-        var written = new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+        // Validate every copy before mutating any caller-owned leaf. A permutation of
+        // existing leaves must not overwrite a source that a later copy still needs.
         for (int i = 0; i < _leaves.Length; i++)
         {
-            if (probedLeaves[i] is ISignatureTensor source && written.Contains(source.SignatureStorageIdentity))
+            if (_leaves[i] is not ISignatureTensor target || probedLeaves[i] is not ISignatureTensor source)
             {
-                reason = $"leaf {i} aliases a compiled leaf overwritten earlier in the rebind";
+                reason = $"leaf {i} is not a tensor";
                 return false;
             }
-            if (!ReferenceEquals(_leaves[i], probedLeaves[i]) && _leaves[i] is ISignatureTensor target)
-                written.Add(target.SignatureStorageIdentity);
+            if (target.ElementType != source.ElementType
+                || !target.SignatureShape.SequenceEqual(source.SignatureShape)
+                || !target.SignatureIsContiguous || !source.SignatureIsContiguous)
+            {
+                reason = $"leaf {i} can no longer be written (incompatible tensor geometry or element type)";
+                return false;
+            }
+            if (ReferenceEquals(_leaves[i], probedLeaves[i])) continue;
+            for (int j = 0; j < probedLeaves.Length; j++)
+                if (probedLeaves[j] is ISignatureTensor other
+                    && ReferenceEquals(target.SignatureStorageIdentity, other.SignatureStorageIdentity))
+                {
+                    reason = $"leaf {i} aliases probe leaf {j}; rebinding would overwrite objective data";
+                    return false;
+                }
         }
 
         for (int i = 0; i < _leaves.Length; i++)
@@ -218,8 +242,7 @@ internal sealed class ClosureObjectiveGuard<T>
         Tensor<T>[] parameters,
         out ObjectiveSignature? signature,
         out object[] leaves,
-        out string? reason,
-        CompiledOpShapeCache? shapes = null)
+        out string? reason, CompiledOpShapeCache? shapes = null)
     {
         if (objective is null) throw new ArgumentNullException(nameof(objective));
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
@@ -235,7 +258,7 @@ internal sealed class ClosureObjectiveGuard<T>
                 reason = unreplayable;
                 return ClosureGuardResult.Unsignable;
             }
-            signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves);
+            signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves, loss);
             if (signature.Signable && DisconnectedReason(scope, loss, parameters) is { } disconnected)
             {
                 reason = disconnected;
@@ -252,7 +275,7 @@ internal sealed class ClosureObjectiveGuard<T>
             // An op that cannot trace without data (or the objective's own failure, which the eager step will
             // surface): either way this step cannot replay a plan.
             // Name where it threw: an op that indexes a value the storage-free probe never computes shows up here.
-            var site = ThrowSite(ex) is { } method ? $" in {method.DeclaringType?.Name}.{method.Name}" : "";
+            var site = ex.TargetSite is { } method ? $" in {method.DeclaringType?.Name}.{method.Name}" : "";
             reason = $"the objective could not be probed ({ex.GetType().Name}{site}: {ex.Message})";
             return ClosureGuardResult.Aborted;
         }
@@ -344,18 +367,5 @@ internal sealed class ClosureObjectiveGuard<T>
             _disposed = true;
             if (ReferenceEquals(_recording, this)) _recording = _parent;
         }
-    }
-
-    // The innermost frame outside the BCL: TargetSite is often a throw helper (ThrowHelpers.ThrowIndexOutOfRange...).
-    private static System.Reflection.MethodBase? ThrowSite(Exception ex)
-    {
-        var frames = new System.Diagnostics.StackTrace(ex, false).GetFrames();
-        if (frames is not null)
-            foreach (var frame in frames)
-                if (frame?.GetMethod() is { DeclaringType: { } type } method
-                    && type.Assembly != typeof(object).Assembly
-                    && !(type.Namespace ?? "").StartsWith("System", StringComparison.Ordinal))
-                    return method;
-        return ex.TargetSite;
     }
 }

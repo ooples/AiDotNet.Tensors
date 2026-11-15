@@ -13,10 +13,10 @@ internal sealed class LastUseReleaseNote : Helpers.ReleaseNote
     private readonly int _producerStep;
     private readonly System.Reflection.MethodInfo? _freer;
     private readonly int _freeingStep;
-    private readonly long _key;
+    private readonly ProducerKey _key;
 
     internal LastUseReleaseNote(int[] shape, System.Reflection.MethodInfo? producer, int producerStep,
-        System.Reflection.MethodInfo? freer, int freeingStep, long key)
+        System.Reflection.MethodInfo? freer, int freeingStep, ProducerKey key)
     {
         _key = key;
         _shape = shape;   // a tensor's shape array is never mutated in place
@@ -45,6 +45,107 @@ internal sealed class LastUseReleaseNote : Helpers.ReleaseNote
         "To read it after backward, call GradientTape.Retain(tensor) on it before backward runs " +
         "(or TensorScope.Keep(tensor) inside a TensorScope). This read was recorded: later backward runs of this graph " +
         "keep this op's output (AutoRetainProbe), as they keep anything read within one step of the graph's first run.";
+}
+
+/// <summary>
+/// Order-sensitive 32-bit hash combine (FNV-1a's offset basis and prime, applied per 32-bit word). It only buckets:
+/// <see cref="ProducerKey"/> and <see cref="GraphSignature"/> decide equality on their full structure.
+/// </summary>
+internal static class StructuralHash
+{
+    /// <summary>FNV-1a 32-bit offset basis.</summary>
+    internal const int Seed = unchecked((int)2166136261);
+
+    /// <summary>FNV-1a 32-bit prime.</summary>
+    private const int Prime = 16777619;
+
+    internal static int Add(int hash, int value) => unchecked((hash ^ value) * Prime);
+}
+
+/// <summary>
+/// A release candidate's producer by structure: the backward function (module and metadata token), the output shape,
+/// and the ordinal among outputs with the same function and shape. Stable across the per-step rebuilds of one graph,
+/// and compared by value, so two different producers never share a key the way a folded hash could
+/// ([1, 32] and [2, 1] hashed alike).
+/// </summary>
+internal sealed class ProducerKey : IEquatable<ProducerKey>
+{
+    private readonly System.Reflection.Module? _module;
+    private readonly int _metadataToken;
+    private readonly int[] _shape;
+    private readonly int _ordinal;
+    private readonly int _hash;
+
+    internal ProducerKey(System.Reflection.MethodInfo? producer, int[] shape)
+        : this(producer?.Module, producer?.MetadataToken ?? 0, (int[])shape.Clone(), ordinal: 0)
+    {
+    }
+
+    private ProducerKey(System.Reflection.Module? module, int metadataToken, int[] shape, int ordinal)
+    {
+        _module = module;
+        _metadataToken = metadataToken;
+        _shape = shape;
+        _ordinal = ordinal;
+        int hash = StructuralHash.Add(StructuralHash.Seed, module?.GetHashCode() ?? 0);
+        hash = StructuralHash.Add(hash, metadataToken);
+        hash = StructuralHash.Add(hash, shape.Length);
+        foreach (int d in shape) hash = StructuralHash.Add(hash, d);
+        _hash = StructuralHash.Add(hash, ordinal);
+    }
+
+    /// <summary>The same producer and shape at another ordinal.</summary>
+    internal ProducerKey WithOrdinal(int ordinal) => new(_module, _metadataToken, _shape, ordinal);
+
+    public bool Equals(ProducerKey? other)
+    {
+        if (other is null) return false;
+        if (ReferenceEquals(this, other)) return true;
+        if (_hash != other._hash || _metadataToken != other._metadataToken || _ordinal != other._ordinal
+            || !ReferenceEquals(_module, other._module) || _shape.Length != other._shape.Length)
+            return false;
+        for (int i = 0; i < _shape.Length; i++)
+            if (_shape[i] != other._shape[i]) return false;
+        return true;
+    }
+
+    public override bool Equals(object? obj) => obj is ProducerKey other && Equals(other);
+
+    public override int GetHashCode() => _hash;
+}
+
+/// <summary>
+/// A backward graph's identity for <see cref="AutoRetainProbe"/>: its step count and the ordered producer keys of its
+/// release candidates, compared by value. A graph whose structure differs in any candidate is a different graph.
+/// </summary>
+internal sealed class GraphSignature : IEquatable<GraphSignature>
+{
+    private readonly int _stepCount;
+    private readonly ProducerKey[] _keys;
+    private readonly int _hash;
+
+    internal GraphSignature(int stepCount, ProducerKey[] keys)
+    {
+        _stepCount = stepCount;
+        _keys = keys;
+        int hash = StructuralHash.Add(StructuralHash.Seed, stepCount);
+        foreach (var key in keys) hash = StructuralHash.Add(hash, key.GetHashCode());
+        _hash = hash;
+    }
+
+    public bool Equals(GraphSignature? other)
+    {
+        if (other is null) return false;
+        if (ReferenceEquals(this, other)) return true;
+        if (_hash != other._hash || _stepCount != other._stepCount || _keys.Length != other._keys.Length) return false;
+        for (int i = 0; i < _keys.Length; i++)
+            if (!_keys[i].Equals(other._keys[i])) return false;
+        return true;
+    }
+
+    public override bool Equals(object? obj) => obj is GraphSignature other && Equals(other);
+
+    public override int GetHashCode() => _hash;
 }
 
 /// <summary>
@@ -83,9 +184,9 @@ internal sealed class BackwardStorageReleasePlan<T>
         internal readonly object StorageIdentity;
         internal readonly Tensor<T> Tensor;
         internal readonly LastUseReleaseNote Note;
-        internal readonly long Key;   // the producer's structural identity (AutoRetainProbe)
+        internal readonly ProducerKey Key;   // the producer's structural identity (AutoRetainProbe)
 
-        internal ReleaseCandidate(object storageIdentity, Tensor<T> tensor, LastUseReleaseNote note, long key)
+        internal ReleaseCandidate(object storageIdentity, Tensor<T> tensor, LastUseReleaseNote note, ProducerKey key)
         {
             StorageIdentity = storageIdentity;
             Tensor = tensor;
@@ -166,29 +267,24 @@ internal sealed class BackwardStorageReleasePlan<T>
             Array.Clear(counts, 0, counts.Length);
             // A producer's structural key: its backward function, output shape and ordinal among same-keyed outputs,
             // stable across the per-step rebuilds of the same graph. The graph signature combines them all.
-            var ordinals = new Dictionary<long, int>();
-            var graphKeys = new List<long>();
+            var ordinals = new Dictionary<ProducerKey, int>();
+            var keys = new List<ProducerKey>();
             foreach (var usage in _usage.Values)
             {
                 if (usage.ReleaseCandidate is null) continue;
                 int step = usage.LastUse;
                 var producer = method(usage.ProducerStep);
-                long key;
-                unchecked
-                {
-                    long shapeKey = AutoRetainProbe.InternIdentity($"producer:{producer?.MethodHandle.Value}:{string.Join(",", usage.ReleaseCandidate._shape)}");
-                    ordinals.TryGetValue(shapeKey, out int ordinal);
-                    ordinals[shapeKey] = ordinal + 1;
-                    key = AutoRetainProbe.InternIdentity($"output:{shapeKey}:{ordinal}");
-                    graphKeys.Add(key);
-                }
+                var baseKey = new ProducerKey(producer, usage.ReleaseCandidate._shape);
+                ordinals.TryGetValue(baseKey, out int ordinal);
+                ordinals[baseKey] = ordinal + 1;
+                var key = ordinal == 0 ? baseKey : baseKey.WithOrdinal(ordinal);
+                keys.Add(key);
                 if (releases[step] is { } slot)
                     slot[counts[step]++] = new ReleaseCandidate(usage.Identity, usage.ReleaseCandidate,
                         new LastUseReleaseNote(usage.ReleaseCandidate._shape, producer, usage.ProducerStep, method(step), step, key), key);
             }
 
-            return new BackwardStorageReleasePlan<T>(releases,
-                AutoRetainProbe.InternIdentity($"graph:{stepCount}:{string.Join(",", graphKeys)}"));
+            return new BackwardStorageReleasePlan<T>(releases, new GraphSignature(stepCount, keys.ToArray()));
         }
     }
 
@@ -211,11 +307,11 @@ internal sealed class BackwardStorageReleasePlan<T>
     }
 
     private readonly ReleaseCandidate[]?[] _releasesAfterStep;
-    private readonly long _signature;
+    private readonly GraphSignature _signature;
     private int _lastStep = int.MaxValue;   // a step index not above the last one starts a new backward run
     private bool _probing;
 
-    private BackwardStorageReleasePlan(ReleaseCandidate[]?[] releasesAfterStep, long signature)
+    private BackwardStorageReleasePlan(ReleaseCandidate[]?[] releasesAfterStep, GraphSignature signature)
     {
         _releasesAfterStep = releasesAfterStep;
         _signature = signature;
@@ -318,10 +414,28 @@ internal sealed class BackwardStorageReleasePlan<T>
             {
                 var tensor = candidate.Tensor;
                 var note = candidate.Note;
-                var storage = candidate.StorageIdentity;
                 var weak = new WeakReference<Tensor<T>>(tensor);   // the quarantine must not keep it alive
+                // The value quarantined, not whatever the tensor holds when the window closes: a write after backward
+                // (IEngine.TensorCopy into it) reports no read, yet the tensor then holds the caller's new value, which
+                // the old entry must not free.
+                // Weakly too: a dropped tensor's storage (and its device buffer) must not live until the window closes.
+                // A live tensor keeps its storage alive, so a rebind is still told apart.
+                var storage = new WeakReference<object>(tensor.StorageIdentity);
+                int version = tensor.Version, deviceVersion = tensor.GpuCacheVersion;
                 AutoRetainProbe.Quarantine(_signature, tensor.DataVector, tensor.GetBackingArrayForCacheLookupUnsafe(),
-                    candidate.Key, () => { if (weak.TryGetTarget(out var held) && ReferenceEquals(held.StorageIdentity, storage)) engine.ReleaseDeadActivation(held, note); });
+                    candidate.Key, () =>
+                    {
+                        if (!weak.TryGetTarget(out var held)) return;
+                        if (!storage.TryGetTarget(out var quarantinedStorage)
+                            || !ReferenceEquals(held.StorageIdentity, quarantinedStorage) || held.Version != version
+                            || held.GpuCacheVersion != deviceVersion)
+                            return;
+                        // Retained after its backward (GradientTape.Retain): the tape's dispose kept it, so must this.
+                        if (Helpers.HostSync.IsRetained(held.DataVector)
+                            || (held.GetBackingArrayForCacheLookupUnsafe() is { } heldArray && Helpers.HostSync.IsRetained(heldArray)))
+                            return;
+                        engine.ReleaseDeadActivation(held, note);
+                    });
                 continue;
             }
             engine.ReleaseDeadActivation(candidate.Tensor, candidate.Note);

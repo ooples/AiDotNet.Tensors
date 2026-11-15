@@ -32,7 +32,7 @@ public class ObjectiveSignatureCaptureTests
         var cycle = new object[1];
         cycle[0] = cycle;
         var a = SignUnary(x, execute, savedState: new object[] { cycle });
-        Assert.True(a.Signable, a.UnsignableReason);
+        Assert.False(a.Signable);
         var matrix = new object[,] { { 1, "a" }, { 2, "b" } };
         var b = SignUnary(x, execute, savedState: new object[] { matrix });
         Assert.True(b.Signable, b.UnsignableReason);

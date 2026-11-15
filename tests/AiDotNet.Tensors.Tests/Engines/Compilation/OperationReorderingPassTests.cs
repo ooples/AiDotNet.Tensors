@@ -160,6 +160,7 @@ public sealed class OperationReorderingPassTests
         public long RecordOrder { get; set; }
         public ILazyNode? PriorWriter => null;
         public bool WritesInPlace => false;
+        public bool ReadsStorageOf(object tensor) => false;
         public int ConsumerCount { get; set; }
         public IEngine RecordingEngine { get; set; } = null!;
         public void Realize(IEngine engine) { }

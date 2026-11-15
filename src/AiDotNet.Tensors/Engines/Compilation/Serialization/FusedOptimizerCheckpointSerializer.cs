@@ -40,7 +40,12 @@ internal static class FusedOptimizerCheckpointSerializer
     /// <param name="doubleHyperparameters">Whether beta1, beta2, epsilon and weight decay were written as double (every
     /// writer since they became double). False reads the older single-precision layout, so optimizer state exported
     /// before the change still imports.</param>
-    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader, bool doubleHyperparameters = true, bool velocityIncludesLearningRate = true)
+    /// <param name="hasVelocityIncludesLearningRate">Whether the extras end with the
+    /// <see cref="FusedOptimizerExtras.VelocityIncludesLearningRate"/> flag (plan format 14, optimizer-state version 5).
+    /// Older payloads end the extras one byte earlier, and reading the flag from them would consume the first byte of
+    /// the LR-schedule count. They restore it as false, the velocity rule they were saved with.</param>
+    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader, bool doubleHyperparameters = true,
+        bool hasVelocityIncludesLearningRate = true)
     {
         if (!reader.ReadBoolean()) return null;
         double ReadHyperparameter() => doubleHyperparameters ? reader.ReadDouble() : reader.ReadSingle();
@@ -58,7 +63,7 @@ internal static class FusedOptimizerCheckpointSerializer
             Int8MomentBlockSize = reader.ReadInt32(),
             Int8MinQuantizedLength = reader.ReadInt32(),
             MaxGradNorm = reader.ReadDouble(),
-            Extras = ReadExtras(reader, velocityIncludesLearningRate),
+            Extras = ReadExtras(reader, hasVelocityIncludesLearningRate),
             Schedules = ReadLrSchedules(reader),
             ParamToGroup = ReadIntArray(reader),
             GroupOptimizerTypes = ReadOptimizerTypeArray(reader),
@@ -138,7 +143,7 @@ internal static class FusedOptimizerCheckpointSerializer
         return present ? value : null;
     }
 
-    private static FusedOptimizerExtras ReadExtras(BinaryReader reader, bool velocityIncludesLearningRate)
+    private static FusedOptimizerExtras ReadExtras(BinaryReader reader, bool hasVelocityIncludesLearningRate)
         => new FusedOptimizerExtras
         {
             Momentum = reader.ReadSingle(),
@@ -169,7 +174,7 @@ internal static class FusedOptimizerCheckpointSerializer
             AmsgradDisableBiasCorrection = reader.ReadBoolean(),
             AmsgradExactBeta1 = ReadNullableDouble(reader),
             AmsgradExactBeta2 = ReadNullableDouble(reader),
-            VelocityIncludesLearningRate = velocityIncludesLearningRate && reader.ReadBoolean(),
+            VelocityIncludesLearningRate = hasVelocityIncludesLearningRate && reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

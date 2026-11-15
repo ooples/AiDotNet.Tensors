@@ -23,12 +23,6 @@ internal interface ISignableLazyNode : ILazyNode
     object[]? SavedStateObjects { get; }
     bool ReplaysHostStateFlag { get; }
     object? AuxiliaryOutput { get; }
-
-
-    /// <summary>
-    /// Set when a probe trace recorded the node: its inputs and output are shape-only stand-ins, so realizing it
-    /// aborts the probe even where an engine op has cleared the ambient scope to compute eagerly.
-    /// </summary>
     bool RecordedInProbe { get; set; }
 }
 
@@ -76,13 +70,12 @@ internal interface ISignatureScratch
 internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
 {
     private const int MaxFieldDepth = 6;
-    private enum Marker { Null, NoDelegate, Static, Cycle }
-
     private static readonly ConcurrentDictionary<Type, FieldInfo[]> FieldCache = new();
 
     private readonly object[] _tokens;
     private readonly int _hash;
 
+    private static readonly object NullValueToken = new();
     private ObjectiveSignature(object[] tokens, int nodeCount, string? unsignableReason)
     {
         _tokens = tokens;
@@ -111,7 +104,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
     /// parameter's storage) in first-use order; each is an <see cref="ISignatureTensor"/>.
     /// </summary>
     internal static ObjectiveSignature Build<T>(
-        IReadOnlyList<ILazyNode> nodes, Tensor<T>[] parameters, out object[] leaves)
+        IReadOnlyList<ILazyNode> nodes, Tensor<T>[] parameters, out object[] leaves, object? loss = null)
     {
         if (nodes is null) throw new ArgumentNullException(nameof(nodes));
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
@@ -121,6 +114,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
         for (int i = 0; i < nodes.Count && reason is null; i++)
             reason = builder.AddNode(i, nodes[i]);
 
+        if (reason is null && loss is not null) reason = builder.AddLoss(loss);
         leaves = builder.Leaves.ToArray();
         return new ObjectiveSignature(builder.Tokens.ToArray(), nodes.Count, reason);
     }
@@ -265,8 +259,8 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
     {
         private readonly Dictionary<object, TensorRef> _classes = new(ReferenceComparer.Instance);
         private readonly Dictionary<object, int> _parameterStorage = new(ReferenceComparer.Instance);
-        private int _nextView;
         private readonly HashSet<object> _visiting = new(ReferenceComparer.Instance);
+        private int _parameterViewCount;
 
         internal List<object> Tokens { get; } = new();
         internal List<object> Leaves { get; } = new();
@@ -331,6 +325,8 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             return null;
         }
 
+        internal string? AddLoss(object loss) => AddTensorReference(loss, "objective", "loss");
+
         internal string? AddTensorReference(object? tensor, string opName, string where)
         {
             if (tensor is null) { Tokens.Add(new TensorRef(RefClass.Null, 0)); return null; }
@@ -341,11 +337,10 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             if (_parameterStorage.TryGetValue(st.SignatureStorageIdentity, out int p))
             {
                 // A view of a parameter (a reshape or slice): the plan reads the parameter's live storage through it,
-                // so it is never rebound; its geometry is part of the structure.
-                var view = new TensorRef(RefClass.ParameterView, _nextView++);
+                var view = new TensorRef(RefClass.ParameterView, _parameterViewCount++);
                 _classes[tensor] = view;
-                Tokens.Add(view);
                 Tokens.Add(p);
+                Tokens.Add(view);
                 Tokens.Add(new ArrayToken(st.SignatureShape));
                 Tokens.Add(new ArrayToken(st.SignatureStrides));
                 Tokens.Add(st.SignatureOffset);
@@ -356,6 +351,10 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
                 return $"op '{opName}' {where} is a non-contiguous external tensor, which cannot be rebound";
 
             var leaf = new TensorRef(RefClass.Leaf, Leaves.Count);
+            foreach (var existing in Leaves)
+                if (existing is ISignatureTensor other && ReferenceEquals(st.SignatureStorageIdentity, other.SignatureStorageIdentity))
+                    return $"op '{opName}' {where} aliases another external leaf; independent rebinding is unsafe";
+
             Leaves.Add(tensor);
             _classes[tensor] = leaf;
             Tokens.Add(leaf);
@@ -366,7 +365,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
 
         internal string? AddDelegate(Delegate? d, string opName, string where, int depth)
         {
-            if (d is null) { Tokens.Add(Marker.NoDelegate); return null; }
+            if (d is null) { Tokens.Add("no-delegate"); return null; }
             if (d.GetInvocationList().Length != 1)
                 return $"op '{opName}' {where} is a multicast delegate";
             var method = d.Method;
@@ -379,7 +378,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
 
         private string? AddTarget(object? target, string opName, string where, int depth)
         {
-            if (target is null) { Tokens.Add(Marker.Static); return null; }
+            if (target is null) { Tokens.Add("static"); return null; }
             if (target is IEngine) { Tokens.Add(target.GetType()); return null; }
             var type = target.GetType();
             if (!IsCompilerGenerated(type))
@@ -391,7 +390,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
         {
             if (depth >= MaxFieldDepth)
                 return $"op '{opName}' {where} nests captured state deeper than {MaxFieldDepth}";
-            if (!type.IsValueType && !_visiting.Add(obj)) { Tokens.Add(Marker.Cycle); return null; }
+            if (!type.IsValueType && !_visiting.Add(obj)) { Tokens.Add("cycle"); return null; }
             try
             {
                 Tokens.Add(type);
@@ -413,7 +412,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             switch (value)
             {
                 case null:
-                    Tokens.Add(Marker.Null);
+                    Tokens.Add(NullValueToken);
                     return null;
                 case string s:
                     Tokens.Add(s);
@@ -459,27 +458,29 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
 
         private string? AddArray(Array a, string opName, string where, int depth)
         {
-            var elementType = a.GetType().GetElementType() ?? typeof(object);
-            if (a.Rank == 1 && (elementType.IsPrimitive || elementType.IsEnum))
-            {
-                Tokens.Add(new ArrayToken(a));
-                return null;
-            }
             if (depth >= MaxFieldDepth)
-                return $"op '{opName}' {where} nests arrays deeper than {MaxFieldDepth}";
-            if (!_visiting.Add(a)) { Tokens.Add(Marker.Cycle); return null; }
+                return $"op '{opName}' {where} nests captured state deeper than {MaxFieldDepth}";
+            if (!_visiting.Add(a))
+                return $"op '{opName}' {where} contains a cyclic array";
             try
             {
+                var elementType = a.GetType().GetElementType() ?? typeof(object);
+                if (a.Rank == 1 && a.GetLowerBound(0) == 0 && (elementType.IsPrimitive || elementType.IsEnum))
+                {
+                    Tokens.Add(new ArrayToken(a));
+                    return null;
+                }
+
                 Tokens.Add(a.GetType());
                 for (int axis = 0; axis < a.Rank; axis++)
                 {
                     Tokens.Add(a.GetLength(axis));
                     Tokens.Add(a.GetLowerBound(axis));
                 }
-                int index = 0;
-                foreach (var item in a)
+                int i = 0;
+                foreach (var value in a)
                 {
-                    string? r = AddValue(item, opName, $"{where}[{index++}]", depth + 1);
+                    string? r = AddValue(value, opName, $"{where}[{i++}]", depth + 1);
                     if (r is not null) return r;
                 }
                 return null;

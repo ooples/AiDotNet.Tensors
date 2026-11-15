@@ -44,14 +44,21 @@ internal sealed class FusedLrScheduleCheckpoint
         Ints = ints;
     }
 
-    public LrSchedule ToSchedule()
+    public LrSchedule ToSchedule() => ToSchedule(0);
+
+    /// <summary>
+    /// Restores the schedule. A family kind is built once, by its constructor, which is also its validation. Calling
+    /// <see cref="Validate"/> first would build it twice per level, and so 2^depth times for nested Sequential children.
+    /// </summary>
+    /// <param name="depth">Sequential nesting level of this checkpoint (0 at the top).</param>
+    internal LrSchedule ToSchedule(int depth)
     {
-        ValidateShape();
+        ValidatePayload();
         // An external rate stays external, so the caller can keep setting it on the restored plan.
         if (Kind == FusedLrScheduleKind.External)
             return new ExternalLrSchedule(Doubles[0]);
         if (CompletedStepLr.IsFamilyKind(Kind))
-            return CompletedStepLr.Restore(Kind, Doubles, Ints);
+            return CompletedStepLr.Restore(Kind, Doubles, Ints, depth);
         return new RestoredLrSchedule(Kind, Doubles, Ints);
     }
 
@@ -62,11 +69,13 @@ internal sealed class FusedLrScheduleCheckpoint
     /// </summary>
     public void Validate()
     {
-        ValidateShape();
-        if (CompletedStepLr.IsFamilyKind(Kind)) CompletedStepLr.Restore(Kind, Doubles, Ints);
+        ValidatePayload();
+        if (CompletedStepLr.IsFamilyKind(Kind))
+            CompletedStepLr.Restore(Kind, Doubles, Ints);   // the constructors' own validation
     }
 
-    private void ValidateShape()
+    /// <summary>The kind, payload-size and finiteness checks, without building the schedule.</summary>
+    private void ValidatePayload()
     {
         (int reqD, int reqI) = Kind switch
         {
@@ -118,7 +127,6 @@ internal sealed class FusedLrScheduleCheckpoint
             foreach (double v in Doubles)
                 if (double.IsNaN(v) || double.IsInfinity(v))
                     throw new System.IO.InvalidDataException($"Serialized LR schedule kind {Kind} has a non-finite value.");
-            // Construction validation is performed once by ToSchedule or Validate.
         }
     }
 

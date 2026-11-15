@@ -75,7 +75,6 @@ public class ObjectiveProbeViewTests
     {
         var engine = new CpuEngine();
         var w = Filled(6, 4, 1);
-        var eagerWeights = Filled(6, 4, 1);
         var parameters = new[] { w };
         int step = 0;
         Tensor<float>? current = null;
@@ -100,6 +99,7 @@ public class ObjectiveProbeViewTests
                     ?? throw new InvalidOperationException($"no guard was recorded: {reason}");
         }
         guard.AttachTo(plan);
+        var expectedWeights = w.ToArray();
 
         using (plan)
         {
@@ -112,25 +112,31 @@ public class ObjectiveProbeViewTests
 
                 // Eager loss on this step's data with the current weights: sum over rows of y[:, 1..2]^2.
                 double expected = 0;
-                var gradient = new double[6, 4];
                 for (int r = 0; r < 3; r++)
                     for (int c = 1; c <= 2; c++)
                     {
                         double y = 0;
-                        for (int k = 0; k < 6; k++) y += x[r, k] * eagerWeights[k, c];
+                        for (int k = 0; k < 6; k++) y += x[r, k] * expectedWeights[k * 4 + c];
                         expected += y * y;
-                        for (int k = 0; k < 6; k++) gradient[k, c] += 2 * x[r, k] * y;
                     }
-                for (int k = 0; k < 6; k++)
-                    for (int c = 0; c < 4; c++)
-                        eagerWeights[k, c] -= 0.01f * (float)gradient[k, c];
+
+                var gradients = new double[24];
+                for (int r = 0; r < 3; r++)
+                    for (int c = 1; c <= 2; c++)
+                    {
+                        double y = 0;
+                        for (int k = 0; k < 6; k++) y += x[r, k] * expectedWeights[k * 4 + c];
+                        for (int k = 0; k < 6; k++) gradients[k * 4 + c] += 2 * x[r, k] * y;
+                    }
+                for (int i = 0; i < expectedWeights.Length; i++)
+                    expectedWeights[i] -= (float)(0.01 * gradients[i]);
 
                 float actual = plan.Step().ToArray()[0];
                 Assert.True(Math.Abs(actual - expected) <= 1e-4 * Math.Max(1, Math.Abs(expected)),
                     $"step {step}: plan loss {actual}, eager {expected}");
-                for (int i = 0; i < w.Length; i++)
-                    Assert.True(Math.Abs(w.GetFlat(i) - eagerWeights.GetFlat(i)) < 1e-5,
-                        $"step {step}, weight {i}: plan {w.GetFlat(i)}, eager {eagerWeights.GetFlat(i)}");
+                for (int i = 0; i < expectedWeights.Length; i++)
+                    Assert.True(Math.Abs(w.GetFlat(i) - expectedWeights[i]) <= 1e-5,
+                        $"step {step}, weight {i}: compiled {w.GetFlat(i)}, eager {expectedWeights[i]}");
             }
         }
     }
