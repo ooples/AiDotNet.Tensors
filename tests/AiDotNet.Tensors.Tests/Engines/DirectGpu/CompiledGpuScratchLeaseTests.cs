@@ -17,7 +17,7 @@ public class CompiledGpuScratchLeaseTests
 {
     private static Tensor<float> Filled(int[] shape, int seed, float scale)
     {
-        var rng = new Random(seed);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         var t = new Tensor<float>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() - 0.5) * scale;
         return t;
@@ -110,7 +110,8 @@ public class CompiledGpuScratchLeaseTests
             return;
         }
         Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
-        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true },
+        // QueryBackend needs no op lease (GetBackend asserts one under AIDOTNET_GPU_LEASE_STRICT=1).
+        Skip.IfNot(gpu.QueryBackend is AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true },
             "The backend does not capture step graphs.");
         bool previous = CompiledTrainingPlan<float>.LeaseBackwardScratch;
         using (gpu)
@@ -198,6 +199,8 @@ public class CompiledGpuScratchLeaseTests
             return;
         }
         Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        Skip.If(capture && gpu.QueryBackend is not AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true },
+            "The backend does not capture step graphs.");
         bool previous = CompiledTrainingPlan<float>.LeaseForwardOutputs;
         using (gpu)
         {
@@ -209,7 +212,11 @@ public class CompiledGpuScratchLeaseTests
                 CompiledTrainingPlan<float>.LeaseForwardOutputs = false;
                 var kept = TrainDenseBlocks(gpu, steps, capture);
                 CompiledTrainingPlan<float>.LeaseForwardOutputs = true;
+                long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
                 var leased = TrainDenseBlocks(gpu, steps, capture);
+                if (capture)
+                    Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore,
+                        "the leased plan never replayed a captured step graph, so this case did not exercise capture");
 
                 Assert.Equal(kept.Parameters, leased.Parameters);
                 Assert.Equal(expected.Length, leased.Parameters.Length);
@@ -238,6 +245,8 @@ public class CompiledGpuScratchLeaseTests
             return;
         }
         Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        Skip.If(capture && gpu.QueryBackend is not AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true },
+            "The backend does not capture step graphs.");
         bool previous = CompiledTrainingPlan<float>.LendForwardSlots;
         using (gpu)
         {
@@ -251,7 +260,11 @@ public class CompiledGpuScratchLeaseTests
                 CompiledTrainingPlan<float>.LendForwardSlots = false;
                 var kept = TrainDenseBlocks(gpu, steps, capture);
                 CompiledTrainingPlan<float>.LendForwardSlots = true;
+                long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
                 var lent = TrainDenseBlocks(gpu, steps, capture);
+                if (capture)
+                    Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore,
+                        "the lending plan never replayed a captured step graph, so this case did not exercise capture");
 
                 Assert.Equal(kept.Parameters, lent.Parameters);
                 Assert.True(lent.ScratchBytes > 0 && lent.ScratchBytes <= kept.ScratchBytes,
@@ -276,6 +289,7 @@ public class CompiledGpuScratchLeaseTests
         Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
         using (gpu)
         {
+            using var op = gpu.EnterGpuOp();   // GetBackend asserts a lease under AIDOTNET_GPU_LEASE_STRICT=1
             var backend = Assert.IsAssignableFrom<AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend>(gpu.GetBackend());
             var pool = gpu.CreateScratchPool();
             pool.FirstLeasedAction = 2;
@@ -332,6 +346,7 @@ public class CompiledGpuScratchLeaseTests
         Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
         using (gpu)
         {
+            using var op = gpu.EnterGpuOp();   // GetBackend asserts a lease under AIDOTNET_GPU_LEASE_STRICT=1
             var backend = Assert.IsAssignableFrom<AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend>(gpu.GetBackend());
             var pool = gpu.CreateScratchPool();
             pool.FirstLeasedAction = 2;
