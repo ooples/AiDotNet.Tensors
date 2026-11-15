@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -126,6 +127,55 @@ public sealed class CompiledRetainedOutputTests : IDisposable
                 input.IncrementVersion();
                 Assert.Equal(length * (4f * step + 0.25f), plan.Step().ToArray()[0], length * 1e-3f);
                 foreach (float value in first.ToArray()) Assert.Equal(step + 0.25f, value);
+            }
+        }
+    }
+
+    // MatMul -> broadcast add of a 1-D bias -> ReLU is what the linear fusion rewrites into one FusedLinear node, which
+    // never writes the matmul's own output. The undeclared plan proves this graph fuses; declaring the matmul result
+    // (or the pre-activation sum) must keep that node, with the same loss and gradients.
+    [Theory]
+    [InlineData(0)]   // nothing declared: the control
+    [InlineData(1)]   // the matmul result
+    [InlineData(2)]   // the pre-activation sum
+    public void Declared_interior_of_a_fusable_linear_chain_is_still_computed(int declared)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var input = new Tensor<float>([4, 4]);
+        var weight = new Tensor<float>([4, 4]);
+        var bias = new Tensor<float>([4]);
+        weight.AsWritableSpan().Fill(0.25f);
+        bias.AsWritableSpan().Fill(0.5f);
+        Tensor<float> product, sum;
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(new[] { weight, bias }))
+        {
+            product = engine.TensorMatMul(input, weight);
+            if (declared == 1) GradientRecording.RetainOutput(product);
+            sum = engine.TensorBroadcastAdd(product, bias);
+            if (declared == 2) GradientRecording.RetainOutput(sum);
+            engine.ReduceSum(engine.ReLU(sum), null);
+            plan = scope.CompileTraining(new[] { weight, bias });
+        }
+        using (plan)
+        {
+            bool fused = plan.BackwardStepKinds.Any(kind => kind.Contains("FusedLinear", StringComparison.Ordinal));
+            if (declared == 0)
+            {
+                Assert.True(fused, "this graph no longer fuses (" + string.Join(", ", plan.BackwardStepKinds)
+                    + "): the declared cases prove nothing");
+                return;
+            }
+            for (int step = 1; step <= 3; step++)
+            {
+                input.AsWritableSpan().Fill(step);
+                input.IncrementVersion();
+                Assert.Equal(16f * (step + 0.5f), plan.Step().ToArray()[0]);
+                foreach (float value in product.ToArray().Take(declared == 1 ? 16 : 0)) Assert.Equal((float)step, value);
+                foreach (float value in sum.ToArray().Take(declared == 2 ? 16 : 0)) Assert.Equal(step + 0.5f, value);
+                foreach (float gradient in plan.Gradients[0].ToArray()) Assert.Equal(4f * step, gradient);
+                foreach (float gradient in plan.Gradients[1].ToArray()) Assert.Equal(4f, gradient);
             }
         }
     }
