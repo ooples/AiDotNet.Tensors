@@ -5057,6 +5057,33 @@ public partial interface IEngine
         bool concatenate,
         out Tensor<T> attentionCoeffs);
 
+    /// <summary>
+    /// Multi-head graph attention aggregation over a sparse graph, differentiable with respect to the transformed
+    /// node features and the attention vector (Velickovic et al. 2018).
+    /// </summary>
+    /// <param name="transformed">
+    /// The per-head transformed node features <c>Wh</c>, laid out as <c>[batch, nodes, heads, features]</c> (any shape
+    /// with that many elements in that order, for example <c>[batch * nodes, heads * features]</c>). Every graph in the
+    /// batch shares <paramref name="graph"/>.
+    /// </param>
+    /// <param name="attention">The attention vector per head, <c>[heads, 2 * features]</c>: the self half, then the neighbour half.</param>
+    /// <param name="graph">The neighbourhoods: row <c>i</c> lists the nodes node <c>i</c> attends to.</param>
+    /// <param name="negativeSlope">The LeakyReLU slope of the attention score.</param>
+    /// <param name="dropoutRate">Inverted dropout on the normalized coefficients, in [0, 1).</param>
+    /// <param name="dropoutRandom">The generator seeding each call's dropout draw; null (or a zero rate) disables dropout.</param>
+    /// <returns>
+    /// <c>out[b, i, h, :] = sum over neighbours j of alpha_ijh * Wh[b, j, h, :]</c> with
+    /// <c>alpha_ijh = softmax_j(LeakyReLU(a_self_h . Wh_ih + a_neigh_h . Wh_jh))</c>, in <paramref name="transformed"/>'s shape.
+    /// It equals the dense formulation with an additive -1e9 mask off the graph whenever every row has an edge.
+    /// </returns>
+    Tensor<T> GraphAttentionCsr<T>(
+        Tensor<T> transformed,
+        Tensor<T> attention,
+        CsrGraph graph,
+        double negativeSlope = 0.2,
+        double dropoutRate = 0.0,
+        Random? dropoutRandom = null);
+
     #endregion
 
     #region FFT and Signal Processing
