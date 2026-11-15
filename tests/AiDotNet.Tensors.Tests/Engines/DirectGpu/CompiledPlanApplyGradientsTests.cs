@@ -93,6 +93,35 @@ public class CompiledPlanApplyGradientsTests
     public void An_outside_step_on_the_cpu_continues_the_plans_optimizer(int outsideAt)
         => AssertSameRun(new CpuEngine(), outsideAt);
 
+    [Fact]
+    public void A_schedule_free_plan_refuses_gradients_computed_outside_it()
+    {
+        // Schedule-Free takes its gradient at y, which the plan writes into the weights before its own forward; a forward
+        // outside the plan ran at x, and the update would have used that gradient as if taken at y.
+        var engine = new CpuEngine();
+        var x = Filled(new[] { 8, 16 }, 1, 2f);
+        var w1 = Filled(new[] { 16, 32 }, 2, 0.5f);
+        var w2 = Filled(new[] { 32, 4 }, 3, 0.5f);
+        var parameters = new[] { w1, w2 };
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Loss(engine, x, w1, w2);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.ScheduleFreeSGD, learningRate: 1e-2);
+            plan.Step();
+            var before = w1.ToArray();
+            Dictionary<Tensor<float>, Tensor<float>> gradients;
+            using (var tape = new GradientTape<float>())
+                gradients = tape.ComputeGradients(Loss(engine, x, w1, w2), parameters);
+            Assert.Throws<NotSupportedException>(() => ((CompiledTrainingPlan<float>)plan).TryApplyGradients(gradients));
+            Assert.Equal(before, w1.ToArray());
+        }
+    }
+
     [SkippableTheory]
     [InlineData(0)]
     [InlineData(1)]

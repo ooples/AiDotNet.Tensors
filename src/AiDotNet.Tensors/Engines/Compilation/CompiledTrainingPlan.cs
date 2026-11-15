@@ -3853,11 +3853,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <paramref name="gradients"/> gets a zero gradient, as one the plan's backward does not reach does. False when no
     /// optimizer is configured.
     /// </summary>
+    /// <remarks>Not for Schedule-Free SGD (or any optimizer with a pre-forward weight transform): its update takes the
+    /// gradient at the point the plan writes into the weights before its own forward (y), which a forward run outside
+    /// the plan never sees, so the update would treat a gradient taken at x as one taken at y. Such a plan throws
+    /// <see cref="NotSupportedException"/> instead of updating silently wrong.</remarks>
     /// <param name="gradients">Each trained parameter's gradient, keyed by the parameter tensor (by reference).</param>
     internal bool TryApplyGradients(IReadOnlyDictionary<Tensor<T>, Tensor<T>> gradients)
     {
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (_optimizerUpdate is null) return false;
+        if (_preForwardParamTransform is not null)
+            throw new NotSupportedException(
+                "This plan's optimizer evaluates its gradient at weights it writes before its own forward (Schedule-Free "
+                + "SGD), so it cannot apply gradients computed outside the plan.");
         var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
         gpuEngine?.NoteCompiledStepThread(_planId);
         if (gpuEngine is null) return ApplyGradientsLocked(gradients);
