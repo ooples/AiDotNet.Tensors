@@ -184,6 +184,7 @@ extern ""C"" __global__ void softmax_rows(
     // count + bound-check, else the top odd element is dropped (corrupts max/sum -> unnormalized softmax).
     for (int n = blockDim.x; n > 1; ) { int half = (n+1)>>1; if (tid < half && tid+half < n) sdata[tid] = fmaxf(sdata[tid], sdata[tid+half]); __syncthreads(); n = half; }
     maxVal = sdata[0];
+    __syncthreads();
     float sumExp = 0.0f;
     for (int c = tid; c < cols; c += blockDim.x) { float e = expf(rowIn[c]-maxVal); rowOut[c] = e; sumExp += e; }
     sdata[tid] = sumExp; __syncthreads();

@@ -311,19 +311,23 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [HostValueFromMetadata]
     public virtual bool TensorIsFloatingPoint<T>(Tensor<T> tensor) => MathHelper.IsFloatingPoint<T>();
 
     /// <inheritdoc/>
+    [HostValueFromMetadata]
     public virtual bool TensorIsSigned<T>(Tensor<T> tensor)
         => !(typeof(T) == typeof(byte) || typeof(T) == typeof(ushort) || typeof(T) == typeof(uint) || typeof(T) == typeof(ulong) || typeof(T) == typeof(bool));
 
     /// <inheritdoc/>
+    [HostValueFromMetadata]
     public virtual bool TensorIsComplex<T>(Tensor<T> tensor)
         => typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Complex<>);
 
     /// <inheritdoc/>
     public virtual bool TensorIsNonzero<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length != 1) throw new InvalidOperationException("TensorIsNonzero is defined only for a single-element tensor.");
         var ops = MathHelper.GetNumericOperations<T>();
@@ -331,6 +335,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [HostValueFromMetadata]
     public virtual bool TensorIsSameSize<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));

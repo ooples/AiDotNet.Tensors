@@ -1339,6 +1339,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual T TensorTrace<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Rank != 2) throw new ArgumentException("Trace requires a 2-D tensor");
         var ops = MathHelper.GetNumericOperations<T>();
@@ -1478,6 +1479,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual T TensorVecDot<T>(Tensor<T> a, Tensor<T> b)
     {
+        BeginHostScalarRead(a);
+        BeginHostScalarRead(b);
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (a.Rank != 1 || b.Rank != 1) throw new ArgumentException("VecDot requires 1-D tensors");
@@ -1733,6 +1736,8 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     public virtual bool TensorAllClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false)
     {
+        BeginHostScalarRead(a);
+        BeginHostScalarRead(b);
         var mask = TensorIsClose(a, b, rtol, atol, equalNan);
         using var spanLease = mask.Lease();
         var span = spanLease.Span;
@@ -1958,6 +1963,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual int TensorCountNonzero<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -2271,6 +2277,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual (T Min, T Max) TensorAminmax<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor.Length == 0) throw new ArgumentException("Aminmax requires a non-empty tensor");
         var ops = MathHelper.GetNumericOperations<T>();
@@ -3299,6 +3306,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual bool TensorEqual<T>(Tensor<T> a, Tensor<T> b)
     {
+        BeginHostScalarRead(a);
+        BeginHostScalarRead(b);
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (!a._shape.SequenceEqual(b._shape)) return false;
@@ -3619,6 +3628,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual (T Value, int Index) TensorKthvalue<T>(Tensor<T> input, int k)
     {
+        BeginHostScalarRead(input);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (k < 1 || k > input.Length) throw new ArgumentOutOfRangeException(nameof(k));
 
@@ -3635,6 +3645,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual T TensorMedian<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("Median requires a non-empty tensor");
         // PyTorch returns the lower median for even-length; keep the same behaviour.
@@ -3825,6 +3836,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual T TensorNanMedian<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         if (input == null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!input.IsContiguous) input = input.Contiguous();
@@ -3843,6 +3855,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual (T Value, int Count) TensorMode<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("Mode requires a non-empty tensor");
         if (!input.IsContiguous) input = input.Contiguous();

@@ -355,7 +355,7 @@
     <!-- #1204: the Joe-Kuo Sobol direction numbers, packed by scripts/pack_joe_kuo.py. -->
     <EmbeddedResource Include="Engines\DevicePrimitives\Cpu\Data\joe-kuo-6.bin" />
     <!-- Kernel source text kept out of the user-string heap (CS8103); read by KernelSourceResources. -->
-    <EmbeddedResource Include="Engines\DirectGpu\KernelSources\*.c;Engines\DirectGpu\KernelSources\*.wgsl" LogicalName="AiDotNet.Tensors.KernelSources.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Engines\DirectGpu\KernelSources\*.c;Engines\DirectGpu\KernelSources\*.wgsl;Engines\DirectGpu\KernelSources\*.glsl;Engines\DirectGpu\KernelSources\*.metal" LogicalName="AiDotNet.Tensors.KernelSources.%(Filename)%(Extension)" />
   </ItemGroup>
 
   <!-- Optional signed revocation deny-list (CRL) for signed entitlements, verified by

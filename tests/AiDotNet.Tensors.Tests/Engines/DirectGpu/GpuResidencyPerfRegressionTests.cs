@@ -1,3 +1,5 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
+
 #if NETCOREAPP
 #nullable disable
 

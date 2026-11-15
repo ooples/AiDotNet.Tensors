@@ -79,7 +79,7 @@ internal static class FloatGradientSweep
                 }
 
                 string id = $"{name}|{DifferentiableOpsGradCheckSweep.ParamFingerprint(m)}";
-                var inputs = TensorInputs(args);
+                var inputs = DifferentiableOpsGradCheckSweep.InputTensors<float>(m, args);
                 Dictionary<Tensor<float>, float[]> cpuGrads;
                 try { cpuGrads = TapeGradients(cpu, m, args, inputs); }
                 catch (Exception ex)
@@ -137,7 +137,7 @@ internal static class FloatGradientSweep
                     AiDotNetEngine.Current = engine;
                     using (var scope = GraphMode.EnableTraining(parameters))
                     {
-                        var traced = (Tensor<float>)m.Invoke(engine, DifferentiableOpsGradCheckSweep.CopyArgs(args))!;
+                        var traced = DifferentiableOpsGradCheckSweep.InvokeOutput<float>(engine, m, args);
                         engine.ReduceSum(traced, null);
                         plan = scope.CompileTraining(parameters);
                     }
@@ -182,7 +182,7 @@ internal static class FloatGradientSweep
         try
         {
             using var tape = new GradientTape<float>();
-            var output = (Tensor<float>)m.Invoke(engine, DifferentiableOpsGradCheckSweep.CopyArgs(args))!;
+            var output = DifferentiableOpsGradCheckSweep.InvokeOutput<float>(engine, m, args);
             var grads = tape.ComputeGradients(engine.ReduceSum(output, null), inputs);
             return inputs.Where(x => grads.TryGetValue(x, out var g) && g is not null)
                 .ToDictionary(x => x, x => grads[x].GetFlattenedData().ToArray());
@@ -265,14 +265,6 @@ internal static class FloatGradientSweep
 
         return worst;
     }
-
-    private static Tensor<float>[] TensorInputs(object[] args) => args.SelectMany(a => a switch
-    {
-        Tensor<float> t => new[] { t },
-        Tensor<float>[] arr => arr,
-        IEnumerable<Tensor<float>> seq => seq.ToArray(),
-        _ => Array.Empty<Tensor<float>>(),
-    }).Distinct().ToArray();
 
     // The sweep's double arguments as float arguments; a tensor passed twice stays one tensor.
     private static object[] ToFloat(object[] args, ParameterInfo[] parameters)

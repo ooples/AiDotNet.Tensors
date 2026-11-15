@@ -1532,6 +1532,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend
     /// <inheritdoc/>
     public virtual void IstftFromSpectrum(IGpuBuffer specRe, IGpuBuffer specIm, IGpuBuffer window, IGpuBuffer result, IGpuBuffer windowSum, int batch, int numFrames, int nFft, int hop, int outputLength, int center) => Inner.IstftFromSpectrum(specRe, specIm, window, result, windowSum, batch, numFrames, nFft, hop, outputLength, center);
     /// <inheritdoc/>
+    public virtual void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget) => Inner.StftBackwardFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
+    /// <inheritdoc/>
+    public virtual void StftBackwardSignal(IGpuBuffer frameGrad, IGpuBuffer window, IGpuBuffer gradSignal, int batch, int length, int pad, int nFft, int hop, int numFrames) => Inner.StftBackwardSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
+    /// <inheritdoc/>
+    public virtual void StftBackwardWindow(IGpuBuffer frameGrad, IGpuBuffer signal, IGpuBuffer gradWindow, int batch, int length, int pad, int nFft, int hop, int numFrames) => Inner.StftBackwardWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
+    /// <inheritdoc/>
     public virtual void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total) => Inner.IstftNormalize(result, windowSum, total);
     /// <inheritdoc/>
     public virtual void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d) => Inner.HistogramDD(samples, hist, bins, mins, maxs, n, d);

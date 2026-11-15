@@ -589,11 +589,18 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         ThrowIfDisposed();
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
 
         if (buffer is not MetalGpuBuffer metalBuffer)
         {
             throw new ArgumentException("Buffer must be a MetalGpuBuffer", nameof(buffer));
         }
+        if (metalBuffer.Handle == IntPtr.Zero && metalBuffer.Size > 0)
+            throw new ObjectDisposedException(nameof(buffer));
+        if (destination.Length < metalBuffer.Size)
+            throw new ArgumentException("Destination array is too small.", nameof(destination));
+        if (metalBuffer.Size == 0) return;
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Metal);
 
         metalBuffer.CopyTo(destination);

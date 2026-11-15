@@ -684,15 +684,14 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_adam_update(
     if (k >= nnz) return;
     int i = decode_sparse_index(indices[k], param_size); if (i < 0) return;
     float grad = values[k];
+    if (weightDecay > 0.0f) grad += weightDecay * param[i];
     float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
     float mHat = mVal / (hip_opt_bias_correction(beta1, (float)step));
     float vHat = vVal / (hip_opt_bias_correction(beta2, (float)step));
-    float update = learningRate * mHat / (sqrtf(vHat) + epsilon);
-    if (weightDecay > 0.0f) update += learningRate * weightDecay * param[i];
-    param[i] -= update;
+    param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void sparse_adamw_update(

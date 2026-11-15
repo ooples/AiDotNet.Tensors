@@ -38,7 +38,7 @@ public sealed class TensorScope : IDisposable
     [ThreadStatic]
     private static int s_suspendedDepth;
 
-    private readonly TensorScope? _outer;
+    private TensorScope? _outer;
     private readonly int _threadId;
     // Keyed by storage (the vector), so a kept view keeps the result it views.
     private readonly Dictionary<object, Action> _results = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
@@ -138,19 +138,35 @@ public sealed class TensorScope : IDisposable
             s_current = null;
             s_suspendedDepth++;
         }
-        return new SuspendHandle(suspended);
+        return new SuspendHandle(suspended, Environment.CurrentManagedThreadId);
     }
 
-    internal readonly struct SuspendHandle : IDisposable
+    internal struct SuspendHandle : IDisposable
     {
-        private readonly TensorScope? _suspended;
-        internal SuspendHandle(TensorScope? suspended) => _suspended = suspended;
+        private TensorScope? _suspended;
+        private readonly int _threadId;
+        internal SuspendHandle(TensorScope? suspended, int threadId)
+        {
+            _suspended = suspended;
+            _threadId = threadId;
+        }
+
         public void Dispose()
         {
-            if (_suspended is not null && s_current is null)
+            if (Environment.CurrentManagedThreadId != _threadId) return;
+            var suspended = System.Threading.Interlocked.Exchange(ref _suspended, null);
+            if (suspended is null) return;
+            s_suspendedDepth--;
+            if (s_current is null)
             {
-                if (s_suspendedDepth > 0) s_suspendedDepth--;
-                s_current = _suspended;
+                s_current = suspended;
+            }
+            else
+            {
+                var root = s_current;
+                while (root._outer is not null)
+                    root = root._outer;
+                root._outer = suspended;
             }
         }
     }
