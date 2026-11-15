@@ -469,6 +469,14 @@ internal sealed class LazyTensorScope : IDisposable
     /// <summary>Gets all recorded nodes (for graph compiler).</summary>
     internal IReadOnlyList<ILazyNode> Nodes => _nodes;
 
+    /// <summary>
+    /// The first op that recorded a gradient-tape entry while this scope was the thread's trace (an op that ran eagerly,
+    /// or a custom backward recorded with DifferentiableOps.RecordUnary/RecordBinary/RecordIfActive), or null. The trace
+    /// holds no node for it, so a plan compiled from the trace cannot replay it; a closure objective that does this is
+    /// unsignable (<see cref="ClosureObjectiveGuard{T}"/>).
+    /// </summary>
+    internal string? TapeRecordedOp { get; set; }
+
     // Process-wide, so record order also holds between nodes of nested or successive traces.
     private static long s_recordOrder;
 
@@ -564,7 +572,7 @@ internal sealed class LazyTensorScope : IDisposable
     {
         EnsureTrainingParametersPrepared(parameters);
         // Signed before compilation, which may rewrite the node list (fusion, DCE).
-        ClosureObjectiveGuard<T>.OnCompileTraining(_nodes, parameters);
+        ClosureObjectiveGuard<T>.OnCompileTraining(this, parameters, explicitLoss: null);
         return CompilePlan(
             () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null));
     }
@@ -577,7 +585,7 @@ internal sealed class LazyTensorScope : IDisposable
     {
         EnsureTrainingParametersPrepared(parameters);
         // Signed before compilation, which may rewrite the node list (fusion, DCE).
-        ClosureObjectiveGuard<T>.OnCompileTraining(_nodes, parameters);
+        ClosureObjectiveGuard<T>.OnCompileTraining(this, parameters, explicitLoss);
         return CompilePlan(
             () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss));
     }

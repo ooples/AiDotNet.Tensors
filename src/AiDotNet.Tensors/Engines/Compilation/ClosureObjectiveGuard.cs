@@ -75,8 +75,9 @@ internal sealed class ClosureObjectiveGuard<T>
     }
 
     /// <summary>Called by <see cref="LazyTensorScope.CompileTraining{T}(Tensor{T}[])"/> before it compiles.</summary>
-    internal static void OnCompileTraining(IReadOnlyList<ILazyNode> nodes, Tensor<T>[] parameters)
+    internal static void OnCompileTraining(LazyTensorScope scope, Tensor<T>[] parameters, Tensor<T>? explicitLoss)
     {
+        var nodes = scope.Nodes;
         var recording = _recording;
         if (recording is null) return;
         recording.Compilations++;
@@ -84,6 +85,12 @@ internal sealed class ClosureObjectiveGuard<T>
         {
             recording.Guard = null;
             recording.Reason = "more than one training plan compiled inside the recording";
+            return;
+        }
+
+        if (UnreplayableReason(scope, explicitLoss) is { } unreplayable)
+        {
+            recording.Reason = unreplayable;
             return;
         }
 
@@ -201,7 +208,12 @@ internal sealed class ClosureObjectiveGuard<T>
         try
         {
             using var scope = GraphMode.EnableProbe();
-            objective();
+            var loss = objective();
+            if (UnreplayableReason(scope, loss) is { } unreplayable)
+            {
+                reason = unreplayable;
+                return ClosureGuardResult.Unsignable;
+            }
             signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves);
         }
         catch (ObjectiveProbeAbortedException ex)
@@ -225,6 +237,22 @@ internal sealed class ClosureObjectiveGuard<T>
 
         reason = null;
         return ClosureGuardResult.Matched;
+    }
+
+    /// <summary>
+    /// Why a plan compiled from <paramref name="scope"/>'s trace could not replay the objective whatever its signature,
+    /// or null: an op recorded only on the gradient tape (a custom backward closing over this step's host values, such
+    /// as a loss computed on the host and recorded with DifferentiableOps.RecordUnary), or a loss no traced op produced.
+    /// </summary>
+    private static string? UnreplayableReason(LazyTensorScope scope, Tensor<T>? loss)
+    {
+        if (scope.TapeRecordedOp is { } op)
+            return $"the objective records '{op}' on the gradient tape, outside the trace (a custom backward a plan cannot replay)";
+        if (loss is null) return null;
+        if (loss.LazySource is { } source)
+            foreach (var node in scope.Nodes)
+                if (ReferenceEquals(node, source)) return null;
+        return "the objective's loss is not computed by a traced op (a value computed on the host, say)";
     }
 
     private sealed class Recording : IDisposable
