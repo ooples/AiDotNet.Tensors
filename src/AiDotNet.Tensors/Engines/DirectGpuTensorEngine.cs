@@ -2042,7 +2042,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
         if ((array is not null && Helpers.HostSync.IsReleased(array))
             || Helpers.HostSync.IsReleased(tensor.DataVector))
+        {
+            // The release's own message: a last-use release names the producing op and the Retain call to add.
+            if (array is not null) Helpers.HostSync.ThrowIfReleased(array);
+            Helpers.HostSync.ThrowIfReleased(tensor.DataVector);
             throw new InvalidOperationException(ReleasedIntermediateMessage);
+        }
     }
 
     private static readonly bool s_staleDropTrace = System.Environment.GetEnvironmentVariable("AIDOTNET_STALE_DROP_TRACE") == "1";
@@ -2050,6 +2055,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
         ThrowIfReleased(tensor);
+        // A device read of an intermediate a probe run quarantined: retain its producer (AutoRetainProbe).
+        if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
@@ -2341,7 +2348,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// a later backward step (it did, in the HRE LM's specialized backwards). The old materialize-then-free contract
     /// hid that by downloading and re-uploading. A tensor with a valid host copy is simply uncached, as before.
     /// </summary>
-    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor)
+    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor, Helpers.ReleaseNote? note = null,
+        bool freeDeviceStorage = true)
     {
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if ((backingArray is not null && Helpers.HostSync.IsRetained(backingArray))
@@ -2349,7 +2357,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;   // kept past the tape by the caller
         if ((backingArray is not null && Helpers.HostSync.IsPending(backingArray))
             || Helpers.HostSync.IsPending(tensor.DataVector))
-            return;   // device-only: released (no download) when the tape is disposed
+        {
+            // Not opted in: device-only, so nothing to uncache; it stays readable and the collector reclaims it.
+            if (!freeDeviceStorage) return;
+            // Device-only, and its last declared backward use just ran (BackwardStorageReleasePlan proved no later step
+            // reads it, and a leaf's storage is never scheduled): free it now, stream ordered, with no download. It used
+            // to wait for the GC, as tape dispose no longer releases results the tensors own: 30-40% of a GPU MoE LM
+            // step's dead device memory, recovered by blocking collections.
+            ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true, note);
+            return;
+        }
         if (backingArray is not null) InvalidateActivationCacheEntry(backingArray);
         InvalidateActivationCacheEntry(tensor.DataVector);
     }
@@ -2541,6 +2558,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // materializes the view's logical layout.
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             return GetOrAllocateBuffer(backend, tensor);
+        // As GetOrAllocateBuffer: a released intermediate fails loudly instead of handing out a buffer the pool may have
+        // re-rented, and a device read of a quarantined one is reported to the probe. The resident and activation-cache
+        // returns below never reach GetOrAllocateBuffer, so a post-backward read through here (IEngine.ReduceSum on the
+        // innermost axis) left its producer unretained, and the next run freed what this consumer still read.
+        ThrowIfReleased(tensor);
+        if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
 
         int hostVersion = tensor.GpuCacheVersion;
         // Fast path: tensor has a GPU buffer from a previous GPU operation, and
@@ -3050,7 +3073,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// pool at once. Only a tensor covering its whole vector qualifies, so the buffer is the vector's own. Its pending
     /// download is replaced by the released-intermediate error, so a read that should not happen fails loudly.
     /// </summary>
-    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor, bool afterQueuedWork = false)
+    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor, bool afterQueuedWork = false, Helpers.ReleaseNote? note = null)
     {
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
@@ -3058,8 +3081,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
         if (s_staleDropTrace)
             StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
-        Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
-        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
+        if (note is not null)
+        {
+            Helpers.HostSync.Release(vector, note);
+            if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } noted) Helpers.HostSync.Release(noted, note);
+        }
+        else
+        {
+            Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
+            if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
+        }
         state.Buffer = null;
         state.DeviceValid = false;
         // If this tensor is the sole storage reference and its storage also owns an attached GPU buffer
@@ -6024,23 +6055,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Whole-step CUDA-graph capture assumes nothing else uses this engine's GPU while a step records: its warm-up, pre-pass
     // and capture share the engine's device caches and stream with any other thread's work, so a second thread training
     // on the same engine corrupted captured steps and faulted the context (CUDA 700; concurrent GPU Autoformer,
-    // AiDotNet#1804). PyTorch states the same rule for torch.cuda.graph. So capture is for an engine one thread trains
-    // on: the first compiled step's thread owns it, and once another thread steps, no plan on the engine captures again.
+    // AiDotNet#1804). PyTorch states the same rule for torch.cuda.graph. So capture is for an engine one training uses:
+    // the first compiled step's thread and plan own it, and once another thread steps a different plan, no plan on the
+    // engine captures again.
+    // A thread change alone is not a second trainer: an async training loop resumes on whichever pool thread finishes
+    // its await (AiModelBuilder's streaming loop after each validation), and its steps never overlap. That hop turned
+    // capture off for good, and the HreLm transformer trained at 230 ms/step with validation against 57 without.
     private int _compiledStepThread;
+    private long _compiledStepPlan;
     private volatile bool _compiledStepsFromSeveralThreads;
     private readonly object _graphCaptureGate = new();
 
     /// <summary>
-    /// Records that the calling thread runs a compiled training step on this engine. A thread other than the first marks
-    /// the engine shared, after waiting out any capture in progress (<see cref="EnterGraphCaptureExclusion"/>), so no capture
-    /// can be recording while that thread's GPU work starts.
+    /// Records that the calling thread runs a compiled training step of plan <paramref name="planId"/> on this engine.
+    /// The owner's thread may change plans (a recompile) and the owner's plan may change threads (an async loop's
+    /// continuation): ownership follows. A different plan on a different thread marks the engine shared, after waiting
+    /// out any capture in progress (<see cref="EnterGraphCaptureExclusion"/>), so no capture can be recording while that
+    /// thread's GPU work starts.
     /// </summary>
-    internal void NoteCompiledStepThread()
+    internal void NoteCompiledStepThread(long planId)
     {
+        if (_compiledStepsFromSeveralThreads) return;
         int thread = Environment.CurrentManagedThreadId;
-        int owner = System.Threading.Interlocked.CompareExchange(ref _compiledStepThread, thread, 0);
-        if (owner == 0 || owner == thread || _compiledStepsFromSeveralThreads) return;
-        lock (_graphCaptureGate) _compiledStepsFromSeveralThreads = true;
+        if (System.Threading.Volatile.Read(ref _compiledStepThread) == thread
+            && System.Threading.Interlocked.Read(ref _compiledStepPlan) == planId) return;
+        lock (_graphCaptureGate)
+        {
+            if (_compiledStepsFromSeveralThreads) return;
+            if (_compiledStepThread == 0 || _compiledStepThread == thread || _compiledStepPlan == planId)
+            {
+                System.Threading.Volatile.Write(ref _compiledStepThread, thread);
+                System.Threading.Interlocked.Exchange(ref _compiledStepPlan, planId);
+                return;
+            }
+            _compiledStepsFromSeveralThreads = true;
+        }
     }
 
     /// <summary>
@@ -6198,6 +6247,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 else backend.Fill(leased, 0f, length);
             }
             return leased;
+        }
+        if (pool.ReuseFreeForNewSlots && pool.TryTakeFree(length, out var reused))
+        {
+            // A forward action writing an output the plan span-leases: its first run reuses a released buffer.
+            if (!fullyWritten)
+            {
+                if (backend is IDeviceZeroFill zeroReused) zeroReused.ZeroBuffer(reused, length);
+                else backend.Fill(reused, 0f, length);
+            }
+            pool.Slots[key] = reused;
+            pool.Keys[reused] = key;
+            return reused;
         }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         pool.Slots[key] = nb;
@@ -6946,13 +7007,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Indices via the EXTERNALLY-MANAGED stable buffer (mirrors TryEmbeddingGatherGpu): register the refresh
             // so the plan re-uploads fresh indices before each captured replay; upload inline only on the eager
             // (non-managed) pass. The index upload (the only HtoD) thus never happens INSIDE the capture (= the 906).
+            // The lookup's own slot, keyed by its float-index tensor (the backward's savedState[0]), so a second lookup
+            // in the step cannot overwrite these ids before this lookup's backward scatters through them.
             var capIdx = floatIndices; var capN = numIndices;
-            RegisterEmbIndexRefresh(() => UploadEmbeddingIndices(capIdx, capN));
-            if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices);
-            if (_cachedEmbIndexBuffer is null) return false;
+            RegisterEmbIndexRefresh(floatIndices, () => UploadEmbeddingIndices(capIdx, capN, capIdx));
+            if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices, floatIndices);
+            if (!TryGetEmbeddingIndexBuffer(floatIndices, numIndices, out var idxBuf)) return false;
             if (s_residentSyncDebug) AliasDiag($"EMB-BUFS n={numIndices} dim={embeddingDim} needOut={(long)numIndices*embeddingDim} "
-                + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={_cachedEmbIndexBuffer.Size} impliedV={tableBuf.Size/embeddingDim}");
-            backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
+                + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={idxBuf.Size} impliedV={tableBuf.Size/embeddingDim}");
+            backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
             output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.GpuCacheVersion;
             var oArr = output.GetBackingArrayForCacheLookupUnsafe();
@@ -6964,13 +7027,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>PR #638 A1: resident embedding BACKWARD — scatter-add the grad rows into a resident [vocab,dim]
     /// table-grad via the backend EmbeddingBackward kernel, reusing the forward's STABLE on-device index buffer
-    /// (_cachedEmbIndexBuffer) so the float-index GetDataArray() download that aborts capture is skipped entirely.
+    /// (its own index slot) so the float-index GetDataArray() download that aborts capture is skipped entirely.
     /// Returns the bound table-grad, else null (off the resident step / no cached indices → caller's CPU path).</summary>
-    internal Tensor<T>? TryEmbeddingBackwardResident<T>(Tensor<T> gradOutput, int numIndices, int vocabSize, int embeddingDim, int[] tableShape)
+    /// <param name="lookupKey">The forward lookup's index identity (see <see cref="GetEmbeddingIndexSlot"/>): its saved
+    /// index array or index tensor. Each lookup scatters through the ids its own forward uploaded; with one engine-wide
+    /// buffer, two lookups in a step sent the first lookup's gradient to the second lookup's rows.</param>
+    internal Tensor<T>? TryEmbeddingBackwardResident<T>(Tensor<T> gradOutput, object lookupKey, int numIndices, int vocabSize, int embeddingDim, int[] tableShape)
     {
         using var __gpuOp = EnterGpuOp();
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
-        if (!TryGetBackend(out var backend) || _cachedEmbIndexBuffer is null) return null;
+        if (!TryGetBackend(out var backend) || !TryGetEmbeddingIndexBuffer(lookupKey, numIndices, out var idxBuf)) return null;
         if ((long)numIndices * embeddingDim != gradOutput.Length) return null;
         var grad = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
         var gR = ResolveResidentBufferNoUpload(backend, grad, numIndices * embeddingDim);
@@ -6984,7 +7050,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (backend is IDeviceZeroFill zeroEmb)
                 zeroEmb.ZeroBuffer(gradBuf, vocabSize * embeddingDim);
             else backend.Fill(gradBuf, 0f, vocabSize * embeddingDim);
-            backend.EmbeddingBackward(gR, _cachedEmbIndexBuffer, gradBuf, numIndices, embeddingDim, vocabSize);
+            backend.EmbeddingBackward(gR, idxBuf, gradBuf, numIndices, embeddingDim, vocabSize);
             ResidentSyncCheck("EmbeddingBackward");
             BindResidentBuffer(gradTable, gradBuf, backend);
             return gradTable;
@@ -13710,9 +13776,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var aB = GetOrAllocateBuffer(backend, inputs[3]);
             using var bB = GetOrAllocateBuffer(backend, inputs[4]);
             for (; allocated < 5; allocated++)
-                gradBuffers[allocated] = AllocateOutputBuffer(backend, allocated < 3 ? n : ng);
-            for (int i = 0; i < 5; i++)
-                backend.Fill(gradBuffers[i].Buffer, 0f, i < 3 ? n : ng);
+                gradBuffers[allocated] = AllocateFullyWrittenOutputBuffer(backend, allocated < 3 ? n : ng);
+            // No fill: the backend zeroes the gradients its atomic path accumulates into, and the deterministic path writes
+            // every element (poison-mode HreLm runs give the same loss with and without these fills).
             gdnBackend.GatedDeltaNetScanBackward(
                 dOut.Buffer, qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer,
                 gradBuffers[0].Buffer, gradBuffers[1].Buffer, gradBuffers[2].Buffer,
@@ -17702,8 +17768,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
             using var gammaBuffer = GetWeightBufferPreferResident(backend, gamma, PersistentTensorRole.Weights);
-            using var outputBuffer = AllocateOutputBuffer(backend, input.Length);
-            using var saveRmsBuffer = AllocateOutputBuffer(backend, batchSize);
+            using var outputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            using var saveRmsBuffer = AllocateFullyWrittenOutputBuffer(backend, batchSize);
 
             backend.RmsNorm(inputBuffer.Buffer, outputBuffer.Buffer, gammaBuffer.Buffer, saveRmsBuffer.Buffer,
                 batchSize, normalizedSize, (float)epsilon);
@@ -17750,7 +17816,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var saveRmsBuffer = GetOrAllocateBuffer(backend, rms);
             // Disposed on failure; once a deferred result owns each, RelinquishOwnership turns the using into a no-op.
             using var gradInputBuffer = AllocateFullyWrittenOutputBuffer(backend, input.Length);
-            using var gradGammaBuffer = AllocateOutputBuffer(backend, normalizedSize);
+            using var gradGammaBuffer = AllocateFullyWrittenOutputBuffer(backend, normalizedSize);   // the kernel writes every element
             backend.RmsNormBackward(gradOutBuffer.Buffer, inputBuffer.Buffer, gammaBuffer.Buffer, saveRmsBuffer.Buffer,
                 gradInputBuffer.Buffer, gradGammaBuffer.Buffer, batchSize, normalizedSize, (float)epsilon);
             var gradInput = DeferTensorResult<T>(backend, gradInputBuffer.Buffer, input.Length, input.Shape.ToArray());
@@ -19419,11 +19485,63 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// The embedding table is read from its LIVE GPU buffer (updated in place by the GPU optimizer), so the
     /// gather sees the current trained embeddings; only the small index vector is uploaded per step.
     /// </summary>
-    private IGpuBuffer? _cachedEmbIndexBuffer;   // stable embedding-index buffer (single alloc; refreshed in place)
-    private int _cachedEmbIndexCapacity;
+    /// <summary>
+    /// One embedding lookup's stable device index buffer (allocated once, refreshed in place) and the action that
+    /// refreshes it from the lookup's live indices before a captured replay. Each lookup has its own: the backward
+    /// scatters through the ids its forward gathered with, so a shared buffer let a later lookup of the same size
+    /// overwrite them, and a single refresh action refreshed only the last lookup registered.
+    /// </summary>
+    internal sealed class EmbeddingIndexSlot
+    {
+        internal IGpuBuffer? Buffer;
+        internal int Capacity;
+        // The host staging for this slot's uploads, exactly Capacity long: one array shared by every lookup outlived a
+        // larger lookup, and its full length was more than a smaller lookup's buffer holds, so the upload threw.
+        internal int[] Host = System.Array.Empty<int>();
+        internal System.Action? Refresh;
+    }
 
-    private int[]? _embIndexScratch;             // host int[] scratch for TIndex→int conversion (long/int tokens)
-    private System.Action? _embIndexRefresh;     // refreshes the index buffer from the LIVE indices (closure knows TIndex)
+    // Keyed weakly by the lookup's index identity, so a slot (and, through its buffer's finalizer, its device memory)
+    // lives exactly as long as the plan node that owns the key.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, EmbeddingIndexSlot> _embIndexSlots = new();
+    private readonly List<WeakReference<EmbeddingIndexSlot>> _embIndexSlotList = new();
+    private readonly object _embIndexLock = new();
+
+
+    /// <summary>The index slot of the lookup identified by <paramref name="lookupKey"/>, created on first use.</summary>
+    /// <param name="lookupKey">An object the forward and the backward of one lookup both hold, and no other lookup
+    /// holds: the saved index snapshot (the int-id lookup) or the index tensor (the float-id and Tensor&lt;int&gt;
+    /// lookups).</param>
+    internal EmbeddingIndexSlot GetEmbeddingIndexSlot(object lookupKey)
+    {
+        if (lookupKey is null) throw new ArgumentNullException(nameof(lookupKey));
+        lock (_embIndexLock)
+        {
+            if (_embIndexSlots.TryGetValue(lookupKey, out var existing)) return existing;
+            var slot = new EmbeddingIndexSlot();
+            _embIndexSlots.Add(lookupKey, slot);
+            _embIndexSlotList.RemoveAll(w => !w.TryGetTarget(out _));
+            _embIndexSlotList.Add(new WeakReference<EmbeddingIndexSlot>(slot));
+            return slot;
+        }
+    }
+
+    /// <summary>The device ids <paramref name="lookupKey"/>'s forward uploaded, if it holds at least
+    /// <paramref name="n"/>.</summary>
+    internal bool TryGetEmbeddingIndexBuffer(object lookupKey, int n,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IGpuBuffer? buffer)
+    {
+        lock (_embIndexLock)
+        {
+            if (_embIndexSlots.TryGetValue(lookupKey, out var slot) && slot.Buffer is { } b && slot.Capacity >= n)
+            {
+                buffer = b;
+                return true;
+            }
+        }
+        buffer = null;
+        return false;
+    }
 
     /// <summary>When true, the embedding index buffer is refreshed EXTERNALLY (by the compiled plan, OUTSIDE any
     /// graph capture) via <see cref="RefreshGraphEmbeddingIndicesNow"/>, so the captured gather kernel reads a stable
@@ -19434,56 +19552,91 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>The embedding op delegate registers a closure here that uploads its LIVE (typed) token indices into
     /// the stable buffer — so the compiled plan can refresh the buffer for ANY TIndex (int/long) without knowing
     /// the type. Invoked by <see cref="RefreshGraphEmbeddingIndicesNow"/> before each graph launch.</summary>
-    internal void RegisterEmbIndexRefresh(System.Action refresh) => _embIndexRefresh = refresh;
-    internal void RefreshGraphEmbeddingIndicesNow() => _embIndexRefresh?.Invoke();
+    internal void RegisterEmbIndexRefresh(object lookupKey, System.Action refresh) => GetEmbeddingIndexSlot(lookupKey).Refresh = refresh;
+
+    /// <summary>Refreshes every live lookup's index buffer, not only the last one registered.</summary>
+    internal void RefreshGraphEmbeddingIndicesNow()
+    {
+        System.Action?[] refreshes;
+        lock (_embIndexLock)
+        {
+            _embIndexSlotList.RemoveAll(w => !w.TryGetTarget(out _));
+            refreshes = new System.Action?[_embIndexSlotList.Count];
+            for (int i = 0; i < refreshes.Length; i++)
+                refreshes[i] = _embIndexSlotList[i].TryGetTarget(out var slot) ? slot.Refresh : null;
+        }
+        foreach (var refresh in refreshes) refresh?.Invoke();
+    }
 
     /// <summary>Convert any-typed token indices to int and upload them into the stable index buffer (allocated once,
     /// refreshed in place — no per-step cuMemAlloc). Used inline on the eager path and via the registered action on
     /// the managed (graph) path.</summary>
-    internal void UploadEmbeddingIndices<TIndex>(Tensor<TIndex> indices, int n)
+    internal void UploadEmbeddingIndices<TIndex>(Tensor<TIndex> indices, int n, object lookupKey)
     {
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return;
-        if (_cachedEmbIndexBuffer is null || _cachedEmbIndexCapacity < n)
+        var slot = GetEmbeddingIndexSlot(lookupKey);
+        IGpuBuffer target;
+        int[] host;
+        lock (_embIndexLock)
         {
-            _cachedEmbIndexBuffer?.Dispose();
-            _cachedEmbIndexBuffer = backend.AllocateIntBuffer(n);
-            _cachedEmbIndexCapacity = n;
+            if (slot.Buffer is null || slot.Capacity < n)
+            {
+                // Both allocated before either is published: a staging array that failed to allocate left the slot with
+                // the new buffer and capacity but the old, shorter array, and every retry overran it.
+                var buffer = backend.AllocateIntBuffer(n);
+                int[]? staging = null;
+                try { staging = new int[n]; }
+                finally
+                {
+                    if (staging is null) buffer.Dispose();
+                }
+                slot.Buffer?.Dispose();
+                slot.Buffer = buffer;
+                slot.Capacity = n;
+                slot.Host = staging;
+            }
+            target = slot.Buffer;
+            host = slot.Host;
         }
-        if (_embIndexScratch is null || _embIndexScratch.Length < n) _embIndexScratch = new int[n];
         using var rawLease = indices.LeaseArray();
         var raw = rawLease.Array;
         // Typed fast paths avoid boxing every token each step (Convert.ToInt32((object)x) on ~B*ctx elements
         // per step is heavy GC pressure). Token indices are int or long in practice.
-        if (raw is int[] ir) System.Array.Copy(ir, _embIndexScratch, n);
-        else if (raw is long[] lr) { for (int i = 0; i < n; i++) _embIndexScratch[i] = (int)lr[i]; }
-        else { for (int i = 0; i < n; i++) _embIndexScratch[i] = System.Convert.ToInt32((object)raw[i]!); }
-        backend.UploadIntBufferInPlace(_embIndexScratch, _cachedEmbIndexBuffer);
+        if (raw is int[] ir) System.Array.Copy(ir, host, n);
+        else if (raw is long[] lr) { for (int i = 0; i < n; i++) host[i] = (int)lr[i]; }
+        else { for (int i = 0; i < n; i++) host[i] = System.Convert.ToInt32((object)raw[i]!); }
+        backend.UploadIntBufferInPlace(host, target);
     }
 
     /// <summary>On-device embedding gather straight into the output's GPU buffer — CUDA-graph-CAPTURABLE. Resolves
     /// the resident embedding-table weight buffer (host-cached weight the optimizer updates in place). On the eager
     /// path it uploads THIS call's indices inline; on the managed (capture/replay) path it reads the stable buffer
     /// the plan already refreshed via the registered action, so no host upload happens inside the captured region.</summary>
-    internal bool TryEmbeddingGatherGpu<T, TIndex>(Tensor<T> embeddingTable, Tensor<TIndex> indices, int n, Tensor<T> output)
+    /// <param name="lookupKey">This lookup's index identity (see <see cref="GetEmbeddingIndexSlot"/>).</param>
+    internal bool TryEmbeddingGatherGpu<T, TIndex>(Tensor<T> embeddingTable, Tensor<TIndex> indices, int n, Tensor<T> output, object lookupKey)
     {
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return false;
-        var outBuf = output.TryGetGpuBuffer();
-        var tableBuf = embeddingTable.TryGetGpuBuffer() ?? ResolveResidentEmbeddingTable(backend, embeddingTable);
-        if (outBuf is null || tableBuf is null) return false;
         int embeddingDim = embeddingTable.Shape._dims[^1];
+        var tableBuf = embeddingTable.TryGetGpuBuffer() ?? ResolveResidentEmbeddingTable(backend, embeddingTable);
+        // On the resident step (and so in capture) give the output its resident buffer, as the float-index gather does:
+        // declining here sent the int-id gather to the host, which a captured graph cannot replay.
+        var outBuf = output.TryGetGpuBuffer()
+            ?? (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && output.IsContiguous
+                ? GetOrCreateResidentBuffer(backend, output, n * embeddingDim) : null);
+        if (outBuf is null || tableBuf is null) return false;
         if ((long)n * embeddingDim > outBuf.Size) return false;
-        if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(indices, n);   // eager: refresh inline
-        if (_cachedEmbIndexBuffer is null) return false;
-        backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, n, embeddingDim);
+        if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(indices, n, lookupKey);   // eager: refresh inline
+        if (!TryGetEmbeddingIndexBuffer(lookupKey, n, out var idxBuf)) return false;
+        backend.Embedding(idxBuf, tableBuf, outBuf, n, embeddingDim);
         // Leave the gathered output GPU-resident + version-current so EVERY downstream op (and the
         // CopyResultInto residency alias) resolves it via the _gpuBuffer fast path instead of re-uploading its
         // stale host data — this is the SOURCE of the forward residency chain that keeps the whole step
         // on-device for CUDA-graph capture. Without it, the first consumer re-uploads and the chain collapses.
-        output._gpuBuffer = outBuf;
-        output._gpuBackend = backend;
-        output._gpuBufferVersion = output.GpuCacheVersion;
+        // Bound as every resident op binds its output, which also arms the host download: setting the fields alone
+        // left a host read of the output with its previous contents (the gather wrote only the device).
+        BindResidentBuffer(output, outBuf, backend);
         return true;
     }
 
@@ -20397,8 +20550,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         bool sumTrailing = trailing > 1;
-        OwnedBuffer rowSums = sumTrailing ? AllocateOutputBuffer(backend, leading * kept) : default;
-        var output = AllocateOutputBuffer(backend, kept);
+        OwnedBuffer rowSums = sumTrailing ? AllocateFullyWrittenOutputBuffer(backend, leading * kept) : default;
+        var output = AllocateFullyWrittenOutputBuffer(backend, kept);
         bool handedOff = false;
         try
         {
@@ -24757,6 +24910,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var input = GetOrAllocateBuffer(viewBackend, source);
             viewBackend.Copy(input.Buffer, 0, whole.Buffer, destination.StorageOffset, destination.Length);
             storage.IncrementVersion();
+            // The wrapper's bump never reaches the storage the destination shares: a quarantined alias of it read no
+            // change, and its release freed the buffer now holding the copied value.
+            destination.IncrementVersion();
             BindResidentBuffer(storage, whole.Buffer, viewBackend);
             base.InvalidatePersistentTensor(destination);
             input.DisposeAfterQueuedUse(viewBackend);
@@ -25991,8 +26147,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int outerSize = input.Length / normSize;
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
-            bufOut = AllocateOutputBuffer(backend, input.Length);
-            bufRms = AllocateOutputBuffer(backend, outerSize);
+            bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            bufRms = AllocateFullyWrittenOutputBuffer(backend, outerSize);
             backend.RmsNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufRms.Buffer,
                 outerSize, normSize, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());

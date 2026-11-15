@@ -4,11 +4,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <summary>A captured graph's kernel, memcpy and memset nodes (see <see cref="IGpuGraphCapture.LastCaptureNodeCounts"/>).</summary>
 internal readonly struct GraphNodeCounts
 {
-    internal GraphNodeCounts(int kernel, int memcpy, int memset)
+    internal GraphNodeCounts(int kernel, int memcpy, int memset, string? memsetSources = null)
     {
         Kernel = kernel;
         Memcpy = memcpy;
         Memset = memset;
+        MemsetSources = memsetSources;
     }
 
     /// <summary>Kernel launch nodes.</summary>
@@ -19,6 +20,13 @@ internal readonly struct GraphNodeCounts
 
     /// <summary>Memory set nodes.</summary>
     internal int Memset { get; }
+
+    /// <summary>
+    /// Each memset node's byte count and the kernel it feeds (or follows, for a memset nothing depends on), separated by
+    /// "; ", so a step-graph ratchet that sees a new memset can name its producer. Null when there are no memset nodes or
+    /// the backend cannot introspect its graph.
+    /// </summary>
+    internal string? MemsetSources { get; }
 }
 
 /// <summary>

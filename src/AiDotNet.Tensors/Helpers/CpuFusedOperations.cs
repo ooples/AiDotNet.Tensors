@@ -1731,7 +1731,7 @@ public static class CpuFusedOperations
                     return t + x * sig * (1.0 - t * t);
                 };
             case FusedActivationType.HardSwish:
-                return x => x <= -3.0 ? 0.0 : (x >= 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0);
+                return x => x < -3.0 ? 0.0 : (x > 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0);
             case FusedActivationType.HardSigmoid:
                 return x => (x > -3.0 && x < 3.0) ? 1.0 / 6.0 : 0.0;
             case FusedActivationType.HardTanh:

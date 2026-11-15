@@ -46,6 +46,7 @@ public abstract class StepCountRatchetBase
         string key = $"{network}:{device}";
         _output.WriteLine($"{key}: {counts.AllocatedBytesPerStep} bytes/step" +
             (counts.KernelNodes is { } k ? $", graph kernels {k}, memcpy {counts.MemcpyNodes}, memset {counts.MemsetNodes}" : "") +
+            (counts.MemsetSources is { } sources ? $" [{sources}]" : "") +
             (counts.GraphCaptureFailure is { } why ? $", no graph: {why}" : ""));
 
         using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, BaselineFile)));
@@ -79,7 +80,8 @@ public abstract class StepCountRatchetBase
             // slack; memcpy and memset nodes are exact.
             int limit = name == "kernelNodes" ? recordedCount.GetInt32() + Math.Max(1, recordedCount.GetInt32() / 20) : recordedCount.GetInt32();
             Assert.True(value <= limit,
-                $"{key}: the captured step graph has {value} {name}, above the recorded {recordedCount.GetInt32()} (limit {limit}).");
+                $"{key}: the captured step graph has {value} {name}, above the recorded {recordedCount.GetInt32()} (limit {limit})." +
+                (name == "memsetNodes" ? $" Memset nodes: {counts.MemsetSources ?? "none described"}." : ""));
             if (value < recordedCount.GetInt32())
                 _output.WriteLine($"  IMPROVED: {name} {value} against {recordedCount.GetInt32()}; lower the baseline.");
         }

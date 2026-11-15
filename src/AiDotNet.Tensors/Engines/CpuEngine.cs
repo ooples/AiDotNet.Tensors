@@ -39038,8 +39038,17 @@ public partial class CpuEngine : ITensorLevelEngine
                         // eager path uploads inline. Falls through to the host gather when not GPU-resident.
                         if (eng.TryGet<DirectGpuTensorEngine>(out var gpuEng))
                         {
-                            gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(capturedIndices, n));
-                            if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output)) return;
+                            // idxSnap is this lookup's index identity: the backward receives it as savedState[0].
+                            gpuEng.RegisterEmbIndexRefresh(idxSnap, () => gpuEng.UploadEmbeddingIndices(capturedIndices, n, idxSnap));
+                            if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output, idxSnap))
+                            {
+                                // The backward scatters through idxSnap off the resident step: refresh it here too, or
+                                // the GPU gather read this step's tokens while the table gradient went to the trace
+                                // batch's rows (measured: a GPU-compiled int-id plan diverged from the CPU from step 2).
+                                var liveIds = capturedIndices.GetReadOnlyDataArray();
+                                for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveIds[i]);
+                                return;
+                            }
                         }
                         // #1331-for-embeddings: re-read the LIVE indices each replay. The compiled plan is
                         // traced once and replayed across steps; the higher-level Train() loop refreshes the
@@ -39058,7 +39067,12 @@ public partial class CpuEngine : ITensorLevelEngine
                         // reject mutation; asking for write intent here made a pure gather fail
                         // after its first eviction. Keep only the destination writable.
                         var embDataLocal = capturedEmb.GetReadOnlyDataArray();
-                        using var outDataLocalLease = output.LeaseArray();
+                        // Gather into a host tensor and hand it over through CopyResultInto, which drops every device
+                        // copy of the output first. Writing the output's host array in place left its device copy
+                        // from the previous step looking current, so on a GPU engine every consumer kept reading the
+                        // first step's embeddings (measured: an int-id compiled plan diverged from the CPU at step 2).
+                        var gathered = new Tensor<TValue>(output._shape);
+                        using var outDataLocalLease = gathered.LeaseArray();
                         var outDataLocal = outDataLocalLease.Array;
                         for (int i = 0; i < n; i++)
                         {
@@ -39072,6 +39086,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             int dstOff = i * capturedDim;
                             Array.Copy(embDataLocal, srcOff, outDataLocal, dstOff, capturedDim);
                         }
+                        DirectGpuTensorEngine.CopyResultInto(eng, gathered, output);
                     },
                     BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
                     new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim, capturedIndices });
@@ -48703,7 +48718,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
-            double deriv = x <= -3.0 ? 0.0 : x >= 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
+            // torch hardswish_backward: the ramp includes both endpoints (-0.5 at -3, 1.5 at 3).
+            double deriv = x < -3.0 ? 0.0 : x > 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
             result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
         }
         return new Tensor<T>(result, gradOutput.Shape.ToArray());
@@ -49346,8 +49362,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         // fall back to the host gather + copy when not GPU-resident (CPU engine / not-yet-resident).
                         if (eng.TryGet<DirectGpuTensorEngine>(out var gpuEng))
                         {
-                            gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(ci, ci.Length));
-                            if (gpuEng.TryEmbeddingGatherGpu(ct, ci, ci.Length, output)) return;
+                            gpuEng.RegisterEmbIndexRefresh(ci, () => gpuEng.UploadEmbeddingIndices(ci, ci.Length, ci));
+                            if (gpuEng.TryEmbeddingGatherGpu(ct, ci, ci.Length, output, ci)) return;
                         }
                         var r = eng.Embedding(ci, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                     },

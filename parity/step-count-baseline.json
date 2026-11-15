@@ -29,7 +29,7 @@
     "mlp:cuda:NVIDIA GeForce GTX 1660 Ti:cudnn": { "allocatedBytesPerStep": 896, "kernelNodes": 24, "memcpyNodes": 0, "memsetNodes": 0 },
     "cnn:cuda:NVIDIA GeForce GTX 1660 Ti:cudnn": { "allocatedBytesPerStep": 1152, "kernelNodes": 41, "memcpyNodes": 0, "memsetNodes": 2 },
     "lstm:cuda:NVIDIA GeForce GTX 1660 Ti:cudnn": { "allocatedBytesPerStep": 896, "kernelNodes": 9, "memcpyNodes": 0, "memsetNodes": 0 },
-    "transformer:cuda:NVIDIA GeForce GTX 1660 Ti:cudnn": { "allocatedBytesPerStep": 1920, "kernelNodes": 35, "memcpyNodes": 0, "memsetNodes": 1 },
+    "transformer:cuda:NVIDIA GeForce GTX 1660 Ti:cudnn": { "allocatedBytesPerStep": 1024, "kernelNodes": 34, "memcpyNodes": 0, "memsetNodes": 1 },
     "resnet18:cuda:NVIDIA GeForce GTX 1660 Ti:cudnn": { "allocatedBytesPerStep": 8064, "kernelNodes": 163, "memcpyNodes": 0, "memsetNodes": 5 }
   }
 }

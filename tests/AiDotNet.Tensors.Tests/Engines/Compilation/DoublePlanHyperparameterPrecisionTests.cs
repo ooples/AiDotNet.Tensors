@@ -159,16 +159,69 @@ public class DoublePlanHyperparameterPrecisionTests
         }
     }
 
+    [Fact]
+    public void Optimizer_state_exported_before_the_velocity_flag_still_imports()
+    {
+        var (_, plan) = Compile();
+        using (plan)
+        {
+            Configure(plan, OptimizerType.Adam);
+            plan.Step();
+            var typed = Assert.IsType<CompiledTrainingPlan<double>>(plan);
+            var saved = typed.CaptureFusedOptimizerCheckpoint() ?? throw new InvalidOperationException("no checkpoint");
+            byte[] current = plan.ExportOptimizerState() ?? throw new InvalidOperationException("no state");
+
+            // Version 4 is the current layout without the velocity flag. Reading the flag from it would take the first
+            // byte of the LR-schedule count, so the import would fail or restore the wrong schedules.
+            plan.ImportOptimizerState(WithoutVelocityFlag(current, version: 4));
+            var restored = typed.CaptureFusedOptimizerCheckpoint() ?? throw new InvalidOperationException("no checkpoint");
+            Assert.Equal(B1, restored.Beta1);
+            Assert.Equal(Eps, restored.Epsilon);
+            Assert.Equal(1, restored.OptimizerStep);
+            Assert.False(restored.Extras.VelocityIncludesLearningRate);
+            Assert.Equal(saved.Schedules.Length, restored.Schedules.Length);
+            for (int k = 0; k < saved.Schedules.Length; k++)
+            {
+                Assert.Equal(saved.Schedules[k].Kind, restored.Schedules[k].Kind);
+                Assert.Equal(saved.Schedules[k].Doubles, restored.Schedules[k].Doubles);
+                Assert.Equal(saved.Schedules[k].Ints, restored.Schedules[k].Ints);
+            }
+            Assert.Equal(saved.Parameters.Length, restored.Parameters.Length);
+        }
+    }
+
     /// <summary>
-    /// Transcodes a current (version 4) optimizer-state export into version 3, which wrote beta1, beta2, epsilon and
-    /// weight decay, and the per-group weight decays, as float. The four values follow magic, version, hasCheckpoint
-    /// (bool), type (int), grouped (bool) and step (int). The group decays are the length-prefixed array holding
-    /// <paramref name="groupWeightDecays"/>, located by its exact bytes; null leaves the -1 marker, which both layouts share.
+    /// Offset of the VelocityIncludesLearningRate flag in a version 5 export: magic, version, hasCheckpoint (bool),
+    /// type, grouped (bool), step, four double hyperparameters, moment storage, int8 block, int8 minimum length, max
+    /// grad norm (double), then the extras: 17 floats, Nesterov (bool), FTRL beta, L-BFGS memory (int), trust radius,
+    /// ADMM rho, LAMB clip, LAMB / decoupled / AMSGrad switches (3 bools), two nullable doubles (bool + double each).
     /// </summary>
-    private static byte[] ToVersion3(byte[] current, double[]? groupWeightDecays)
+    private const int VelocityFlagOffset = 4 + 4 + 1 + 4 + 1 + 4 + (4 * 8) + 4 + 4 + 4 + 8
+        + (17 * 4) + 1 + 4 + 4 + 4 + 4 + 4 + 3 + (2 * 9);
+
+    /// <summary>Drops the velocity flag from a version 5 export and stamps <paramref name="version"/>.</summary>
+    private static byte[] WithoutVelocityFlag(byte[] current, int version)
+    {
+        Assert.Equal(5, BitConverter.ToInt32(current, 4));
+        Assert.True(current[VelocityFlagOffset] <= 1, "the byte at the velocity-flag offset is not a bool");
+        var legacy = new System.Collections.Generic.List<byte>(current);
+        legacy.RemoveAt(VelocityFlagOffset);
+        byte[] v = BitConverter.GetBytes(version);
+        for (int b = 0; b < 4; b++) legacy[4 + b] = v[b];
+        return legacy.ToArray();
+    }
+
+    /// <summary>
+    /// Transcodes a current (version 5) optimizer-state export into version 3, which wrote beta1, beta2, epsilon and
+    /// weight decay, and the per-group weight decays, as float, and had no velocity flag. The four values follow magic,
+    /// version, hasCheckpoint (bool), type (int), grouped (bool) and step (int). The group decays are the
+    /// length-prefixed array holding <paramref name="groupWeightDecays"/>, located by its exact bytes; null leaves the -1
+    /// marker, which both layouts share.
+    /// </summary>
+    private static byte[] ToVersion3(byte[] export, double[]? groupWeightDecays)
     {
         const int at = 4 + 4 + 1 + 4 + 1 + 4;
-        Assert.Equal(4, BitConverter.ToInt32(current, 4));
+        byte[] current = WithoutVelocityFlag(export, version: 4);
         var legacy = new System.Collections.Generic.List<byte>(current.Length);
         legacy.AddRange(new ArraySegment<byte>(current, 0, at));
         for (int b = 0; b < 4; b++) legacy[4 + b] = BitConverter.GetBytes(3)[b];

@@ -289,9 +289,9 @@ extern ""C"" __global__ __launch_bounds__(256) void hardswish_backward(const flo
     if (idx >= size) return;
     float x = input[idx];
     float grad;
-    if (x <= -3.0f) {
+    if (x < -3.0f) {
         grad = 0.0f;
-    } else if (x >= 3.0f) {
+    } else if (x > 3.0f) {
         grad = 1.0f;
     } else {
         // d/dx[x * (x + 3) / 6] = (2x + 3) / 6

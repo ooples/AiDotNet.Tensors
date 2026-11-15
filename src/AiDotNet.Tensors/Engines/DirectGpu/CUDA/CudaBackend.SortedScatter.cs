@@ -20,6 +20,12 @@ public sealed partial class CudaBackend
     internal long SortedScatterLaunches => System.Threading.Interlocked.Read(ref _sortedScatterLaunches);
     private long _sortedScatterLaunches;
 
+    /// <summary>
+    /// Tests: run the sorted path even where the cost model prefers the scanning kernels (one item into many rows), so
+    /// its correctness is checked at sizes production never sends it.
+    /// </summary>
+    internal bool SortedScatterIgnoresCostModel { get; set; }
+
     private IntPtr _sortedScatterModule;
     private readonly object _sortedScatterLock = new();
 
@@ -48,7 +54,7 @@ public sealed partial class CudaBackend
         // Below ~150 us of scanning they win (300 tokens into 7 rows: 29 us against 51).
         long cells = (long)destinations * features;
         double scanMicroseconds = (double)cells * count / Math.Min(1.5e5, 24.0 * cells);
-        if (scanMicroseconds < 150 || cells > int.MaxValue) return false;
+        if (cells > int.MaxValue || (scanMicroseconds < 150 && !SortedScatterIgnoresCostModel)) return false;
         if (!_kernelCache.TryGetValue("sorted_scatter_init", out var init) ||
             !_kernelCache.TryGetValue("sorted_scatter_histogram", out var histogram) ||
             !_kernelCache.TryGetValue("sorted_scatter_scan", out var scan) ||
@@ -98,7 +104,7 @@ public sealed partial class CudaBackend
 
             void** startArgs = stackalloc void*[4];
             startArgs[0] = &sortedKeys; startArgs[1] = &st; startArgs[2] = &n; startArgs[3] = &dest;
-            LaunchKernel(startsKernel, (uint)((count + 1 + 255) / 256), 256, startArgs);
+            LaunchKernel(startsKernel, checked((uint)(((long)destinations + 1 + 255) / 256)), 256, startArgs);
 
             IntPtr rowPtr = rows?.Handle ?? IntPtr.Zero, weightPtr = weights?.Handle ?? IntPtr.Zero;
             IntPtr countPtr = counts?.Handle ?? IntPtr.Zero;

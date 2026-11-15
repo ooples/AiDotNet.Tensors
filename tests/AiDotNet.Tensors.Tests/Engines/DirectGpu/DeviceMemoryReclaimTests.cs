@@ -166,6 +166,39 @@ public sealed class DeviceMemoryReclaimTests
     }
 
     [Fact]
+    public void ScopedScratch_InsideATape_IsNotChargedAndForcesNoCollection()
+    {
+        // Scratch its allocating method disposes (the GatedDeltaNet backward's trajectory) never becomes garbage, so it
+        // must not count toward the in-tape threshold: charging it forced a blocking GC inside every training step.
+        var tapeOpen = DeviceMemoryReclaim.TapeOpen;
+        DeviceMemoryReclaim.TapeOpen = () => true;
+        try
+        {
+            DeviceMemoryReclaim.ResetCountsForTests();
+            int collectionsBefore = GC.CollectionCount(1);
+            long epoch;
+            using (DeviceMemoryReclaim.EnterScopedScratch())
+            {
+                Assert.True(DeviceMemoryReclaim.InScopedScratch);
+                epoch = DeviceMemoryReclaim.OnDeviceAllocation(2 * DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes);
+            }
+            Assert.False(DeviceMemoryReclaim.InScopedScratch);
+            Assert.Equal(-1, epoch);
+            Assert.Equal(collectionsBefore, GC.CollectionCount(1));
+            Assert.False(DeviceMemoryReclaim.CollectionDue);
+            Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
+            // Outside the scope the same allocation is charged as before.
+            DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectAfterDeviceBytes);
+            Assert.True(DeviceMemoryReclaim.CollectionDue);
+        }
+        finally
+        {
+            DeviceMemoryReclaim.TapeOpen = tapeOpen;
+            DeviceMemoryReclaim.ResetCountsForTests();
+        }
+    }
+
+    [Fact]
     public void StepBoundary_SkipsTheCollection_WhenOwnersDisposedWhatWasHandedOut()
     {
         // A TensorScope ending an inference call disposes its intermediates: they are back in the pool and credited, so
@@ -417,6 +450,33 @@ public sealed class DeviceMemoryReclaimTests
 
         using var next = backend!.AllocateBuffer(1024);              // the next allocation runs it
         Assert.True(DirectOpenClGpuBuffer.PendingFrees.IsEmpty);
+    }
+
+    [Fact]
+    public void A_scoped_scratch_scope_disposed_twice_does_not_leave_the_thread_uncharged()
+    {
+        var scope = DeviceMemoryReclaim.EnterScopedScratch();
+        Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        scope.Dispose();
+        scope.Dispose();   // a copy of the struct disposed again: the depth went to -1, read as inside a scope
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
+        using (DeviceMemoryReclaim.EnterScopedScratch())
+            Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
+    }
+
+    [Fact]
+    public void An_inner_scratch_scope_disposed_twice_leaves_its_enclosing_scope_open()
+    {
+        using (DeviceMemoryReclaim.EnterScopedScratch())
+        {
+            var inner = DeviceMemoryReclaim.EnterScopedScratch();
+            inner.Dispose();
+            inner.Dispose();                                  // the depth went from 2 to 0: the outer scope ended too
+            default(DeviceMemoryReclaim.ScopedScratchScope).Dispose();
+            Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        }
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
     }
 
     [SkippableFact]

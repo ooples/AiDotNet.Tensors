@@ -49,6 +49,27 @@ internal unsafe struct CudaDeviceUuid
     internal fixed byte Bytes[16];
 }
 
+/// <summary>CUmemAllocationProp: a pinned device allocation on one device (the fields cuMemCreate reads).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct CudaMemAllocationProp
+{
+    internal int Type;                    // CU_MEM_ALLOCATION_TYPE_PINNED = 1
+    internal int RequestedHandleTypes;    // CU_MEM_HANDLE_TYPE_NONE = 0
+    internal int LocationType;            // CU_MEM_LOCATION_TYPE_DEVICE = 1
+    internal int LocationId;              // the device ordinal
+    internal IntPtr Win32HandleMetaData;
+    internal ulong AllocFlags;            // compression type, RDMA, usage: all zero
+}
+
+/// <summary>CUmemAccessDesc: what one device may do with a mapped range.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct CudaMemAccessDesc
+{
+    internal int LocationType;            // CU_MEM_LOCATION_TYPE_DEVICE = 1
+    internal int LocationId;
+    internal int Flags;                   // CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+}
+
 internal static class CudaNativeBindings
 {
 #if WINDOWS
@@ -401,6 +422,25 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuGraphNodeGetType")]
     public static extern CudaResult cuGraphNodeGetType(IntPtr node, out int type);
 
+    // Graph node introspection for capture diagnostics: which kernel a memset node zeroes for.
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphNodeGetDependentNodes")]
+    public static extern CudaResult cuGraphNodeGetDependentNodes(IntPtr node, [Out] IntPtr[]? dependentNodes, ref ulong numDependentNodes);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphNodeGetDependencies")]
+    public static extern CudaResult cuGraphNodeGetDependencies(IntPtr node, [Out] IntPtr[]? dependencies, ref ulong numDependencies);
+
+    /// <summary>Writes a CUDA_KERNEL_NODE_PARAMS (v1, 56 bytes) whose first field is the CUfunction.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphKernelNodeGetParams")]
+    public static extern CudaResult cuGraphKernelNodeGetParams(IntPtr node, IntPtr nodeParams);
+
+    /// <summary>Writes a CUDA_MEMSET_NODE_PARAMS: dst@0, pitch@8, value@16, elementSize@20, width@24, height@32.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphMemsetNodeGetParams")]
+    public static extern CudaResult cuGraphMemsetNodeGetParams(IntPtr node, IntPtr nodeParams);
+
+    /// <summary>The mangled name of a CUfunction (driver 12.3+; older drivers lack the export).</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuFuncGetName")]
+    public static extern CudaResult cuFuncGetName(out IntPtr name, IntPtr func);
+
     [DllImport(CudaLibrary, EntryPoint = "cuGraphDestroy")]
     public static extern CudaResult cuGraphDestroy(IntPtr graph);
 
@@ -454,6 +494,32 @@ internal static class CudaNativeBindings
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxPopCurrent_v2")]
     public static extern CudaResult cuCtxPopCurrent(out IntPtr ctx);
+
+    // Virtual memory management: a reserved address range mapped onto physical allocations. Tests map one small
+    // allocation many times over, to address a range far larger than the device holds.
+    [DllImport(CudaLibrary, EntryPoint = "cuMemGetAllocationGranularity")]
+    public static extern CudaResult cuMemGetAllocationGranularity(out ulong granularity, ref CudaMemAllocationProp prop, int option);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemCreate")]
+    public static extern CudaResult cuMemCreate(out ulong handle, ulong size, ref CudaMemAllocationProp prop, ulong flags);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemRelease")]
+    public static extern CudaResult cuMemRelease(ulong handle);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAddressReserve")]
+    public static extern CudaResult cuMemAddressReserve(out IntPtr ptr, ulong size, ulong alignment, IntPtr addr, ulong flags);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemAddressFree")]
+    public static extern CudaResult cuMemAddressFree(IntPtr ptr, ulong size);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemMap")]
+    public static extern CudaResult cuMemMap(IntPtr ptr, ulong size, ulong offset, ulong handle, ulong flags);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemUnmap")]
+    public static extern CudaResult cuMemUnmap(IntPtr ptr, ulong size);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemSetAccess")]
+    public static extern CudaResult cuMemSetAccess(IntPtr ptr, ulong size, ref CudaMemAccessDesc desc, ulong count);
 
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyPeerAsync")]
     public static extern CudaResult cuMemcpyPeerAsync(

@@ -13,7 +13,18 @@ internal enum FusedLrScheduleKind
     LinearWarmupDecay = 9,
     LinearWarmupPhasedDecay = 10,
     LinearWarmupLegacyEagerDecay = 11,
-    External = 12
+    External = 12,
+    // Kinds from 13 on are CompletedStepLr schedules, restored through their constructors.
+    WarmupStableDecay = 13,
+    Polynomial = 14,
+    MultiStep = 15,
+    TriStage = 16,
+    NoamHoldAnnealing = 17,
+    CosineWarmRestarts = 18,
+    OneCycleWithAnneal = 19,
+    CyclicRange = 20,
+    Sequential = 21,
+    CosineAnnealingHold = 22
 }
 
 internal sealed class FusedLrScheduleCheckpoint
@@ -33,12 +44,21 @@ internal sealed class FusedLrScheduleCheckpoint
         Ints = ints;
     }
 
-    public LrSchedule ToSchedule()
+    public LrSchedule ToSchedule() => ToSchedule(0);
+
+    /// <summary>
+    /// Restores the schedule. A family kind is built once, by its constructor, which is also its validation. Calling
+    /// <see cref="Validate"/> first would build it twice per level, and so 2^depth times for nested Sequential children.
+    /// </summary>
+    /// <param name="depth">Sequential nesting level of this checkpoint (0 at the top).</param>
+    internal LrSchedule ToSchedule(int depth)
     {
-        Validate();
+        ValidatePayload();
         // An external rate stays external, so the caller can keep setting it on the restored plan.
         if (Kind == FusedLrScheduleKind.External)
             return new ExternalLrSchedule(Doubles[0]);
+        if (CompletedStepLr.IsFamilyKind(Kind))
+            return CompletedStepLr.Restore(Kind, Doubles, Ints, depth);
         return new RestoredLrSchedule(Kind, Doubles, Ints);
     }
 
@@ -48,6 +68,14 @@ internal sealed class FusedLrScheduleCheckpoint
     /// inside <c>GetLr</c> mid-training (or silently restoring an invalid schedule).
     /// </summary>
     public void Validate()
+    {
+        ValidatePayload();
+        if (CompletedStepLr.IsFamilyKind(Kind))
+            CompletedStepLr.Restore(Kind, Doubles, Ints);   // the constructors' own validation
+    }
+
+    /// <summary>The kind, payload-size and finiteness checks, without building the schedule.</summary>
+    private void ValidatePayload()
     {
         (int reqD, int reqI) = Kind switch
         {
@@ -63,6 +91,16 @@ internal sealed class FusedLrScheduleCheckpoint
             FusedLrScheduleKind.LinearWarmupDecay => (3, 3),
             FusedLrScheduleKind.LinearWarmupPhasedDecay => (3, 3),
             FusedLrScheduleKind.LinearWarmupLegacyEagerDecay => (3, 3),
+            FusedLrScheduleKind.WarmupStableDecay => (2, 4),
+            FusedLrScheduleKind.Polynomial => (3, 1),
+            FusedLrScheduleKind.MultiStep => (3, 1),
+            FusedLrScheduleKind.TriStage => (3, 3),
+            FusedLrScheduleKind.NoamHoldAnnealing => (2, 2),
+            FusedLrScheduleKind.CosineWarmRestarts => (2, 2),
+            FusedLrScheduleKind.OneCycleWithAnneal => (4, 2),
+            FusedLrScheduleKind.CyclicRange => (3, 3),
+            FusedLrScheduleKind.Sequential => (0, 1),
+            FusedLrScheduleKind.CosineAnnealingHold => (2, 1),
             _ => throw new System.IO.InvalidDataException(
                 $"Unknown serialized LR schedule kind {(int)Kind}."),
         };
@@ -84,6 +122,12 @@ internal sealed class FusedLrScheduleCheckpoint
             && (Ints[0] < 0 || !Enum.IsDefined(typeof(WarmupDecayMode), Ints[2])
                 || (Ints[2] != (int)WarmupDecayMode.Constant && Ints[1] < Ints[0])))
             throw new System.IO.InvalidDataException("Serialized phased warmup has invalid steps or decay mode.");
+        if (CompletedStepLr.IsFamilyKind(Kind))
+        {
+            foreach (double v in Doubles)
+                if (double.IsNaN(v) || double.IsInfinity(v))
+                    throw new System.IO.InvalidDataException($"Serialized LR schedule kind {Kind} has a non-finite value.");
+        }
     }
 
     private sealed class RestoredLrSchedule : LrSchedule

@@ -14056,7 +14056,10 @@ KERNEL VARIANTS (A/B testing):
                 Fill(dBeta, 0f, batch * seqLen * numHeads);
             }
             int trajLen = (int)trajLenLong;
-            using var trajBuf = AllocateBuffer(trajLen);
+            // Disposed below: not charged toward the reclaim collections.
+            IGpuBuffer trajScratch;
+            using (DeviceMemoryReclaim.EnterScopedScratch()) trajScratch = AllocateBuffer(trajLen);
+            using var trajBuf = trajScratch;
             int total = (int)totalLong;
             // One size launches both kernels, so it must fit the smaller compiled limit: their private state arrays
             // can push CL_KERNEL_WORK_GROUP_SIZE below the device maximum.

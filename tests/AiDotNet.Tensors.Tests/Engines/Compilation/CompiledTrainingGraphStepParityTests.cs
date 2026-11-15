@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -109,10 +110,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public long InputCopiesSkipped;   // replays' skipped input copies (unchanged inputs)
         public long ResidentCopiesSkipped;   // ... of device-resident inputs, on an unchanged version alone
         public bool ClobberedLossGradient;
+        public bool CapturedUpdateBeforeOutsideStep;   // the update ran in the step graph when the outside step came
+        public bool ParityGraphsBeforeOutsideStep;   // ... and two parity graphs alternated
         public bool ReleasedIntermediatePending;   // a forward intermediate held a download from a released buffer at retirement   // the loss gradient's device buffer was zeroed between replays
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool releasedIntermediateDownload = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool releasedIntermediateDownload = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false, int outsideAt = -1)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -228,6 +231,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 // Reference loss from the exact host batch and pre-step weights: a mismatch message then says whether the
                 // plan computed a wrong loss or reported one it never downloaded.
                 double reference = CpuLoss(x, y, parameters, composedMse);
+                if (s == outsideAt)
+                {
+                    run.CapturedUpdateBeforeOutsideStep = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete) is not null;
+                    run.ParityGraphsBeforeOutsideStep = concrete.ReplaysParityGraphs;
+                    losses[s] = ApplyOutsideStep(gpu, concrete, x, y, parameters, composedMse);
+                    states[s] = $"outside cpuRef={reference:G6}";
+                    continue;
+                }
                 var lossTensor = plan.Step();
                 if (releasedIntermediateDownload && s == Steps - 1)
                 {
@@ -284,6 +296,73 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             plan.Dispose();
             run.WeightsAfterDispose = parameters.Select(p => p.ToArray()).ToArray();
             return run;
+        }
+    }
+
+    // One step the plan does not replay: the eager tape's gradients of the same loss, handed to the plan's optimizer
+    // (TryApplyGradients), as AiDotNet does for an objective that reads its own forward on the host. Returns the loss.
+    private static double ApplyOutsideStep(DirectGpuTensorEngine gpu, CompiledTrainingPlan<float> plan, Tensor<float> x,
+        Tensor<float> y, Tensor<float>[] parameters, bool composedMse)
+    {
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+        var h = gpu.FusedLinear(x, parameters[0], parameters[1], FusedActivationType.ReLU);
+        var pred = gpu.FusedLinear(h, parameters[2], parameters[3], FusedActivationType.None);
+        Tensor<float> loss;
+        if (composedMse)
+        {
+            var diff = gpu.TensorSubtract(pred, y);
+            loss = gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+        }
+        else
+        {
+            loss = gpu.TensorMSELoss(pred, y);
+        }
+        var gradients = tape.ComputeGradients(loss, parameters);
+        double value = loss.ToArray()[0];
+        Assert.True(plan.TryApplyGradients(gradients), "the plan has no optimizer to apply the outside step");
+        return value;
+    }
+
+    /// <summary>
+    /// A step the plan cannot replay, after it has replayed its captured update: the outside update must start from the
+    /// current weights and step count. The captured update kept both on the device (the weights in the second buffer set
+    /// after an odd number of ping-pong replays, the count in the step I/O), while the outside update ran the eager
+    /// optimizer on the plan's own buffers and its host step count: it updated stale weights the next replay ignored,
+    /// and the next resolve of the device count dropped its step (wrong Adam bias correction and schedule position).
+    /// The oracle is the same schedule with capture off.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(OptimizerType.SGD, 6)]
+    [InlineData(OptimizerType.SGD, 7)]
+    [InlineData(OptimizerType.Adam, 6)]
+    [InlineData(OptimizerType.Adam, 7)]
+    public void An_outside_step_after_captured_updates_continues_from_the_current_weights_and_step(
+        OptimizerType optimizer, int outsideAt)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var schedule = LrSchedule.Cosine(0.05, Steps, 1e-3);
+            var eager = Train(gpu, capture: false, schedule: schedule, optimizer: optimizer, outsideAt: outsideAt);
+            var captured = Train(gpu, capture: true, schedule: schedule, optimizer: optimizer, outsideAt: outsideAt);
+            Assert.True(captured.CapturedUpdateBeforeOutsideStep, "the update was not in the step graph before the outside step");
+            if (optimizer == OptimizerType.SGD && Environment.GetEnvironmentVariable("AIDOTNET_SGD_PINGPONG") != "0")
+                Assert.True(captured.ParityGraphsBeforeOutsideStep, "the ping-pong graphs were not alternating");
+            Assert.Equal(eager.OptimizerStep, captured.OptimizerStep);
+            Assert.Equal(Steps, captured.OptimizerStep);
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6} ({captured.StepStates[s]})");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
         }
     }
 
@@ -450,6 +529,255 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 for (int i = 0; i < eager.FinalWeights[p].Length; i++)
                     Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
                         $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A plan whose first op is an embedding gather refreshes the gather's indices before each replay, and must refresh
+    /// every other caller-fed tensor too. It did not: the embedding branch skipped the target, so every replay trained
+    /// on the capture step's labels (an LM's reported loss fell below the eager run's while its validation CE stayed at
+    /// the untrained level). Both index forms an LM feeds - int ids and float ids - must train exactly like eager.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void An_embedding_first_plan_replays_each_steps_target(bool floatIndices)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = TrainEmbeddingFirst(gpu, capture: false, floatIndices);
+            var captured = TrainEmbeddingFirst(gpu, capture: true, floatIndices);
+            // Ground truth: the same plan on the CPU engine. Both GPU arms once agreed with each other while both read
+            // stale ids (the host gather left the output's device copy from the previous step looking current).
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainEmbeddingFirst(cpu, capture: false, floatIndices);
+            AiDotNetEngine.Current = prior;
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - eager.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {eager.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
+            Assert.False(eager.Replayed, "the eager reference captured a graph");
+            Assert.True(captured.Replayed, "the captured plan is not replaying a graph after warm-up");
+            // Positive control: the targets differ step to step, so a replay of one step's target changes the losses.
+            Assert.True(eager.Losses.Distinct().Count() == Steps, "the eager losses repeat; the comparison would be vacuous");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            for (int p = 0; p < eager.Weights.Length; p++)
+                for (int i = 0; i < eager.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.Weights[p][i] - captured.Weights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.Weights[p][i]} != eager {eager.Weights[p][i]}");
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainEmbeddingFirst(IEngine gpu, bool capture, bool floatIndices)
+    {
+        const int vocab = 40;
+        var ids = new Tensor<int>([Batch]);
+        var floatIds = new Tensor<float>([Batch]);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var table = Rand([vocab, Inputs], 5, 0.5f);
+        var w1 = Rand([Inputs, Hidden], 3, 0.3f);
+        var b1 = new Tensor<float>([Hidden]);
+        var w2 = Rand([Hidden, Outputs], 4, 0.3f);
+        var b2 = new Tensor<float>([Outputs]);
+        var parameters = new[] { table, w1, b1, w2, b2 };
+        if (gpu is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(300 + step);
+            var idSpan = ids.AsWritableSpan();
+            var floatSpan = floatIds.AsWritableSpan();
+            for (int i = 0; i < Batch; i++) { idSpan[i] = rng.Next(vocab); floatSpan[i] = idSpan[i]; }
+            ids.IncrementVersion();
+            floatIds.IncrementVersion();
+            FeedTarget(y, step);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var x = floatIndices ? gpu.TensorEmbeddingLookupFromFloatIndices(table, floatIds) : gpu.TensorEmbeddingLookup<float, int>(table, ids);
+            var h = gpu.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
+            var pred = gpu.FusedLinear(h, w2, b2, FusedActivationType.None);
+            gpu.TensorMSELoss(pred, y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            var concrete = (CompiledTrainingPlan<float>)plan;
+            if (!capture) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            var execField = typeof(CompiledTrainingPlan<float>)
+                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+            var exec = execField.GetValue(concrete) is IntPtr handle ? handle : IntPtr.Zero;
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), exec != IntPtr.Zero);
+        }
+    }
+
+    /// <summary>
+    /// Two embedding lookups of the same size in one plan (a token and a position table, say) must each scatter their
+    /// gradient through their OWN ids. The resident path kept one engine-wide device index buffer: the second lookup's
+    /// upload overwrote the first's ids, so the first table's gradient landed on the second lookup's rows, and a replay
+    /// refreshed only the last lookup registered. The ground truth is the same plan on the CPU engine.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void Two_embedding_lookups_of_one_size_each_train_through_their_own_ids(bool floatIndices, bool capture)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            if (capture)
+            {
+                Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                    "Whole-step graph capture is CUDA-only.");
+                Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                    "Graph capture is disabled for this process.");
+            }
+
+            var onGpu = TrainTwoEmbeddings(gpu, capture, floatIndices);
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainTwoEmbeddings(cpu, capture: false, floatIndices);
+            AiDotNetEngine.Current = prior;
+            if (capture) Assert.True(onGpu.Replayed, "the captured plan is not replaying a graph after warm-up");
+            Assert.True(truth.Losses.Distinct().Count() == Steps, "the CPU losses repeat; the comparison would be vacuous");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - onGpu.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {onGpu.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            for (int p = 0; p < truth.Weights.Length; p++)
+                for (int i = 0; i < truth.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(truth.Weights[p][i] - onGpu.Weights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: GPU {onGpu.Weights[p][i]} != CPU {truth.Weights[p][i]}");
+            // A host read of a gathered embedding after each eager step: the device gather bound its output without
+            // arming the download, so the host saw the previous step's rows. (A replayed graph runs no gather op.)
+            if (!capture)
+                for (int s = 0; s < Steps; s++)
+                    for (int i = 0; i < truth.Gathered[s].Length; i++)
+                        Assert.True(Math.Abs(truth.Gathered[s][i] - onGpu.Gathered[s][i]) <= 1e-5f,
+                            $"step {s}: gathered[{i}] read {onGpu.Gathered[s][i]} on the host, CPU {truth.Gathered[s][i]}");
+        }
+    }
+
+    /// <summary>
+    /// The host staging array was shared by every lookup and only grew: after a larger lookup it was longer than a
+    /// smaller lookup's index buffer, and uploading it whole threw.
+    /// </summary>
+    [SkippableFact]
+    public void A_smaller_embedding_lookup_after_a_larger_one_uploads_its_indices()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            var larger = new Tensor<int>(new[] { 0, 1, 2, 3, 4, 5, 6, 7 }, new[] { 8 });
+            var smaller = new Tensor<int>(new[] { 2, 0, 1 }, new[] { 3 });
+            object largerKey = new object(), smallerKey = new object();
+            gpu.UploadEmbeddingIndices(larger, 8, largerKey);
+            gpu.UploadEmbeddingIndices(smaller, 3, smallerKey);
+            var slot = gpu.GetEmbeddingIndexSlot(smallerKey);
+            Assert.Equal(3, slot.Capacity);
+            Assert.Equal(new[] { 2, 0, 1 }, slot.Host);
+            GC.KeepAlive(largerKey);
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed, float[][] Gathered) TrainTwoEmbeddings(IEngine engine, bool capture, bool floatIndices)
+    {
+        const int vocab = 40;
+        var idsA = new Tensor<int>([Batch]);
+        var idsB = new Tensor<int>([Batch]);
+        var floatIdsA = new Tensor<float>([Batch]);
+        var floatIdsB = new Tensor<float>([Batch]);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var tableA = Rand([vocab, Inputs], 5, 0.5f);
+        var tableB = Rand([vocab, Inputs], 6, 0.5f);
+        var w1 = Rand([Inputs, Hidden], 3, 0.3f);
+        var b1 = new Tensor<float>([Hidden]);
+        var w2 = Rand([Hidden, Outputs], 4, 0.3f);
+        var b2 = new Tensor<float>([Outputs]);
+        var parameters = new[] { tableA, tableB, w1, b1, w2, b2 };
+        if (engine is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            // Disjoint id ranges, so a gradient scattered through the other lookup's ids lands on rows this table
+            // never gathered.
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(500 + step);
+            var a = idsA.AsWritableSpan();
+            var b = idsB.AsWritableSpan();
+            var fa = floatIdsA.AsWritableSpan();
+            var fb = floatIdsB.AsWritableSpan();
+            for (int i = 0; i < Batch; i++)
+            {
+                a[i] = rng.Next(vocab / 2);
+                b[i] = (vocab / 2) + rng.Next(vocab / 2);
+                fa[i] = a[i];
+                fb[i] = b[i];
+            }
+            idsA.IncrementVersion();
+            idsB.IncrementVersion();
+            floatIdsA.IncrementVersion();
+            floatIdsB.IncrementVersion();
+            FeedTarget(y, step);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Tensor<float> gatheredA;
+        Feed(0);
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var xa = floatIndices ? engine.TensorEmbeddingLookupFromFloatIndices(tableA, floatIdsA) : engine.TensorEmbeddingLookup<float, int>(tableA, idsA);
+            var xb = floatIndices ? engine.TensorEmbeddingLookupFromFloatIndices(tableB, floatIdsB) : engine.TensorEmbeddingLookup<float, int>(tableB, idsB);
+            gatheredA = xa;
+            var x = engine.TensorAdd(xa, xb);
+            var h = engine.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
+            var pred = engine.FusedLinear(h, w2, b2, FusedActivationType.None);
+            engine.TensorMSELoss(pred, y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            var concrete = (CompiledTrainingPlan<float>)plan;
+            if (!capture) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 5e-2f);
+            var losses = new double[Steps];
+            var gathered = new float[Steps][];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+                gathered[s] = gatheredA.ToArray();
+            }
+            var execField = typeof(CompiledTrainingPlan<float>)
+                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+            var exec = execField.GetValue(concrete) is IntPtr handle ? handle : IntPtr.Zero;
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), exec != IntPtr.Zero, gathered);
         }
     }
 
@@ -2230,6 +2558,97 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// of dead GPU results): step 4 - the first captured launch - reported a negative or zero mean-squared loss.
     /// Here the free is queued deterministically from inside the capture.
     /// </summary>
+    /// <summary>
+    /// The capture released its gate, counted its nodes into the LastCapture* properties, then read them back to build
+    /// its node counts: another thread's capture in between replaced them, and this graph reported that one's nodes.
+    /// The hook runs a second, smaller capture on another thread at exactly that point.
+    /// </summary>
+    [SkippableFact]
+    public void A_capture_reports_its_own_node_counts_when_another_thread_captures_after_it()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        // A worker still capturing when its wait times out must not find the engine and buffers disposed under it: they
+        // are disposed only once the worker is known to be done (and the test fails on the hang).
+        bool workerHung = false;
+        AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer? a = null, b = null;
+        try
+        {
+            using var op = gpu.EnterGpuOp();
+            var maybeCuda = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            Skip.If(maybeCuda is null, "Graph capture is CUDA-only.");
+            if (maybeCuda is null) return;
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda = maybeCuda;
+            var engine = gpu;
+            var capture = (AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture)cuda;
+            var bufferA = cuda.AllocateBuffer(new float[256]);
+            a = bufferA;
+            var bufferB = cuda.AllocateBuffer(new float[256]);
+            b = bufferB;
+            void Large() { for (int k = 0; k < 4; k++) cuda.Scale(bufferA, bufferB, 1.5f, 256); }
+            void Small() => cuda.Scale(bufferB, bufferA, 0.5f, 256);
+
+            // The two reference captures establish that this device captures at all (a skip otherwise); the
+            // instrumented capture is the operation under test, so its failure fails the test.
+            int Kernels(Action body, bool instrumented)
+            {
+                var graph = cuda.CaptureGraph(body);
+                if (instrumented)
+                    Assert.True(graph != IntPtr.Zero, "the instrumented capture failed: " + capture.LastCaptureFailure);
+                else
+                    Skip.If(graph == IntPtr.Zero, "capture failed: " + capture.LastCaptureFailure);
+                int kernels = capture.LastCaptureNodeCounts?.Kernel ?? -1;
+                cuda.DestroyCapturedGraph(graph);
+                return kernels;
+            }
+            int largeAlone = Kernels(Large, instrumented: false), smallAlone = Kernels(Small, instrumented: false);
+            Assert.NotEqual(largeAlone, smallAlone);   // otherwise the overwrite could not show
+
+            int otherThreadCaptures = 0;
+            Exception? otherFailure = null;
+            int testThread = Environment.CurrentManagedThreadId;
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookAfterCaptureCounted = () =>
+            {
+                // Only this test's capture: the hook is process-wide, and the other thread's capture runs it too.
+                if (Environment.CurrentManagedThreadId != testThread) return;
+                if (Interlocked.Exchange(ref otherThreadCaptures, 1) != 0) return;
+                var other = new Thread(() =>
+                {
+                    try
+                    {
+                        using var otherOp = engine.EnterGpuOp();
+                        var graph = cuda.CaptureGraph(Small);
+                        if (graph != IntPtr.Zero) cuda.DestroyCapturedGraph(graph);
+                    }
+                    catch (Exception ex) { otherFailure = ex; }
+                }) { IsBackground = true };   // a hung worker must not keep the test process alive
+                other.Start();
+                if (!other.Join(TimeSpan.FromSeconds(60)))
+                {
+                    workerHung = true;
+                    otherFailure = new TimeoutException("the other capture hung");
+                }
+            };
+            int reported;
+            try { reported = Kernels(Large, instrumented: true); }
+            finally { AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookAfterCaptureCounted = null; }
+
+            Assert.False(workerHung, "the other thread's capture never finished");
+            Assert.Null(otherFailure);
+            Assert.Equal(1, otherThreadCaptures);
+            Assert.Equal(smallAlone, cuda.LastCaptureKernelNodeCount);   // the other capture did overwrite the telemetry
+            Assert.Equal(largeAlone, reported);
+        }
+        finally
+        {
+            if (!workerHung)
+            {
+                a?.Dispose();
+                b?.Dispose();
+                gpu.Dispose();
+            }
+        }
+    }
+
     [SkippableFact]
     public void A_finalizer_free_queued_during_capture_is_not_recorded_into_the_step_graph()
     {
