@@ -1132,31 +1132,44 @@ public class DirectPtxScientificTests
     }
 
     [Fact]
-    public void InstantNgpHashEncodeBackwardEmitter_AccumulatesUnderHashMatch()
+    public void InstantNgpHashEncodeBackwardEmitter_AccumulatesUnderIndexMatch()
     {
-        string ptx = PtxInstantNgpHashEncodeBackwardKernel.EmitPtx(8, 6, 64, 16, 256, 2, 0, 4);
+        // scale 15 -> 16 vertices per axis; 16^3 = 4096 > 256 entries, so the level is hashed.
+        string ptx = PtxInstantNgpHashEncodeBackwardKernel.EmitPtx(8, 6, 64, 15f, 0.5f, 16, 256, 2, 0, 4);
         Assert.Contains(PtxInstantNgpHashEncodeBackwardKernel.EntryPoint, ptx);
         Assert.Contains("$NGPB_N_LOOP:", ptx);       // scan over points
-        Assert.Contains("$NGPB_CONTINUE:", ptx);      // grad-skip target
-        Assert.Equal(8, Count(ptx, "setp.eq.u32 %p1, %r14, %r3"));   // 8 corner hash-vs-entry matches
+        Assert.Contains("$NGPB_CONTINUE:", ptx);      // zero-gradient skip target
+        Assert.Equal(8, Count(ptx, "setp.eq.u32 %p1, %r14, %r3"));   // 8 corner index-vs-entry matches
         Assert.Equal(8, Count(ptx, "@%p1 fma.rn.f32 %f16"));         // predicated accumulate per corner
+        Assert.Equal(8, Count(ptx, "0x9E3779B1"));                   // tiny-cuda-nn coherent prime hash, y factor
+        Assert.Equal(8, Count(ptx, "0x30025795"));                   // z factor 805459861
+        Assert.DoesNotContain("73856093", ptx, StringComparison.Ordinal);   // no Teschner primes
+        Assert.Equal(3, Count(ptx, "    fma.rn.f32 %f"));            // pos = fma(scale, x, 0.5) per axis
         Assert.Equal(1, Count(ptx, "st.global.f32"));
         Assert.Equal(3, Count(ptx, "cvt.rmi.s32.f32"));              // floor per axis
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.True(PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(64, 16, 256, 2, 0, 4));   // cells = 256*2 = 512
-        Assert.False(PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(64, 16, 100, 2, 0, 4));  // 100*2=200 not mult of 256
-        Assert.False(PtxInstantNgpHashEncodeBackwardKernel.IsPromotedShape(64, 16, 256, 2, 0, 4));
+        Assert.True(PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(64, 15f, 0.5f, 16, 256, 2, 0, 4));   // cells = 256*2 = 512
+        Assert.False(PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(64, 15f, 0.5f, 16, 100, 2, 0, 4));  // 100*2=200 not mult of 256
+        Assert.False(PtxInstantNgpHashEncodeBackwardKernel.IsPromotedShape(64, 15f, 0.5f, 16, 256, 2, 0, 4));
+
+        // scale 5 -> 6 vertices per axis; 6^3 = 216 <= 256 entries, so the level is indexed densely.
+        string dense = PtxInstantNgpHashEncodeBackwardKernel.EmitPtx(8, 6, 64, 5f, 0.5f, 6, 256, 2, 0, 4);
+        Assert.Equal(0, Count(dense, "0x9E3779B1"));
+        Assert.Equal(16, Count(dense, "mad.lo.u32 %r14, "));         // (z*R + y)*R + x per corner
     }
 
-    [SkippableFact]
-    public void DriverOnlyInstantNgpHashEncodeBackward_MatchesOracle()
+    [SkippableTheory]
+    [InlineData(15f, 16)]   // 16^3 = 4096 > 256: hashed
+    [InlineData(5f, 6)]     // 6^3 = 216 <= 256: dense
+    public void DriverOnlyInstantNgpHashEncodeBackward_MatchesOracle(float scale, int gridResolution)
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in instant-ngp-hash-encode-backward specialization is measured on GA10x/SM86.");
-        const int numPoints = 64, resolution = 16, tableSize = 256, fpl = 2, levelOffset = 0, outputStride = 4;
-        using var kernel = new PtxInstantNgpHashEncodeBackwardKernel(runtime, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
+        const int numPoints = 64, tableSize = 256, fpl = 2, levelOffset = 0, outputStride = 4;
+        const float offset = 0.5f;
+        using var kernel = new PtxInstantNgpHashEncodeBackwardKernel(runtime, numPoints, scale, offset, gridResolution, tableSize, fpl, levelOffset, outputStride);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20268900);
@@ -1167,7 +1180,7 @@ public class DirectPtxScientificTests
         for (int gid = 0; gid < expected.Length; gid++)
         {
             int entry = gid / fpl, f = gid % fpl;
-            expected[gid] = NgpBackwardOracle(positions, outGrad, entry, f, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
+            expected[gid] = NgpBackwardOracle(positions, outGrad, entry, f, numPoints, scale, offset, gridResolution, tableSize, fpl, levelOffset, outputStride);
         }
 
         using var pos = runtime.AllocateBytes((nuint)(positions.Length * sizeof(float)));
@@ -1185,57 +1198,99 @@ public class DirectPtxScientificTests
         AssertVectorClose(actual, expected, 3e-3f, "instant-ngp hash encode backward");
     }
 
-    private static float NgpBackwardOracle(
-        float[] positions, float[] outGrad, int entry, int f, int numPoints, int resolution, int tableSize, int fpl, int levelOffset, int outputStride)
+    // tiny-cuda-nn grid_index (common_device.h), three dimensions: dense (x + y*R + z*R*R) when R^3 fits the table
+    // (R <= MAX_BASES[3] = 0x659), otherwise coherent_prime_hash x*1 ^ y*2654435761 ^ z*805459861; uint32, mod T.
+    private static uint NgpGridIndex(uint x, uint y, uint z, int gridResolution, int tableSize)
     {
-        float Clamp(float v) => v <= 0f ? 0f : (v >= 0.999999f ? 0.999999f : v);
+        unchecked
+        {
+            uint r = (uint)gridResolution;
+            uint stride = gridResolution <= 0x659 ? r * r * r : 0xFFFFFFFFu;
+            uint index = (uint)tableSize < stride ? (x * 1u) ^ (y * 2654435761u) ^ (z * 805459861u) : x + y * r + z * r * r;
+            return index % (uint)tableSize;
+        }
+    }
+
+    // tiny-cuda-nn pos_fract with identity interpolation: pos = fmaf(scale, x, offset), cell = floor, fraction = rest.
+    private static void NgpAxis(float value, float scale, float offset, out uint cell, out float fraction)
+    {
+        float x = !(value > 0f) ? 0f : (value >= 0.999999f ? 0.999999f : value);
+        float p = (float)((double)scale * x + offset);   // the double product of two floats is exact: one rounding, as fmaf
+        float floor = (float)Math.Floor(p);
+        cell = (uint)(int)floor;
+        fraction = p - floor;
+    }
+
+    // The 8 corners of a point's cell and their trilinear weights; corner c takes the upper vertex on axis d when bit d is set.
+    private static void NgpCorners(float[] positions, int n, float scale, float offset, int gridResolution, int tableSize, uint[] index, float[] weight)
+    {
+        NgpAxis(positions[n * 3], scale, offset, out uint gx, out float fx);
+        NgpAxis(positions[n * 3 + 1], scale, offset, out uint gy, out float fy);
+        NgpAxis(positions[n * 3 + 2], scale, offset, out uint gz, out float fz);
+        for (int c = 0; c < 8; c++)
+        {
+            bool ux = (c & 1) != 0, uy = (c & 2) != 0, uz = (c & 4) != 0;
+            weight[c] = (ux ? fx : 1f - fx) * (uy ? fy : 1f - fy) * (uz ? fz : 1f - fz);
+            index[c] = NgpGridIndex(ux ? gx + 1 : gx, uy ? gy + 1 : gy, uz ? gz + 1 : gz, gridResolution, tableSize);
+        }
+    }
+
+    private static float NgpBackwardOracle(
+        float[] positions, float[] outGrad, int entry, int f, int numPoints, float scale, float offset, int gridResolution,
+        int tableSize, int fpl, int levelOffset, int outputStride)
+    {
+        var index = new uint[8];
+        var weight = new float[8];
         float acc = 0f;
         for (int n = 0; n < numPoints; n++)
         {
-            float gx = Clamp(positions[n * 3]) * resolution, gy = Clamp(positions[n * 3 + 1]) * resolution, gz = Clamp(positions[n * 3 + 2]) * resolution;
-            int x0 = (int)Math.Floor(gx), y0 = (int)Math.Floor(gy), z0 = (int)Math.Floor(gz);
-            int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
-            float fx = gx - x0, fy = gy - y0, fz = gz - z0, ix = 1f - fx, iy = 1f - fy, iz = 1f - fz;
             float grad = outGrad[n * outputStride + levelOffset + f];
-            if (Math.Abs(grad) < 1e-10f) continue;
-            if (NgpHash(x0, y0, z0, tableSize) == entry) acc += grad * ix * iy * iz;
-            if (NgpHash(x0, y0, z1, tableSize) == entry) acc += grad * ix * iy * fz;
-            if (NgpHash(x0, y1, z0, tableSize) == entry) acc += grad * ix * fy * iz;
-            if (NgpHash(x0, y1, z1, tableSize) == entry) acc += grad * ix * fy * fz;
-            if (NgpHash(x1, y0, z0, tableSize) == entry) acc += grad * fx * iy * iz;
-            if (NgpHash(x1, y0, z1, tableSize) == entry) acc += grad * fx * iy * fz;
-            if (NgpHash(x1, y1, z0, tableSize) == entry) acc += grad * fx * fy * iz;
-            if (NgpHash(x1, y1, z1, tableSize) == entry) acc += grad * fx * fy * fz;
+            NgpCorners(positions, n, scale, offset, gridResolution, tableSize, index, weight);
+            for (int c = 0; c < 8; c++)
+                if (index[c] == (uint)entry) acc += grad * weight[c];
         }
         return acc;
     }
 
     [Fact]
-    public void InstantNgpHashEncodeEmitter_IsTrilinearEightCornerHash()
+    public void InstantNgpHashEncodeEmitter_IsTrilinearEightCornerIndex()
     {
-        string ptx = PtxInstantNgpHashEncodeKernel.EmitPtx(8, 6, 256, 16, 4096, 2, 0, 32);
+        // scale 16 -> 17 vertices per axis; 17^3 = 4913 > 4096 entries, so the level is hashed.
+        string ptx = PtxInstantNgpHashEncodeKernel.EmitPtx(8, 6, 256, 16f, 0.5f, 17, 4096, 2, 0, 32);
         Assert.Contains(PtxInstantNgpHashEncodeKernel.EntryPoint, ptx);
         Assert.Equal(3, Count(ptx, "cvt.rmi.s32.f32"));      // floor on x/y/z
-        Assert.Equal(8, Count(ptx, "rem.u32 %r14"));         // 8 corner spatial hashes
+        Assert.Equal(8, Count(ptx, "rem.u32 %r14"));         // 8 corner indices, mod tableSize
         Assert.Equal(3 + 8, Count(ptx, "ld.global.nc.f32")); // 3 position + 8 corner lookups
         Assert.Equal(1, Count(ptx, "st.global.f32"));
-        Assert.Equal(8, Count(ptx, "mul.lo.u32 %r11, "));    // one hash multiply per corner
+        Assert.Equal(8, Count(ptx, "mul.lo.u32 %r12, "));    // y * 2654435761 per corner
+        Assert.Equal(8, Count(ptx, "0x9E3779B1"));
+        Assert.Equal(8, Count(ptx, "0x30025795"));
+        Assert.DoesNotContain("73856093", ptx, StringComparison.Ordinal);
+        Assert.Contains($"fma.rn.f32 %f3, {DirectPtxPtxText.Hex(16f)}, %f0, {DirectPtxPtxText.Hex(0.5f)};", ptx);   // pos = fma(scale, x, 0.5)
         Assert.Equal(0, Count(ptx, "bar.sync 0"));
         Assert.DoesNotContain(".shared", ptx, StringComparison.Ordinal);
         Assert.DoesNotContain(".local", ptx, StringComparison.Ordinal);
-        Assert.True(PtxInstantNgpHashEncodeKernel.IsSupportedShape(256, 16, 4096, 2, 0, 32));
-        Assert.False(PtxInstantNgpHashEncodeKernel.IsSupportedShape(255, 16, 4096, 2, 0, 32));   // not mult of 256
-        Assert.False(PtxInstantNgpHashEncodeKernel.IsSupportedShape(256, 16, 4096, 2, 31, 32));  // levelOffset+fpl (33) > stride (32)
-        Assert.False(PtxInstantNgpHashEncodeKernel.IsPromotedShape(256, 16, 4096, 2, 0, 32));
+        Assert.True(PtxInstantNgpHashEncodeKernel.IsSupportedShape(256, 16f, 0.5f, 17, 4096, 2, 0, 32));
+        Assert.False(PtxInstantNgpHashEncodeKernel.IsSupportedShape(255, 16f, 0.5f, 17, 4096, 2, 0, 32));   // not mult of 256
+        Assert.False(PtxInstantNgpHashEncodeKernel.IsSupportedShape(256, 16f, 0.5f, 17, 4096, 2, 31, 32));  // levelOffset+fpl (33) > stride (32)
+        Assert.False(PtxInstantNgpHashEncodeKernel.IsPromotedShape(256, 16f, 0.5f, 17, 4096, 2, 0, 32));
+
+        // scale 15 -> 16 vertices per axis; 16^3 = 4096 <= 4096 entries, so the level is indexed densely.
+        string dense = PtxInstantNgpHashEncodeKernel.EmitPtx(8, 6, 256, 15f, 0.5f, 16, 4096, 2, 0, 32);
+        Assert.Equal(0, Count(dense, "0x9E3779B1"));
+        Assert.Equal(16, Count(dense, "mad.lo.u32 %r14, "));
     }
 
-    [SkippableFact]
-    public void DriverOnlyInstantNgpHashEncode_MatchesOracle()
+    [SkippableTheory]
+    [InlineData(16f, 17)]   // 17^3 = 4913 > 4096: hashed
+    [InlineData(15f, 16)]   // 16^3 = 4096 <= 4096: dense
+    public void DriverOnlyInstantNgpHashEncode_MatchesOracle(float scale, int gridResolution)
     {
         using var runtime = CreateValidatedRuntime(
             "The checked-in instant-ngp-hash-encode specialization is measured on GA10x/SM86.");
-        const int numPoints = 256, resolution = 16, tableSize = 4096, fpl = 2, levelOffset = 0, outputStride = 4;
-        using var kernel = new PtxInstantNgpHashEncodeKernel(runtime, numPoints, resolution, tableSize, fpl, levelOffset, outputStride);
+        const int numPoints = 256, tableSize = 4096, fpl = 2, levelOffset = 0, outputStride = 4;
+        const float offset = 0.5f;
+        using var kernel = new PtxInstantNgpHashEncodeKernel(runtime, numPoints, scale, offset, gridResolution, tableSize, fpl, levelOffset, outputStride);
         Assert.Equal(0, kernel.Audit.Function.LocalBytesPerThread);
 
         var random = RandomHelper.CreateSeededRandom(20268800);
@@ -1250,7 +1305,7 @@ public class DirectPtxScientificTests
         for (int i = 0; i < expected.Length; i++) expected[i] = untouched;
         for (int n = 0; n < numPoints; n++)
             for (int f = 0; f < fpl; f++)
-                expected[n * outputStride + levelOffset + f] = NgpEncodeOracle(positions, table, n, f, resolution, tableSize, fpl);
+                expected[n * outputStride + levelOffset + f] = NgpEncodeOracle(positions, table, n, f, scale, offset, gridResolution, tableSize, fpl);
 
         using var pos = runtime.AllocateBytes((nuint)(positions.Length * sizeof(float)));
         using var tbl = runtime.AllocateBytes((nuint)(table.Length * sizeof(float)));
@@ -1270,27 +1325,14 @@ public class DirectPtxScientificTests
         AssertVectorClose(actual, expected, 3e-3f, "instant-ngp hash encode");
     }
 
-    private static uint NgpHash(int x, int y, int z, int tableSize)
+    private static float NgpEncodeOracle(float[] positions, float[] table, int n, int f, float scale, float offset, int gridResolution, int tableSize, int fpl)
     {
-        uint hx = (uint)x * 73856093u, hy = (uint)y * 19349663u, hz = (uint)z * 83492791u;
-        return (hx ^ hy ^ hz) % (uint)tableSize;
-    }
-
-    private static float NgpEncodeOracle(float[] positions, float[] table, int n, int f, int resolution, int tableSize, int fpl)
-    {
-        float Clamp(float v) => v <= 0f ? 0f : (v >= 0.999999f ? 0.999999f : v);
-        float gx = Clamp(positions[n * 3]) * resolution, gy = Clamp(positions[n * 3 + 1]) * resolution, gz = Clamp(positions[n * 3 + 2]) * resolution;
-        int x0 = (int)Math.Floor(gx), y0 = (int)Math.Floor(gy), z0 = (int)Math.Floor(gz);
-        int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
-        float fx = gx - x0, fy = gy - y0, fz = gz - z0, ix = 1f - fx, iy = 1f - fy, iz = 1f - fz;
-        return ix * iy * iz * table[NgpHash(x0, y0, z0, tableSize) * fpl + f]
-             + ix * iy * fz * table[NgpHash(x0, y0, z1, tableSize) * fpl + f]
-             + ix * fy * iz * table[NgpHash(x0, y1, z0, tableSize) * fpl + f]
-             + ix * fy * fz * table[NgpHash(x0, y1, z1, tableSize) * fpl + f]
-             + fx * iy * iz * table[NgpHash(x1, y0, z0, tableSize) * fpl + f]
-             + fx * iy * fz * table[NgpHash(x1, y0, z1, tableSize) * fpl + f]
-             + fx * fy * iz * table[NgpHash(x1, y1, z0, tableSize) * fpl + f]
-             + fx * fy * fz * table[NgpHash(x1, y1, z1, tableSize) * fpl + f];
+        var index = new uint[8];
+        var weight = new float[8];
+        NgpCorners(positions, n, scale, offset, gridResolution, tableSize, index, weight);
+        float value = 0f;
+        for (int c = 0; c < 8; c++) value += weight[c] * table[index[c] * fpl + f];
+        return value;
     }
 
     [Fact]

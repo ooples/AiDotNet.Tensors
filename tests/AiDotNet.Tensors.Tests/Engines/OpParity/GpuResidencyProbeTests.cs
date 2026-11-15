@@ -487,7 +487,7 @@ public sealed class GpuResidencyProbeTests
             [8, 2], ownsBuffer: true);
 
         using var encoded = gpu.MultiresolutionHashEncoding(
-            positions, [table0, table1], [4, 8], 2);
+            positions, [table0, table1], 4, 2.0, 2);
         Assert.True(encoded.IsGpuResident);
         Assert.Equal(new[] { 2, 4 }, encoded.Shape.ToArray());
 
@@ -495,7 +495,7 @@ public sealed class GpuResidencyProbeTests
             backend.AllocateBuffer([1f, -1f, 0.5f, -0.5f, 2f, -2f, 1.5f, -1.5f]),
             [2, 4], ownsBuffer: true);
         var gradients = gpu.MultiresolutionHashEncodingBackward(
-            positions, [table0, table1], [4, 8], 2, outputGradient);
+            positions, [table0, table1], 4, 2.0, 2, outputGradient);
         try
         {
             Assert.Equal(2, gradients.Length);
