@@ -194,4 +194,31 @@ public class ClosureObjectiveHostLossTests
         var result = guard!.TryRebind(objective, parameters, out _);
         Assert.True(result == ClosureGuardResult.Matched, guard.LastReason);
     }
+
+    // Recorders that copy an eager result into their own just-recorded output (BatchNorm on a non-4D input, GroupNorm)
+    // write that node, not read a traced value: a Conformer's convolution module ([B, C, T] BatchNorm) and Wav2Vec2's
+    // GroupNorm were declined as "reads 'BatchNorm' / 'GroupNorm' on the host while it is traced".
+    [Fact]
+    public void Normalizations_that_prefill_their_recorded_output_still_record_a_guard()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(6, 12, 13);
+        var x = Filled(4, 6, 14);
+        var gamma = new Tensor<float>(new[] { 4 });   // a 3D BatchNorm input is [C, H, W]
+        var beta = new Tensor<float>(new[] { 4 });
+        for (int i = 0; i < 4; i++) gamma[i] = 1f;
+        var gamma4 = new Tensor<float>(new[] { 4 });
+        var beta4 = new Tensor<float>(new[] { 4 });
+        for (int i = 0; i < 4; i++) gamma4[i] = 1f;
+        var parameters = new[] { w, gamma, beta, gamma4, beta4 };
+        Func<Tensor<float>> objective = () =>
+        {
+            var y = engine.Reshape(engine.TensorMatMul(x, w), new[] { 4, 3, 4 });       // [C, H, W], not 4D
+            var b = engine.BatchNorm(y, gamma, beta, 1e-5, out _, out _);
+            var g = engine.GroupNorm(engine.Reshape(b, new[] { 1, 4, 3, 4 }), 2, gamma4, beta4, 1e-5, out _, out _);
+            return engine.ReduceSum(engine.TensorMultiply(g, g), null);
+        };
+        var (guard, reason) = CompileGuarded(objective, parameters);
+        Assert.True(guard is not null, reason);
+    }
 }
