@@ -2594,9 +2594,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
             int otherThreadCaptures = 0;
             Exception? otherFailure = null;
+            int testThread = Environment.CurrentManagedThreadId;
             AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookAfterCaptureCounted = () =>
             {
-                if (Interlocked.Exchange(ref otherThreadCaptures, 1) != 0) return;   // the other thread's own capture
+                // Only this test's capture: the hook is process-wide, and the other thread's capture runs it too.
+                if (Environment.CurrentManagedThreadId != testThread) return;
+                if (Interlocked.Exchange(ref otherThreadCaptures, 1) != 0) return;
                 var other = new Thread(() =>
                 {
                     try
