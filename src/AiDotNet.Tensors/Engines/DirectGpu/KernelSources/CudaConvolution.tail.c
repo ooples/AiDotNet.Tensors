@@ -1,11 +1,11 @@
 
 // Fusion hooks live: pro = relu(x * ps[ci] + pt[ci]) on in-bounds inputs when ps is set (an inference batch norm and
-// ReLU before the convolution; padding stays 0), epi = + bias[co] (ef bit 0), ReLU (bit 1) in the store (ef = 0 with
-// split-K, whose partials are summed after).
+// ReLU before the convolution; padding stays 0), epi = + bias[co] (ef bit 0), ReLU (bit 1), and with bit 2 also the
+// clamp at 6 (ReLU6) in the store (ef = 0 with split-K: conv2d_fprop_splitk_reduce_epi applies it to the summed partials).
 struct CeAffPro { const float* s; const float* t;
     __device__ __forceinline__ float operator()(int, int c, int, float x) const { return s ? fmaxf(fmaf(x, s[c], t[c]), 0.0f) : x; } };
 struct CeBiasEpi { const float* b; int f;
-    __device__ __forceinline__ float operator()(int, int c, int, float y) const { if (f & 1) y += b[c]; return (f & 2) ? fmaxf(y, 0.0f) : y; } };
+    __device__ __forceinline__ float operator()(int, int c, int, float y) const { if (f & 1) y += b[c]; if (f & 2) y = fmaxf(y, 0.0f); return (f & 4) ? fminf(y, 6.0f) : y; } };
 #define CE_FPROP_KERNEL(NAME, BM, TAPU, MAIN) \
 extern "C" __global__ __launch_bounds__(256) void NAME( \
     const float* __restrict__ input, const float* __restrict__ kernel, float* __restrict__ out, \

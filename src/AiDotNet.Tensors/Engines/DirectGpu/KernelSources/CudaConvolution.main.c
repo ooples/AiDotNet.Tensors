@@ -1179,6 +1179,22 @@ extern "C" __global__ __launch_bounds__(256) void conv2d_wgrad_splitk_reduce(
     gradKernel[i] = sum;
 }
 
+// The forward engine's split-K sum with its epilogue: y[i] = epi(sum over z of partials[z][i]) in split order, where epi
+// adds bias[c] (ef bit 0), applies ReLU (bit 1) and the clamp at 6 (bit 2); c = (i / spatial) % channels (NCHW).
+extern "C" __global__ __launch_bounds__(256) void conv2d_fprop_splitk_reduce_epi(
+    const float* __restrict__ partials, float* __restrict__ y, int count, int splits,
+    const float* __restrict__ bias, int ef, int channels, int spatial)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float sum = 0.0f;
+    for (int z = 0; z < splits; z++) sum += partials[(long long)z * count + i];
+    if (ef & 1) sum += __ldg(&bias[(i / spatial) % channels]);
+    if (ef & 2) sum = fmaxf(sum, 0.0f);
+    if (ef & 4) sum = fminf(sum, 6.0f);
+    y[i] = sum;
+}
+
 // The dgrad engine's weight layout: wt[tap][co][ci] = w[co][ci][tap] (tap = kh * kW + kw).
 extern "C" __global__ __launch_bounds__(256) void conv2d_dgrad_weight_tapmajor(
     const float* __restrict__ w, float* __restrict__ wt, int outC, int inC, int khw)

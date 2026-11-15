@@ -47,7 +47,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
                 "depthwise_conv2d_backward_input",
                 "depthwise_conv2d_backward_weights",
                 "conv2d_wgrad_implicit_gemm",
-                "conv2d_wgrad_splitk_reduce", "conv2d_dgrad_phase_reduce", "conv2d_dgrad_weight_tapmajor",
+                "conv2d_wgrad_splitk_reduce", "conv2d_fprop_splitk_reduce_epi", "conv2d_dgrad_phase_reduce", "conv2d_dgrad_weight_tapmajor",
                 "conv2d_dgrad_implicit_gemm",
                 "conv2d_dgrad_implicit_gemm_c16",
                 "conv2d_dgrad_implicit_gemm_c16_phase",

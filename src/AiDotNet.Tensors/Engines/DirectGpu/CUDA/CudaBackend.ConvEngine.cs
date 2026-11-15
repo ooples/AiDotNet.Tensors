@@ -120,14 +120,16 @@ public sealed partial class CudaBackend
         bool tapUniform = a.InChannels % ConvEngineTileK == 0;
         string name = (tile == 128 ? "conv2d_fprop_ig128_" : "conv2d_fprop_ig64_") + (tapUniform ? "tap" : "gen")
                       + ConvMainloopSuffix(mainloop);
-        // The kernels' four trailing arguments: the epilogue's bias and flags (0 with split-K: the partials are
-        // summed after, or when the activation is not one the output store fuses) and the prologue's per-input-channel
-        // scale and shift (null: none).
-        bool canFuseEpilogue = fuseEpilogue && splits == 1 && ConvEpilogue.Fuses(a.Activation);
-        int epiFlags = canFuseEpilogue ? a.EpilogueFlags : 0;
+        // The kernels' four trailing arguments: the epilogue's bias and flags (0 when the activation is not one the
+        // output store fuses, and 0 with split-K, whose reduce applies them to the summed partials) and the prologue's
+        // per-input-channel scale and shift (null: none).
+        bool canFuseEpilogue = fuseEpilogue && CudaConvFuses(a.Activation);
+        int fusedFlags = canFuseEpilogue ? a.EngineEpilogueFlags : 0;
+        int epiFlags = splits == 1 ? fusedFlags : 0;
         if (!_kernelCache.TryGetValue(name, out var gemm)) return false;
         IntPtr reduce = IntPtr.Zero;
-        if (splits > 1 && !_kernelCache.TryGetValue("conv2d_wgrad_splitk_reduce", out reduce)) return false;
+        if (splits > 1 && !_kernelCache.TryGetValue(fusedFlags != 0 ? "conv2d_fprop_splitk_reduce_epi"
+                : "conv2d_wgrad_splitk_reduce", out reduce)) return false;
 
         using var _ = PushContext();
         IGpuBuffer destination = a.Output;
@@ -143,6 +145,7 @@ public sealed partial class CudaBackend
         int outH = a.OutHeight, outW = a.OutWidth, kH = a.KernelH, kW = a.KernelW, sH = a.StrideH, sW = a.StrideW;
         int pH = a.PadH, pW = a.PadW, dH = a.DilationH, dW = a.DilationW;
         IntPtr biasPtr = canFuseEpilogue && a.Bias is not null ? a.Bias.Handle : IntPtr.Zero;
+        IntPtr gemmBiasPtr = splits == 1 ? biasPtr : IntPtr.Zero;
         IntPtr scalePtr = a.PreScale?.Handle ?? IntPtr.Zero, shiftPtr = a.PreShift?.Handle ?? IntPtr.Zero;
         void** args = stackalloc void*[23];
         args[0] = &xPtr; args[1] = &wPtr; args[2] = &outPtr;
@@ -150,7 +153,7 @@ public sealed partial class CudaBackend
         args[7] = &outC; args[8] = &outH; args[9] = &outW;
         args[10] = &kH; args[11] = &kW; args[12] = &sH; args[13] = &sW;
         args[14] = &pH; args[15] = &pW; args[16] = &dH; args[17] = &dW; args[18] = &kPerSplit;
-        args[19] = &biasPtr; args[20] = &epiFlags; args[21] = &scalePtr; args[22] = &shiftPtr;
+        args[19] = &gemmBiasPtr; args[20] = &epiFlags; args[21] = &scalePtr; args[22] = &shiftPtr;
         LaunchKernel3D(gemm, (uint)tilesN, (uint)tilesM, (uint)splits, (uint)DefaultBlockSize, 1, 1, args, 0);
         epilogueApplied = canFuseEpilogue || (a.Bias is null && a.Activation == FusedActivationType.None);
 
@@ -158,8 +161,10 @@ public sealed partial class CudaBackend
         {
             IntPtr partPtr = destination.Handle, yPtr = a.Output.Handle;
             int count = (int)outputs;
-            void** rargs = stackalloc void*[4];
+            int spatial = outH * outW;
+            void** rargs = stackalloc void*[8];
             rargs[0] = &partPtr; rargs[1] = &yPtr; rargs[2] = &count; rargs[3] = &splits;
+            rargs[4] = &biasPtr; rargs[5] = &fusedFlags; rargs[6] = &outC; rargs[7] = &spatial;
             LaunchKernel(reduce, (uint)((count + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, rargs);
         }
         return true;

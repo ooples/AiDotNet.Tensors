@@ -41,8 +41,13 @@ internal readonly struct CudaConv2DArgs
     /// <summary>The prologue's per-input-channel shift (with <see cref="PreScale"/>).</summary>
     internal IGpuBuffer? PreShift { get; }
 
-    /// <summary>The output kernels' epilogue flags: bit 0 bias, bit 1 ReLU.</summary>
+    /// <summary>The output kernels' epilogue flags: bit 0 bias, bit 1 ReLU. A ReLU6 is not in them (those kernels
+    /// add only the bias); <see cref="CudaBackend.RunActivationAfterKernelEpilogue"/> applies it after.</summary>
     internal int EpilogueFlags => (Bias is null ? 0 : 1) | (Activation == FusedActivationType.ReLU ? 2 : 0);
+
+    /// <summary>The implicit-GEMM engine's epilogue flags: <see cref="EpilogueFlags"/>, and bits 1 and 2 (ReLU, then the
+    /// clamp at 6) for a ReLU6.</summary>
+    internal int EngineEpilogueFlags => EpilogueFlags | (Activation == FusedActivationType.ReLU6 ? 6 : 0);
 
     internal int Batch { get; }
     internal int InChannels { get; }
@@ -163,7 +168,8 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend, IConvPreAc
                         TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                         (in CudaConv2DArgs a) =>
                         {
-                            if (!TryConv2DForwardWinogradF23(a))
+                            if (TryConv2DForwardWinogradF23(a)) RunActivationAfterKernelEpilogue(a);
+                            else
                             {
                                 LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                                     a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
@@ -184,9 +190,9 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend, IConvPreAc
                             RunConvEpiloguePasses(a);
                         }));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
-                        true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)));
+                        true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => { LaunchConv2DTiled(a); RunActivationAfterKernelEpilogue(a); }));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,
-                        true, _ => HasTunedKernel("conv2d_direct"), (in CudaConv2DArgs a) => LaunchConv2DDirect(a)));
+                        true, _ => HasTunedKernel("conv2d_direct"), (in CudaConv2DArgs a) => { LaunchConv2DDirect(a); RunActivationAfterKernelEpilogue(a); }));
                     // #890 phase 4b: the declared implicit-GEMM programs, last, so never the reference.
                     AddDeclaredConvForwardCandidates(candidates);
                     _conv2DForwardCandidateList = candidates.ToArray();
@@ -208,7 +214,19 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend, IConvPreAc
     {
         if (a.Bias is { } bias) Conv2DBiasAdd(a.Output, bias, a.Batch, a.OutChannels, a.OutHeight * a.OutWidth);
         if (a.Activation == FusedActivationType.ReLU) Relu(a.Output, a.Output, a.OutputCount);
+        else if (a.Activation == FusedActivationType.ReLU6) Relu6(a.Output, a.Output, a.OutputCount);
     }
+
+    // The activation a kernel that applied EpilogueFlags (bias, ReLU) left out: ReLU6, whose clamp those kernels lack.
+    internal void RunActivationAfterKernelEpilogue(in CudaConv2DArgs a)
+    {
+        if (a.Activation == FusedActivationType.ReLU6) Relu6(a.Output, a.Output, a.OutputCount);
+    }
+
+    /// <summary>The activations the CUDA convolution routes apply (in the engine's output store, or as passes):
+    /// none, ReLU and ReLU6 (MobileNet's).</summary>
+    internal static bool CudaConvFuses(FusedActivationType activation)
+        => activation is FusedActivationType.None or FusedActivationType.ReLU or FusedActivationType.ReLU6;
 
     // The im2col scratch is batch * Cin*kH*kW * outH*outW floats; keep it under 256 MiB.
     private static bool ConvGemmForwardFits(TunedShape s)
@@ -344,7 +362,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend, IConvPreAc
     {
         // The engine's fused kernels only (the tuned slot's other routes read the input as stored): its default
         // mainloop, the one the slot's reference runs. Deterministic: split-K partials are summed in a fixed order.
-        if (!s_convEngineFprop || !s_convPreActivation || !ConvEpilogue.Fuses(activation)
+        if (!s_convEngineFprop || !s_convPreActivation || !CudaConvFuses(activation)
             || batch <= 0 || outHeight <= 0 || outWidth <= 0)
             return false;
         var args = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
@@ -362,7 +380,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend, IConvPreAc
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, FusedActivationType activation)
     {
-        if (!ConvEpilogue.Fuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+        if (!CudaConvFuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
         var args = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
             outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
         // cuDNN, when the policy routes convolutions there, then the passes; otherwise the tuned routes (each applies the

@@ -10775,8 +10775,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : null;
             // A backend that adds the bias and applies the activation in the convolution's own output kernel saves the
             // two passes below (conv2d_bias_add and the activation) over the whole output.
-            if (!autocastConv && (bias is not null || activation == FusedActivationType.ReLU)
-                && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU)
+            // ReLU6 (MobileNet's) is offered too; a backend whose kernels lack it declines and the passes below run.
+            if (!autocastConv && (bias is not null || activation != FusedActivationType.None)
+                && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU
+                    || activation == FusedActivationType.ReLU6)
                 && backend is IConvBiasActivationBackend fusedConv)
             {
                 using var fusedBiasBuffer = bias is null
