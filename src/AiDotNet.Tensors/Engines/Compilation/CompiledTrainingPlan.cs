@@ -638,13 +638,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             foreach (var (view, _) in views) Unbind(view, isResult: false);
         Unbind(_lossGradSeed);
         Unbind(_lossGradDest);
-        // The pre-pass (and the aborted capture) ran every forward op on the capture path, where GPU ops bind their
-        // outputs - the loss and every intermediate - to stable resident buffers. Left bound, the eager step after a
-        // failed capture served those stale device copies: with a composed loss (ReduceMean over (pred - y)^2) the
-        // reported loss froze at the last warmup step's value and the backward read stale intermediates.
         // A declared output (GradientRecording.RetainOutput) is a result too: the caller reads it after the step, and
         // its device buffer is one the plan keeps (never leased, lent or evicted), so it is still there to land.
-        // Treated as an intermediate, its pending download was dropped here and a read after anything that retires
+        // Treated as an intermediate, its pending download was dropped below and a read after anything that retires
         // the graph (ConfigureOptimizer, ApplyGradients, another plan claiming the parameters) returned the host
         // copy of an earlier step.
         if (landResults)
@@ -661,6 +657,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // The caller released the tensor itself: nothing left to preserve, and Dispose must not throw.
                 }
             }
+        // The pre-pass (and the aborted capture) ran every forward op on the capture path, where GPU ops bind their
+        // outputs - the loss and every intermediate - to stable resident buffers. Left bound, the eager step after a
+        // failed capture served those stale device copies: with a composed loss (ReduceMean over (pred - y)^2) the
+        // reported loss froze at the last warmup step's value and the backward read stale intermediates.
         if (_forwardSteps is not null)
             foreach (var step in _forwardSteps) Unbind(step.OutputBuffer, isResult: ReferenceEquals(step.OutputBuffer, _lossOutput));
         Unbind(_lossOutput);
