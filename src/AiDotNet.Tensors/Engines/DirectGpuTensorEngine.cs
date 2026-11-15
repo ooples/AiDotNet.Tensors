@@ -24901,6 +24901,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var input = GetOrAllocateBuffer(viewBackend, source);
             viewBackend.Copy(input.Buffer, 0, whole.Buffer, destination.StorageOffset, destination.Length);
             storage.IncrementVersion();
+            // The wrapper's bump never reaches the storage the destination shares: a quarantined alias of it read no
+            // change, and its release freed the buffer now holding the copied value.
+            destination.IncrementVersion();
             BindResidentBuffer(storage, whole.Buffer, viewBackend);
             base.InvalidatePersistentTensor(destination);
             input.DisposeAfterQueuedUse(viewBackend);

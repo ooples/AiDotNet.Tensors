@@ -284,6 +284,53 @@ public sealed class LastUseReleaseGpuTests
     }
 
     [SkippableFact]
+    public void A_non_persistent_opted_in_tape_frees_its_non_leaf_gradients_at_dispose()
+    {
+        // A non-persistent tape's backward clears its entries before returning, so the non-leaf set read afterwards was
+        // empty: every non-leaf gradient was kept and stayed allocated after dispose.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var x = gpu.UploadToGpu(Input(40), GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(41), GpuTensorRole.General);
+        Tensor<float>? gradY = null;
+        using (var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false, ReleaseDeviceActivationsAtLastUse = true }))
+        {
+            var y = gpu.Sigmoid(x);
+            var grads = tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(y, w), null));
+            if (grads.TryGetValue(y, out var g)) gradY = g;
+        }
+        Assert.NotNull(gradY);
+        if (gradY is not null) Assert.Throws<InvalidOperationException>(() => gradY.ToArray());
+    }
+
+    [SkippableFact]
+    public void A_cpu_resident_tape_under_a_gpu_default_engine_runs_a_second_backward()
+    {
+        // The consumed decision read the tape's engine before the backward resolved it: a tape of host data made while
+        // the process default is a GPU engine runs on the CPU and frees nothing, yet it was marked consumed.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var cpu = new CpuEngine();
+            var x = Input(42);
+            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true, ReleaseDeviceActivationsAtLastUse = true });
+            var loss = cpu.ReduceSum(cpu.Sigmoid(x), null);
+            var first = tape.ComputeGradients(loss, new[] { x })[x].ToArray();
+            var second = tape.ComputeGradients(loss, new[] { x })[x].ToArray();
+            Assert.Equal(first, second, new FloatTolerance(1e-6f));
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
+    [SkippableFact]
     public void A_backward_that_throws_after_freeing_leaves_the_tape_consumed()
     {
         // A step after the first free threw, so the consumed flag (set after a finished walk) was never set: a retry
@@ -315,6 +362,10 @@ public sealed class LastUseReleaseGpuTests
             Assert.Throws<NotSupportedException>(() => tape.ComputeGradients(loss, new[] { x }));
             var retry = Assert.Throws<InvalidOperationException>(() => tape.ComputeGradients(loss, new[] { x }));
             Assert.Contains("RetainUntilTapeDisposal", retry.Message);
+            // The streaming entry point walks the same freed graph: it must refuse too.
+            var streamed = Assert.Throws<InvalidOperationException>(
+                () => tape.ComputeGradientsStreaming(loss, new[] { x }, (source, gradient) => { }));
+            Assert.Contains("RetainUntilTapeDisposal", streamed.Message);
         }
     }
 
@@ -436,6 +487,32 @@ public sealed class LastUseReleaseGpuTests
         });
         Assert.NotNull(read);
         if (read is not null) Assert.Equal(Input(32).ToArray(), read, new FloatTolerance(1e-6f));
+    }
+
+    [SkippableFact]
+    public void A_quarantined_intermediate_overwritten_through_an_offset_view_keeps_the_new_value()
+    {
+        // The offset-view copy bumped only a wrapper tensor's version, so the quarantine saw the storage unchanged and
+        // the graph's next run released the buffer holding the copied rows.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var x = gpu.UploadToGpu(Input(37), GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(38), GpuTensorRole.General);
+        var hostFresh = new Tensor<float>(Enumerable.Range(0, Shape[1] * Shape[2]).Select(i => 0.25f * i).ToArray(),
+            new[] { Shape[1], Shape[2] });
+        var fresh = gpu.UploadToGpu(hostFresh, GpuTensorRole.General);
+        float[]? read = null;
+        Step(gpu, x, w, readAfterBackward: false, out _, afterBackward: y =>
+        {
+            var view = y.Slice(1);                              // storage offset Shape[1] * Shape[2]
+            Assert.NotEqual(0, view.StorageOffset);
+            ((IEngine)gpu).TensorCopy(fresh, view);   // the engine's device copy, through IEngine
+            Step(gpu, x, w, readAfterBackward: false, out _);   // closes the probe window
+            read = view.ToArray();
+        });
+        Assert.NotNull(read);
+        if (read is not null) Assert.Equal(hostFresh.ToArray(), read, new FloatTolerance(1e-6f));
     }
 
     [SkippableFact]
