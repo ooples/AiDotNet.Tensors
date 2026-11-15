@@ -732,7 +732,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphstep_diag.txt"),
                     "[GRAPHSTEP-DIAG] CAPTURE-FAILED " + reason + System.Environment.NewLine);
             }
-            catch { /* diagnostic only */ }
+            catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                // The diagnostic file is optional; the failure itself was traced above.
+                System.Diagnostics.Trace.TraceWarning("Could not write the graph-step diagnostic file: " + ex.GetType().Name);
+            }
         }
     }
 

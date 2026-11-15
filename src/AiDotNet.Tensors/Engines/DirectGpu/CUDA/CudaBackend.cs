@@ -444,16 +444,27 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         lock (ContextLifecycleLock)
         {
             if (_cudaContext == IntPtr.Zero || !IsLiveContext(_cudaContext, _contextGeneration)) return;
+            var pushed = CuBlasNative.cuCtxPushCurrent(_cudaContext);
+            if (pushed != CudaResult.Success)
+            {
+                // A leaked block, not a crash: the context is going away, and its memory with it.
+                Interlocked.Increment(ref _failedDeferredReleases);
+                System.Diagnostics.Trace.TraceWarning($"CUDA step arena block free skipped: cuCtxPushCurrent returned {pushed}.");
+                return;
+            }
             try
             {
-                CuBlasNative.cuCtxPushCurrent(_cudaContext);
                 GpuMemoryTracker.OnFree(ptr);
-                CuBlasNative.cuMemFree(ptr); // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
-                CuBlasNative.cuCtxPopCurrent(out _);
+                var freed = CuBlasNative.cuMemFree(ptr); // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                if (freed != CudaResult.Success)
+                {
+                    Interlocked.Increment(ref _failedDeferredReleases);
+                    System.Diagnostics.Trace.TraceWarning($"CUDA step arena block free failed: cuMemFree returned {freed}.");
+                }
             }
-            catch
+            finally
             {
-                // Suppress disposal errors during context teardown.
+                CuBlasNative.cuCtxPopCurrent(out _);
             }
         }
     }

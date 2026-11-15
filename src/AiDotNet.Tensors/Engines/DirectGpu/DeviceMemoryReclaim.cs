@@ -121,7 +121,7 @@ internal static class DeviceMemoryReclaim
     [ThreadStatic] private static int t_scopedScratchDepth;
 
     /// <summary>Whether this thread is inside <see cref="EnterScopedScratch"/>.</summary>
-    internal static bool InScopedScratch => t_scopedScratchDepth != 0;
+    internal static bool InScopedScratch => t_scopedScratchDepth > 0;
 
     /// <summary>
     /// Device allocations this thread makes until the scope is disposed are not charged toward the reclaim collections.
@@ -138,7 +138,12 @@ internal static class DeviceMemoryReclaim
 
     internal readonly struct ScopedScratchScope : IDisposable
     {
-        public void Dispose() => t_scopedScratchDepth--;
+        // A scope disposed twice (or a default one) must not leave the depth negative: every later allocation on the
+        // thread would read as scoped scratch and go uncharged for good.
+        public void Dispose()
+        {
+            if (t_scopedScratchDepth > 0) t_scopedScratchDepth--;
+        }
     }
 
     // Set by a collection that ran inside an open tape. What the tape still held survived it and was promoted, so the
@@ -197,7 +202,7 @@ internal static class DeviceMemoryReclaim
     /// too, which only brings a collection slightly earlier, never later.</returns>
     internal static long OnDeviceAllocation(long bytes)
     {
-        if (t_scopedScratchDepth != 0) return -1;   // never garbage: see EnterScopedScratch (epoch -1: no credit either)
+        if (t_scopedScratchDepth > 0) return -1;   // never garbage: see EnterScopedScratch (epoch -1: no credit either)
         long epoch = Volatile.Read(ref s_collectionEpoch);
         Interlocked.Increment(ref s_allocationsSinceCollection);
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);

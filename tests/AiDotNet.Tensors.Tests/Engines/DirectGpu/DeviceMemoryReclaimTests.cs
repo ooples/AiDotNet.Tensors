@@ -452,6 +452,19 @@ public sealed class DeviceMemoryReclaimTests
         Assert.True(DirectOpenClGpuBuffer.PendingFrees.IsEmpty);
     }
 
+    [Fact]
+    public void A_scoped_scratch_scope_disposed_twice_does_not_leave_the_thread_uncharged()
+    {
+        var scope = DeviceMemoryReclaim.EnterScopedScratch();
+        Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        scope.Dispose();
+        scope.Dispose();   // a copy of the struct disposed again: the depth went to -1, read as inside a scope
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
+        using (DeviceMemoryReclaim.EnterScopedScratch())
+            Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
+    }
+
     [SkippableFact]
     public void Vulkan_AbandonedBuffer_IsFreedByTheNextAllocation()
     {
