@@ -332,6 +332,12 @@ public sealed partial class CudaBackend
     /// <summary>Test hook: runs on the capturing thread right after the step capture opens.</summary>
     internal static Action? TestHookInsideCapture;
 
+    /// <summary>
+    /// Test hook: runs on the capturing thread after the gate is released and the graph's nodes are counted, before the
+    /// counts are described: where another thread's capture can overwrite the LastCapture* telemetry.
+    /// </summary>
+    internal static Action? TestHookAfterCaptureCounted;
+
     /// <summary>Call right after cuStreamEndCapture, so the queued releases are not captured.</summary>
     private void ExitCapture()
     {
@@ -470,6 +476,7 @@ public sealed partial class CudaBackend
         LastCaptureKernelNodeCount = kernelNodes;
         LastCaptureMemcpyNodeCount = memcpyNodes;
         LastCaptureMemsetNodeCount = memsetNodes;
+        TestHookAfterCaptureCounted?.Invoke();
         string? lastMemsetSources = memsetNodes > 0 ? DescribeMemsetNodes(graph) : null;
         { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})");
           // Node-type breakdown (KERNEL/MEMCPY/MEMSET/MEM_ALLOC/MEM_FREE/…) — tells us how much of the chain is

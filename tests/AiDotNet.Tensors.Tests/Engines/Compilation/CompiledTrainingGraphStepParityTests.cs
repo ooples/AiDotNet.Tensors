@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -2557,6 +2558,69 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// of dead GPU results): step 4 - the first captured launch - reported a negative or zero mean-squared loss.
     /// Here the free is queued deterministically from inside the capture.
     /// </summary>
+    /// <summary>
+    /// The capture released its gate, counted its nodes into the LastCapture* properties, then read them back to build
+    /// its node counts: another thread's capture in between replaced them, and this graph reported that one's nodes.
+    /// The hook runs a second, smaller capture on another thread at exactly that point.
+    /// </summary>
+    [SkippableFact]
+    public void A_capture_reports_its_own_node_counts_when_another_thread_captures_after_it()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            using var op = gpu.EnterGpuOp();
+            var maybeCuda = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            Skip.If(maybeCuda is null, "Graph capture is CUDA-only.");
+            if (maybeCuda is null) return;
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda = maybeCuda;
+            var engine = gpu;
+            var capture = (AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture)cuda;
+            using var a = cuda.AllocateBuffer(new float[256]);
+            using var b = cuda.AllocateBuffer(new float[256]);
+            void Large() { for (int k = 0; k < 4; k++) cuda.Scale(a, b, 1.5f, 256); }
+            void Small() => cuda.Scale(b, a, 0.5f, 256);
+
+            int Kernels(Action body)
+            {
+                var graph = cuda.CaptureGraph(body);
+                Skip.If(graph == IntPtr.Zero, "capture failed: " + capture.LastCaptureFailure);
+                int kernels = capture.LastCaptureNodeCounts?.Kernel ?? -1;
+                cuda.DestroyCapturedGraph(graph);
+                return kernels;
+            }
+            int largeAlone = Kernels(Large), smallAlone = Kernels(Small);
+            Assert.NotEqual(largeAlone, smallAlone);   // otherwise the overwrite could not show
+
+            int otherThreadCaptures = 0;
+            Exception? otherFailure = null;
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookAfterCaptureCounted = () =>
+            {
+                if (Interlocked.Exchange(ref otherThreadCaptures, 1) != 0) return;   // the other thread's own capture
+                var other = new Thread(() =>
+                {
+                    try
+                    {
+                        using var otherOp = engine.EnterGpuOp();
+                        var graph = cuda.CaptureGraph(Small);
+                        if (graph != IntPtr.Zero) cuda.DestroyCapturedGraph(graph);
+                    }
+                    catch (Exception ex) { otherFailure = ex; }
+                });
+                other.Start();
+                if (!other.Join(TimeSpan.FromSeconds(60))) otherFailure = new TimeoutException("the other capture hung");
+            };
+            int reported;
+            try { reported = Kernels(Large); }
+            finally { AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookAfterCaptureCounted = null; }
+
+            Assert.Null(otherFailure);
+            Assert.Equal(1, otherThreadCaptures);
+            Assert.Equal(smallAlone, cuda.LastCaptureKernelNodeCount);   // the other capture did overwrite the telemetry
+            Assert.Equal(largeAlone, reported);
+        }
+    }
+
     [SkippableFact]
     public void A_finalizer_free_queued_during_capture_is_not_recorded_into_the_step_graph()
     {

@@ -76,19 +76,70 @@ public sealed class CudaLongRowKernelTests
         }
     }
 
-    [Fact]
-    public void MaxAxisRows_StridesARowWithA64BitIndex()
+    [SkippableFact]
+    public unsafe void MaxAxisRows_ScansARowWithinABlockOfIntMaxValue()
     {
-        // A row within blockDim.x of int.MaxValue elements (about 8 GiB, a whole-tensor max) stepped an int index past
-        // int.MaxValue, where it wrapped negative and still passed the bound. Too large to run here: read the kernel.
-        string source = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaNeuralNetKernels.GetSource();
-        int start = source.IndexOf("void max_axis_rows(", StringComparison.Ordinal);
-        Assert.True(start >= 0, "max_axis_rows is not in the neural-net kernel source");
-        int bodyEnd = source.IndexOf("__syncthreads()", start, StringComparison.Ordinal);
-        Assert.True(bodyEnd > start, "max_axis_rows has no reduction after its row scan");
-        string scan = source.Substring(start, bodyEnd - start);
-        Assert.Contains("for (long long i = threadIdx.x; i < axisSize; i += blockDim.x)", scan);
-        Assert.DoesNotContain("for (int i = threadIdx.x; i < axisSize", scan);
+        // A row within blockDim.x of int.MaxValue elements stepped an int index past int.MaxValue, where it wrapped
+        // negative and still passed the bound: the kernel read 8 GiB below the row. The row is 8 GiB of address space
+        // over one small physical allocation mapped again and again (CUDA virtual memory), so it runs on any device.
+        var (gpu, cuda) = Cuda();
+        using (gpu)
+        {
+            const int axis = int.MaxValue - 100;   // the last thread's next index passes int.MaxValue
+            Check(CudaNativeBindings.cuCtxPushCurrent(cuda.CudaContextHandle), "cuCtxPushCurrent");
+            IntPtr reserved = IntPtr.Zero;
+            ulong handle = 0, granularity = 0, span = 0;
+            int mapped = 0;
+            var gate = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.DirectPtxFeatureGate.TestOverride;
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.DirectPtxFeatureGate.TestOverride = false;   // the NVRTC kernel
+            try
+            {
+                Check(CudaNativeBindings.cuCtxGetDevice(out int device), "cuCtxGetDevice");
+                const int VirtualMemoryManagementSupported = 102;
+                Skip.If(AiDotNet.Tensors.Engines.CuBlasNative.cuDeviceGetAttribute(out int vmm, VirtualMemoryManagementSupported, device)
+                    != CudaResult.Success || vmm == 0, "the device has no virtual memory management");
+                var prop = new CudaMemAllocationProp { Type = 1, LocationType = 1, LocationId = device };
+                Check(CudaNativeBindings.cuMemGetAllocationGranularity(out granularity, ref prop, 0), "cuMemGetAllocationGranularity");
+                ulong rowBytes = (ulong)axis * sizeof(float);
+                span = (rowBytes + granularity - 1) / granularity * granularity;
+                Check(CudaNativeBindings.cuMemCreate(out handle, granularity, ref prop, 0), "cuMemCreate");
+                Check(CudaNativeBindings.cuMemAddressReserve(out reserved, span, granularity, IntPtr.Zero, 0), "cuMemAddressReserve");
+                for (ulong at = 0; at < span; at += granularity, mapped++)
+                    Check(CudaNativeBindings.cuMemMap(new IntPtr(reserved.ToInt64() + (long)at), granularity, 0, handle, 0), "cuMemMap");
+                var access = new CudaMemAccessDesc { LocationType = 1, LocationId = device, Flags = 3 };
+                Check(CudaNativeBindings.cuMemSetAccess(reserved, span, ref access, 1), "cuMemSetAccess");
+
+                // Every granule is the same memory: -1 everywhere but one 5, so the row's maximum is 5.
+                int perGranule = (int)(granularity / sizeof(float));
+                var host = Enumerable.Repeat(-1f, perGranule).ToArray();
+                host[perGranule / 3] = 5f;
+                fixed (float* src = host)
+                    Check(AiDotNet.Tensors.Engines.CuBlasNative.cuMemcpyHtoD(reserved, (IntPtr)src, granularity), "cuMemcpyHtoD");
+
+                var row = new CudaBackend.CudaGpuBuffer(IntPtr.Zero, reserved, axis);
+                GC.SuppressFinalize(row);   // the mapping is released below, never through the pool
+                using var output = cuda.AllocateBuffer(1);
+                cuda.MaxAxis(row, output, 1, axis);
+                Assert.Equal(5f, cuda.DownloadBuffer(output)[0]);
+            }
+            finally
+            {
+                AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.DirectPtxFeatureGate.TestOverride = gate;
+                if (reserved != IntPtr.Zero)
+                {
+                    for (int m = 0; m < mapped; m++)
+                        CudaNativeBindings.cuMemUnmap(new IntPtr(reserved.ToInt64() + (long)((ulong)m * granularity)), granularity);
+                    CudaNativeBindings.cuMemAddressFree(reserved, span);
+                }
+                if (handle != 0) CudaNativeBindings.cuMemRelease(handle);
+                CudaNativeBindings.cuCtxPopCurrent(out _);
+            }
+        }
+    }
+
+    private static void Check(CudaResult result, string call)
+    {
+        if (result != CudaResult.Success) throw new InvalidOperationException(call + " failed: " + result);
     }
 
     [SkippableTheory]
