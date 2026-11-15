@@ -1370,6 +1370,37 @@ public sealed class TensorArena : IDisposable
         _watchedOwners = null;
     }
 
+    /// <summary>
+    /// Bytes of unresolved quarantine (buffers whose readers no collection has yet shown dead) above which a sweep
+    /// asks for a gen-1 collection first. Each quarantined buffer is LOH-sized, so the alternative is allocating its
+    /// replacement on the LOH, and LOH allocation budgets trigger gen-2 collections.
+    /// </summary>
+    private const long InducedCollectMinBytes = 1L << 20;
+
+    private static readonly bool InducedCollectEnabled =
+        Environment.GetEnvironmentVariable("AIDOTNET_TAPE_ARENA_COLLECT") != "0";
+
+    [ThreadStatic] private static int t_lastSweepCollectionCount;
+
+    // A quarantined buffer is known dead only once a collection has cleared the weak references to its readers. A
+    // hand-rolled tape loop allocates little besides the arena's own buffers, so collections are rare, and every step
+    // re-allocated its LOH-sized buffers (2 MB a step and a gen-2 collection every ~8 steps on a [128,512]x[512,512]
+    // MLP) while the dead ones waited. A gen-1 collection here finds this and earlier steps' dropped readers (the
+    // step's tensors are young), so the sweep pools them at once: 19 KB a step, no gen-2 collections, and 15% faster
+    // than without the arena. Skipped when a collection already ran since the last sweep, or for small quarantines.
+    private static void CollectIfQuarantineUnresolved(List<Quarantined> q)
+    {
+        if (!InducedCollectEnabled) return;
+        int collections = GC.CollectionCount(0);
+        if (collections != t_lastSweepCollectionCount) { t_lastSweepCollectionCount = collections; return; }
+        long bytes = 0;
+        foreach (var entry in q)
+            if ((bytes += (long)entry.Size * ElementBytes(entry.Type)) >= InducedCollectMinBytes) break;
+        if (bytes < InducedCollectMinBytes) return;
+        GC.Collect(1, GCCollectionMode.Forced, blocking: true, compacting: false);
+        t_lastSweepCollectionCount = GC.CollectionCount(0);
+    }
+
     // Moves quarantined buffers nothing references any more into the cross-arena pool; ages the rest. A collection
     // frees many steps' buffers at once, so a sweep returns no more of a size than the newest arena quarantined (one
     // step's use, the self-limit an arena's own Dispose has); the others are left to the GC.
@@ -1377,6 +1408,7 @@ public sealed class TensorArena : IDisposable
     {
         var q = t_quarantine;
         if (q is null || q.Count == 0) return;
+        CollectIfQuarantineUnresolved(q);
         var need = t_sweepNeed ??= new Dictionary<(Type, int), int>();
         need.Clear();
         foreach (var entry in q)
