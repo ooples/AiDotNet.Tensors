@@ -73,6 +73,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
     private readonly object[] _tokens;
     private readonly int _hash;
 
+    private static readonly object NullValueToken = new();
     private ObjectiveSignature(object[] tokens, int nodeCount, string? unsignableReason)
     {
         _tokens = tokens;
@@ -101,7 +102,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
     /// parameter's storage) in first-use order; each is an <see cref="ISignatureTensor"/>.
     /// </summary>
     internal static ObjectiveSignature Build<T>(
-        IReadOnlyList<ILazyNode> nodes, Tensor<T>[] parameters, out object[] leaves)
+        IReadOnlyList<ILazyNode> nodes, Tensor<T>[] parameters, out object[] leaves, object? loss = null)
     {
         if (nodes is null) throw new ArgumentNullException(nameof(nodes));
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
@@ -111,6 +112,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
         for (int i = 0; i < nodes.Count && reason is null; i++)
             reason = builder.AddNode(i, nodes[i]);
 
+        if (reason is null && loss is not null) reason = builder.AddLoss(loss);
         leaves = builder.Leaves.ToArray();
         return new ObjectiveSignature(builder.Tokens.ToArray(), nodes.Count, reason);
     }
@@ -235,6 +237,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
         private readonly Dictionary<object, TensorRef> _classes = new(ReferenceComparer.Instance);
         private readonly Dictionary<object, int> _parameterStorage = new(ReferenceComparer.Instance);
         private readonly HashSet<object> _visiting = new(ReferenceComparer.Instance);
+        private int _parameterViewCount;
 
         internal List<object> Tokens { get; } = new();
         internal List<object> Leaves { get; } = new();
@@ -291,6 +294,8 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             return null;
         }
 
+        internal string? AddLoss(object loss) => AddTensorReference(loss, "objective", "loss");
+
         private string? AddTensorReference(object? tensor, string opName, string where)
         {
             if (tensor is null) { Tokens.Add(new TensorRef(RefClass.Null, 0)); return null; }
@@ -301,9 +306,9 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             if (_parameterStorage.TryGetValue(st.SignatureStorageIdentity, out int p))
             {
                 // A view of a parameter (a reshape or slice): the plan reads the parameter's live storage through it,
-                // so it is never rebound; its geometry is part of the structure.
-                var view = new TensorRef(RefClass.ParameterView, p);
+                var view = new TensorRef(RefClass.ParameterView, _parameterViewCount++);
                 _classes[tensor] = view;
+                Tokens.Add(p);
                 Tokens.Add(view);
                 Tokens.Add(new ArrayToken(st.SignatureShape));
                 Tokens.Add(new ArrayToken(st.SignatureStrides));
@@ -315,6 +320,10 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
                 return $"op '{opName}' {where} is a non-contiguous external tensor, which cannot be rebound";
 
             var leaf = new TensorRef(RefClass.Leaf, Leaves.Count);
+            foreach (var existing in Leaves)
+                if (existing is ISignatureTensor other && ReferenceEquals(st.SignatureStorageIdentity, other.SignatureStorageIdentity))
+                    return $"op '{opName}' {where} aliases another external leaf; independent rebinding is unsafe";
+
             Leaves.Add(tensor);
             _classes[tensor] = leaf;
             Tokens.Add(leaf);
@@ -372,7 +381,7 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             switch (value)
             {
                 case null:
-                    Tokens.Add("null");
+                    Tokens.Add(NullValueToken);
                     return null;
                 case string s:
                     Tokens.Add(s);
@@ -418,21 +427,34 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
 
         private string? AddArray(Array a, string opName, string where, int depth)
         {
-            var elementType = a.GetType().GetElementType() ?? typeof(object);
-            if (a.Rank == 1 && (elementType.IsPrimitive || elementType.IsEnum))
+            if (depth >= MaxFieldDepth)
+                return $"op '{opName}' {where} nests captured state deeper than {MaxFieldDepth}";
+            if (!_visiting.Add(a))
+                return $"op '{opName}' {where} contains a cyclic array";
+            try
             {
-                Tokens.Add(new ArrayToken(a));
+                var elementType = a.GetType().GetElementType() ?? typeof(object);
+                if (a.Rank == 1 && a.GetLowerBound(0) == 0 && (elementType.IsPrimitive || elementType.IsEnum))
+                {
+                    Tokens.Add(new ArrayToken(a));
+                    return null;
+                }
+
+                Tokens.Add(a.GetType());
+                for (int axis = 0; axis < a.Rank; axis++)
+                {
+                    Tokens.Add(a.GetLength(axis));
+                    Tokens.Add(a.GetLowerBound(axis));
+                }
+                int i = 0;
+                foreach (var value in a)
+                {
+                    string? r = AddValue(value, opName, $"{where}[{i++}]", depth + 1);
+                    if (r is not null) return r;
+                }
                 return null;
             }
-
-            Tokens.Add(a.GetType());
-            Tokens.Add(a.Length);
-            for (int i = 0; i < a.Length; i++)
-            {
-                string? r = AddValue(a.GetValue(i), opName, $"{where}[{i}]", depth + 1);
-                if (r is not null) return r;
-            }
-            return null;
+            finally { _visiting.Remove(a); }
         }
     }
 

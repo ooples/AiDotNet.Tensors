@@ -23,11 +23,13 @@ internal sealed class ClosureObjectiveGuard<T>
     private static Recording? _recording;
 
     private readonly object[] _leaves;
+    private readonly Tensor<T>[] _parameters;
 
-    private ClosureObjectiveGuard(ObjectiveSignature signature, object[] leaves)
+    private ClosureObjectiveGuard(ObjectiveSignature signature, object[] leaves, Tensor<T>[] parameters)
     {
         Signature = signature;
         _leaves = leaves;
+        _parameters = (Tensor<T>[])parameters.Clone();
         foreach (var leaf in leaves)
             if (leaf is ISignatureTensor st && st.ElementType != typeof(T))
                 HasForeignLeaves = true;
@@ -94,7 +96,8 @@ internal sealed class ClosureObjectiveGuard<T>
             return;
         }
 
-        var signature = ObjectiveSignature.Build(nodes, parameters, out var leaves);
+        var signature = ObjectiveSignature.Build(nodes, parameters, out var leaves,
+            explicitLoss ?? (nodes.Count > 0 ? (nodes[nodes.Count - 1] as ISignableLazyNode)?.OutputTensor : null));
         if (!signature.Signable)
         {
             recording.Reason = signature.UnsignableReason;
@@ -106,7 +109,7 @@ internal sealed class ClosureObjectiveGuard<T>
             return;
         }
 
-        recording.Guard = new ClosureObjectiveGuard<T>(signature, leaves);
+        recording.Guard = new ClosureObjectiveGuard<T>(signature, leaves, parameters);
         recording.Reason = null;
     }
 
@@ -130,6 +133,14 @@ internal sealed class ClosureObjectiveGuard<T>
     /// signature looks it up on <see cref="ClosureGuardResult.Mismatched"/>.</param>
     internal ClosureGuardResult TryRebind(Func<Tensor<T>> objective, Tensor<T>[] parameters, out ObjectiveSignature? probed)
     {
+        if (objective is null) throw new ArgumentNullException(nameof(objective));
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        probed = null;
+        if (parameters.Length != _parameters.Length || parameters.Where((p, i) => !ReferenceEquals(p, _parameters[i])).Any())
+        {
+            LastReason = "the parameters differ from those owned by the compiled plan";
+            return ClosureGuardResult.Mismatched;
+        }
         var result = Probe(objective, parameters, out probed, out var leaves, out string? reason);
         if (result != ClosureGuardResult.Matched || probed is null)
         {
@@ -164,6 +175,32 @@ internal sealed class ClosureObjectiveGuard<T>
         {
             reason = $"the probe has {probedLeaves.Length} leaves, the plan {_leaves.Length}";
             return false;
+        }
+
+        // Validate every copy before mutating any caller-owned leaf. A permutation of
+        // existing leaves must not overwrite a source that a later copy still needs.
+        for (int i = 0; i < _leaves.Length; i++)
+        {
+            if (_leaves[i] is not ISignatureTensor target || probedLeaves[i] is not ISignatureTensor source)
+            {
+                reason = $"leaf {i} is not a tensor";
+                return false;
+            }
+            if (target.ElementType != source.ElementType
+                || !target.SignatureShape.SequenceEqual(source.SignatureShape)
+                || !target.SignatureIsContiguous || !source.SignatureIsContiguous)
+            {
+                reason = $"leaf {i} can no longer be written (incompatible tensor geometry or element type)";
+                return false;
+            }
+            if (ReferenceEquals(_leaves[i], probedLeaves[i])) continue;
+            for (int j = 0; j < probedLeaves.Length; j++)
+                if (probedLeaves[j] is ISignatureTensor other
+                    && ReferenceEquals(target.SignatureStorageIdentity, other.SignatureStorageIdentity))
+                {
+                    reason = $"leaf {i} aliases probe leaf {j}; rebinding would overwrite objective data";
+                    return false;
+                }
         }
 
         for (int i = 0; i < _leaves.Length; i++)
@@ -219,7 +256,7 @@ internal sealed class ClosureObjectiveGuard<T>
                 reason = unreplayable;
                 return ClosureGuardResult.Unsignable;
             }
-            signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves);
+            signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves, loss);
             if (signature.Signable && DisconnectedReason(scope, loss, parameters) is { } disconnected)
             {
                 reason = disconnected;
