@@ -92,4 +92,39 @@ public class SvdRelativeAccuracyTests
         // relative; through a float or double AᵀA it was lost entirely.
         Assert.True(Math.Abs(values[1] - 1e-10f) < 1e-15f, $"σ2 = {values[1]:R}");
     }
+
+    [Fact]
+    public void Double_FullMatrices_TallThin_CompletesAnOrthonormalU()
+    {
+        // 998 of U's 1000 columns are completions. Trying every standard basis vector for each was about 2m^4
+        // operations (2e12 here); the Householder completion is O(m^2 k).
+        const int m = 1000, n = 2;
+        var values = new double[m * n];
+        for (int i = 0; i < m; i++) { values[i * n] = Math.Sin(i + 1); values[i * n + 1] = Math.Cos(3 * i); }
+        var (u, s, _) = Linalg.Svd(Matrix(m, n, values), true);
+        double[] ud = u.GetDataArray();
+        Assert.Equal(new[] { m, m }, u.Shape.ToArray());
+        Assert.True(s.GetDataArray()[1] > 0);
+        // Spot-check orthonormality on a spread of column pairs, including completed ones.
+        int[] cols = { 0, 1, 2, 3, 500, 998, 999 };
+        foreach (int a in cols)
+            foreach (int b in cols)
+            {
+                double dot = 0;
+                for (int i = 0; i < m; i++) dot += ud[i * m + a] * ud[i * m + b];
+                Assert.True(Math.Abs(dot - (a == b ? 1.0 : 0.0)) < 1e-12, $"(U^T U)[{a},{b}] = {dot:R}");
+            }
+    }
+
+    [Fact]
+    public void Double_SubnormalColumnNorm_ConvergesToTheTinySingularValue()
+    {
+        // Column norms 1 and about 1.4e-310 at 45 degrees: np / nq overflowed to infinity, the tangent became -0, the
+        // rotation did nothing and the sweep limit threw. A = [[1, 1e-310], [0, 1e-310]] has det 1e-310 and sigma_1
+        // about 1, so sigma_2 is about 1e-310.
+        var (_, s, _) = Linalg.Svd(Matrix(2, 2, new[] { 1.0, 1e-310, 0.0, 1e-310 }), false);
+        double[] values = s.GetDataArray();
+        Assert.True(Math.Abs(values[0] - 1.0) < 1e-15, $"sigma_1 = {values[0]:R}");
+        Assert.True(Math.Abs(values[1] - 1e-310) < 1e-6 * 1e-310, $"sigma_2 = {values[1]:R}");
+    }
 }

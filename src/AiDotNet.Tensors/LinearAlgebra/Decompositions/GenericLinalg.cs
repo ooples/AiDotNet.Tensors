@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 
@@ -1053,12 +1054,24 @@ internal static class GenericLinalg<T>
                     if (Real<T>.Abs(gamma) <= tol) continue;
                     rotated = true;
                     largestCosine = Real<T>.Max(largestCosine, Real<T>.Abs(gamma));
-                    Real<T> zeta = (nq / np - np / nq) / (two * gamma);
-                    Real<T> absZeta = Real<T>.Abs(zeta);
+                    // The smaller-to-larger norm ratio r lies in [0, 1]. Below sqrt(eps), |zeta| is huge and t = 1/(2 zeta) =
+                    // ±gamma r / (1 - r²), formed from r: the quotient of a normal by a subnormal norm overflowed to
+                    // infinity, t became -0, the rotation did nothing and the sweep limit threw.
+                    Real<T> ratio = np <= nq ? np / nq : nq / np;
                     Real<T> t;
-                    if (zeta.IsZero) t = one;
-                    else if (absZeta > one / Real<T>.Sqrt(Eps)) t = one / (two * zeta);
-                    else t = Real<T>.CopySign(one, zeta) / (absZeta + Real<T>.Sqrt(one + zeta * zeta));
+                    if (ratio < Real<T>.Sqrt(Eps))
+                    {
+                        t = gamma * ratio / (one - ratio * ratio);
+                        if (np > nq) t = -t;
+                    }
+                    else
+                    {
+                        Real<T> zeta = (nq / np - np / nq) / (two * gamma);
+                        Real<T> absZeta = Real<T>.Abs(zeta);
+                        if (zeta.IsZero) t = one;
+                        else if (absZeta > one / Real<T>.Sqrt(Eps)) t = one / (two * zeta);
+                        else t = Real<T>.CopySign(one, zeta) / (absZeta + Real<T>.Sqrt(one + zeta * zeta));
+                    }
                     Real<T> c = one / Real<T>.Sqrt(one + t * t);
                     Real<T> sn = c * t;
                     for (int i = 0; i < m; i++)
@@ -1111,37 +1124,62 @@ internal static class GenericLinalg<T>
     }
 
     /// <summary>
-    /// Fills every column not marked in <paramref name="filled"/> with a unit vector orthogonal to all
-    /// columns filled so far (modified Gram–Schmidt with re-orthogonalization over the standard basis).
+    /// Fills every column not marked in <paramref name="filled"/> with a unit vector orthogonal to the filled columns:
+    /// the trailing columns of Q from the Householder QR of the filled columns (LAPACK's orgqr completion).
     /// </summary>
+    /// <remarks>
+    /// O(m²·k) for k filled columns. It replaced trying every standard basis vector for every missing column, which
+    /// was about 2m⁴ operations (2·10¹² for a full-matrices SVD of a 1000 x 2 input).
+    /// </remarks>
     private static void CompleteOrthonormalColumns(Real<T>[] u, int m, int cols, bool[] filled)
     {
-        var cand = new Real<T>[m];
-        var best = new Real<T>[m];
-        for (int j = 0; j < cols; j++)
+        var known = new List<int>();
+        var missing = new List<int>();
+        for (int j = 0; j < cols; j++) (filled[j] ? known : missing).Add(j);
+        if (missing.Count == 0) return;
+        int k = known.Count;
+
+        // Householder QR of the m x k matrix of filled columns; reflector c acts on rows c..m-1.
+        var f = new Real<T>[m * k];
+        for (int i = 0; i < m; i++)
+            for (int c = 0; c < k; c++) f[i * k + c] = u[i * cols + known[c]];
+        var reflectors = new Real<T>[]?[Math.Min(k, m)];
+        for (int c = 0; c < reflectors.Length; c++)
         {
-            if (filled[j]) continue;
-            Real<T> bestNorm = Real<T>.Zero;
-            for (int e = 0; e < m; e++)
+            var x = new Real<T>[m - c];
+            for (int i = c; i < m; i++) x[i - c] = f[i * k + c];
+            Real<T> norm = Norm2(x);
+            if (norm.IsZero) continue;
+            x[0] += Real<T>.CopySign(norm, x[0]);
+            Real<T> vNorm = Norm2(x);
+            if (vNorm.IsZero) continue;
+            for (int i = 0; i < x.Length; i++) x[i] /= vNorm;
+            reflectors[c] = x;
+            for (int col = c + 1; col < k; col++)
             {
-                for (int i = 0; i < m; i++) cand[i] = i == e ? Real<T>.One : Real<T>.Zero;
-                for (int pass = 0; pass < 2; pass++)
-                    for (int c = 0; c < cols; c++)
-                    {
-                        if (!filled[c]) continue;
-                        Real<T> dot = Real<T>.Zero;
-                        for (int i = 0; i < m; i++) dot += u[i * cols + c] * cand[i];
-                        for (int i = 0; i < m; i++) cand[i] -= dot * u[i * cols + c];
-                    }
-                Real<T> nrm = Norm2(cand);
-                if (nrm > bestNorm)
-                {
-                    bestNorm = nrm;
-                    Array.Copy(cand, best, m);
-                }
+                Real<T> dot = Real<T>.Zero;
+                for (int i = c; i < m; i++) dot += x[i - c] * f[i * k + col];
+                Real<T> twice = dot + dot;
+                for (int i = c; i < m; i++) f[i * k + col] -= twice * x[i - c];
             }
-            if (bestNorm.IsZero) continue;
-            for (int i = 0; i < m; i++) u[i * cols + j] = best[i] / bestNorm;
+        }
+
+        // Q e_(k + t) for the t-th missing column: apply H_(k-1) first, H_0 last.
+        var y = new Real<T>[m];
+        for (int t = 0; t < missing.Count && k + t < m; t++)
+        {
+            for (int i = 0; i < m; i++) y[i] = i == k + t ? Real<T>.One : Real<T>.Zero;
+            for (int c = reflectors.Length - 1; c >= 0; c--)
+            {
+                var v = reflectors[c];
+                if (v is null) continue;
+                Real<T> dot = Real<T>.Zero;
+                for (int i = c; i < m; i++) dot += v[i - c] * y[i];
+                Real<T> twice = dot + dot;
+                for (int i = c; i < m; i++) y[i] -= twice * v[i - c];
+            }
+            int j = missing[t];
+            for (int i = 0; i < m; i++) u[i * cols + j] = y[i];
             filled[j] = true;
         }
     }
