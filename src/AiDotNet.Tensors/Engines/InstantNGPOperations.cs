@@ -260,6 +260,20 @@ public static class InstantNGPOperations
     }
 
     /// <summary>
+    /// Whether a level is indexed densely: tiny-cuda-nn's <c>grid_index</c> hashes when <c>hashmap_size &lt; stride</c>,
+    /// with <c>stride = R^3</c> for <c>R &lt;= MAX_BASES[3]</c> and <c>0xFFFFFFFF</c> beyond it.
+    /// </summary>
+    internal static bool UsesDenseHashGridIndex(int gridResolution, int tableSize)
+    {
+        unchecked
+        {
+            uint resolution = (uint)gridResolution;
+            uint stride = gridResolution <= MaxDenseResolution ? resolution * resolution * resolution : uint.MaxValue;
+            return (uint)tableSize >= stride;
+        }
+    }
+
+    /// <summary>
     /// tiny-cuda-nn's <c>grid_index</c> for three dimensions: the dense index when the level's whole grid fits the table,
     /// the coherent prime hash otherwise, in wrapping uint32 arithmetic and modulo the table size.
     /// </summary>
@@ -268,8 +282,7 @@ public static class InstantNGPOperations
         unchecked
         {
             uint resolution = (uint)gridResolution;
-            uint stride = gridResolution <= MaxDenseResolution ? resolution * resolution * resolution : uint.MaxValue;
-            uint index = (uint)tableSize < stride
+            uint index = !UsesDenseHashGridIndex(gridResolution, tableSize)
                 ? x ^ (y * HashPrimeY) ^ (z * HashPrimeZ)
                 : x + y * resolution + z * resolution * resolution;
             return index % (uint)tableSize;

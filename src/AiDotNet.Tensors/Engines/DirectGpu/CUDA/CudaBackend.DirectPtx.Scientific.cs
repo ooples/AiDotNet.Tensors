@@ -35,7 +35,7 @@ public sealed partial class CudaBackend
     private readonly record struct SciAnnCdKey(AnnMetric Metric, int NumQueries, int NumDatabase, int Dim);
     private readonly record struct SciAnnPqKey(AnnMetric Metric, int NumQueries, int M, int Ksub, int Dsub);
     private readonly record struct SciAnnAdcKey(int NumQueries, int NumCodes, int M, int Ksub);
-    private readonly record struct SciNgpKey(int NumPoints, int Resolution, int TableSize, int FeaturesPerLevel, int LevelOffset, int OutputStride);
+    private readonly record struct SciNgpKey(int NumPoints, float Scale, float PositionOffset, int GridResolution, int TableSize, int FeaturesPerLevel, int LevelOffset, int OutputStride);
 
     private readonly DirectPtxKernelCache<SciCountKey, PtxComplexMultiplyKernel> _sciComplexMul =
         new(ScientificCacheCapacity());
@@ -609,40 +609,46 @@ public sealed partial class CudaBackend
 
     internal bool TryDirectPtxInstantNgpHashEncode(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize, int featuresPerLevel,
+        int levelOffset, int outputStride)
     {
         if (!ScientificGateOpen ||
-            !PtxInstantNgpHashEncodeKernel.IsSupportedShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return Fail("instant-ngp-hash-encode");
+            !PtxInstantNgpHashEncodeKernel.IsSupportedShape(numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return Fail("instant-ngp-hash-encode");
         if (positions.SizeInBytes != checked((long)numPoints * 3 * sizeof(float)) ||
             hashTable.SizeInBytes != checked((long)tableSize * featuresPerLevel * sizeof(float)) ||
             output.SizeInBytes != checked((long)numPoints * outputStride * sizeof(float))) return Fail("instant-ngp-hash-encode-extent");
+        var runtime = _directPtxRuntime;
+        if (runtime is null) return Fail("instant-ngp-hash-encode-runtime");
         var key = new SciNgpKey(
-            numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
+            numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride);
         return SciDispatch(() =>
         {
             var k = _sciNgpHashEncode.GetOrAdd(
                 key,
-                () => new PtxInstantNgpHashEncodeKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
+                () => new PtxInstantNgpHashEncodeKernel(runtime, numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride));
             Launch3(k.Blueprint, positions, hashTable, output, (vp, vt, vo) => k.Launch(vp, vt, vo));
         }, () => _sciNgpHashEncode.Pin(key));
     }
 
     internal bool TryDirectPtxInstantNgpHashEncodeBackward(
         IGpuBuffer positions, IGpuBuffer outputGradient, IGpuBuffer tableGradient,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize, int featuresPerLevel,
+        int levelOffset, int outputStride)
     {
         if (!ScientificGateOpen ||
-            !PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return Fail("instant-ngp-hash-encode-backward");
+            !PtxInstantNgpHashEncodeBackwardKernel.IsSupportedShape(numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return Fail("instant-ngp-hash-encode-backward");
         if (positions.SizeInBytes != checked((long)numPoints * 3 * sizeof(float)) ||
             outputGradient.SizeInBytes != checked((long)numPoints * outputStride * sizeof(float)) ||
             tableGradient.SizeInBytes != checked((long)tableSize * featuresPerLevel * sizeof(float))) return Fail("instant-ngp-hash-encode-backward-extent");
+        var runtime = _directPtxRuntime;
+        if (runtime is null) return Fail("instant-ngp-hash-encode-backward-runtime");
         var key = new SciNgpKey(
-            numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
+            numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride);
         return SciDispatch(() =>
         {
             var k = _sciNgpHashEncodeBwd.GetOrAdd(
                 key,
-                () => new PtxInstantNgpHashEncodeBackwardKernel(_directPtxRuntime!, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride));
+                () => new PtxInstantNgpHashEncodeBackwardKernel(runtime, numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride));
             Launch3(k.Blueprint, positions, outputGradient, tableGradient, (vp, vg, vt) => k.Launch(vp, vg, vt));
         }, () => _sciNgpHashEncodeBwd.Pin(key));
     }

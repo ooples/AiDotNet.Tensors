@@ -4,26 +4,26 @@ public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBac
 {
     public void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(numPoints * featuresPerLevel);
         GlslDispatchN(VulkanInstantNgpKernels.Forward, total,
             [positions, hashTable, output],
-            [(uint)numPoints, (uint)resolution, (uint)tableSize, (uint)featuresPerLevel,
-                (uint)levelOffset, (uint)outputStride]);
+            [Bits(numPoints), FloatBits(scale), FloatBits(positionOffset), Bits(gridResolution),
+                Bits(tableSize), Bits(featuresPerLevel), Bits(levelOffset), Bits(outputStride)]);
     }
 
     public void HashGridEncodeLevelBackward(
         IGpuBuffer positions, IGpuBuffer outputGradient, IGpuBuffer tableGradient,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(tableSize * featuresPerLevel);
         GlslDispatchN(VulkanInstantNgpKernels.Backward, total,
             [positions, outputGradient, tableGradient],
-            [(uint)numPoints, (uint)resolution, (uint)tableSize, (uint)featuresPerLevel,
-                (uint)levelOffset, (uint)outputStride]);
+            [Bits(numPoints), FloatBits(scale), FloatBits(positionOffset), Bits(gridResolution),
+                Bits(tableSize), Bits(featuresPerLevel), Bits(levelOffset), Bits(outputStride)]);
     }
 
     public void UniqueConsecutive(

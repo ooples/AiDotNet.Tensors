@@ -12,57 +12,62 @@ public static class CudaInstantNgpKernels
 #define INFINITY __int_as_float(0x7f800000)
 #endif
 
-__device__ __forceinline__ unsigned int instant_ngp_hash(int x, int y, int z, int tableSize)
+// tiny-cuda-nn grid_index (common_device.h) for three dimensions: dense when the level's
+// gridResolution^3 vertices fit the table (gridResolution <= MAX_BASES[3] = 0x659), otherwise
+// coherent_prime_hash (factors 1, 2654435761, 805459861); wrapping uint32, mod tableSize.
+__device__ __forceinline__ unsigned int instant_ngp_grid_index(
+    unsigned int x, unsigned int y, unsigned int z, int gridResolution, int tableSize)
 {
-    unsigned int hx = (unsigned int)x * 73856093u;
-    unsigned int hy = (unsigned int)y * 19349663u;
-    unsigned int hz = (unsigned int)z * 83492791u;
-    return (hx ^ hy ^ hz) % (unsigned int)tableSize;
+    unsigned int r = (unsigned int)gridResolution;
+    unsigned int stride = gridResolution <= 0x659 ? r * r * r : 0xFFFFFFFFu;
+    unsigned int index = (unsigned int)tableSize < stride
+        ? (x ^ (y * 2654435761u) ^ (z * 805459861u))
+        : (x + y * r + z * r * r);
+    return index % (unsigned int)tableSize;
 }
 
 __device__ __forceinline__ float instant_ngp_clamp_position(float value)
 {
-    if (value <= 0.0f) return 0.0f;
+    if (!(value > 0.0f)) return 0.0f;
     if (value >= 0.999999f) return 0.999999f;
     return value;
+}
+
+// tiny-cuda-nn pos_fract: pos = fma(scale, x, offset), cell = floor(pos), fraction = pos - cell.
+__device__ __forceinline__ void instant_ngp_pos_fract(
+    float value, float scale, float positionOffset, unsigned int* cell, float* fraction)
+{
+    float pos = fmaf(scale, instant_ngp_clamp_position(value), positionOffset);
+    float cellf = floorf(pos);
+    *cell = (unsigned int)(int)cellf;
+    *fraction = pos - cellf;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void instant_ngp_hash_encode_level(
     const float* __restrict__ positions,
     const float* __restrict__ hashTable,
     float* __restrict__ output,
-    int numPoints, int resolution, int tableSize, int featuresPerLevel,
-    int levelOffset, int outputStride)
+    int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+    int featuresPerLevel, int levelOffset, int outputStride)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = numPoints * featuresPerLevel;
     if (gid >= total) return;
     int n = gid / featuresPerLevel;
     int f = gid - n * featuresPerLevel;
-    float gx = instant_ngp_clamp_position(positions[n * 3]) * (float)resolution;
-    float gy = instant_ngp_clamp_position(positions[n * 3 + 1]) * (float)resolution;
-    float gz = instant_ngp_clamp_position(positions[n * 3 + 2]) * (float)resolution;
-    int x0 = (int)floorf(gx), y0 = (int)floorf(gy), z0 = (int)floorf(gz);
-    int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
-    float fx = gx - (float)x0, fy = gy - (float)y0, fz = gz - (float)z0;
-    float ix = 1.0f - fx, iy = 1.0f - fy, iz = 1.0f - fz;
-    unsigned int h000 = instant_ngp_hash(x0, y0, z0, tableSize);
-    unsigned int h001 = instant_ngp_hash(x0, y0, z1, tableSize);
-    unsigned int h010 = instant_ngp_hash(x0, y1, z0, tableSize);
-    unsigned int h011 = instant_ngp_hash(x0, y1, z1, tableSize);
-    unsigned int h100 = instant_ngp_hash(x1, y0, z0, tableSize);
-    unsigned int h101 = instant_ngp_hash(x1, y0, z1, tableSize);
-    unsigned int h110 = instant_ngp_hash(x1, y1, z0, tableSize);
-    unsigned int h111 = instant_ngp_hash(x1, y1, z1, tableSize);
-    float value =
-        ix * iy * iz * hashTable[h000 * featuresPerLevel + f] +
-        ix * iy * fz * hashTable[h001 * featuresPerLevel + f] +
-        ix * fy * iz * hashTable[h010 * featuresPerLevel + f] +
-        ix * fy * fz * hashTable[h011 * featuresPerLevel + f] +
-        fx * iy * iz * hashTable[h100 * featuresPerLevel + f] +
-        fx * iy * fz * hashTable[h101 * featuresPerLevel + f] +
-        fx * fy * iz * hashTable[h110 * featuresPerLevel + f] +
-        fx * fy * fz * hashTable[h111 * featuresPerLevel + f];
+    unsigned int gx, gy, gz;
+    float fx, fy, fz;
+    instant_ngp_pos_fract(positions[n * 3], scale, positionOffset, &gx, &fx);
+    instant_ngp_pos_fract(positions[n * 3 + 1], scale, positionOffset, &gy, &fy);
+    instant_ngp_pos_fract(positions[n * 3 + 2], scale, positionOffset, &gz, &fz);
+    float value = 0.0f;
+    for (int c = 0; c < 8; c++) {
+        float w = ((c & 1) ? fx : 1.0f - fx) * ((c & 2) ? fy : 1.0f - fy) * ((c & 4) ? fz : 1.0f - fz);
+        unsigned int index = instant_ngp_grid_index(
+            gx + (unsigned int)(c & 1), gy + (unsigned int)((c >> 1) & 1), gz + (unsigned int)((c >> 2) & 1),
+            gridResolution, tableSize);
+        value += w * hashTable[index * (unsigned int)featuresPerLevel + (unsigned int)f];
+    }
     output[n * outputStride + levelOffset + f] = value;
 }
 
@@ -70,8 +75,8 @@ extern ""C"" __global__ __launch_bounds__(256) void instant_ngp_hash_encode_leve
     const float* __restrict__ positions,
     const float* __restrict__ outputGradient,
     float* __restrict__ tableGradient,
-    int numPoints, int resolution, int tableSize, int featuresPerLevel,
-    int levelOffset, int outputStride)
+    int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+    int featuresPerLevel, int levelOffset, int outputStride)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = tableSize * featuresPerLevel;
@@ -80,23 +85,22 @@ extern ""C"" __global__ __launch_bounds__(256) void instant_ngp_hash_encode_leve
     int f = gid - (int)entry * featuresPerLevel;
     float acc = 0.0f;
     for (int n = 0; n < numPoints; n++) {
-        float gx = instant_ngp_clamp_position(positions[n * 3]) * (float)resolution;
-        float gy = instant_ngp_clamp_position(positions[n * 3 + 1]) * (float)resolution;
-        float gz = instant_ngp_clamp_position(positions[n * 3 + 2]) * (float)resolution;
-        int x0 = (int)floorf(gx), y0 = (int)floorf(gy), z0 = (int)floorf(gz);
-        int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
-        float fx = gx - (float)x0, fy = gy - (float)y0, fz = gz - (float)z0;
-        float ix = 1.0f - fx, iy = 1.0f - fy, iz = 1.0f - fz;
         float grad = outputGradient[n * outputStride + levelOffset + f];
-        if (fabsf(grad) < 1.0e-10f) continue;
-        if (instant_ngp_hash(x0, y0, z0, tableSize) == entry) acc += grad * ix * iy * iz;
-        if (instant_ngp_hash(x0, y0, z1, tableSize) == entry) acc += grad * ix * iy * fz;
-        if (instant_ngp_hash(x0, y1, z0, tableSize) == entry) acc += grad * ix * fy * iz;
-        if (instant_ngp_hash(x0, y1, z1, tableSize) == entry) acc += grad * ix * fy * fz;
-        if (instant_ngp_hash(x1, y0, z0, tableSize) == entry) acc += grad * fx * iy * iz;
-        if (instant_ngp_hash(x1, y0, z1, tableSize) == entry) acc += grad * fx * iy * fz;
-        if (instant_ngp_hash(x1, y1, z0, tableSize) == entry) acc += grad * fx * fy * iz;
-        if (instant_ngp_hash(x1, y1, z1, tableSize) == entry) acc += grad * fx * fy * fz;
+        if (grad == 0.0f) continue;
+        unsigned int gx, gy, gz;
+        float fx, fy, fz;
+        instant_ngp_pos_fract(positions[n * 3], scale, positionOffset, &gx, &fx);
+        instant_ngp_pos_fract(positions[n * 3 + 1], scale, positionOffset, &gy, &fy);
+        instant_ngp_pos_fract(positions[n * 3 + 2], scale, positionOffset, &gz, &fz);
+        for (int c = 0; c < 8; c++) {
+            unsigned int index = instant_ngp_grid_index(
+                gx + (unsigned int)(c & 1), gy + (unsigned int)((c >> 1) & 1), gz + (unsigned int)((c >> 2) & 1),
+                gridResolution, tableSize);
+            if (index == entry) {
+                float w = ((c & 1) ? fx : 1.0f - fx) * ((c & 2) ? fy : 1.0f - fy) * ((c & 4) ? fz : 1.0f - fz);
+                acc += grad * w;
+            }
+        }
     }
     tableGradient[gid] = acc;
 }

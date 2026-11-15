@@ -14,8 +14,8 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
 
     public void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(numPoints * featuresPerLevel);
         if (total <= 0) return;
@@ -23,15 +23,16 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
         kernel.SetArg(0, InstantNgpHandle(positions));
         kernel.SetArg(1, InstantNgpHandle(hashTable));
         kernel.SetArg(2, InstantNgpHandle(output));
-        kernel.SetArg(3, numPoints); kernel.SetArg(4, resolution); kernel.SetArg(5, tableSize);
-        kernel.SetArg(6, featuresPerLevel); kernel.SetArg(7, levelOffset); kernel.SetArg(8, outputStride);
+        kernel.SetArg(3, numPoints); kernel.SetArg(4, scale); kernel.SetArg(5, positionOffset);
+        kernel.SetArg(6, gridResolution); kernel.SetArg(7, tableSize); kernel.SetArg(8, featuresPerLevel);
+        kernel.SetArg(9, levelOffset); kernel.SetArg(10, outputStride);
         kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 
     public void HashGridEncodeLevelBackward(
         IGpuBuffer positions, IGpuBuffer outputGradient, IGpuBuffer tableGradient,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(tableSize * featuresPerLevel);
         if (total <= 0) return;
@@ -39,8 +40,9 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
         kernel.SetArg(0, InstantNgpHandle(positions));
         kernel.SetArg(1, InstantNgpHandle(outputGradient));
         kernel.SetArg(2, InstantNgpHandle(tableGradient));
-        kernel.SetArg(3, numPoints); kernel.SetArg(4, resolution); kernel.SetArg(5, tableSize);
-        kernel.SetArg(6, featuresPerLevel); kernel.SetArg(7, levelOffset); kernel.SetArg(8, outputStride);
+        kernel.SetArg(3, numPoints); kernel.SetArg(4, scale); kernel.SetArg(5, positionOffset);
+        kernel.SetArg(6, gridResolution); kernel.SetArg(7, tableSize); kernel.SetArg(8, featuresPerLevel);
+        kernel.SetArg(9, levelOffset); kernel.SetArg(10, outputStride);
         kernel.Execute1D(total, CalculateOptimalWorkGroupSize1D(total));
     }
 

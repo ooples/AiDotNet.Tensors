@@ -6,14 +6,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
 /// Instant-NGP multiresolution hash-grid encoding, one level (issue #854), matching the NVRTC
-/// <c>instant_ngp_hash_encode_level</c> kernel: for each (point, feature), trilinearly interpolate the
-/// hashed feature at the 8 voxel corners of the clamped, scaled 3-D position. One thread owns one
-/// (point, feature) output and computes the 8 spatial-hash lookups and interpolation weights in
-/// registers — no shared memory, no reduction. Integer coordinates use <c>cvt.rmi.s32.f32</c> (floor),
-/// and the spatial hash uses the reference multiply/xor/mod.
+/// <c>instant_ngp_hash_encode_level</c> kernel and tiny-cuda-nn's GridEncoding: for each (point, feature),
+/// trilinearly interpolate the features at the 8 voxel corners of <c>fma(scale, clamp(pos), offset)</c>. One thread
+/// owns one (point, feature) output and computes the 8 corner indices and interpolation weights in registers — no
+/// shared memory, no reduction. Integer coordinates use <c>cvt.rmi.s32.f32</c> (floor). A level whose
+/// <c>gridResolution^3</c> vertices fit the table is indexed densely, any other through tiny-cuda-nn's
+/// coherent prime hash; the choice is made when the PTX is emitted.
 ///
-/// Shape (numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride) is baked into
-/// the PTX, so the launch takes buffer pointers only. 256 threads/block,
+/// Shape (numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride)
+/// is baked into the PTX, so the launch takes buffer pointers only. 256 threads/block,
 /// grid = (numPoints*featuresPerLevel)/256, required to divide evenly (no divergent bounds guard).
 /// </summary>
 internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
@@ -26,7 +27,9 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
     private readonly IntPtr _function;
 
     internal int NumPoints { get; }
-    internal int Resolution { get; }
+    internal float Scale { get; }
+    internal float PositionOffset { get; }
+    internal int GridResolution { get; }
     internal int TableSize { get; }
     internal int FeaturesPerLevel { get; }
     internal int LevelOffset { get; }
@@ -36,7 +39,7 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
     internal DirectPtxKernelAudit Audit { get; }
 
     internal PtxInstantNgpHashEncodeKernel(
-        DirectPtxRuntime runtime, int numPoints, int resolution, int tableSize,
+        DirectPtxRuntime runtime, int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
         int featuresPerLevel, int levelOffset, int outputStride)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
@@ -44,16 +47,18 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor))
             throw new PlatformNotSupportedException(
                 "The checked-in instant-ngp-hash-encode specialization is measured only on GA10x/SM86.");
-        ValidateShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
+        ValidateShape(numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride);
         NumPoints = numPoints;
-        Resolution = resolution;
+        Scale = scale;
+        PositionOffset = positionOffset;
+        GridResolution = gridResolution;
         TableSize = tableSize;
         FeaturesPerLevel = featuresPerLevel;
         LevelOffset = levelOffset;
         OutputStride = outputStride;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
+        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride);
         Ptx = EmitPtx(runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
-            numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
+            numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride);
         var loaded = DirectPtxResourceInitialization.Complete(
             runtime.LoadModule(Ptx), module => InitializeModule(runtime, module));
         _module = loaded.Resource;
@@ -91,24 +96,34 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
 
     public void Dispose() => _module.Dispose();
 
-
-    // Emits h = ((x*73856093) ^ (y*19349663) ^ (z*83492791)) % tableSize into %r14, using %r11..%r13.
-    private static void AppendHash(StringBuilder ptx, string xReg, string yReg, string zReg, int tableSize)
+    // Emits tiny-cuda-nn's grid_index of (x, y, z) into %r14, using %r12..%r13: the dense index
+    // ((z*R + y)*R + x) when the level fits the table, otherwise the coherent prime hash
+    // x ^ y*2654435761 ^ z*805459861 (0x9E3779B1, 0x30025795); wrapping u32, then mod tableSize.
+    internal static void AppendGridIndex(
+        StringBuilder ptx, string xReg, string yReg, string zReg, int gridResolution, int tableSize)
     {
-        ptx.AppendLine($"    mul.lo.u32 %r11, {xReg}, 73856093;");
-        ptx.AppendLine($"    mul.lo.u32 %r12, {yReg}, 19349663;");
-        ptx.AppendLine($"    mul.lo.u32 %r13, {zReg}, 83492791;");
-        ptx.AppendLine("    xor.b32 %r14, %r11, %r12;");
-        ptx.AppendLine("    xor.b32 %r14, %r14, %r13;");
+        if (InstantNGPOperations.UsesDenseHashGridIndex(gridResolution, tableSize))
+        {
+            ptx.AppendLine($"    mad.lo.u32 %r14, {zReg}, {gridResolution}, {yReg};");
+            ptx.AppendLine($"    mad.lo.u32 %r14, %r14, {gridResolution}, {xReg};");
+        }
+        else
+        {
+            ptx.AppendLine($"    mul.lo.u32 %r12, {yReg}, 0x9E3779B1;");
+            ptx.AppendLine($"    mul.lo.u32 %r13, {zReg}, 0x30025795;");
+            ptx.AppendLine($"    xor.b32 %r14, {xReg}, %r12;");
+            ptx.AppendLine("    xor.b32 %r14, %r14, %r13;");
+        }
         ptx.AppendLine($"    rem.u32 %r14, %r14, {tableSize};");
     }
 
-    // Emits: value += weightReg * hashTable[hash(coords)*featuresPerLevel + f]
+    // Emits: value += weightReg * hashTable[index(coords)*featuresPerLevel + f]
     private static void AppendCorner(
-        StringBuilder ptx, string xReg, string yReg, string zReg, string weightReg, int tableSize, int featuresPerLevel)
+        StringBuilder ptx, string xReg, string yReg, string zReg, string weightReg, int gridResolution, int tableSize,
+        int featuresPerLevel)
     {
-        AppendHash(ptx, xReg, yReg, zReg, tableSize);
-        ptx.AppendLine($"    mad.lo.u32 %r15, %r14, {featuresPerLevel}, %r4;");   // hash*fpl + f
+        AppendGridIndex(ptx, xReg, yReg, zReg, gridResolution, tableSize);
+        ptx.AppendLine($"    mad.lo.u32 %r15, %r14, {featuresPerLevel}, %r4;");   // index*fpl + f
         ptx.AppendLine("    mul.wide.u32 %rd10, %r15, 4;");
         ptx.AppendLine("    add.u64 %rd11, %rd1, %rd10;");
         ptx.AppendLine("    ld.global.nc.f32 %f17, [%rd11];");
@@ -116,17 +131,19 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
     }
 
     internal static string EmitPtx(
-        int ccMajor, int ccMinor, int numPoints, int resolution, int tableSize,
+        int ccMajor, int ccMinor, int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
         int featuresPerLevel, int levelOffset, int outputStride)
     {
-        ValidateShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride);
-        string res = DirectPtxPtxText.Hex(resolution), clampHi = DirectPtxPtxText.Hex(0.999999f);
+        ValidateShape(numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride);
+        string sc = DirectPtxPtxText.Hex(scale), off = DirectPtxPtxText.Hex(positionOffset);
+        string clampHi = DirectPtxPtxText.Hex(InstantNGPOperations.PositionClampMax);
         const string one = "0f3F800000", zero = "0f00000000";
+        bool dense = InstantNGPOperations.UsesDenseHashGridIndex(gridResolution, tableSize);
 
         var ptx = new StringBuilder(6_000);
         PtxIsa.AppendVersionAndTarget(ptx, ccMajor, ccMinor);
         ptx.AppendLine(".address_size 64");
-        ptx.AppendLine($"// instant-ngp-hash-encode points={numPoints} res={resolution} table={tableSize} fpl={featuresPerLevel} loff={levelOffset} ostride={outputStride}");
+        ptx.AppendLine($"// instant-ngp-hash-encode points={numPoints} scale={sc} offset={off} res={gridResolution} {(dense ? "dense" : "hashed")} table={tableSize} fpl={featuresPerLevel} loff={levelOffset} ostride={outputStride}");
         ptx.AppendLine();
         ptx.AppendLine($".visible .entry {EntryPoint}(");
         ptx.AppendLine("    .param .u64 pos_ptr,");
@@ -153,12 +170,12 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd4+4];");
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd4+8];");
-        // clamp each to [0, 0.999999] then scale by resolution
+        // clamp each to [0, 0.999999] (max first, so NaN becomes 0), then pos = fma(scale, x, offset)
         foreach ((string src, string g) in new[] { ("%f0", "%f3"), ("%f1", "%f4"), ("%f2", "%f5") })
         {
-            ptx.AppendLine($"    min.f32 {src}, {src}, {clampHi};");
             ptx.AppendLine($"    max.f32 {src}, {src}, {zero};");
-            ptx.AppendLine($"    mul.rn.f32 {g}, {src}, {res};");
+            ptx.AppendLine($"    min.f32 {src}, {src}, {clampHi};");
+            ptx.AppendLine($"    fma.rn.f32 {g}, {sc}, {src}, {off};");
         }
         // x0/x1, fx, ix (and y, z). floor via cvt.rmi.s32.f32.
         // coords: x0=%r6 x1=%r7 ; y0=%r8 y1=%r9 ; z0=%r16 z1=%r17
@@ -173,14 +190,14 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         ptx.AppendLine("    mul.rn.f32 %f15, %f6, %f7;");
         ptx.AppendLine($"    mov.f32 %f16, {zero};");                     // value
         // 8 corners: (x,y,z) with weight = xy_product * (iz|fz).  %f18/%f19 hold corner weights.
-        ptx.AppendLine("    mul.rn.f32 %f18, %f12, %f11;"); AppendCorner(ptx, "%r6", "%r8", "%r16", "%f18", tableSize, featuresPerLevel);  // 000 ix iy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f12, %f8;");  AppendCorner(ptx, "%r6", "%r8", "%r17", "%f19", tableSize, featuresPerLevel);  // 001 ix iy fz
-        ptx.AppendLine("    mul.rn.f32 %f18, %f13, %f11;"); AppendCorner(ptx, "%r6", "%r9", "%r16", "%f18", tableSize, featuresPerLevel);  // 010 ix fy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f13, %f8;");  AppendCorner(ptx, "%r6", "%r9", "%r17", "%f19", tableSize, featuresPerLevel);  // 011 ix fy fz
-        ptx.AppendLine("    mul.rn.f32 %f18, %f14, %f11;"); AppendCorner(ptx, "%r7", "%r8", "%r16", "%f18", tableSize, featuresPerLevel);  // 100 fx iy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f14, %f8;");  AppendCorner(ptx, "%r7", "%r8", "%r17", "%f19", tableSize, featuresPerLevel);  // 101 fx iy fz
-        ptx.AppendLine("    mul.rn.f32 %f18, %f15, %f11;"); AppendCorner(ptx, "%r7", "%r9", "%r16", "%f18", tableSize, featuresPerLevel);  // 110 fx fy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f15, %f8;");  AppendCorner(ptx, "%r7", "%r9", "%r17", "%f19", tableSize, featuresPerLevel);  // 111 fx fy fz
+        ptx.AppendLine("    mul.rn.f32 %f18, %f12, %f11;"); AppendCorner(ptx, "%r6", "%r8", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 000 ix iy iz
+        ptx.AppendLine("    mul.rn.f32 %f19, %f12, %f8;");  AppendCorner(ptx, "%r6", "%r8", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 001 ix iy fz
+        ptx.AppendLine("    mul.rn.f32 %f18, %f13, %f11;"); AppendCorner(ptx, "%r6", "%r9", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 010 ix fy iz
+        ptx.AppendLine("    mul.rn.f32 %f19, %f13, %f8;");  AppendCorner(ptx, "%r6", "%r9", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 011 ix fy fz
+        ptx.AppendLine("    mul.rn.f32 %f18, %f14, %f11;"); AppendCorner(ptx, "%r7", "%r8", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 100 fx iy iz
+        ptx.AppendLine("    mul.rn.f32 %f19, %f14, %f8;");  AppendCorner(ptx, "%r7", "%r8", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 101 fx iy fz
+        ptx.AppendLine("    mul.rn.f32 %f18, %f15, %f11;"); AppendCorner(ptx, "%r7", "%r9", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 110 fx fy iz
+        ptx.AppendLine("    mul.rn.f32 %f19, %f15, %f8;");  AppendCorner(ptx, "%r7", "%r9", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 111 fx fy fz
         // output[n*outputStride + levelOffset + f]
         ptx.AppendLine($"    mad.lo.u32 %r18, %r3, {outputStride}, %r4;");
         ptx.AppendLine($"    add.u32 %r18, %r18, {levelOffset};");
@@ -192,8 +209,8 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         return ptx.ToString();
     }
 
-    // For a scaled coordinate g: c0 = floor(g), c1 = c0+1, frac = g - c0, inv = 1 - frac.
-    private static void EmitAxis(StringBuilder ptx, string gReg, string c0Reg, string c1Reg, string fracReg, string invReg, string one)
+    // For a grid coordinate g: c0 = floor(g), c1 = c0+1, frac = g - c0, inv = 1 - frac.
+    internal static void EmitAxis(StringBuilder ptx, string gReg, string c0Reg, string c1Reg, string fracReg, string invReg, string one)
     {
         ptx.AppendLine($"    cvt.rmi.s32.f32 {c0Reg}, {gReg};");       // floor
         ptx.AppendLine($"    add.s32 {c1Reg}, {c0Reg}, 1;");
@@ -203,17 +220,17 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
     }
 
     private static DirectPtxKernelBlueprint CreateBlueprint(
-        DirectPtxArchitectureFamily architecture, int numPoints, int resolution, int tableSize,
-        int featuresPerLevel, int levelOffset, int outputStride)
+        DirectPtxArchitectureFamily architecture, int numPoints, float scale, float positionOffset, int gridResolution,
+        int tableSize, int featuresPerLevel, int levelOffset, int outputStride)
     {
         var posExtent = new DirectPtxExtent(numPoints * 3);
         var tblExtent = new DirectPtxExtent(tableSize * featuresPerLevel);
         var outExtent = new DirectPtxExtent(numPoints * outputStride);
         return new DirectPtxKernelBlueprint(
             Operation: "instant-ngp-hash-encode",
-            Version: 1,
+            Version: 2,
             Architecture: architecture,
-            Variant: $"fp32-p{numPoints}-r{resolution}-t{tableSize}-f{featuresPerLevel}-lo{levelOffset}-os{outputStride}",
+            Variant: $"fp32-p{numPoints}-s{DirectPtxPtxText.Hex(scale)}-o{DirectPtxPtxText.Hex(positionOffset)}-r{gridResolution}-t{tableSize}-f{featuresPerLevel}-lo{levelOffset}-os{outputStride}",
             Tensors:
             [
                 new("positions", DirectPtxPhysicalType.Float32, DirectPtxPhysicalLayout.Vector,
@@ -230,30 +247,43 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "output[n, levelOffset+f] = trilinear over 8 hashed corners of clamp01(pos)*resolution",
-                ["hash"] = "((x*73856093)^(y*19349663)^(z*83492791)) mod tableSize",
+                ["formula"] = "output[n, levelOffset+f] = trilinear over the 8 corners of fma(scale, clamp(pos, 0, 0.999999), offset)",
+                ["index"] = InstantNGPOperations.UsesDenseHashGridIndex(gridResolution, tableSize)
+                    ? "(x + y*R + z*R*R) mod tableSize, dense (tiny-cuda-nn grid_index)"
+                    : "(x ^ y*2654435761 ^ z*805459861) mod tableSize (tiny-cuda-nn coherent_prime_hash)",
                 ["global-intermediates"] = "none",
                 ["temporary-device-allocation"] = "none",
                 ["stride-parameters"] = "levelOffset/outputStride baked (constant, not runtime)"
             });
     }
 
-    internal static bool IsSupportedShape(int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride)
+    internal static bool IsSupportedShape(
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize, int featuresPerLevel,
+        int levelOffset, int outputStride)
     {
-        if (numPoints <= 0 || resolution <= 0 || tableSize <= 0 || featuresPerLevel <= 0) return false;
+        if (numPoints <= 0 || gridResolution <= 0 || tableSize <= 0 || featuresPerLevel <= 0) return false;
+        if (!IsSupportedGrid(scale, positionOffset)) return false;
         if (levelOffset < 0 || outputStride <= 0 || levelOffset + featuresPerLevel > outputStride) return false;
         long cells = (long)numPoints * featuresPerLevel;
         return cells > 0 && cells % BlockThreads == 0 && cells <= MaxCells;
     }
 
-    internal static bool IsPromotedShape(int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride) => false;
+    // The grid coordinate fma(scale, x, offset) of x in [0, 1) must stay a non-negative int.
+    internal static bool IsSupportedGrid(float scale, float positionOffset) =>
+        scale >= 0f && scale <= InstantNGPOperations.MaxGridScale && positionOffset >= 0f && positionOffset < 1f;
 
-    private static void ValidateShape(int numPoints, int resolution, int tableSize, int featuresPerLevel, int levelOffset, int outputStride)
+    internal static bool IsPromotedShape(
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize, int featuresPerLevel,
+        int levelOffset, int outputStride) => false;
+
+    private static void ValidateShape(
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize, int featuresPerLevel,
+        int levelOffset, int outputStride)
     {
-        if (!IsSupportedShape(numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride))
+        if (!IsSupportedShape(numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride))
             throw new ArgumentOutOfRangeException(
                 nameof(numPoints),
-                $"Instant-NGP hash encode requires positive dims, levelOffset+featuresPerLevel<=outputStride, and (numPoints*featuresPerLevel) a multiple of {BlockThreads} up to {MaxCells}.");
+                $"Instant-NGP hash encode requires positive dims, a scale in [0, {InstantNGPOperations.MaxGridScale}], an offset in [0, 1), levelOffset+featuresPerLevel<=outputStride, and (numPoints*featuresPerLevel) a multiple of {BlockThreads} up to {MaxCells}.");
     }
 
 }

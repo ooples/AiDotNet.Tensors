@@ -6,7 +6,9 @@ public static class WebGpuInstantNgpKernels
     private const string Common = @"
 struct P {
     numPoints: i32,
-    resolution: i32,
+    scale: f32,
+    positionOffset: f32,
+    gridResolution: i32,
     tableSize: i32,
     featuresPerLevel: i32,
     levelOffset: i32,
@@ -14,17 +16,36 @@ struct P {
 };
 @group(0) @binding(3) var<uniform> p : P;
 
-fn instant_ngp_hash(x: i32, y: i32, z: i32) -> u32 {
-    let hx = bitcast<u32>(x) * 73856093u;
-    let hy = bitcast<u32>(y) * 19349663u;
-    let hz = bitcast<u32>(z) * 83492791u;
-    return (hx ^ hy ^ hz) % u32(p.tableSize);
+// tiny-cuda-nn grid_index (common_device.h) for three dimensions: dense when the level's
+// gridResolution^3 vertices fit the table (gridResolution <= MAX_BASES[3] = 0x659), otherwise
+// coherent_prime_hash (factors 1, 2654435761, 805459861); wrapping u32, mod tableSize.
+fn instant_ngp_grid_index(x: u32, y: u32, z: u32) -> u32 {
+    let r = u32(p.gridResolution);
+    let stride = select(0xFFFFFFFFu, r * r * r, p.gridResolution <= 0x659);
+    let hashed = x ^ (y * 2654435761u) ^ (z * 805459861u);
+    let dense = x + y * r + z * r * r;
+    let index = select(dense, hashed, u32(p.tableSize) < stride);
+    return index % u32(p.tableSize);
 }
 
 fn instant_ngp_clamp_position(value: f32) -> f32 {
-    if (value <= 0.0) { return 0.0; }
+    if (!(value > 0.0)) { return 0.0; }
     if (value >= 0.999999) { return 0.999999; }
     return value;
+}
+
+// tiny-cuda-nn pos_fract: pos = fma(scale, x, offset); the cell is floor(pos), the fraction pos - floor(pos).
+fn instant_ngp_grid_position(value: f32) -> f32 {
+    return fma(p.scale, instant_ngp_clamp_position(value), p.positionOffset);
+}
+
+fn instant_ngp_weight(c: i32, fx: f32, fy: f32, fz: f32) -> f32 {
+    return select(1.0 - fx, fx, (c & 1) != 0) * select(1.0 - fy, fy, (c & 2) != 0) * select(1.0 - fz, fz, (c & 4) != 0);
+}
+
+fn instant_ngp_corner_index(c: i32, g: vec3<u32>) -> u32 {
+    return instant_ngp_grid_index(
+        g.x + u32(c & 1), g.y + u32((c >> 1u) & 1), g.z + u32((c >> 2u) & 1));
 }
 ";
 
@@ -39,30 +60,18 @@ fn instant_ngp_clamp_position(value: f32) -> f32 {
     if (gid >= total) { return; }
     let n = gid / p.featuresPerLevel;
     let f = gid - n * p.featuresPerLevel;
-    let gx = instant_ngp_clamp_position(positions[n * 3]) * f32(p.resolution);
-    let gy = instant_ngp_clamp_position(positions[n * 3 + 1]) * f32(p.resolution);
-    let gz = instant_ngp_clamp_position(positions[n * 3 + 2]) * f32(p.resolution);
-    let x0 = i32(floor(gx)); let y0 = i32(floor(gy)); let z0 = i32(floor(gz));
-    let x1 = x0 + 1; let y1 = y0 + 1; let z1 = z0 + 1;
-    let fx = gx - f32(x0); let fy = gy - f32(y0); let fz = gz - f32(z0);
-    let ix = 1.0 - fx; let iy = 1.0 - fy; let iz = 1.0 - fz;
-    let h000 = i32(instant_ngp_hash(x0, y0, z0));
-    let h001 = i32(instant_ngp_hash(x0, y0, z1));
-    let h010 = i32(instant_ngp_hash(x0, y1, z0));
-    let h011 = i32(instant_ngp_hash(x0, y1, z1));
-    let h100 = i32(instant_ngp_hash(x1, y0, z0));
-    let h101 = i32(instant_ngp_hash(x1, y0, z1));
-    let h110 = i32(instant_ngp_hash(x1, y1, z0));
-    let h111 = i32(instant_ngp_hash(x1, y1, z1));
-    let value =
-        ix * iy * iz * hashTable[h000 * p.featuresPerLevel + f] +
-        ix * iy * fz * hashTable[h001 * p.featuresPerLevel + f] +
-        ix * fy * iz * hashTable[h010 * p.featuresPerLevel + f] +
-        ix * fy * fz * hashTable[h011 * p.featuresPerLevel + f] +
-        fx * iy * iz * hashTable[h100 * p.featuresPerLevel + f] +
-        fx * iy * fz * hashTable[h101 * p.featuresPerLevel + f] +
-        fx * fy * iz * hashTable[h110 * p.featuresPerLevel + f] +
-        fx * fy * fz * hashTable[h111 * p.featuresPerLevel + f];
+    let pos = vec3<f32>(
+        instant_ngp_grid_position(positions[n * 3]),
+        instant_ngp_grid_position(positions[n * 3 + 1]),
+        instant_ngp_grid_position(positions[n * 3 + 2]));
+    let cellf = floor(pos);
+    let g = vec3<u32>(vec3<i32>(cellf));
+    let fr = pos - cellf;
+    var value = 0.0;
+    for (var c = 0; c < 8; c = c + 1) {
+        let index = instant_ngp_corner_index(c, g);
+        value = value + instant_ngp_weight(c, fr.x, fr.y, fr.z) * hashTable[index * u32(p.featuresPerLevel) + u32(f)];
+    }
     output_[n * p.outputStride + p.levelOffset + f] = value;
 }
 ";
@@ -80,23 +89,20 @@ fn instant_ngp_clamp_position(value: f32) -> f32 {
     let f = gid - i32(entry) * p.featuresPerLevel;
     var acc = 0.0;
     for (var n = 0; n < p.numPoints; n = n + 1) {
-        let gx = instant_ngp_clamp_position(positions[n * 3]) * f32(p.resolution);
-        let gy = instant_ngp_clamp_position(positions[n * 3 + 1]) * f32(p.resolution);
-        let gz = instant_ngp_clamp_position(positions[n * 3 + 2]) * f32(p.resolution);
-        let x0 = i32(floor(gx)); let y0 = i32(floor(gy)); let z0 = i32(floor(gz));
-        let x1 = x0 + 1; let y1 = y0 + 1; let z1 = z0 + 1;
-        let fx = gx - f32(x0); let fy = gy - f32(y0); let fz = gz - f32(z0);
-        let ix = 1.0 - fx; let iy = 1.0 - fy; let iz = 1.0 - fz;
         let grad = outputGradient[n * p.outputStride + p.levelOffset + f];
-        if (abs(grad) < 1.0e-10) { continue; }
-        if (instant_ngp_hash(x0, y0, z0) == entry) { acc = acc + grad * ix * iy * iz; }
-        if (instant_ngp_hash(x0, y0, z1) == entry) { acc = acc + grad * ix * iy * fz; }
-        if (instant_ngp_hash(x0, y1, z0) == entry) { acc = acc + grad * ix * fy * iz; }
-        if (instant_ngp_hash(x0, y1, z1) == entry) { acc = acc + grad * ix * fy * fz; }
-        if (instant_ngp_hash(x1, y0, z0) == entry) { acc = acc + grad * fx * iy * iz; }
-        if (instant_ngp_hash(x1, y0, z1) == entry) { acc = acc + grad * fx * iy * fz; }
-        if (instant_ngp_hash(x1, y1, z0) == entry) { acc = acc + grad * fx * fy * iz; }
-        if (instant_ngp_hash(x1, y1, z1) == entry) { acc = acc + grad * fx * fy * fz; }
+        if (grad == 0.0) { continue; }
+        let pos = vec3<f32>(
+            instant_ngp_grid_position(positions[n * 3]),
+            instant_ngp_grid_position(positions[n * 3 + 1]),
+            instant_ngp_grid_position(positions[n * 3 + 2]));
+        let cellf = floor(pos);
+        let g = vec3<u32>(vec3<i32>(cellf));
+        let fr = pos - cellf;
+        for (var c = 0; c < 8; c = c + 1) {
+            if (instant_ngp_corner_index(c, g) == entry) {
+                acc = acc + grad * instant_ngp_weight(c, fr.x, fr.y, fr.z);
+            }
+        }
     }
     tableGradient[gid] = acc;
 }
