@@ -224,8 +224,10 @@ public partial class DifferentiableOpsGradCheckSweep
         [
             new Tensor<double>(new[] { 0.17, 0.31, 0.43, 0.61, 0.79, 0.83 }, new[] { 2, 3 }),
             new[] { SafeTensor([16, 2], r), SafeTensor([16, 2], r) },
-            new[] { 4, 8 },
-            2
+            4,
+            2.0,
+            2,
+            HashGridAlignment.TinyCudaNn
         ];
         cases["NativeBatchedCavityForward"] = r => [SafeTensor([1, 8], r), ComplexFilterBank(2, 8, r), 1];
         cases["NativeMfccFeatures"] = r => [SafeTensor([1, 32], r), 2, 4, 16];

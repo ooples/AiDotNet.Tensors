@@ -431,10 +431,10 @@ internal static class DirectPtxScientificHeadToHead
             () => AdcCase(backend, random, 1024, 4096, 16, 256),
             () => FloatCase(backend, "CudaBackend.HashGridEncodeLevel", "hash-grid encode 1M cells",
                 [P((Count / 2) * 3), V(1 << 18)], [Count],
-                static (b, i, o) => b.HashGridEncodeLevel(i[0], i[1], o[0], Count / 2, 64, 1 << 17, 2, 0, 2), 32L * Count),
+                static (b, i, o) => b.HashGridEncodeLevel(i[0], i[1], o[0], Count / 2, 63f, 0.5f, 64, 1 << 17, 2, 0, 2), 32L * Count),
             () => FloatCase(backend, "CudaBackend.HashGridEncodeLevelBackward", "hash-grid backward 4096x4096x2",
                 [P(4096 * 3), V(4096 * 2)], [4096 * 2],
-                static (b, i, o) => b.HashGridEncodeLevelBackward(i[0], i[1], o[0], 4096, 64, 4096, 2, 0, 2), 4096L * 4096),
+                static (b, i, o) => b.HashGridEncodeLevelBackward(i[0], i[1], o[0], 4096, 63f, 0.5f, 64, 4096, 2, 0, 2), 4096L * 4096),
             () => MeshCase(backend, random, 1024, 256)
         };
         return cases;

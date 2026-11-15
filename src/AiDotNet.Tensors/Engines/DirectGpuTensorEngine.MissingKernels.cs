@@ -110,26 +110,23 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> MultiresolutionHashEncoding<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
-        int featuresPerLevel)
+        int baseResolution,
+        double perLevelScale,
+        int featuresPerLevel,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn)
     {
         using var __gpuOp = EnterGpuOp();
-        ValidateHashEncodingArguments(positions, hashTables, resolutions, featuresPerLevel);
+        InstantNGPOperations.ValidateHashEncodingArguments(positions, hashTables, featuresPerLevel);
+        var levels = InstantNGPOperations.ComputeHashGridLevels(
+            hashTables.Length, baseResolution, perLevelScale, alignment);
         if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive ||
             positions.Length == 0 || !TryGetBackend(out var backend) ||
             backend is not IInstantNgpBackend instantNgp)
             return base.MultiresolutionHashEncoding(
-                positions, hashTables, resolutions, featuresPerLevel);
+                positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, alignment);
 
         int numPoints = positions._shape[0];
         int totalFeatures = checked(hashTables.Length * featuresPerLevel);
-        for (int level = 0; level < hashTables.Length; level++)
-        {
-            int tableSize = hashTables[level]._shape[0];
-            if (tableSize <= 0 || hashTables[level].Length < checked(tableSize * featuresPerLevel))
-                return base.MultiresolutionHashEncoding(
-                    positions, hashTables, resolutions, featuresPerLevel);
-        }
 
         using var positionBuffer = GetOrAllocateBuffer(backend, positions);
         var tableBuffers = new OwnedBuffer[hashTables.Length];
@@ -152,7 +149,9 @@ public partial class DirectGpuTensorEngine
                             tableBuffers[level].Buffer,
                             output,
                             numPoints,
-                            resolutions[level],
+                            levels[level].Scale,
+                            levels[level].PositionOffset,
+                            levels[level].GridResolution,
                             hashTables[level]._shape[0],
                             featuresPerLevel,
                             level * featuresPerLevel,
@@ -171,13 +170,17 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T>[] MultiresolutionHashEncodingBackward<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
+        int baseResolution,
+        double perLevelScale,
         int featuresPerLevel,
-        Tensor<T> outputGradient)
+        Tensor<T> outputGradient,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn)
     {
         using var __gpuOp = EnterGpuOp();
-        ValidateHashEncodingArguments(positions, hashTables, resolutions, featuresPerLevel);
+        InstantNGPOperations.ValidateHashEncodingArguments(positions, hashTables, featuresPerLevel);
         if (outputGradient is null) throw new ArgumentNullException(nameof(outputGradient));
+        var levels = InstantNGPOperations.ComputeHashGridLevels(
+            hashTables.Length, baseResolution, perLevelScale, alignment);
         int numPoints = positions._shape[0];
         int totalFeatures = checked(hashTables.Length * featuresPerLevel);
         if (outputGradient.Length != checked(numPoints * totalFeatures))
@@ -187,15 +190,7 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || positions.Length == 0 ||
             !TryGetBackend(out var backend) || backend is not IInstantNgpBackend instantNgp)
             return base.MultiresolutionHashEncodingBackward(
-                positions, hashTables, resolutions, featuresPerLevel, outputGradient);
-
-        for (int level = 0; level < hashTables.Length; level++)
-        {
-            int tableSize = hashTables[level]._shape[0];
-            if (tableSize <= 0 || hashTables[level].Length < checked(tableSize * featuresPerLevel))
-                return base.MultiresolutionHashEncodingBackward(
-                    positions, hashTables, resolutions, featuresPerLevel, outputGradient);
-        }
+                positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, outputGradient, alignment);
 
         using var positionBuffer = GetOrAllocateBuffer(backend, positions);
         using var gradientBuffer = GetOrAllocateBuffer(backend, outputGradient);
@@ -215,7 +210,9 @@ public partial class DirectGpuTensorEngine
                             gradientBuffer.Buffer,
                             tableGradient,
                             numPoints,
-                            resolutions[capturedLevel],
+                            levels[capturedLevel].Scale,
+                            levels[capturedLevel].PositionOffset,
+                            levels[capturedLevel].GridResolution,
                             tableSize,
                             featuresPerLevel,
                             capturedLevel * featuresPerLevel,
@@ -230,26 +227,6 @@ public partial class DirectGpuTensorEngine
                 result?.Dispose();
             throw;
         }
-    }
-
-    private static void ValidateHashEncodingArguments<T>(
-        Tensor<T> positions,
-        Tensor<T>[] hashTables,
-        int[] resolutions,
-        int featuresPerLevel)
-    {
-        if (positions is null) throw new ArgumentNullException(nameof(positions));
-        if (hashTables is null) throw new ArgumentNullException(nameof(hashTables));
-        if (resolutions is null) throw new ArgumentNullException(nameof(resolutions));
-        if (positions.Rank != 2 || positions._shape[1] != 3)
-            throw new ArgumentException("Positions must be [N, 3].", nameof(positions));
-        if (hashTables.Length != resolutions.Length)
-            throw new ArgumentException("Hash tables and resolutions count mismatch.");
-        if (featuresPerLevel <= 0)
-            throw new ArgumentOutOfRangeException(nameof(featuresPerLevel));
-        for (int level = 0; level < hashTables.Length; level++)
-            if (hashTables[level] is null)
-                throw new ArgumentException($"Hash table {level} is null.", nameof(hashTables));
     }
 
     Tensor<T> IEngine.TensorCTCLoss<T>(

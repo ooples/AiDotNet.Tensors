@@ -8443,9 +8443,11 @@ public partial interface IEngine
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="positions">Input positions [N, 3] normalized to [0, 1].</param>
-    /// <param name="hashTables">List of hash tables, one per resolution level.</param>
-    /// <param name="resolutions">Resolution at each level.</param>
+    /// <param name="hashTables">One table [T_l, featuresPerLevel] per level, coarsest first.</param>
+    /// <param name="baseResolution">N_min, the coarsest level's resolution (tiny-cuda-nn's base_resolution).</param>
+    /// <param name="perLevelScale">b, the growth factor between levels (tiny-cuda-nn's per_level_scale), at least 1.</param>
     /// <param name="featuresPerLevel">Number of features stored per hash entry.</param>
+    /// <param name="alignment">How each level's grid is placed over the unit cube; tiny-cuda-nn's by default.</param>
     /// <returns>Encoded features [N, numLevels * featuresPerLevel].</returns>
     /// <remarks>
     /// <para>
@@ -8460,14 +8462,17 @@ public partial interface IEngine
     /// </para>
     /// <para>
     /// Reference: "Instant Neural Graphics Primitives with a Multiresolution Hash Encoding"
-    /// by MÃƒÂ¼ller et al., ACM Transactions on Graphics 2022
+    /// by Müller et al., ACM Transactions on Graphics 2022. The grid, the dense coarse levels and the coherent prime
+    /// hash match tiny-cuda-nn's GridEncoding on every backend; see <see cref="HashGridAlignment"/>.
     /// </para>
     /// </remarks>
     Tensor<T> MultiresolutionHashEncoding<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
-        int featuresPerLevel);
+        int baseResolution,
+        double perLevelScale,
+        int featuresPerLevel,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn);
 
     /// <summary>
     /// Computes the backward pass for multiresolution hash encoding.
@@ -8476,16 +8481,20 @@ public partial interface IEngine
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="positions">Input positions from forward pass.</param>
     /// <param name="hashTables">Hash tables from forward pass.</param>
-    /// <param name="resolutions">Resolutions from forward pass.</param>
+    /// <param name="baseResolution">Base resolution from forward pass.</param>
+    /// <param name="perLevelScale">Per-level scale from forward pass.</param>
     /// <param name="featuresPerLevel">Features per level from forward pass.</param>
     /// <param name="outputGradient">Gradient with respect to encoded features.</param>
+    /// <param name="alignment">Grid alignment from forward pass.</param>
     /// <returns>Gradients for each hash table.</returns>
     Tensor<T>[] MultiresolutionHashEncodingBackward<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
+        int baseResolution,
+        double perLevelScale,
         int featuresPerLevel,
-        Tensor<T> outputGradient);
+        Tensor<T> outputGradient,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn);
 
     /// <summary>
     /// Updates occupancy grid for efficient ray sampling in Instant-NGP.

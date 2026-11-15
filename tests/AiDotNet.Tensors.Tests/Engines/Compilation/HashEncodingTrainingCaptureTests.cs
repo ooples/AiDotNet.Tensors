@@ -16,7 +16,8 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 public class HashEncodingTrainingCaptureTests
 {
     private const int Points = 37, Levels = 3, FeaturesPerLevel = 2, TableSize = 64;
-    private static readonly int[] Resolutions = { 4, 9, 17 };
+    private const int BaseResolution = 4;
+    private const double PerLevelScale = 2.0;
 
     private static Tensor<double> Positions(int seed)
     {
@@ -50,7 +51,7 @@ public class HashEncodingTrainingCaptureTests
             ICompiledTrainingPlan<double> plan;
             using (var scope = GraphMode.Enable())
             {
-                var features = engine.MultiresolutionHashEncoding(positions, tables, Resolutions, FeaturesPerLevel);
+                var features = engine.MultiresolutionHashEncoding(positions, tables, BaseResolution, PerLevelScale, FeaturesPerLevel);
                 engine.ReduceSum(engine.TensorMultiply(features, coef), null);
                 plan = scope.CompileTraining(tables);
             }
@@ -64,7 +65,7 @@ public class HashEncodingTrainingCaptureTests
                     plan.Step();
 
                     // d(sum(features * coef)) / dfeatures = coef, scattered into the tables by the encoding backward.
-                    var expected = engine.MultiresolutionHashEncodingBackward(positions, tables, Resolutions, FeaturesPerLevel, coef);
+                    var expected = engine.MultiresolutionHashEncodingBackward(positions, tables, BaseResolution, PerLevelScale, FeaturesPerLevel, coef);
                     bool anyNonZero = false;
                     for (int level = 0; level < Levels; level++)
                     {

@@ -15,41 +15,45 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRe
 
     public unsafe void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(numPoints * featuresPerLevel);
         if (total <= 0) return;
-        if (TryDirectPtxInstantNgpHashEncode(positions, hashTable, output, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
+        if (TryDirectPtxInstantNgpHashEncode(positions, hashTable, output, numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
         var kernel = ResolveInstantNgpKernel("instant_ngp_hash_encode_level");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr p = positions.Handle, t = hashTable.Handle, o = output.Handle;
-        int np = numPoints, r = resolution, ts = tableSize, f = featuresPerLevel;
+        int np = numPoints, r = gridResolution, ts = tableSize, f = featuresPerLevel;
+        float sc = scale, po = positionOffset;
         int offset = levelOffset, stride = outputStride;
-        void** args = stackalloc void*[9];
+        void** args = stackalloc void*[11];
         args[0] = &p; args[1] = &t; args[2] = &o; args[3] = &np;
-        args[4] = &r; args[5] = &ts; args[6] = &f; args[7] = &offset; args[8] = &stride;
+        args[4] = &sc; args[5] = &po; args[6] = &r; args[7] = &ts; args[8] = &f;
+        args[9] = &offset; args[10] = &stride;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
     public unsafe void HashGridEncodeLevelBackward(
         IGpuBuffer positions, IGpuBuffer outputGradient, IGpuBuffer tableGradient,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(tableSize * featuresPerLevel);
         if (total <= 0) return;
-        if (TryDirectPtxInstantNgpHashEncodeBackward(positions, outputGradient, tableGradient, numPoints, resolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
+        if (TryDirectPtxInstantNgpHashEncodeBackward(positions, outputGradient, tableGradient, numPoints, scale, positionOffset, gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride)) return;
         var kernel = ResolveInstantNgpKernel("instant_ngp_hash_encode_level_backward");
         using var _ = PushContext();
         uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr p = positions.Handle, go = outputGradient.Handle, gt = tableGradient.Handle;
-        int np = numPoints, r = resolution, ts = tableSize, f = featuresPerLevel;
+        int np = numPoints, r = gridResolution, ts = tableSize, f = featuresPerLevel;
+        float sc = scale, po = positionOffset;
         int offset = levelOffset, stride = outputStride;
-        void** args = stackalloc void*[9];
+        void** args = stackalloc void*[11];
         args[0] = &p; args[1] = &go; args[2] = &gt; args[3] = &np;
-        args[4] = &r; args[5] = &ts; args[6] = &f; args[7] = &offset; args[8] = &stride;
+        args[4] = &sc; args[5] = &po; args[6] = &r; args[7] = &ts; args[8] = &f;
+        args[9] = &offset; args[10] = &stride;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

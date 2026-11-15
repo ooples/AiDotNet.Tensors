@@ -3,44 +3,45 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
+    // Matches struct P in WebGpuInstantNgpKernels: eight 4-byte fields, 32 bytes.
     private static float[] InstantNgpUniforms(
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride) =>
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride) =>
         [
             BitConverter.Int32BitsToSingle(numPoints),
-            BitConverter.Int32BitsToSingle(resolution),
+            scale,
+            positionOffset,
+            BitConverter.Int32BitsToSingle(gridResolution),
             BitConverter.Int32BitsToSingle(tableSize),
             BitConverter.Int32BitsToSingle(featuresPerLevel),
             BitConverter.Int32BitsToSingle(levelOffset),
             BitConverter.Int32BitsToSingle(outputStride),
-            0f,
-            0f,
         ];
 
     public void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(numPoints * featuresPerLevel);
         if (total <= 0) return;
         Dispatch3BufferAsync("InstantNgp:Forward", WebGpuInstantNgpKernels.Forward, "main",
             positions, hashTable, output,
-            InstantNgpUniforms(numPoints, resolution, tableSize, featuresPerLevel,
-                levelOffset, outputStride), total).GetAwaiter().GetResult();
+            InstantNgpUniforms(numPoints, scale, positionOffset, gridResolution, tableSize,
+                featuresPerLevel, levelOffset, outputStride), total).GetAwaiter().GetResult();
     }
 
     public void HashGridEncodeLevelBackward(
         IGpuBuffer positions, IGpuBuffer outputGradient, IGpuBuffer tableGradient,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride)
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride)
     {
         int total = checked(tableSize * featuresPerLevel);
         if (total <= 0) return;
         Dispatch3BufferAsync("InstantNgp:Backward", WebGpuInstantNgpKernels.Backward, "main",
             positions, outputGradient, tableGradient,
-            InstantNgpUniforms(numPoints, resolution, tableSize, featuresPerLevel,
-                levelOffset, outputStride), total).GetAwaiter().GetResult();
+            InstantNgpUniforms(numPoints, scale, positionOffset, gridResolution, tableSize,
+                featuresPerLevel, levelOffset, outputStride), total).GetAwaiter().GetResult();
     }
 
     public void UniqueConsecutive(
