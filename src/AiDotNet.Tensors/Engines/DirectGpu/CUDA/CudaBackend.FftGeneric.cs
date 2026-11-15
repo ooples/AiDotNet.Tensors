@@ -368,6 +368,13 @@ public sealed partial class CudaBackend : IGenericFftBackend
     internal IGpuBuffer AllocateStreamOrderedScratchBuffer(int size) => AllocateFftScratchBuffer(size);
 
     /// <summary>
+    /// <see cref="AllocateStreamOrderedScratchBuffer"/> without the zero fill, for scratch the next kernel writes in
+    /// full. Under a step capture a zero fill of arena scratch is a memset node replayed every step.
+    /// </summary>
+    internal IGpuBuffer AllocateStreamOrderedScratchBufferUninitialized(int size) =>
+        new DeferredFftScratchBuffer(this, AllocateBufferUninitialized(size));
+
+    /// <summary>
     /// Gives every temporary FFT allocation stream-safe RAII semantics. The normal async
     /// allocator releases in stream order; the legacy allocator records an event and keeps
     /// the buffer out of its reuse pool until all preceding FFT work has completed.

@@ -128,7 +128,8 @@ public sealed partial class CudaBackend : IFusedAttentionBackend, IFusedAttentio
         IntPtr kvKernel = FusedAttentionKernel($"fa_backward_kv_d{headDim}");
         IntPtr qKernel = FusedAttentionKernel($"fa_backward_q_d{headDim}");
         int rows = p.B * p.H * p.Sq;
-        using var delta = AllocateStreamOrderedScratchBuffer(Math.Max(1, rows));
+        // fa_backward_delta writes every row's delta before anything reads it (nothing reads it when rows is 0).
+        using var delta = AllocateStreamOrderedScratchBufferUninitialized(Math.Max(1, rows));
         using var _ = PushContext();
         var args0 = p;
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, po = o.Handle, pg = dO.Handle, pl = lse.Handle;

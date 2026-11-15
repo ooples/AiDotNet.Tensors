@@ -153,11 +153,10 @@ public sealed class TensorScope : IDisposable
 
         public void Dispose()
         {
+            if (Environment.CurrentManagedThreadId != _threadId) return;
             var suspended = System.Threading.Interlocked.Exchange(ref _suspended, null);
             if (suspended is null) return;
-            if (Environment.CurrentManagedThreadId != _threadId) return;
-            if (s_suspendedDepth > 0) s_suspendedDepth--;
-            if (suspended._disposed) return;
+            s_suspendedDepth--;
             if (s_current is null)
             {
                 s_current = suspended;
@@ -165,10 +164,9 @@ public sealed class TensorScope : IDisposable
             else
             {
                 var root = s_current;
-                while (root._outer is not null && !ReferenceEquals(root, suspended))
+                while (root._outer is not null)
                     root = root._outer;
-                if (!ReferenceEquals(root, suspended))
-                    root._outer = suspended;
+                root._outer = suspended;
             }
         }
     }
