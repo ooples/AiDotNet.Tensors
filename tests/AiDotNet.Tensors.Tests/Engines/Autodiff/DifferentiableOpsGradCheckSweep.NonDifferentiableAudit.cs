@@ -136,7 +136,10 @@ public partial class DifferentiableOpsGradCheckSweep
         ["BoxConvert"] = NoGradientReason.DomainSpecificPrimitive,
         ["ComputeGaussianCovariance"] = NoGradientReason.DomainSpecificPrimitive,
         ["EvaluateSphericalHarmonics"] = NoGradientReason.DomainSpecificPrimitive,
-        ["ImportanceSampling"] = NoGradientReason.DomainSpecificPrimitive,
+        // Stratified samples jittered by a generator seeded from Environment.TickCount: a random draw. Classed as a
+        // domain primitive, the audit's determinism check passed whenever its calls shared a tick, and whether the
+        // finite differences then saw a smooth dependence varied with the draw ("stale exemption" on some CI runs).
+        ["ImportanceSampling"] = NoGradientReason.RandomDraw,
         ["MultiresolutionHashEncoding"] = NoGradientReason.DomainSpecificPrimitive,
         ["PositionalEncoding"] = NoGradientReason.DomainSpecificPrimitive,
         ["ProjectGaussians3DTo2D"] = NoGradientReason.DomainSpecificPrimitive,
