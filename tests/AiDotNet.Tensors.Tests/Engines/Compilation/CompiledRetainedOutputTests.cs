@@ -210,6 +210,74 @@ public sealed class CompiledRetainedOutputTests : IDisposable
             }
     }
 
+    // The embedding gather a device step writes straight into its output (this file's original defect, on every device
+    // backend, not only under CUDA graph replay): read on some steps and not others, the declared rows must be the rows
+    // of that step's ids.
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Declared_embedding_rows_follow_each_steps_indices(bool gpu, bool floatIndices)
+    {
+        DirectGpuTensorEngine? device = null;
+        if (gpu)
+        {
+            try { device = new DirectGpuTensorEngine(); }
+            catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+            Skip.If(device is null || !device.IsGpuAvailable, "No direct GPU backend available.");
+        }
+        using (device)
+        {
+            IEngine engine = device is null ? new CpuEngine() : device;
+            AiDotNetEngine.Current = engine;
+            const int vocab = 32, width = 8, batch = 16;
+            var table = new Tensor<float>([vocab, width]);
+            var tableSpan = table.AsWritableSpan();
+            for (int i = 0; i < tableSpan.Length; i++) tableSpan[i] = i * 0.125f;
+            var hostTable = table.ToArray();
+            var weight = new Tensor<float>([width, 4]);
+            weight.AsWritableSpan().Fill(0.25f);
+            var ids = new Tensor<int>([batch]);
+            var floatIds = new Tensor<float>([batch]);
+            var parameters = new[] { table, weight };
+            if (gpu) foreach (var p in parameters) p.Gpu();
+            Tensor<float> rows;
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                rows = floatIndices
+                    ? engine.TensorEmbeddingLookupFromFloatIndices(table, floatIds)
+                    : engine.TensorEmbeddingLookup<float, int>(table, ids);
+                GradientRecording.RetainOutput(rows);
+                var hidden = engine.TensorMatMul(rows, weight);
+                engine.ReduceSum(engine.TensorMultiply(hidden, hidden), null);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                var rng = new Random(9);
+                for (int step = 0; step < 8; step++)
+                {
+                    var picked = new int[batch];
+                    for (int i = 0; i < batch; i++) picked[i] = rng.Next(vocab);
+                    picked.AsSpan().CopyTo(ids.AsWritableSpan());
+                    var floats = floatIds.AsWritableSpan();
+                    for (int i = 0; i < batch; i++) floats[i] = picked[i];
+                    ids.IncrementVersion();
+                    floatIds.IncrementVersion();
+                    plan.Step();
+                    if (step is 1 or 2 or 5) continue;   // unread steps: the next read must still be its own step's rows
+                    var actual = rows.ToArray();
+                    Assert.Equal(batch * width, actual.Length);
+                    for (int i = 0; i < batch; i++)
+                        for (int c = 0; c < width; c++)
+                            Assert.Equal(hostTable[picked[i] * width + c], actual[i * width + c]);
+                }
+            }
+        }
+    }
+
     [Fact]
     public void Declared_output_outside_the_loss_ancestry_is_recomputed_each_step()
     {
