@@ -125,7 +125,7 @@ public class MultiresolutionHashEncodingTinyCudaNnTests
     {
         // b = exp(ln(4096 / 32) / 7) evaluates to 1.9999999999999998, so N_min * b^l falls just below 64, 128, ...
         // 4096 in double; eq. 2's floor of the real product is the integer itself (N_{L-1} = N_max).
-        const double b = 1.9999999999999998;
+        double b = 1.9999999999999998;
         Assert.True(32 * b < 64);
         var level1 = InstantNGPOperations.ComputeHashGridLevel(1, 32, b, HashGridAlignment.Paper);
         Assert.Equal(64f, level1.Scale);
