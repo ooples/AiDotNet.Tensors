@@ -180,7 +180,7 @@ internal static class NchwcBatchNorm
     }
 
     // scale' = gamma / sqrt(var + eps) and bias' = beta - scale' * mean, computed in double as before.
-    private static void PackScaleBias(ReadOnlySpan<float> gamma, ReadOnlySpan<float> beta, ReadOnlySpan<float> mean,
+    internal static void PackScaleBias(ReadOnlySpan<float> gamma, ReadOnlySpan<float> beta, ReadOnlySpan<float> mean,
         ReadOnlySpan<float> variance, float epsilon, int C, float[] packedScale, float[] packedBias)
     {
         for (int c = 0; c < C; c++)

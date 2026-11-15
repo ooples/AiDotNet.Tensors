@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -57,11 +58,22 @@ internal static unsafe partial class DepthwiseConv3x3
 
     /// <summary>y [B, C, oH, oW] = depthwise 3x3 of x [B, C, H, W], w [C, 1, 3, 3].</summary>
     internal static void Forward(float[] x, float[] w, float[] y, int batch, int channels, int h, int wd, int stride)
+        => Forward(x, w, y, batch, channels, h, wd, stride, null, null, 0f, 0f);
+
+    /// <summary>
+    /// y = clamp(depthwise(x) * scale[c] + bias[c], low, high) per channel c in the same pass when
+    /// <paramref name="scale"/> is given (an inference batch norm and its ReLU/ReLU6 after a depthwise convolution), else
+    /// the plain product. The epilogue is <see cref="NchwcBatchNorm"/>'s: one fused multiply-add then the clamp with the
+    /// bound first, on the stored float product, so the result equals the depthwise convolution followed by that batch
+    /// norm bit for bit without writing and re-reading the intermediate activation.
+    /// </summary>
+    internal static void Forward(float[] x, float[] w, float[] y, int batch, int channels, int h, int wd, int stride,
+        float[]? scale, float[]? bias, float low, float high)
     {
 #if NET5_0_OR_GREATER
         if (stride == 1 ? UseChannelBlocksStride1Product(channels, wd) : UseChannelBlocks(channels, wd))
         {
-            ForwardChannelBlocks(x, w, y, batch, channels, h, wd, stride, flip: false);
+            ForwardChannelBlocks(x, w, y, batch, channels, h, wd, stride, flip: false, scale, bias, low, high);
             return;
         }
 #endif
@@ -80,10 +92,12 @@ internal static unsafe partial class DepthwiseConv3x3
                 new Span<float>(sp, planeLen * stride).Clear();
                 for (int p = t * group, end = Math.Min(planes, p + group); p < end; p++)
                 {
-                    float* wc = pw + (p % channels) * 9;
+                    int c = p % channels;
+                    float* wc = pw + c * 9;
                     for (int i = 0; i < 9; i++) k[i] = wc[i];
                     Pad(px + (long)p * h * wd, h, wd, stride, rowLen, sp);
-                    ConvPadded(sp, rowLen, planeLen, stride, k, py + (long)p * oH * oW, oH, oW);
+                    var epi = scale is null ? default : new Epilogue(scale[c], bias![c], low, high);
+                    ConvPadded(sp, rowLen, planeLen, stride, k, py + (long)p * oH * oW, oH, oW, epi);
                 }
             }
         }, deterministicSafe: true);
@@ -143,7 +157,7 @@ internal static unsafe partial class DepthwiseConv3x3
                             for (int ow = 0; ow < oW; ow++) dst[2 * ow] = row[ow];
                         }
                     }
-                    ConvPadded(sp, rowLen, planeLen, 1, k, pdx + (long)p * h * wd, h, wd);
+                    ConvPadded(sp, rowLen, planeLen, 1, k, pdx + (long)p * h * wd, h, wd, default);
                 }
             }
         }, deterministicSafe: true);
@@ -360,11 +374,12 @@ internal static unsafe partial class DepthwiseConv3x3
     }
 
     /// <summary>One plane's 3x3 product (kernel k) at the given stride from its padded scratch into y [oH, oW].</summary>
-    private static void ConvPadded(float* s, int rowLen, int planeLen, int stride, float* k, float* y, int oH, int oW)
+    private static void ConvPadded(float* s, int rowLen, int planeLen, int stride, float* k, float* y, int oH, int oW,
+        Epilogue epi)
     {
         if (stride == 1)
         {
-            Stride1FromPadded(s, rowLen, k, y, oH, oW);
+            Stride1FromPadded(s, rowLen, k, y, oH, oW, epi);
             return;
         }
         int vw = VW;
@@ -382,13 +397,13 @@ internal static unsafe partial class DepthwiseConv3x3
                 var acc = *(Vector<float>*)e0 * k0 + *(Vector<float>*)o0 * k1 + *(Vector<float>*)(e0 + 1) * k2
                     + *(Vector<float>*)e1 * k3 + *(Vector<float>*)o1 * k4 + *(Vector<float>*)(e1 + 1) * k5
                     + *(Vector<float>*)e2 * k6 + *(Vector<float>*)o2 * k7 + *(Vector<float>*)(e2 + 1) * k8;
-                Store(acc, yRow, ow, oW, tail);
+                Store(epi.Apply(acc), yRow, ow, oW, tail);
             }
         }
     }
 
     /// <summary>Stride-1 3x3 product over a zero-bordered plane P (row length rowLen) into y [oH, oW].</summary>
-    private static void Stride1FromPadded(float* p, int rowLen, float* k, float* y, int oH, int oW)
+    private static void Stride1FromPadded(float* p, int rowLen, float* k, float* y, int oH, int oW, Epilogue epi)
     {
         int vw = VW;
         float* tail = stackalloc float[vw];
@@ -403,8 +418,54 @@ internal static unsafe partial class DepthwiseConv3x3
                 var acc = *(Vector<float>*)(r0 + ow) * k0 + *(Vector<float>*)(r0 + ow + 1) * k1 + *(Vector<float>*)(r0 + ow + 2) * k2
                     + *(Vector<float>*)(r1 + ow) * k3 + *(Vector<float>*)(r1 + ow + 1) * k4 + *(Vector<float>*)(r1 + ow + 2) * k5
                     + *(Vector<float>*)(r2 + ow) * k6 + *(Vector<float>*)(r2 + ow + 1) * k7 + *(Vector<float>*)(r2 + ow + 2) * k8;
-                Store(acc, yRow, ow, oW, tail);
+                Store(epi.Apply(acc), yRow, ow, oW, tail);
             }
+        }
+    }
+
+    /// <summary>
+    /// One channel's batch-norm epilogue, clamp(v * Scale + Bias, Low, High), rounded as <see cref="NchwcBatchNorm"/>
+    /// rounds it: a fused multiply-add where FMA is available (the lanes of a vector one by one otherwise), and the
+    /// clamp with the bound first, so a NaN passes through. Default: no epilogue.
+    /// </summary>
+    private readonly struct Epilogue
+    {
+        private readonly float _scale, _bias, _low, _high;
+        private readonly bool _on;
+
+        internal Epilogue(float scale, float bias, float low, float high)
+        {
+            _scale = scale; _bias = bias; _low = low; _high = high; _on = true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Vector<float> Apply(Vector<float> v)
+        {
+            if (!_on) return v;
+#if NET5_0_OR_GREATER
+            if (Vector<float>.Count == 8 && Fma.IsSupported)
+            {
+                var r = Fma.MultiplyAdd(v.AsVector256(), Vector256.Create(_scale), Vector256.Create(_bias));
+                return Avx.Min(Vector256.Create(_high), Avx.Max(Vector256.Create(_low), r)).AsVector();
+            }
+#endif
+            var lanes = new float[Vector<float>.Count];
+            v.CopyTo(lanes);
+            for (int i = 0; i < lanes.Length; i++) lanes[i] = ApplyScalar(lanes[i]);
+            return new Vector<float>(lanes);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private float ApplyScalar(float x)
+        {
+#if NET5_0_OR_GREATER
+            float r = Fma.IsSupported ? MathF.FusedMultiplyAdd(x, _scale, _bias) : x * _scale + _bias;
+#else
+            float r = x * _scale + _bias;
+#endif
+            if (r < _low) r = _low;
+            if (r > _high) r = _high;
+            return r;
         }
     }
 

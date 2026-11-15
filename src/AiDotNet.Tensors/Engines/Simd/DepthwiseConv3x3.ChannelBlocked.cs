@@ -41,7 +41,7 @@ internal static unsafe partial class DepthwiseConv3x3
 
     /// <summary>Forward, or (flip) the stride-1 input gradient over dy, on blocks of eight channels.</summary>
     private static void ForwardChannelBlocks(float[] x, float[] w, float[] y, int batch, int channels, int h, int wd,
-        int stride, bool flip)
+        int stride, bool flip, float[]? scale = null, float[]? bias = null, float low = 0f, float high = 0f)
     {
         int oH = (h - 1) / stride + 1, oW = (wd - 1) / stride + 1;
         int blocks = channels / 8, units = batch * blocks;
@@ -52,7 +52,7 @@ internal static unsafe partial class DepthwiseConv3x3
             var tile = Tile(ref t_tile, tileLen);
             var outTile = Tile(ref t_tileOut, (oH * oW + h * wd) * 8 + 64);
             float* k = stackalloc float[72];
-            fixed (float* px = x, pw = w, py = y, tp = tile, op = outTile)
+            fixed (float* px = x, pw = w, py = y, tp = tile, op = outTile, ps = scale, pb = bias)
             {
                 new Span<float>(tp, tileLen).Clear();
                 for (int u = t * group, end = Math.Min(units, u + group); u < end; u++)
@@ -60,7 +60,8 @@ internal static unsafe partial class DepthwiseConv3x3
                     int b = u / blocks, c0 = (u % blocks) * 8;
                     LoadWeights(pw + c0 * 9, k, flip);
                     PackPadded(px + ((long)b * channels + c0) * h * wd, h, wd, tp, op + oH * oW * 8);
-                    ConvTile(tp, tw, stride, k, op, oH, oW);
+                    if (ps is null) ConvTile(tp, tw, stride, k, op, oH, oW);
+                    else ConvTileEpilogue(tp, tw, stride, k, op, oH, oW, ps + c0, pb + c0, low, high);
                     Unpack(op, oH * oW, py + ((long)b * channels + c0) * oH * oW);
                 }
             }
@@ -247,6 +248,37 @@ internal static unsafe partial class DepthwiseConv3x3
                 acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r2 + c + 8), k7));
                 acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r2 + c + 16), k8));
                 Avx.Store(orow + j * 8, acc);
+            }
+        }
+    }
+
+    /// <summary><see cref="ConvTile"/> with the eight channels' batch-norm epilogue, clamp(acc * scale + bias), applied as
+    /// <see cref="NchwcBatchNorm"/> applies it (FMA, then max with the low bound first and min with the high one).</summary>
+    private static void ConvTileEpilogue(float* tile, int tw, int stride, float* k, float* o, int oH, int oW,
+        float* scale, float* bias, float low, float high)
+    {
+        var k0 = Avx.LoadVector256(k); var k1 = Avx.LoadVector256(k + 8); var k2 = Avx.LoadVector256(k + 16);
+        var k3 = Avx.LoadVector256(k + 24); var k4 = Avx.LoadVector256(k + 32); var k5 = Avx.LoadVector256(k + 40);
+        var k6 = Avx.LoadVector256(k + 48); var k7 = Avx.LoadVector256(k + 56); var k8 = Avx.LoadVector256(k + 64);
+        var vs = Avx.LoadVector256(scale); var vb = Avx.LoadVector256(bias);
+        var vLow = Vector256.Create(low); var vHigh = Vector256.Create(high);
+        for (int i = 0; i < oH; i++)
+        {
+            float* r0 = tile + i * stride * tw * 8, r1 = r0 + tw * 8, r2 = r1 + tw * 8;
+            float* orow = o + i * oW * 8;
+            for (int j = 0; j < oW; j++)
+            {
+                int c = j * stride * 8;
+                var acc = Avx.Multiply(Avx.LoadVector256(r0 + c), k0);
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r0 + c + 8), k1));
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r0 + c + 16), k2));
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r1 + c), k3));
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r1 + c + 8), k4));
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r1 + c + 16), k5));
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r2 + c), k6));
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r2 + c + 8), k7));
+                acc = Avx.Add(acc, Avx.Multiply(Avx.LoadVector256(r2 + c + 16), k8));
+                Avx.Store(orow + j * 8, Avx.Min(vHigh, Avx.Max(vLow, Fma.MultiplyAdd(acc, vs, vb))));
             }
         }
     }

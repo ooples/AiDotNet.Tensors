@@ -3397,6 +3397,18 @@ public partial interface IEngine
     Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding);
 
     /// <summary>
+    /// An inference depthwise convolution followed by a batch norm with its running statistics and an activation:
+    /// <c>activation(batchnorm(depthwiseConv2D(input, kernel)))</c>, MobileNet's depthwise stage. The same values as
+    /// <see cref="DepthwiseConv2D{T}"/> then
+    /// <see cref="BatchNormInference{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, FusedActivationType)"/>,
+    /// which a backend may compute with the batch norm and activation applied as the convolution stores each output, so
+    /// the intermediate activation is never written. Under a gradient tape or graph capture it records the unfused ops.
+    /// </summary>
+    Tensor<T> DepthwiseConv2DBatchNorm<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding,
+        Tensor<T> gamma, Tensor<T> beta, Tensor<T> runningMean, Tensor<T> runningVariance, double epsilon,
+        FusedActivationType activation);
+
+    /// <summary>
     /// Computes the gradient of DepthwiseConv2D with respect to the input.
     /// </summary>
     Tensor<T> DepthwiseConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding);
