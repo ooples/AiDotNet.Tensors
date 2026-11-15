@@ -3123,6 +3123,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary><see cref="AsWritableSpan"/> without the escape mark, for leases (which keep this tensor alive).</summary>
     internal Span<T> AsWritableSpanUnmarked()
     {
+        // Engine code overwriting a traced value it just recorded (an eager result copied into the recorded output,
+        // as BatchNorm, GroupNorm and their statistics do) realizes that node as a write, not a host read by the
+        // objective: realize it with recording suspended so the training trace does not note it as one
+        // (LazyTensorScope.HostReadOp). The node realizes exactly as before; a probe still aborts on it.
+        if (LazySource is ILazyNode { IsRealized: false } && GraphMode.Current is { IsProbe: false })
+        {
+            using (GraphMode.SuspendRecording())
+                EnsureMaterialized();
+        }
         EnsureMaterialized();
         EnsureOwnedForWrite();
 
