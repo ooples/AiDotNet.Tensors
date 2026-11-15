@@ -24,10 +24,10 @@ public class MomentumLearningRateVelocityTests
     private static LrSchedule Schedule() => LrSchedule.Exponential(0.1, 0.7);
 
     // f(w) = sum(w^2): the gradient is 2w at the parameters before the step. Step k (1-based) runs at GetLr(k).
-    private static double[] Reference(bool lrInVelocity, float weightDecay = 0f)
+    private static double[] Reference(bool lrInVelocity, float weightDecay = 0f, float[]? start = null)
     {
         var schedule = Schedule();
-        var w = Array.ConvertAll(Init, x => (double)x);
+        var w = Array.ConvertAll(start ?? Init, x => (double)x);
         var v = new double[w.Length];
         for (int k = 1; k <= Steps; k++)
         {
@@ -104,6 +104,47 @@ public class MomentumLearningRateVelocityTests
         using var reader = new BinaryReader(stream);
         var restored = FusedOptimizerCheckpointSerializer.Read(reader);
         Assert.True(restored is not null && restored.Extras.VelocityIncludesLearningRate);
+    }
+
+    /// <summary>
+    /// Reconfiguring frees the optimizer's device state, which held the learning-rate-in-velocity scratch; the scratch
+    /// cache kept naming the freed buffer, so the reconfigured run scaled its gradients into released memory. After the
+    /// reconfigure the plan must train from fresh state exactly like the reference started from the same weights.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_plan_reconfigured_after_momentum_steps_trains_from_fresh_state()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend.");
+        var prevEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var hostWeight = new Tensor<float>((float[])Init.Clone(), new[] { Init.Length });
+            var weight = gpu.UploadToGpu(hostWeight, AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.Weight);
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                gpu.ReduceSum(gpu.TensorMultiply(weight, weight), null);
+                plan = scope.CompileTraining(new[] { weight });
+            }
+            float[] afterFirstRun;
+            using (plan)
+            {
+                var extras = new FusedOptimizerExtras { VelocityIncludesLearningRate = true };
+                plan.ConfigureOptimizer(OptimizerType.SGDMomentum, Schedule(), Mu, 0f, 0f, 0f, extras);
+                for (int k = 0; k < 3; k++) plan.Step();
+                afterFirstRun = weight.ToArray();
+                plan.ConfigureOptimizer(OptimizerType.SGDMomentum, Schedule(), Mu, 0f, 0f, 0f, extras);
+                for (int k = 0; k < Steps; k++) plan.Step();
+            }
+            double err = MaxAbs(weight.ToArray(), Reference(true, start: afterFirstRun));
+            Assert.True(err < 1e-4, $"reconfigured GPU plan vs reference max |diff| {err:E3}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prevEngine;
+        }
     }
 
     [Fact]

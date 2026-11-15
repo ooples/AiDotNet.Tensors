@@ -179,6 +179,12 @@ public static class AiDotNetEngine
     /// flag passed by the caller, the <c>AIDOTNET_QUIET</c> env var (forces silence), and
     /// the <see cref="Logger"/> callback (overrides Console destination).
     /// </summary>
+    /// <summary>
+    /// Emits an opt-in diagnostic line (the caller checked its own switch) through the same sink as the engine's
+    /// status lines: <see cref="Logger"/> when set, else the console, silenced by <c>AIDOTNET_QUIET</c>.
+    /// </summary>
+    internal static void LogDiagnostic(string message) => EmitLog(message, verbose: true);
+
     private static void EmitLog(string message, bool verbose)
     {
         if (!verbose) return;

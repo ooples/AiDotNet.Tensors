@@ -499,9 +499,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
 
@@ -3871,6 +3869,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ResolvePingPongClaims(force: false);
         lock (_stepSync)
         {
+            // An update captured into the step graph owns the device step count (the step I/O's applied count) and, for
+            // ping-pong SGD, may hold the current weights in the second buffer set. The update below runs the eager
+            // optimizer on the plan's own buffers and advances _optimizerStep: retire the captured graph first, which
+            // copies the current weights back and lands the device count, so this update starts from both and the next
+            // capture re-seeds from what it leaves.
+            if (_capturedOptimizer is not null) InvalidateCapturedStepGraph();
             UploadHostWrittenParameters();
             using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
             using var graphModeSuspension = GraphMode.SuspendRecording();
@@ -6214,6 +6218,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Dictionary<Engines.DirectGpu.IDirectGpuBackend, Engines.DirectGpu.IGpuBuffer> _lrVelocityScratch
         = new(ReferenceEqualityComparer<Engines.DirectGpu.IDirectGpuBackend>.Instance);
 
+    // Every path that frees the optimizer's device state goes through here: the scratch cache names a buffer in that list,
+    // and a cached entry left behind handed the next momentum update a released buffer to scale into.
+    private void DisposeGpuOptimizerBuffers()
+    {
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
+    }
+
     private Engines.DirectGpu.IGpuBuffer LearningRateVelocityScratch(Engines.DirectGpu.IDirectGpuBackend backend, int length)
     {
         if (_lrVelocityScratch.TryGetValue(backend, out var scratch) && scratch.Size >= length) return scratch;
@@ -6261,9 +6275,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // first bring them back to the shared buffers.
         ResolvePingPongClaims(force: true);
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // A captured step graph holds kernel nodes wired to the OLD optimizer state
@@ -7727,9 +7739,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
         // See ConfigureOptimizerFloat for the rationale.
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // Drop any captured step graph wired to the old optimizer state (see
@@ -8394,9 +8404,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
@@ -8609,9 +8617,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
@@ -8911,9 +8917,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Releases the configured fused optimizer so the plan steps without one, as before configuration.</summary>
     private void ClearFusedOptimizer()
     {
-        foreach (var buf in _gpuOptimizerBuffers)
-            buf.Dispose();
-        _gpuOptimizerBuffers.Clear();
+        DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _capturedOptimizerFactory = null;
@@ -10848,7 +10852,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return (result, pooled);
     }
     /// <summary>
-    /// AIDOTNET_GRAD_POOL_DIAG=1: why each gradient is or is not pooled, by count and bytes, on stderr. The unpooled ones
+    /// AIDOTNET_GRAD_POOL_DIAG=1: why each gradient is or is not pooled, by count and bytes, through the engine log
+    /// (<see cref="AiDotNetEngine.Logger"/>). The unpooled ones
     /// each hold an array (and on a GPU a device buffer) of their own for the plan's life.
     /// </summary>
     private static void TraceGradientPooling(List<int> tenants, List<int> capacity, List<Tensor<T>> allGrads,
@@ -10874,9 +10879,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Add(reason, grad.Length);
         }
         long pooledBytes = capacity.Sum(c => (long)c) * esz;
-        Console.Error.WriteLine($"[GRAD-POOL] {allGrads.Count} gradients; {capacity.Count} shared arrays hold the pooled ones in {pooledBytes / 1048576.0:F1} MB");
+        AiDotNetEngine.LogDiagnostic($"[GRAD-POOL] {allGrads.Count} gradients; {capacity.Count} shared arrays hold the pooled ones in {pooledBytes / 1048576.0:F1} MB");
         foreach (var entry in reasons)
-            Console.Error.WriteLine($"[GRAD-POOL]   {entry.Key}: {entry.Value.Count} gradients, {entry.Value.Bytes / 1048576.0:F1} MB");
+            AiDotNetEngine.LogDiagnostic($"[GRAD-POOL]   {entry.Key}: {entry.Value.Count} gradients, {entry.Value.Bytes / 1048576.0:F1} MB");
     }
 
     /// <summary>

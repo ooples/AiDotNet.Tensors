@@ -109,10 +109,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public long InputCopiesSkipped;   // replays' skipped input copies (unchanged inputs)
         public long ResidentCopiesSkipped;   // ... of device-resident inputs, on an unchanged version alone
         public bool ClobberedLossGradient;
+        public bool CapturedUpdateBeforeOutsideStep;   // the update ran in the step graph when the outside step came
+        public bool ParityGraphsBeforeOutsideStep;   // ... and two parity graphs alternated
         public bool ReleasedIntermediatePending;   // a forward intermediate held a download from a released buffer at retirement   // the loss gradient's device buffer was zeroed between replays
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool releasedIntermediateDownload = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool releasedIntermediateDownload = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false, int outsideAt = -1)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -228,6 +230,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 // Reference loss from the exact host batch and pre-step weights: a mismatch message then says whether the
                 // plan computed a wrong loss or reported one it never downloaded.
                 double reference = CpuLoss(x, y, parameters, composedMse);
+                if (s == outsideAt)
+                {
+                    run.CapturedUpdateBeforeOutsideStep = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete) is not null;
+                    run.ParityGraphsBeforeOutsideStep = concrete.ReplaysParityGraphs;
+                    losses[s] = ApplyOutsideStep(gpu, concrete, x, y, parameters, composedMse);
+                    states[s] = $"outside cpuRef={reference:G6}";
+                    continue;
+                }
                 var lossTensor = plan.Step();
                 if (releasedIntermediateDownload && s == Steps - 1)
                 {
@@ -284,6 +295,73 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             plan.Dispose();
             run.WeightsAfterDispose = parameters.Select(p => p.ToArray()).ToArray();
             return run;
+        }
+    }
+
+    // One step the plan does not replay: the eager tape's gradients of the same loss, handed to the plan's optimizer
+    // (TryApplyGradients), as AiDotNet does for an objective that reads its own forward on the host. Returns the loss.
+    private static double ApplyOutsideStep(DirectGpuTensorEngine gpu, CompiledTrainingPlan<float> plan, Tensor<float> x,
+        Tensor<float> y, Tensor<float>[] parameters, bool composedMse)
+    {
+        using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+        var h = gpu.FusedLinear(x, parameters[0], parameters[1], FusedActivationType.ReLU);
+        var pred = gpu.FusedLinear(h, parameters[2], parameters[3], FusedActivationType.None);
+        Tensor<float> loss;
+        if (composedMse)
+        {
+            var diff = gpu.TensorSubtract(pred, y);
+            loss = gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+        }
+        else
+        {
+            loss = gpu.TensorMSELoss(pred, y);
+        }
+        var gradients = tape.ComputeGradients(loss, parameters);
+        double value = loss.ToArray()[0];
+        Assert.True(plan.TryApplyGradients(gradients), "the plan has no optimizer to apply the outside step");
+        return value;
+    }
+
+    /// <summary>
+    /// A step the plan cannot replay, after it has replayed its captured update: the outside update must start from the
+    /// current weights and step count. The captured update kept both on the device (the weights in the second buffer set
+    /// after an odd number of ping-pong replays, the count in the step I/O), while the outside update ran the eager
+    /// optimizer on the plan's own buffers and its host step count: it updated stale weights the next replay ignored,
+    /// and the next resolve of the device count dropped its step (wrong Adam bias correction and schedule position).
+    /// The oracle is the same schedule with capture off.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(OptimizerType.SGD, 6)]
+    [InlineData(OptimizerType.SGD, 7)]
+    [InlineData(OptimizerType.Adam, 6)]
+    [InlineData(OptimizerType.Adam, 7)]
+    public void An_outside_step_after_captured_updates_continues_from_the_current_weights_and_step(
+        OptimizerType optimizer, int outsideAt)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var schedule = LrSchedule.Cosine(0.05, Steps, 1e-3);
+            var eager = Train(gpu, capture: false, schedule: schedule, optimizer: optimizer, outsideAt: outsideAt);
+            var captured = Train(gpu, capture: true, schedule: schedule, optimizer: optimizer, outsideAt: outsideAt);
+            Assert.True(captured.CapturedUpdateBeforeOutsideStep, "the update was not in the step graph before the outside step");
+            if (optimizer == OptimizerType.SGD && Environment.GetEnvironmentVariable("AIDOTNET_SGD_PINGPONG") != "0")
+                Assert.True(captured.ParityGraphsBeforeOutsideStep, "the ping-pong graphs were not alternating");
+            Assert.Equal(eager.OptimizerStep, captured.OptimizerStep);
+            Assert.Equal(Steps, captured.OptimizerStep);
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6} ({captured.StepStates[s]})");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
         }
     }
 
