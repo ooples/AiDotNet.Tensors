@@ -60,6 +60,15 @@ internal static class AutoRetainProbe
     // Keyed by value (ProducerKey / GraphSignature implement equality).
     private static readonly ConcurrentDictionary<object, byte> s_retained = new();
     private static readonly HashSet<object> s_probedGraphs = new();
+    // Probed graphs in the order they first ran, for the bound below.
+    private static readonly Queue<object> s_probeOrder = new();
+
+    /// <summary>
+    /// The most graph signatures remembered as probed. A run with variable sequence lengths or changing structure sees
+    /// a new signature per shape, each holding its producer keys; past the bound the oldest is forgotten, and that graph
+    /// simply probes again the next time it runs (a probe run frees nothing, so forgetting costs memory, never safety).
+    /// </summary>
+    internal const int MaxProbedGraphs = 1024;
     private static readonly ConditionalWeakTable<object, Probe> s_quarantined = new();
     private static readonly Dictionary<object, List<Quarantined>> s_windows = new();   // per graph signature
     private static readonly object s_lock = new();
@@ -76,6 +85,12 @@ internal static class AutoRetainProbe
 
     /// <summary>Producers retained so far (tests and diagnostics).</summary>
     internal static int RetainedCount => s_retained.Count;
+
+    /// <summary>Graph signatures remembered as probed (tests and diagnostics).</summary>
+    internal static int ProbedGraphCount
+    {
+        get { lock (s_lock) return s_probedGraphs.Count; }
+    }
 
     /// <summary>Graphs whose probe quarantine is still open (tests and diagnostics).</summary>
     internal static int OpenWindowCount
@@ -114,6 +129,11 @@ internal static class AutoRetainProbe
                 s_active = s_windows.Count != 0;
             }
             probe = s_probedGraphs.Add(graphSignature);
+            if (probe)
+            {
+                s_probeOrder.Enqueue(graphSignature);
+                while (s_probeOrder.Count > MaxProbedGraphs) s_probedGraphs.Remove(s_probeOrder.Dequeue());
+            }
         }
         if (closing is not null)
         {
@@ -202,6 +222,7 @@ internal static class AutoRetainProbe
             foreach (var window in s_windows.Values) Forget(window);
             s_windows.Clear();
             s_probedGraphs.Clear();
+            s_probeOrder.Clear();
             s_active = false;
         }
         s_retained.Clear();

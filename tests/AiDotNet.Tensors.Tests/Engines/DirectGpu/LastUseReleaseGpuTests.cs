@@ -324,6 +324,56 @@ public sealed class LastUseReleaseGpuTests
         if (read is not null) Assert.Equal(Sigmoid(xb.ToArray()), read, new FloatTolerance(1e-5f));
     }
 
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_quarantined_intermediate_kept_after_backward_survives_the_graphs_next_run(bool overwrite)
+    {
+        // On the probe run y is quarantined, not read. The caller then keeps it past the tape (Retain after backward),
+        // optionally writing a new value into it first (IEngine.TensorCopy reports no read). The graph's next run closed
+        // the window and the old entry freed y anyway: the kept tensor, or the caller's new value in it.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var host = Input(27);
+        var x = gpu.UploadToGpu(host, GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(28), GpuTensorRole.General);
+        var fresh = gpu.UploadToGpu(Input(29), GpuTensorRole.General);
+        Tensor<float> kept;
+        using (var tape = new GradientTape<float>(OptIn))
+        {
+            kept = gpu.Sigmoid(x);
+            tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(kept, w), null), new[] { x });
+            if (overwrite) gpu.TensorCopy(fresh, kept);
+            tape.Retain(kept);
+        }
+        Step(gpu, x, w, readAfterBackward: false, out _);   // the same graph's next run closes the probe window
+        var expected = overwrite ? Input(29).ToArray() : Sigmoid(host.ToArray());
+        Assert.Equal(expected, kept.ToArray(), new FloatTolerance(1e-5f));
+    }
+
+    [SkippableFact]
+    public void A_quarantined_intermediate_overwritten_after_backward_keeps_the_new_value_through_the_next_run()
+    {
+        // The write reports no read, so the entry stayed armed; the graph's next run (inside this tape's life) released
+        // the tensor that now holds the caller's value.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        AutoRetainProbe.ResetForTests();
+        var x = gpu.UploadToGpu(Input(30), GpuTensorRole.General);
+        var w = gpu.UploadToGpu(Input(31), GpuTensorRole.General);
+        var fresh = gpu.UploadToGpu(Input(32), GpuTensorRole.General);
+        float[]? read = null;
+        Step(gpu, x, w, readAfterBackward: false, out _, afterBackward: y =>
+        {
+            gpu.TensorCopy(fresh, y);
+            Step(gpu, x, w, readAfterBackward: false, out _);   // closes the probe window
+            read = y.ToArray();
+        });
+        Assert.NotNull(read);
+        if (read is not null) Assert.Equal(Input(32).ToArray(), read, new FloatTolerance(1e-6f));
+    }
+
     [SkippableFact]
     public void A_checkpoint_segments_parameter_gradient_survives_its_step_scope()
     {
@@ -336,7 +386,7 @@ public sealed class LastUseReleaseGpuTests
         var hostW = Input(26);
         (float[] Dx, float[] Dw) Run(IEngine engine, Tensor<float> x, Tensor<float> w)
         {
-            using var tape = new GradientTape<float>(engine is CpuEngine ? null : OptIn);
+            using var tape = new GradientTape<float>(engine.SupportsGpu ? OptIn : null);
             var stem = engine.Sigmoid(x);
             var segmentOut = GradientCheckpointing<float>.CheckpointSegments(
                 new Func<Tensor<float>, Tensor<float>>[] { t => engine.TensorMultiply(t, w), t => engine.Sigmoid(t) },

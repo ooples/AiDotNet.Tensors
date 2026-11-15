@@ -167,6 +167,17 @@ public sealed class AutoRetainProbeTests : IDisposable
     }
 
     [Fact]
+    public void Probe_history_is_bounded_and_a_forgotten_graph_probes_again()
+    {
+        // Every signature stayed remembered until ResetForTests: a run over many shapes grew the set without bound.
+        for (long g = 0; g < AutoRetainProbe.MaxProbedGraphs + 100; g++)
+            Assert.True(AutoRetainProbe.BeginRun(0x7000_0000L + g));
+        Assert.Equal(AutoRetainProbe.MaxProbedGraphs, AutoRetainProbe.ProbedGraphCount);
+        Assert.True(AutoRetainProbe.BeginRun(0x7000_0000L));    // the oldest was forgotten: it probes again
+        Assert.False(AutoRetainProbe.BeginRun(0x7000_0000L + AutoRetainProbe.MaxProbedGraphs + 99));   // a recent one does not
+    }
+
+    [Fact]
     public void A_storage_nothing_holds_drops_out_of_another_graphs_window()
     {
         AutoRetainProbe.BeginRun(GraphA);

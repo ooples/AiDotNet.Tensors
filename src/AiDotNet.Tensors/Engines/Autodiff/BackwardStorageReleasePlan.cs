@@ -415,8 +415,24 @@ internal sealed class BackwardStorageReleasePlan<T>
                 var tensor = candidate.Tensor;
                 var note = candidate.Note;
                 var weak = new WeakReference<Tensor<T>>(tensor);   // the quarantine must not keep it alive
+                // The value quarantined, not whatever the tensor holds when the window closes: a write after backward
+                // (IEngine.TensorCopy into it) reports no read, yet the tensor then holds the caller's new value, which
+                // the old entry must not free.
+                var storage = tensor.StorageIdentity;
+                int version = tensor.Version, deviceVersion = tensor.GpuCacheVersion;
                 AutoRetainProbe.Quarantine(_signature, tensor.DataVector, tensor.GetBackingArrayForCacheLookupUnsafe(),
-                    candidate.Key, () => { if (weak.TryGetTarget(out var held)) engine.ReleaseDeadActivation(held, note); });
+                    candidate.Key, () =>
+                    {
+                        if (!weak.TryGetTarget(out var held)) return;
+                        if (!ReferenceEquals(held.StorageIdentity, storage) || held.Version != version
+                            || held.GpuCacheVersion != deviceVersion)
+                            return;
+                        // Retained after its backward (GradientTape.Retain): the tape's dispose kept it, so must this.
+                        if (Helpers.HostSync.IsRetained(held.DataVector)
+                            || (held.GetBackingArrayForCacheLookupUnsafe() is { } heldArray && Helpers.HostSync.IsRetained(heldArray)))
+                            return;
+                        engine.ReleaseDeadActivation(held, note);
+                    });
                 continue;
             }
             engine.ReleaseDeadActivation(candidate.Tensor, candidate.Note);
