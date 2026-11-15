@@ -836,8 +836,8 @@ extern ""C"" __global__ __launch_bounds__(256) void softplus_backward(const floa
 // f(x) = 0 if x <= -3
 // f(x) = x if x >= 3
 // f(x) = x * (x + 3) / 6 otherwise
-// f'(x) = 0 if x <= -3
-// f'(x) = 1 if x >= 3
+// f'(x) = 0 if x < -3
+// f'(x) = 1 if x > 3
 // f'(x) = (2x + 3) / 6 otherwise
 extern ""C"" __global__ __launch_bounds__(256) void hardswish_backward(const float* gradOutput, const float* input, float* gradInput, int size)
 {

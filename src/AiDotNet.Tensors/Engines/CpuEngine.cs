@@ -39071,7 +39071,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // copy of the output first. Writing the output's host array in place left its device copy
                         // from the previous step looking current, so on a GPU engine every consumer kept reading the
                         // first step's embeddings (measured: an int-id compiled plan diverged from the CPU at step 2).
-                        var gathered = new Tensor<TValue>(output._shape);
+                        var gathered = eng.Is<DirectGpuTensorEngine>() ? new Tensor<TValue>(output._shape) : output;
                         using var outDataLocalLease = gathered.LeaseArray();
                         var outDataLocal = outDataLocalLease.Array;
                         for (int i = 0; i < n; i++)
@@ -39086,7 +39086,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             int dstOff = i * capturedDim;
                             Array.Copy(embDataLocal, srcOff, outDataLocal, dstOff, capturedDim);
                         }
-                        DirectGpuTensorEngine.CopyResultInto(eng, gathered, output);
+                        if (!ReferenceEquals(gathered, output)) DirectGpuTensorEngine.CopyResultInto(eng, gathered, output);
                     },
                     BackwardFunctions<TValue>.TensorEmbeddingLookupBackward,
                     new object[] { idxSnap, idxShapeSnap, capturedVocab, capturedDim, capturedIndices });

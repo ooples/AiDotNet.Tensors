@@ -14,6 +14,14 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class CompletedStepLrScheduleTests
 {
+    [Fact]
+    public void Large_steps_preserve_hold_and_constant_restart_periods()
+    {
+        Assert.Equal(1.0, LrSchedule.NoamHoldAnnealing(1.0, 1500000000, 1500000000, 0.5).GetLr(2000000000));
+        var restarts = LrSchedule.CosineWarmRestarts(0.1, 2);
+        Assert.Equal(restarts.GetLr(1), restarts.GetLr(int.MaxValue));
+    }
+
     public static IEnumerable<object[]> Schedules()
     {
         yield return new object[] { "wsd", LrSchedule.WarmupStableDecay(3e-4, 10, 50, 30, StableDecayShape.OneMinusSqrt, 1e-5) };
@@ -61,9 +69,9 @@ public class CompletedStepLrScheduleTests
         var a = LrSchedule.Polynomial(1.0, 10);
         var b = LrSchedule.MultiStep(0.5, new[] { 2 }, 0.1);
         var s = LrSchedule.Sequential(new[] { a, b }, new[] { 4 });
-        // Steps 1-5 = 0-4 completed: schedule a. Step 6 = 5 completed, the first step of b after its start: b step 2.
-        for (int step = 1; step <= 5; step++) Assert.Equal(a.GetLr(step), s.GetLr(step));
-        for (int step = 6; step <= 20; step++) Assert.Equal(b.GetLr(step - 4), s.GetLr(step));
+        // After four completed steps, schedule b begins at its own step one.
+        for (int step = 1; step <= 4; step++) Assert.Equal(a.GetLr(step), s.GetLr(step));
+        for (int step = 5; step <= 20; step++) Assert.Equal(b.GetLr(step - 4), s.GetLr(step));
     }
 
     [Fact]
@@ -196,11 +204,11 @@ public class CompletedStepLrScheduleTests
     }
 
     [Fact]
-    public void Sequential_MatchesTheEagerSequentialScheduler_StepForStep()
+    public void Sequential_UsesEveryChildStartingAtItsFirstStep()
     {
-        // Transcription of AiDotNet's SequentialLRScheduler driven per batch: the optimizer reads CurrentLearningRate,
-        // then calls Step(), which advances the step, switches child while step > milestone, and steps the active child.
-        // A completed-step child holds GetLr(k + 1) after k of its own steps.
+        // Advance the child that just supplied a rate, then switch at the completed-step milestone.
+        // The newly selected child has completed no steps and supplies its first rate next.
+        // This deliberately corrects the older eager scheduler's delayed transition; it is not a parity claim for it.
         var children = new[] { LrSchedule.Polynomial(1.0, 10), LrSchedule.MultiStep(0.5, new[] { 2 }, 0.1), LrSchedule.CosineAnnealing(0.2, 5) };
         int[] milestones = { 4, 9 };
         var fused = LrSchedule.Sequential(children, milestones);
@@ -213,8 +221,8 @@ public class CompletedStepLrScheduleTests
             Assert.True(BitConverter.DoubleToInt64Bits(rate) == BitConverter.DoubleToInt64Bits(fused.GetLr(step)),
                 $"step {step}: eager {rate:R}, fused {fused.GetLr(step):R}");
             current++;
-            while (index < milestones.Length && current > milestones[index]) index++;
             childSteps[index]++;
+            while (index < milestones.Length && current >= milestones[index]) index++;
             rate = children[index].GetLr(childSteps[index] + 1);
         }
     }

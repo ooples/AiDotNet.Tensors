@@ -84,8 +84,25 @@ internal enum StreamingReleaseOutcome
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource, IBackingArraySource
+public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource, IBackingArraySource, ISignatureTensor
 {
+    Type ISignatureTensor.ElementType => typeof(T);
+    int[] ISignatureTensor.SignatureShape => _shape;
+    int[] ISignatureTensor.SignatureStrides => _strides;
+    int ISignatureTensor.SignatureOffset => _storageOffset;
+    bool ISignatureTensor.SignatureIsContiguous => IsContiguous;
+    object ISignatureTensor.SignatureStorageIdentity => _storage;
+
+    void ISignatureTensor.CopyLeafFrom(ISignatureTensor source)
+    {
+        if (source is not TensorBase<T> typed)
+            throw new ArgumentException($"A {typeof(T).Name} leaf cannot be rebound from a {source.ElementType.Name} tensor.", nameof(source));
+        if (typed.Length != Length)
+            throw new ArgumentException($"Leaf length {Length} cannot be rebound from a tensor of length {typed.Length}.", nameof(source));
+        typed.AsSpan().CopyTo(AsWritableSpan());
+        IncrementVersion();
+    }
+
     private bool _disposed;
 
     /// <summary>
@@ -2327,6 +2344,32 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         Lifetime = WeightLifetime.Deferred;
     }
 
+    /// <summary>
+    /// Gives a shape-only probe tensor the layout of a view (strides, offset): a reshape, narrow, transpose or other
+    /// view of a probe value is itself a probe value with no storage, but downstream ops still see whether it is
+    /// contiguous, exactly as they would in the trace the plan was compiled from.
+    /// </summary>
+    private protected void SetProbeViewLayout(int[] strides, int storageOffset)
+    {
+        _strides = (int[])strides.Clone();
+        _storageOffset = storageOffset;
+        IsView = true;
+        IsContiguous = CheckContiguous(_shape, _strides);
+        _probeView = true;
+    }
+
+    // A view of a probe value (SetProbeViewLayout): never materializable, whatever its LazySource.
+    private bool _probeView;
+
+    /// <summary>
+    /// Marks a shape-only tensor as a probe value an op produced outside a recorded node (a side output such as
+    /// LayerNorm's mean): reading it aborts the probe like reading any recorded probe value.
+    /// </summary>
+    private protected void MarkProbeStandIn() => _probeView = true;
+
+    /// <summary>Whether this is a probe stand-in (<see cref="SetProbeViewLayout"/>, <see cref="MarkProbeStandIn"/>).</summary>
+    private protected bool IsProbeView => _probeView;
+
     /// <summary>Fill to run when deferred storage is first created; cleared once applied.</summary>
     private Action<TensorBase<T>>? _deferredInitializer;
 
@@ -2378,6 +2421,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     private void MaterializeDeferredStorage()
     {
+        // A probe output is a shape-only stand-in for a value the probe never computes. An op that reaches for
+        // its storage directly (bypassing the lazy-realization check) would otherwise read zeros and execute
+        // eagerly against them, so the probe aborts exactly as a realization would.
+        if (GraphMode.IsProbe && LazySource is ILazyNode probeNode && !probeNode.IsRealized)
+            throw new ObjectiveProbeAbortedException(probeNode.OpName);
+        if (_probeView && GraphMode.IsProbe)
+            throw new ObjectiveProbeAbortedException(LazySource?.OpName ?? "view");
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         lock (System.Threading.LazyInitializer.EnsureInitialized(ref _deferredLock)!)
         {
@@ -3073,6 +3123,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary><see cref="AsWritableSpan"/> without the escape mark, for leases (which keep this tensor alive).</summary>
     internal Span<T> AsWritableSpanUnmarked()
     {
+        // Engine code overwriting a traced value it just recorded (an eager result copied into the recorded output,
+        // as BatchNorm, GroupNorm and their statistics do) realizes that node as a write, not a host read by the
+        // objective: realize it with recording suspended so the training trace does not note it as one
+        // (LazyTensorScope.HostReadOp). The node realizes exactly as before; a probe still aborts on it.
+        if (LazySource is ILazyNode { IsRealized: false } && GraphMode.Current is { IsProbe: false })
+        {
+            using (GraphMode.SuspendRecording())
+                EnsureMaterialized();
+        }
         EnsureMaterialized();
         EnsureOwnedForWrite();
 

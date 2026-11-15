@@ -35,10 +35,14 @@ public partial class CpuEngine
         var batchShape = new int[Math.Max(1, input.Rank - normDims)];
         if (input.Rank - normDims == 0) batchShape[0] = 1;
         else for (int i = 0; i < batchShape.Length; i++) batchShape[i] = input._shape[i];
-        var meanT = new Tensor<float>(batchShape);
-        var varT = new Tensor<float>(batchShape);
-        var meanArr = meanT.GetCpuBackingForContiguousWrite(out _)!;
-        var varArr = varT.GetCpuBackingForContiguousWrite(out _)!;
+        // A probe trace never computes: the mean and variance are shape-only probe values, and the node's statistics
+        // buffers have metadata only.
+        bool probe = GraphMode.IsProbe;
+        var meanT = probe ? Tensor<float>.CreateProbeStandIn(batchShape) : new Tensor<float>(batchShape);
+        var varT = probe ? Tensor<float>.CreateProbeStandIn(batchShape) : new Tensor<float>(batchShape);
+        var stats = probe
+            ? new LayerNormStats(rows)
+            : new LayerNormStats(meanT.GetCpuBackingForContiguousWrite(out _)!, varT.GetCpuBackingForContiguousWrite(out _)!);
         float eps = (float)epsilon;
         var shape = new LayerNormRowShape(rows, features, eps);
 
@@ -50,12 +54,12 @@ public partial class CpuEngine
             var b = beta.GetCpuBackingForStridedRead(out _)!;
             if (o is not null && oOff == 0)
             {
-                ProcessBatchesSimd(x, g, b, o, meanArr, varArr, rows, features, eps);
+                ProcessBatchesSimd(x, g, b, o, stats.Mean, stats.Variance, rows, features, eps);
             }
             else
             {
                 var staged = new float[input.Length];
-                ProcessBatchesSimd(x, g, b, staged, meanArr, varArr, rows, features, eps);
+                ProcessBatchesSimd(x, g, b, staged, stats.Mean, stats.Variance, rows, features, eps);
                 staged.AsSpan().CopyTo(output.AsWritableSpan());
             }
             output.IncrementVersion();
@@ -75,16 +79,36 @@ public partial class CpuEngine
                     DirectGpuTensorEngine.CopyResultInto(eng, staged, output);
                 }
             },
-            LayerNormBackwardCompiledFloat, new object[] { meanArr, varArr, shape });
-        // Values at trace time too, as the generic node had: code between ops may read them.
-        Forward(result);
+            LayerNormBackwardCompiledFloat, new object[] { stats, shape });
+        // Values at trace time too, as the generic node had: code between ops may read them. Computed outside the
+        // trace, so reading the traced input here is the op's own work, not a host read by the objective.
+        if (!probe)
+            using (GraphMode.SuspendRecording())
+                Forward(result);
         mean = meanT;
         variance = varT;
         return result;
     }
 
+    // An unrealized traced value is checked from its layout alone: fetching its backing would compute it mid-trace.
     private static bool IsZeroOffsetContiguous(Tensor<float> t) =>
-        t.IsContiguous && t.GetCpuBackingForStridedRead(out int off) is not null && off == 0;
+        t.IsContiguous && (t.LazySource is { IsRealized: false }
+            ? t.StorageOffset == 0
+            : t.GetCpuBackingForStridedRead(out int off) is not null && off == 0);
+
+    /// <summary>
+    /// The per-row mean and variance a compiled LayerNorm node writes in its forward and reads in its backward: this
+    /// step's statistics, so a closure-objective signature compares only their size.
+    /// </summary>
+    internal sealed class LayerNormStats : ISignatureScratch
+    {
+        public LayerNormStats(float[] mean, float[] variance) { Mean = mean; Variance = variance; SignatureLength = mean.Length; }
+        internal LayerNormStats(int rows) { Mean = Variance = Array.Empty<float>(); SignatureLength = rows; }
+
+        public float[] Mean { get; }
+        public float[] Variance { get; }
+        public int SignatureLength { get; }
+    }
 
     internal sealed class LayerNormRowShape
     {
@@ -109,9 +133,10 @@ public partial class CpuEngine
         Tensor<float> gradOutput, Tensor<float>[] inputs, Tensor<float> output, object[] savedState, IEngine engine,
         Dictionary<Tensor<float>, Tensor<float>> grads)
     {
-        var meanArr = (float[])savedState[0];
-        var varArr = (float[])savedState[1];
-        var s = (LayerNormRowShape)savedState[2];
+        var stats = (LayerNormStats)savedState[0];
+        var meanArr = stats.Mean;
+        var varArr = stats.Variance;
+        var s = (LayerNormRowShape)savedState[1];
         Tensor<float> input = inputs[0], gamma = inputs[1], beta = inputs[2];
         bool needX = DifferentiableOps.IsGradientRequired(input);
         bool needG = DifferentiableOps.IsGradientRequired(gamma);

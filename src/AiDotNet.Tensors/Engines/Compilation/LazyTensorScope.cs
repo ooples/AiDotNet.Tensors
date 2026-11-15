@@ -23,13 +23,18 @@ internal sealed class LazyTensorScope : IDisposable
     private bool _disposed;
     private bool _realized;
     private readonly GraphTraceKind _traceKind;
+    private readonly bool _isProbe;
+
+    internal CompiledOpShapeCache CompiledOpShapes { get; set; } = new();
 
     internal LazyTensorScope(
         LazyTensorScope? parent,
-        GraphTraceKind traceKind = GraphTraceKind.Compatibility)
+        GraphTraceKind traceKind = GraphTraceKind.Compatibility,
+        bool isProbe = false)
     {
         _parent = parent;
         _traceKind = traceKind;
+        _isProbe = isProbe;
         // Default to AiDotNetEngine.Current; the first op recorded into the
         // scope will rebind via BindEngineIfUnset to the engine instance the
         // user actually invoked the op on. This matters because the global
@@ -79,6 +84,21 @@ internal sealed class LazyTensorScope : IDisposable
     internal GraphTraceKind TraceKind => _traceKind;
 
     /// <summary>
+    /// Whether this is a storage-free probe trace (<see cref="GraphMode.EnableProbe"/>): recorded outputs are
+    /// shape-only tensors and no node ever executes. Any realization aborts the probe with
+    /// <see cref="ObjectiveProbeAbortedException"/>.
+    /// </summary>
+    internal bool IsProbe => _isProbe;
+
+    /// <summary>
+    /// The output tensor for a recorded node. A probe gives a shape-only tensor whose storage is never created
+    /// (reading it realizes the node, which a probe forbids); every other trace rents uninitialized storage the
+    /// node's Execute will overwrite.
+    /// </summary>
+    private Tensor<TOut> RentOutput<TOut>(int[] outputShape)
+        => _isProbe ? Tensor<TOut>.CreateDeferred(outputShape) : TensorAllocator.RentUninitialized<TOut>(outputShape);
+
+    /// <summary>
     /// Records a unary operation as a lazy node. Returns a tensor whose data
     /// is not yet computed — it will be materialized during Realize().
     /// </summary>
@@ -92,7 +112,7 @@ internal sealed class LazyTensorScope : IDisposable
         object[]? savedState = null)
     {
         // Allocate output tensor with correct shape but uninitialized data
-        var output = TensorAllocator.RentUninitialized<T>(outputShape);
+        var output = RentOutput<T>(outputShape);
 
         var node = new LazyNode<T>(opType, opName, input, output, execute, backwardFn, savedState);
         output.LazySource = node;
@@ -111,7 +131,7 @@ internal sealed class LazyTensorScope : IDisposable
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
 
-        var output = TensorAllocator.RentUninitialized<TOut>(outputShape);
+        var output = RentOutput<TOut>(outputShape);
         var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute);
         output.LazySource = node;
         AddNode(node);
@@ -133,7 +153,7 @@ internal sealed class LazyTensorScope : IDisposable
         CrossTypeBackwardFunction<TIn, TOut> backwardFn,
         object[]? savedState = null)
     {
-        var output = TensorAllocator.RentUninitialized<TOut>(outputShape);
+        var output = RentOutput<TOut>(outputShape);
         var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute, backwardFn, savedState);
         output.LazySource = node;
         AddNode(node);
@@ -151,7 +171,7 @@ internal sealed class LazyTensorScope : IDisposable
         BackwardFunction<T>? backwardFn = null,
         object[]? savedState = null)
     {
-        var output = TensorAllocator.RentUninitialized<T>(outputShape);
+        var output = RentOutput<T>(outputShape);
 
         var node = new LazyNode<T>(opType, opName, input0, input1, output, execute, backwardFn, savedState);
         output.LazySource = node;
@@ -373,7 +393,7 @@ internal sealed class LazyTensorScope : IDisposable
         BackwardFunction<T>? backwardFn = null,
         object[]? savedState = null)
     {
-        var output = TensorAllocator.RentUninitialized<T>(outputShape);
+        var output = RentOutput<T>(outputShape);
 
         var node = new LazyNode<T>(opType, opName, inputs, output, execute, backwardFn, savedState);
         output.LazySource = node;
@@ -451,11 +471,27 @@ internal sealed class LazyTensorScope : IDisposable
     /// <summary>Gets all recorded nodes (for graph compiler).</summary>
     internal IReadOnlyList<ILazyNode> Nodes => _nodes;
 
+    /// <summary>
+    /// The first op that recorded a gradient-tape entry while this scope was the thread's trace (an op that ran eagerly,
+    /// or a custom backward recorded with DifferentiableOps.RecordUnary/RecordBinary/RecordIfActive), or null. The trace
+    /// holds no node for it, so a plan compiled from the trace cannot replay it; a closure objective that does this is
+    /// unsignable (<see cref="ClosureObjectiveGuard{T}"/>).
+    /// </summary>
+    internal string? TapeRecordedOp { get; set; }
+
+    /// <summary>
+    /// The first traced op whose output was computed while this training scope was still tracing (a host read such as
+    /// <c>ToArray()</c> of a traced value), or null. A probe of the same objective aborts at that read, so a closure
+    /// objective that does this is unsignable (<see cref="ClosureObjectiveGuard{T}"/>).
+    /// </summary>
+    internal string? HostReadOp { get; set; }
+
     // Process-wide, so record order also holds between nodes of nested or successive traces.
     private static long s_recordOrder;
 
     private void AddNode(ILazyNode node)
     {
+        if (node is ISignableLazyNode signable) signable.RecordedInProbe = IsProbe;
         // Acquire ownership before publishing the node. A composite is free to dispose a
         // temporary tensor immediately after its operation returns; the graph must therefore
         // hold an independent storage reference from the moment the node becomes visible.
@@ -545,6 +581,8 @@ internal sealed class LazyTensorScope : IDisposable
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters)
     {
         EnsureTrainingParametersPrepared(parameters);
+        // Signed before compilation, which may rewrite the node list (fusion, DCE).
+        ClosureObjectiveGuard<T>.OnCompileTraining(this, parameters, explicitLoss: null);
         return CompilePlan(
             () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null));
     }
@@ -556,6 +594,8 @@ internal sealed class LazyTensorScope : IDisposable
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters, Tensor<T> explicitLoss)
     {
         EnsureTrainingParametersPrepared(parameters);
+        // Signed before compilation, which may rewrite the node list (fusion, DCE).
+        ClosureObjectiveGuard<T>.OnCompileTraining(this, parameters, explicitLoss);
         return CompilePlan(
             () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss));
     }

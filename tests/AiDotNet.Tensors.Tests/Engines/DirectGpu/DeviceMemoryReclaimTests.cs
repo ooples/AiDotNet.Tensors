@@ -151,9 +151,9 @@ public sealed class DeviceMemoryReclaimTests
             Assert.True(DeviceMemoryReclaim.CollectionDue);
             // Past it, the step's dead results are collected now: a GPU step can drop gigabytes before its boundary.
             // The collection count proves this call collected; an unrelated GC could clear `dead` on its own.
-            int collectionsBefore = GC.CollectionCount(1);
+            long collectionsBefore = DeviceMemoryReclaim.RequestedCollectionsForTests;
             DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes - DeviceMemoryReclaim.CollectAfterDeviceBytes);
-            Assert.True(GC.CollectionCount(1) > collectionsBefore, "the in-tape threshold did not collect");
+            Assert.True(DeviceMemoryReclaim.RequestedCollectionsForTests > collectionsBefore, "the in-tape threshold did not collect");
             Assert.False(dead.IsAlive);
             // What the tape still holds survived that collection, so the boundary sweep stays requested.
             Assert.True(DeviceMemoryReclaim.CollectionDue);
@@ -175,7 +175,7 @@ public sealed class DeviceMemoryReclaimTests
         try
         {
             DeviceMemoryReclaim.ResetCountsForTests();
-            int collectionsBefore = GC.CollectionCount(1);
+            long collectionsBefore = DeviceMemoryReclaim.RequestedCollectionsForTests;
             long epoch;
             using (DeviceMemoryReclaim.EnterScopedScratch())
             {
@@ -184,7 +184,7 @@ public sealed class DeviceMemoryReclaimTests
             }
             Assert.False(DeviceMemoryReclaim.InScopedScratch);
             Assert.Equal(-1, epoch);
-            Assert.Equal(collectionsBefore, GC.CollectionCount(1));
+            Assert.Equal(collectionsBefore, DeviceMemoryReclaim.RequestedCollectionsForTests);
             Assert.False(DeviceMemoryReclaim.CollectionDue);
             Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
             // Outside the scope the same allocation is charged as before.
@@ -367,9 +367,9 @@ public sealed class DeviceMemoryReclaimTests
             using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
             {
                 weakHeld = RecordHeldEntry(tape, x);
-                int collectionsBefore = GC.CollectionCount(1);
+                long collectionsBefore = DeviceMemoryReclaim.RequestedCollectionsForTests;
                 DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes);
-                Assert.True(GC.CollectionCount(1) > collectionsBefore, "the in-tape threshold did not collect");
+                Assert.True(DeviceMemoryReclaim.RequestedCollectionsForTests > collectionsBefore, "the in-tape threshold did not collect");
                 // The tape still roots its entry: the collection promoted it instead of freeing it.
                 Assert.True(weakHeld.IsAlive);
                 Assert.True(DeviceMemoryReclaim.CollectionDue);
