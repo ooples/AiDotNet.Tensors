@@ -159,6 +159,7 @@ internal sealed class TensorStorage<T>
     private MmapOwnerState? _mmapOwner;
     private IDisposable? _gpuBufferOwner;
     internal bool HasGpuBufferOwner => Volatile.Read(ref _gpuBufferOwner) is not null;
+    internal bool OwnsGpuBuffer(object buffer) => ReferenceEquals(Volatile.Read(ref _gpuBufferOwner), buffer);
     // Only READ-ONLY aliases gate the write paths (AsWritableSpan / AsWritableMemory / GetDataArray) —
     // a writable alias (#1715) exists to be written, its mutations persist via MAP_SHARED.
     internal bool IsReadOnlyMapped => Volatile.Read(ref _mmapOwner) is { Writable: false };

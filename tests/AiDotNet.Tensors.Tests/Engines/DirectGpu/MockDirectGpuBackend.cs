@@ -103,6 +103,20 @@ public class MockDirectGpuBackend : DispatchProxy
         return (IMultiTensorGpuOptimizerBackend)(object)proxy;
     }
 
+    internal static IAdam8BitWeightDecayBackend CreateCompressedMoment(MockBackendState state)
+    {
+        var proxy = (MockDirectGpuBackend)Create<IAdam8BitWeightDecayBackend, MockDirectGpuBackend>();
+        proxy._state = state;
+        return (IAdam8BitWeightDecayBackend)(object)proxy;
+    }
+
+    internal static ICompressedMomentGpuOptimizerBackend CreateCompressedMomentWithoutDecay(MockBackendState state)
+    {
+        var proxy = (MockDirectGpuBackend)Create<ICompressedMomentGpuOptimizerBackend, MockDirectGpuBackend>();
+        proxy._state = state;
+        return (ICompressedMomentGpuOptimizerBackend)(object)proxy;
+    }
+
     protected override object Invoke(MethodInfo targetMethod, object[] args)
     {
         if (_state.ThrowOnCall.TryGetValue(targetMethod.Name, out var injected)) throw injected;
@@ -209,6 +223,11 @@ public class MockDirectGpuBackend : DispatchProxy
                 var byteBuf = new MockGpuBuffer(new float[floatSlots]);
                 _state.AllocatedBuffers.Add(byteBuf);
                 return byteBuf;
+            }
+            case "UploadByteBuffer":
+            {
+                object none = null;
+                return none;
             }
             case "Copy" when args.Length == 5 && args[0] is MockGpuBuffer copySrc && args[2] is MockGpuBuffer copyDst:
             {
@@ -374,6 +393,8 @@ public class MockDirectGpuBackend : DispatchProxy
             case "SparseFtrlUpdate":
             case "SparseProximalL1Update":
             case "AdamBf16Update":
+            case "AdamUpdateBf16":
+            case "AdamWUpdateBf16":
             case "Adam8BitUpdate":
                 _state.OptimizerCalls.Add(targetMethod.Name);
                 object noResult = null;
