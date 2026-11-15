@@ -67,6 +67,8 @@ public class LazyInPlaceReaderOrderingTests
         var engine = new CpuEngine();
         var host = new[] { 0.5f, -1.25f, 2f, 0.75f, -0.3f, 1.1f, 0.2f, -0.9f };
         var expected = engine.NativeComplexMagnitude(engine.NativeComplexFFT(Values(host))).ToArray();
+        // Before the write: x wraps `host` itself, so after x *= 2 the array holds the doubled values.
+        var doubled = host.Select(v => 2f * v).ToArray();
         var x = Values(host);
         float[] xRead, magRead;
         using (GraphMode.Enable())
@@ -77,7 +79,7 @@ public class LazyInPlaceReaderOrderingTests
             if (writeReadFirst) { xRead = x.ToArray(); magRead = magnitude.ToArray(); }
             else { magRead = magnitude.ToArray(); xRead = x.ToArray(); }
         }
-        Assert.Equal(host.Select(v => 2f * v).ToArray(), xRead);
+        Assert.Equal(doubled, xRead);
         Assert.Equal(expected.Length, magRead.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(expected[i] - magRead[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),

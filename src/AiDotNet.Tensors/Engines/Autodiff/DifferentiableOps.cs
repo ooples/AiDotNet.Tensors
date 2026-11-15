@@ -728,7 +728,7 @@ internal static class DifferentiableOps
         // An irrelevant contribution was never donated to an accumulator, so the caller may
         // immediately return its scratch buffer instead of leaking the rental.
         if (!IsGradientRequired(tensor)) return true;
-        BackwardStepGradientWrites<T>.Current?.Add(tensor);
+        BackwardStepGradientWrites<T>.Note(tensor);
 
         bool needsOutOfPlace = _isBackwardCreateGraph;
         bool wasAlreadyOwned = !needsOutOfPlace && IsAccumulatorBufferOwned(grad);
@@ -911,7 +911,7 @@ internal static class DifferentiableOps
         // by a later input. Silently returning from this donation point either leaked the rental
         // or made generic reclamation unsafe. Storing the contribution preserves ownership until
         // the normal filtered-gradient cleanup; AccumulateGradPoolable handles disposable scratch.
-        BackwardStepGradientWrites<T>.Current?.Add(tensor);
+        BackwardStepGradientWrites<T>.Note(tensor);
 
         // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
         // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
@@ -1123,7 +1123,18 @@ internal static class DifferentiableOps
     internal static class BackwardStepGradientWrites<T>
     {
         [ThreadStatic]
-        internal static List<Tensor<T>>? Current;
+        private static List<Tensor<T>>? t_current;
+
+        /// <summary>Records a gradient key the running step wrote, when a runner is collecting them.</summary>
+        internal static void Note(Tensor<T> tensor) => t_current?.Add(tensor);
+
+        /// <summary>Installs <paramref name="next"/> (null: stop collecting) and returns the list it replaces.</summary>
+        internal static List<Tensor<T>>? Swap(List<Tensor<T>>? next)
+        {
+            var prior = t_current;
+            t_current = next;
+            return prior;
+        }
     }
 
     /// <summary>

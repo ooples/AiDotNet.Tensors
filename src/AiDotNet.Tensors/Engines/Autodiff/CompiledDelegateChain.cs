@@ -259,11 +259,11 @@ internal sealed class CompiledDelegateChain<T>
                 // contributions it summed into an input's gradient) are dead once it returns: free them now, stream
                 // ordered, as PyTorch's refcount frees them, instead of leaving them to the GC.
                 var stepScope = gpuRelease?.BeginStepScope();
-                var outerWrites = DifferentiableOps.BackwardStepGradientWrites<T>.Current;
+                List<Tensor<T>>? outerWrites = null;
                 if (stepScope is not null)
                 {
                     stepWrites.Clear();
-                    DifferentiableOps.BackwardStepGradientWrites<T>.Current = stepWrites;
+                    outerWrites = DifferentiableOps.BackwardStepGradientWrites<T>.Swap(stepWrites);
                 }
                 try
                 {
@@ -278,11 +278,11 @@ internal sealed class CompiledDelegateChain<T>
                         foreach (var input in step.Inputs)
                             if (input is not null && grads.TryGetValue(input, out var inputGrad) && inputGrad is not null)
                                 stepScope.Keep(inputGrad);
-                        // Still this step's list here: a nested walk restores the one it found before returning.
-                        foreach (var written in DifferentiableOps.BackwardStepGradientWrites<T>.Current ?? stepWrites)
-                            if (grads.TryGetValue(written, out var writtenGrad) && writtenGrad is not null)
+                        // This step's list comes back from the swap: a nested walk restores the one it found before returning.
+                        var written = DifferentiableOps.BackwardStepGradientWrites<T>.Swap(outerWrites) ?? stepWrites;
+                        foreach (var key in written)
+                            if (grads.TryGetValue(key, out var writtenGrad) && writtenGrad is not null)
                                 stepScope.Keep(writtenGrad);
-                        DifferentiableOps.BackwardStepGradientWrites<T>.Current = outerWrites;
                         stepWrites.Clear();
                         stepScope.Dispose();
                     }
