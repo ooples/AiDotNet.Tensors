@@ -92,23 +92,30 @@ internal sealed class StepScratchPool
 
     /// <summary>Slots once seen outliving their action (<see cref="EndLeases"/>): kept for good from then on.</summary>
     private readonly HashSet<long> _pinned = new();
+    // Forward output slots leased across actions (SpanLease): from the action that writes them to their last forward
+    // reader. Keyed to the slot they were converted from, and held now by buffer.
+    private readonly HashSet<long> _spanKeys = new();
+    private readonly Dictionary<IGpuBuffer, long> _spanning = new();
+    // Bumped by every change to which slots lease: a pin, a slot converted to a span lease.
+    private int _assignmentChanges;
     private readonly List<IGpuBuffer> _free = new();
     private readonly List<(long Key, IGpuBuffer Buffer)> _leases = new();
     // Buffers leased since the last TrimUnleased: a free buffer outside it served no lease in the last run.
     private readonly HashSet<IGpuBuffer> _leasedThisRun = new();
 
     /// <summary>
-    /// How many slots have been pinned so far. Pins only grow. A captured step graph bakes in the lease assignment of
-    /// the run it recorded, so a pin first seen after that run means the graph may have handed the slot's buffer to a
-    /// later action while it was still live. The plan compares this count against the one at capture and re-captures.
+    /// How many times the lease assignment has changed: a slot pinned, a forward slot turned into a span lease. It only
+    /// grows. A captured step graph bakes in the lease assignment of the run it recorded, so a change first seen after
+    /// that run means the graph may have handed a buffer to a later action while it was still live, or keeps one the
+    /// next run leases elsewhere. The plan compares this count against the one at capture and re-captures.
     /// </summary>
-    internal int PinnedCount => _pinned.Count;
+    internal int PinnedCount => _assignmentChanges;
 
     /// <summary>Whether slot <paramref name="key"/> of the running action is leased.</summary>
-    internal bool Leases(long key) => Action >= FirstLeasedAction && !_pinned.Contains(key);
+    internal bool Leases(long key) => (Action >= FirstLeasedAction || _spanKeys.Contains(key)) && !_pinned.Contains(key);
 
     /// <summary>The device buffers the pool holds: kept slots, the transient arena and free leased buffers.</summary>
-    internal int BufferCount => Slots.Count + Transient.Count + _free.Count + _leases.Count;
+    internal int BufferCount => Slots.Count + Transient.Count + _free.Count + _leases.Count + _spanning.Count;
 
     /// <summary>The bytes of those buffers.</summary>
     internal long BufferBytes
@@ -120,8 +127,39 @@ internal sealed class StepScratchPool
             foreach (var b in Transient.Values) bytes += b.SizeInBytes;
             foreach (var b in _free) bytes += b.SizeInBytes;
             foreach (var (_, b) in _leases) bytes += b.SizeInBytes;
+            foreach (var b in _spanning.Keys) bytes += b.SizeInBytes;
             return bytes;
         }
+    }
+
+    /// <summary>
+    /// Set by the plan around a forward action that writes an output it will span-lease: a slot that action allocates for
+    /// the first time takes a free buffer (<see cref="TryTakeFree"/>) instead of a new one.
+    /// </summary>
+    internal bool ReuseFreeForNewSlots { get; set; }
+
+    /// <summary>
+    /// Takes the smallest free buffer of at least <paramref name="length"/> elements, within twice the length, for a slot
+    /// allocated for the first time; false when none fits. Nothing holds a free buffer, so the slot owns it from now on.
+    /// </summary>
+    internal bool TryTakeFree(int length, out IGpuBuffer buffer)
+    {
+        int pick = -1;
+        for (int i = 0; i < _free.Count; i++)
+        {
+            var candidate = _free[i];
+            if (candidate.Handle == IntPtr.Zero || candidate.Size < length || candidate.Size > 2L * length) continue;
+            if (pick < 0 || candidate.Size < _free[pick].Size) pick = i;
+        }
+        if (pick < 0)
+        {
+            buffer = null!;
+            return false;
+        }
+        buffer = _free[pick];
+        _free[pick] = _free[_free.Count - 1];
+        _free.RemoveAt(_free.Count - 1);
+        return true;
     }
 
     /// <summary>Whether any slot is leased now.</summary>
@@ -153,7 +191,8 @@ internal sealed class StepScratchPool
             buffer = backend.AllocateBuffer(length);
             Track(buffer);
         }
-        _leases.Add((key, buffer));
+        if (_spanKeys.Contains(key)) _spanning[buffer] = key;   // a forward output: held until its last reader
+        else _leases.Add((key, buffer));
         _leasedThisRun.Add(buffer);
         Keys[buffer] = key;
         return buffer;
@@ -170,7 +209,14 @@ internal sealed class StepScratchPool
         {
             if (escaped is not null && escaped.Contains(buffer))
             {
-                _pinned.Add(key);
+                // A lent forward slot that escaped its lease becomes this slot's for good: its forward slot takes a new
+                // buffer on the next run (a buffer cannot be both, or a later lease could take it while it is pinned).
+                if (_lent.TryGetValue(buffer, out long forwardKey))
+                {
+                    _lent.Remove(buffer);
+                    if (Slots.TryGetValue(forwardKey, out var bound) && ReferenceEquals(bound, buffer)) Slots.Remove(forwardKey);
+                }
+                if (_pinned.Add(key)) _assignmentChanges++;
                 Slots[key] = buffer;
             }
             else
@@ -179,6 +225,87 @@ internal sealed class StepScratchPool
             }
         }
         _leases.Clear();
+    }
+
+    /// <summary>
+    /// Whether <paramref name="buffer"/> is a forward output's span lease (<see cref="SpanLease"/>) held now.
+    /// </summary>
+    internal bool IsSpanLeased(IGpuBuffer buffer) => _spanning.ContainsKey(buffer);
+
+    /// <summary>
+    /// Leases kept slot <paramref name="key"/> across actions from now on: a forward output no backward reads, needed
+    /// only until its last forward reader, as PyTorch frees such an intermediate once it is consumed. Its buffer is held
+    /// now (the slot's first run kept it) and returns to the free list at <see cref="EndSpanLease"/>; later runs lease
+    /// the slot a free buffer instead. Returns false when <paramref name="key"/> is not a kept slot.
+    /// </summary>
+    internal bool SpanLease(long key)
+    {
+        if (_pinned.Contains(key) || !Slots.TryGetValue(key, out var buffer)) return false;
+        Slots.Remove(key);
+        _spanKeys.Add(key);
+        _spanning[buffer] = key;
+        _leasedThisRun.Add(buffer);
+        _assignmentChanges++;
+        return true;
+    }
+
+    /// <summary>Ends a forward output's span lease: its last reader ran, so the buffer is free for the next lease.</summary>
+    internal void EndSpanLease(IGpuBuffer buffer)
+    {
+        if (_spanning.Remove(buffer)) _free.Add(buffer);
+    }
+
+    /// <summary>
+    /// A span-leased forward output turned out to be read past its forward (a tensor still bound to its buffer is read
+    /// later): its slot keeps the buffer for good from now on, as a backward slot that escapes its action does.
+    /// </summary>
+    internal void PinSpanLease(IGpuBuffer buffer)
+    {
+        if (!_spanning.TryGetValue(buffer, out long key)) return;
+        _spanning.Remove(buffer);
+        _spanKeys.Remove(key);
+        _pinned.Add(key);
+        Slots[key] = buffer;
+        _assignmentChanges++;
+    }
+
+    // Forward slots lent to the free list for the rest of the backward (Lend), by buffer, with their forward key; withdrawn
+    // when it ends.
+    private readonly Dictionary<IGpuBuffer, long> _lent = new(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
+
+    /// <summary>
+    /// Lends forward slots no later backward action reads to the free list, so the backward's leases reuse them. Each
+    /// stays its slot's: <see cref="WithdrawLent"/> takes it back before the next forward writes it. A slot no longer
+    /// bound to the buffer the schedule recorded is skipped.
+    /// </summary>
+    internal void Lend(List<(long Key, IGpuBuffer Buffer)> slots)
+    {
+        foreach (var (key, buffer) in slots)
+        {
+            if (!Slots.TryGetValue(key, out var bound) || !ReferenceEquals(bound, buffer) || buffer.Handle == IntPtr.Zero)
+                continue;
+            if (_lent.ContainsKey(buffer)) continue;
+            _free.Add(buffer);
+            _lent[buffer] = key;
+        }
+    }
+
+    /// <summary>Takes every lent forward slot back off the free list (one a lease still holds ended with its action).</summary>
+    internal void WithdrawLent()
+    {
+        if (_lent.Count == 0) return;
+        _free.RemoveAll(_lent.ContainsKey);
+        // A lease names its slot in Keys; the buffer is its forward slot's again.
+        foreach (var entry in _lent) Keys[entry.Key] = entry.Value;
+        _lent.Clear();
+    }
+
+    /// <summary>Ends every span lease still held (the forward is over: nothing reads its forward-only outputs again).</summary>
+    internal void EndSpanLeases()
+    {
+        if (_spanning.Count == 0) return;
+        foreach (var buffer in _spanning.Keys) _free.Add(buffer);
+        _spanning.Clear();
     }
 
     /// <summary>
@@ -207,6 +334,7 @@ internal sealed class StepScratchPool
     internal void Release()
     {
         EndLeases(null);
+        EndSpanLeases();
         foreach (var buffer in Slots.Values) DisposeReleased(buffer);
         foreach (var buffer in Transient.Values) DisposeReleased(buffer);
         foreach (var buffer in _free) DisposeReleased(buffer);

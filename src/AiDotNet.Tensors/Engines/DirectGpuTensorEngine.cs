@@ -5913,6 +5913,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             return leased;
         }
+        if (pool.ReuseFreeForNewSlots && pool.TryTakeFree(length, out var reused))
+        {
+            // A forward action writing an output the plan span-leases: its first run reuses a released buffer.
+            if (!fullyWritten)
+            {
+                if (backend is IDeviceZeroFill zeroReused) zeroReused.ZeroBuffer(reused, length);
+                else backend.Fill(reused, 0f, length);
+            }
+            pool.Slots[key] = reused;
+            pool.Keys[reused] = key;
+            return reused;
+        }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         pool.Slots[key] = nb;
         pool.Track(nb);
