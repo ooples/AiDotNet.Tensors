@@ -37,6 +37,12 @@ internal interface ILazyNode
     bool WritesInPlace { get; }
 
     /// <summary>
+    /// Whether one of the node's inputs is <paramref name="tensor"/> or shares its storage (a view of it, or it a view of
+    /// the input): what a later in-place write of <paramref name="tensor"/> must run after.
+    /// </summary>
+    bool ReadsStorageOf(object tensor);
+
+    /// <summary>
     /// The engine that recorded this node: the scope's bound engine (the one the op was invoked on), stamped when the
     /// scope publishes the node. A read of an unrealized output realizes it here - defaulting to the process-wide
     /// AiDotNetEngine.Current realized a CpuEngine model on whatever engine happened to be global.

@@ -336,12 +336,17 @@ internal sealed class LazyTensorScope : IDisposable
             backwardFn: backwardFn,
             savedState: savedState,
             externalPrerequisite: prevProducer);
-        // Every node that read the target since its prior producer must run before this write.
+        // Every node that read the target since its prior producer must run before this write: an in-place write of
+        // another tensor that reads it (y += x before x *= 2), a reader of a view sharing its storage (copy(view(x))),
+        // and a cross-type reader. Only the target's own chain of writes is ordered by the prior-producer edge instead.
         long since = prevProducer?.RecordOrder ?? 0;
         var readers = new List<ILazyNode>();
         foreach (var recorded in _nodes)
-            if (recorded is LazyNode<T> reader && reader.RecordOrder > since && !reader.WritesInPlace && reader.Reads(target))
-                readers.Add(reader);
+        {
+            if (recorded.RecordOrder <= since) continue;
+            if (recorded is LazyNode<T> { WritesInPlace: true } writer && ReferenceEquals(writer.Output, target)) continue;
+            if (recorded.ReadsStorageOf(target)) readers.Add(recorded);
+        }
         node.SetEarlierReaders(readers.ToArray());
         target.LazySource = node;
         AddNode(node);
