@@ -89,7 +89,7 @@ public sealed class TensorArena : IDisposable
     //
     // Thread-static: each thread keeps its own pool (no locks, matches the
     // [ThreadStatic] _current contract). Bounded: only arrays at/above
-    // PersistThresholdElems are retained (small buffers GC cheaply and would
+    // PersistThresholdElems, or on the Large Object Heap, are retained (small buffers GC cheaply and would
     // bloat the dictionary), and at most MaxPersistPerSize per (type,size) so
     // a model with many distinct shapes can't grow the pool without bound.
     // ---------------------------------------------------------------------
@@ -105,7 +105,7 @@ public sealed class TensorArena : IDisposable
     /// buckets, and the bucket key is an EXACT (type, element-count) pair — so a process that runs
     /// many distinct shapes accumulated one bucket per shape and released none of them until
     /// <see cref="ClearPersistentPool"/> was called by hand. Every retained buffer is at least
-    /// <see cref="PersistThresholdElems"/> elements (256 KB at float, 512 KB at double) and there
+    /// 85 KB (the Large Object Heap threshold, see <see cref="Persists"/>) and there
     /// can be up to <see cref="MaxPersistPerSize"/> of them per bucket, so the ceiling was
     /// shapes × 64 × 256 KB — hundreds of MB of Gen2 for a few dozen shapes.
     /// Measured on AiDotNet's RecurrentGemma finite-difference gradcheck: 11-13 s in a clean
@@ -162,6 +162,20 @@ public sealed class TensorArena : IDisposable
     /// allocation/GC is cheap and pooling churns the dictionary for no gain.</summary>
     private const int PersistThresholdElems = 64 * 1024;
 
+    /// <summary>Arrays of at least this many bytes are allocated on the Large Object Heap.</summary>
+    private const int LargeObjectHeapThresholdBytes = 85_000;
+
+    /// <summary>
+    /// True when a buffer of <paramref name="elementCount"/> elements of <paramref name="type"/> is kept across arena
+    /// lifetimes: at or above <see cref="PersistThresholdElems"/>, or whenever it lands on the Large Object Heap. An LOH
+    /// array is not cheap to GC: only a gen-2 collection reclaims it, so a per-call inference arena that dropped its
+    /// 85-256 KB activations allocated them again on every forward (MobileNetV2 at batch 16: 5.7 MB a forward on the
+    /// LOH and a gen-2 GC every ninth call, the gap to torch.compile at that batch, #2561).
+    /// </summary>
+    private static bool Persists(Type type, int elementCount)
+        => elementCount >= PersistThresholdElems
+           || (elementCount >= 1024 && (long)elementCount * ElementBytes(type) >= LargeObjectHeapThresholdBytes);
+
     /// <summary>Max retained buffers per (type, size). Retention is SELF-LIMITING:
     /// a single arena's Dispose returns exactly as many same-size buffers as the
     /// step actually used, so a shallow model that rents a size once retains one —
@@ -181,7 +195,7 @@ public sealed class TensorArena : IDisposable
 
     private static Array? RentPersistent(Type type, int elementCount, bool zero = true)
     {
-        if (elementCount < PersistThresholdElems) return null;
+        if (!Persists(type, elementCount)) return null;
         var pool = _persistent;
         if (pool is null) return null;
         if (pool.TryGetValue((type, elementCount), out var bucket) && bucket.Arrays.Count > 0)
@@ -228,7 +242,7 @@ public sealed class TensorArena : IDisposable
 
     private static void ReturnPersistent(Type type, int elementCount, Array arr)
     {
-        if (elementCount < PersistThresholdElems) return; // let small buffers GC
+        if (!Persists(type, elementCount)) return; // let small (gen-0) buffers GC
         var pool = _persistent ??= new Dictionary<(Type, int), Bucket>();
         var key = (type, elementCount);
         if (!pool.TryGetValue(key, out var bucket))
@@ -256,7 +270,7 @@ public sealed class TensorArena : IDisposable
     /// so they pool across re-creations without ever being recycled as scratch.
     /// Return with <see cref="ReturnPersistentBuffer{T}"/> when the state is
     /// discarded (on the next re-configure). Buffers below
-    /// <see cref="PersistThresholdElems"/> aren't pooled (they GC cheaply) — a
+    /// gen-0 size (see <see cref="Persists"/>) aren't pooled (they GC cheaply) — a
     /// fresh zeroed array is returned, matching the pooled path's zero-init.
     /// </summary>
     internal static T[] RentPersistentZeroed<T>(int elementCount)
@@ -1238,6 +1252,11 @@ public sealed class TensorArena : IDisposable
     // Returns an array to the cross-arena pool unless the finished step's caller still holds it.
     private void ReturnPersistentUnlessHeld(Type type, int size, Array arr)
     {
+        // A tape-owned arena is one the caller never opened, so nothing tells the caller its op outputs end with the
+        // tape: a forward output kept past the tape is still arena memory. Its buffers below PersistThresholdElems stay
+        // out of the pool (GC-owned) as before the LOH rule, so keeping such an output does not hand its storage to a
+        // later tape. Explicit arenas scope their outputs and pool every LOH-sized buffer.
+        if (OwnedByTape && size < PersistThresholdElems) return;
         if (_heldOver is not null && _heldOver.Contains(arr))
             (t_withheldFromPool ??= new List<(Type, int, Array)>()).Add((type, size, arr));
         else
@@ -1315,7 +1334,7 @@ public sealed class TensorArena : IDisposable
 
         // Return large backing arrays to the cross-arena persistent pool so the
         // NEXT arena on this thread reuses them instead of GC-allocating fresh
-        // (issue #478). Small buffers (< PersistThresholdElems) are skipped by
+        // (issue #478). Small buffers (see Persists) are skipped by
         // ReturnPersistent and simply dropped for GC. The pinned tier is NOT
         // returned — those are long-lived (weights / optimizer state) and the
         // owner still holds references to them.
