@@ -401,6 +401,25 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuGraphNodeGetType")]
     public static extern CudaResult cuGraphNodeGetType(IntPtr node, out int type);
 
+    // Graph node introspection for capture diagnostics: which kernel a memset node zeroes for.
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphNodeGetDependentNodes")]
+    public static extern CudaResult cuGraphNodeGetDependentNodes(IntPtr node, [Out] IntPtr[]? dependentNodes, ref ulong numDependentNodes);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphNodeGetDependencies")]
+    public static extern CudaResult cuGraphNodeGetDependencies(IntPtr node, [Out] IntPtr[]? dependencies, ref ulong numDependencies);
+
+    /// <summary>Writes a CUDA_KERNEL_NODE_PARAMS (v1, 56 bytes) whose first field is the CUfunction.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphKernelNodeGetParams")]
+    public static extern CudaResult cuGraphKernelNodeGetParams(IntPtr node, IntPtr nodeParams);
+
+    /// <summary>Writes a CUDA_MEMSET_NODE_PARAMS: dst@0, pitch@8, value@16, elementSize@20, width@24, height@32.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuGraphMemsetNodeGetParams")]
+    public static extern CudaResult cuGraphMemsetNodeGetParams(IntPtr node, IntPtr nodeParams);
+
+    /// <summary>The mangled name of a CUfunction (driver 12.3+; older drivers lack the export).</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuFuncGetName")]
+    public static extern CudaResult cuFuncGetName(out IntPtr name, IntPtr func);
+
     [DllImport(CudaLibrary, EntryPoint = "cuGraphDestroy")]
     public static extern CudaResult cuGraphDestroy(IntPtr graph);
 

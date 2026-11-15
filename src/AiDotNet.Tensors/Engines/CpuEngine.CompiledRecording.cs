@@ -153,13 +153,19 @@ public partial class CpuEngine
     /// that also returns a non-differentiable auxiliary output through an <c>out</c> parameter (argmax indices).
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The caller receives the trace's auxiliary output. Each replay recomputes it and <paramref name="refreshAux"/>
     /// copies the fresh value into that same object in place, so a caller holding it reads the current step's
     /// indices, as AiDotNet#1331 does for ScatterMean's counts.
+    /// </para>
+    /// <para>
+    /// <paramref name="backward"/>, when given, is the node's own backward; it must read what the latest replay of
+    /// <paramref name="forward"/> kept. Without it the backward re-runs the forward under a tape.
+    /// </para>
     /// </remarks>
     internal bool TryRecordCompiledOp<T, TAux>(string opName, Tensor<T>?[] inputs,
         Func<IEngine, (Tensor<T> Result, TAux Aux)> forward, Action<IEngine, TAux, TAux> refreshAux,
-        [NotNullWhen(true)] out Tensor<T>? result, [MaybeNullWhen(false)] out TAux aux)
+        [NotNullWhen(true)] out Tensor<T>? result, [MaybeNullWhen(false)] out TAux aux, BackwardFunction<T>? backward = null)
     {
         result = null;
         aux = default;
@@ -194,7 +200,7 @@ public partial class CpuEngine
                 DirectGpuTensorEngine.CopyResultInto(eng, CheckReplayShape(opName, r, output), output);
                 refreshAux(eng, a, tracedAux);
             },
-            BackwardFunctions<T>.ReplayUnderTape(eng => forward(eng).Result));
+            backward ?? BackwardFunctions<T>.ReplayUnderTape(eng => forward(eng).Result));
         if (tracedAux is not null) scope.RegisterAuxiliaryOutput(tracedAux, result);
         return true;
     }

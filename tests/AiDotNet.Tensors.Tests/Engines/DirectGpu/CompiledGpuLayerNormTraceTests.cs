@@ -5,7 +5,7 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
-namespace AiDotNet.Tensors.Tests.Engines.Compilation;
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// The GPU trace records LayerNorm from shapes alone (no eager pass, so the forward upstream of it stays lazy and is not

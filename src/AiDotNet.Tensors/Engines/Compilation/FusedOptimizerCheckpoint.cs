@@ -13,7 +13,18 @@ internal enum FusedLrScheduleKind
     LinearWarmupDecay = 9,
     LinearWarmupPhasedDecay = 10,
     LinearWarmupLegacyEagerDecay = 11,
-    External = 12
+    External = 12,
+    // Kinds from 13 on are CompletedStepLr schedules, restored through their constructors.
+    WarmupStableDecay = 13,
+    Polynomial = 14,
+    MultiStep = 15,
+    TriStage = 16,
+    NoamHoldAnnealing = 17,
+    CosineWarmRestarts = 18,
+    OneCycleWithAnneal = 19,
+    CyclicRange = 20,
+    Sequential = 21,
+    CosineAnnealingHold = 22
 }
 
 internal sealed class FusedLrScheduleCheckpoint
@@ -39,6 +50,8 @@ internal sealed class FusedLrScheduleCheckpoint
         // An external rate stays external, so the caller can keep setting it on the restored plan.
         if (Kind == FusedLrScheduleKind.External)
             return new ExternalLrSchedule(Doubles[0]);
+        if (CompletedStepLr.IsFamilyKind(Kind))
+            return CompletedStepLr.Restore(Kind, Doubles, Ints);
         return new RestoredLrSchedule(Kind, Doubles, Ints);
     }
 
@@ -63,6 +76,16 @@ internal sealed class FusedLrScheduleCheckpoint
             FusedLrScheduleKind.LinearWarmupDecay => (3, 3),
             FusedLrScheduleKind.LinearWarmupPhasedDecay => (3, 3),
             FusedLrScheduleKind.LinearWarmupLegacyEagerDecay => (3, 3),
+            FusedLrScheduleKind.WarmupStableDecay => (2, 4),
+            FusedLrScheduleKind.Polynomial => (3, 1),
+            FusedLrScheduleKind.MultiStep => (3, 1),
+            FusedLrScheduleKind.TriStage => (3, 3),
+            FusedLrScheduleKind.NoamHoldAnnealing => (2, 2),
+            FusedLrScheduleKind.CosineWarmRestarts => (2, 2),
+            FusedLrScheduleKind.OneCycleWithAnneal => (4, 2),
+            FusedLrScheduleKind.CyclicRange => (3, 3),
+            FusedLrScheduleKind.Sequential => (0, 1),
+            FusedLrScheduleKind.CosineAnnealingHold => (2, 1),
             _ => throw new System.IO.InvalidDataException(
                 $"Unknown serialized LR schedule kind {(int)Kind}."),
         };
@@ -84,6 +107,13 @@ internal sealed class FusedLrScheduleCheckpoint
             && (Ints[0] < 0 || !Enum.IsDefined(typeof(WarmupDecayMode), Ints[2])
                 || (Ints[2] != (int)WarmupDecayMode.Constant && Ints[1] < Ints[0])))
             throw new System.IO.InvalidDataException("Serialized phased warmup has invalid steps or decay mode.");
+        if (CompletedStepLr.IsFamilyKind(Kind))
+        {
+            foreach (double v in Doubles)
+                if (double.IsNaN(v) || double.IsInfinity(v))
+                    throw new System.IO.InvalidDataException($"Serialized LR schedule kind {Kind} has a non-finite value.");
+            CompletedStepLr.Restore(Kind, Doubles, Ints);   // the constructors' own validation
+        }
     }
 
     private sealed class RestoredLrSchedule : LrSchedule

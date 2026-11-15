@@ -125,6 +125,24 @@ public sealed class GradientTapeOptions
     public bool ReleaseActivationsDuringBackward { get; init; }
 
     /// <summary>
+    /// When true, a GPU backward frees each device-only forward intermediate right after the last backward step that
+    /// reads it, with no download, instead of leaving it for the garbage collector.
+    /// </summary>
+    /// <remarks>
+    /// <para>Off by default, so a tape never invalidates a tensor its caller still holds: PyTorch keeps a forward output
+    /// valid for as long as Python references it. .NET cannot see those references without a collection, so freeing at
+    /// last use is an opt-in for loops that own their forward's tensors (a training step), where it returns 30-40% of a
+    /// step's dead device memory without the blocking collections waiting for the GC costs.</para>
+    /// <para>An opted-in graph's first backward run is a probe: it frees nothing, and any of its intermediates read
+    /// after that backward, until the same graph runs backward again, are kept on every later run. A read the probe
+    /// could not see throws an error naming the producing op; keep such a tensor with
+    /// <see cref="GradientTape{T}.Retain(AiDotNet.Tensors.LinearAlgebra.Tensor{T})"/>. The loss, the sources and the
+    /// returned gradients are never freed. On a CPU engine it does nothing (see
+    /// <see cref="ReleaseActivationsDuringBackward"/>).</para>
+    /// </remarks>
+    public bool ReleaseDeviceActivationsAtLastUse { get; init; }
+
+    /// <summary>
     /// When true, the loss and gradients this tape's backward returned go back to the step's arena when the tape is
     /// disposed, instead of being held out of reuse for one more step.
     /// </summary>

@@ -454,6 +454,108 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// A plan whose first op is an embedding gather refreshes the gather's indices before each replay, and must refresh
+    /// every other caller-fed tensor too. It did not: the embedding branch skipped the target, so every replay trained
+    /// on the capture step's labels (an LM's reported loss fell below the eager run's while its validation CE stayed at
+    /// the untrained level). Both index forms an LM feeds - int ids and float ids - must train exactly like eager.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void An_embedding_first_plan_replays_each_steps_target(bool floatIndices)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = TrainEmbeddingFirst(gpu, capture: false, floatIndices);
+            var captured = TrainEmbeddingFirst(gpu, capture: true, floatIndices);
+            // Ground truth: the same plan on the CPU engine. Both GPU arms once agreed with each other while both read
+            // stale ids (the host gather left the output's device copy from the previous step looking current).
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainEmbeddingFirst(cpu, capture: false, floatIndices);
+            AiDotNetEngine.Current = prior;
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - eager.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {eager.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
+            Assert.False(eager.Replayed, "the eager reference captured a graph");
+            Assert.True(captured.Replayed, "the captured plan is not replaying a graph after warm-up");
+            // Positive control: the targets differ step to step, so a replay of one step's target changes the losses.
+            Assert.True(eager.Losses.Distinct().Count() == Steps, "the eager losses repeat; the comparison would be vacuous");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            for (int p = 0; p < eager.Weights.Length; p++)
+                for (int i = 0; i < eager.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.Weights[p][i] - captured.Weights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.Weights[p][i]} != eager {eager.Weights[p][i]}");
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainEmbeddingFirst(IEngine gpu, bool capture, bool floatIndices)
+    {
+        const int vocab = 40;
+        var ids = new Tensor<int>([Batch]);
+        var floatIds = new Tensor<float>([Batch]);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var table = Rand([vocab, Inputs], 5, 0.5f);
+        var w1 = Rand([Inputs, Hidden], 3, 0.3f);
+        var b1 = new Tensor<float>([Hidden]);
+        var w2 = Rand([Hidden, Outputs], 4, 0.3f);
+        var b2 = new Tensor<float>([Outputs]);
+        var parameters = new[] { table, w1, b1, w2, b2 };
+        if (gpu is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(300 + step);
+            var idSpan = ids.AsWritableSpan();
+            var floatSpan = floatIds.AsWritableSpan();
+            for (int i = 0; i < Batch; i++) { idSpan[i] = rng.Next(vocab); floatSpan[i] = idSpan[i]; }
+            ids.IncrementVersion();
+            floatIds.IncrementVersion();
+            FeedTarget(y, step);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var x = floatIndices ? gpu.TensorEmbeddingLookupFromFloatIndices(table, floatIds) : gpu.TensorEmbeddingLookup<float, int>(table, ids);
+            var h = gpu.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
+            var pred = gpu.FusedLinear(h, w2, b2, FusedActivationType.None);
+            gpu.TensorMSELoss(pred, y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            var concrete = (CompiledTrainingPlan<float>)plan;
+            if (!capture) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            var execField = typeof(CompiledTrainingPlan<float>)
+                .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+            var exec = execField.GetValue(concrete) is IntPtr handle ? handle : IntPtr.Zero;
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), exec != IntPtr.Zero);
+        }
+    }
+
+    /// <summary>
     /// A replay copies only the inputs the host changed since the replay that last copied them (the step I/O prologue's
     /// copy mask): fed every third step, once, or one input every step and the other once, a captured plan must train
     /// exactly like the eager one, through the replays that skip every copy, make every copy, or make exactly one. With

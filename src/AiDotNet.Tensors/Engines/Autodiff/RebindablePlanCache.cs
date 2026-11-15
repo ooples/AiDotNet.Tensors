@@ -184,21 +184,8 @@ internal static class RebindablePlanCache<T>
         // Progressive GPU activation release for rebound replay (e.g., GradientCheckpointing segment recompute):
         // BackwardRecycler<T>.Begin returns null when engine.SupportsGpu is true, so without a storage release
         // plan every recomputed forward activation across all layers in the segment stays pinned until tape dispose.
-        var gpuEngine = engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>();
-        BackwardStorageReleasePlan<T>? storageReleasePlan = null;
-        HashSet<object>? protectedStorages = null;
-        if (gpuEngine is not null)
-        {
-            storageReleasePlan = BackwardStorageReleasePlan<T>.Create(currentEntries, indices);
-            protectedStorages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance)
-            {
-                loss.StorageIdentity
-            };
-            if (sources is not null)
-                foreach (var source in sources) protectedStorages.Add(source.StorageIdentity);
-            if (retainedTensors is not null)
-                foreach (var retained in retainedTensors) protectedStorages.Add(retained.StorageIdentity);
-        }
+        var gpuRelease = GpuBackwardRelease<T>.BeginRebound(
+            engine, currentEntries, indices, loss, sources, retainedTensors);
 
         // Walk the cached reverse-topo indices, reading entries from the
         // CURRENT arena. entry.Output is this iteration's tensor, not the
@@ -242,15 +229,13 @@ internal static class RebindablePlanCache<T>
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
                 {
                     recycler?.AfterStep(grads, entry.Output, i);
-                    if (gpuEngine is not null)
-                        storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    gpuRelease?.ReleaseAfterStep(i);
                     continue;
                 }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
                 {
                     recycler?.AfterStep(grads, entry.Output, i);
-                    if (gpuEngine is not null)
-                        storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                    gpuRelease?.ReleaseAfterStep(i);
                     continue;
                 }
 
@@ -276,8 +261,7 @@ internal static class RebindablePlanCache<T>
                     BackwardTiming.Record(entry.Backward.Method.Name, ticks);
                 }
                 recycler?.AfterStep(grads, entry.Output, i);
-                if (gpuEngine is not null)
-                    storageReleasePlan!.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
+                gpuRelease?.ReleaseAfterStep(i);
             }
         }
         finally
