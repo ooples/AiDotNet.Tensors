@@ -173,4 +173,25 @@ public class ClosureObjectiveHostLossTests
         Assert.True(guard is not null, reason);
         Assert.Equal(ClosureGuardResult.Matched, guard!.TryRebind(objective, parameters, out _));
     }
+
+    // SeedTTSClone's RmsNorm: ReduceMean over the last axis of x*x. Its recorder computed the forward at record time,
+    // which under a probe indexed the shape-only input (IndexOutOfRangeException) and aborted every step.
+    [Fact]
+    public void ReduceMean_over_a_traced_input_probes_and_matches()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(6, 8, 11);
+        var x = Filled(5, 6, 12);
+        var parameters = new[] { w };
+        Func<Tensor<float>> objective = () =>
+        {
+            var y = engine.TensorMatMul(x, w);
+            var meanSquare = engine.ReduceMean(engine.TensorMultiply(y, y), new[] { 1 }, keepDims: true);
+            return engine.ReduceSum(meanSquare, null);
+        };
+        var (guard, reason) = CompileGuarded(objective, parameters);
+        Assert.True(guard is not null, reason);
+        var result = guard!.TryRebind(objective, parameters, out _);
+        Assert.True(result == ClosureGuardResult.Matched, guard.LastReason);
+    }
 }
