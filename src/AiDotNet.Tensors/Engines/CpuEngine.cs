@@ -44176,16 +44176,19 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> MultiresolutionHashEncoding<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
-        int featuresPerLevel)
+        int baseResolution,
+        double perLevelScale,
+        int featuresPerLevel,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn)
     {
-        if (positions == null) throw new ArgumentNullException(nameof(positions));
-        if (hashTables == null) throw new ArgumentNullException(nameof(hashTables));
+        // Validated before tracing, so a bad argument fails here rather than when the plan replays.
+        InstantNGPOperations.ValidateHashEncodingArguments(positions, hashTables, featuresPerLevel);
+        InstantNGPOperations.ComputeHashGridLevels(hashTables.Length, baseResolution, perLevelScale, alignment);
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(
                 new[] { positions }.Concat(hashTables).ToArray(),
                 engine => engine.MultiresolutionHashEncoding(
-                    positions, hashTables, resolutions, featuresPerLevel));
+                    positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, alignment));
 
         // A training trace records the encoding as one node whose backward scatters the feature gradient into every
         // level's table, so a compiled training plan replays it on each step's positions and trains the tables
@@ -44197,7 +44200,6 @@ public partial class CpuEngine : ITensorLevelEngine
             scope.BindEngineIfUnset(this);
             var capturedPositions = positions;
             var capturedTables = (Tensor<T>[])hashTables.Clone();
-            var capturedResolutions = (int[])resolutions.Clone();
             int levels = capturedTables.Length;
             return scope.RecordVariadic(
                 LazyNodeType.Custom,
@@ -44207,7 +44209,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 (eng, output) =>
                 {
                     var result = eng.MultiresolutionHashEncoding(
-                        capturedPositions, capturedTables, capturedResolutions, featuresPerLevel);
+                        capturedPositions, capturedTables, baseResolution, perLevelScale, featuresPerLevel, alignment);
                     DirectGpuTensorEngine.CopyResultInto(eng, result, output);
                 },
                 (gradOutput, inputs, _, _, eng, grads) =>
@@ -44215,26 +44217,28 @@ public partial class CpuEngine : ITensorLevelEngine
                     var tables = new Tensor<T>[inputs.Length - 1];
                     Array.Copy(inputs, 1, tables, 0, tables.Length);
                     var tableGradients = eng.MultiresolutionHashEncodingBackward(
-                        inputs[0], tables, capturedResolutions, featuresPerLevel, gradOutput);
+                        inputs[0], tables, baseResolution, perLevelScale, featuresPerLevel, gradOutput, alignment);
                     for (int level = 0; level < tables.Length; level++)
                         DifferentiableOps.AccumulateGrad(grads, tables[level], tableGradients[level], eng);
                 });
         }
 
         return InstantNGPOperations.MultiresolutionHashEncoding(
-            positions, hashTables, resolutions, featuresPerLevel);
+            positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, alignment);
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T>[] MultiresolutionHashEncodingBackward<T>(
         Tensor<T> positions,
         Tensor<T>[] hashTables,
-        int[] resolutions,
+        int baseResolution,
+        double perLevelScale,
         int featuresPerLevel,
-        Tensor<T> outputGradient)
+        Tensor<T> outputGradient,
+        HashGridAlignment alignment = HashGridAlignment.TinyCudaNn)
     {
         return InstantNGPOperations.MultiresolutionHashEncodingBackward(
-            positions, hashTables, resolutions, featuresPerLevel, outputGradient);
+            positions, hashTables, baseResolution, perLevelScale, featuresPerLevel, outputGradient, alignment);
     }
 
     /// <inheritdoc/>
