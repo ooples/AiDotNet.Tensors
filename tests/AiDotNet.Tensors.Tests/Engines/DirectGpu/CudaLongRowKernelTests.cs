@@ -76,6 +76,21 @@ public sealed class CudaLongRowKernelTests
         }
     }
 
+    [Fact]
+    public void MaxAxisRows_StridesARowWithA64BitIndex()
+    {
+        // A row within blockDim.x of int.MaxValue elements (about 8 GiB, a whole-tensor max) stepped an int index past
+        // int.MaxValue, where it wrapped negative and still passed the bound. Too large to run here: read the kernel.
+        string source = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaNeuralNetKernels.GetSource();
+        int start = source.IndexOf("void max_axis_rows(", StringComparison.Ordinal);
+        Assert.True(start >= 0, "max_axis_rows is not in the neural-net kernel source");
+        int bodyEnd = source.IndexOf("__syncthreads()", start, StringComparison.Ordinal);
+        Assert.True(bodyEnd > start, "max_axis_rows has no reduction after its row scan");
+        string scan = source.Substring(start, bodyEnd - start);
+        Assert.Contains("for (long long i = threadIdx.x; i < axisSize; i += blockDim.x)", scan);
+        Assert.DoesNotContain("for (int i = threadIdx.x; i < axisSize", scan);
+    }
+
     [SkippableTheory]
     [InlineData(600, 49152, 8)]     // few items, many destinations: long empty runs
     [InlineData(5000, 64, 3)]       // many items per destination
@@ -104,8 +119,10 @@ public sealed class CudaLongRowKernelTests
             bool ran = cuda.TrySortedScatterAdd(src, idx, output, count, destinations, features, accumulate: false);
             Assert.True(ran, "the sorted scatter did not run (kernels missing?)");
             var actual = cuda.DownloadBuffer(output);
+            // Bit for bit: the scatter is stable and each destination sums its sources in increasing source order from
+            // +0, as the reference does, so even a zero's sign must agree.
             for (int i = 0; i < expected.Length; i++)
-                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected[i]) == TestHelpers.MathCompat.SingleToInt32Bits(actual[i]),
                     $"output[{i / features}, {i % features}]: gpu {actual[i]} cpu {expected[i]}");
         }
     }

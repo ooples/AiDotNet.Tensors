@@ -1019,10 +1019,12 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis_rows(
     const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
     unsigned int best = 0xFF800000u;
     int bestAt = 0x7FFFFFFF;
-    for (int i = threadIdx.x; i < axisSize; i += blockDim.x)
+    // 64-bit index: an axis within blockDim.x of int.MaxValue steps an int index past it, which wraps negative and
+    // still passes the bound. Every in-range index fits the int it is stored as.
+    for (long long i = threadIdx.x; i < axisSize; i += blockDim.x)
     {
         unsigned int v = row[i];
-        if (xf_gt(v, best)) { best = v; bestAt = i; }
+        if (xf_gt(v, best)) { best = v; bestAt = (int)i; }
     }
     bestBits[threadIdx.x] = best;
     bestIndex[threadIdx.x] = bestAt;
