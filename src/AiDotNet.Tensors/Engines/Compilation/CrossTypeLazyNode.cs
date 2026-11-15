@@ -115,7 +115,11 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
             if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { IsRealized: false } inputNode)
                 inputNode.Realize(engine);
 
-            Execute(engine, Output);
+            var input = Input;
+            var latest = input?.LazySource;
+            if (input is not null) input.LazySource = LazyNodeOrder.ProducerAsOf(latest, RecordOrder);
+            try { Execute(engine, Output); }
+            finally { if (input is not null) input.LazySource = latest; }
         }
         catch
         {

@@ -36,12 +36,12 @@ public partial class CpuEngine
         if (input.Rank - normDims == 0) batchShape[0] = 1;
         else for (int i = 0; i < batchShape.Length; i++) batchShape[i] = input._shape[i];
         // A probe trace never computes: the mean and variance are shape-only probe values, and the node's statistics
-        // buffers are allocated but never written.
+        // buffers have metadata only.
         bool probe = GraphMode.IsProbe;
         var meanT = probe ? Tensor<float>.CreateProbeStandIn(batchShape) : new Tensor<float>(batchShape);
         var varT = probe ? Tensor<float>.CreateProbeStandIn(batchShape) : new Tensor<float>(batchShape);
         var stats = probe
-            ? new LayerNormStats(new float[rows], new float[rows])
+            ? new LayerNormStats(rows)
             : new LayerNormStats(meanT.GetCpuBackingForContiguousWrite(out _)!, varT.GetCpuBackingForContiguousWrite(out _)!);
         float eps = (float)epsilon;
         var shape = new LayerNormRowShape(rows, features, eps);
@@ -102,11 +102,12 @@ public partial class CpuEngine
     /// </summary>
     internal sealed class LayerNormStats : ISignatureScratch
     {
-        public LayerNormStats(float[] mean, float[] variance) { Mean = mean; Variance = variance; }
+        public LayerNormStats(float[] mean, float[] variance) { Mean = mean; Variance = variance; SignatureLength = mean.Length; }
+        internal LayerNormStats(int rows) { Mean = Variance = Array.Empty<float>(); SignatureLength = rows; }
 
         public float[] Mean { get; }
         public float[] Variance { get; }
-        public int SignatureLength => Mean.Length;
+        public int SignatureLength { get; }
     }
 
     internal sealed class LayerNormRowShape

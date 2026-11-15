@@ -13,6 +13,36 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class ObjectiveSignatureCaptureTests
 {
+    [Fact]
+    public void Null_marker_cannot_collide_with_a_literal_string()
+    {
+        var x = new Tensor<float>(new[] { 1 });
+        Action<IEngine, Tensor<float>> execute = (_, _) => { };
+        var a = SignUnary(x, execute, savedState: new object[] { null! });
+        var b = SignUnary(x, execute, savedState: new object[] { "null" });
+        Assert.True(a.Signable, a.UnsignableReason);
+        Assert.NotEqual(a, b);
+    }
+
+    [Fact]
+    public void Recursive_and_multidimensional_arrays_are_bounded()
+    {
+        var x = new Tensor<float>(new[] { 1 });
+        Action<IEngine, Tensor<float>> execute = (_, _) => { };
+        var cycle = new object[1];
+        cycle[0] = cycle;
+        var a = SignUnary(x, execute, savedState: new object[] { cycle });
+        Assert.True(a.Signable, a.UnsignableReason);
+        var matrix = new object[,] { { 1, "a" }, { 2, "b" } };
+        var b = SignUnary(x, execute, savedState: new object[] { matrix });
+        Assert.True(b.Signable, b.UnsignableReason);
+        matrix[1, 1] = "c";
+        Assert.NotEqual(b, SignUnary(x, execute, savedState: new object[] { matrix }));
+        object nested = 0;
+        for (int i = 0; i < 20; i++) nested = new object[] { nested };
+        Assert.False(SignUnary(x, execute, savedState: new object[] { nested }).Signable);
+    }
+
     private enum Mode { First, Second }
 
     private struct Coefficients

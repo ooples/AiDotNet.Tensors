@@ -165,8 +165,46 @@ public class DoublePlanHyperparameterPrecisionTests
     /// (bool), type (int), grouped (bool) and step (int). The group decays are the length-prefixed array holding
     /// <paramref name="groupWeightDecays"/>, located by its exact bytes; null leaves the -1 marker, which both layouts share.
     /// </summary>
+    private static byte[] ToVersion4(byte[] current)
+    {
+        Assert.Equal(5, BitConverter.ToInt32(current, 4));
+        using var reader = new System.IO.BinaryReader(new System.IO.MemoryStream(current));
+        // Header, presence/type/group/step, four double hyperparameters, moment settings and max norm.
+        reader.BaseStream.Position = 4 + 4 + 1 + 4 + 1 + 4 + 4 * 8 + 3 * 4 + 8;
+        for (int i = 0; i < 17; i++) reader.ReadSingle();
+        reader.ReadBoolean(); // Nesterov
+        reader.ReadSingle(); // FtrlBeta
+        reader.ReadInt32(); // LbfgsMemorySize
+        for (int i = 0; i < 3; i++) reader.ReadSingle();
+        for (int i = 0; i < 3; i++) reader.ReadBoolean();
+        for (int i = 0; i < 2; i++) if (reader.ReadBoolean()) reader.ReadDouble();
+        int flag = checked((int)reader.BaseStream.Position);
+        var legacy = new System.Collections.Generic.List<byte>(current);
+        legacy.RemoveAt(flag); // v4 has no VelocityIncludesLearningRate byte.
+        for (int i = 0; i < 4; i++) legacy[4 + i] = BitConverter.GetBytes(4)[i];
+        return legacy.ToArray();
+    }
+
+    [Fact]
+    public void Version4_optimizer_state_without_velocity_flag_still_imports()
+    {
+        var (_, plan) = Compile();
+        using (plan)
+        {
+            Configure(plan, OptimizerType.Adam);
+            plan.Step();
+            plan.ImportOptimizerState(ToVersion4(plan.ExportOptimizerState()!));
+            var restored = Assert.IsType<CompiledTrainingPlan<double>>(plan).CaptureFusedOptimizerCheckpoint();
+            Assert.NotNull(restored);
+            Assert.False(restored!.Extras.VelocityIncludesLearningRate);
+            Assert.Equal(B1, restored.Beta1);
+            Assert.Equal(1, restored.OptimizerStep);
+        }
+    }
+
     private static byte[] ToVersion3(byte[] current, double[]? groupWeightDecays)
     {
+        current = ToVersion4(current);
         const int at = 4 + 4 + 1 + 4 + 1 + 4;
         Assert.Equal(4, BitConverter.ToInt32(current, 4));
         var legacy = new System.Collections.Generic.List<byte>(current.Length);

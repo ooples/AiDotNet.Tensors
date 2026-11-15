@@ -168,7 +168,7 @@ void main() {
         case 4u: z = x * y * (1.0 - y); break;
         case 5u: z = x * (1.0 - y * y); break;
         case 6u: z = x / (1.0 + exp(-y)); break;
-        case 7u: z = x * (y <= -3.0 ? 0.0 : (y >= 3.0 ? 1.0 : (2.0*y+3.0)/6.0)); break;
+        case 7u: z = x * (y < -3.0 ? 0.0 : (y > 3.0 ? 1.0 : (2.0*y+3.0)/6.0)); break;
         case 8u: z = x * v1 * (y >= 0.0 ? 1.0 : v0 * exp(y)); break;
         case 9u: z = x * (y > -3.0 && y < 3.0 ? 0.1666666666666667 : 0.0); break;
         case 10u: z = y > v0 && y < v1 ? x : 0.0; break;

@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -53,6 +54,8 @@ public sealed class FusedActivationBackwardGpuTests
         var input = gpu.UploadToGpu(new Tensor<float>(x, new[] { n }), GpuTensorRole.General);
         var gradOut = gpu.UploadToGpu(new Tensor<float>(g, new[] { n }), GpuTensorRole.General);
         IEngine engine = gpu;
+        long launches = GpuLaunchProbe.TotalEver;
+        var fallbacks = GpuLaunchProbe.Fallbacks;
         var actual = (op switch
         {
             "swish" => engine.SwishBackward(gradOut, input),
@@ -60,12 +63,14 @@ public sealed class FusedActivationBackwardGpuTests
             "hardswish" => engine.HardswishBackward(gradOut, input),
             _ => engine.SoftplusBackward(gradOut, input),
         }).ToArray();
+        Assert.True(GpuLaunchProbe.TotalEver > launches, "The derivative must execute on the GPU.");
+        Assert.Equal(fallbacks, GpuLaunchProbe.Fallbacks);
 
         double worst = 0;
-        int worstAt = -1;
+        int worstAt = 0;
         for (int i = 0; i < n; i++)
         {
-            if (op == "hardswish" && (x[i] == -3f || x[i] == 3f)) continue;   // one-sided at the kinks: either side is right
+            Assert.True(!float.IsNaN(actual[i]) && !float.IsInfinity(actual[i]), $"{op}: non-finite result at {i}");
             double expected = g[i] * Derivative(op, x[i]);
             // Relative to the incoming gradient: the derivatives are O(1) and cross zero (Swish near -1.28, Mish near -1.19),
             // where an error relative to the product itself measures cancellation, not the kernel.

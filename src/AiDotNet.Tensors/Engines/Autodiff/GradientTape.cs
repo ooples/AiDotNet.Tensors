@@ -1139,61 +1139,18 @@ public sealed class GradientTape<T> : IDisposable
         // so inside the release window) and the loss outlive the tape, for as long as the caller holds them.
         KeepAfterTape(loss);
         HoldOverStepBoundary(loss);
-        // Asked for every gradient (no sources), the caller is handed the non-leaf ones too. As PyTorch keeps no .grad
-        // on a non-leaf tensor it was not told to retain, those are freed when this tape is disposed, on the device and
-        // in stream order, instead of waiting for the GC; leaf gradients (parameters, inputs) and retained ones stay.
-        var nonLeaf = sources is null && !createGraph && seedOverride is null && _engine.Is<DirectGpuTensorEngine>()
-            && !DifferentiableOps._isBackwardCreateGraph ? EntryOutputs() : null;
-        HashSet<object>? keptStorage = null;
-        List<Tensor<T>>? toRelease = null;
-        foreach (var pair in grads)
+        // Every returned gradient belongs to the caller, including non-leaf gradients from an unfiltered call.
+        foreach (var gradient in grads.Values)
         {
-            var gradient = pair.Value;
             if (gradient is null) continue;
-            if (nonLeaf is not null && nonLeaf.Contains(pair.Key) && _retainGrad?.Contains(pair.Key) != true)
-            {
-                (toRelease ??= new List<Tensor<T>>()).Add(gradient);
-                continue;
-            }
             KeepAfterTape(gradient);
             HoldOverStepBoundary(gradient);
-            if (nonLeaf is not null)
-            {
-                keptStorage ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
-                keptStorage.Add(gradient.StorageIdentity);
-                keptStorage.Add(gradient.DataVector);
-            }
         }
-        if (toRelease is not null)
-        {
-            // A non-leaf gradient sharing storage with something that stays (a leaf's gradient, the loss, a forward
-            // value: views and pass-through backwards alias) is not freed.
-            var kept = ForwardStorageOfEntries();
-            foreach (var tensor in EntryTensors()) kept.Add(tensor.StorageIdentity);
-            if (keptStorage is not null) kept.UnionWith(keptStorage);
-            kept.Add(loss.StorageIdentity);
-            kept.Add(loss.DataVector);
-            foreach (var gradient in toRelease)
-            {
-                if (kept.Contains(gradient.StorageIdentity) || kept.Contains(gradient.DataVector)) continue;
-                kept.Add(gradient.StorageIdentity);   // once per storage
-                (_nonLeafGradients ??= new List<Tensor<T>>()).Add(gradient);
-            }
-        }
+
 
         return grads;
     }
 
-    // Non-leaf gradients handed back by a backward with no sources: freed at this tape's dispose.
-    private List<Tensor<T>>? _nonLeafGradients;
-
-    private HashSet<Tensor<T>> EntryOutputs()
-    {
-        var outputs = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-        for (int i = 0; i < _entries.Count; i++)
-            if (_entries[i].Output is { } o) outputs.Add(o);
-        return outputs;
-    }
 
     private IEnumerable<Tensor<T>> EntryTensors()
     {
@@ -3321,11 +3278,6 @@ public sealed class GradientTape<T> : IDisposable
         // becomes safe-to-not-execute (no-op) once cleared.
         _cachedDelegateChain?.Clear();
         _cachedDelegateChain = null;
-        if (_nonLeafGradients is { } nonLeafGradients && _engine.TryGet<DirectGpuTensorEngine>(out var nonLeafEngine))
-        {
-            _nonLeafGradients = null;
-            foreach (var gradient in nonLeafGradients) nonLeafEngine.ReleaseDeadDeviceStorage(gradient, afterQueuedWork: true);
-        }
 
         // Issue #283 fix: invalidate ONLY this tape's forward-recorded
         // outputs from the GPU activation cache BEFORE resetting the

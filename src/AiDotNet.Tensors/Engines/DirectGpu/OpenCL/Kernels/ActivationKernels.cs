@@ -998,9 +998,9 @@ __kernel void hardswish_backward(
 
     float x = input[idx];
     float grad;
-    if (x <= -3.0f) {
+    if (x < -3.0f) {
         grad = 0.0f;
-    } else if (x >= 3.0f) {
+    } else if (x > 3.0f) {
         grad = 1.0f;
     } else {
         grad = (2.0f * x + 3.0f) / 6.0f;

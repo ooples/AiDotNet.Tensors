@@ -236,7 +236,7 @@ internal sealed class NoamHoldAnnealingLr : CompletedStepLr
     {
         double trainingStep = t + 1.0;
         if (trainingStep < _warmup) return _peak * trainingStep / _warmup;
-        if (trainingStep < _warmup + _hold) return _peak;
+        if (trainingStep < (long)_warmup + _hold) return _peak;
         double decayStep = trainingStep - _hold;
         return _peak * System.Math.Pow(_warmup / decayStep, _decayRate);
     }
@@ -266,7 +266,7 @@ internal sealed class CosineWarmRestartsLr : CompletedStepLr
 
     internal override double RateAfter(int t)
     {
-        long accumulated = 0;
+        long accumulated = _tMult == 1 ? (long)(t / _t0) * _t0 : 0;
         double currentPeriod = _t0;
         while (accumulated + currentPeriod <= t)
         {
@@ -418,7 +418,7 @@ internal sealed class SequentialLr : LrSchedule
         int completed = step <= 1 ? 0 : step - 1;
         if (completed == 0) return _schedules[0].GetLr(1);
         int index = 0;
-        while (index < _milestones.Length && completed > _milestones[index]) index++;
+        while (index < _milestones.Length && completed >= _milestones[index]) index++;
         int start = index == 0 ? 0 : _milestones[index - 1];
         return _schedules[index].GetLr(completed - start + 1);
     }

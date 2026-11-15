@@ -46,7 +46,7 @@ internal sealed class FusedLrScheduleCheckpoint
 
     public LrSchedule ToSchedule()
     {
-        Validate();
+        ValidateShape();
         // An external rate stays external, so the caller can keep setting it on the restored plan.
         if (Kind == FusedLrScheduleKind.External)
             return new ExternalLrSchedule(Doubles[0]);
@@ -61,6 +61,12 @@ internal sealed class FusedLrScheduleCheckpoint
     /// inside <c>GetLr</c> mid-training (or silently restoring an invalid schedule).
     /// </summary>
     public void Validate()
+    {
+        ValidateShape();
+        if (CompletedStepLr.IsFamilyKind(Kind)) CompletedStepLr.Restore(Kind, Doubles, Ints);
+    }
+
+    private void ValidateShape()
     {
         (int reqD, int reqI) = Kind switch
         {
@@ -112,7 +118,7 @@ internal sealed class FusedLrScheduleCheckpoint
             foreach (double v in Doubles)
                 if (double.IsNaN(v) || double.IsInfinity(v))
                     throw new System.IO.InvalidDataException($"Serialized LR schedule kind {Kind} has a non-finite value.");
-            CompletedStepLr.Restore(Kind, Doubles, Ints);   // the constructors' own validation
+            // Construction validation is performed once by ToSchedule or Validate.
         }
     }
 

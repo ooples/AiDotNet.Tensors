@@ -7,6 +7,19 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 public class CompiledOpShapeCacheTests
 {
+    [Fact]
+    public void Moe_with_materialized_operands_aborts_before_eager_forward()
+    {
+        var engine = new CpuEngine();
+        var x = new Tensor<float>(new[] { 1, 2 });
+        var scores = new Tensor<float>(new[] { 1, 1 });
+        var weight = new Tensor<float>(new[] { 1, 2, 2 });
+        using var scope = GraphMode.EnableProbe();
+        Assert.Throws<ObjectiveProbeAbortedException>(() =>
+            engine.MoeSwiGlu(x, scores, null, weight, weight, weight, 1, 1, out _));
+        Assert.Empty(scope.Nodes);
+    }
+
     private static Tensor<float> Values(int[] shape, float[] values) => new(values, shape);
 
     private sealed class CountingEngine : CpuEngine

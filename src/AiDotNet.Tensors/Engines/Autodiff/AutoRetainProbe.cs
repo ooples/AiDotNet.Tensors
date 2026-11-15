@@ -55,6 +55,12 @@ internal static class AutoRetainProbe
     private static readonly Dictionary<long, List<Quarantined>> s_windows = new();   // per graph signature
     private static readonly object s_lock = new();
     private static volatile bool s_active;
+    private static readonly ConcurrentDictionary<string, long> s_identities = new(StringComparer.Ordinal);
+    private static long s_nextIdentity = long.MinValue;
+
+    // Equality of the full structural description, not equality of a lossy shape hash.
+    internal static long InternIdentity(string description) => s_identities.GetOrAdd(description,
+        _ => System.Threading.Interlocked.Increment(ref s_nextIdentity));
 
     /// <summary>Whether a probe window is open: only then do buffer lookups and host reads consult the table.</summary>
     internal static bool Active => s_active;
@@ -130,10 +136,12 @@ internal static class AutoRetainProbe
         var probe = new Probe(key);
         lock (s_lock)
         {
+            if (s_quarantined.TryGetValue(vector, out var previous)) previous.Hit = true;
             s_quarantined.Remove(vector);
             s_quarantined.Add(vector, probe);
             if (array is not null)
             {
+                if (s_quarantined.TryGetValue(array, out previous)) previous.Hit = true;
                 s_quarantined.Remove(array);
                 s_quarantined.Add(array, probe);
             }
@@ -159,8 +167,10 @@ internal static class AutoRetainProbe
     {
         foreach (var q in window)
         {
-            if (q.Vector.TryGetTarget(out var vector)) s_quarantined.Remove(vector);
-            if (q.Array is not null && q.Array.TryGetTarget(out var array)) s_quarantined.Remove(array);
+            if (q.Vector.TryGetTarget(out var vector) && s_quarantined.TryGetValue(vector, out var owner) && ReferenceEquals(owner, q.Probe))
+                s_quarantined.Remove(vector);
+            if (q.Array is not null && q.Array.TryGetTarget(out var array) && s_quarantined.TryGetValue(array, out owner) && ReferenceEquals(owner, q.Probe))
+                s_quarantined.Remove(array);
         }
     }
 

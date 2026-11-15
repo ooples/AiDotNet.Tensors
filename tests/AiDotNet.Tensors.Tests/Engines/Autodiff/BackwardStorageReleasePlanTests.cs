@@ -7,6 +7,21 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 public sealed class BackwardStorageReleasePlanTests
 {
     [Fact]
+    public void Colliding_polynomial_shape_hashes_have_distinct_retention_identity()
+    {
+        long Signature(int[] shape)
+        {
+            using var output = new Tensor<float>(shape);
+            var steps = new[] { new BackwardStep<float> { Output = output, Inputs = Array.Empty<Tensor<float>>(), Backward = null! } };
+            var plan = BackwardStorageReleasePlan<float>.Create(steps, 1);
+            return (long)typeof(BackwardStorageReleasePlan<float>).GetField("_signature",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(plan)!;
+        }
+        Assert.NotEqual(Signature(new[] { 1, 32 }), Signature(new[] { 2, 1 }));
+        Assert.Equal(Signature(new[] { 1, 32 }), Signature(new[] { 1, 32 }));
+    }
+
+    [Fact]
     public void AliasStorage_IsReleasedAfterFinalSavedStateUse_NotAliasStep()
     {
         using var saved = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 2, 2 });

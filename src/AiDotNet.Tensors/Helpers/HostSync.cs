@@ -35,7 +35,7 @@ internal abstract class ReleaseNote
     internal abstract string Describe();
 
     /// <summary>Runs when something reads the released storage, just before the read throws.</summary>
-    internal virtual void OnRead() { }
+    internal abstract void OnRead();
 }
 
 internal sealed class HostSync

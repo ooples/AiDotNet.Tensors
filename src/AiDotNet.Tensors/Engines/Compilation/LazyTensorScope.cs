@@ -360,8 +360,13 @@ internal sealed class LazyTensorScope : IDisposable
         long since = prevProducer?.RecordOrder ?? 0;
         var readers = new List<ILazyNode>();
         foreach (var recorded in _nodes)
-            if (recorded is LazyNode<T> reader && reader.RecordOrder > since && !reader.WritesInPlace && reader.Reads(target))
-                readers.Add(reader);
+            if (recorded.RecordOrder > since && recorded is ISignableLazyNode reader)
+                for (int inputIndex = 0; inputIndex < reader.SignatureInputCount; inputIndex++)
+                    if (ReferenceEquals(reader.GetSignatureInput(inputIndex), target))
+                    {
+                        readers.Add(recorded);
+                        break;
+                    }
         node.SetEarlierReaders(readers.ToArray());
         target.LazySource = node;
         AddNode(node);

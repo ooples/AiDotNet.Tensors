@@ -167,7 +167,7 @@ internal sealed class BackwardStorageReleasePlan<T>
             // A producer's structural key: its backward function, output shape and ordinal among same-keyed outputs,
             // stable across the per-step rebuilds of the same graph. The graph signature combines them all.
             var ordinals = new Dictionary<long, int>();
-            long signature = stepCount;
+            var graphKeys = new List<long>();
             foreach (var usage in _usage.Values)
             {
                 if (usage.ReleaseCandidate is null) continue;
@@ -176,19 +176,19 @@ internal sealed class BackwardStorageReleasePlan<T>
                 long key;
                 unchecked
                 {
-                    long shapeKey = (producer?.MetadataToken ?? 0) * 1_000_003L + (producer?.Module.GetHashCode() ?? 0);
-                    foreach (int d in usage.ReleaseCandidate._shape) shapeKey = shapeKey * 31 + d;
+                    long shapeKey = AutoRetainProbe.InternIdentity($"producer:{producer?.MethodHandle.Value}:{string.Join(",", usage.ReleaseCandidate._shape)}");
                     ordinals.TryGetValue(shapeKey, out int ordinal);
                     ordinals[shapeKey] = ordinal + 1;
-                    key = shapeKey * 1_000_033L + ordinal;
-                    signature = (signature * 1_099_511_628_211L) ^ key;
+                    key = AutoRetainProbe.InternIdentity($"output:{shapeKey}:{ordinal}");
+                    graphKeys.Add(key);
                 }
                 if (releases[step] is { } slot)
                     slot[counts[step]++] = new ReleaseCandidate(usage.Identity, usage.ReleaseCandidate,
                         new LastUseReleaseNote(usage.ReleaseCandidate._shape, producer, usage.ProducerStep, method(step), step, key), key);
             }
 
-            return new BackwardStorageReleasePlan<T>(releases, signature);
+            return new BackwardStorageReleasePlan<T>(releases,
+                AutoRetainProbe.InternIdentity($"graph:{stepCount}:{string.Join(",", graphKeys)}"));
         }
     }
 
@@ -318,9 +318,10 @@ internal sealed class BackwardStorageReleasePlan<T>
             {
                 var tensor = candidate.Tensor;
                 var note = candidate.Note;
+                var storage = candidate.StorageIdentity;
                 var weak = new WeakReference<Tensor<T>>(tensor);   // the quarantine must not keep it alive
                 AutoRetainProbe.Quarantine(_signature, tensor.DataVector, tensor.GetBackingArrayForCacheLookupUnsafe(),
-                    candidate.Key, () => { if (weak.TryGetTarget(out var held)) engine.ReleaseDeadActivation(held, note); });
+                    candidate.Key, () => { if (weak.TryGetTarget(out var held) && ReferenceEquals(held.StorageIdentity, storage)) engine.ReleaseDeadActivation(held, note); });
                 continue;
             }
             engine.ReleaseDeadActivation(candidate.Tensor, candidate.Note);
@@ -415,8 +416,10 @@ internal sealed class GpuBackwardRelease<T>
     internal void ReleaseAfterStep(int step)
         => _plan?.ReleaseAfterStep(step, _engine, _protectedStorages);
 
-    internal void AfterCompletedStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> stepOutput, int step)
+    internal void AfterCompletedStep(Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> stepOutput, int step,
+        Tensor<T>[] inputs, bool opaque)
     {
+        _gradientReleaser?.Observe(grads, inputs, opaque);
         _gradientReleaser?.AfterStep(grads, stepOutput, _engine);
         _plan?.ReleaseAfterStep(step, _engine, _protectedStorages);
     }

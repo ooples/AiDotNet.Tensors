@@ -225,25 +225,37 @@ public sealed partial class CudaBackend
     /// accumulating GEMM, a split-K reduction, our own scratch consumer), or "after kernel" when nothing depends on it.
     /// Diagnostics only; an introspection call that fails leaves that part of the entry as "?".
     /// </summary>
+    // CUDA driver API cuda.h layouts on the supported 64-bit host ABI.
+    private static class GraphNodeAbi
+    {
+        internal const int KernelType = 0, MemcpyType = 1, MemsetType = 2, FreeType = 11;
+        internal const int MemsetParamsSize = 40, KernelParamsSize = 56;
+        internal const int MemsetElementSize = 20, MemsetWidth = 24, MemsetHeight = 32;
+        internal const int KernelFunction = 0;
+        internal static int ScratchSize => Math.Max(MemsetParamsSize, KernelParamsSize);
+    }
+
+
     private static string? DescribeMemsetNodes(IntPtr graph)
     {
+        if (IntPtr.Size != 8) return null; // These native layouts require the x64 CUDA ABI.
         ulong count = 0;
         if (CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref count) != CudaResult.Success || count == 0) return null;
         var nodes = new IntPtr[count];
         if (CudaNativeBindings.cuGraphGetNodesArray(graph, nodes, ref count) != CudaResult.Success) return null;
         var parts = new System.Collections.Generic.List<string>();
-        IntPtr scratch = System.Runtime.InteropServices.Marshal.AllocHGlobal(256);
+        IntPtr scratch = System.Runtime.InteropServices.Marshal.AllocHGlobal(GraphNodeAbi.ScratchSize);
         try
         {
             for (ulong i = 0; i < count; i++)
             {
-                if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) != CudaResult.Success || t != 2) continue;
+                if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) != CudaResult.Success || t != GraphNodeAbi.MemsetType) continue;
                 string bytes = "?";
                 if (CudaNativeBindings.cuGraphMemsetNodeGetParams(nodes[i], scratch) == CudaResult.Success)
                 {
-                    long elementSize = System.Runtime.InteropServices.Marshal.ReadInt32(scratch, 20);
-                    long width = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, 24);
-                    long height = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, 32);
+                    long elementSize = System.Runtime.InteropServices.Marshal.ReadInt32(scratch, GraphNodeAbi.MemsetElementSize);
+                    long width = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, GraphNodeAbi.MemsetWidth);
+                    long height = System.Runtime.InteropServices.Marshal.ReadInt64(scratch, GraphNodeAbi.MemsetHeight);
                     bytes = (elementSize * width * Math.Max(1, height)).ToString(System.Globalization.CultureInfo.InvariantCulture) + "B";
                 }
 
@@ -278,9 +290,9 @@ public sealed partial class CudaBackend
             if (rc != CudaResult.Success) return null;
             for (ulong j = 0; j < n; j++)
             {
-                if (CudaNativeBindings.cuGraphNodeGetType(neighbours[j], out int t) != CudaResult.Success || t != 0) continue;
+                if (CudaNativeBindings.cuGraphNodeGetType(neighbours[j], out int t) != CudaResult.Success || t != GraphNodeAbi.KernelType) continue;
                 if (CudaNativeBindings.cuGraphKernelNodeGetParams(neighbours[j], scratch) != CudaResult.Success) return "kernel";
-                IntPtr func = System.Runtime.InteropServices.Marshal.ReadIntPtr(scratch, 0);
+                IntPtr func = System.Runtime.InteropServices.Marshal.ReadIntPtr(scratch, GraphNodeAbi.KernelFunction);
                 try
                 {
                     return CudaNativeBindings.cuFuncGetName(out var name, func) == CudaResult.Success && name != IntPtr.Zero
@@ -434,10 +446,10 @@ public sealed partial class CudaBackend
         // Diagnostic: how many kernel/memory nodes did the capture actually record? A near-empty graph means
         // the forward's ops were short-circuited (e.g. served from the activation cache) during capture, so
         // replay reproduces a frozen output that ignores refreshed inputs.
-        LastCaptureFreeNodeCount = CountNodes(graph, nodeType: 11); // CU_GRAPH_NODE_TYPE_MEM_FREE
-        LastCaptureKernelNodeCount = CountNodes(graph, nodeType: 0); // CU_GRAPH_NODE_TYPE_KERNEL
-        LastCaptureMemcpyNodeCount = CountNodes(graph, nodeType: 1); // CU_GRAPH_NODE_TYPE_MEMCPY
-        LastCaptureMemsetNodeCount = CountNodes(graph, nodeType: 2); // CU_GRAPH_NODE_TYPE_MEMSET
+        LastCaptureFreeNodeCount = CountNodes(graph, nodeType: GraphNodeAbi.FreeType); // CU_GRAPH_NODE_TYPE_MEM_FREE
+        LastCaptureKernelNodeCount = CountNodes(graph, nodeType: GraphNodeAbi.KernelType); // CU_GRAPH_NODE_TYPE_KERNEL
+        LastCaptureMemcpyNodeCount = CountNodes(graph, nodeType: GraphNodeAbi.MemcpyType); // CU_GRAPH_NODE_TYPE_MEMCPY
+        LastCaptureMemsetNodeCount = CountNodes(graph, nodeType: GraphNodeAbi.MemsetType); // CU_GRAPH_NODE_TYPE_MEMSET
         string? lastMemsetSources = LastCaptureMemsetNodeCount > 0 ? DescribeMemsetNodes(graph) : null;
         { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})");
           // Node-type breakdown (KERNEL/MEMCPY/MEMSET/MEM_ALLOC/MEM_FREE/…) — tells us how much of the chain is

@@ -2436,7 +2436,7 @@ internal static partial class BackwardFunctions<T>
         // which the plan refreshes before each launch. A host index array here would be uploaded inside the capture
         // and replayed with the capture step's ids, as the float-index sister path documents.
         if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deEmb) && deEmb.ResidentStepActive
-            && deEmb.TryEmbeddingBackwardResident<T>(gradOutput, indicesData.Length, vocabSize, embeddingDim, inputs[0]._shape) is { } residentTableGrad)
+            && deEmb.TryEmbeddingBackwardResident<T>(gradOutput, indicesData.Length, vocabSize, embeddingDim, inputs[0]._shape, indicesData) is { } residentTableGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], residentTableGrad, engine);
             return;

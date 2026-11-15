@@ -13,6 +13,21 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class ObjectiveSignatureTests
 {
+    [Fact]
+    public void Parameter_view_reuse_preserves_which_view_is_read()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(2, 2, 1);
+        // Use two distinct views with the same shape but different storage offsets.
+        var a = engine.TensorNarrow(w, 0, 0, 1);
+        var b = engine.TensorNarrow(w, 0, 1, 1);
+        var first = Probe(() => engine.TensorMultiply(engine.TensorAdd(a, b), a), new[] { w }, out _);
+        var second = Probe(() => engine.TensorMultiply(engine.TensorAdd(a, b), b), new[] { w }, out _);
+        Assert.True(first.Signable, first.UnsignableReason);
+        Assert.True(second.Signable, second.UnsignableReason);
+        Assert.NotEqual(first, second);
+    }
+
     private static Tensor<float> Filled(int rows, int cols, int seed)
     {
         var rng = new Random(seed);

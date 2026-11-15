@@ -40,7 +40,7 @@ internal static class FusedOptimizerCheckpointSerializer
     /// <param name="doubleHyperparameters">Whether beta1, beta2, epsilon and weight decay were written as double (every
     /// writer since they became double). False reads the older single-precision layout, so optimizer state exported
     /// before the change still imports.</param>
-    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader, bool doubleHyperparameters = true)
+    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader, bool doubleHyperparameters = true, bool velocityIncludesLearningRate = true)
     {
         if (!reader.ReadBoolean()) return null;
         double ReadHyperparameter() => doubleHyperparameters ? reader.ReadDouble() : reader.ReadSingle();
@@ -58,7 +58,7 @@ internal static class FusedOptimizerCheckpointSerializer
             Int8MomentBlockSize = reader.ReadInt32(),
             Int8MinQuantizedLength = reader.ReadInt32(),
             MaxGradNorm = reader.ReadDouble(),
-            Extras = ReadExtras(reader),
+            Extras = ReadExtras(reader, velocityIncludesLearningRate),
             Schedules = ReadLrSchedules(reader),
             ParamToGroup = ReadIntArray(reader),
             GroupOptimizerTypes = ReadOptimizerTypeArray(reader),
@@ -138,7 +138,7 @@ internal static class FusedOptimizerCheckpointSerializer
         return present ? value : null;
     }
 
-    private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
+    private static FusedOptimizerExtras ReadExtras(BinaryReader reader, bool velocityIncludesLearningRate)
         => new FusedOptimizerExtras
         {
             Momentum = reader.ReadSingle(),
@@ -169,7 +169,7 @@ internal static class FusedOptimizerCheckpointSerializer
             AmsgradDisableBiasCorrection = reader.ReadBoolean(),
             AmsgradExactBeta1 = ReadNullableDouble(reader),
             AmsgradExactBeta2 = ReadNullableDouble(reader),
-            VelocityIncludesLearningRate = reader.ReadBoolean(),
+            VelocityIncludesLearningRate = velocityIncludesLearningRate && reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

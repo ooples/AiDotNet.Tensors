@@ -52,6 +52,12 @@ public class CompiledGpuAliasGradientPoolingTests
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.001f);
             if (!captured && plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
             for (int s = 0; s < steps; s++) plan.Step();
+            if (captured)
+            {
+                var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(plan)!;
+                Assert.NotEqual(IntPtr.Zero, exec);
+            }
             var all = new List<float>();
             foreach (var p in parameters) all.AddRange(p.ToArray());
             return (all.ToArray(), pooled);
@@ -71,6 +77,8 @@ public class CompiledGpuAliasGradientPoolingTests
             return;
         }
         Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
+        Skip.If(captured && (gpu.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend
+            || Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0"), "CUDA graph capture required.");
         bool previous = CompiledTrainingPlan<float>.PoolAliasTargetGradients;
         using (gpu)
         {

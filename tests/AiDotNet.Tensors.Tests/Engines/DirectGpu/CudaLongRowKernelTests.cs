@@ -105,7 +105,7 @@ public sealed class CudaLongRowKernelTests
             Assert.True(ran, "the sorted scatter did not run (kernels missing?)");
             var actual = cuda.DownloadBuffer(output);
             for (int i = 0; i < expected.Length; i++)
-                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected[i]) == TestHelpers.MathCompat.SingleToInt32Bits(actual[i]),
                     $"output[{i / features}, {i % features}]: gpu {actual[i]} cpu {expected[i]}");
         }
     }

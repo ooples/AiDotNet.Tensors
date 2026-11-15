@@ -202,7 +202,14 @@ Token rules (spec §Signature):
 - Consumes: Task 4 `FusedTrainingStepRequest<T>.ClosureObjective`.
 - Produces: `internal static T ObjectiveStep(object owner, Func<IReadOnlyList<Tensor<T>>> parameters,
   Func<Tensor<T>> objective, IGradientBasedOptimizer<T, Tensor<T>, Tensor<T>> optimizer, EagerStepHooks hooks)`.
-  It tries the fused closure path and otherwise runs the existing `EagerTapeStep`.
+  An arbitrary objective runs exactly once through the existing `EagerTapeStep`. It must not be probed and then
+  invoked again after an abort or signature mismatch: batch iteration, RNG, and other external effects cannot be rolled back.
+  Compilation requires an explicit prepared-step contract: call `prepareStep` exactly once before probing to consume
+  the batch, sample randomness, and perform step effects. Its result owns immutable step inputs and exposes a replay-safe
+  `evaluate` closure that only computes tensors from those inputs and model state. Probe, compilation, and eager fallback
+  may evaluate that same prepared step; none may call `prepareStep` again. Keep its inputs alive through the update and
+  dispose them afterward. A plain `Func<Tensor<T>>` carries no such guarantee and remains eager unless its caller explicitly
+  supplies this contract. This contract is required AiDotNet integration work; the Tensors guard does not implement rollback.
   - Stays eager when `hooks.BeforeUpdate` is set, the optimizer is a line-search one, or
     `TensorCodecOptions.Current.EnableCompilation` is false.
   - The SGD variant maps to the fused SGD optimizer type.
@@ -210,6 +217,9 @@ Token rules (spec §Signature):
 - [ ] **Step 1: Write the tests** (theory over families, each 5 steps with fresh data, compiled vs eager from cloned
   weights, plus `FusedSteps > 0`): DDPM via `StepWithCustomLoss`, OCTGAN generator, a `SelfSupervisedLearningMethodBase`
   method, `FTTransformerClassifier`, a `TensorModelTrainer` model, `ChronosT5`.
+  Also force probe abort and signature mismatch after preparation; assert the batch cursor and RNG advance once,
+  fallback/compilation consume the identical prepared tensors, and each update matches a single eager invocation.
+  Verify a side-effecting plain objective bypasses probing entirely.
 - [ ] **Step 2: Implement** the routing. `TapeTrainingLoopRatchetTests` must stay green.
 - [ ] **Step 3: Build.** Expected `0 Error(s)`.
 - [ ] **Step 4: Commit and open the AiDotNet draft PR.** Mark it ready only when CI evidence is needed (AiDotNet draft

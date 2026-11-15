@@ -14,6 +14,14 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class CompletedStepLrScheduleTests
 {
+    [Fact]
+    public void Large_steps_preserve_hold_and_constant_restart_periods()
+    {
+        Assert.Equal(1.0, LrSchedule.NoamHoldAnnealing(1.0, 1500000000, 1500000000, 0.5).GetLr(2000000000));
+        var restarts = LrSchedule.CosineWarmRestarts(0.1, 2);
+        Assert.Equal(restarts.GetLr(1), restarts.GetLr(int.MaxValue));
+    }
+
     public static IEnumerable<object[]> Schedules()
     {
         yield return new object[] { "wsd", LrSchedule.WarmupStableDecay(3e-4, 10, 50, 30, StableDecayShape.OneMinusSqrt, 1e-5) };
@@ -61,9 +69,9 @@ public class CompletedStepLrScheduleTests
         var a = LrSchedule.Polynomial(1.0, 10);
         var b = LrSchedule.MultiStep(0.5, new[] { 2 }, 0.1);
         var s = LrSchedule.Sequential(new[] { a, b }, new[] { 4 });
-        // Steps 1-5 = 0-4 completed: schedule a. Step 6 = 5 completed, the first step of b after its start: b step 2.
-        for (int step = 1; step <= 5; step++) Assert.Equal(a.GetLr(step), s.GetLr(step));
-        for (int step = 6; step <= 20; step++) Assert.Equal(b.GetLr(step - 4), s.GetLr(step));
+        // After four completed steps, schedule b begins at its own step one.
+        for (int step = 1; step <= 4; step++) Assert.Equal(a.GetLr(step), s.GetLr(step));
+        for (int step = 5; step <= 20; step++) Assert.Equal(b.GetLr(step - 4), s.GetLr(step));
     }
 
     [Fact]

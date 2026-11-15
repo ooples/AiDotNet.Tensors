@@ -305,6 +305,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             DetachDeviceBinding(grad);
             using (var own = new Tensor<T>((int[])grad._shape.Clone()))
                 grad.RebindStorageFrom(own);
+            if (_aliasedGradViews is not null)
+                foreach (var alias in _aliasedGradViews)
+                    if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
         }
         _pooledGradients = null;
         _deferredZeroByAction = null;
@@ -323,6 +326,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         DetachDeviceBinding(grad);
         using (var own = new Tensor<T>((int[])grad._shape.Clone()))
             grad.RebindStorageFrom(own);
+        if (_aliasedGradViews is not null)
+            foreach (var alias in _aliasedGradViews)
+                if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
         pooled[index] = false;
         _cachedGradArrays = null;   // rebound
     }
@@ -502,6 +508,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
 
@@ -5860,6 +5867,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // A captured step graph holds kernel nodes wired to the OLD optimizer state
@@ -7326,6 +7334,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         // Drop any captured step graph wired to the old optimizer state (see
@@ -7993,6 +8002,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
@@ -8208,6 +8218,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
@@ -8510,6 +8521,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
+        _lrVelocityScratch.Clear();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _capturedOptimizerFactory = null;
@@ -8970,10 +8982,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             int version = reader.ReadInt32();
             // Version 3 wrote the hyperparameters as float; it is still read, so state exported before they became
             // double imports unchanged (with the float-rounded values it was saved with).
-            if (version != OptimizerStateVersion && version != SingleHyperparameterOptimizerStateVersion)
+            if (version != OptimizerStateVersion && version != 4 && version != SingleHyperparameterOptimizerStateVersion)
                 throw new InvalidDataException(
                     $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
-            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader, doubleHyperparameters: version >= OptimizerStateVersion);
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader, doubleHyperparameters: version >= 4, velocityIncludesLearningRate: version >= OptimizerStateVersion);
         }
         catch (EndOfStreamException ex)
         {
@@ -8991,7 +9003,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // 3: the extras gained AMSGrad's decoupled-decay switch (format 8), bias-correction switch (format 9) and exact
     //    betas (format 10). Each also changed this payload's layout without a bump, so "version 2" names more than
     //    one layout and a reader cannot tell which it holds: every version 2 payload is rejected, never misread.
-    private const int OptimizerStateVersion = 4;
+    // 5: adds VelocityIncludesLearningRate; versions 3/4 restore the original velocity convention.
+    private const int OptimizerStateVersion = 5;
     private const int SingleHyperparameterOptimizerStateVersion = 3;
 
     /// <inheritdoc/>
@@ -10428,7 +10441,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return (result, pooled);
     }
     /// <summary>
-    /// AIDOTNET_GRAD_POOL_DIAG=1: why each gradient is or is not pooled, by count and bytes, on stderr. The unpooled ones
+    /// AIDOTNET_GRAD_POOL_DIAG=1: why each gradient is or is not pooled, by count and bytes, through AiDotNetEngine.Logger. The unpooled ones
     /// each hold an array (and on a GPU a device buffer) of their own for the plan's life.
     /// </summary>
     private static void TraceGradientPooling(List<int> tenants, List<int> capacity, List<Tensor<T>> allGrads,
@@ -10454,9 +10467,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Add(reason, grad.Length);
         }
         long pooledBytes = capacity.Sum(c => (long)c) * esz;
-        Console.Error.WriteLine($"[GRAD-POOL] {allGrads.Count} gradients; {capacity.Count} shared arrays hold the pooled ones in {pooledBytes / 1048576.0:F1} MB");
+        AiDotNetEngine.Logger?.Invoke($"[GRAD-POOL] {allGrads.Count} gradients; {capacity.Count} shared arrays hold the pooled ones in {pooledBytes / 1048576.0:F1} MB");
         foreach (var entry in reasons)
-            Console.Error.WriteLine($"[GRAD-POOL]   {entry.Key}: {entry.Value.Count} gradients, {entry.Value.Bytes / 1048576.0:F1} MB");
+            AiDotNetEngine.Logger?.Invoke($"[GRAD-POOL]   {entry.Key}: {entry.Value.Count} gradients, {entry.Value.Bytes / 1048576.0:F1} MB");
     }
 
     /// <summary>

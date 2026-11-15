@@ -107,11 +107,14 @@ public sealed class AutoRetainProbeTests : IDisposable
         AutoRetainProbe.BeginRun(GraphA);
         var vector = new object();
         var array = new object();
-        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 55, () => { });
-        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 56, () => { });
+        int released = 0;
+        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 55, () => released++);
+        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 56, () => released++);
         AutoRetainProbe.NoteAccess(vector);
         Assert.True(AutoRetainProbe.IsRetained(56));
         Assert.False(AutoRetainProbe.IsRetained(55));
+        AutoRetainProbe.BeginRun(GraphA);
+        Assert.Equal(0, released);
         GC.KeepAlive(vector);
         GC.KeepAlive(array);
     }

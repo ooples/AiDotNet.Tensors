@@ -4,8 +4,8 @@ Date: 2026-11-14. Repos: AiDotNet.Tensors (compiled-plan machinery) and AiDotNet
 
 ## Intent
 
-Every AiDotNet model should train on a compiled plan by default, because eager is always slower and the library's
-job is to pick the best settings for a beginner. About 130 model files currently never try one:
+Eligible AiDotNet models should try compiled plans, with performance established by measurement. About 130 model
+files currently never try one:
 
 - `NeuralNetworkBase.TrainWithCustomLoss`: 93 callers.
 - `TapeTrainingStepper.EagerObjectiveStep` / `EagerSgdObjectiveStep`: about 17 direct callers. These include
@@ -16,12 +16,15 @@ They stay eager because their loss is a closure. A closure creates its per-step 
 samples, a sampled timestep) as new tensors and scalars inside itself, and a compiled plan traced once would replay
 the first step's values forever.
 
-The fix belongs in shared code: model authors write only their loss, and new models need no extra work. Eager stays
-correct and selectable.
+The guard belongs in shared code. Side-effecting objectives require an explicit prepared-step contract before
+they are eligible: consume the batch, sample randomness and perform step effects exactly once, then expose a
+replay-safe tensor computation over those fixed inputs. An abort or mismatch may reevaluate that computation,
+but must not repeat preparation. Arbitrary `Func<Tensor<T>>` objectives remain eager; the guard cannot roll back
+RNGs, iterators or external state. Task 5 of the implementation plan defines this required integration contract.
 
 ## Goals
 
-- Closure objectives run on a compiled plan, CUDA graph included, with no per-model code.
+- Replay-safe prepared objectives can run on a compiled plan, CUDA graph included.
 - It is correct by construction: a step whose closure differs from the compiled one in any way the plan would freeze
   never replays that plan.
 - Per-step overhead stays well below an eager step. A model where it doesn't falls back to eager, chosen by
@@ -43,7 +46,7 @@ correct and selectable.
 
 ## Approaches considered
 
-1. **Re-trace and rebind (chosen).** Each step, re-run the closure as a storage-free probe trace. Compare its
+1. **Re-trace and rebind (chosen for replay-safe prepared objectives).** Each step, re-run the computation as a storage-free probe trace. Compare its
    signature with the compiled plan's. If they match, copy the new step's leaf data into the plan's leaves and replay
    the plan. Pros: generic, base-class level, correct by construction. Cons: host tracing cost every step.
 2. **Migrate call sites.** Move each of the ~130 files to `TrainObjectiveFused` with per-step tensors packed into

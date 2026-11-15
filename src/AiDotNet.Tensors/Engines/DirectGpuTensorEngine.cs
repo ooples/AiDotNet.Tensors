@@ -2559,6 +2559,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             return GetOrAllocateBuffer(backend, tensor);
 
+        if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
         int hostVersion = tensor.GpuCacheVersion;
         // Fast path: tensor has a GPU buffer from a previous GPU operation, and
         // the tensor's CPU-side Version hasn't advanced since the upload. Stale-
@@ -7004,36 +7005,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (NotSupportedException eex) { GpuLaunchProbe.OnFallback("TryEmbeddingFromFloatIndicesResidentInto", eex); AliasDiag($"EmbFloat-resident FELLBACK n={numIndices} dim={embeddingDim}: {eex.GetType().Name}: {eex.Message}"); return false; }
     }
-
-    /// <summary>PR #638 A1: resident embedding BACKWARD — scatter-add the grad rows into a resident [vocab,dim]
-    /// table-grad via the backend EmbeddingBackward kernel, reusing the forward's STABLE on-device index buffer
-    /// (_cachedEmbIndexBuffer) so the float-index GetDataArray() download that aborts capture is skipped entirely.
-    /// Returns the bound table-grad, else null (off the resident step / no cached indices → caller's CPU path).</summary>
-    internal Tensor<T>? TryEmbeddingBackwardResident<T>(Tensor<T> gradOutput, int numIndices, int vocabSize, int embeddingDim, int[] tableShape)
-    {
-        using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
-        if (!TryGetBackend(out var backend) || _cachedEmbIndexBuffer is null) return null;
-        if ((long)numIndices * embeddingDim != gradOutput.Length) return null;
-        var grad = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-        var gR = ResolveResidentBufferNoUpload(backend, grad, numIndices * embeddingDim);
-        if (gR is null) return null;
-        try
-        {
-            var gradTable = new Tensor<T>(new T[(long)vocabSize * embeddingDim], tableShape);
-            var gradBuf = GetOrCreateResidentBuffer(backend, gradTable, vocabSize * embeddingDim);
-            if (gradBuf.Handle == System.IntPtr.Zero || gradBuf.Size < (long)vocabSize * embeddingDim) return null;
-            // Capturable zero (cuMemsetD8Async); backend.Fill (cuMemsetD32) aborts capture (906). Scatter-ADD needs 0-init.
-            if (backend is IDeviceZeroFill zeroEmb)
-                zeroEmb.ZeroBuffer(gradBuf, vocabSize * embeddingDim);
-            else backend.Fill(gradBuf, 0f, vocabSize * embeddingDim);
-            backend.EmbeddingBackward(gR, _cachedEmbIndexBuffer, gradBuf, numIndices, embeddingDim, vocabSize);
-            ResidentSyncCheck("EmbeddingBackward");
-            BindResidentBuffer(gradTable, gradBuf, backend);
-            return gradTable;
-        }
-        catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("TryEmbeddingBackwardResident", ex); AliasDiag($"EmbeddingBackward-resident FELLBACK n={numIndices} dim={embeddingDim}: {ex.GetType().Name}: {ex.Message}"); return null; }
-    }
+    /// <summary>The engine-wide forward index buffer has no per-lookup ownership. Decline this shortcut
+    /// until indices are retained per lookup, including across graph replay; use the saved-index backward path.</summary>
+    internal Tensor<T>? TryEmbeddingBackwardResident<T>(Tensor<T> gradOutput, int numIndices, int vocabSize, int embeddingDim, int[] tableShape, long[]? expectedIndices = null)
+        => null;
 
     /// <summary>GPU-RESIDENT slice-along-axis for the compiled step (e.g. the LM-head last-token select
     /// [B,S,D]→[B,D]): backend.SliceAxis into the destination's stable buffer — no host TensorSliceAxis that

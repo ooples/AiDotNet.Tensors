@@ -43,7 +43,8 @@ internal sealed class CudaStepArena : IDisposable
     private readonly List<int> _sizes = new();
     private readonly List<long> _allocatedAt = new();
     private readonly List<long> _returnedAt = new();
-    private readonly Dictionary<CudaBackend.CudaGpuBuffer, int> _recorded = new(Autodiff.ReferenceEqualityComparer<CudaBackend.CudaGpuBuffer>.Instance);
+    private ConditionalWeakTable<CudaBackend.CudaGpuBuffer, RecordedSlot> _recorded = new();
+    private sealed class RecordedSlot { internal int Index; internal RecordedSlot(int index) => Index = index; }
     private long _clock;
     private int _pendingRecord = -1;
 
@@ -72,14 +73,12 @@ internal sealed class CudaStepArena : IDisposable
     {
         internal readonly int[] Size;
         internal readonly long[] Offset;     // -1: pool
-        internal readonly int[][] Conflicts; // slots sharing memory: all must be dead to hand this one out
         internal readonly long Bytes;
 
-        internal Plan(int[] size, long[] offset, int[][] conflicts, long bytes)
+        internal Plan(int[] size, long[] offset, long bytes)
         {
             Size = size;
             Offset = offset;
-            Conflicts = conflicts;
             Bytes = bytes;
         }
     }
@@ -93,6 +92,7 @@ internal sealed class CudaStepArena : IDisposable
         internal int Live;
         internal int ArenaDisposed;
 
+        internal RangeOccupancy? Occupancy;
         internal Block(IntPtr ptr, IntPtr context, long contextGeneration, int slots)
         {
             Ptr = ptr;
@@ -103,6 +103,58 @@ internal sealed class CudaStepArena : IDisposable
     }
 
     /// <summary>
+    // Compressed range occupancy: O(n) metadata, O(log n) admission/return, including identical offsets.
+    internal sealed class RangeOccupancy
+    {
+        private readonly int[] _start, _end, _max, _lazy;
+        private readonly int _segments;
+
+        internal RangeOccupancy(long[] offsets, long[] bytes)
+        {
+            var endpoints = new SortedSet<long>();
+            for (int i = 0; i < offsets.Length; i++)
+                if (offsets[i] >= 0) { endpoints.Add(offsets[i]); endpoints.Add(offsets[i] + bytes[i]); }
+            var points = endpoints.ToArray();
+            _segments = Math.Max(1, points.Length - 1);
+            _start = new int[offsets.Length];
+            _end = new int[offsets.Length];
+            for (int i = 0; i < offsets.Length; i++)
+            {
+                _start[i] = Array.BinarySearch(points, offsets[i]);
+                _end[i] = Array.BinarySearch(points, offsets[i] + bytes[i]) - 1;
+            }
+            _max = new int[4 * _segments];
+            _lazy = new int[4 * _segments];
+        }
+
+        internal bool TryAcquire(int slot)
+        {
+            if (_start[slot] < 0 || Query(1, 0, _segments - 1, _start[slot], _end[slot]) != 0) return false;
+            Add(1, 0, _segments - 1, _start[slot], _end[slot], 1);
+            return true;
+        }
+
+        internal void Release(int slot) => Add(1, 0, _segments - 1, _start[slot], _end[slot], -1);
+
+        private int Query(int node, int lo, int hi, int from, int to)
+        {
+            if (from <= lo && hi <= to) return _max[node];
+            int mid = lo + (hi - lo) / 2, value = 0;
+            if (from <= mid) value = Query(node * 2, lo, mid, from, to);
+            if (to > mid) value = Math.Max(value, Query(node * 2 + 1, mid + 1, hi, from, to));
+            return value + _lazy[node];
+        }
+
+        private void Add(int node, int lo, int hi, int from, int to, int delta)
+        {
+            if (from <= lo && hi <= to) { _max[node] += delta; _lazy[node] += delta; return; }
+            int mid = lo + (hi - lo) / 2;
+            if (from <= mid) Add(node * 2, lo, mid, from, to, delta);
+            if (to > mid) Add(node * 2 + 1, mid + 1, hi, from, to, delta);
+            _max[node] = _lazy[node] + Math.Max(_max[node * 2], _max[node * 2 + 1]);
+        }
+    }
+
     /// The planned slot for this allocation, or null for the pool. Call on the allocating thread only inside a
     /// training step (<see cref="TrainingStep.InStep"/>); when it returns null while recording, pass the pool's buffer to
     /// <see cref="Track"/>.
@@ -139,7 +191,7 @@ internal sealed class CudaStepArena : IDisposable
     internal void Track(CudaBackend.CudaGpuBuffer buffer)
     {
         if (_pendingRecord < 0) return;
-        lock (_lock) _recorded[buffer] = _pendingRecord;
+        lock (_lock) { _recorded.Remove(buffer); _recorded.Add(buffer, new RecordedSlot(_pendingRecord)); }
         _pendingRecord = -1;
     }
 
@@ -149,10 +201,10 @@ internal sealed class CudaStepArena : IDisposable
         if (_mode != Mode.Recording) return;
         lock (_lock)
         {
-            if (_recorded.TryGetValue(buffer, out int index))
+            if (_recorded.TryGetValue(buffer, out var recorded))
             {
                 _recorded.Remove(buffer);
-                _returnedAt[index] = _clock++;
+                _returnedAt[recorded.Index] = _clock++;
             }
         }
     }
@@ -160,7 +212,11 @@ internal sealed class CudaStepArena : IDisposable
     /// <summary>A slot buffer was disposed, released or finalized: its memory may be handed out again.</summary>
     internal static void OnSlotDead(Block block, int slot)
     {
-        if (Interlocked.Exchange(ref block.SlotLive[slot], 0) == 0) return;
+        lock (block)
+        {
+            if (Interlocked.Exchange(ref block.SlotLive[slot], 0) == 0) return;
+            block.Occupancy?.Release(slot);
+        }
         if (Interlocked.Decrement(ref block.Live) == 0 && Volatile.Read(ref block.ArenaDisposed) != 0)
         {
             var ptr = Interlocked.Exchange(ref block.Ptr, IntPtr.Zero);
@@ -184,10 +240,12 @@ internal sealed class CudaStepArena : IDisposable
         long offset = plan.Offset[i];
         var blockPtr = Volatile.Read(ref block.Ptr);
         if (offset < 0 || blockPtr == IntPtr.Zero || Volatile.Read(ref block.SlotLive[i]) != 0) { PoolFallbacks++; return null; }
-        foreach (int j in plan.Conflicts[i])
-            if (Volatile.Read(ref block.SlotLive[j]) != 0) { PoolFallbacks++; return null; }   // outlived its recorded lifetime
-        Volatile.Write(ref block.SlotLive[i], 1);
-        Interlocked.Increment(ref block.Live);
+        lock (block)
+        {
+            if (block.SlotLive[i] != 0 || !block.Occupancy!.TryAcquire(i)) { PoolFallbacks++; return null; }
+            Volatile.Write(ref block.SlotLive[i], 1);
+            Interlocked.Increment(ref block.Live);
+        }
         SlotHits++;
         return CudaBackend.CudaGpuBuffer.ForArenaSlot(_context, new IntPtr(blockPtr.ToInt64() + offset), size, block, i);
     }
@@ -224,14 +282,14 @@ internal sealed class CudaStepArena : IDisposable
         _sizes.Clear();
         _allocatedAt.Clear();
         _returnedAt.Clear();
-        lock (_lock) _recorded.Clear();
+        lock (_lock) _recorded = new();
         _clock = 0;
         _mode = Mode.Recording;
     }
 
     private void BuildPlan()
     {
-        lock (_lock) _recorded.Clear();   // still out at the step's end: they stay on the pool
+        lock (_lock) _recorded = new();   // still out at the step's end: they stay on the pool
         int n = _sizes.Count;
         var bytes = new long[n];
         var order = new List<int>(n);
@@ -266,25 +324,11 @@ internal sealed class CudaStepArena : IDisposable
         }
         if (placed.Count == 0) { _mode = Mode.Off; return; }
 
-        // Conflicts: every other slot sharing memory. Within a step the plan keeps them apart in time, but one that
-        // outlives its recorded lifetime (into a later step, or past its recorded return) must not be aliased.
-        var conflicts = new int[n][];
-        var scratch = new List<int>();
-        for (int i = 0; i < n; i++)
-        {
-            scratch.Clear();
-            if (offset[i] >= 0)
-                foreach (int j in placed)
-                    if (j != i && offset[j] < offset[i] + bytes[i] && offset[i] < offset[j] + bytes[j])
-                        scratch.Add(j);
-            conflicts[i] = scratch.Count == 0 ? Array.Empty<int>() : scratch.ToArray();
-        }
-
         IntPtr ptr;
         try { ptr = _allocateBlock((ulong)total); }
         catch (InvalidOperationException) { _mode = Mode.Off; return; }   // no room for the plan: the pool serves the steps
-        _plan = new Plan(_sizes.ToArray(), offset, conflicts, total);
-        _block = new Block(ptr, _context, _contextGeneration, n);
+        _plan = new Plan(_sizes.ToArray(), offset, total);
+        _block = new Block(ptr, _context, _contextGeneration, n) { Occupancy = new RangeOccupancy(offset, bytes) };
         _next = 0;
         _aborted = false;
         _mode = Mode.Replaying;
@@ -326,7 +370,7 @@ internal sealed class CudaStepArena : IDisposable
             if (_disposed) return;
             Volatile.Write(ref _disposed, true);
             _mode = Mode.Off;
-            _recorded.Clear();
+            _recorded = new();
             if (_block is { } active)
             {
                 _retiring.Add(active);

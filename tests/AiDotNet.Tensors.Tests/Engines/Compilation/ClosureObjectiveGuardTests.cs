@@ -12,6 +12,27 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class ClosureObjectiveGuardTests
 {
+    [Fact]
+    public void Swapped_leaf_storage_is_rejected_before_any_copy()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(2, 2, 1);
+        var a = Filled(2, 2, 2);
+        var b = Filled(2, 2, 3);
+        var originalA = a.ToArray();
+        var originalB = b.ToArray();
+        Func<Tensor<float>> objective = () => engine.ReduceSum(engine.TensorMultiply(w, engine.TensorSubtract(a, b)));
+        var parameters = new[] { w };
+        var (plan, guard) = Compile(objective, parameters);
+        using (plan)
+        {
+            (a, b) = (b, a);
+            Assert.NotEqual(ClosureGuardResult.Matched, guard.TryRebind(objective, parameters, out _));
+            Assert.Equal(originalA, b.ToArray());
+            Assert.Equal(originalB, a.ToArray());
+        }
+    }
+
     private const int Rows = 5, Inner = 6, Cols = 4;
 
     private static Tensor<float> Filled(int rows, int cols, int seed)

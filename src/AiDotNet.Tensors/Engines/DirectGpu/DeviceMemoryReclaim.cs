@@ -64,6 +64,8 @@ internal interface IChargesDeviceMemoryReclaim
 
 internal static class DeviceMemoryReclaim
 {
+    private static long s_requestedCollections;
+    internal static long RequestedCollectionsForTests => Interlocked.Read(ref s_requestedCollections);
     private static int s_processExiting;
 
     static DeviceMemoryReclaim()
@@ -234,6 +236,7 @@ internal static class DeviceMemoryReclaim
         {
             Volatile.Write(ref s_collectionDue, 0);
         }
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         GC.WaitForPendingFinalizers();
         return epoch;
@@ -321,6 +324,7 @@ internal static class DeviceMemoryReclaim
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         ResetDeviceBytes(resetGen2: gen2);
         Volatile.Write(ref s_collectionDue, 0);
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers, which only queue a pool return.
         GC.WaitForPendingFinalizers();
@@ -352,6 +356,7 @@ internal static class DeviceMemoryReclaim
         // Normal managed-heap Gen-0/Gen-1 collections during a multi-layer training step promote early forward
         // activations into Gen 1 or Gen 2; collect through Gen 1 every 64 MB and Gen 2 every 256 MB of cumulative
         // unreleased device allocations once GradientTape._entries has been reset.
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers. Waiting for them (they only queue a pool return)
         // lets the next step's allocations find them in the pool instead of going to the driver.
@@ -365,8 +370,10 @@ internal static class DeviceMemoryReclaim
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
         Volatile.Write(ref s_survivorsPromotedInsideTape, 0);
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect();
         GC.WaitForPendingFinalizers();
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect();
     }
 

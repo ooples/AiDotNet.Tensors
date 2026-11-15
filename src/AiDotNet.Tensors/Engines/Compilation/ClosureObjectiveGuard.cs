@@ -168,6 +168,19 @@ internal sealed class ClosureObjectiveGuard<T>
             return false;
         }
 
+        // Preflight the entire copy order: swapping existing leaves must not overwrite a later source.
+        var written = new HashSet<object>(Autodiff.ReferenceEqualityComparer<object>.Instance);
+        for (int i = 0; i < _leaves.Length; i++)
+        {
+            if (probedLeaves[i] is ISignatureTensor source && written.Contains(source.SignatureStorageIdentity))
+            {
+                reason = $"leaf {i} aliases a compiled leaf overwritten earlier in the rebind";
+                return false;
+            }
+            if (!ReferenceEquals(_leaves[i], probedLeaves[i]) && _leaves[i] is ISignatureTensor target)
+                written.Add(target.SignatureStorageIdentity);
+        }
+
         for (int i = 0; i < _leaves.Length; i++)
         {
             if (ReferenceEquals(_leaves[i], probedLeaves[i])) continue;   // a persistent buffer the caller refills

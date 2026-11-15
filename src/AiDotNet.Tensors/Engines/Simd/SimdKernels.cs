@@ -8189,7 +8189,7 @@ namespace AiDotNet.Tensors.Engines.Simd
 
         /// <summary>
         /// SIMD-accelerated HardSwish backward for float.
-        /// d/dx[x*(x+3)/6] = (2x+3)/6 for -3 &lt; x &lt; 3, 0 for x &lt;= -3, 1 for x >= 3
+        /// d/dx[x*(x+3)/6] = (2x+3)/6 for -3 &lt;= x &lt;= 3, 0 for x &lt; -3, 1 for x &gt; 3
         /// </summary>
         [MethodImpl(Hot)]
         public static unsafe void HardSwishBackwardUnsafe(float* grad, float* input, float* output, int length)
@@ -8212,9 +8212,9 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var g = Avx.LoadVector256(grad + i);
                     // linear region: (2x+3)/6
                     var linear = Avx.Divide(Avx.Add(Avx.Multiply(vTwo, x), vThree), vSix);
-                    // mask: x >= 3 => 1, x <= -3 => 0, else linear
-                    var maskHigh = Avx.Compare(x, vPos3, FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
-                    var maskLow = Avx.Compare(x, vNeg3, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+                    // mask: x > 3 => 1, x < -3 => 0, else linear
+                    var maskHigh = Avx.Compare(x, vPos3, FloatComparisonMode.OrderedGreaterThanNonSignaling);
+                    var maskLow = Avx.Compare(x, vNeg3, FloatComparisonMode.OrderedLessThanNonSignaling);
                     var deriv = Avx.BlendVariable(linear, vOne, maskHigh);
                     deriv = Avx.BlendVariable(deriv, vZero, maskLow);
                     Avx.Store(output + i, Avx.Multiply(g, deriv));
@@ -8224,7 +8224,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (; i < length; i++)
             {
                 float x = input[i];
-                float deriv = x <= -3f ? 0f : x >= 3f ? 1f : (2f * x + 3f) / 6f;
+                float deriv = x < -3f ? 0f : x > 3f ? 1f : (2f * x + 3f) / 6f;
                 output[i] = grad[i] * deriv;
             }
         }
@@ -8458,7 +8458,7 @@ namespace AiDotNet.Tensors.Engines.Simd
             for (int i = 0; i < length; i++)
             {
                 double x = input[i];
-                double deriv = x <= -3.0 ? 0.0 : x >= 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
+                double deriv = x < -3.0 ? 0.0 : x > 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
                 output[i] = grad[i] * deriv;
             }
         }
