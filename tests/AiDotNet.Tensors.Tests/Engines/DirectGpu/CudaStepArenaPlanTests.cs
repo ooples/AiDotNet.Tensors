@@ -74,6 +74,21 @@ public sealed class CudaStepArenaPlanTests
     }
 
     [Fact]
+    public void A_plan_with_no_room_for_its_block_falls_back_to_the_pool_and_says_so()
+    {
+        using var arena = new CudaStepArena(IntPtr.Zero, 0,
+            _ => throw new InvalidOperationException("no device memory for the plan"), _ => { });
+        WarmUpAndRecordSequentialTemporaries(arena, 2, 64);
+        TrainingStep.Begin();
+        Assert.Null(arena.TryRent(64));   // builds the plan, cannot place it: the pool serves
+        Assert.Null(arena.TryRent(64));
+        TrainingStep.End();
+        Assert.Equal(0, arena.SlotHits);
+        Assert.Equal(0, arena.PlannedBytes);
+        Assert.Contains(GpuLaunchProbe.Fallbacks, entry => entry.Contains("CudaStepArena.BuildPlan: InvalidOperationException"));
+    }
+
+    [Fact]
     public void A_slot_that_outlives_its_recorded_lifetime_is_never_aliased()
     {
         using var arena = NewArena();

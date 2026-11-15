@@ -346,7 +346,14 @@ internal sealed class CudaStepArena : IDisposable
         // aliased: the block's live set (Block.TryClaim) refuses any slot whose memory a live slot still holds.
         IntPtr ptr;
         try { ptr = _allocateBlock((ulong)total); }
-        catch (InvalidOperationException) { _mode = Mode.Off; return; }   // no room for the plan: the pool serves the steps
+        catch (InvalidOperationException noRoom)
+        {
+            // No room for the plan (GpuOutOfMemoryException is one): the pool serves the steps from now on. Recorded,
+            // so a workload that silently lost its arena shows it.
+            GpuLaunchProbe.OnFallback("CudaStepArena.BuildPlan", noRoom);
+            _mode = Mode.Off;
+            return;
+        }
         _plan = new Plan(_sizes.ToArray(), offset, bytes, total);
         _block = new Block(ptr, _context, _contextGeneration, n);
         _next = 0;
