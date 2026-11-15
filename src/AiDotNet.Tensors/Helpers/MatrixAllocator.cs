@@ -53,7 +53,9 @@ public static class MatrixAllocator
             if (arenaArray != null)
             {
                 var memory = new Memory<T>(arenaArray, 0, totalSize);
-                return Matrix<T>.FromMemory(memory, rows, cols);
+                var issued = Matrix<T>.FromMemory(memory, rows, cols);
+                arena.WatchIssued(arenaArray, issued);
+                return issued;
             }
             // Arena full — fall through to other tiers
         }

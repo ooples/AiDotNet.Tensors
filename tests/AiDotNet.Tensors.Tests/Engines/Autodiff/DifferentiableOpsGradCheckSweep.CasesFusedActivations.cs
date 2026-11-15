@@ -44,6 +44,11 @@ public partial class DifferentiableOpsGradCheckSweep
             SafeTensor([2], r), Variance(2, r), 1e-5, SafeTensor([3, 2, 2, 2], r), SafeTensor([3], r),
             SafeTensor([3], r), SafeTensor([3], r), SafeTensor([3], r), Variance(3, r), 1e-5,
             1, 1, 0, 0, 1, 1, FusedActivationType.Tanh];
+        // Depthwise kernel [C, 1, 3, 3]; inference batch norm over the C output channels. Tanh: smooth, so second and
+        // third derivatives exist everywhere (the CPU fast path takes only ReLU/ReLU6, and none under a tape).
+        cases["DepthwiseConv2DBatchNorm"] = r => [SafeTensor([1, 3, 5, 5], r), SafeTensor([3, 1, 3, 3], r),
+            new[] { 1, 1 }, new[] { 1, 1 }, SafeTensor([3], r), SafeTensor([3], r), SafeTensor([3], r), Variance(3, r),
+            1e-5, FusedActivationType.Tanh];
         // [N, C] batch norm in training mode (batch statistics); the trailing nulls are the saveMean / saveVar outs.
         cases["FusedBatchNorm"] = r => [SafeTensor([4, 3], r), SafeTensor([3], r), SafeTensor([3], r),
             SafeTensor([3], r), Variance(3, r), 1e-5, 0.1, true, FusedActivationType.Tanh, null!, null!];

@@ -51,7 +51,9 @@ public static class VectorAllocator
             if (arenaArray != null)
             {
                 var memory = new Memory<T>(arenaArray, 0, length);
-                return Vector<T>.FromMemory(memory);
+                var issued = Vector<T>.FromMemory(memory);
+                arena.WatchIssued(arenaArray, issued);
+                return issued;
             }
             // Arena full — fall through to other tiers
         }

@@ -108,4 +108,32 @@ public class DepthwiseConv2DBatchNormTests
         var grads = tape.ComputeGradients(engine.ReduceSum(y, null), sources: new[] { w });
         Assert.True(grads.ContainsKey(w), "the depthwise kernel received no gradient: the fused op was not recorded");
     }
+
+    [SkippableTheory]
+    [InlineData(1, FusedActivationType.ReLU6)]
+    [InlineData(2, FusedActivationType.ReLU)]
+    [InlineData(1, FusedActivationType.None)]
+    public void Gpu_MatchesTheCpuComposition(int stride, FusedActivationType activation)
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "No DirectGpu backend.");
+        using var _ = gpu;
+        var cpu = new CpuEngine();
+        var x = Random(new[] { 2, 24, 15, 15 }, 21, -2f, 2f);
+        var w = Random(new[] { 24, 1, 3, 3 }, 22, -1f, 1f);
+        var gamma = Random(new[] { 24 }, 23, 0.5f, 1.5f);
+        var beta = Random(new[] { 24 }, 24, -0.5f, 0.5f);
+        var mean = Random(new[] { 24 }, 25, -0.3f, 0.3f);
+        var variance = Random(new[] { 24 }, 26, 0.2f, 2f);
+        int[] s = { stride, stride }, p = { 1, 1 };
+        var expected = cpu.BatchNormInference(cpu.DepthwiseConv2D(x, w, s, p), gamma, beta, mean, variance, 1e-5,
+            activation).ToArray();
+        var actual = gpu!.DepthwiseConv2DBatchNorm(x, w, s, p, gamma, beta, mean, variance, 1e-5, activation).ToArray();
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f * Math.Max(1f, Math.Abs(expected[i])),
+                $"[{i}] GPU {actual[i]} vs CPU {expected[i]}");
+    }
 }

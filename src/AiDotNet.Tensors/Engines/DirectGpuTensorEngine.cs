@@ -2243,10 +2243,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
         if (tensor.IsGpuResident) return true;
-        // A buffer the tensor owns (an optimizer state from TryCreateDeviceStateTensor) is neither a cache entry nor
-        // poolable, so no other tensor can hold it. Bound in sync with the host (isDeviceModified: false), it has no
-        // pending download yet; the caller's version check still rejects it after a host write.
-        if (tensor._ownsGpuBuffer) return true;
+        if ((tensor._ownsGpuBuffer || tensor._storage.OwnsGpuBuffer(tensor._gpuBuffer)) && ReferenceEquals(tensor._gpuBackend, backend)) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
         // A device-owned binding (an optimizer state, a resident step buffer, a parameter updated on the device) is
         // not a cache entry: its storage has a pending download FROM the device, so the device copy is the current
@@ -2431,6 +2428,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 removed = taken;
         }
         removed?.Dispose();
+    }
+
+    internal static void ReleaseSupersededOwnedBuffer(IGpuBuffer buffer, IDirectGpuBackend? ownerBackend, bool capturing)
+    {
+        if (StepScratchPool.IsPooled(buffer)) return;
+        if (!capturing)
+        {
+            if (ownerBackend is IQueuedBufferRelease queued)
+                queued.ReleaseAfterQueuedWork(buffer);
+            else
+                buffer.Dispose();
+        }
+        else if (!Gpu.GpuBufferReleaseDeferral.TryDefer(buffer.Dispose))
+        {
+            buffer.Dispose();
+        }
     }
 
     private void InvalidateActivationCacheEntry(object key)
@@ -3098,7 +3111,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             tensor._storage.DisposeGpuBufferOwner(owner =>
             {
-                if (!ReferenceEquals((object)owner, (object)buffer))
+                if (!ReferenceEquals(owner, buffer))
                 {
                     if (afterQueuedWork && owner is IGpuBuffer otherGpu && tensor._gpuBackend is IQueuedBufferRelease otherQueued)
                         otherQueued.ReleaseAfterQueuedWork(otherGpu);
@@ -3106,7 +3119,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         owner.Dispose();
                 }
             });
-            if (ReferenceEquals((object?)tensor._gpuBuffer, (object)buffer))
+            if (ReferenceEquals(tensor._gpuBuffer, buffer))
             {
                 tensor._gpuBuffer = null;
                 tensor._ownsGpuBuffer = false;
@@ -3992,7 +4005,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             lock (_activationCacheLock)
             {
                 if (_activationCache.TryGetValue(cachedArr, out var actEntry)
-                    && ReferenceEquals((object?)actEntry.Backend, (object)backend)
+                    && ReferenceEquals(actEntry.Backend, backend)
                     && actEntry.HostVersion == source.GpuCacheVersion
                     && !actEntry.IsFp16
                     && actEntry.Buffer.Handle != IntPtr.Zero
@@ -4113,12 +4126,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (param._storageOffset != 0) return null;
         var paramArray = param.GetBackingArrayForCacheLookupUnsafe();
-        if (param._gpuBuffer is { } existingBuf && existingBuf.Handle != IntPtr.Zero && ReferenceEquals((object?)param._gpuBackend, (object)be)
+        if (param._gpuBuffer is { } existingBuf && existingBuf.Handle != IntPtr.Zero && ReferenceEquals(param._gpuBackend, be)
             && existingBuf.Size >= param.Length)
         {
             if (param._gpuBufferVersion == param.GpuCacheVersion)
             {
-                if (paramArray is null || param._ownsGpuBuffer || param._storage.HasGpuBufferOwner)
+                if (paramArray is null || param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf))
                     return existingBuf;
                 if (paramArray.Length == param.Length)
                 {
@@ -4126,7 +4139,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     lock (_persistentBufferLock)
                     {
                         if (_persistentBufferCache.TryGetValue(paramArray, out var cached)
-                            && ReferenceEquals((object?)cached.Buffer, (object)existingBuf))
+                            && ReferenceEquals(cached.Buffer, existingBuf))
                         {
                             isPersistent = true;
                         }
@@ -4136,7 +4149,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             lock (_activationCacheLock)
                             {
                                 if (_activationCache.TryGetValue(paramArray, out var actEntry)
-                                    && ReferenceEquals((object?)actEntry.Buffer, (object)existingBuf))
+                                    && ReferenceEquals(actEntry.Buffer, existingBuf))
                                     removedActivation = _activationCache.TryRemove(paramArray, out _);
                             }
                             if (removedActivation)
@@ -4155,7 +4168,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         return existingBuf;
                 }
             }
-            else if (param._ownsGpuBuffer || param._storage.HasGpuBufferOwner || param._device != TensorDevice.CPU)
+            else if (param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf) || param._device != TensorDevice.CPU)
             {
                 try
                 {
@@ -4173,7 +4186,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         lock (_persistentBufferLock)
                         {
                             if (_persistentBufferCache.TryGetValue(paramArray, out var cached)
-                                && ReferenceEquals((object?)cached.Buffer, (object)existingBuf))
+                                && ReferenceEquals(cached.Buffer, existingBuf))
                             {
                                 cached.Version = param.GpuCacheVersion;
                                 _persistentWeightHostVersion[paramArray] = param.GpuCacheVersion;
@@ -4201,7 +4214,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     lock (_activationCacheLock)
                     {
                         if (_activationCache.TryGetValue(paramArray, out var actEntry)
-                            && ReferenceEquals((object?)actEntry.Buffer, (object)owned.Buffer))
+                            && ReferenceEquals(actEntry.Buffer, owned.Buffer))
                             removedActivation = _activationCache.TryRemove(paramArray, out _);
                     }
                     if (removedActivation)
@@ -4365,7 +4378,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Keyed on the backing array, not this Tensor object: the optimizer and the layer can hold different
         // wrappers over the same storage, and only the one the optimizer updated has its device buffer bound.
         object? arr = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (arr is null && typeof(T) == typeof(float) && TryGetFlatParameterView((Tensor<float>)(object)tensor) is { } flatView)
+        if (arr is null && tensor is Tensor<float> floatTensor && TryGetFlatParameterView(floatTensor) is { } flatView)
             arr = flatView.Flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
         return arr is not null && Helpers.HostSync.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
     }
@@ -4933,10 +4946,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // keyed by its storage) is never read again: from here dest borrows srcBuf every step. Left in the cache it
         // lived as long as dest's storage, the plan's lifetime: 3 GB of trace-time results on DenseNet-121. Released
         // only outside a stream capture, so the pre-residency pass frees them and a capture frees nothing.
-        if (!(backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing()))
+        bool streamCapturing = backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing();
+        if (!streamCapturing)
         {
             ReleaseSupersededActivation(destArr, srcBuf);
             ReleaseSupersededActivation(dest.DataVector, srcBuf);
+        }
+        if (dest._storage.RefCount == 1 && dest._storage.HasGpuBufferOwner && !dest._storage.OwnsGpuBuffer(srcBuf))
+        {
+            var prevStorageBackend = dest._gpuBackend;
+            dest._storage.DisposeGpuBufferOwner(owner =>
+            {
+                if (ReferenceEquals(owner, srcBuf)) return;
+                if (owner is IGpuBuffer gpuOwner)
+                    ReleaseSupersededOwnedBuffer(gpuOwner, prevStorageBackend, streamCapturing);
+                else if (!streamCapturing || !Gpu.GpuBufferReleaseDeferral.TryDefer(owner.Dispose))
+                    owner.Dispose();
+            });
+        }
+        if (dest._ownsGpuBuffer)
+        {
+            var prevOwned = dest._gpuBuffer;
+            var prevBackend = dest._gpuBackend;
+            dest._ownsGpuBuffer = false;
+            if (prevOwned is not null && !ReferenceEquals(prevOwned, srcBuf))
+                ReleaseSupersededOwnedBuffer(prevOwned, prevBackend, streamCapturing);
         }
 
         // Borrow src's buffer: consumers resolve dest via the _gpuBuffer fast path. We do NOT add a second
