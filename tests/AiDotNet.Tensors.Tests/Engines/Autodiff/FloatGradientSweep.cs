@@ -200,16 +200,15 @@ internal static class FloatGradientSweep
         try
         {
             var cpu = new CpuEngine();
-            var doubleInputs = doubleArgs.SelectMany(a => a switch
-            {
-                Tensor<double> t => new[] { t },
-                Tensor<double>[] arr => arr,
-                IEnumerable<Tensor<double>> seq => seq.ToArray(),
-                _ => Array.Empty<Tensor<double>>(),
-            }).Distinct().ToArray();
+            // The same operands and output the float tapes differentiate: an op that writes its results to out
+            // tensors (STFT, FFT) has out slots among its arguments and returns nothing, so the slots must not count
+            // as inputs and its output is the weighted sum InvokeOutput forms (else no reference, and an
+            // ill-conditioned out-parameter gradient was held to the strict CPU-float comparison).
+            var doubleInputs = DifferentiableOpsGradCheckSweep.InputTensors<double>(doubleMethod, doubleArgs)
+                .Distinct().ToArray();
             if (doubleInputs.Length != floatInputs.Length) return null;
             using var tape = new GradientTape<double>();
-            var output = (Tensor<double>)doubleMethod.Invoke(cpu, DifferentiableOpsGradCheckSweep.CopyArgs(doubleArgs))!;
+            var output = DifferentiableOpsGradCheckSweep.InvokeOutput<double>(cpu, doubleMethod, doubleArgs);
             var grads = tape.ComputeGradients(cpu.ReduceSum(output, null), doubleInputs);
             var result = new Dictionary<Tensor<float>, float[]>();
             for (int i = 0; i < floatInputs.Length; i++)

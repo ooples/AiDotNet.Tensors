@@ -83,7 +83,10 @@ public class ProgramOperationReplaySweepTests : IDisposable
                     IEnumerable<Tensor<double>> ts => ts.Select(Substitute).ToArray(),
                     _ => arg
                 };
-                return new[] { (Tensor<double>)method.Invoke(AiDotNetEngine.Current, args.Select(SubstituteArg).ToArray())! };
+                // An op that writes its results to out tensors (FFT, STFT) returns nothing: replay what the gradient
+                // sweeps differentiate, a weighted sum over every out tensor.
+                return new[] { DifferentiableOpsGradCheckSweep.InvokeOutput<double>(AiDotNetEngine.Current, method,
+                    args.Select(SubstituteArg).ToArray()) };
             }
             try
             {
