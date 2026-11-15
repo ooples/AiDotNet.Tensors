@@ -2436,7 +2436,7 @@ internal static partial class BackwardFunctions<T>
         // which the plan refreshes before each launch. A host index array here would be uploaded inside the capture
         // and replayed with the capture step's ids, as the float-index sister path documents.
         if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deEmb) && deEmb.ResidentStepActive
-            && deEmb.TryEmbeddingBackwardResident<T>(gradOutput, indicesData.Length, vocabSize, embeddingDim, inputs[0]._shape) is { } residentTableGrad)
+            && deEmb.TryEmbeddingBackwardResident<T>(gradOutput, savedState[0], indicesData.Length, vocabSize, embeddingDim, inputs[0]._shape) is { } residentTableGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], residentTableGrad, engine);
             return;
@@ -2502,7 +2502,7 @@ internal static partial class BackwardFunctions<T>
         if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deEmb) && deEmb.ResidentStepActive)
         {
             var residentTableGrad = deEmb.TryEmbeddingBackwardResident<T>(
-                gradOutput, capturedFloatIdx.Length, vocabSize, embeddingDim, inputs[0]._shape);
+                gradOutput, capturedFloatIdx, capturedFloatIdx.Length, vocabSize, embeddingDim, inputs[0]._shape);
             if (residentTableGrad is not null)
             {
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], residentTableGrad, engine);
@@ -3801,7 +3801,7 @@ internal static partial class BackwardFunctions<T>
     {
         if (!DifferentiableOps._isBackwardCreateGraph)
         {
-            // One fused kernel (IEngine.HardswishBackward: (2x+3)/6 on (-3, 3), 0 below, 1 above) instead of the
+            // One fused kernel (IEngine.HardswishBackward: (2x+3)/6 on [-3, 3], 0 below, 1 above) instead of the
             // element-wise ops and their temporaries. A create-graph backward keeps the recorded form below.
             DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.HardswishBackward(gradOutput, inputs[0]), engine);
             return;

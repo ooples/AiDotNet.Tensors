@@ -39038,8 +39038,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         // eager path uploads inline. Falls through to the host gather when not GPU-resident.
                         if (eng.TryGet<DirectGpuTensorEngine>(out var gpuEng))
                         {
-                            gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(capturedIndices, n));
-                            if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output))
+                            // idxSnap is this lookup's index identity: the backward receives it as savedState[0].
+                            gpuEng.RegisterEmbIndexRefresh(idxSnap, () => gpuEng.UploadEmbeddingIndices(capturedIndices, n, idxSnap));
+                            if (gpuEng.TryEmbeddingGatherGpu(capturedEmb, capturedIndices, n, output, idxSnap))
                             {
                                 // The backward scatters through idxSnap off the resident step: refresh it here too, or
                                 // the GPU gather read this step's tokens while the table gradient went to the trace
@@ -48717,7 +48718,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
-            double deriv = x <= -3.0 ? 0.0 : x >= 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
+            // torch hardswish_backward: the ramp includes both endpoints (-0.5 at -3, 1.5 at 3).
+            double deriv = x < -3.0 ? 0.0 : x > 3.0 ? 1.0 : (2.0 * x + 3.0) / 6.0;
             result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
         }
         return new Tensor<T>(result, gradOutput.Shape.ToArray());
@@ -49360,8 +49362,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         // fall back to the host gather + copy when not GPU-resident (CPU engine / not-yet-resident).
                         if (eng.TryGet<DirectGpuTensorEngine>(out var gpuEng))
                         {
-                            gpuEng.RegisterEmbIndexRefresh(() => gpuEng.UploadEmbeddingIndices(ci, ci.Length));
-                            if (gpuEng.TryEmbeddingGatherGpu(ct, ci, ci.Length, output)) return;
+                            gpuEng.RegisterEmbIndexRefresh(ci, () => gpuEng.UploadEmbeddingIndices(ci, ci.Length, ci));
+                            if (gpuEng.TryEmbeddingGatherGpu(ct, ci, ci.Length, output, ci)) return;
                         }
                         var r = eng.Embedding(ci, ct); DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                     },

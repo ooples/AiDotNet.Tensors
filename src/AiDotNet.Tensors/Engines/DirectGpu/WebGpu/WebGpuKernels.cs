@@ -2215,8 +2215,8 @@ fn hardswish_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx < params.size) {
         let x = forward_data[idx];
         var grad: f32 = 0.0;
-        if (x <= -3.0) { grad = 0.0; }
-        else if (x >= 3.0) { grad = 1.0; }
+        if (x < -3.0) { grad = 0.0; }
+        else if (x > 3.0) { grad = 1.0; }
         else { grad = (2.0 * x + 3.0) / 6.0; }
         grad_input[idx] = grad_output[idx] * grad;
     }

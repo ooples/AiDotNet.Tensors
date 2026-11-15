@@ -1534,7 +1534,7 @@ kernel void hardswish_backward(
 {
     if (gid >= size) return;
     float x = input[gid];
-    float grad = x <= -3.0f ? 0.0f : (x >= 3.0f ? 1.0f : (2.0f * x + 3.0f) / 6.0f);
+    float grad = x < -3.0f ? 0.0f : (x > 3.0f ? 1.0f : (2.0f * x + 3.0f) / 6.0f);
     gradInput[gid] = gradOutput[gid] * grad;
 }
 ";
