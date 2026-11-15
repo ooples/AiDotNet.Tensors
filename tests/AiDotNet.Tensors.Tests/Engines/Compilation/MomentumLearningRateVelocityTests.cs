@@ -147,6 +147,52 @@ public class MomentumLearningRateVelocityTests
         }
     }
 
+    /// <summary>
+    /// The scratch grew to each larger parameter in turn and kept every superseded buffer allocated, so a model whose
+    /// parameters grow in update order held one scratch per size. One scratch, sized to the largest, must serve them all.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_momentum_scratch_is_allocated_once_for_parameters_of_growing_size()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend.");
+        var prevEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var small = gpu.UploadToGpu(new Tensor<float>(new[] { 0.5f, -0.25f, 1f }, new[] { 3 }),
+                AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.Weight);
+            var large = gpu.UploadToGpu(new Tensor<float>((float[])Init.Clone(), new[] { Init.Length }),
+                AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.Weight);
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                gpu.TensorAdd(gpu.ReduceSum(gpu.TensorMultiply(small, small), null),
+                    gpu.ReduceSum(gpu.TensorMultiply(large, large), null));
+                plan = scope.CompileTraining(new[] { small, large });
+            }
+            using (plan)
+            {
+                var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+                plan.ConfigureOptimizer(OptimizerType.SGDMomentum, Schedule(), Mu, 0f, 0f, 0f,
+                    new FusedOptimizerExtras { VelocityIncludesLearningRate = true });
+                plan.Step();
+                int afterFirst = compiled.GpuOptimizerBufferCount;
+                for (int k = 1; k < Steps; k++) plan.Step();
+                Assert.Equal(afterFirst, compiled.GpuOptimizerBufferCount);
+                plan.ConfigureOptimizer(OptimizerType.SGDMomentum, Schedule(), Mu, 0f, 0f, 0f,
+                    new FusedOptimizerExtras { VelocityIncludesLearningRate = false });
+                plan.Step();
+                int withoutScratch = compiled.GpuOptimizerBufferCount;
+                Assert.Equal(withoutScratch + 1, afterFirst);
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prevEngine;
+        }
+    }
+
     [Fact]
     public void Nesterov_is_rejected()
     {

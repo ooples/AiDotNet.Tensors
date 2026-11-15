@@ -6225,7 +6225,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Moment state starts at zero on the device; allocating and uploading a host zero array
     // adds LOH/GC pressure and a full transfer for every parameter and every optimizer slot.
     // One gradient-sized scratch per backend for the learning-rate-in-velocity momentum update (see
-    // FusedOptimizerExtras.VelocityIncludesLearningRate). Grown on demand; owned by _gpuOptimizerBuffers.
+    // FusedOptimizerExtras.VelocityIncludesLearningRate). Sized once to the backend's largest parameter, so it never grows
+    // a step at a time and never leaves a superseded buffer allocated; owned by _gpuOptimizerBuffers.
     private readonly Dictionary<Engines.DirectGpu.IDirectGpuBackend, Engines.DirectGpu.IGpuBuffer> _lrVelocityScratch
         = new(ReferenceEqualityComparer<Engines.DirectGpu.IDirectGpuBackend>.Instance);
 
@@ -6239,13 +6240,22 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lrVelocityScratch.Clear();
     }
 
-    private Engines.DirectGpu.IGpuBuffer LearningRateVelocityScratch(Engines.DirectGpu.IDirectGpuBackend backend, int length)
+    /// <summary>The optimizer's device buffers (moments, scratch) currently allocated; for tests.</summary>
+    internal int GpuOptimizerBufferCount => _gpuOptimizerBuffers.Count;
+
+    private Engines.DirectGpu.IGpuBuffer LearningRateVelocityScratch(
+        Engines.DirectGpu.IDirectGpuBackend backend, int length, int[] lengths,
+        Engines.DirectGpu.IGpuBuffer?[] gpuParam, Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends)
     {
         if (_lrVelocityScratch.TryGetValue(backend, out var scratch) && scratch.Size >= length) return scratch;
-        var grown = AllocateGpuOptimizerState(backend, length);
-        _gpuOptimizerBuffers.Add(grown);
-        _lrVelocityScratch[backend] = grown;
-        return grown;
+        int size = length;
+        for (int p = 0; p < lengths.Length && p < gpuParam.Length && p < gpuBackends.Length; p++)
+            if (gpuParam[p] is not null && ReferenceEquals(gpuBackends[p], backend)) size = Math.Max(size, lengths[p]);
+        var sized = AllocateGpuOptimizerState(backend, size);
+        if (scratch is not null && _gpuOptimizerBuffers.Remove(scratch)) scratch.Dispose();
+        _gpuOptimizerBuffers.Add(sized);
+        _lrVelocityScratch[backend] = sized;
+        return sized;
     }
 
     internal static Engines.DirectGpu.IGpuBuffer AllocateGpuOptimizerState(
@@ -7312,7 +7322,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 {
                                     // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
                                     // weight decay lr*wd is exactly that, without a new backend entry point.
-                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
+                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len, lengths, gpuParam, gpuBackends);
                                     gpuBe.Scale(gradBuf, scaledGrad, lr, len);
                                     gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, momentumBuf,
                                         1f, b1, wd * lr, len);
@@ -8190,7 +8200,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 {
                                     // v = b1*v + lr*(g + wd*p); p -= v. The kernel's form with g' = lr*g, lr = 1 and
                                     // weight decay lr*wd is exactly that, without a new backend entry point.
-                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len);
+                                    var scaledGrad = LearningRateVelocityScratch(gpuBe, len, lengths, gpuParam, gpuBackends);
                                     gpuBe.Scale(gradBuf, scaledGrad, lr, len);
                                     gpuBe.SgdMomentumUpdate(gpuP, scaledGrad, momentumBuf,
                                         1f, b1, wd * lr, len);
