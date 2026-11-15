@@ -43,7 +43,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual byte[] ImageEncode(Tensor<byte> image, ImageFormat format, int quality = 90)
     {
-        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+        // The encoded bytes leave the graph: no trace kind can replay them, so every trace refuses the operation.
+        Compilation.GraphMode.ThrowIfActiveUnsupported(
             Compilation.GraphCaptureLimitation.HostBoundary);
 
         if (image is null) throw new ArgumentNullException(nameof(image));

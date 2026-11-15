@@ -624,6 +624,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     [ThreadStatic]
     private static IntPtr _threadCurrentContext;
+    internal static IntPtr ThreadCurrentContextForTests => _threadCurrentContext;
 
     private bool _isAvailable;
 
@@ -2544,6 +2545,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
+        if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         TraceCapturePathHostRead();
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
@@ -2557,6 +2562,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         if (destination.Length < buffer.Size)
             throw new ArgumentException("Destination array is too small.", nameof(destination));
+        if (buffer.Size == 0) return;
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Cuda);
 
         using var _ = PushContext();
@@ -2577,7 +2583,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
         long probeSynced = probeStart != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
-        ulong byteSize = (ulong)(buffer.Size * sizeof(float));
+        ulong byteSize = (ulong)buffer.Size * sizeof(float);
 
         unsafe
         {
@@ -5890,6 +5896,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
         // Fail fast with a managed exception BEFORE touching the driver — matches the rest of the
         // backend. Without this, a failed backend init or a freed graph-input buffer (zero handle)
         // would fall through to a raw cuMemcpyHtoD and fault the CUDA context (error 700) instead.
@@ -5900,6 +5907,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "GPU buffer was released before its in-place upload.");
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
+        if (data.Length == 0) return;
         using var _ = PushContext();
         ulong byteSize = (ulong)data.Length * sizeof(float);
         // Stream-ordered through pinned staging: the copy lands after the previous replay has finished reading this
@@ -14097,6 +14105,51 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8; args[9] = &la9; args[10] = &la10;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
+    private static bool IsReleased(IGpuBuffer buffer)
+    {
+        while (buffer is IGpuBufferViewSource view) buffer = view.ViewParent;
+        return buffer.Handle == IntPtr.Zero || (buffer is CudaGpuBuffer cuda && cuda.IsReleased);
+    }
+
+    public unsafe void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_backward_frames");
+        using var _ = PushContext();
+        int __total = GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget);
+        if (IsReleased(grad) || IsReleased(magnitude) || IsReleased(phase) || IsReleased(frameGrad))
+            throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = grad.Handle; IntPtr la1 = magnitude.Handle; IntPtr la2 = phase.Handle; IntPtr la3 = frameGrad.Handle; int la4 = batch; int la5 = nFft; int la6 = numFrames; int la7 = numFreqs; int la8 = phaseTarget;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void StftBackwardSignal(IGpuBuffer frameGrad, IGpuBuffer window, IGpuBuffer gradSignal, int batch, int length, int pad, int nFft, int hop, int numFrames)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_backward_signal");
+        using var _ = PushContext();
+        int __total = GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames);
+        if (IsReleased(frameGrad) || IsReleased(window) || IsReleased(gradSignal))
+            throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = frameGrad.Handle; IntPtr la1 = window.Handle; IntPtr la2 = gradSignal.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+    public unsafe void StftBackwardWindow(IGpuBuffer frameGrad, IGpuBuffer signal, IGpuBuffer gradWindow, int batch, int length, int pad, int nFft, int hop, int numFrames)
+    {
+        var kernel = ResolveParity210Kernel("parity210_stft_backward_window");
+        using var _ = PushContext();
+        int __total = GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames);
+        if (IsReleased(frameGrad) || IsReleased(signal) || IsReleased(gradWindow))
+            throw new ObjectDisposedException(nameof(IGpuBuffer), "An STFT backward operand was released before launch.");
+        uint grid = (uint)((__total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr la0 = frameGrad.Handle; IntPtr la1 = signal.Handle; IntPtr la2 = gradWindow.Handle; int la3 = batch; int la4 = length; int la5 = pad; int la6 = nFft; int la7 = hop; int la8 = numFrames;
+        void** args = stackalloc void*[9];
+        args[0] = &la0; args[1] = &la1; args[2] = &la2; args[3] = &la3; args[4] = &la4; args[5] = &la5; args[6] = &la6; args[7] = &la7; args[8] = &la8;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
     public unsafe void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total)
     {
         var kernel = ResolveParity210Kernel("parity210_istft_normalize");
@@ -19377,6 +19430,62 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         GC.SuppressFinalize(this);
     }
 
+    internal static bool TryPushDisposeContext(IntPtr cudaContext)
+    {
+        if (cudaContext == IntPtr.Zero)
+            return false;
+        try
+        {
+            if (CudaNativeBindings.cuCtxGetCurrent(out var currentContext) == CudaResult.Success
+                && currentContext == cudaContext)
+            {
+                _threadCurrentContext = cudaContext;
+                return false;
+            }
+
+            if (CuBlasNative.cuCtxPushCurrent(cudaContext) == 0)
+            {
+                _threadCurrentContext = cudaContext;
+                return true;
+            }
+        }
+        catch (DllNotFoundException)
+        {
+            // Suppress context-push errors if the native CUDA library is unavailable.
+        }
+        catch (EntryPointNotFoundException)
+        {
+            // Suppress context-push errors if the driver entry point is unavailable.
+        }
+        return false;
+    }
+
+    private static void PopDisposeContext(IntPtr disposedContext)
+    {
+        try
+        {
+            CuBlasNative.cuCtxPopCurrent(out _);
+            _threadCurrentContext = CudaNativeBindings.cuCtxGetCurrent(out var activeContext) == CudaResult.Success
+                && activeContext != disposedContext
+                ? activeContext
+                : IntPtr.Zero;
+        }
+        catch (DllNotFoundException)
+        {
+            _threadCurrentContext = IntPtr.Zero;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _threadCurrentContext = IntPtr.Zero;
+        }
+    }
+
+    internal static void ClearThreadCurrentContext(IntPtr disposedContext)
+    {
+        if (_threadCurrentContext == disposedContext)
+            _threadCurrentContext = IntPtr.Zero;
+    }
+
     private void Dispose(bool disposing)
     {
         if (_disposed)
@@ -19452,6 +19561,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // now-stale _context handle; when those CudaGpuBuffer instances later finalize
         // they would cuCtxPushCurrent/cuMemFree against a DESTROYED context — the exact
         // finalizer-fatal 0xC0000005 path this method's teardown guards exist to prevent.
+        // Ensure this backend's CUDA context is current on the disposing thread before draining events,
+        // freeing staged/pinned buffers, or destroying stream/module handles (a multi-GPU caller may have
+        // switched the thread to another device's context prior to Dispose).
+        IntPtr disposeContext = _cudaContext;
+        bool pushedDisposeContext = TryPushDisposeContext(disposeContext);
+        try
+        {
         DrainDeferredFrees(blockOldest: true);
 
         // Direct-PTX modules borrow this backend's context and stream. Unload
@@ -19857,6 +19973,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         UnloadRemainingModules();
+        }
+        finally
+        {
+        if (pushedDisposeContext)
+            PopDisposeContext(disposeContext);
 
         if (_cudaContext != IntPtr.Zero)
         {
@@ -19870,7 +19991,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 RemoveContextHolder(context, _cuDevice);
                 _cudaContext = IntPtr.Zero;
             }
-            if (_threadCurrentContext == context) _threadCurrentContext = IntPtr.Zero;
+            ClearThreadCurrentContext(context);
+        }
         }
 
         GC.SuppressFinalize(this);
@@ -20880,6 +21002,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private readonly bool _allocatedDuringCapture; // a graph-owned allocation: its free belongs in the capture
         private readonly long _contextGeneration = 0; // the context registration this memory belongs to
         private int _poolState;
+        internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
         private int _size;
         private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
         private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory

@@ -386,8 +386,10 @@ public partial class CpuEngine
         // phase to pipe the magnitude gradient through ISTFT — see
         // BackwardFunctions<T>.SpectrogramBackward.
         var win = window ?? HannWindow<T>(winLength);
-        STFT(waveform, nFft, hopLength, win, center: true,
-            out var mag, out var phase);
+        // Without a tape here: this op records its own edge below, and STFT's own edges would count the gradient twice.
+        Tensor<T> mag, phase;
+        using (new NoGradScope<T>())
+            STFT(waveform, nFft, hopLength, win, center: true, out mag, out phase);
         int origLength = waveform._shape[waveform.Rank - 1];
         DifferentiableOps.RecordUnary(
             "Spectrogram", mag, waveform,
@@ -413,8 +415,10 @@ public partial class CpuEngine
         // The mirror of Spectrogram: same STFT, the other output kept, and the discarded half
         // saved for the backward, which needs the magnitudes to scale each bin by 1/|C|.
         var win = window ?? HannWindow<T>(winLength);
-        STFT(waveform, nFft, hopLength, win, center: true,
-            out var mag, out var phase);
+        // Without a tape here: this op records its own edge below, and STFT's own edges would count the gradient twice.
+        Tensor<T> mag, phase;
+        using (new NoGradScope<T>())
+            STFT(waveform, nFft, hopLength, win, center: true, out mag, out phase);
         int origLength = waveform._shape[waveform.Rank - 1];
         DifferentiableOps.RecordUnary(
             "StftPhase", phase, waveform,
@@ -737,7 +741,10 @@ public partial class CpuEngine
         for (int i = 0; i < winLength; i++)
             wSpan[i] = ops.FromDouble(0.5 - 0.5 * Math.Cos(2.0 * Math.PI * i / (winLength - 1)));
 
-        STFT(waveform, nFft, hopLength, window, center: true, out var mag, out var phase);
+        // The phase vocoder below rebuilds the output on the host, so STFT's tape edges would only pin the spectrogram.
+        Tensor<T> mag, phase;
+        using (new NoGradScope<T>())
+            STFT(waveform, nFft, hopLength, window, center: true, out mag, out phase);
         // Phase vocoder: remap time axis with linear interpolation, update
         // phase by accumulating the phase difference scaled by the time
         // stretch. Operates on the (last-frame, freq) sub-axes.

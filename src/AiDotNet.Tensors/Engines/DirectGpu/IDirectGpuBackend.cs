@@ -2100,6 +2100,32 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>ISTFT normalize: result /= windowSum where windowSum &gt; 1e-8.</summary>
     void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total);
 
+    /// <summary>
+    /// First stage of the STFT analysis adjoint: per <c>(b, frame, i)</c>, the unnormalised one-sided inverse DFT
+    /// <c>frameGrad[(b*numFrames + frame)*nFft + i] = Σ_{k&lt;numFreqs} Re(c[k] e^(+2πi k i/nFft))</c> of the per-bin seed,
+    /// read from the STFT layout <c>[b][k*numFrames + frame]</c>.
+    /// </summary>
+    /// <remarks>
+    /// The seed is <c>g·e^(i·phase)</c> for the magnitude output (<paramref name="phaseTarget"/> = 0) and
+    /// <c>(g/|C|)·i·e^(i·phase)</c> for the phase output (1), zero where <c>|C| ≤ 1e-12</c>, where the phase is not
+    /// differentiable. <paramref name="magnitude"/> is read for the phase output only.
+    /// </remarks>
+    void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget);
+
+    /// <summary>
+    /// Second stage of the STFT analysis adjoint: the waveform gradient <c>[batch, length]</c>. Each padded sample
+    /// gathers <c>frameGrad·window</c> from the frames that read it (overlap-add), and each waveform sample gathers the
+    /// padded samples that were copies of it under reflection padding by <paramref name="pad"/> (0 for
+    /// <c>center: false</c>).
+    /// </summary>
+    void StftBackwardSignal(IGpuBuffer frameGrad, IGpuBuffer window, IGpuBuffer gradSignal, int batch, int length, int pad, int nFft, int hop, int numFrames);
+
+    /// <summary>
+    /// Window gradient of the STFT: <c>gradWindow[i] = Σ_b Σ_frame frameGrad[b, frame, i] · xPadded[b, frame*hop + i]</c>,
+    /// with <c>xPadded</c> the reflection padding by <paramref name="pad"/> of <paramref name="signal"/> <c>[batch, length]</c>.
+    /// </summary>
+    void StftBackwardWindow(IGpuBuffer frameGrad, IGpuBuffer signal, IGpuBuffer gradWindow, int batch, int length, int pad, int nFft, int hop, int numFrames);
+
     /// <summary>D-dim histogram (atomic). bins int[D], mins/maxs float[D]; hist pre-zeroed length prod(bins).</summary>
     void HistogramDD(IGpuBuffer samples, IGpuBuffer hist, IGpuBuffer bins, IGpuBuffer mins, IGpuBuffer maxs, int n, int d);
 

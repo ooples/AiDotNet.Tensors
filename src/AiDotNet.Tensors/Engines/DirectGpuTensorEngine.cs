@@ -1645,7 +1645,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         IsFinite = 2,
     }
 
-    private readonly struct OwnedBuffer : IDisposable
+    internal readonly struct OwnedBuffer : IDisposable
     {
         private sealed class OwnershipState
         {
@@ -2226,6 +2226,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
         if (tensor.IsGpuResident) return true;
+        if ((tensor._ownsGpuBuffer || tensor._storage.OwnsGpuBuffer(tensor._gpuBuffer)) && ReferenceEquals(tensor._gpuBackend, backend)) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
         // A device-owned binding (an optimizer state, a resident step buffer, a parameter updated on the device) is
         // not a cache entry: its storage has a pending download FROM the device, so the device copy is the current
@@ -2410,6 +2411,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 removed = taken;
         }
         removed?.Dispose();
+    }
+
+    internal static void ReleaseSupersededOwnedBuffer(IGpuBuffer buffer, IDirectGpuBackend? ownerBackend, bool capturing)
+    {
+        if (StepScratchPool.IsPooled(buffer)) return;
+        if (!capturing)
+        {
+            if (ownerBackend is IQueuedBufferRelease queued)
+                queued.ReleaseAfterQueuedWork(buffer);
+            else
+                buffer.Dispose();
+        }
+        else if (!Gpu.GpuBufferReleaseDeferral.TryDefer(buffer.Dispose))
+        {
+            buffer.Dispose();
+        }
     }
 
     private void InvalidateActivationCacheEntry(object key)
@@ -3070,6 +3087,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         state.Buffer = null;
         state.DeviceValid = false;
+        // If this tensor is the sole storage reference and its storage also owns an attached GPU buffer
+        // (e.g., Tensor<T>.FromGpuBuffer(..., ownsBuffer: true) / UploadToGpu), detach it here so a
+        // subsequent tensor.Dispose() does not synchronously double-free the same IGpuBuffer.
+        if (tensor._storage.RefCount == 1)
+        {
+            tensor._storage.DisposeGpuBufferOwner(owner =>
+            {
+                if (!ReferenceEquals(owner, buffer))
+                {
+                    if (afterQueuedWork && owner is IGpuBuffer otherGpu && tensor._gpuBackend is IQueuedBufferRelease otherQueued)
+                        otherQueued.ReleaseAfterQueuedWork(otherGpu);
+                    else
+                        owner.Dispose();
+                }
+            });
+            if (ReferenceEquals(tensor._gpuBuffer, buffer))
+            {
+                tensor._gpuBuffer = null;
+                tensor._ownsGpuBuffer = false;
+            }
+        }
         if (afterQueuedWork && tensor._gpuBackend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);
         else buffer.Dispose();
     }
@@ -3853,19 +3891,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var be) || !param.IsContiguous) return null;
-        if (!TryGetFlatParameterView(param, out var flat, out int offset)) return null;
-        var flatBuffer = AcquireFlatDeviceBuffer(flat, be, param.GpuCacheVersion);
+        if (TryGetFlatParameterView(param) is not { } flatView) return null;
+        var flatBuffer = AcquireFlatDeviceBuffer(flatView.Flat, be, param.GpuCacheVersion);
         var staged = be.AllocateBuffer(param.Length);
         try
         {
-            be.Copy(flatBuffer, offset, staged, 0, param.Length);
+            be.Copy(flatBuffer, flatView.Offset, staged, 0, param.Length);
         }
         catch
         {
             staged.Dispose();
             throw;
         }
-        return new StagedFlatParameter(staged, flatBuffer, offset);
+        return new StagedFlatParameter(staged, flatBuffer, flatView.Offset);
     }
 
     /// <summary>A flat parameter's elements staged in their own device buffer; disposing it returns that buffer.</summary>
@@ -3890,27 +3928,260 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         public void Dispose() => Staged.Dispose();
     }
 
-    internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend backend)
+    internal readonly struct TransientDeviceSlice : IDisposable
+    {
+        private readonly IDirectGpuBackend? _backend;
+        private readonly OwnedBuffer _owned;
+
+        internal TransientDeviceSlice(IDirectGpuBackend backend, OwnedBuffer owned)
+        {
+            _backend = backend;
+            _owned = owned;
+        }
+
+        internal IGpuBuffer Buffer => _owned.Buffer;
+
+        public void Dispose()
+        {
+            if (_backend is not null)
+                _owned.DisposeAfterQueuedUse(_backend);
+            else
+                _owned.Dispose();
+        }
+    }
+
+    internal bool TryUploadTransientFloat(IDirectGpuBackend backend, Tensor<float> source, int length, out TransientDeviceSlice slice)
+    {
+        slice = default;
+        if (length < 0 || source.Length < length || !source.IsContiguous) return false;
+        if (source._storageOffset == 0 && source.GetBackingArrayForCacheLookupUnsafe() is { } cachedArr)
+        {
+            lock (_activationCacheLock)
+            {
+                if (_activationCache.TryGetValue(cachedArr, out var actEntry)
+                    && ReferenceEquals(actEntry.Backend, backend)
+                    && actEntry.HostVersion == source.GpuCacheVersion
+                    && !actEntry.IsFp16
+                    && actEntry.Buffer.Handle != IntPtr.Zero
+                    && actEntry.Buffer.Size >= length)
+                {
+                    slice = new TransientDeviceSlice(backend, new OwnedBuffer(actEntry.Buffer, ownsBuffer: false));
+                    return true;
+                }
+            }
+        }
+
+        float[] uploadSource;
+        var host = source.GetCpuBackingForStridedRead(out int offset);
+        if (host is not null && (long)offset + length <= host.Length)
+        {
+            if (offset == 0 && host.Length == length)
+            {
+                uploadSource = host;
+            }
+            else
+            {
+                uploadSource = new float[length];
+                Array.Copy(host, offset, uploadSource, 0, length);
+            }
+        }
+        else if (length == 0)
+        {
+            uploadSource = Array.Empty<float>();
+        }
+        else
+        {
+            var span = source.AsSpan();
+            if (span.Length < length) return false;
+            uploadSource = span.Slice(0, length).ToArray();
+        }
+        var scratch = AllocateTransientScratch(backend, Math.Max(1, length), fullyWritten: length > 0);
+        try
+        {
+            if (length > 0)
+                backend.UploadBufferInPlace(uploadSource, scratch.Buffer);
+            slice = new TransientDeviceSlice(backend, scratch);
+            return true;
+        }
+        catch (NotSupportedException ex)
+        {
+            scratch.Dispose();
+            GpuLaunchProbe.OnFallback("TryUploadTransientFloat", ex);
+            return false;
+        }
+        catch
+        {
+            scratch.Dispose();
+            throw;
+        }
+    }
+
+    internal bool TryUploadTransientInt(IDirectGpuBackend backend, Tensor<int> source, int length, out TransientDeviceSlice slice)
+    {
+        slice = default;
+        if (length < 0 || source.Length < length || !source.IsContiguous) return false;
+        int[] uploadSource;
+        var host = source.GetCpuBackingForStridedRead(out int offset);
+        if (host is not null && (long)offset + length <= host.Length)
+        {
+            if (offset == 0 && host.Length == length)
+            {
+                uploadSource = host;
+            }
+            else
+            {
+                uploadSource = new int[length];
+                Array.Copy(host, offset, uploadSource, 0, length);
+            }
+        }
+        else if (length == 0)
+        {
+            uploadSource = Array.Empty<int>();
+        }
+        else
+        {
+            var span = source.AsSpan();
+            if (span.Length < length) return false;
+            uploadSource = span.Slice(0, length).ToArray();
+        }
+        try
+        {
+            if (length == 0)
+            {
+                var emptyBuf = backend.AllocateIntBuffer(1);
+                slice = new TransientDeviceSlice(backend, new OwnedBuffer(emptyBuf, ownsBuffer: true));
+                return true;
+            }
+            var intBuf = backend.AllocateIntBuffer(uploadSource);
+            slice = new TransientDeviceSlice(backend, new OwnedBuffer(intBuf, ownsBuffer: true));
+            return true;
+        }
+        catch (NotSupportedException ex)
+        {
+            GpuLaunchProbe.OnFallback("TryUploadTransientInt", ex);
+            return false;
+        }
+    }
+
+    internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend? backend)
     {
         using var __gpuOp = EnterGpuOp();
-        backend = null!;
+        backend = null;
         if (!TryGetBackend(out var be) || !param.IsContiguous) return null;
         backend = be;
-        if (TryGetFlatParameterView(param, out var flat, out int offset))
+        if (TryGetFlatParameterView(param) is { } flatView)
         {
             // A view into the model's flat ParameterBuffer: the WHOLE flat array lives on the device as one buffer and
             // each parameter is a view of it. While the flat array is device-authoritative (pending host download) the
             // existing buffer is current; otherwise the host copy is, so it is uploaded once for every parameter.
             // A backend without sub-buffer views updates the parameter through a staged copy (TryStageFlatParameter).
             if (be is not IGpuBufferViews views) return null;
-            return views.TryCreateView(AcquireFlatDeviceBuffer(flat, be, param.GpuCacheVersion), offset, param.Length);
+            return views.TryCreateView(AcquireFlatDeviceBuffer(flatView.Flat, be, param.GpuCacheVersion), flatView.Offset, param.Length);
         }
         if (param._storageOffset != 0) return null;
-        if (param._gpuBuffer is not null && ReferenceEquals(param._gpuBackend, be) && param._gpuBuffer.Handle != IntPtr.Zero
-            && param._gpuBufferVersion == param.GpuCacheVersion && param._gpuBuffer.Size >= param.Length)
-            return param._gpuBuffer;
+        var paramArray = param.GetBackingArrayForCacheLookupUnsafe();
+        if (param._gpuBuffer is { } existingBuf && existingBuf.Handle != IntPtr.Zero && ReferenceEquals(param._gpuBackend, be)
+            && existingBuf.Size >= param.Length)
+        {
+            if (param._gpuBufferVersion == param.GpuCacheVersion)
+            {
+                if (paramArray is null || param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf))
+                    return existingBuf;
+                if (paramArray.Length == param.Length)
+                {
+                    bool isPersistent = false;
+                    lock (_persistentBufferLock)
+                    {
+                        if (_persistentBufferCache.TryGetValue(paramArray, out var cached)
+                            && ReferenceEquals(cached.Buffer, existingBuf))
+                        {
+                            isPersistent = true;
+                        }
+                        else
+                        {
+                            bool removedActivation = false;
+                            lock (_activationCacheLock)
+                            {
+                                if (_activationCache.TryGetValue(paramArray, out var actEntry)
+                                    && ReferenceEquals(actEntry.Buffer, existingBuf))
+                                    removedActivation = _activationCache.TryRemove(paramArray, out _);
+                            }
+                            if (removedActivation)
+                            {
+                                // Promote activation-cached weight/bias buffer to persistent weight cache without re-uploading.
+                                _persistentBufferCache[paramArray] = new GpuBufferCacheEntry(existingBuf, PersistentTensorRole.Weights)
+                                {
+                                    Version = param.GpuCacheVersion
+                                };
+                                _persistentWeightHostVersion[paramArray] = param.GpuCacheVersion;
+                                isPersistent = true;
+                            }
+                        }
+                    }
+                    if (isPersistent)
+                        return existingBuf;
+                }
+            }
+            else if (param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf) || param._device != TensorDevice.CPU)
+            {
+                try
+                {
+                    if (param.Length > 0)
+                    {
+                        float[] refreshData = paramArray is not null && paramArray.Length == param.Length
+                            ? paramArray
+                            : param.AsSpan().ToArray();
+                        be.UploadBufferInPlace(refreshData, existingBuf);
+                    }
+                    param._gpuBufferVersion = param.GpuCacheVersion;
+                    if (paramArray is not null)
+                    {
+                        Helpers.HostSync.Remove(paramArray);
+                        lock (_persistentBufferLock)
+                        {
+                            if (_persistentBufferCache.TryGetValue(paramArray, out var cached)
+                                && ReferenceEquals(cached.Buffer, existingBuf))
+                            {
+                                cached.Version = param.GpuCacheVersion;
+                                _persistentWeightHostVersion[paramArray] = param.GpuCacheVersion;
+                            }
+                        }
+                    }
+                    return existingBuf;
+                }
+                catch (NotSupportedException ex)
+                {
+                    GpuLaunchProbe.OnFallback("AcquireParameterBuffer.RefreshInPlace", ex);
+                    return null;
+                }
+            }
+        }
         var owned = GetOrCacheWeightBufferVersionAware(be, param, PersistentTensorRole.Weights);
         if (owned.OwnsBuffer) { owned.Dispose(); return null; }   // not cacheable; the caller keeps the host path
+        if (paramArray is not null && paramArray.Length == param.Length)
+        {
+            lock (_persistentBufferLock)
+            {
+                if (!_persistentBufferCache.ContainsKey(paramArray))
+                {
+                    bool removedActivation = false;
+                    lock (_activationCacheLock)
+                    {
+                        if (_activationCache.TryGetValue(paramArray, out var actEntry)
+                            && ReferenceEquals(actEntry.Buffer, owned.Buffer))
+                            removedActivation = _activationCache.TryRemove(paramArray, out _);
+                    }
+                    if (removedActivation)
+                    {
+                        _persistentBufferCache[paramArray] = new GpuBufferCacheEntry(owned.Buffer, PersistentTensorRole.Weights)
+                        {
+                            Version = param.GpuCacheVersion
+                        };
+                        _persistentWeightHostVersion[paramArray] = param.GpuCacheVersion;
+                    }
+                }
+            }
+        }
         param._gpuBuffer = owned.Buffer; param._gpuBackend = be; param._gpuBufferVersion = param.GpuCacheVersion;
         return owned.Buffer;
     }
@@ -3924,9 +4195,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void CommitParameterUpdatedOnDevice(Tensor<float> param, IGpuBuffer buffer, IDirectGpuBackend backend,
         Gpu.GpuSyncPoint? syncPoint)
     {
-        param.MarkModified(syncPoint);   // bumps Version
-        if (TryGetFlatParameterView(param, out var flat, out _))
+        if (TryGetFlatParameterView(param) is { } flatView)
         {
+            var flat = flatView.Flat;
+            param.MarkModified(syncPoint);   // bumps Version
             // A ParameterBuffer view: the flat array's device buffer is now the authoritative copy of EVERY parameter
             // in it; a host read of any of them downloads the whole flat buffer once. The view is not bound to the
             // tensor: forwards resolve it from the flat buffer while that stays authoritative (a bound view could
@@ -3944,27 +4216,61 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             if (flatBuffer is null) return;
             var capFlat = flatBuffer; var capFlatBackend = backend;
+            Helpers.HostSync.Remove(flat);
             Helpers.HostSync.Register(flat, a =>
             {
+                var dst = (float[])a;
+                if (dst.Length >= capFlat.Size)
+                {
+                    capFlatBackend.DownloadBuffer(capFlat, dst);
+                    return;
+                }
                 float[] f = capFlatBackend.DownloadBuffer(capFlat);
-                System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
+                System.Array.Copy(f, dst, System.Math.Min(f.Length, dst.Length));
             });
             return;
         }
-        param._gpuBuffer = buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.GpuCacheVersion;
         var arr = param.GetBackingArrayForCacheLookupUnsafe();
-        if (arr is null) return;
+        param._gpuBuffer = buffer;
+        param._gpuBackend = backend;
+        if (arr is not null)
+        {
+            Helpers.HostSync.Remove(arr);
+            Helpers.ResidentHostMirror.Attach(param);
+        }
+        param.MarkModified(syncPoint);   // bumps Version, updates _gpuBufferVersion, and registers ResidentHostMirror
+        param._gpuBufferVersion = param.GpuCacheVersion;
+        if (arr is null)
+        {
+            // Tensor<float>.FromGpuBuffer / UploadToGpu parameter without a materialized host array yet:
+            // re-arm vector-keyed HostSync if a prior host read already materialized DataVector.
+            if (param._gpuMaterializerKey is { } vecKey && param._gpuMaterializerCallback is { } vecCb)
+            {
+                Helpers.HostSync.Remove(vecKey);
+                Helpers.HostSync.Register(vecKey, vecCb);
+            }
+            return;
+        }
         lock (_persistentBufferLock)
         {
             if (_persistentBufferCache.TryGetValue(arr, out var entry) && ReferenceEquals(entry.Buffer, buffer))
                 _persistentWeightHostVersion[arr] = param.GpuCacheVersion;
         }
-        var capBuf = buffer; var capBackend = backend;
-        Helpers.HostSync.Register(arr, a =>
+        if (!Helpers.HostSync.IsPending(arr))
         {
-            float[] f = capBackend.DownloadBuffer(capBuf);
-            System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
-        });
+            var capBuf = buffer; var capBackend = backend;
+            Helpers.HostSync.Register(arr, a =>
+            {
+                var dst = (float[])a;
+                if (dst.Length >= capBuf.Size)
+                {
+                    capBackend.DownloadBuffer(capBuf, dst);
+                    return;
+                }
+                float[] f = capBackend.DownloadBuffer(capBuf);
+                System.Array.Copy(f, dst, System.Math.Min(f.Length, dst.Length));
+            });
+        }
     }
 
     /// <summary>
@@ -3990,14 +4296,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// A zero-filled float tensor whose data lives in a dedicated device buffer (not the activation cache, so no
     /// step release or eviction frees it while the tensor is alive); a host read downloads it lazily.
     /// </summary>
-    internal bool TryCreateDeviceStateTensor(int[] shape, out Tensor<float> tensor)
+    internal Tensor<float>? TryCreateDeviceStateTensor(int[] shape)
     {
         using var __gpuOp = EnterGpuOp();
-        tensor = null!;
-        if (!TryGetBackend(out var backend)) return false;
+        if (!TryGetBackend(out var backend)) return null;
         int n = 1;
         foreach (var d in shape) n = checked(n * d);
-        if (n == 0) return false;
+        if (n == 0) return null;
         IGpuBuffer buffer;
         try
         {
@@ -4006,12 +4311,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (NotSupportedException ex) {
             GpuLaunchProbe.OnFallback("TryCreateDeviceStateTensor", ex);
-            return false;
+            return null;
         }
         var t = new Tensor<float>(shape);
-        BindResidentBuffer(t, buffer, backend);
-        tensor = t;
-        return true;
+        t._ownsGpuBuffer = true;
+        // Both t's newly allocated host array and `buffer` hold zeros at creation time, so attach ResidentHostMirror
+        // without arming a redundant zero D2H download until a device kernel actually mutates `t`.
+        BindResidentBuffer(t, buffer, backend, isDeviceModified: false);
+        return t;
     }
 
     /// <summary>
@@ -4025,28 +4332,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Keyed on the backing array, not this Tensor object: the optimizer and the layer can hold different
         // wrappers over the same storage, and only the one the optimizer updated has its device buffer bound.
         object? arr = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (arr is null && typeof(T) == typeof(float) && TryGetFlatParameterView((Tensor<float>)(object)tensor, out var flat, out _))
-            arr = flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
+        if (arr is null && tensor is Tensor<float> floatTensor && TryGetFlatParameterView(floatTensor) is { } flatView)
+            arr = flatView.Flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
         return arr is not null && Helpers.HostSync.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
     }
 
     /// <summary>True when <paramref name="t"/> is a view into a larger flat array (a ParameterBuffer parameter).</summary>
-    internal static bool IsFlatParameterView(Tensor<float> t) => TryGetFlatParameterView(t, out _, out _);
+    internal static bool IsFlatParameterView(Tensor<float> t) => TryGetFlatParameterView(t) is not null;
 
     /// <summary>
-    /// True when <paramref name="t"/> is a contiguous view at a non-zero offset into a larger flat array (the shape of a
-    /// ParameterBuffer parameter), returning that array and the element offset.
+    /// Returns the flat array and element offset when <paramref name="t"/> is a contiguous view into a larger flat
+    /// array (the shape of a ParameterBuffer parameter), or <c>null</c> otherwise.
     /// </summary>
-    private static bool TryGetFlatParameterView(Tensor<float> t, out float[] flat, out int offset)
+    private static (float[] Flat, int Offset)? TryGetFlatParameterView(Tensor<float> t)
     {
-        flat = null!; offset = 0;
-        if (!t.IsContiguous) return false;
-        if (!t.DataVector.TryGetBackingArraySegmentForReadOnlyAccess(out var arr, out int segment) || arr is null) return false;
-        offset = segment + t._storageOffset;
-        if (offset == 0 && arr.Length == t.Length) return false;   // the tensor owns the whole array: not a view
-        if ((long)offset + t.Length > arr.Length) return false;
-        flat = arr;
-        return true;
+        if (!t.IsContiguous) return null;
+        _ = t.DataVector.TryGetBackingArraySegmentForReadOnlyAccess(out var arr, out int segment);
+        if (arr is null) return null;
+        int offset = segment + t._storageOffset;
+        if (offset == 0 && arr.Length == t.Length) return null;   // the tensor owns the whole array: not a view
+        if ((long)offset + t.Length > arr.Length) return null;
+        return (arr, offset);
     }
 
     /// <summary>
@@ -4066,7 +4372,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         owned = false;
         if (typeof(T) != typeof(float)) return false;
         var ft = (Tensor<float>)(object)t;
-        if (!TryGetFlatParameterView(ft, out var flat, out int offset)) return false;
+        if (TryGetFlatParameterView(ft) is not { } flatView) return false;
+        var flat = flatView.Flat;
+        int offset = flatView.Offset;
         IGpuBuffer? flatBuffer = null;
         if (Helpers.HostSync.IsPending(flat))
         {
@@ -4124,7 +4432,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // elements. Views stay unbound and resolve from the flat buffer at their offset (TryResolveDeviceParameterView);
         // see CommitParameterUpdatedOnDevice for why a bound alias is not kept either.
         if (!param.IsContiguous || param._storage.IsParameterBuffer
-            || (param is Tensor<float> floatParam && TryGetFlatParameterView(floatParam, out _, out int viewOffset) && viewOffset != 0)) return;
+            || (param is Tensor<float> floatParam && TryGetFlatParameterView(floatParam) is { Offset: not 0 })) return;
 
         int hostVersion = param.GpuCacheVersion;
         PersistentTensorRole role = _persistentBufferCache.TryGetValue(arr, out var current)
@@ -4592,10 +4900,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // keyed by its storage) is never read again: from here dest borrows srcBuf every step. Left in the cache it
         // lived as long as dest's storage, the plan's lifetime: 3 GB of trace-time results on DenseNet-121. Released
         // only outside a stream capture, so the pre-residency pass frees them and a capture frees nothing.
-        if (!(backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing()))
+        bool streamCapturing = backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing();
+        if (!streamCapturing)
         {
             ReleaseSupersededActivation(destArr, srcBuf);
             ReleaseSupersededActivation(dest.DataVector, srcBuf);
+        }
+        if (dest._storage.RefCount == 1 && dest._storage.HasGpuBufferOwner && !dest._storage.OwnsGpuBuffer(srcBuf))
+        {
+            var prevStorageBackend = dest._gpuBackend;
+            dest._storage.DisposeGpuBufferOwner(owner =>
+            {
+                if (ReferenceEquals(owner, srcBuf)) return;
+                if (owner is IGpuBuffer gpuOwner)
+                    ReleaseSupersededOwnedBuffer(gpuOwner, prevStorageBackend, streamCapturing);
+                else if (!streamCapturing || !Gpu.GpuBufferReleaseDeferral.TryDefer(owner.Dispose))
+                    owner.Dispose();
+            });
+        }
+        if (dest._ownsGpuBuffer)
+        {
+            var prevOwned = dest._gpuBuffer;
+            var prevBackend = dest._gpuBackend;
+            dest._ownsGpuBuffer = false;
+            if (prevOwned is not null && !ReferenceEquals(prevOwned, srcBuf))
+                ReleaseSupersededOwnedBuffer(prevOwned, prevBackend, streamCapturing);
         }
 
         // Borrow src's buffer: consumers resolve dest via the _gpuBuffer fast path. We do NOT add a second
@@ -6026,6 +6355,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Mark a tensor GPU-resident on `buf`: consumers resolve it via the _gpuBuffer fast path (no re-upload), and
     // a deferred materializer keeps host reads correct. Used by the compiled-step resident op paths.
     internal void BindResidentBuffer<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend)
+        => BindResidentBuffer(t, buf, backend, isDeviceModified: true);
+
+    internal void BindResidentBuffer<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend, bool isDeviceModified)
     {
         int hostVersion = t.GpuCacheVersion;
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = hostVersion;
@@ -6072,6 +6404,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #3 FP16-act: this array now holds FP32 — drop any stale FP16 tag (a pooled array reused FP16→FP32).
         if (Fp16ActEnabled) _fp16ResidentArrays.TryRemove(arr, out _);
         if (s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = s_currentForwardOp;
+        if (!isDeviceModified)
+        {
+            // The buffer was initialized directly from the tensor's already-synchronized host data: attach
+            // ResidentHostMirror so future MarkModified(syncPoint) calls re-arm HostSync, without registering
+            // a redundant device-to-host download before any device kernel mutates the buffer.
+            Helpers.ResidentHostMirror.Attach(t);
+            return;
+        }
         // Arm the host download through the per-backing-array mirror: it copies each resident view into ITS slice
         // and covers every view sharing the array. (A per-tensor callback here copied to index 0 of the array -
         // onto another parameter when this tensor is a view into a shared parameter buffer - and, since
@@ -7671,7 +8011,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).Sigmoid(input);
         using var resultDataKeep1 = new KeepAliveScope(result);
         using var destDataKeep1 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
@@ -7803,7 +8143,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).ReLU(input);
         using var resultDataKeep2 = new KeepAliveScope(result);
         using var destDataKeep2 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     /// <summary>GPU-resident elementwise log into the destination's stable buffer (the cross-entropy loss's log
@@ -8349,7 +8689,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var result = ((IEngine)this).TensorMatMul(a, b);
         using var resultDataKeep3 = new KeepAliveScope(result);
         using var destDataKeep3 = new KeepAliveScope(dest);
-        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
+        result.ReadOnlyDataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
@@ -8913,6 +9253,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSum<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
@@ -8925,6 +9266,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMaxValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
@@ -8937,6 +9279,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMinValue<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
@@ -15347,15 +15690,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.FFT<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.FFT(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank == 0
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.FFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
         }
 
         int n = inputReal.Shape._dims[^1];
-        if ((n & (n - 1)) != 0) // Not power of 2
+        if (n < 2 || (n & (n - 1)) != 0) // Non-power-of-two or length <= 1
         {
             base.FFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15383,6 +15736,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("FFT", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Forward);
         }
         catch
         {
@@ -15396,15 +15750,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.IFFT<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.IFFT(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank == 0
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.IFFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
         }
 
         int n = inputReal.Shape._dims[^1];
-        if ((n & (n - 1)) != 0)
+        if (n < 2 || (n & (n - 1)) != 0)
         {
             base.IFFT(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15432,6 +15796,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("IFFT", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Inverse);
         }
         catch
         {
@@ -15445,8 +15810,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.FFT2D<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.FFT2D(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Rank < 2 || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank < 2
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.FFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15455,7 +15830,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int height = inputReal.Shape._dims[^2];
         int width = inputReal.Shape._dims[^1];
 
-        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        if (height < 2 || width < 2 || (height & (height - 1)) != 0 || (width & (width - 1)) != 0)
         {
             base.FFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15483,6 +15858,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("FFT2D", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Forward2D);
         }
         catch
         {
@@ -15496,8 +15872,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     void IEngine.IFFT2D<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
+        if (inputReal is null) throw new ArgumentNullException(nameof(inputReal));
+        if (inputImag is null) throw new ArgumentNullException(nameof(inputImag));
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.IFFT2D(inputReal, inputImag, out outputReal, out outputImag);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || inputReal.Rank < 2 || inputReal.Length != inputImag.Length)
+        if (inputReal.Rank < 2
+            || !inputReal._shape.AsSpan().SequenceEqual(inputImag._shape.AsSpan())
+            || !TryGetBackend(out var backend)
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.IFFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15506,7 +15892,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int height = inputReal.Shape._dims[^2];
         int width = inputReal.Shape._dims[^1];
 
-        if ((height & (height - 1)) != 0 || (width & (width - 1)) != 0)
+        if (height < 2 || width < 2 || (height & (height - 1)) != 0 || (width & (width - 1)) != 0)
         {
             base.IFFT2D(inputReal, inputImag, out outputReal, out outputImag);
             return;
@@ -15534,6 +15920,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 inputImag.Length, inputImag.Shape.ToArray());
             outputRealBuffer.RelinquishOwnership();
             outputImagBuffer.RelinquishOwnership();
+            RecordFftTapeEdges("IFFT2D", inputReal, inputImag, outputReal, outputImag, Autodiff.FftTransform.Inverse2D);
         }
         catch
         {
@@ -15554,8 +15941,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         out Tensor<T> magnitudeOut,
         out Tensor<T> phaseOut)
     {
+        // Any graph trace goes through CpuEngine.STFT, which captures it (an inference kernel, or one training node per
+        // output) and replays on this engine with the trace suspended, landing on the device path below.
+        if (Compilation.GraphMode.IsActive)
+        {
+            base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
+            return;
+        }
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft)
+        // The device kernel computes in float. A taped call in any other precision trains on the CPU path, whose
+        // forward is exact in T, so its recorded gradient matches the function the loss actually sees.
+        if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0 || window.Length != nFft
+            || (typeof(T) != typeof(float) && Autodiff.DifferentiableOps.IsRecording<T>()))
         {
             base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
             return;
@@ -15569,7 +15966,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int paddedLength = signalLength + 2 * pad;
             int numFrames = (paddedLength - nFft) / hopLength + 1;
             int numFreqs = nFft / 2 + 1;
-            if (numFrames <= 0)
+            // Reflection padding of pad = nFft / 2 samples requires signalLength > pad (same guard as CpuEngine.STFT);
+            // otherwise e.g. signalLength = 4, nFft = 16 has numFrames > 0 and ReflectPad1d would read out of bounds.
+            if ((center && signalLength <= pad) || numFrames <= 0)
             {
                 base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
                 return;
@@ -15600,11 +15999,104 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             phaseOut = DeferTensorResult<T>(backend, phaseBuffer.Buffer, outputLength, outputShape);
             magnitudeBuffer.RelinquishOwnership();
             phaseBuffer.RelinquishOwnership();
+            RecordStftTapeEdges(input, nFft, hopLength, window, center, magnitudeOut, phaseOut);
         }
         catch
         {
             if (ThrowOnGpuKernelFallback) throw;
             base.STFT(input, nFft, hopLength, window, center, out magnitudeOut, out phaseOut);
+        }
+    }
+
+    /// <summary>
+    /// The first-order STFT backward on the device: the waveform gradient and the window gradient of one output's seed
+    /// (<see cref="Autodiff.BackwardFunctions{T}.StftMagnitudeBackward"/> and its phase sibling), with the same analysis
+    /// adjoint as the host kernel. Returns false, computing nothing, where the host path must run: non-float data, no
+    /// backend, an active graph trace, or a window that is not <paramref name="nFft"/> long.
+    /// </summary>
+    internal bool TryStftBackward<T>(Tensor<T> gradient, Tensor<T> magnitude, Tensor<T> phase, bool phaseTarget,
+        Tensor<T> waveform, Tensor<T> window, int nFft, int hopLength, bool center,
+        out Tensor<T>? gradWaveform, out Tensor<T>? gradWindow)
+    {
+        gradWaveform = null;
+        gradWindow = null;
+        using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend))
+            return false;
+
+        // A pure recording deferred scope has queued, not run, the work that produces these operands. These kernels
+        // are not recorded, so launching them would run them now, ahead of their producers; the host adjoint would
+        // download the same unwritten buffers. A scope executes once, so nothing can run the producers first here:
+        // refuse rather than return a gradient computed from uninitialised memory.
+        // This holds for every element type, since the host adjoint of a double STFT reads the same buffers.
+        if (backend is Gpu.RecordingGpuBackend { IsRecording: true, ExecuteWhileRecording: false })
+            throw new InvalidOperationException(
+                "The STFT backward cannot run inside a deferred scope that records without executing: its operands "
+                + "are not computed until the scope executes. Compute the gradient after DeferredScope.Execute(), or "
+                + "set GpuExecutionOptions.ExecuteEagerlyWhileRecording.");
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
+            || waveform.Rank == 0 || gradient.Rank < 2 || window.Length != nFft || nFft <= 0 || hopLength <= 0)
+            return false;
+
+        int length = waveform.Shape._dims[^1];
+        int numFreqs = nFft / 2 + 1;
+        int numFrames = gradient.Shape._dims[^1];
+        int batch = length == 0 ? 0 : waveform.Length / length;
+        int pad = center ? nFft / 2 : 0;
+        long padded = (long)length + 2L * pad;
+        long batchFrames = (long)batch * numFrames;
+        if (batch <= 0 || numFrames <= 0 || batchFrames > int.MaxValue
+            || (center ? length <= pad : length < nFft)
+            || 2L * padded > int.MaxValue || hopLength > padded
+            || padded < nFft || (long)(numFrames - 1) * hopLength + nFft > padded
+            || batchFrames * numFreqs != gradient.Length
+            || batchFrames * nFft > int.MaxValue
+            || magnitude.Length != gradient.Length || phase.Length != gradient.Length)
+            return false;
+
+        // The kernels are queued when this returns, so every temporary they read is released only after that work
+        // (CUDA's legacy allocator would otherwise hand the memory to another stream while they still use it).
+        OwnedBuffer gradBuffer = default, magnitudeBuffer = default, phaseBuffer = default, waveformBuffer = default,
+            windowBuffer = default, frameGradBuffer = default, signalGradBuffer = default, windowGradBuffer = default;
+        bool handedOff = false;
+        try
+        {
+            gradBuffer = GetOrAllocateBuffer(backend, gradient);
+            magnitudeBuffer = GetOrAllocateBuffer(backend, magnitude);
+            phaseBuffer = GetOrAllocateBuffer(backend, phase);
+            waveformBuffer = GetOrAllocateBuffer(backend, waveform);
+            windowBuffer = GetOrAllocateBuffer(backend, window);
+            frameGradBuffer = AllocateFullyWrittenOutputBuffer(backend, (int)(batchFrames * nFft));
+            signalGradBuffer = AllocateFullyWrittenOutputBuffer(backend, waveform.Length);
+            windowGradBuffer = AllocateFullyWrittenOutputBuffer(backend, nFft);
+            backend.StftBackwardFrames(gradBuffer.Buffer, magnitudeBuffer.Buffer, phaseBuffer.Buffer, frameGradBuffer.Buffer,
+                batch, nFft, numFrames, numFreqs, phaseTarget ? 1 : 0);
+            backend.StftBackwardSignal(frameGradBuffer.Buffer, windowBuffer.Buffer, signalGradBuffer.Buffer,
+                batch, length, pad, nFft, hopLength, numFrames);
+            backend.StftBackwardWindow(frameGradBuffer.Buffer, waveformBuffer.Buffer, windowGradBuffer.Buffer,
+                batch, length, pad, nFft, hopLength, numFrames);
+            gradWaveform = DeferTensorResult<T>(backend, signalGradBuffer.Buffer, waveform.Length, waveform.Shape.ToArray());
+            gradWindow = DeferTensorResult<T>(backend, windowGradBuffer.Buffer, nFft, window.Shape.ToArray());
+            signalGradBuffer.RelinquishOwnership();
+            windowGradBuffer.RelinquishOwnership();
+            handedOff = true;
+            return true;
+        }
+        finally
+        {
+            if (!handedOff)
+            {
+                signalGradBuffer.DisposeAfterQueuedUse(backend);
+                windowGradBuffer.DisposeAfterQueuedUse(backend);
+                gradWaveform = null;
+                gradWindow = null;
+            }
+            frameGradBuffer.DisposeAfterQueuedUse(backend);
+            windowBuffer.DisposeAfterQueuedUse(backend);
+            waveformBuffer.DisposeAfterQueuedUse(backend);
+            phaseBuffer.DisposeAfterQueuedUse(backend);
+            magnitudeBuffer.DisposeAfterQueuedUse(backend);
+            gradBuffer.DisposeAfterQueuedUse(backend);
         }
     }
 
@@ -15699,6 +16191,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> window,
         bool powerToDb)
     {
+        // Any graph trace goes through CpuEngine.MelSpectrogram, which captures it and replays on this engine.
+        if (Compilation.GraphMode.IsActive)
+            return base.MelSpectrogram(input, sampleRate, nFft, hopLength, nMels, fMin, fMax, window, powerToDb);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend) || (nFft & (nFft - 1)) != 0)
         {
@@ -15707,8 +16202,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            ((IEngine)this).STFT(input, nFft, hopLength, window, center: true,
-                out var magnitude, out var phase);
+            // Without a tape: this override records its own MelSpectrogram edge, and STFT's edges would double it.
+            Tensor<T> magnitude, phase;
+            using (new Autodiff.NoGradScope<T>())
+                ((IEngine)this).STFT(input, nFft, hopLength, window, center: true, out magnitude, out phase);
             // `phase` is retained (it used to be discarded via `_ = phase`) because
             // MelSpectrogramBackward needs it to rebuild the complex spectrum when propagating the
             // gradient back through |STFT|.
@@ -28627,12 +29124,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private void DisposeAfterQueuedRead<T>(Tensor<T> tensor)
     {
         if (tensor._storage.RefCount == 1)
+        {
             ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true);
+            var backend = tensor._gpuBackend;
+            tensor._storage.DisposeGpuBufferOwner(owner =>
+            {
+                if (owner is IGpuBuffer gpuBuffer && backend is IQueuedBufferRelease queued)
+                    queued.ReleaseAfterQueuedWork(gpuBuffer);
+                else
+                    owner.Dispose();
+            });
+            if (tensor._ownsGpuBuffer && tensor._gpuBuffer is { } ownedBuffer)
+            {
+                tensor._gpuBuffer = null;
+                tensor._ownsGpuBuffer = false;
+                if (backend is IQueuedBufferRelease queuedOwned)
+                    queuedOwned.ReleaseAfterQueuedWork(ownedBuffer);
+                else
+                    ownedBuffer.Dispose();
+            }
+        }
         tensor.Dispose();
     }
 
     T IEngine.TensorSumOfSquares<T>(Tensor<T> tensor)
     {
+        BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
         // Composed from IDirectGpuBackend.DotProduct(x, x, scalarOut, n), which all 6 backends implement without
         // materializing a full-length squares buffer on device (except WebGPU whose DotProduct composes internally);
@@ -30145,6 +30662,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMean<T>(Tensor<T> input)
     {
+        BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
         if (ShouldReduceOnDevice(input) && TryGetBackend(out var b))
         {

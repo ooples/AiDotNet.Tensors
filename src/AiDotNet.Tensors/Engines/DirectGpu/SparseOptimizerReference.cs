@@ -76,13 +76,12 @@ internal static class SparseOptimizerReference
         {
             int i = DecodeIndex(indices[k], param.Length);
             float grad = values[k];
+            if (weightDecay > 0f) grad += weightDecay * param[i];
             float mVal = beta1 * m[i] + (1f - beta1) * grad;
             float vVal = beta2 * v[i] + (1f - beta2) * grad * grad;
             m[i] = mVal;
             v[i] = vVal;
-            float update = learningRate * (mVal / bc1) / (MathF.Sqrt(vVal / bc2) + epsilon);
-            if (weightDecay > 0f) update += learningRate * weightDecay * param[i];
-            param[i] -= update;
+            param[i] -= learningRate * (mVal / bc1) / (MathF.Sqrt(vVal / bc2) + epsilon);
         }
     }
 

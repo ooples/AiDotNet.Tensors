@@ -230,13 +230,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
                     || (variant.Length > 0 && FirstOrderExemptVariants.ContainsKey($"{name}|{variant}"));
                 string label = $"{name}|{DifferentiableOpsGradCheckSweep.ParamFingerprint(m)}" + (variant.Length > 0 ? $" {{{variant}}}" : "");
 
-                var inputs = args.SelectMany(a => a switch
-                {
-                    Tensor<double> t => new[] { t },
-                    Tensor<double>[] arr => arr,
-                    IEnumerable<Tensor<double>> seq => seq.ToArray(),
-                    _ => Array.Empty<Tensor<double>>(),
-                }).Distinct().ToArray();
+                var inputs = DifferentiableOpsGradCheckSweep.InputTensors<double>(m, args);
 
                 // Only the inputs the backward differentiates: an input a first-order backward gives no gradient
                 // (an index tensor, a target) is the first-order sweep's business.
@@ -244,7 +238,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
                 try
                 {
                     using var tape = new GradientTape<double>();
-                    var outT = (Tensor<double>)m.Invoke(_engine, DifferentiableOpsGradCheckSweep.CopyArgs(args))!;
+                    var outT = DifferentiableOpsGradCheckSweep.InvokeOutput<double>(_engine, m, args);
                     if (outT.GradFn?.Backward?.Method is { } bm) label += $" [{bm.DeclaringType?.Name}.{bm.Name}]";
                     // One producer per tensor: an op that records itself AND the engine ops it is built from leaves its
                     // output with two tape entries, and a create-graph backward (a tape walk) runs both, doubling the
@@ -275,7 +269,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
                     result = GradCheck.GradGradCheckMany<double>(
                         _ =>
                         {
-                            var y = (Tensor<double>)m.Invoke(_engine, DifferentiableOpsGradCheckSweep.CopyArgs(args))!;
+                            var y = DifferentiableOpsGradCheckSweep.InvokeOutput<double>(_engine, m, args);
                             return _engine.TensorMultiply(y, y);
                         }, inputs,
                         new GradCheckOptions
@@ -372,13 +366,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
                 if (NotSecondOrderCheckable.ContainsKey(name) || DifferentiableOpsGradCheckSweep.Exempt.ContainsKey(name)
                     || NotThirdOrderCheckable.ContainsKey(name)) { exempt++; continue; }
                 string label = $"{name}|{DifferentiableOpsGradCheckSweep.ParamFingerprint(m)}";
-                var inputs = args.SelectMany(a => a switch
-                {
-                    Tensor<double> t => new[] { t },
-                    Tensor<double>[] arr => arr,
-                    IEnumerable<Tensor<double>> seq => seq.ToArray(),
-                    _ => Array.Empty<Tensor<double>>(),
-                }).Distinct().ToArray();
+                var inputs = DifferentiableOpsGradCheckSweep.InputTensors<double>(m, args);
                 var excluded = NonDifferentiableInputs.TryGetValue(name, out var nd) ? nd.Inputs : Array.Empty<int>();
 
                 try
@@ -387,7 +375,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
                     int[] outputShape;
                     using (var tape = new GradientTape<double>())
                     {
-                        var y = (Tensor<double>)m.Invoke(_engine, DifferentiableOpsGradCheckSweep.CopyArgs(args))!;
+                        var y = DifferentiableOpsGradCheckSweep.InvokeOutput<double>(_engine, m, args);
                         outputShape = (int[])y._shape.Clone();
                         var g = tape.ComputeGradients(_engine.ReduceSum(y, null), inputs);
                         sources = Enumerable.Range(0, inputs.Length)
@@ -405,7 +393,7 @@ public partial class DifferentiableOpsGradGradCheckSweep
                     {
                         third = null;
                         using var tape = new GradientTape<double>();
-                        var y = (Tensor<double>)m.Invoke(_engine, DifferentiableOpsGradCheckSweep.CopyArgs(args))!;
+                        var y = DifferentiableOpsGradCheckSweep.InvokeOutput<double>(_engine, m, args);
                         var loss = _engine.ReduceSum(_engine.TensorMultiply(_engine.TensorMultiply(y, y), u), null);
                         var g1 = tape.ComputeGradients(loss, sources, createGraph: true);
                         var h = Contract(g1, sources, v);

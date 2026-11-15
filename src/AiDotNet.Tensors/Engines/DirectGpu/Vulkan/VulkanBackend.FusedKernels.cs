@@ -243,6 +243,24 @@ public sealed partial class VulkanBackend
             new IGpuBuffer[] { specRe, specIm, window, result, windowSum },
             new uint[] { (uint)batch, (uint)numFrames, (uint)nFft, (uint)hop, (uint)outputLength, (uint)center });
     }
+    public void StftBackwardFrames(IGpuBuffer grad, IGpuBuffer magnitude, IGpuBuffer phase, IGpuBuffer frameGrad, int batch, int nFft, int numFrames, int numFreqs, int phaseTarget)
+    {
+        GlslDispatchN(VulkanAuditKernels.StftBackwardFrames, GpuBufferCapacity.RequireStftFrames(grad, magnitude, phase, frameGrad, batch, nFft, numFrames, numFreqs, phaseTarget),
+            new IGpuBuffer[] { grad, magnitude, phase, frameGrad },
+            new uint[] { (uint)batch, (uint)nFft, (uint)numFrames, (uint)numFreqs, (uint)phaseTarget });
+    }
+    public void StftBackwardSignal(IGpuBuffer frameGrad, IGpuBuffer window, IGpuBuffer gradSignal, int batch, int length, int pad, int nFft, int hop, int numFrames)
+    {
+        GlslDispatchN(VulkanAuditKernels.StftBackwardSignal, GpuBufferCapacity.RequireStftSignal(frameGrad, window, gradSignal, batch, length, pad, nFft, hop, numFrames),
+            new IGpuBuffer[] { frameGrad, window, gradSignal },
+            new uint[] { (uint)batch, (uint)length, (uint)pad, (uint)nFft, (uint)hop, (uint)numFrames });
+    }
+    public void StftBackwardWindow(IGpuBuffer frameGrad, IGpuBuffer signal, IGpuBuffer gradWindow, int batch, int length, int pad, int nFft, int hop, int numFrames)
+    {
+        GlslDispatchN(VulkanAuditKernels.StftBackwardWindow, GpuBufferCapacity.RequireStftWindow(frameGrad, signal, gradWindow, batch, length, pad, nFft, hop, numFrames),
+            new IGpuBuffer[] { frameGrad, signal, gradWindow },
+            new uint[] { (uint)batch, (uint)length, (uint)pad, (uint)nFft, (uint)hop, (uint)numFrames });
+    }
     public void IstftNormalize(IGpuBuffer result, IGpuBuffer windowSum, int total)
     {
         GlslDispatchN(VulkanAuditKernels.IstftNormalize, total,
