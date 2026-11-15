@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// represented by the generic floating-point tensor algebra.
 /// </summary>
 /// <remarks>
-/// One call encodes one level of tiny-cuda-nn's hash grid. Each coordinate is clamped to [0, 0.999999] and mapped to
+/// One call encodes one level of tiny-cuda-nn's hash grid. Each coordinate is clamped to [0, 1] (NaN to 0) and mapped to
 /// <c>pos = fma(scale, x, positionOffset)</c> in fp32; the cell is <c>floor(pos)</c> and the trilinear weights come from
 /// <c>pos - floor(pos)</c>. A corner is indexed densely (<c>x + y*R + z*R*R</c>, R = <c>gridResolution</c>
 /// in the methods below) when <c>R^3</c> is at most the table size, and through the coherent prime hash

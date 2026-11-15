@@ -173,14 +173,15 @@ internal sealed class PtxInstantNgpHashEncodeBackwardKernel : IDisposable
         ptx.AppendLine("    mul.rn.f32 %f13, %f9, %f7;");    // ixfy
         ptx.AppendLine("    mul.rn.f32 %f14, %f6, %f10;");   // fxiy
         ptx.AppendLine("    mul.rn.f32 %f15, %f6, %f7;");    // fxfy
-        AppendBackwardCorner(ptx, "%r8", "%r16", "%r18", "%f12", "%f11", gridResolution, tableSize);  // 000
-        AppendBackwardCorner(ptx, "%r8", "%r16", "%r19", "%f12", "%f8", gridResolution, tableSize);   // 001
-        AppendBackwardCorner(ptx, "%r8", "%r17", "%r18", "%f13", "%f11", gridResolution, tableSize);  // 010
-        AppendBackwardCorner(ptx, "%r8", "%r17", "%r19", "%f13", "%f8", gridResolution, tableSize);   // 011
-        AppendBackwardCorner(ptx, "%r9", "%r16", "%r18", "%f14", "%f11", gridResolution, tableSize);  // 100
-        AppendBackwardCorner(ptx, "%r9", "%r16", "%r19", "%f14", "%f8", gridResolution, tableSize);   // 101
-        AppendBackwardCorner(ptx, "%r9", "%r17", "%r18", "%f15", "%f11", gridResolution, tableSize);  // 110
-        AppendBackwardCorner(ptx, "%r9", "%r17", "%r19", "%f15", "%f8", gridResolution, tableSize);   // 111
+        // 8 corners in tiny-cuda-nn's order (bit d of c = upper vertex on axis d, x fastest), as the NVRTC kernel and the
+        // CPU, so two colliding corners of one point add into the entry in the same order.
+        for (int c = 0; c < 8; c++)
+        {
+            bool upperX = (c & 1) != 0, upperY = (c & 2) != 0, upperZ = (c & 4) != 0;
+            string xy = upperX ? (upperY ? "%f15" : "%f14") : (upperY ? "%f13" : "%f12");
+            AppendBackwardCorner(ptx, upperX ? "%r9" : "%r8", upperY ? "%r17" : "%r16", upperZ ? "%r19" : "%r18", xy,
+                upperZ ? "%f8" : "%f11", gridResolution, tableSize);
+        }
         ptx.AppendLine("$NGPB_CONTINUE:");
         ptx.AppendLine("    add.u32 %r5, %r5, 1;");
         ptx.AppendLine($"    setp.lt.u32 %p2, %r5, {numPoints};");

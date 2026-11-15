@@ -15,9 +15,12 @@ uint instant_ngp_grid_index(uint x, uint y, uint z, int gridResolution, int tabl
         : (x + y * r + z * r * r);
     return index % uint(tableSize);
 }
+// Clamp to the closed unit cube (tiny-cuda-nn's domain), NaN to 0, with NaN tested on the bits so that no driver
+// optimization of a float comparison with NaN can drop it.
 float instant_ngp_clamp_position(float value) {
-    if (!(value > 0.0)) return 0.0;
-    if (value >= 0.999999) return 0.999999;
+    if ((floatBitsToUint(value) & 0x7FFFFFFFu) > 0x7F800000u) return 0.0;
+    if (value <= 0.0) return 0.0;
+    if (value >= 1.0) return 1.0;
     return value;
 }
 // tiny-cuda-nn pos_fract: pos = fma(scale, x, offset), cell = floor(pos), fraction = pos - cell.

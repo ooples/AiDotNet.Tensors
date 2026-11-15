@@ -1160,6 +1160,39 @@ public class DirectPtxScientificTests
         Assert.Equal(16, Count(dense, "mad.lo.u32 %r14, "));         // (z*R + y)*R + x per corner
     }
 
+    // The x, y and z registers of the 8 hashed corners, in emission order.
+    private static string[][] HashedCornerRegisters(string ptx)
+    {
+        var timeout = TimeSpan.FromSeconds(1);
+        string[] Capture(string pattern) => System.Text.RegularExpressions.Regex
+            .Matches(ptx, pattern, System.Text.RegularExpressions.RegexOptions.None, timeout)
+            .Cast<System.Text.RegularExpressions.Match>().Select(m => m.Groups[1].Value).ToArray();
+        return new[]
+        {
+            Capture(@"xor\.b32 %r14, (%r\d+), %r12;"),
+            Capture(@"mul\.lo\.u32 %r12, (%r\d+), 0x9E3779B1;"),
+            Capture(@"mul\.lo\.u32 %r13, (%r\d+), 0x30025795;"),
+        };
+    }
+
+    [Fact]
+    public void InstantNgpHashEncodeEmitters_VisitCornersInTinyCudaNnOrder()
+    {
+        // tiny-cuda-nn's interpolation loop takes the upper vertex on axis d when bit d of the corner index is set, so x
+        // varies fastest; the NVRTC kernel and the CPU sum the corners in that order. The emitters used z-fastest.
+        string forward = PtxInstantNgpHashEncodeKernel.EmitPtx(8, 6, 256, 16f, 0.5f, 17, 4096, 2, 0, 32);
+        var f = HashedCornerRegisters(forward);   // x0/x1 = %r6/%r7, y0/y1 = %r8/%r9, z0/z1 = %r16/%r17
+        Assert.Equal(new[] { "%r6", "%r7", "%r6", "%r7", "%r6", "%r7", "%r6", "%r7" }, f[0]);
+        Assert.Equal(new[] { "%r8", "%r8", "%r9", "%r9", "%r8", "%r8", "%r9", "%r9" }, f[1]);
+        Assert.Equal(new[] { "%r16", "%r16", "%r16", "%r16", "%r17", "%r17", "%r17", "%r17" }, f[2]);
+
+        string backward = PtxInstantNgpHashEncodeBackwardKernel.EmitPtx(8, 6, 64, 15f, 0.5f, 16, 256, 2, 0, 4);
+        var b = HashedCornerRegisters(backward);  // x0/x1 = %r8/%r9, y0/y1 = %r16/%r17, z0/z1 = %r18/%r19
+        Assert.Equal(new[] { "%r8", "%r9", "%r8", "%r9", "%r8", "%r9", "%r8", "%r9" }, b[0]);
+        Assert.Equal(new[] { "%r16", "%r16", "%r17", "%r17", "%r16", "%r16", "%r17", "%r17" }, b[1]);
+        Assert.Equal(new[] { "%r18", "%r18", "%r18", "%r18", "%r19", "%r19", "%r19", "%r19" }, b[2]);
+    }
+
     [SkippableTheory]
     [InlineData(15f, 16)]   // 16^3 = 4096 > 256: hashed
     [InlineData(5f, 6)]     // 6^3 = 216 <= 256: dense
@@ -1214,8 +1247,9 @@ public class DirectPtxScientificTests
     // tiny-cuda-nn pos_fract with identity interpolation: pos = fmaf(scale, x, offset), cell = floor, fraction = rest.
     private static void NgpAxis(float value, float scale, float offset, out uint cell, out float fraction)
     {
-        float x = !(value > 0f) ? 0f : (value >= 0.999999f ? 0.999999f : value);
-        float p = (float)((double)scale * x + offset);   // the double product of two floats is exact: one rounding, as fmaf
+        // tiny-cuda-nn does not clamp (grid.h passes positions_in to pos_fract), so x is only held to its domain [0, 1].
+        float x = !(value > 0f) ? 0f : (value >= 1f ? 1f : value);
+        float p = InstantNGPOperations.FusedMultiplyAdd(scale, x, offset);   // fmaf, pinned to exact values in the CPU tests
         float floor = (float)Math.Floor(p);
         cell = (uint)(int)floor;
         fraction = p - floor;

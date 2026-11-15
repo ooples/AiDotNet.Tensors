@@ -83,6 +83,10 @@ public sealed class HashGridEncodingBackendParityTests
         CheckKnownHashIndices(backend, ngp);
 
         float[] positions = Random(2490, Points * 3, 0.0, 1.0);
+        // The far faces and out-of-domain coordinates: x = 1 exactly (tiny-cuda-nn does not clamp it), below 0, above 1
+        // and NaN, which every backend maps to 0 even when its compiler assumes finite math.
+        float[] edges = { 1f, 1f, 1f, float.NaN, 0.3f, 0.7f, -0.25f, 1.5f, 0.5f, 1f, 0.999f, 0f };
+        Array.Copy(edges, positions, edges.Length);
         var tables = new float[Levels][];
         var tableTensors = new Tensor<float>[Levels];
         for (int l = 0; l < Levels; l++)
@@ -124,6 +128,33 @@ public sealed class HashGridEncodingBackendParityTests
             backend.Synchronize();
             // Up to 256 points add into one entry in a different order than the CPU's double sum.
             AssertClose(expectedGradients[l].ToArray(), backend.DownloadBuffer(tableGradient), 1e-3, $"level {l} table gradient");
+        }
+    }
+
+    [Fact]
+    public void EveryKernel_ClampsToTheClosedUnitCube_AndTestsNaNOnTheBits()
+    {
+        // HIP (-ffast-math), OpenCL (-cl-finite-math-only), Metal (fast math by default) and WGSL may fold a float
+        // comparison with NaN, so the NaN-to-0 clamp reads the bits; the upper clamp is 1, tiny-cuda-nn's domain edge.
+        var sources = new (string Name, string Source, string NaNTest)[]
+        {
+            ("CUDA/HIP", AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaInstantNgpKernels.GetSource(),
+                "(__float_as_uint(value) & 0x7FFFFFFFu) > 0x7F800000u"),
+            ("OpenCL", OpenClInstantNgpKernels.GetSource(), "(as_uint(value) & 0x7FFFFFFFu) > 0x7F800000u"),
+            ("Metal", MetalInstantNgpKernels.Source, "(as_type<uint>(value) & 0x7FFFFFFFu) > 0x7F800000u"),
+            ("Vulkan", VulkanInstantNgpKernels.Forward, "(floatBitsToUint(value) & 0x7FFFFFFFu) > 0x7F800000u"),
+#if NET7_0_OR_GREATER
+            ("WebGPU", AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuInstantNgpKernels.Forward,
+                "(bitcast<u32>(value) & 0x7FFFFFFFu) > 0x7F800000u"),
+#endif
+        };
+        foreach (var (name, source, nanTest) in sources)
+        {
+            int start = source.IndexOf("instant_ngp_clamp_position(", StringComparison.Ordinal);
+            Assert.True(start >= 0, $"{name}: no clamp function");
+            string clamp = source.Substring(start, source.IndexOf('}', start) - start);
+            Assert.Contains(nanTest, clamp, StringComparison.Ordinal);
+            Assert.DoesNotContain("0.999999", clamp, StringComparison.Ordinal);
         }
     }
 

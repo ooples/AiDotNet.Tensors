@@ -26,10 +26,13 @@ __device__ __forceinline__ unsigned int instant_ngp_grid_index(
     return index % (unsigned int)tableSize;
 }
 
+// Clamp to the closed unit cube (tiny-cuda-nn's domain), NaN to 0. NaN is tested on the bits: HIP compiles this
+// source with -ffast-math, under which a float comparison with NaN may be folded away.
 __device__ __forceinline__ float instant_ngp_clamp_position(float value)
 {
-    if (!(value > 0.0f)) return 0.0f;
-    if (value >= 0.999999f) return 0.999999f;
+    if ((__float_as_uint(value) & 0x7FFFFFFFu) > 0x7F800000u) return 0.0f;
+    if (value <= 0.0f) return 0.0f;
+    if (value >= 1.0f) return 1.0f;
     return value;
 }
 

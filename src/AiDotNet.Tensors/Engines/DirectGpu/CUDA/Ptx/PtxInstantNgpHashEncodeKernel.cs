@@ -170,7 +170,7 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");
         ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd4+4];");
         ptx.AppendLine("    ld.global.nc.f32 %f2, [%rd4+8];");
-        // clamp each to [0, 0.999999] (max first, so NaN becomes 0), then pos = fma(scale, x, offset)
+        // clamp each to [0, 1] (max first, so NaN becomes 0), then pos = fma(scale, x, offset)
         foreach ((string src, string g) in new[] { ("%f0", "%f3"), ("%f1", "%f4"), ("%f2", "%f5") })
         {
             ptx.AppendLine($"    max.f32 {src}, {src}, {zero};");
@@ -189,15 +189,16 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         ptx.AppendLine("    mul.rn.f32 %f14, %f6, %f10;");
         ptx.AppendLine("    mul.rn.f32 %f15, %f6, %f7;");
         ptx.AppendLine($"    mov.f32 %f16, {zero};");                     // value
-        // 8 corners: (x,y,z) with weight = xy_product * (iz|fz).  %f18/%f19 hold corner weights.
-        ptx.AppendLine("    mul.rn.f32 %f18, %f12, %f11;"); AppendCorner(ptx, "%r6", "%r8", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 000 ix iy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f12, %f8;");  AppendCorner(ptx, "%r6", "%r8", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 001 ix iy fz
-        ptx.AppendLine("    mul.rn.f32 %f18, %f13, %f11;"); AppendCorner(ptx, "%r6", "%r9", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 010 ix fy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f13, %f8;");  AppendCorner(ptx, "%r6", "%r9", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 011 ix fy fz
-        ptx.AppendLine("    mul.rn.f32 %f18, %f14, %f11;"); AppendCorner(ptx, "%r7", "%r8", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 100 fx iy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f14, %f8;");  AppendCorner(ptx, "%r7", "%r8", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 101 fx iy fz
-        ptx.AppendLine("    mul.rn.f32 %f18, %f15, %f11;"); AppendCorner(ptx, "%r7", "%r9", "%r16", "%f18", gridResolution, tableSize, featuresPerLevel);  // 110 fx fy iz
-        ptx.AppendLine("    mul.rn.f32 %f19, %f15, %f8;");  AppendCorner(ptx, "%r7", "%r9", "%r17", "%f19", gridResolution, tableSize, featuresPerLevel);  // 111 fx fy fz
+        // 8 corners in tiny-cuda-nn's order: corner c takes the upper vertex on axis d when bit d of c is set (x fastest),
+        // with weight (wx * wy) * wz, so the fma chain adds them in the same order as the NVRTC kernel and the CPU.
+        for (int c = 0; c < 8; c++)
+        {
+            bool upperX = (c & 1) != 0, upperY = (c & 2) != 0, upperZ = (c & 4) != 0;
+            string xy = upperX ? (upperY ? "%f15" : "%f14") : (upperY ? "%f13" : "%f12");
+            ptx.AppendLine($"    mul.rn.f32 %f18, {xy}, {(upperZ ? "%f8" : "%f11")};");
+            AppendCorner(ptx, upperX ? "%r7" : "%r6", upperY ? "%r9" : "%r8", upperZ ? "%r17" : "%r16", "%f18",
+                gridResolution, tableSize, featuresPerLevel);
+        }
         // output[n*outputStride + levelOffset + f]
         ptx.AppendLine($"    mad.lo.u32 %r18, %r3, {outputStride}, %r4;");
         ptx.AppendLine($"    add.u32 %r18, %r18, {levelOffset};");
@@ -247,7 +248,7 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
                 MinBlocksPerMultiprocessor: 1),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["formula"] = "output[n, levelOffset+f] = trilinear over the 8 corners of fma(scale, clamp(pos, 0, 0.999999), offset)",
+                ["formula"] = "output[n, levelOffset+f] = trilinear over the 8 corners of fma(scale, clamp(pos, 0, 1), offset), corners in tiny-cuda-nn order (bit d = axis d)",
                 ["index"] = InstantNGPOperations.UsesDenseHashGridIndex(gridResolution, tableSize)
                     ? "(x + y*R + z*R*R) mod tableSize, dense (tiny-cuda-nn grid_index)"
                     : "(x ^ y*2654435761 ^ z*805459861) mod tableSize (tiny-cuda-nn coherent_prime_hash)",
@@ -268,7 +269,7 @@ internal sealed class PtxInstantNgpHashEncodeKernel : IDisposable
         return cells > 0 && cells % BlockThreads == 0 && cells <= MaxCells;
     }
 
-    // The grid coordinate fma(scale, x, offset) of x in [0, 1) must stay a non-negative int.
+    // The grid coordinate fma(scale, x, offset) of x in [0, 1] must stay a non-negative int.
     internal static bool IsSupportedGrid(float scale, float positionOffset) =>
         scale >= 0f && scale <= InstantNGPOperations.MaxGridScale && positionOffset >= 0f && positionOffset < 1f;
 

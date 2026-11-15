@@ -28,9 +28,12 @@ fn instant_ngp_grid_index(x: u32, y: u32, z: u32) -> u32 {
     return index % u32(p.tableSize);
 }
 
+// Clamp to the closed unit cube (tiny-cuda-nn's domain), NaN to 0. NaN is tested on the bits: WGSL lets an
+// implementation assume no float is NaN, so a float comparison cannot be relied on to catch it.
 fn instant_ngp_clamp_position(value: f32) -> f32 {
-    if (!(value > 0.0)) { return 0.0; }
-    if (value >= 0.999999) { return 0.999999; }
+    if ((bitcast<u32>(value) & 0x7FFFFFFFu) > 0x7F800000u) { return 0.0; }
+    if (value <= 0.0) { return 0.0; }
+    if (value >= 1.0) { return 1.0; }
     return value;
 }
 
