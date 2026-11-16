@@ -288,6 +288,34 @@ public sealed class CompiledRetainedOutputTests : IDisposable
     }
 
     [Fact]
+    public void Observation_only_add_does_not_merge_distinct_loss_gradient_buffers()
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<float>([8]);
+        ICompiledTrainingPlan<float> plan;
+        Tensor<float> observed;
+        using (var scope = GraphMode.EnableTraining(new[] { parameter }))
+        {
+            var left = engine.TensorMultiplyScalar(parameter, 2f);
+            var right = engine.TensorMultiplyScalar(parameter, 3f);
+            var loss = engine.ReduceSum(engine.TensorMultiply(left, right), null);
+            observed = engine.TensorAdd(left, right);
+            GradientRecording.RetainOutput(observed);
+            plan = scope.CompileTraining(new[] { parameter }, loss);
+        }
+        using (plan)
+            for (int step = 1; step <= 3; step++)
+            {
+                parameter.AsWritableSpan().Fill(step);
+                parameter.IncrementVersion();
+                Assert.Equal(48f * step * step, plan.Step().ToArray()[0]);
+                foreach (var value in observed.ToArray()) Assert.Equal(5f * step, value);
+                foreach (var value in plan.Gradients[0].ToArray()) Assert.Equal(12f * step, value);
+            }
+    }
+
+    [Fact]
     public void Registration_requires_an_active_uncompiled_training_forward()
     {
         var engine = new CpuEngine();

@@ -1790,6 +1790,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             var step = forwardSteps[i];
+            if (step.BackwardFn is null) continue;
             bool reshape = step.OpName == "Reshape" && step.Inputs.Length == 1;
             // An elementwise add's backward hands each operand the output gradient unchanged, so an operand used only
             // here (a residual branch's output) can view it too. Its step still runs for an operand that cannot (the
@@ -1913,6 +1914,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var step = forwardSteps[i];
             producer[step.OutputBuffer] = i;
+            // Detached statistics and observation-only branches impose forward ordering, not gradient writes.
+            if (step.BackwardFn is null) continue;
             foreach (var input in step.Inputs)
             {
                 if (input is null) continue;
@@ -1925,6 +1928,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var lastRead = new Dictionary<Tensor<T>, int>(cmp);
         for (int i = 0; i < forwardSteps.Count; i++)
         {
+            if (forwardSteps[i].BackwardFn is null) continue;
             if (!gradMap.TryGetValue(forwardSteps[i].OutputBuffer, out var g)) continue;
             var r = Root(g);
             if (!lastRead.TryGetValue(r, out int k) || i < k) lastRead[r] = i;
@@ -1936,6 +1940,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int a = forwardSteps.Count - 1; a >= 0; a--)
         {
             var step = forwardSteps[a];
+            if (step.BackwardFn is null) continue;
             bool reshape = step.OpName == "Reshape" && step.Inputs.Length == 1;
             bool add = step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
                 && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
