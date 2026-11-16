@@ -40,11 +40,6 @@ internal sealed class LayerNormStateRef<T> : Compilation.ISignatureScratch
     public int SignatureLength { get; }
     public Tensor<T>? Mean;
     public Tensor<T>? Variance;
-
-    // The statistics are each replay's results, never configuration: an objective signature compares the holder's
-    // type only. Their shape follows from the input's and gamma's, which the node's inputs already sign, and a holder
-    // is empty until its node first runs, so a size taken from it would differ between a probe and a realized trace.
-    int Compilation.ISignatureScratch.SignatureLength => 0;
 }
 
 /// <summary>
