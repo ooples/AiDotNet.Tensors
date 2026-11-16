@@ -125,7 +125,8 @@ public sealed class CompiledSharedOperandMatMulBackwardTests : IDisposable
         {
             var kinds = ((CompiledTrainingPlan<T>)plan).BackwardStepKinds;
             Assert.DoesNotContain("generic:TensorMatMul", kinds);
-            Assert.Equal(Blocks * (Layers + 4), kinds.Count(k => k == "specialized:TensorMatMul"));
+            // The final backcast's theta projection and basis product feed no loss, so neither has a backward.
+            Assert.Equal(Blocks * (Layers + 4) - 2, kinds.Count(k => k == "specialized:TensorMatMul"));
 
             for (int step = 0; step < 2; step++)
             {

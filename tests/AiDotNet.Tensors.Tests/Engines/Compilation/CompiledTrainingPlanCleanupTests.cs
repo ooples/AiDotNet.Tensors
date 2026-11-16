@@ -20,7 +20,8 @@ public sealed class CompiledTrainingPlanCleanupTests
         var grad1 = new Tensor<float>(new[] { 3 });
         var seed = new Tensor<float>(new[] { 1 });
         var dest = new Tensor<float>(new[] { 1 });
-        var plan = CreatePlan(loss, new[] { grad0, grad1 }, seed, dest);
+        var retained = new Tensor<float>(new[] { 4 });
+        var plan = CreatePlan(loss, new[] { grad0, grad1 }, seed, dest, new[] { retained });
 
         var protect = (HashSet<object>)Invoke(plan, "BuildStepEvictionProtectSet")!;
 
@@ -29,6 +30,7 @@ public sealed class CompiledTrainingPlanCleanupTests
         AssertContainsTensorKeys(protect, grad1);
         AssertContainsTensorKeys(protect, seed);
         AssertContainsTensorKeys(protect, dest);
+        AssertContainsTensorKeys(protect, retained);
         Assert.DoesNotContain(loss.DataVector, protect);
     }
 
@@ -72,7 +74,8 @@ public sealed class CompiledTrainingPlanCleanupTests
         Tensor<float> loss,
         Tensor<float>[] gradients,
         Tensor<float> lossGradSeed,
-        Tensor<float>? lossGradDest)
+        Tensor<float>? lossGradDest,
+        Tensor<float>[]? retainedOutputs = null)
     {
 #pragma warning disable SYSLIB0050
         var plan = (CompiledTrainingPlan<float>)FormatterServices.GetUninitializedObject(typeof(CompiledTrainingPlan<float>));
@@ -81,6 +84,9 @@ public sealed class CompiledTrainingPlanCleanupTests
         SetField(plan, "_gradients", gradients);
         SetField(plan, "_lossGradSeed", lossGradSeed);
         SetField(plan, "_lossGradDest", lossGradDest);
+        // This fixture bypasses the constructor, including its retained-output field initializer.
+        SetField(plan, "_retainedOutputs", new HashSet<Tensor<float>>(
+            retainedOutputs ?? Array.Empty<Tensor<float>>(), ReferenceEqualityComparer<Tensor<float>>.Instance));
         return plan;
     }
 
