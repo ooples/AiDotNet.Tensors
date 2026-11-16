@@ -15,27 +15,31 @@ public sealed class BatchNormReluDestinationGradientTests : IClassFixture<Direct
     private readonly DirectGpuTensorEngineTestFixture _fixture;
     public BatchNormReluDestinationGradientTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
 
-    private static readonly double[] X = { -1.2, 0.4, 2.0, -0.8, 0.6, 1.3, -0.1, 1.8 };
+    // CUDA's register kernel loads float4s; spatial=4 also fits the portable OpenCL register variant.
+    private const int Batch = 2, Channels = 2, Spatial = 4;
+    private static readonly double[] X = { -1.2, 0.4, 1.7, -0.3, 2.0, -0.8, 0.9, -1.5,
+        0.6, 1.3, -0.9, 2.2, -0.1, 1.8, -0.6, 0.5 };
     private static readonly double[] Gamma = { 1.1, -0.7 }, Beta = { 0.15, 0.4 };
-    private static readonly float[] Seed = { 0.3f, -0.9f, 0.2f, 0.7f, -0.4f, 1.2f, 0.8f, -0.1f };
+    private static readonly float[] Seed = { 0.3f, -0.9f, 0.2f, 0.7f, -0.4f, 1.2f, 0.8f, -0.1f,
+        -0.2f, 0.5f, -0.7f, 0.6f, 0.9f, -0.8f, 0.4f, 0.1f };
     private const double Epsilon = 1e-3;
 
     // Independent scalar forward, differentiated by central differences rather than repeating the backward formula.
     private static double Objective(double[] x, double[] gamma, double[] beta)
     {
         double loss = 0;
-        for (int c = 0; c < 2; c++)
+        for (int c = 0; c < Channels; c++)
         {
             double mean = 0, variance = 0;
-            for (int n = 0; n < 2; n++) for (int s = 0; s < 2; s++) mean += x[(n * 2 + c) * 2 + s] / 4;
-            for (int n = 0; n < 2; n++) for (int s = 0; s < 2; s++)
+            for (int n = 0; n < Batch; n++) for (int s = 0; s < Spatial; s++) mean += x[(n * Channels + c) * Spatial + s] / (Batch * Spatial);
+            for (int n = 0; n < Batch; n++) for (int s = 0; s < Spatial; s++)
             {
-                double centered = x[(n * 2 + c) * 2 + s] - mean;
-                variance += centered * centered / 4;
+                double centered = x[(n * Channels + c) * Spatial + s] - mean;
+                variance += centered * centered / (Batch * Spatial);
             }
-            for (int n = 0; n < 2; n++) for (int s = 0; s < 2; s++)
+            for (int n = 0; n < Batch; n++) for (int s = 0; s < Spatial; s++)
             {
-                int i = (n * 2 + c) * 2 + s;
+                int i = (n * Channels + c) * Spatial + s;
                 loss += Seed[i] * Math.Max(0, gamma[c] * (x[i] - mean) / Math.Sqrt(variance + Epsilon) + beta[c]);
             }
         }
@@ -71,10 +75,10 @@ public sealed class BatchNormReluDestinationGradientTests : IClassFixture<Direct
         var expectedX = NumericalGradient(x, ObjectiveNow);
         var expectedGamma = NumericalGradient(gamma, ObjectiveNow);
         var expectedBeta = NumericalGradient(beta, ObjectiveNow);
-        var input = Tensor(x, new[] { 2, 2, 1, 2 });
-        var scale = Tensor(gamma, new[] { 2 });
-        var shift = Tensor(beta, new[] { 2 });
-        var dy = new Tensor<float>((float[])Seed.Clone(), new[] { 2, 2, 1, 2 });
+        var input = Tensor(x, new[] { Batch, Channels, 1, Spatial });
+        var scale = Tensor(gamma, new[] { Channels });
+        var shift = Tensor(beta, new[] { Channels });
+        var dy = new Tensor<float>((float[])Seed.Clone(), new[] { Batch, Channels, 1, Spatial });
         // The CPU forward supplies saved statistics; the derivative oracle above uses neither engine implementation.
         var cpu = new CpuEngine();
         var output = cpu.ReLU(cpu.BatchNorm(input, scale, shift, Epsilon, out var mean, out var variance));
@@ -88,7 +92,7 @@ public sealed class BatchNormReluDestinationGradientTests : IClassFixture<Direct
             {
                 gpu.SuspendActivationEviction();
                 capturePath = gpu.EnterCompiledCapturePath();
-                var destination = new Tensor<float>(new[] { 2, 2, 1, 2 });
+                var destination = new Tensor<float>(new[] { Batch, Channels, 1, Spatial });
                 destination.AsWritableSpan().Fill(123f); // A previous step's contents must be overwritten.
                 grads[input] = destination;
                 foreach (var tensor in new[] { input, scale, shift, output, mean, variance, dy, destination })
@@ -138,7 +142,7 @@ public sealed class BatchNormReluDestinationGradientTests : IClassFixture<Direct
         Skip.IfNot(_fixture.IsAvailable && _fixture.Engine is not null, "No direct GPU backend available.");
         var gpu = _fixture.Engine ?? throw new InvalidOperationException("The fixture reported a GPU without an engine.");
         var varianceBackend = Assert.IsAssignableFrom<IBatchNormVarianceBackend>(gpu.GetBackend());
-        Assert.True(varianceBackend.AcceptsTrainingShape(2, 2, 2),
+        Assert.True(varianceBackend.AcceptsTrainingShape(Batch, Channels, Spatial),
             "The register BatchNorm kernel for the regression shape is unavailable.");
         Verify(gpu, resident);
     }
