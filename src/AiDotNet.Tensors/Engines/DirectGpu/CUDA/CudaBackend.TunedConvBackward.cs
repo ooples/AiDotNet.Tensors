@@ -103,6 +103,7 @@ public sealed partial class CudaBackend
                     _conv2DBackwardFilterCandidateList = candidates.ToArray();
                     _conv2DBackwardFilterSlot = new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardFilter,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
+                    _conv2DBackwardFilterSlot.UntunedPreference = static shape => ConvUntuned.Filter(shape);
                 }
                 return Created(_conv2DBackwardFilterSlot);
             }
@@ -178,6 +179,7 @@ public sealed partial class CudaBackend
                     _conv2DBackwardDataCandidateList = candidates.ToArray();
                     _conv2DBackwardDataSlot = new TunedKernelSlot<TunedConv2DBackwardArgs>(TunedKernelOp.Conv2DBackwardData,
                         TunedDeviceKey, BackwardHarness(), () => GpuDeterminism.IsActive, candidates.ToArray());
+                    _conv2DBackwardDataSlot.UntunedPreference = static shape => ConvUntuned.Data(shape);
                 }
                 return Created(_conv2DBackwardDataSlot);
             }

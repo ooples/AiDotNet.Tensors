@@ -6,7 +6,7 @@
 // for the gradients), and every cuDNN algorithm and every backend route competes under the slot's evidence gate, so a
 // shape runs whichever measured fastest, as cudnn.benchmark does for PyTorch but against our kernels too.
 //
-// Precision: the descriptors use FMA math (strict fp32) unless the explicit reduced-precision opt-in
+// Precision: the descriptors use FMA math (strict fp32) unless the TF32 policy (default on, as PyTorch)
 // (CudaDispatchPolicy.ConvReducedPrecisionTF32) allows tensor-core TF32, the policy the backend's own engine follows
 // (the forward used to request tensor-op math, which is TF32 for fp32 data on Ampere, whatever the opt-in).
 // Determinism: cuDNN's backward-data algorithm 0 and backward-filter algorithms 0 and 3 accumulate with atomics, so

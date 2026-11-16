@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
@@ -15,6 +16,35 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </remarks>
 public static class GradientRecording
 {
+    /// <summary>
+    /// Declares a forward result observable after a training step. Call this while recording the forward,
+    /// before compilation or backward; a compiled plan keeps the result's storage until its next step or disposal.
+    /// </summary>
+    /// <remarks>Only declared results keep their buffers; ordinary intermediates remain eligible for fusion and reuse.
+    /// On an eager tape this has the same effect as <see cref="GradientTape{T}.Retain"/>. Retention does not retain
+    /// a gradient or copy the value to the host. The same tensor receives each compiled step's latest value.
+    /// Mixed-precision compiled plans do not support retained outputs and reject them during compilation.</remarks>
+    /// <typeparam name="T">The result's element type.</typeparam>
+    /// <param name="output">A result produced by the active training forward.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="output"/> is null.</exception>
+    /// <exception cref="ArgumentException">The result does not belong to the active compiled trace.</exception>
+    /// <exception cref="InvalidOperationException">No training forward is being recorded.</exception>
+    public static void RetainOutput<T>(Tensor<T> output)
+    {
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (IsTrainingTrace && GraphMode.Current is { } scope)
+        {
+            scope.RetainOutput(output);
+            return;
+        }
+        if (GradientTape<T>.Current is { } tape && !NoGradScope<T>.IsSuppressed)
+        {
+            tape.Retain(output);
+            return;
+        }
+        throw new InvalidOperationException("RetainOutput must be called while recording a training forward, before compilation or backward.");
+    }
+
     /// <summary>True while the forward is being traced for a compiled training plan.</summary>
     public static bool IsTrainingTrace => GraphMode.IsActive && !GraphMode.IsInferenceTrace;
 

@@ -14,6 +14,15 @@ public partial class DifferentiableOpsGradCheckSweep
     // A positive running variance (SafeTensor's values are already in [0.35, 0.95]).
     private static Tensor<double> Variance(int n, Random rng) => SafeTensor(new[] { n }, rng);
 
+    // Shifts pre-BN beta well above (0.95 - 0.35) * 0.95 / sqrt(0.35) ~= 0.963 so the prologue ReLU stays strictly positive.
+    private static Tensor<double> PositivePreBeta(int n, Random rng)
+    {
+        var data = new double[n];
+        for (int i = 0; i < n; i++)
+            data[i] = 1.6 + 0.4 * rng.NextDouble();
+        return new Tensor<double>(data, new[] { n });
+    }
+
     static partial void AddCasesFusedActivations(Dictionary<string, Func<Random, object[]>> cases)
     {
         // NCHW input [1, 2, 4, 4], OIHW kernel [3, 2, 2, 2], bias [3]; stride 1, no padding, no dilation.
@@ -28,6 +37,18 @@ public partial class DifferentiableOpsGradCheckSweep
         cases["FusedConv2DBatchNorm"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([3, 2, 2, 2], r), SafeTensor([3], r),
             SafeTensor([3], r), SafeTensor([3], r), SafeTensor([3], r), Variance(3, r), 1e-5,
             1, 1, 0, 0, 1, 1, FusedActivationType.Tanh];
+        cases["BatchNormActivationConv2D"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([2], r), PositivePreBeta(2, r),
+            SafeTensor([2], r), Variance(2, r), 1e-5, SafeTensor([3, 2, 2, 2], r), SafeTensor([3], r),
+            1, 1, 0, 0, 1, 1, FusedActivationType.Tanh];
+        cases["BatchNormActivationConv2DBatchNorm"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([2], r), PositivePreBeta(2, r),
+            SafeTensor([2], r), Variance(2, r), 1e-5, SafeTensor([3, 2, 2, 2], r), SafeTensor([3], r),
+            SafeTensor([3], r), SafeTensor([3], r), SafeTensor([3], r), Variance(3, r), 1e-5,
+            1, 1, 0, 0, 1, 1, FusedActivationType.Tanh];
+        // Depthwise kernel [C, 1, 3, 3]; inference batch norm over the C output channels. Tanh: smooth, so second and
+        // third derivatives exist everywhere (the CPU fast path takes only ReLU/ReLU6, and none under a tape).
+        cases["DepthwiseConv2DBatchNorm"] = r => [SafeTensor([1, 3, 5, 5], r), SafeTensor([3, 1, 3, 3], r),
+            new[] { 1, 1 }, new[] { 1, 1 }, SafeTensor([3], r), SafeTensor([3], r), SafeTensor([3], r), Variance(3, r),
+            1e-5, FusedActivationType.Tanh];
         // [N, C] batch norm in training mode (batch statistics); the trailing nulls are the saveMean / saveVar outs.
         cases["FusedBatchNorm"] = r => [SafeTensor([4, 3], r), SafeTensor([3], r), SafeTensor([3], r),
             SafeTensor([3], r), Variance(3, r), 1e-5, 0.1, true, FusedActivationType.Tanh, null!, null!];

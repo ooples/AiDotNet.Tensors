@@ -100,15 +100,16 @@ internal static class CudaDispatchPolicy
     private static bool? _allowTF32Override;
 
     /// <summary>
-    /// Explicit opt-in to plain TF32 (10-bit mantissa products, fp32 accumulate) in the implicit-GEMM convolution engine
-    /// (#1335). Default false: the engine's default mainloop is FP32 FMA, and on Ampere+ 3xTF32 (fp32-level accuracy on
-    /// the Tensor Cores) is only a tuned candidate after it; the opt-in puts plain TF32 first. Unlike
-    /// <see cref="AllowTF32"/> (default true, the cuBLAS math mode) this is a deliberate reduced-precision
-    /// choice: set <c>AIDOTNET_CONV_TF32=1</c> before startup or this property before creating a backend.
+    /// Plain TF32 (10-bit mantissa products, fp32 accumulate) in the implicit-GEMM convolution engine on Ampere+ (#1335,
+    /// #2561). Default true, as PyTorch's <c>torch.backends.cudnn.allow_tf32</c>: its convolutions run TF32 by default,
+    /// and with FP32 FMA as our default DenseNet-121's 1x1 convolutions ran ~35% slower than cuDNN's. The engine's TF32
+    /// mainloop is then the slot's reference and FP32 FMA / 3xTF32 / Winograd compete as tuned candidates. Set
+    /// <c>AIDOTNET_CONV_TF32=0</c> before startup, or this property to false before creating a backend, for fp32-exact
+    /// convolutions (FP32 FMA first, 3xTF32 a candidate).
     /// </summary>
     public static bool ConvReducedPrecisionTF32
     {
-        get => _convTF32Override ?? Environment.GetEnvironmentVariable("AIDOTNET_CONV_TF32") == "1";
+        get => _convTF32Override ?? Environment.GetEnvironmentVariable("AIDOTNET_CONV_TF32") != "0";
         set => _convTF32Override = value;
     }
 

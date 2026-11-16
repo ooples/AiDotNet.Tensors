@@ -32,6 +32,7 @@ public sealed partial class CudaBackend
     private readonly bool _directPtxResidualRmsNormOptedIn =
         DirectPtxFeatureGate.IsResidualRmsNormEnabled;
     private readonly object _directPtxLock = new();
+    internal static Action? TestHookInsideDirectPtxSolverLock;
     private DirectPtxCapturePinSet? _activeDirectPtxCapturePins;
     private Dictionary<IntPtr, DirectPtxCapturePinSet>? _directPtxGraphPins;
     private readonly DirectPtxKernelCache<DirectPtxAttentionKey, PtxOnlineFusedAttention128x64Kernel>
@@ -197,9 +198,7 @@ public sealed partial class CudaBackend
         }
     }
 
-    private void CompleteDirectPtxCapturePinTracking(
-        DirectPtxCapturePinSet pins,
-        IntPtr graphExec)
+    private void DetachDirectPtxCapturePinTracking(DirectPtxCapturePinSet pins)
     {
         lock (_directPtxLock)
         {
@@ -207,6 +206,15 @@ public sealed partial class CudaBackend
                 throw new InvalidOperationException(
                     "The direct-PTX CUDA graph capture pin owner changed unexpectedly.");
             _activeDirectPtxCapturePins = null;
+        }
+    }
+
+    private void CompleteDirectPtxCapturePinTracking(
+        DirectPtxCapturePinSet pins,
+        IntPtr graphExec)
+    {
+        lock (_directPtxLock)
+        {
             if (pins.Count == 0) return;
             _directPtxGraphPins ??= new Dictionary<IntPtr, DirectPtxCapturePinSet>();
             // The driver can recycle a CUgraphExec address after cuGraphExecDestroy,
@@ -226,8 +234,10 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins)) return;
-            _activeDirectPtxCapturePins = null;
+            // A failed graph may already have detached its collector while another capture is recording.
+            // Release only this graph's pins, without changing the new capture's collector.
+            if (ReferenceEquals(_activeDirectPtxCapturePins, pins))
+                _activeDirectPtxCapturePins = null;
             pins.Release();
         }
     }
@@ -238,10 +248,6 @@ public sealed partial class CudaBackend
     {
         lock (_directPtxLock)
         {
-            if (!ReferenceEquals(_activeDirectPtxCapturePins, pins))
-                throw new InvalidOperationException(
-                    "The direct-PTX CUDA graph update pin owner changed unexpectedly.");
-            _activeDirectPtxCapturePins = null;
             if (_directPtxGraphPins is not null &&
                 _directPtxGraphPins.TryGetValue(graphExec, out DirectPtxCapturePinSet? oldPins))
             {
@@ -802,8 +808,12 @@ public sealed partial class CudaBackend
             }
             if (hot is null) capturing = IsStreamCapturingCurrentContext();
             var planKey = new DirectPtxCholesky4x4PlanKey(batchCount);
+            // Capture launches enter the context gate before the PTX cache. The cold solver path
+            // must use that order too: its single-flight tuner opens a CUDA capture while holding the cache.
+            lock (CaptureGateFor(_cudaContext))
             lock (_directPtxLock)
             {
+                TestHookInsideDirectPtxSolverLock?.Invoke();
                 if (capturing && !_directPtxCholesky4x4Plans.TryGetValue(planKey, out _))
                 {
                     DirectPtxLastError =

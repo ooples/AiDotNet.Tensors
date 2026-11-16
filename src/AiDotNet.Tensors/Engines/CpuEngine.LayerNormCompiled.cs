@@ -80,13 +80,10 @@ public partial class CpuEngine
                 }
             },
             LayerNormBackwardCompiledFloat, new object[] { stats, shape });
-        // Values at trace time too, as the generic node had: code between ops may read them. Computed outside the
-        // trace, so reading the traced input here is the op's own work, not a host read by the objective.
-        if (!probe)
-            using (GraphMode.SuspendRecording())
-                Forward(result);
-        mean = meanT;
-        variance = varT;
+        // Out statistics are lazy outputs of the same forward, so reads still get real values without
+        // forcing the whole input graph during recording.
+        mean = BatchStatisticOutput(scope, result, meanT, "LayerNormMean");
+        variance = BatchStatisticOutput(scope, result, varT, "LayerNormVariance");
         return result;
     }
 

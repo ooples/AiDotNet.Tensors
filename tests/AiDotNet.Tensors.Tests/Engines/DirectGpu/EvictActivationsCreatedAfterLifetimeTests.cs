@@ -27,6 +27,25 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public class EvictActivationsCreatedAfterLifetimeTests
 {
+    [Fact]
+    public void Rebinding_an_unmaterialized_tensor_downloads_the_latest_buffer()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var first = new MockGpuBuffer(new[] { 1f, 2f, 3f, 4f });
+        using var latest = new MockGpuBuffer(new[] { 5f, 6f, 7f, 8f });
+        using var tensor = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateGpuResident(new[] { 4 }, TensorDevice.OpenCL);
+
+        engine.BindResidentBuffer(tensor, first, backend);
+        Assert.Null(tensor.GetBackingArrayForCacheLookupUnsafe());
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(tensor.DataVector));
+        engine.BindResidentBuffer(tensor, latest, backend);
+        Assert.Equal(0, state.DownloadBufferCalls);
+        Assert.Equal(new[] { 5f, 6f, 7f, 8f }, tensor.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
+    }
+
     /// <summary>Fake GPU buffer — tracks Dispose so the test can assert on lifetime.</summary>
     private sealed class TrackingGpuBuffer : IGpuBuffer
     {

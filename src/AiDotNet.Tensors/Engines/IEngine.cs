@@ -3397,6 +3397,18 @@ public partial interface IEngine
     Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding);
 
     /// <summary>
+    /// An inference depthwise convolution followed by a batch norm with its running statistics and an activation:
+    /// <c>activation(batchnorm(depthwiseConv2D(input, kernel)))</c>, MobileNet's depthwise stage. The same values as
+    /// <see cref="DepthwiseConv2D{T}"/> then
+    /// <see cref="BatchNormInference{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, FusedActivationType)"/>,
+    /// which a backend may compute with the batch norm and activation applied as the convolution stores each output, so
+    /// the intermediate activation is never written. Under a gradient tape or graph capture it records the unfused ops.
+    /// </summary>
+    Tensor<T> DepthwiseConv2DBatchNorm<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding,
+        Tensor<T> gamma, Tensor<T> beta, Tensor<T> runningMean, Tensor<T> runningVariance, double epsilon,
+        FusedActivationType activation);
+
+    /// <summary>
     /// Computes the gradient of DepthwiseConv2D with respect to the input.
     /// </summary>
     Tensor<T> DepthwiseConv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding);
@@ -5503,6 +5515,32 @@ public partial interface IEngine
     /// <param name="activation">The activation applied to the normalized values.</param>
     Tensor<T> FusedConv2DBatchNorm<T>(
         Tensor<T> input, Tensor<T> kernel, Tensor<T>? bias,
+        Tensor<T> gamma, Tensor<T> beta, Tensor<T> runningMean, Tensor<T> runningVariance, double epsilon,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        FusedActivationType activation);
+
+    /// <summary>
+    /// A pre-activated convolution: <c>activation(conv2d(relu(batchnorm(input)), kernel) + bias)</c>, the batch norm
+    /// with its running statistics, as DenseNet's pre-activation layers compute. The same values as
+    /// <see cref="BatchNormInference{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, double, FusedActivationType)"/>
+    /// with ReLU followed by <see cref="FusedConv2D{T}"/>, which a backend may compute with the batch norm and ReLU
+    /// applied as the convolution loads its input, so the normalized activation is never written. Under a gradient tape
+    /// or graph capture it records the unfused ops.
+    /// </summary>
+    Tensor<T> BatchNormActivationConv2D<T>(
+        Tensor<T> input, Tensor<T> preGamma, Tensor<T> preBeta, Tensor<T> preMean, Tensor<T> preVariance, double preEpsilon,
+        Tensor<T> kernel, Tensor<T>? bias,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        FusedActivationType activation);
+
+    /// <summary>
+    /// <see cref="BatchNormActivationConv2D{T}"/> with a batch norm after the convolution, folded into it as
+    /// <see cref="FusedConv2DBatchNorm{T}"/> folds it: <c>activation(batchnorm2(conv2d(relu(batchnorm1(input)), kernel) +
+    /// bias))</c>, both batch norms with their running statistics.
+    /// </summary>
+    Tensor<T> BatchNormActivationConv2DBatchNorm<T>(
+        Tensor<T> input, Tensor<T> preGamma, Tensor<T> preBeta, Tensor<T> preMean, Tensor<T> preVariance, double preEpsilon,
+        Tensor<T> kernel, Tensor<T>? bias,
         Tensor<T> gamma, Tensor<T> beta, Tensor<T> runningMean, Tensor<T> runningVariance, double epsilon,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
         FusedActivationType activation);

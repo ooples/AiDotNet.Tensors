@@ -40,12 +40,14 @@ public sealed class CudaTunedKernelTests
     // LayerNorm's dx on a one-column row, is only accurate relative to those terms, not to its own value.
     private static void AssertClose(float[] expected, float[] actual, int count, string what, double termScale = 1e-30)
     {
+        // A plain-TF32 engine candidate (10-bit mantissa products) is ~1e-3 of the output scale from the fp32 sum.
+        double tolerance = what.Contains("_tf32") ? 2e-3 : Tolerance;
         double scale = termScale;
         for (int i = 0; i < count; i++) scale = Math.Max(scale, Math.Abs(expected[i]));
         for (int i = 0; i < count; i++)
         {
             double err = Math.Abs((double)actual[i] - expected[i]) / scale;
-            Assert.True(err <= Tolerance, $"{what}: index {i} expected {expected[i]} actual {actual[i]} (rel {err:E2})");
+            Assert.True(err <= tolerance, $"{what}: index {i} expected {expected[i]} actual {actual[i]} (rel {err:E2})");
         }
     }
 
@@ -378,6 +380,8 @@ public sealed class CudaTunedKernelTests
     {
         (1, 3, 8, 8, 4, 3, 1, 1, 1), (2, 4, 9, 7, 5, 3, 1, 0, 1), (1, 8, 6, 6, 3, 1, 1, 0, 1),
         (2, 3, 11, 10, 2, 5, 2, 2, 1), (1, 2, 12, 12, 3, 3, 1, 2, 2), (3, 5, 7, 9, 6, 3, 2, 1, 1),
+        // Deep K over few output pixels: the engine splits K, and its reduce applies the epilogue.
+        (1, 256, 4, 4, 32, 3, 1, 1, 1),
     };
 
     [SkippableFact]
@@ -419,23 +423,29 @@ public sealed class CudaTunedKernelTests
             // output kernel or as passes after it, and must equal the convolution, then the bias add, then the ReLU.
             float[] bias = Values(o, o * 3 + k, 1f);
             using var bb = backend.AllocateBuffer(bias);
-            foreach (var (withBias, relu) in new[] { (true, false), (true, true), (false, true) })
+            const AiDotNet.Tensors.Engines.FusedActivationType None = AiDotNet.Tensors.Engines.FusedActivationType.None,
+                Relu = AiDotNet.Tensors.Engines.FusedActivationType.ReLU, Relu6 = AiDotNet.Tensors.Engines.FusedActivationType.ReLU6;
+            // The error of a reduced-precision sum scales with the convolution's own outputs, which the clamp at 6 hides.
+            double rawScale = 1.0;
+            foreach (float v in expected) rawScale = Math.Max(rawScale, Math.Abs(v) + 1.0);
+            foreach (var (withBias, act) in new[] { (true, None), (true, Relu), (false, Relu), (true, Relu6), (false, Relu6) })
             {
+                bool relu = act != None;
                 var epilogued = new float[expected.Length];
                 for (int i = 0; i < epilogued.Length; i++)
                 {
                     float v = withBias ? expected[i] + bias[(i / (oh * ow)) % o] : expected[i];
-                    epilogued[i] = relu && v < 0f ? 0f : v;
+                    if (relu && v < 0f) v = 0f;
+                    epilogued[i] = act == Relu6 && v > 6f ? 6f : v;
                 }
                 var epiArgs = new CudaConv2DArgs(xb, wb, yb, bt, c, h, w, o, oh, ow, k, k, s, s, p, p, d, d,
-                    withBias ? bb : null,
-                    relu ? AiDotNet.Tensors.Engines.FusedActivationType.ReLU : AiDotNet.Tensors.Engines.FusedActivationType.None);
+                    withBias ? bb : null, act);
                 foreach (var cand in Applicable(backend.Conv2DForwardSlot, epiArgs.Shape()))
                 {
                     cand.Execute(epiArgs);
                     backend.Synchronize();
                     AssertClose(epilogued, backend.DownloadBuffer(yb), expected.Length,
-                        $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d} bias={withBias} relu={relu}", termScale: 1.0);
+                        $"{cand.Id} conv {bt}x{c}x{h}x{w} k{k} s{s} p{p} d{d} bias={withBias} act={act}", termScale: rawScale);
                 }
             }
         }

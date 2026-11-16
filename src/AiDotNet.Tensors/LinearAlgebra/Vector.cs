@@ -710,8 +710,10 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public new Vector<T> GetSubVector(int startIndex, int length)
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        if (startIndex < 0 || startIndex >= this.Length)
-            throw new ArgumentOutOfRangeException(nameof(startIndex), "Start index must be within the bounds of the vector.");
+        // startIndex == Length is the empty slice at the end, as VectorBase.GetSubVector and Span.Slice allow;
+        // rejecting it broke "everything after the first" on a one-element vector (GetSubVector(1, Length - 1)).
+        if (startIndex < 0 || startIndex > this.Length)
+            throw new ArgumentOutOfRangeException(nameof(startIndex), "Start index must be between 0 and the vector length (inclusive).");
         if (length < 0)
             throw new ArgumentOutOfRangeException(nameof(length), "Length cannot be negative.");
         if (startIndex + length > this.Length)

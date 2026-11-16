@@ -1,6 +1,8 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -67,9 +69,52 @@ public sealed class MultiHeadAttentionLaunchCountTests : IClassFixture<DirectGpu
         long largeLaunches = Launches(large);
         _output.WriteLine($"b1: {smallLaunches} launches, b16: {largeLaunches} launches");
 
-        // The per-(batch, head) loop took about 7 launches per pair: 28 at b1 and 448 at b16.
-        Assert.True(largeLaunches <= smallLaunches,
-            $"b16 took {largeLaunches} launches against {smallLaunches} at b1; the per-head loop is back.");
+        // CUDA's supported fused route projects [Q|K|V] in one GEMM and the output in another.
+        // Measure their shape-dependent dispatch costs independently instead of granting fixed slack.
+        // Other routes retain the original whole-call invariant; their projection topology can differ.
+        bool packedCuda = gpu!.GetBackend() is CudaBackend backend
+            && backend is IFusedAttentionBackend fused && fused.SupportsFusedAttention(Model / Heads)
+            && backend is IGpuBufferViews views && views.ViewsAreFreeAtAnyOffset
+            && backend is IFusedAttentionPreference preference
+            && preference.PrefersFusedAttention(1, Heads, Seq, Seq, Model / Heads)
+            && preference.PrefersFusedAttention(16, Heads, Seq, Seq, Model / Heads)
+            && !GraphMode.IsActive && !AiDotNet.Tensors.Engines.Gpu.AutocastScope.IsEnabled
+            && !AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.IsRecording<float>()
+            && AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>.Current is null
+            && !AiDotNet.Tensors.Engines.Autodiff.AnomalyModeScope.IsActive;
+        long smallProjection = 0, largeProjection = 0;
+        if (packedCuda)
+        {
+            long ProjectionLaunches(int batch)
+            {
+                var cuda = (CudaBackend)gpu.GetBackend()!;
+                int rows = batch * Seq;
+                using var input = cuda.AllocateBuffer(new float[rows * Model]);
+                using var qkvWeight = cuda.AllocateBuffer(new float[Model * 3 * Model]);
+                using var qkv = cuda.AllocateBuffer(new float[rows * 3 * Model]);
+                using var heads = cuda.AllocateBuffer(new float[rows * Model]);
+                using var outWeight = cuda.AllocateBuffer(new float[Model * Model]);
+                using var output = cuda.AllocateBuffer(new float[rows * Model]);
+                void Project()
+                {
+                    cuda.Gemm(input, qkvWeight, qkv, rows, 3 * Model, Model);
+                    cuda.Gemm(heads, outWeight, output, rows, Model, Model);
+                }
+                Project();
+                long before = GpuLaunchProbe.TotalEver;
+                Project();
+                return GpuLaunchProbe.TotalEver - before;
+            }
+            smallProjection = ProjectionLaunches(1);
+            largeProjection = ProjectionLaunches(16);
+            Assert.True(smallProjection > 0 && largeProjection > 0);
+            Assert.True(smallLaunches > smallProjection && largeLaunches > largeProjection,
+                "The attention must launch device work beyond its two projections.");
+            _output.WriteLine($"projection launches: b1 {smallProjection}, b16 {largeProjection}");
+        }
+        Assert.True(largeLaunches - largeProjection <= smallLaunches - smallProjection,
+            $"b16 took {largeLaunches} launches ({largeProjection} projections) against " +
+            $"{smallLaunches} at b1 ({smallProjection} projections); attention launches grew with batch.");
 
         var actual = engine.MultiHeadAttentionForward(large, qW, kW, vW, oW, Heads).ToArray();
         Assert.Equal(fallbacksBefore, GpuLaunchProbe.Fallbacks);

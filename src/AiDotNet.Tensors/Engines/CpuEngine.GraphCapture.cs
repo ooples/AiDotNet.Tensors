@@ -194,6 +194,8 @@ public partial class CpuEngine
                 savedState: savedState);
         }
 
+        foreach (var node in captured.Select(output => output.LazySource).OfType<LazyNode<T>>())
+            node.PrimaryOutput = captured[0];
         return captured;
     }
 

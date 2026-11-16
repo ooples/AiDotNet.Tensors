@@ -17,8 +17,16 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public class CudnnForwardHeuristicTests
+public class CudnnForwardHeuristicTests : IDisposable
 {
+    // The candidates are compared at FP32 accuracy (FMA math): TF32, the convolution default as in PyTorch's cuDNN
+    // convolutions, is pinned off here and restored after.
+    private readonly bool _priorConvTF32 = CudaDispatchPolicy.ConvReducedPrecisionTF32;
+
+    public CudnnForwardHeuristicTests() => CudaDispatchPolicy.ConvReducedPrecisionTF32 = false;
+
+    public void Dispose() => CudaDispatchPolicy.ConvReducedPrecisionTF32 = _priorConvTF32;
+
     [SkippableFact]
     public void DistinctShapesDoNotGrowTheHeuristicCacheWithoutLimit()
     {

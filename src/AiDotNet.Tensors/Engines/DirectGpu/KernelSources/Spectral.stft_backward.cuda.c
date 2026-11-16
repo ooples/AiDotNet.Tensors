@@ -21,7 +21,7 @@ extern "C" __global__ void parity210_stft_backward_frames(
         else if (2 * m == nFft) { c = -1.0f; s = 0.0f; }
         else if (4 * m == nFft) { c = 0.0f; s = 1.0f; }
         else if (4 * m == 3 * nFft) { c = 0.0f; s = -1.0f; }
-        else { float a = tw * (float)(2 * m > nFft ? m - nFft : m); c = cosf(a); s = sinf(a); }
+        else { sincospif((tw < 0.0f ? -2.0f : 2.0f) * (float)(2 * m > nFft ? m - nFft : m) / (float)nFft, &s, &c); }
         acc += sr*c - si*s;
         m += i; if (m >= nFft) m -= nFft;
     }

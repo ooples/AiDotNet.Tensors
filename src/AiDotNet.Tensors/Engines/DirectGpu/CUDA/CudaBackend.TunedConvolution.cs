@@ -10,9 +10,11 @@ internal readonly struct CudaConv2DArgs
     internal CudaConv2DArgs(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
-        IGpuBuffer? bias = null, FusedActivationType activation = FusedActivationType.None)
+        IGpuBuffer? bias = null, FusedActivationType activation = FusedActivationType.None,
+        IGpuBuffer? preScale = null, IGpuBuffer? preShift = null)
     {
         Input = input; Kernel = kernel; Output = output; Bias = bias; Activation = activation;
+        PreScale = preScale; PreShift = preShift;
         Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
         OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
         KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW;
@@ -29,8 +31,23 @@ internal readonly struct CudaConv2DArgs
     /// <summary>The activation after the bias; every route produces the same result, fused or as passes after it.</summary>
     internal FusedActivationType Activation { get; }
 
-    /// <summary>The output kernels' epilogue flags: bit 0 bias, bit 1 ReLU.</summary>
+    /// <summary>
+    /// The input prologue: relu(x * PreScale[ci] + PreShift[ci]) on every in-bounds input element (an inference batch
+    /// norm and ReLU before the convolution), or null. Only the engine's fused kernels take it; the tuned slot never
+    /// sees such arguments.
+    /// </summary>
+    internal IGpuBuffer? PreScale { get; }
+
+    /// <summary>The prologue's per-input-channel shift (with <see cref="PreScale"/>).</summary>
+    internal IGpuBuffer? PreShift { get; }
+
+    /// <summary>The output kernels' epilogue flags: bit 0 bias, bit 1 ReLU. A ReLU6 is not in them (those kernels
+    /// add only the bias); <see cref="CudaBackend.RunActivationAfterKernelEpilogue"/> applies it after.</summary>
     internal int EpilogueFlags => (Bias is null ? 0 : 1) | (Activation == FusedActivationType.ReLU ? 2 : 0);
+
+    /// <summary>The implicit-GEMM engine's epilogue flags: <see cref="EpilogueFlags"/>, and bits 1 and 2 (ReLU, then the
+    /// clamp at 6) for a ReLU6.</summary>
+    internal int EngineEpilogueFlags => EpilogueFlags | (Activation == FusedActivationType.ReLU6 ? 6 : 0);
 
     internal int Batch { get; }
     internal int InChannels { get; }
@@ -67,11 +84,15 @@ internal readonly struct CudaConv2DArgs
 /// direct kernels and im2col + one strided-batched cuBLAS GEMM (the implicit-GEMM formulation the backward pass
 /// already uses), each selected per shape class only after the correctness and paired-timing gate.
 /// </summary>
-public sealed partial class CudaBackend : IConvBiasActivationBackend
+public sealed partial class CudaBackend : IConvBiasActivationBackend, IConvPreActivationBackend, IRowConcatBackend
 {
     // Convolution reassociates long K = Cin*kH*kW dot products; Winograd and GEMM differ from the direct sum by
-    // a few ulps of the output scale.
-    private const double ConvolutionTolerance = 1e-4;
+    // a few ulps of the output scale. Under the plain-TF32 opt-in the reference is the TF32 engine, itself ~4e-4 of the
+    // output scale from the fp32 sum (10-bit mantissa products): at 1e-4 every fp32 candidate failed the gate against it
+    // and the slot served TF32 everywhere, 1.75x slower than the fp32 Winograd/r8 routes on DenseNet-121's 3x3 layers.
+    // The gate is set to the reference's own precision instead.
+    private double ConvolutionTolerance =>
+        CudaDispatchPolicy.ConvReducedPrecisionTF32 && ConvTensorCoresAvailable ? 2e-3 : 1e-4;
     private TunedKernelSlot<CudaConv2DArgs>? _conv2DForwardSlot;
 
     internal TunedKernelSlot<CudaConv2DArgs> Conv2DForwardSlot
@@ -90,8 +111,8 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                     // The first applicable candidate is the slot's reference (served under capture and once the online
                     // tuning budget is spent), so #1325's engine, fastest on every ResNet-18 layer, goes first when on.
                     var candidates = new List<ITunedKernelCandidate<CudaConv2DArgs>>();
-                    // #1335: one candidate per engine mainloop, the precision default first (plain TF32 only under the
-                    // explicit opt-in, then 3xTF32 on Ampere+), so the reference keeps the requested precision.
+                    // #1335: one candidate per engine mainloop, the precision default first (plain TF32 under the
+                    // TF32 policy, default on, then FMA and 3xTF32 on Ampere+), so the reference keeps the requested precision.
                     if (s_convEngineFprop)
                         foreach (int mainloop in ConvEngineMainloopsInOrder())
                         {
@@ -99,7 +120,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                             candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>(
                                 "nvrtc.conv2d.implicit_engine" + ConvMainloopSuffix(ml), TunedKernelOrigin.Builtin, true,
                                 _ => HasTunedKernel("conv2d_fprop_ig128_tap" + ConvMainloopSuffix(ml)),
-                                (in CudaConv2DArgs a) => { ExecuteConv2DForwardEngine(a, ml); RunConvEpiloguePasses(a); }));
+                                (in CudaConv2DArgs a) => { if (!ExecuteConv2DForwardEngine(a, ml)) RunConvEpiloguePasses(a); }));
                         }
                     candidates.Add(
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.generic", TunedKernelOrigin.Builtin,
@@ -147,7 +168,8 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                         TunedKernelOrigin.Builtin, true, shape => WinogradF23AdmitsShape(shape) && EnsureWinogradModule(),
                         (in CudaConv2DArgs a) =>
                         {
-                            if (!TryConv2DForwardWinogradF23(a))
+                            if (TryConv2DForwardWinogradF23(a)) RunActivationAfterKernelEpilogue(a);
+                            else
                             {
                                 LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                                     a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
@@ -168,9 +190,9 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                             RunConvEpiloguePasses(a);
                         }));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
-                        true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)));
+                        true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => { LaunchConv2DTiled(a); RunActivationAfterKernelEpilogue(a); }));
                     candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,
-                        true, _ => HasTunedKernel("conv2d_direct"), (in CudaConv2DArgs a) => LaunchConv2DDirect(a)));
+                        true, _ => HasTunedKernel("conv2d_direct"), (in CudaConv2DArgs a) => { LaunchConv2DDirect(a); RunActivationAfterKernelEpilogue(a); }));
                     // #890 phase 4b: the declared implicit-GEMM programs, last, so never the reference.
                     AddDeclaredConvForwardCandidates(candidates);
                     _conv2DForwardCandidateList = candidates.ToArray();
@@ -180,6 +202,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
                             a => new[] { (a.Output, a.OutputCount) },
                             a => a.Output.Handle == a.Input.Handle || a.Output.Handle == a.Kernel.Handle),
                         () => GpuDeterminism.IsActive, candidates.ToArray());
+                    _conv2DForwardSlot.UntunedPreference = static shape => ConvUntuned.Forward(shape);
                 }
                 return Created(_conv2DForwardSlot);
             }
@@ -191,7 +214,19 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
     {
         if (a.Bias is { } bias) Conv2DBiasAdd(a.Output, bias, a.Batch, a.OutChannels, a.OutHeight * a.OutWidth);
         if (a.Activation == FusedActivationType.ReLU) Relu(a.Output, a.Output, a.OutputCount);
+        else if (a.Activation == FusedActivationType.ReLU6) Relu6(a.Output, a.Output, a.OutputCount);
     }
+
+    // The activation a kernel that applied EpilogueFlags (bias, ReLU) left out: ReLU6, whose clamp those kernels lack.
+    internal void RunActivationAfterKernelEpilogue(in CudaConv2DArgs a)
+    {
+        if (a.Activation == FusedActivationType.ReLU6) Relu6(a.Output, a.Output, a.OutputCount);
+    }
+
+    /// <summary>The activations the CUDA convolution routes apply (in the engine's output store, or as passes):
+    /// none, ReLU and ReLU6 (MobileNet's).</summary>
+    internal static bool CudaConvFuses(FusedActivationType activation)
+        => activation is FusedActivationType.None or FusedActivationType.ReLU or FusedActivationType.ReLU6;
 
     // The im2col scratch is batch * Cin*kH*kW * outH*outW floats; keep it under 256 MiB.
     private static bool ConvGemmForwardFits(TunedShape s)
@@ -222,7 +257,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
     }
 
     /// <summary>
-    /// The engine mainloops to register, the default (the slot's reference) first: plain TF32 under the explicit
+    /// The engine mainloops to register, the default (the slot's reference) first: plain TF32 under the TF32 policy
     /// reduced-precision opt-in, else FP32 FMA. 3xTF32 (fp32-level accuracy, Ampere+) competes as a measured candidate:
     /// on the RTX 3080 it is still 20-25% slower than FMA (the engine is data-path bound, not math bound), so it is not
     /// the default until it measures faster (#1335).
@@ -235,14 +270,16 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
             : new[] { ConvMainloopFma, ConvMainloop3xTf32 };
     }
 
-    private void ExecuteConv2DForwardEngine(in CudaConv2DArgs a, int mainloop)
+    // True when the bias and activation were applied in the engine's output store (one launch covers K).
+    private bool ExecuteConv2DForwardEngine(in CudaConv2DArgs a, int mainloop)
     {
         // Declines only transiently (split-K partials not yet sized during a capture): the generic kernel computes the
         // same convolution.
-        if (!TryConv2DForwardEngine(a, mainloop))
-            LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
-                a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
-                a.PadH, a.PadW, a.DilationH, a.DilationW);
+        if (TryConv2DForwardEngine(a, mainloop, fuseEpilogue: true, out bool applied)) return applied;
+        LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+            a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,
+            a.PadH, a.PadW, a.DilationH, a.DilationW);
+        return false;
     }
 
     /// <summary>out_b[Cout, L] = W[Cout, P] * col_b[P, L] for every batch item, as one strided-batched GEMM.</summary>
@@ -309,6 +346,32 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
         LaunchKernel3D(function, gx, gy, (uint)(batch * outC), (uint)block, (uint)block, 1, args, sharedMem);
     }
 
+    // AIDOTNET_CONV_PREACTIVATION=0: pre-activated convolutions take the engine's base path (a batch norm pass, then
+    // the convolution).
+    private static readonly bool s_convPreActivation =
+        Environment.GetEnvironmentVariable("AIDOTNET_CONV_PREACTIVATION") != "0";
+
+    /// <inheritdoc/>
+    bool IConvPreActivationBackend.TryConv2DPreActivatedBiasActivation(IGpuBuffer input, IGpuBuffer scale, IGpuBuffer shift, IGpuBuffer kernel,
+        IGpuBuffer? bias, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW, FusedActivationType activation)
+    {
+        // The engine's fused kernels only (the tuned slot's other routes read the input as stored): its default
+        // mainloop, the one the slot's reference runs. Deterministic: split-K partials are summed in a fixed order.
+        if (!s_convEngineFprop || !s_convPreActivation || !CudaConvFuses(activation)
+            || batch <= 0 || outHeight <= 0 || outWidth <= 0)
+            return false;
+        var args = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation, scale, shift);
+        if (!TryConv2DForwardEngine(args, ConvEngineMainloop, fuseEpilogue: true, out bool applied)) return false;
+        if (!applied) RunConvEpiloguePasses(args);
+        return true;
+    }
+
     /// <inheritdoc/>
     public bool TryConv2DBiasActivation(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer? bias, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth,
@@ -317,7 +380,7 @@ public sealed partial class CudaBackend : IConvBiasActivationBackend
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW, FusedActivationType activation)
     {
-        if (!ConvEpilogue.Fuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
+        if (!CudaConvFuses(activation) || batch <= 0 || outHeight <= 0 || outWidth <= 0) return false;
         var args = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
             outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, bias, activation);
         // cuDNN, when the policy routes convolutions there, then the passes; otherwise the tuned routes (each applies the

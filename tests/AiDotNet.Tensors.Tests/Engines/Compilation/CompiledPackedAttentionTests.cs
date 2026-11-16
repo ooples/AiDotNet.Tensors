@@ -43,7 +43,7 @@ public class CompiledPackedAttentionTests : IDisposable
     }
 
     // blocks: how many model-wide column blocks the in-projection has; starts: the query, key and value blocks.
-    private static Run Train(IEngine engine, bool onDevice, int blocks, int[] starts)
+    private static Run Train(IEngine engine, bool onDevice, int blocks, int[] starts, bool layerNorm = false)
     {
         AiDotNetEngine.Current = engine;
         var x = Rand([Batch * Seq, Model], 1, 1f);
@@ -61,6 +61,12 @@ public class CompiledPackedAttentionTests : IDisposable
             var qkv = engine.FusedLinear(x, inProj, inBias, FusedActivationType.None);
             Tensor<float> Part(int i) => engine.Reshape(engine.TensorNarrow(qkv, 1, starts[i] * Model, Model), new[] { Batch, Seq, Model });
             var context = engine.MultiHeadAttentionCore(Part(0), Part(1), Part(2), Heads);
+            if (layerNorm)
+            {
+                var gamma = new Tensor<float>(Enumerable.Repeat(1f, Model).ToArray(), new[] { Model });
+                var beta = new Tensor<float>(new float[Model], new[] { Model });
+                context = engine.LayerNorm(context, gamma, beta, 1e-5, out _, out _);
+            }
             var pred = engine.FusedLinear(engine.Reshape(context, new[] { Batch * Seq, Model }), outProj, outBias, FusedActivationType.None);
             engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(pred, y)), new[] { 0, 1 }, false);
             plan = scope.CompileTraining(parameters);
@@ -80,12 +86,13 @@ public class CompiledPackedAttentionTests : IDisposable
     }
 
     [SkippableTheory]
-    [InlineData(3, 0, 1, 2, true, false)]    // torch's order
-    [InlineData(3, 0, 1, 2, true, true)]     // ... with deterministic reductions: the two-pass backward, no dQ memset
-    [InlineData(3, 2, 0, 1, true, false)]    // any order of the three blocks
-    [InlineData(4, 0, 1, 3, false, false)]   // a fourth block nothing reads: not covered, kept composed
+    [InlineData(3, 0, 1, 2, true, false, false)]    // torch's order
+    [InlineData(3, 0, 1, 2, true, true, false)]     // deterministic reductions
+    [InlineData(3, 2, 0, 1, true, false, false)]    // any order of the three blocks
+    [InlineData(4, 0, 1, 3, false, false, false)]   // a fourth unread block: not covered
+    [InlineData(3, 0, 1, 2, true, false, true)]     // post-norm must not realize QKV before fusion
     public void A_packed_qkv_attention_fuses_on_the_gpu_and_trains_like_the_cpu_plan(int blocks, int q, int k, int v, bool fuses,
-        bool deterministic)
+        bool deterministic, bool layerNorm)
     {
         DirectGpuTensorEngine? gpu = null;
         try
@@ -98,13 +105,13 @@ public class CompiledPackedAttentionTests : IDisposable
         using (gpu)
         {
             var starts = new[] { q, k, v };
-            var reference = Train(new CpuEngine(), onDevice: false, blocks, starts);
+            var reference = Train(new CpuEngine(), onDevice: false, blocks, starts, layerNorm);
             bool priorDeterministic = AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions;
             Run device;
             try
             {
                 AiDotNet.Tensors.Helpers.CpuParallelSettings.DeterministicReductions = deterministic;
-                device = Train(gpu!, onDevice: true, blocks, starts);
+                device = Train(gpu!, onDevice: true, blocks, starts, layerNorm);
             }
             finally
             {

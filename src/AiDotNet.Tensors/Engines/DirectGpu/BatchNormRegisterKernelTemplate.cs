@@ -14,7 +14,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <item>forward: bit 0 ReLU, bit 1 a residual added before it;</item>
 /// <item>backward: bit 0 dY masked where the ReLU output is not positive, bit 1 the masked dY also written as the
 /// residual's gradient, bit 2 the mask rebuilt from x instead of read (the forward's own value, same fma), bit 3 a second
-/// output gradient summed into dY as it loads (gradOutput + gradOutput2).</item>
+/// output gradient summed into dY as it loads (gradOutput + gradOutput2), bit 4 the input gradient added to the
+/// destination's contents instead of overwriting them (an accumulator that already holds this step's gradient).</item>
 /// </list>
 /// The mask rebuild (backward bit 2) is exact only where the forward and the backward round z = fma(gamma, x-hat, beta)
 /// the same: OpenCL, Metal and HIP define fma as one correctly rounded operation, GLSL does under <c>precise</c> (which the
@@ -155,7 +156,9 @@ internal static class BatchNormRegisterKernelTemplate
         {
             int b = e / spatial;
             int idx = (b * channels + c) * spatial + (e - b * spatial);
-            dxout[idx] = inv * (dv[k] * g - invCount * (sumDxhat + ((xv[k] - mean) * inv) * sumDxhatXhat));
+            float dxv = inv * (dv[k] * g - invCount * (sumDxhat + ((xv[k] - mean) * inv) * sumDxhatXhat));
+            if ((mode & 16) != 0) dxv = dxv + dxout[idx];
+            dxout[idx] = dxv;
         }
     }
 ").Replace("KPT", k.ToString(System.Globalization.CultureInfo.InvariantCulture));

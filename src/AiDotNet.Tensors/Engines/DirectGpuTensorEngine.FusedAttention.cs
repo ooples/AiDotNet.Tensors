@@ -468,10 +468,12 @@ public partial class DirectGpuTensorEngine
     {
         using var __gpuOp = EnterGpuOp();
         if (!ShortAttentionEnabled || GraphMode.IsActive || typeof(T) != typeof(float)
+            || batch <= 0 || heads <= 0 || seq <= 0 || headDim <= 0
             || Autodiff.DifferentiableOps.IsRecording<T>() || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
             || backend is not IShortAttentionForwardBackend shortAttention || !shortAttention.SupportsShortAttention(headDim)
             || (backend is IFusedAttentionPreference preference && preference.PrefersFusedAttention(batch, heads, seq, seq, headDim))
-            || (long)batch * seq * 3 * heads * headDim > int.MaxValue)
+            || (long)heads * headDim > int.MaxValue / 3
+            || (long)batch * seq > int.MaxValue / (3L * heads * headDim))
             return null;
         int width = heads * headDim, rows = batch * seq;
         try
@@ -494,6 +496,57 @@ public partial class DirectGpuTensorEngine
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             GpuLaunchProbe.OnFallback("PackedShortSelfAttention", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    // Inference self-attention on the backend's fused kernel with the three projections as one GEMM over the cached
+    // [W_q | W_k | W_v]: the kernel reads Q, K and V in place from the packed [B*S, 3D] rows through offset views (row
+    // stride 3D), so the projections cost one launch and no copies. Three [D x D] GEMMs at a ViT's D = 192 and
+    // B*S = 1040 took 57 us against 39 us for the one [D x 3D] GEMM (RTX 1000 Ada). Null where it does not apply.
+    private Tensor<T>? TryPackedFusedSelfAttention<T>(Tensor<T> input2d, Tensor<T> qWeight, Tensor<T> kWeight,
+        Tensor<T> vWeight, int batch, int heads, int seq, int headDim, double scale)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (GraphMode.IsActive || typeof(T) != typeof(float) || Autodiff.DifferentiableOps.IsRecording<T>()
+            || batch <= 0 || heads <= 0 || seq <= 0 || headDim <= 0
+            || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend)
+            || backend is not IFusedAttentionBackend fused || !fused.SupportsFusedAttention(headDim)
+            || backend is not IGpuBufferViews views || !views.ViewsAreFreeAtAnyOffset
+            || !(backend is IFusedAttentionPreference preference && preference.PrefersFusedAttention(batch, heads, seq, seq, headDim))
+            || ((long)heads * headDim) % 4 != 0
+            || (long)heads * headDim > int.MaxValue / 3
+            || (long)batch * seq > int.MaxValue / (3L * heads * headDim)
+            || (long)batch * heads * seq > int.MaxValue)
+            return null;
+        int width = heads * headDim, rows = batch * seq;
+        try
+        {
+            var fusedWeight = FusedQkvWeight<T>.Get(this, qWeight, kWeight, vWeight);                    // [D, 3D]
+            int packedLength = rows * 3 * width, outLength = rows * width;
+            using var x = GetOrAllocateBuffer(backend, input2d);
+            using var w = GetWeightBufferPreferResident(backend, fusedWeight, PersistentTensorRole.Weights);
+            using var packed = AllocateFullyWrittenOutputBuffer(backend, packedLength);
+            backend.Gemm(x.Buffer, w.Buffer, packed.Buffer, rows, 3 * width, width);                     // [B*S, 3D]
+            using var q = views.TryCreateView(packed.Buffer, 0, packedLength);
+            using var k = views.TryCreateView(packed.Buffer, width, packedLength - width);
+            using var v = views.TryCreateView(packed.Buffer, 2 * width, packedLength - 2 * width);
+            if (q is null || k is null || v is null) return null;
+            var p = FusedParams(batch, heads, seq, seq, headDim, interleaved: true, scale, 0.0, causal: false, causalOffset: 0);
+            long packedRow = 3L * width;
+            p.Qr = p.Kr = p.Vr = packedRow;
+            p.Qb = p.Kb = p.Vb = seq * packedRow;
+            using var output = AllocateFullyWrittenOutputBuffer(backend, outLength);
+            using var lse = AllocateFullyWrittenOutputBuffer(backend, batch * heads * seq);              // unused (no backward)
+            fused.FusedAttentionForward(q, k, v, output.Buffer, lse.Buffer, null, p, headDim);
+            var result = DeferTensorResult<T>(backend, output.Buffer, outLength, new[] { batch, seq, width });
+            output.RelinquishOwnership();
+            return result;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            GpuLaunchProbe.OnFallback("PackedFusedSelfAttention", ex);
             if (ThrowOnGpuKernelFallback) throw;
             return null;
         }

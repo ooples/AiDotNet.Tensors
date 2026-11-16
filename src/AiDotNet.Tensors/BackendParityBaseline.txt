@@ -4,3 +4,13 @@
 
 
 
+capability IConvPreActivationBackend HipBackend #1749
+capability IConvPreActivationBackend MetalBackend #1749
+capability IConvPreActivationBackend OpenClBackend #1749
+capability IConvPreActivationBackend VulkanBackend #1749
+capability IConvPreActivationBackend WebGpuBackend #1749
+capability IRowConcatBackend HipBackend #1749
+capability IRowConcatBackend MetalBackend #1749
+capability IRowConcatBackend OpenClBackend #1749
+capability IRowConcatBackend VulkanBackend #1749
+capability IRowConcatBackend WebGpuBackend #1749
