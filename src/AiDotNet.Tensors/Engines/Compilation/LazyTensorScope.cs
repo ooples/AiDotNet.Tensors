@@ -76,6 +76,8 @@ internal sealed class LazyTensorScope : IDisposable
 
     private readonly HashSet<object> _retainedOutputs = new(ReferenceEqualityComparer<object>.Instance);
 
+    internal bool HasRetainedOutputs => _retainedOutputs.Count != 0;
+
     /// <summary>Declares an observable output while the forward is still being recorded.</summary>
     internal void RetainOutput<T>(Tensor<T> output)
     {

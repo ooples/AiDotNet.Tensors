@@ -4808,6 +4808,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     return new[] { freshMean, freshVariance };
                 },
                 operationName: "GroupNormIntoStatistics");
+            // These statistics belong to the preceding Into call, whose destination is the primary result.
+            foreach (var node in statistics.Select(statistic => statistic.LazySource).OfType<LazyNode<T>>())
+                node.PrimaryOutput = output;
+
             mean = statistics[0];
             variance = statistics[1];
             return;

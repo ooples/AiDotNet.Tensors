@@ -34,6 +34,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
     private readonly bool _forTraining;
     private readonly HashSet<ILazyNode>? _observableOutputs;
 
+    /// <summary>Creates a fusion pass that preserves training and observable-output contracts.</summary>
     /// <param name="forTraining">True when compiling a TRAINING plan: inference-only patterns (whose fused node has
     /// no backward) are skipped, so the matched ops keep their backward steps. Measured before this: a matmul by a
     /// sparse constant selection matrix was rewritten to FusedSparseLinear inside a training plan and every gradient

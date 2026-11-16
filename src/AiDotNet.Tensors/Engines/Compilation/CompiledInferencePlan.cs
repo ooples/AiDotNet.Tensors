@@ -1360,6 +1360,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 "whatever it computed from that value ran outside the graph and would replay as a stale constant. " +
                 "Express that computation with engine operations to make the forward compilable.");
 
+        if (explicitOutput is null && scope.Nodes.LastOrDefault() is LazyNode<T> last)
+        {
+            if (last.PrimaryOutput is not null) explicitOutput = last.PrimaryOutput;
+            else if (last.OpName is "LayerNormMean" or "LayerNormVariance" or "BatchNormBatchMean" or "BatchNormBatchVariance")
+                explicitOutput = last.GetInputsArray()[0];
+        }
+
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
 

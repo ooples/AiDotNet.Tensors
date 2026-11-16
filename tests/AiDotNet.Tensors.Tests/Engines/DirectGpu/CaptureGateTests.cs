@@ -29,6 +29,14 @@ public class CaptureGateTests
         using (gpu)
         {
             var cuda = (CudaBackend)gpu!.GetBackend()!;
+            // Tuning holds the PTX cache monitor while its runtime opens a capture. Backend capture
+            // enters the context gate before collecting kernel pins: these must be one reentrant monitor.
+            var ptxGate = typeof(CudaBackend).GetField("_directPtxLock",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(cuda);
+            Assert.NotNull(ptxGate);
+            lock (ptxGate!)
+                Assert.False(GateFreeFromAnotherThread(CudaBackend.CaptureGateFor(cuda.CudaContextHandle)),
+                    "A capture can enter while a tuner owns the PTX cache, allowing lock inversion.");
             CudaBackend.TestHookCaptureSetup = () => throw new InvalidOperationException("injected capture setup failure");
             try
             {

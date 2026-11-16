@@ -14,8 +14,88 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// </summary>
 public class LayerNormCompiledTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ImplicitInferenceOutput_IsNormalizedTensorOnEveryReplay(bool inference)
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 3f, 5f, 9f }, new[] { 2, 2 });
+        var gamma = new Tensor<float>(new[] { 1f, 1f }, new[] { 2 });
+        var beta = new Tensor<float>(new[] { 0f, 0f }, new[] { 2 });
+        ICompiledPlan<float> plan;
+        using (var scope = inference ? GraphMode.EnableInference() : GraphMode.Enable())
+        {
+            engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
+            plan = scope.CompileInference<float>();
+        }
+        using (plan)
+            for (int step = 0; step < 3; step++)
+            {
+                input.AsWritableSpan()[0] = 1f + step * 4f;
+                input.IncrementVersion();
+                var expected = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
+                var actual = plan.Execute();
+                Assert.Equal(new[] { 2, 2 }, actual.Shape);
+                AssertClose(Array.ConvertAll(expected.ToArray(), value => (double)value), actual.ToArray(),
+                    $"implicit inference step {step}");
+            }
+    }
+
     [Fact]
     public void RecordingFloat_DefersForwardUntilAStatisticIsRead() => CheckDeferredStatistics<float>();
+
+    [Fact]
+    public void ImplicitMultiOutputInference_SelectsFirstSplitAndAllowsExplicitAuxiliaryOutput()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f }, new[] { 7 });
+        foreach (bool explicitOutput in new[] { false, true })
+        {
+            ICompiledPlan<float> plan;
+            using (var scope = GraphMode.EnableInference())
+            {
+                var split = engine.TensorTensorSplit(input, 3, 0);
+                plan = explicitOutput ? scope.CompileInference(split[2]) : scope.CompileInference<float>();
+            }
+            using (plan)
+                for (int step = 0; step < 2; step++)
+                {
+                    input.AsWritableSpan().Fill(step + 1);
+                    input.IncrementVersion();
+                    var result = plan.Execute();
+                    Assert.Equal(explicitOutput ? 2 : 3, result.Length);
+                    foreach (var value in result.ToArray()) Assert.Equal(step + 1f, value);
+                }
+        }
+    }
+
+    [Fact]
+    public void ImplicitGroupNormIntoInference_SelectsDestinationInsteadOfStatistics()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, new[] { 1, 4, 1, 2 });
+        var output = new Tensor<float>([1, 4, 1, 2]);
+        var gamma = new Tensor<float>(new[] { 1f, 1f, 1f, 1f }, new[] { 4 });
+        var beta = new Tensor<float>([4]);
+        ICompiledPlan<float> plan;
+        using (var scope = GraphMode.EnableInference())
+        {
+            engine.GroupNormInto(output, input, 2, gamma, beta, 1e-5, out _, out _);
+            plan = scope.CompileInference<float>();
+        }
+        using (plan)
+            for (int step = 0; step < 2; step++)
+            {
+                input.AsWritableSpan()[0] = 1f + step * 4f;
+                input.IncrementVersion();
+                var expected = engine.GroupNorm(input, 2, gamma, beta, 1e-5, out _, out _);
+                var actual = plan.Execute();
+                Assert.Equal(output.Shape, actual.Shape);
+                AssertClose(Array.ConvertAll(expected.ToArray(), value => (double)value), actual.ToArray(),
+                    $"group normalization step {step}");
+            }
+    }
 
     [Fact]
     public void RecordingDouble_DefersForwardUntilAStatisticIsRead() => CheckDeferredStatistics<double>();
@@ -62,6 +142,34 @@ public class LayerNormCompiledTests
             Assert.Equal(16d, plan.Step().ToArray()[0], 10);
             // Statistics are detached outputs; the differentiable normalization still trains beta.
             Assert.Equal(new[] { 2d, 2d }, plan.Gradients[2].ToArray());
+        }
+    }
+
+    [Fact]
+    public void DetachedStatistics_DoNotPreventIdentityGradientAliasing()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { 1d, 3d, 5d, 9d }, new[] { 2, 2 });
+        var gamma = new Tensor<double>(new[] { 1d, 1d }, new[] { 2 });
+        var beta = new Tensor<double>(new[] { 0d, 0d }, new[] { 2 });
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var normalized = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
+            var residual = engine.TensorMultiplyScalar(input, 2d);
+            var loss = engine.ReduceSum(engine.TensorAdd(normalized, residual), null);
+            plan = scope.CompileTraining(new[] { gamma, beta }, loss);
+        }
+        using (plan)
+        {
+            // Mean/variance are forward readers, but do not need copies of the add's identity gradients.
+            var concrete = (CompiledTrainingPlan<double>)plan;
+            Assert.DoesNotContain(concrete.BackwardStepKinds, kind => kind.EndsWith(":TensorAdd", StringComparison.Ordinal));
+            Assert.Equal(36d, plan.Step().ToArray()[0], 10);
+            Assert.Equal(new[] { 2d, 2d }, plan.Gradients[1].ToArray());
+            input.AsWritableSpan()[0] = 5d;
+            Assert.Equal(44d, plan.Step().ToArray()[0], 10);
+            Assert.Equal(new[] { 2d, 2d }, plan.Gradients[1].ToArray());
         }
     }
 

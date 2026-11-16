@@ -809,6 +809,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(
                 CuBlasNative.cuDevicePrimaryCtxRetain(out _cudaContext, device),
                 "cuDevicePrimaryCtxRetain");
+            // Kernel tuning and capture both enter this reentrant context gate. Using the same monitor
+            // for PTX cache/pin ownership prevents capture -> cache and tuner -> capture lock inversion.
+            _directPtxLock = CaptureGateFor(_cudaContext);
+
             _cuDevice = device;
             // cuCtxCreate made the new context current on this thread, and the rest of construction (stream,
             // modules, cuBLAS) depends on that; cuDevicePrimaryCtxRetain does not, so push it the same way.

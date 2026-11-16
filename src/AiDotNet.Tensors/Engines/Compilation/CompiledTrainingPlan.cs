@@ -3976,9 +3976,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var loss = StepCore();
             // Graph replay runs no host code: re-arm declared outputs without downloading any activations.
             if (_retainedOutputs.Count > 0 && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var outputEngine))
-                foreach (var output in _retainedOutputs)
-                    if (output._gpuBuffer is { } buffer && output._gpuBackend is { } backend)
-                        outputEngine.BindResidentBuffer(output, buffer, backend);
+                foreach (var output in _retainedOutputs.Where(output => output._gpuBuffer is not null && output._gpuBackend is not null))
+                    outputEngine.BindResidentBuffer(output, output._gpuBuffer!, output._gpuBackend!);
             return loss;
         }
     }
@@ -9682,6 +9681,23 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var compiler = new LazyGraphCompiler(forTraining: true, observableOutputs: observableNodes);
         var optimized = compiler.Compile(scope.Nodes);
 
+        // Observation keeps forward work alive, but only loss ancestors may contribute gradients.
+        // Resolve producer edges before clearing LazySource; GetInputNodes preserves in-place read ordering.
+        var lossRoot = optimized.OfType<LazyNode<T>>()
+            .LastOrDefault(node => ReferenceEquals(node.Output, explicitLoss ?? recordedLastOutput))
+            ?? (explicitLoss is null ? optimized.OfType<LazyNode<T>>().LastOrDefault() : null);
+        var lossAncestors = new HashSet<ILazyNode>();
+        var pendingLossNodes = new Stack<ILazyNode>();
+        if (lossRoot is not null) pendingLossNodes.Push(lossRoot);
+        while (pendingLossNodes.Count != 0)
+        {
+            var ancestor = pendingLossNodes.Pop();
+            if (!lossAncestors.Add(ancestor)) continue;
+            var gradientInputs = ancestor is LazyNode<T> typedAncestor
+                ? typedAncestor.GetGradientInputNodes() : ancestor.GetInputNodes();
+            foreach (var inputNode in gradientInputs) pendingLossNodes.Push(inputNode);
+        }
+
         // Collect all forward steps
         var forwardSteps = new List<CompiledStep<T>>();
         foreach (var node in optimized)
@@ -9693,7 +9709,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     typed.Execute,
                     typed.Output,
                     typed.GetInputsArray(),
-                    typed.BackwardFn,
+                    lossAncestors.Contains(typed) ? typed.BackwardFn : null,
                     typed.SavedState) { ReplaysHostState = typed.ReplaysHostState });
                 // CRITICAL (issue #350 root cause): clear LazySource on every
                 // forward-step output BEFORE the plan starts executing. Each
@@ -9848,7 +9864,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the GPU generic path (no dataflow fusion, no host specializations appended out of order).
             bool staticReverseBackward = engine.SupportsGpu
                 && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
-            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, allTensors, parameters, consumerCount, engine, gradMap, allGrads,
+            // Detached statistic readers constrain forward liveness but never write gradients.
+            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, allTensors, parameters, gradWriterCount, engine, gradMap, allGrads,
                 staticReverseBackward, out aliasedGradViews, placeholderGradient);
             if (gradPlaceholders is not null)
             {
@@ -10021,7 +10038,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (aliasedReshapeSteps is not null)
                 for (int stepIndex = 0; stepIndex < forwardSteps.Count; stepIndex++)
                     if (aliasedReshapeSteps.Contains(forwardSteps[stepIndex])) claimedElsewhere.Add(stepIndex);
-            DetectConvBiasActivationFusion(forwardSteps, fusionConsumerCount, gradMap, requiresGradTensors,
+            DetectConvBiasActivationFusion(forwardSteps, fusionConsumerCount, gradMap, gradWriterCount, requiresGradTensors,
                 convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue, convEpilogueChains,
                 convEpilogueDeadInternals, claimedElsewhere);
         }
@@ -15348,6 +15365,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var step0 = steps[i];
             var step1 = steps[i + 1];
             var step2 = steps[i + 2];
+            if (step0.BackwardFn is null || step1.BackwardFn is null || step2.BackwardFn is null) continue;
 
             // Pattern: MatMul[i] → activation[i+1] → MatMul[i+2]
             // where the activation's input is MatMul[i]'s output, and
@@ -15613,6 +15631,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             var matmul = forwardSteps[i];
             var reduce = forwardSteps[i + 1];
+            if (matmul.BackwardFn is null || reduce.BackwardFn is null) continue;
 
             if (matmul.OpName != "TensorMatMul") continue;
             if (reduce.OpName != "ReduceSum") continue;
@@ -15868,6 +15887,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<CompiledStep<T>> steps,
         Dictionary<Tensor<T>, int> consumerCount,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<Tensor<T>, int> gradWriterCount,
         HashSet<Tensor<T>> requiresGrad,
         Dictionary<int, Action<IEngine>> forwardSpecs,
         Dictionary<int, Action<IEngine>> backwardSpecs,
@@ -15978,9 +15998,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
             }
 
-            bool accumX = consumerCount.TryGetValue(x, out int xConsumers) && xConsumers > 1;
-            bool accumKernel = consumerCount.TryGetValue(kernel, out int kConsumers) && kConsumers > 1;
-            bool accumBias = consumerCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
+            bool accumX = gradWriterCount.TryGetValue(x, out int xConsumers) && xConsumers > 1;
+            bool accumKernel = gradWriterCount.TryGetValue(kernel, out int kConsumers) && kConsumers > 1;
+            bool accumBias = gradWriterCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
             // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
             bool needInputGrad = requiresGrad.Contains(x);
             var xShape = (int[])x._shape.Clone();
@@ -16077,6 +16097,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var matmul = forwardSteps[i];
             var slice = forwardSteps[i + 1];
+            if (matmul.BackwardFn is null || slice.BackwardFn is null) continue;
 
             if (matmul.OpName != "TensorMatMul") continue;
             if (slice.OpName != "TensorSlice") continue;
@@ -16224,6 +16245,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             var step0 = steps[i];
             var step1 = steps[i + 1];
+            if (step0.BackwardFn is null || step1.BackwardFn is null) continue;
 
             if (step0.OpName != "TensorMatMul" || step1.OpName != "TensorMatMul") continue;
             if (step0.Inputs.Length != 2 || step1.Inputs.Length != 2) continue;

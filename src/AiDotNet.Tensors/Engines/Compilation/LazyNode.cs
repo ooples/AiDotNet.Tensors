@@ -72,6 +72,8 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
     public bool IsRealized { get; set; }
     public int TopologicalIndex { get; set; } = -1;
     public long RecordOrder { get; set; }
+    // Auxiliary outputs of one inference call share its primary result for implicit compilation.
+    internal Tensor<T>? PrimaryOutput { get; set; }
     public bool WritesInPlace => ReferenceEquals(Input0, Output);
     public ILazyNode? PriorWriter => WritesInPlace ? _externalPrerequisite : null;
 
@@ -289,6 +291,13 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
 
     /// <summary>Get input nodes for graph traversal.</summary>
     public ILazyNode[] GetInputNodes()
+        => GetInputNodes(includeEarlierReaders: true);
+
+    // Execution ordering edges keep old reads ahead of in-place writes; they do not carry derivatives.
+    internal ILazyNode[] GetGradientInputNodes()
+        => BackwardFn is null ? Array.Empty<ILazyNode>() : GetInputNodes(includeEarlierReaders: false);
+
+    private ILazyNode[] GetInputNodes(bool includeEarlierReaders)
     {
         var nodes = new List<ILazyNode>();
         // External prerequisite first (when present) — see _externalPrerequisite
@@ -311,7 +320,7 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
         if (InputsOverflow != null)
             foreach (var inp in InputsOverflow)
                 if (ProducerOf(inp) is { } n && !ReferenceEquals(n, this)) nodes.Add(n);
-        if (_earlierReaders is not null)
+        if (includeEarlierReaders && _earlierReaders is not null)
             foreach (var reader in _earlierReaders)
                 if (!ReferenceEquals(reader, this)) nodes.Add(reader);
         return nodes.ToArray();
