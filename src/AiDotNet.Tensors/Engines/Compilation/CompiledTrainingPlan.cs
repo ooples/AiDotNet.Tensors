@@ -9848,7 +9848,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the GPU generic path (no dataflow fusion, no host specializations appended out of order).
             bool staticReverseBackward = engine.SupportsGpu
                 && Environment.GetEnvironmentVariable("AIDOTNET_GPU_PREFER_GENERIC") != "0";
-            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, allTensors, parameters, consumerCount, engine, gradMap, allGrads,
+            // Detached statistic readers constrain forward liveness but never write gradients.
+            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, allTensors, parameters, gradWriterCount, engine, gradMap, allGrads,
                 staticReverseBackward, out aliasedGradViews, placeholderGradient);
             if (gradPlaceholders is not null)
             {

@@ -65,6 +65,34 @@ public class LayerNormCompiledTests
         }
     }
 
+    [Fact]
+    public void DetachedStatistics_DoNotPreventIdentityGradientAliasing()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { 1d, 3d, 5d, 9d }, new[] { 2, 2 });
+        var gamma = new Tensor<double>(new[] { 1d, 1d }, new[] { 2 });
+        var beta = new Tensor<double>(new[] { 0d, 0d }, new[] { 2 });
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var normalized = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
+            var residual = engine.TensorMultiplyScalar(input, 2d);
+            var loss = engine.ReduceSum(engine.TensorAdd(normalized, residual), null);
+            plan = scope.CompileTraining(new[] { gamma, beta }, loss);
+        }
+        using (plan)
+        {
+            // Mean/variance are forward readers, but do not need copies of the add's identity gradients.
+            var concrete = (CompiledTrainingPlan<double>)plan;
+            Assert.DoesNotContain(concrete.BackwardStepKinds, kind => kind.EndsWith(":TensorAdd", StringComparison.Ordinal));
+            Assert.Equal(36d, plan.Step().ToArray()[0], 10);
+            Assert.Equal(new[] { 2d, 2d }, plan.Gradients[1].ToArray());
+            input.AsWritableSpan()[0] = 5d;
+            Assert.Equal(44d, plan.Step().ToArray()[0], 10);
+            Assert.Equal(new[] { 2d, 2d }, plan.Gradients[1].ToArray());
+        }
+    }
+
     public static TheoryData<int[], int[]> Shapes => new()
     {
         // input shape, gamma shape
