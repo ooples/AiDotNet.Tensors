@@ -4742,7 +4742,33 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (_releasedUnusedMemory || !ReleaseUnusedMemoryBeforeCapture) return;
         _releasedUnusedMemory = true;
+        ReleaseTraceTimeDeviceCopies();
         gte.ReleaseUnusedDeviceMemory();
+    }
+
+    /// <summary>
+    /// Frees the device copies that forward outputs with deferred host storage took while the forward was traced (a
+    /// value the trace realized: CopyResultInto copies it on the device rather than into a new host array). Every forward
+    /// output is recomputed by the step about to run, which binds it to a step buffer, so the trace-time values are dead;
+    /// freed here, before the unused device memory is returned, they do not stay reserved beside the step's working set.
+    /// The loss is kept: a caller may still read the traced loss.
+    /// </summary>
+    private void ReleaseTraceTimeDeviceCopies()
+    {
+        if (_forwardSteps is not { } steps) return;
+        foreach (var step in steps)
+        {
+            var output = step.OutputBuffer;
+            if (output is null || ReferenceEquals(output, _lossOutput) || !output._ownsGpuBuffer
+                || !output.HasDeferredHostStorage || output._gpuBuffer is not { } buffer)
+                continue;
+            Helpers.HostSync.Remove(output.DataVector);
+            output._gpuBuffer = null;
+            output._gpuBackend = null;
+            output._gpuBufferVersion = -1;
+            output._ownsGpuBuffer = false;
+            buffer.Dispose();
+        }
     }
 
     private bool _releasedUnusedMemory;
@@ -10692,6 +10718,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // non-contiguous output is a view onto another tensor's storage -- an Expand's output
             // carries stride 0 on its broadcast axes -- and has no writable span of its own to bind.
             if (outputBuffer is null || outputBuffer.Length == 0 || !outputBuffer.IsContiguous) continue;
+            // Deferred host storage (a GPU training trace's outputs) is never a pooled padded block: its array is
+            // allocated at its exact length on the first host access, so binding it here would only allocate a host
+            // copy of every device-bound output for the plan's lifetime.
+            if (outputBuffer.HasDeferredHostStorage) continue;
 
             outputBuffer.AsWritableSpan();
         }
@@ -11208,6 +11238,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Gradient buffers still backed by the shared compile-time placeholder (gradient pooling, PoolGradientBuffers).
     // Set only while a plan's backward is being built on this thread.
     [ThreadStatic] private static HashSet<Tensor<T>>? t_gradPlaceholders;
+
 
     // The alias views among the gradients (AliasReshapeViewGradients' device aliases) and the gradient each views, while
     // the backward is being built on this thread: a placeholder target's views share the placeholder's scratch until

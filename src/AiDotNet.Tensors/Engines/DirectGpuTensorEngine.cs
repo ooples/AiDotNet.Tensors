@@ -4852,6 +4852,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (eng.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
+        if (gpu is not null && gpu.TryCopyIntoDeferredHost(src, dest))
+        { AliasDiag("OK device copy into deferred host storage"); return; }
         AliasDiag(eng.Is<DirectGpuTensorEngine>() ? "FELLBACK host-copy" : "not-gpu-engine");
         // The host copy below makes dest's HOST data authoritative, so every device-side copy of dest is stale from
         // here on and must go: its bound buffer and pending download (the next read would run that download over the
@@ -4946,9 +4948,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return false;
         }
 
-        // dest needs a backing array as the deferred-materializer key (for any host read of dest).
+        // dest needs a key for its deferred materializer (any host read of dest): its backing array, or, for an output
+        // whose host storage is still deferred (a GPU training trace records them so), its storage vector, which
+        // allocates the array on the first host read and then runs the download into it.
         var destArr = dest.GetBackingArrayForCacheLookupUnsafe();
-        if (destArr is null) { AliasDiag("skip: dest has no backing array"); return false; }
+        var destVector = dest.DataVector;
+        bool deferredDest = destArr is null && dest.HasDeferredHostStorage && dest.IsContiguous && dest._storageOffset == 0
+            && destVector.Length == dest.Length;
+        if (destArr is null && !deferredDest) { AliasDiag("skip: dest has no backing array"); return false; }
 
         // dest's own device copy from before the plan took it over (its trace-time result, an activation-cache entry
         // keyed by its storage) is never read again: from here dest borrows srcBuf every step. Left in the cache it
@@ -4957,7 +4964,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool streamCapturing = backend is IGpuGraphCapture graphCapture && graphCapture.IsStreamCapturing();
         if (!streamCapturing)
         {
-            ReleaseSupersededActivation(destArr, srcBuf);
+            if (destArr is not null) ReleaseSupersededActivation(destArr, srcBuf);
             ReleaseSupersededActivation(dest.DataVector, srcBuf);
         }
         if (dest._storage.RefCount == 1 && dest._storage.HasGpuBufferOwner && !dest._storage.OwnsGpuBuffer(srcBuf))
@@ -4990,16 +4997,82 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         dest._gpuBufferVersion = dest.GpuCacheVersion;
 
         // Host reads of dest (the loss scalar, a debug checksum, a host op) download from the borrowed buffer.
-        var capturedBuf = srcBuf;
-        var capturedBackend = backend;
-        Helpers.HostSync.Remove(destArr);
-        Helpers.HostSync.Register(destArr, arr =>
+        var hostKey = destArr ?? (object)destVector;
+        Helpers.HostSync.Remove(hostKey);
+        RegisterHostDownload<T>(hostKey, backend, srcBuf, keepAlive: src);
+        return true;
+    }
+
+    /// <summary>
+    /// Arms the next host read of <paramref name="key"/> (a host array, or the storage vector of a tensor whose host
+    /// storage is still deferred) to download <paramref name="buffer"/> into it. <paramref name="keepAlive"/> (the owner
+    /// of a borrowed buffer) is kept alive through the download.
+    /// </summary>
+    private static void RegisterHostDownload<T>(object key, IDirectGpuBackend backend, IGpuBuffer buffer, object? keepAlive = null)
+    {
+        Helpers.HostSync.Register(key, k =>
         {
-            float[] floatData = capturedBackend.DownloadBuffer(capturedBuf);
+            float[] floatData = backend.DownloadBuffer(buffer);
             var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
-            System.Array.Copy(converted, (T[])arr, System.Math.Min(converted.Length, ((T[])arr).Length));
-            GC.KeepAlive(src); // keep the borrowed buffer's cache owner alive through the download
+            GC.KeepAlive(keepAlive); // keep the borrowed buffer's cache owner alive through the download
+            if (k is LinearAlgebra.VectorBase<T> vector)
+            {
+                // A host read allocated the array before running this download; an eviction-first materialization
+                // finds none yet and installs one of the logical length.
+                var host = vector.GetBackingArrayIdentity();
+                if (host is null)
+                {
+                    host = new T[vector.Length];
+                    vector.MaterializeBacking(host);
+                }
+                System.Array.Copy(converted, host, System.Math.Min(converted.Length, vector.Length));
+                return;
+            }
+            System.Array.Copy(converted, (T[])k, System.Math.Min(converted.Length, ((T[])k).Length));
         });
+    }
+
+    /// <summary>
+    /// Writes a device-resident <paramref name="src"/> into <paramref name="dest"/> whose host storage is still deferred
+    /// (a GPU training trace's node output) with a device copy into a buffer <paramref name="dest"/> owns, instead of
+    /// downloading it into a new host array. Runs where the resident alias cannot (a value realized while the forward
+    /// is still being traced, an uncaptured eager step): the host copy there allocated a host array per output that the
+    /// plan then kept for its lifetime. A host read of <paramref name="dest"/> downloads the copy.
+    /// </summary>
+    private bool TryCopyIntoDeferredHost<T>(Tensor<T> src, Tensor<T> dest)
+    {
+        if (typeof(T) != typeof(float) || ReferenceEquals(src, dest)) return false;
+        if (!dest.HasDeferredHostStorage || !dest.IsContiguous || dest._storageOffset != 0 || dest._gpuBuffer is not null
+            || dest.DataVector.Length != dest.Length)
+            return false;
+        if (!src.IsContiguous || src._storageOffset != 0 || src.Length != dest.Length) return false;
+        using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend)) return false;
+        if (src._gpuBuffer is not { } srcBuf || srcBuf.Handle == IntPtr.Zero || !ReferenceEquals(src._gpuBackend, backend)
+            || srcBuf.Size < dest.Length)
+            return false;
+        // The device copy must be the current value of src: a host write after the device result was bound makes the
+        // host authoritative (version moved, no download pending), and the host copy below handles that.
+        if (src._gpuBufferVersion != src.GpuCacheVersion) return false;
+        if (backend is IGpuGraphCapture capture && capture.IsStreamCapturing()) return false;
+        IGpuBuffer? copy = null;
+        try
+        {
+            copy = backend.AllocateBuffer(dest.Length);
+            backend.Copy(srcBuf, 0, copy, 0, dest.Length);
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            copy?.Dispose();
+            GpuLaunchProbe.OnFallback("CopyResultInto.DeferredHost", capabilityGap);
+            return false;
+        }
+        dest.IncrementVersion();
+        dest._gpuBuffer = copy;
+        dest._gpuBackend = backend;
+        dest._gpuBufferVersion = dest.GpuCacheVersion;
+        dest._ownsGpuBuffer = true;
+        RegisterHostDownload<T>(dest.DataVector, backend, copy);
         return true;
     }
 
