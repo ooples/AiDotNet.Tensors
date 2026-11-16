@@ -1,0 +1,143 @@
+name: Coordination validation package
+
+on:
+  push:
+    branches: [codex/2524-ci-coordination]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'build/**'
+      - 'Directory.*'
+      - 'global.json'
+      - 'NuGet.Config'
+      - 'nuget.config'
+      - '.github/workflows/coordination-package.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coordination-package-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  AIDOTNET_DIRECTGPU_BACKENDS: none
+  BASELINE_SHA: da76b5e84b8de94936e8398449b71d72c328a638
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Identify exact source and unique package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
+          version="0.151.1-coordination.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.g${GITHUB_SHA:0:12}"
+          echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=tensors-coordination-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
+        with:
+          dotnet-version: |
+            10.0.x
+            8.0.x
+
+      # No framework override: normal pack builds all five declared TFMs and runs
+      # the project's analyzers, public API checks and package validation.
+      - name: Build and pack all target frameworks
+        run: >-
+          dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj
+          --configuration Release --output artifacts/coordination/packages
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          -p:Version="$PACKAGE_VERSION" -m:2
+
+      - name: Verify LSTM replay and gradient regressions
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          -p:Version="$PACKAGE_VERSION"
+          --filter 'FullyQualifiedName~LstmClosureReplayTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~LstmFusedBackwardGradientDoubleTests|FullyQualifiedName~CompiledFusedLstmTrainingTests'
+          --logger 'trx;LogFileName=lstm-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
+      - name: Verify package contents and write provenance
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          import zipfile
+
+          root = Path('artifacts/coordination')
+          packages = list((root / 'packages').glob('AiDotNet.Tensors.*.nupkg'))
+          assert len(packages) == 1, f'Expected one tensor package, got {packages}'
+          package = packages[0]
+          frameworks = ['net10.0', 'net8.0', 'net471', 'net462', 'netstandard2.0']
+          with zipfile.ZipFile(package) as archive:
+              for framework in frameworks:
+                  assert f'lib/{framework}/AiDotNet.Tensors.dll' in archive.namelist(), framework
+              nuspec = ET.fromstring(archive.read('AiDotNet.Tensors.nuspec'))
+              version = nuspec.find('.//{*}version').text
+              assert version == os.environ['PACKAGE_VERSION'], version
+              packaged_binary_sha256 = hashlib.sha256(archive.read('lib/net10.0/AiDotNet.Tensors.dll')).hexdigest()
+
+          # The test project uses the SDK's default bin/Configuration/TFM output
+          # layout. Compare its actual loaded dependency with the packed asset.
+          tested_binary = Path('tests/AiDotNet.Tensors.Tests/bin/Release/net10.0/AiDotNet.Tensors.dll')
+          assert tested_binary.is_file(), f'Missing tested tensor assembly: {tested_binary}'
+          tested_binary_sha256 = hashlib.sha256(tested_binary.read_bytes()).hexdigest()
+          assert tested_binary_sha256 == packaged_binary_sha256, 'Tests did not exercise the packaged net10.0 binary'
+
+          trx = root / 'TestResults/lstm-signature.trx'
+          results = ET.parse(trx).getroot()
+          counters = results.find('.//{*}Counters').attrib
+          assert int(counters['total']) == 37, counters
+          assert int(counters['passed']) == 37, counters
+          assert int(counters['failed']) == 0, counters
+          assert int(counters['executed']) == 37, counters
+          assert results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', counters
+
+          checksums = {}
+          for path in [package, trx]:
+              checksums[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+          manifest = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'sourceCommit': os.environ['GITHUB_SHA'],
+              'baselineCommit': os.environ['BASELINE_SHA'],
+              'packageVersion': version,
+              'targetFrameworks': frameworks,
+              'testedBinary': tested_binary.as_posix(),
+              'testedAndPackagedNet10BinarySha256': tested_binary_sha256,
+              'testCounters': counters,
+              'sha256': checksums,
+              'workflowRun': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'runAttempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
+          }
+          (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          (root / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in checksums.items()))
+
+      - name: Upload validated package and evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifacts/coordination/
+          if-no-files-found: error
+          retention-days: 14
