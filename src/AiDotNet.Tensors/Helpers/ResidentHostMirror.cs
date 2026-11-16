@@ -77,8 +77,18 @@ internal static class ResidentHostMirror
         var group = (Group<T>)_groups.GetValue(array, static _ => new Group<T>());
         lock (group.Members)
         {
-            group.Members.RemoveAll(w => !w.TryGetTarget(out var m) || ReferenceEquals(m, tensor));
-            group.Members.Add(new WeakReference<Tensor<T>>(tensor));
+            bool attached = false;
+            for (int i = group.Members.Count - 1; i >= 0; i--)
+            {
+                if (!group.Members[i].TryGetTarget(out var member))
+                    group.Members.RemoveAt(i);
+                else if (ReferenceEquals(member, tensor))
+                {
+                    if (attached) group.Members.RemoveAt(i);
+                    else attached = true;
+                }
+            }
+            if (!attached) group.Members.Add(new WeakReference<Tensor<T>>(tensor));
         }
         tensor._gpuMaterializerKey = array;
         tensor._gpuMaterializerCallback = group.Callback;

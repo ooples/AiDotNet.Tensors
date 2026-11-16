@@ -1,3 +1,4 @@
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -36,6 +37,37 @@ public sealed class ResidentHostMirrorRangeTests
         Assert.Null(found);
         Assert.Equal(0, offset);
         Assert.Equal(0, state.DownloadBufferCalls);
+    }
+
+    [Fact]
+    public void RepeatedAttach_AllocatesNothing_AndDownloadsTheReboundBufferOnce()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var tensor = new Tensor<float>(new float[2], new[] { 2 });
+        using var original = new MockGpuBuffer(new[] { 1f, 2f });
+        using var rebound = new MockGpuBuffer(new[] { 3f, 4f });
+        tensor._gpuBackend = backend;
+        tensor._gpuBuffer = original;
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe()!;
+        ResidentHostMirror.Attach(tensor);
+        for (int i = 0; i < 100; i++) ResidentHostMirror.Attach(tensor);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1000; i++) ResidentHostMirror.Attach(tensor);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(0, allocated);
+
+        // Membership follows the tensor, not its old device buffer. Reattaching must neither duplicate
+        // its download nor leave the prior buffer authoritative after an optimizer swaps buffers.
+        tensor._gpuBuffer = rebound;
+        Assert.True(ResidentHostMirror.ArmDownload(tensor));
+        Assert.Equal(new[] { 3f, 4f }, tensor.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
+        Assert.Equal(new[] { 3f, 4f }, tensor.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
+        ResidentHostMirror.Detach(tensor);
+        Assert.False(ResidentHostMirror.TryFindCovering(tensor, array, 0, 2, backend, out _, out _));
     }
 
     [Fact]

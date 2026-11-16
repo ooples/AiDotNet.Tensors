@@ -6478,10 +6478,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // registration is per array, displaced the other views' pending downloads.)
         if (Helpers.ResidentHostMirror.ArmDownload(t))
             return;
-        var capBuf = buf; var capBackend = backend;
-        Helpers.HostSync.Register(arr, a =>
+        ArmUnmirroredResidentDownload<T>(arr, buf, backend);
+    }
+
+    // Keep the cold fallback's closure out of BindResidentBuffer's allocation-free mirror path.
+    private static void ArmUnmirroredResidentDownload<T>(object array, IGpuBuffer buffer, IDirectGpuBackend backend)
+    {
+        Helpers.HostSync.Register(array, a =>
         {
-            float[] f = capBackend.DownloadBuffer(capBuf);
+            float[] f = backend.DownloadBuffer(buffer);
             var conv = DirectGpuEngine.FromFloatArray<T>(f);
             System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
         });

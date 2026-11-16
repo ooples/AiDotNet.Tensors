@@ -46,7 +46,7 @@ on:
         type: string
         default: ''
       suite_filter:
-        description: Manual SM86 regression suites only; OR-separated FullyQualifiedName~class terms (no model families or timing benchmarks)
+        description: Manual regression suites only; OR-separated FullyQualifiedName~class terms (no model families or timing benchmarks)
         type: string
         default: ''
       # Runs one architecture's job alone (for example to exercise a newly registered runner) instead of all of them.
@@ -113,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJSON(github.event_name == 'pull_request' && '["pr","pr-models"]' || (inputs.ratchets_only || inputs.suite_filter) && '["sm86"]' || (inputs.arch && inputs.arch != 'all') && format('["{0}"]', inputs.arch) || (vars.CUDA_SM89_RUNNER_ENABLED == 'true' && '["sm86","sm75","sm89"]' || '["sm86","sm75"]')) }}
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && '["pr","pr-models"]' || inputs.ratchets_only && '["sm86"]' || (inputs.arch && inputs.arch != 'all') && format('["{0}"]', inputs.arch) || inputs.suite_filter && '["sm86"]' || (vars.CUDA_SM89_RUNNER_ENABLED == 'true' && '["sm86","sm75","sm89"]' || '["sm86","sm75"]')) }}
     name: ${{ (matrix.arch == 'sm86' || matrix.arch == 'pr') && 'cuda' || matrix.arch == 'pr-models' && 'cuda-models' || format('cuda-{0}', matrix.arch) }}
     # Each runner needs self-hosted, gpu, cuda AND its architecture label (sm86, sm75 or sm89), plus cuda-pr to take pull
     # requests' GPU suites; a runner registered before the split carries no architecture label and picks up no job until
@@ -187,7 +187,7 @@ jobs:
         SUITE_FILTER: ${{ inputs.suite_filter }}
       run: |
         if ('${{ github.event_name }}' -ne 'workflow_dispatch' -or
-            '${{ inputs.ratchets_only }}' -eq 'true' -or
+            '${{ inputs.ratchets_only }}' -eq 'true' -or '${{ inputs.arch }}' -eq 'pr-models' -or
             $env:SUITE_FILTER -notmatch '^FullyQualifiedName~[A-Za-z0-9_.]+(\|FullyQualifiedName~[A-Za-z0-9_.]+)*$') {
           Write-Output '::error::suite_filter requires a manual dispatch, ratchets_only=false, and OR-separated FullyQualifiedName~class terms.'
           exit 1
