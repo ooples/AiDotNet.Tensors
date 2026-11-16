@@ -1802,14 +1802,7 @@ public partial class CpuEngine
         var result = new Bit[src.Length];
         for (int i = 0; i < src.Length; i++)
         {
-            bool finite = !ops.IsNaN(src[i]);
-            // Also check for ±∞ via round-trip to double (when T is fp).
-            if (finite)
-            {
-                double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
-                finite = !double.IsInfinity(d);
-            }
-            result[i] = finite ? Bit.True : Bit.False;
+            result[i] = !ops.IsNaN(src[i]) && !ops.IsInfinity(src[i]) ? Bit.True : Bit.False;
         }
         return new Tensor<Bit>(result, tensor._shape);
     }
@@ -1833,14 +1826,14 @@ public partial class CpuEngine
     public virtual Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         using var srcLease = tensor.Lease();
         var src = srcLease.Span;
         var result = new Bit[src.Length];
         for (int i = 0; i < src.Length; i++)
         {
-            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
-            result[i] = double.IsInfinity(d) ? Bit.True : Bit.False;
+            result[i] = ops.IsInfinity(src[i]) ? Bit.True : Bit.False;
         }
         return new Tensor<Bit>(result, tensor._shape);
     }
