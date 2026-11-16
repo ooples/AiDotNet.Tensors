@@ -160,7 +160,7 @@ public sealed class CompiledRetainedOutputTests : IDisposable
         }
         using (plan)
         {
-            bool fused = plan.BackwardStepKinds.Any(kind => kind.Contains("FusedLinear", StringComparison.Ordinal));
+            bool fused = plan.BackwardStepKinds.Any(kind => kind.IndexOf("FusedLinear", StringComparison.Ordinal) >= 0);
             if (declared == 0)
             {
                 Assert.True(fused, "this graph no longer fuses (" + string.Join(", ", plan.BackwardStepKinds)
