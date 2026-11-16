@@ -75,7 +75,7 @@ public partial class CpuEngine
 
     /// <summary>
     /// An inference batch norm as a per-channel affine, scale = gamma / sqrt(var + eps) and shift = beta - mean * scale,
-    /// computed on the host and cached by the gamma tensor until any of the four parameters changes version or identity
+    /// computed by the owning tensor engine and cached until any parameter changes version or identity
     /// (or epsilon changes): the prologue a pre-activated convolution applies to its input.
     /// </summary>
     internal static class BatchNormAffineFold<T>
@@ -89,44 +89,49 @@ public partial class CpuEngine
             internal Tensor<T> Shift = new(new[] { 0 });
         }
 
-        private static readonly ConditionalWeakTable<Tensor<T>, Entry> s_entries = new();
+        // Device results belong to their engine; the same gamma can also be evaluated on another backend.
+        private static readonly ConditionalWeakTable<IEngine, ConditionalWeakTable<Tensor<T>, Entry>> s_entries = new();
 
-        [ScalarKernel("Folds a batch norm's per-channel statistics into a scale and shift once per parameter version; cached.")]
-        internal static (Tensor<T> Scale, Tensor<T> Shift) Get(Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean,
-            Tensor<T> variance, double epsilon)
+        internal static (Tensor<T> Scale, Tensor<T> Shift) Get(IEngine engine, Tensor<T> gamma, Tensor<T> beta, Tensor<T> mean,
+            Tensor<T> variance, double epsilon, Action<Tensor<T>>? releaseReplaced = null)
         {
             var versions = new[]
             {
                 gamma.Version, gamma.GpuCacheVersion, beta.Version, beta.GpuCacheVersion,
                 mean.Version, mean.GpuCacheVersion, variance.Version, variance.GpuCacheVersion,
             };
-            lock (s_entries)
+            var entries = s_entries.GetValue(engine, _ => new ConditionalWeakTable<Tensor<T>, Entry>());
+            lock (entries)
             {
-                if (s_entries.TryGetValue(gamma, out var entry) && ReferenceEquals(entry.Beta, beta)
+                if (entries.TryGetValue(gamma, out var entry) && ReferenceEquals(entry.Beta, beta)
                     && ReferenceEquals(entry.Mean, mean) && ReferenceEquals(entry.Variance, variance)
                     && entry.Epsilon.Equals(epsilon) && entry.Versions.AsSpan().SequenceEqual(versions))
                     return (entry.Scale, entry.Shift);
 
-                var ops = MathHelper.GetNumericOperations<T>();
-                var g = gamma.ToArray();
-                var b = beta.ToArray();
-                var m = mean.ToArray();
-                var v = variance.ToArray();
-                var scale = new T[g.Length];
-                var shift = new T[g.Length];
-                for (int c = 0; c < g.Length; c++)
+                Tensor<T> scale, shift;
+                // Cache outputs outlive the caller's TensorScope; temporary affine operations do not.
+                using (TensorScope.Suspend())
+                using (var temporaries = TensorScope.Begin())
                 {
-                    double s = ops.ToDouble(g[c]) / Math.Sqrt(ops.ToDouble(v[c]) + epsilon);
-                    scale[c] = ops.FromDouble(s);
-                    shift[c] = ops.FromDouble(ops.ToDouble(b[c]) - ops.ToDouble(m[c]) * s);
+                    var varianceWithEpsilon = engine.TensorAddScalar(variance, MathHelper.GetNumericOperations<T>().FromDouble(epsilon));
+                    var denominator = engine.TensorSqrt(varianceWithEpsilon);
+                    scale = engine.TensorDivide(gamma, denominator);
+                    shift = engine.TensorSubtract(beta, engine.TensorMultiply(mean, scale));
+                    temporaries.Keep(scale);
+                    temporaries.Keep(shift);
                 }
                 var created = new Entry
                 {
                     Beta = beta, Mean = mean, Variance = variance, Versions = versions, Epsilon = epsilon,
-                    Scale = new Tensor<T>(scale, new[] { g.Length }), Shift = new Tensor<T>(shift, new[] { g.Length }),
+                    Scale = scale, Shift = shift,
                 };
-                s_entries.Remove(gamma);
-                s_entries.Add(gamma, created);
+                if (entry is not null && releaseReplaced is not null)
+                {
+                    releaseReplaced(entry.Scale);
+                    releaseReplaced(entry.Shift);
+                }
+                entries.Remove(gamma);
+                entries.Add(gamma, created);
                 return (created.Scale, created.Shift);
             }
         }

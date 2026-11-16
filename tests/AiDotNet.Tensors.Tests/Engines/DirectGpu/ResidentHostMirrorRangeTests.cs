@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -68,6 +69,31 @@ public sealed class ResidentHostMirrorRangeTests
         Assert.Equal(1, state.DownloadBufferCalls);
         ResidentHostMirror.Detach(tensor);
         Assert.False(ResidentHostMirror.TryFindCovering(tensor, array, 0, 2, backend, out _, out _));
+    }
+
+    [Fact]
+    public void RepeatedParameterCommit_AllocatesNothing_AndPreservesFreshHostReads()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var parameter = new Tensor<float>(new float[2], new[] { 2 });
+        using var buffer = new MockGpuBuffer(new[] { 7f, 9f });
+        for (int i = 0; i < 100; i++)
+            engine.CommitParameterUpdatedOnDevice(parameter, buffer, backend, syncPoint: null);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1000; i++)
+            engine.CommitParameterUpdatedOnDevice(parameter, buffer, backend, syncPoint: null);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(0, allocated);
+        Assert.Equal(parameter.GpuCacheVersion, parameter._gpuBufferVersion);
+        Assert.Equal(new[] { 7f, 9f }, parameter.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
+        engine.CommitParameterUpdatedOnDevice(parameter, buffer, backend, syncPoint: null);
+        Assert.Equal(new[] { 7f, 9f }, parameter.ToArray());
+        Assert.Equal(2, state.DownloadBufferCalls);
     }
 
     [Fact]

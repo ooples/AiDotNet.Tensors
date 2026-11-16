@@ -59,7 +59,7 @@ public partial class DirectGpuTensorEngine
                 strideH, strideW, padH, padW, dilationH, dilationW, activation);
 
         int count = (int)countL;
-        var (scale, shift) = BatchNormAffineFold<T>.Get(preGamma, preBeta, preMean, preVariance, preEpsilon);
+        var (scale, shift) = BatchNormAffineFold<T>.Get(this, preGamma, preBeta, preMean, preVariance, preEpsilon, ReleaseFolded);
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var kernelBuffer = GetWeightBufferPreferResident(backend, kernel, PersistentTensorRole.Weights);
         using var scaleBuffer = GetWeightBufferPreferResident(backend, scale, PersistentTensorRole.Biases);
