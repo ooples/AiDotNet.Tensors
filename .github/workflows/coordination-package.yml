@@ -25,6 +25,7 @@ env:
   DOTNET_CLI_TELEMETRY_OPTOUT: true
   DOTNET_NOLOGO: true
   AIDOTNET_DIRECTGPU_BACKENDS: none
+  AIDOTNET_OPENCL_ALLOW_CPU: '1'
   BASELINE_SHA: da76b5e84b8de94936e8398449b71d72c328a638
 
 jobs:
@@ -55,6 +56,13 @@ jobs:
             10.0.x
             8.0.x
 
+      - name: Install and verify OpenCL runtime for state-adjoint regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd clinfo
+          clinfo
       # No framework override: normal pack builds all five declared TFMs and runs
       # the project's analyzers, public API checks and package validation.
       - name: Build and pack all target frameworks
