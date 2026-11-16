@@ -356,7 +356,7 @@ jobs:
       with:
         repository: ooples/AiDotNet
         # AiDotNet #2524: fractional hash-grid API migration and build-contract repairs.
-        ref: 687748a269ffd08594e4158b66cf6e237bc910d2
+        ref: 4e8028853fb311660849f0101bf592574b520c67
         path: aidn
         persist-credentials: false
 
