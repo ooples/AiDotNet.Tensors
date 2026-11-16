@@ -382,6 +382,9 @@ internal static class DifferentiableOps
         if (NoGradScope<T>.IsSuppressed) return;
         var tape = GradientTape<T>.Current;
         if (tape is null) return;
+        // Inside a trace the op ran eagerly and only the tape saw it, so the trace's plan cannot replay it (see
+        // LazyTensorScope.TapeRecordedOp).
+        if (Compilation.GraphMode.Current is { } traceScope) traceScope.TapeRecordedOp ??= opName;
         // Note: we always record during forward passes even when a compiled backward exists.
         // This ensures GradFn is set on outputs (needed for createGraph: true) and the tape
         // is populated as a fallback. The compiled backward is used at ComputeGradients time
@@ -476,6 +479,9 @@ internal static class DifferentiableOps
         if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
+        // Inside a trace the op ran eagerly and only the tape saw it, so the trace's plan cannot replay it (see
+        // LazyTensorScope.TapeRecordedOp).
+        if (Compilation.GraphMode.Current is { } traceScope) traceScope.TapeRecordedOp ??= opName;
         ref var slot = ref tape.RecordSlot(out bool accepted);
         if (!accepted) return;
         // Dispatch the backward to wherever the data actually lives. This is the single funnel every
@@ -538,6 +544,9 @@ internal static class DifferentiableOps
         if (_anyTapeActive == 0) return;
         var tape = GradientTape<T>.Current;
         if (tape is null || NoGradScope<T>.IsSuppressed) return;
+        // Inside a trace the op ran eagerly and only the tape saw it, so the trace's plan cannot replay it (see
+        // LazyTensorScope.TapeRecordedOp).
+        if (Compilation.GraphMode.Current is { } traceScope) traceScope.TapeRecordedOp ??= opName;
         ref var slot = ref tape.RecordSlot(out bool accepted);
         if (!accepted) return;
         // Dispatch the backward to wherever the data actually lives. This is the single funnel every
@@ -728,6 +737,7 @@ internal static class DifferentiableOps
         // An irrelevant contribution was never donated to an accumulator, so the caller may
         // immediately return its scratch buffer instead of leaking the rental.
         if (!IsGradientRequired(tensor)) return true;
+        BackwardStepGradientWrites<T>.Note(tensor);
 
         bool needsOutOfPlace = _isBackwardCreateGraph;
         bool wasAlreadyOwned = !needsOutOfPlace && IsAccumulatorBufferOwned(grad);
@@ -910,6 +920,7 @@ internal static class DifferentiableOps
         // by a later input. Silently returning from this donation point either leaked the rental
         // or made generic reclamation unsafe. Storing the contribution preserves ownership until
         // the normal filtered-gradient cleanup; AccumulateGradPoolable handles disposable scratch.
+        BackwardStepGradientWrites<T>.Note(tensor);
 
         // PR #638 A2: mark this scope as grad accumulation so the DirectGpu engine's resident in-place add
         // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
@@ -1110,6 +1121,28 @@ internal static class DifferentiableOps
             MarkWrittenThisStep(stored);
             grads[tensor] = stored;
             tensor.Grad = stored;
+        }
+    }
+
+    /// <summary>
+    /// The gradient keys the running backward step wrote, when its runner asked for them (see
+    /// <see cref="CompiledDelegateChain{T}"/>): a step's device results are released when its step scope ends unless
+    /// kept, and an opaque backward (a checkpoint segment) writes the gradients of tensors that are not its inputs.
+    /// </summary>
+    internal static class BackwardStepGradientWrites<T>
+    {
+        [ThreadStatic]
+        private static List<Tensor<T>>? t_current;
+
+        /// <summary>Records a gradient key the running step wrote, when a runner is collecting them.</summary>
+        internal static void Note(Tensor<T> tensor) => t_current?.Add(tensor);
+
+        /// <summary>Installs <paramref name="next"/> (null: stop collecting) and returns the list it replaces.</summary>
+        internal static List<Tensor<T>>? Swap(List<Tensor<T>>? next)
+        {
+            var prior = t_current;
+            t_current = next;
+            return prior;
         }
     }
 

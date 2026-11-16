@@ -9,7 +9,9 @@ public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IR
         IGpuBuffer output,
         int dispatchSize,
         int numPoints,
-        int resolution,
+        float scale,
+        float positionOffset,
+        int gridResolution,
         int tableSize,
         int featuresPerLevel,
         int levelOffset,
@@ -27,27 +29,28 @@ public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IR
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(firstBuffer, 0); encoder.SetBuffer(secondBuffer, 1);
         encoder.SetBuffer(outputBuffer, 2);
-        encoder.SetBytes(numPoints, 3); encoder.SetBytes(resolution, 4);
-        encoder.SetBytes(tableSize, 5); encoder.SetBytes(featuresPerLevel, 6);
-        encoder.SetBytes(levelOffset, 7); encoder.SetBytes(outputStride, 8);
+        encoder.SetBytes(numPoints, 3); encoder.SetBytes(scale, 4);
+        encoder.SetBytes(positionOffset, 5); encoder.SetBytes(gridResolution, 6);
+        encoder.SetBytes(tableSize, 7); encoder.SetBytes(featuresPerLevel, 8);
+        encoder.SetBytes(levelOffset, 9); encoder.SetBytes(outputStride, 10);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
     public void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride) =>
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride) =>
         DispatchInstantNgp("instant_ngp_hash_encode_level", positions, hashTable, output,
-            checked(numPoints * featuresPerLevel), numPoints, resolution, tableSize,
-            featuresPerLevel, levelOffset, outputStride);
+            checked(numPoints * featuresPerLevel), numPoints, scale, positionOffset, gridResolution,
+            tableSize, featuresPerLevel, levelOffset, outputStride);
 
     public void HashGridEncodeLevelBackward(
         IGpuBuffer positions, IGpuBuffer outputGradient, IGpuBuffer tableGradient,
-        int numPoints, int resolution, int tableSize, int featuresPerLevel,
-        int levelOffset, int outputStride) =>
+        int numPoints, float scale, float positionOffset, int gridResolution, int tableSize,
+        int featuresPerLevel, int levelOffset, int outputStride) =>
         DispatchInstantNgp("instant_ngp_hash_encode_level_backward", positions, outputGradient,
-            tableGradient, checked(tableSize * featuresPerLevel), numPoints, resolution,
-            tableSize, featuresPerLevel, levelOffset, outputStride);
+            tableGradient, checked(tableSize * featuresPerLevel), numPoints, scale, positionOffset,
+            gridResolution, tableSize, featuresPerLevel, levelOffset, outputStride);
 
     public void UniqueConsecutive(
         IGpuBuffer input, IGpuBuffer outputCapacity, IGpuBuffer outputCount, int length)

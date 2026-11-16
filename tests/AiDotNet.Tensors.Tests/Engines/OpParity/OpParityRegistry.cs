@@ -554,8 +554,8 @@ public static class OpParityRegistry
         var hashTable1 = OpInput.Rand(7152, new[] { 16, 2 });
         var hashGradient = OpInput.Rand(7153, new[] { 5, 4 });
         yield return HomogeneousOutputCase("MultiresolutionHashEncodingBackward[all-outputs]", "encoding-bwd", "MultiresolutionHashEncodingBackward",
-            e => e.MultiresolutionHashEncodingBackward(hashPositions.F(), new[] { hashTable0.F(), hashTable1.F() }, new[] { 4, 8 }, 2, hashGradient.F()),
-            e => e.MultiresolutionHashEncodingBackward(hashPositions.D(), new[] { hashTable0.D(), hashTable1.D() }, new[] { 4, 8 }, 2, hashGradient.D()),
+            e => e.MultiresolutionHashEncodingBackward(hashPositions.F(), new[] { hashTable0.F(), hashTable1.F() }, 4, 2.0, 2, hashGradient.F()),
+            e => e.MultiresolutionHashEncodingBackward(hashPositions.D(), new[] { hashTable0.D(), hashTable1.D() }, 4, 2.0, 2, hashGradient.D()),
             ParityTol.Accum(2e-3), GraphCaptureExpectation.BackwardKernel);
     }
 
@@ -1827,9 +1827,9 @@ public static class OpParityRegistry
         var outputGradient = OpInput.Rand(6023, new[] { 5, 4 });
         yield return new OpCase("MultiresolutionHashEncodingBackward[5,3;2lvl;t0]", "encoding",
             e => FirstHashGradient(e.MultiresolutionHashEncodingBackward(
-                positions.F(), new[] { table0.F(), table1.F() }, new[] { 4, 8 }, 2, outputGradient.F())),
+                positions.F(), new[] { table0.F(), table1.F() }, 4, 2.0, 2, outputGradient.F())),
             e => FirstHashGradient(e.MultiresolutionHashEncodingBackward(
-                positions.D(), new[] { table0.D(), table1.D() }, new[] { 4, 8 }, 2, outputGradient.D())),
+                positions.D(), new[] { table0.D(), table1.D() }, 4, 2.0, 2, outputGradient.D())),
             ParityTol.Accum(1e-3), opMethod: "MultiresolutionHashEncodingBackward", graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
 
         var pacWaveforms = OpInput.Rand(6030, new[] { 2, 32 });
@@ -2085,8 +2085,8 @@ public static class OpParityRegistry
         var t0 = OpInput.Rand(5311, new[] { 16, 2 });
         var t1 = OpInput.Rand(5312, new[] { 16, 2 });
         yield return new OpCase("MultiresolutionHashEncoding[5,3;2lvl]", "encoding",
-            e => e.MultiresolutionHashEncoding(pos.F(), new[] { t0.F(), t1.F() }, new[] { 4, 8 }, 2),
-            e => e.MultiresolutionHashEncoding(pos.D(), new[] { t0.D(), t1.D() }, new[] { 4, 8 }, 2),
+            e => e.MultiresolutionHashEncoding(pos.F(), new[] { t0.F(), t1.F() }, 4, 2.0, 2),
+            e => e.MultiresolutionHashEncoding(pos.D(), new[] { t0.D(), t1.D() }, 4, 2.0, 2),
             ParityTol.Accum(1e-3), opMethod: "MultiresolutionHashEncoding");
 
         // Gaussian rasterization: 3 gaussians into an 8x8 RGB image.

@@ -22,6 +22,23 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class CrossTypeLazyNodeBackwardTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Cross_type_read_precedes_a_later_in_place_write(bool realizeWriterFirst)
+    {
+        var engine = new CpuEngine();
+        var x = Vec(1, 2);
+        var increment = Vec(10, 20);
+        using var scope = GraphMode.Enable();
+        var cast = scope.RecordCrossType<float, double>(LazyNodeType.Custom, "CastForOrdering", x, new[] { 2 },
+            (_, output) => { for (int i = 0; i < 2; i++) output.SetFlat(i, x.GetFlat(i)); });
+        engine.TensorAddInPlace(x, increment);
+        if (realizeWriterFirst) Assert.Equal(new[] { 11f, 22f }, x.ToArray());
+        Assert.Equal(new[] { 1.0, 2.0 }, cast.ToArray());
+        Assert.Equal(new[] { 11f, 22f }, x.ToArray());
+    }
+
     private readonly IEngine _engine = AiDotNetEngine.Current;
 
     private static Tensor<float> Vec(params float[] v) => new(v, new[] { v.Length });

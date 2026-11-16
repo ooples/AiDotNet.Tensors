@@ -18,6 +18,34 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 [Collection("ConvPerfSerial")]
 public class DepthwiseConv2DBatchNormTests
 {
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void Rejects_mismatched_normalization_parameters_before_the_fused_path(int bad)
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1, 2, 3, 3 });
+        var kernel = new Tensor<float>(new[] { 2, 1, 3, 3 });
+        var parameters = new Tensor<float>[4];
+        for (int i = 0; i < 4; i++) parameters[i] = new Tensor<float>(new[] { i == bad ? 1 : 2 });
+        Assert.Throws<ArgumentException>(() => engine.DepthwiseConv2DBatchNorm(input, kernel,
+            new[] { 1, 1 }, new[] { 1, 1 }, parameters[0], parameters[1], parameters[2], parameters[3],
+            1e-5, FusedActivationType.ReLU));
+    }
+
+    [Fact]
+    public void Rejects_short_stride_before_indexing_it()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1, 2, 3, 3 });
+        var kernel = new Tensor<float>(new[] { 2, 1, 3, 3 });
+        var p = new Tensor<float>(new[] { 2 });
+        Assert.Throws<ArgumentException>(() => engine.DepthwiseConv2DBatchNorm(input, kernel,
+            new[] { 1 }, new[] { 1, 1 }, p, p, p, p, 1e-5, FusedActivationType.ReLU));
+    }
+
     public static TheoryData<int, int, int, int, bool> Shapes => new()
     {
         // batch, channels, size, stride, channel-blocked kernels

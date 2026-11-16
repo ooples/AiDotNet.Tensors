@@ -102,18 +102,79 @@ public sealed class AutoRetainProbeTests : IDisposable
     }
 
     [Fact]
-    public void Requarantining_a_storage_rebinds_it_to_the_new_probe()
+    public void A_storage_quarantined_under_two_keys_is_kept_for_both_once_read()
     {
+        // The same storage freed under two producer keys in one window (a view's producer and its base's). The second
+        // quarantine used to rebind the storage to its own probe, so a read marked only that one, and closing the window
+        // ran the first entry's release on storage that had been read.
         AutoRetainProbe.BeginRun(GraphA);
         var vector = new object();
         var array = new object();
-        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 55, () => { });
-        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 56, () => { });
+        int released55 = 0, released56 = 0;
+        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 55, () => released55++);
+        AutoRetainProbe.Quarantine(GraphA, vector, array, key: 56, () => released56++);
         AutoRetainProbe.NoteAccess(vector);
         Assert.True(AutoRetainProbe.IsRetained(56));
-        Assert.False(AutoRetainProbe.IsRetained(55));
+        Assert.True(AutoRetainProbe.IsRetained(55));
+
+        AutoRetainProbe.BeginRun(GraphA);   // closes the window
+        Assert.Equal(0, released55);
+        Assert.Equal(0, released56);
+        Assert.Equal(0, AutoRetainProbe.OpenWindowCount);
         GC.KeepAlive(vector);
         GC.KeepAlive(array);
+    }
+
+    [Fact]
+    public void A_storage_quarantined_under_two_keys_and_never_read_is_released()
+    {
+        AutoRetainProbe.BeginRun(GraphA);
+        var vector = new object();
+        int released = 0;
+        AutoRetainProbe.Quarantine(GraphA, vector, null, key: 57, () => released++);
+        AutoRetainProbe.Quarantine(GraphA, vector, null, key: 58, () => released++);
+        AutoRetainProbe.BeginRun(GraphA);
+        Assert.Equal(2, released);
+        Assert.False(AutoRetainProbe.IsRetained(57));
+        Assert.False(AutoRetainProbe.IsRetained(58));
+        // The closed window forgot the storage: a later read retains nothing.
+        AutoRetainProbe.NoteAccess(vector);
+        Assert.Equal(0, AutoRetainProbe.RetainedCount);
+        GC.KeepAlive(vector);
+    }
+
+    [Fact]
+    public void Producer_keys_compare_their_whole_structure()
+    {
+        // [1, 32] and [2, 1] folded to the same 31-based hash, so two different graphs shared one signature and one probe.
+        var method = typeof(AutoRetainProbeTests).GetMethod(nameof(Producer_keys_compare_their_whole_structure))
+            ?? throw new InvalidOperationException("method not found");
+        var a = new ProducerKey(method, new[] { 1, 32 });
+        var b = new ProducerKey(method, new[] { 2, 1 });
+        Assert.NotEqual(a, b);
+        Assert.Equal(a, new ProducerKey(method, new[] { 1, 32 }));
+        Assert.NotEqual(a, a.WithOrdinal(1));
+        Assert.Equal(a.WithOrdinal(1), new ProducerKey(method, new[] { 1, 32 }).WithOrdinal(1));
+        Assert.NotEqual(a, new ProducerKey(null, new[] { 1, 32 }));
+        Assert.NotEqual(new GraphSignature(3, new[] { a }), new GraphSignature(3, new[] { b }));
+        Assert.NotEqual(new GraphSignature(3, new[] { a }), new GraphSignature(4, new[] { a }));
+        Assert.Equal(new GraphSignature(3, new[] { a, b }), new GraphSignature(3, new[] { new ProducerKey(method, new[] { 1, 32 }), b }));
+
+        // The probe tells the two graphs apart: each one's first run probes.
+        Assert.True(AutoRetainProbe.BeginRun(new GraphSignature(3, new[] { a })));
+        Assert.True(AutoRetainProbe.BeginRun(new GraphSignature(3, new[] { b })));
+        Assert.False(AutoRetainProbe.BeginRun(new GraphSignature(3, new[] { new ProducerKey(method, new[] { 1, 32 }) })));
+    }
+
+    [Fact]
+    public void Probe_history_is_bounded_and_a_forgotten_graph_probes_again()
+    {
+        // Every signature stayed remembered until ResetForTests: a run over many shapes grew the set without bound.
+        for (long g = 0; g < AutoRetainProbe.MaxProbedGraphs + 100; g++)
+            Assert.True(AutoRetainProbe.BeginRun(0x7000_0000L + g));
+        Assert.Equal(AutoRetainProbe.MaxProbedGraphs, AutoRetainProbe.ProbedGraphCount);
+        Assert.True(AutoRetainProbe.BeginRun(0x7000_0000L));    // the oldest was forgotten: it probes again
+        Assert.False(AutoRetainProbe.BeginRun(0x7000_0000L + AutoRetainProbe.MaxProbedGraphs + 99));   // a recent one does not
     }
 
     [Fact]

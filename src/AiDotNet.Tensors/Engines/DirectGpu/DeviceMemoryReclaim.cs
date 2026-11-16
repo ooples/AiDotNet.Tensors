@@ -64,6 +64,8 @@ internal interface IChargesDeviceMemoryReclaim
 
 internal static class DeviceMemoryReclaim
 {
+    private static long s_requestedCollections;
+    internal static long RequestedCollectionsForTests => Interlocked.Read(ref s_requestedCollections);
     private static int s_processExiting;
 
     static DeviceMemoryReclaim()
@@ -121,7 +123,7 @@ internal static class DeviceMemoryReclaim
     [ThreadStatic] private static int t_scopedScratchDepth;
 
     /// <summary>Whether this thread is inside <see cref="EnterScopedScratch"/>.</summary>
-    internal static bool InScopedScratch => t_scopedScratchDepth != 0;
+    internal static bool InScopedScratch => t_scopedScratchDepth > 0;
 
     /// <summary>
     /// Device allocations this thread makes until the scope is disposed are not charged toward the reclaim collections.
@@ -133,12 +135,28 @@ internal static class DeviceMemoryReclaim
     internal static ScopedScratchScope EnterScopedScratch()
     {
         t_scopedScratchDepth++;
-        return default;
+        return new ScopedScratchScope(new ScopeToken());
+    }
+
+    internal sealed class ScopeToken
+    {
+        internal int Exited;
     }
 
     internal readonly struct ScopedScratchScope : IDisposable
     {
-        public void Dispose() => t_scopedScratchDepth--;
+        // Each entered scope leaves once. A copy disposed again, or a default handle, must not decrement another
+        // scope's depth: an inner scope disposed twice ended its enclosing scope too, and a depth driven negative read as
+        // scoped scratch for every later allocation on the thread.
+        private readonly ScopeToken? _token;
+
+        internal ScopedScratchScope(ScopeToken token) => _token = token;
+
+        public void Dispose()
+        {
+            if (_token is null || System.Threading.Interlocked.Exchange(ref _token.Exited, 1) != 0) return;
+            if (t_scopedScratchDepth > 0) t_scopedScratchDepth--;
+        }
     }
 
     // Set by a collection that ran inside an open tape. What the tape still held survived it and was promoted, so the
@@ -197,7 +215,7 @@ internal static class DeviceMemoryReclaim
     /// too, which only brings a collection slightly earlier, never later.</returns>
     internal static long OnDeviceAllocation(long bytes)
     {
-        if (t_scopedScratchDepth != 0) return -1;   // never garbage: see EnterScopedScratch (epoch -1: no credit either)
+        if (t_scopedScratchDepth > 0) return -1;   // never garbage: see EnterScopedScratch (epoch -1: no credit either)
         long epoch = Volatile.Read(ref s_collectionEpoch);
         Interlocked.Increment(ref s_allocationsSinceCollection);
         long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
@@ -234,6 +252,7 @@ internal static class DeviceMemoryReclaim
         {
             Volatile.Write(ref s_collectionDue, 0);
         }
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         GC.WaitForPendingFinalizers();
         return epoch;
@@ -321,6 +340,7 @@ internal static class DeviceMemoryReclaim
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         ResetDeviceBytes(resetGen2: gen2);
         Volatile.Write(ref s_collectionDue, 0);
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers, which only queue a pool return.
         GC.WaitForPendingFinalizers();
@@ -352,6 +372,7 @@ internal static class DeviceMemoryReclaim
         // Normal managed-heap Gen-0/Gen-1 collections during a multi-layer training step promote early forward
         // activations into Gen 1 or Gen 2; collect through Gen 1 every 64 MB and Gen 2 every 256 MB of cumulative
         // unreleased device allocations once GradientTape._entries has been reset.
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect(gen2 ? 2 : 1, GCCollectionMode.Forced, blocking: true);
         // The collected buffers come back through their finalizers. Waiting for them (they only queue a pool return)
         // lets the next step's allocations find them in the pool instead of going to the driver.
@@ -365,8 +386,10 @@ internal static class DeviceMemoryReclaim
         Interlocked.Exchange(ref s_allocationsSinceCollection, 0);
         Volatile.Write(ref s_collectionDue, 0);
         Volatile.Write(ref s_survivorsPromotedInsideTape, 0);
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect();
         GC.WaitForPendingFinalizers();
+        Interlocked.Increment(ref s_requestedCollections);
         GC.Collect();
     }
 

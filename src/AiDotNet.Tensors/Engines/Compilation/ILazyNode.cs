@@ -10,6 +10,9 @@ internal interface ILazyNode
     /// <summary>The operation type for pattern matching during fusion.</summary>
     LazyNodeType OpType { get; }
 
+    /// <summary>The operation's name as recorded (used in diagnostics and objective signatures).</summary>
+    string OpName { get; }
+
     /// <summary>Output tensor shape (computed eagerly during recording).</summary>
     int[] OutputShape { get; }
 
@@ -35,6 +38,12 @@ internal interface ILazyNode
 
     /// <summary>Whether the node writes one of its inputs in place.</summary>
     bool WritesInPlace { get; }
+
+    /// <summary>
+    /// Whether one of the node's inputs is <paramref name="tensor"/> or shares its storage (a view of it, or it a view of
+    /// the input): what a later in-place write of <paramref name="tensor"/> must run after.
+    /// </summary>
+    bool ReadsStorageOf(object tensor);
 
     /// <summary>
     /// The engine that recorded this node: the scope's bound engine (the one the op was invoked on), stamped when the
@@ -68,6 +77,13 @@ internal interface ILazyNode
 
     /// <summary>Adds every tensor storage structurally retained by this node.</summary>
     void AddStorageLeases(TensorStorageLeaseSet leases);
+}
+
+/// <summary>An in-place write ordered after the earlier readers of its target (see <c>LazyTensorScope.RecordInPlace</c>).</summary>
+internal interface IInPlaceReadOrdering
+{
+    /// <summary>The nodes that read the write's target before it was recorded; empty when none did.</summary>
+    IReadOnlyList<ILazyNode> EarlierReaders { get; }
 }
 
 /// <summary>Resolves a node's producers by record order.</summary>

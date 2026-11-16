@@ -151,9 +151,9 @@ public sealed class DeviceMemoryReclaimTests
             Assert.True(DeviceMemoryReclaim.CollectionDue);
             // Past it, the step's dead results are collected now: a GPU step can drop gigabytes before its boundary.
             // The collection count proves this call collected; an unrelated GC could clear `dead` on its own.
-            int collectionsBefore = GC.CollectionCount(1);
+            long collectionsBefore = DeviceMemoryReclaim.RequestedCollectionsForTests;
             DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes - DeviceMemoryReclaim.CollectAfterDeviceBytes);
-            Assert.True(GC.CollectionCount(1) > collectionsBefore, "the in-tape threshold did not collect");
+            Assert.True(DeviceMemoryReclaim.RequestedCollectionsForTests > collectionsBefore, "the in-tape threshold did not collect");
             Assert.False(dead.IsAlive);
             // What the tape still holds survived that collection, so the boundary sweep stays requested.
             Assert.True(DeviceMemoryReclaim.CollectionDue);
@@ -175,7 +175,7 @@ public sealed class DeviceMemoryReclaimTests
         try
         {
             DeviceMemoryReclaim.ResetCountsForTests();
-            int collectionsBefore = GC.CollectionCount(1);
+            long collectionsBefore = DeviceMemoryReclaim.RequestedCollectionsForTests;
             long epoch;
             using (DeviceMemoryReclaim.EnterScopedScratch())
             {
@@ -184,7 +184,7 @@ public sealed class DeviceMemoryReclaimTests
             }
             Assert.False(DeviceMemoryReclaim.InScopedScratch);
             Assert.Equal(-1, epoch);
-            Assert.Equal(collectionsBefore, GC.CollectionCount(1));
+            Assert.Equal(collectionsBefore, DeviceMemoryReclaim.RequestedCollectionsForTests);
             Assert.False(DeviceMemoryReclaim.CollectionDue);
             Assert.Equal(0, DeviceMemoryReclaim.BytesSinceGen2CollectionForTests);
             // Outside the scope the same allocation is charged as before.
@@ -367,9 +367,9 @@ public sealed class DeviceMemoryReclaimTests
             using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
             {
                 weakHeld = RecordHeldEntry(tape, x);
-                int collectionsBefore = GC.CollectionCount(1);
+                long collectionsBefore = DeviceMemoryReclaim.RequestedCollectionsForTests;
                 DeviceMemoryReclaim.OnDeviceAllocation(DeviceMemoryReclaim.CollectInsideTapeAfterDeviceBytes);
-                Assert.True(GC.CollectionCount(1) > collectionsBefore, "the in-tape threshold did not collect");
+                Assert.True(DeviceMemoryReclaim.RequestedCollectionsForTests > collectionsBefore, "the in-tape threshold did not collect");
                 // The tape still roots its entry: the collection promoted it instead of freeing it.
                 Assert.True(weakHeld.IsAlive);
                 Assert.True(DeviceMemoryReclaim.CollectionDue);
@@ -450,6 +450,33 @@ public sealed class DeviceMemoryReclaimTests
 
         using var next = backend!.AllocateBuffer(1024);              // the next allocation runs it
         Assert.True(DirectOpenClGpuBuffer.PendingFrees.IsEmpty);
+    }
+
+    [Fact]
+    public void A_scoped_scratch_scope_disposed_twice_does_not_leave_the_thread_uncharged()
+    {
+        var scope = DeviceMemoryReclaim.EnterScopedScratch();
+        Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        scope.Dispose();
+        scope.Dispose();   // a copy of the struct disposed again: the depth went to -1, read as inside a scope
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
+        using (DeviceMemoryReclaim.EnterScopedScratch())
+            Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
+    }
+
+    [Fact]
+    public void An_inner_scratch_scope_disposed_twice_leaves_its_enclosing_scope_open()
+    {
+        using (DeviceMemoryReclaim.EnterScopedScratch())
+        {
+            var inner = DeviceMemoryReclaim.EnterScopedScratch();
+            inner.Dispose();
+            inner.Dispose();                                  // the depth went from 2 to 0: the outer scope ended too
+            default(DeviceMemoryReclaim.ScopedScratchScope).Dispose();
+            Assert.True(DeviceMemoryReclaim.InScopedScratch);
+        }
+        Assert.False(DeviceMemoryReclaim.InScopedScratch);
     }
 
     [SkippableFact]

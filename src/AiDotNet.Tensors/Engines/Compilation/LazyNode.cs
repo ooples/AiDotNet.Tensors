@@ -10,8 +10,27 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// operation later (during Realize) or to fuse it with adjacent operations.
 /// </summary>
 /// <typeparam name="T">The numeric element type.</typeparam>
-internal sealed class LazyNode<T> : ILazyNode
+internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLazyNode
 {
+    Type ISignableLazyNode.OutputElementType => typeof(T);
+    object ISignableLazyNode.OutputTensor => Output;
+    // InputCount is 0xFF for 4+ inputs; the overflow array holds inputs 3 and up.
+    int ISignableLazyNode.SignatureInputCount => InputsOverflow is { } extra ? 3 + extra.Length : InputCount;
+    object? ISignableLazyNode.GetSignatureInput(int index) => index switch
+    {
+        0 => Input0,
+        1 => Input1,
+        2 => Input2,
+        _ => InputsOverflow is { } overflow && index - 3 < overflow.Length ? overflow[index - 3] : null,
+    };
+    Delegate ISignableLazyNode.ExecuteDelegate => Execute;
+    Delegate? ISignableLazyNode.BackwardDelegate => BackwardFn;
+    object[]? ISignableLazyNode.SavedStateObjects => SavedState;
+    bool ISignableLazyNode.ReplaysHostStateFlag => ReplaysHostState;
+    internal object? AuxiliaryOutput { get; set; }
+    object? ISignableLazyNode.AuxiliaryOutput => AuxiliaryOutput;
+
+
     // ═══ Operation identity ═══
     public LazyNodeType OpType { get; }
     public string OpName { get; }
@@ -62,19 +81,27 @@ internal sealed class LazyNode<T> : ILazyNode
 
     internal void SetEarlierReaders(ILazyNode[] readers) => _earlierReaders = readers.Length == 0 ? null : readers;
 
-    /// <summary>Whether <paramref name="tensor"/> is one of the node's inputs.</summary>
-    internal bool Reads(Tensor<T> tensor)
+    /// <inheritdoc />
+    public IReadOnlyList<ILazyNode> EarlierReaders => _earlierReaders ?? Array.Empty<ILazyNode>();
+
+    /// <inheritdoc />
+    public bool ReadsStorageOf(object tensor)
     {
-        if (ReferenceEquals(Input0, tensor) || ReferenceEquals(Input1, tensor) || ReferenceEquals(Input2, tensor)) return true;
+        if (tensor is not Tensor<T> target) return false;
+        static bool Same(Tensor<T>? input, Tensor<T> t) => input is not null && (ReferenceEquals(input, t) || input.SharesStorageWith(t));
+        if (Same(Input0, target) || Same(Input1, target) || Same(Input2, target)) return true;
         if (InputsOverflow is not null)
             foreach (var input in InputsOverflow)
-                if (ReferenceEquals(input, tensor)) return true;
+                if (Same(input, target)) return true;
         return false;
     }
 
     private ILazyNode? ProducerOf(Tensor<T>? input) => LazyNodeOrder.ProducerAsOf(input?.LazySource, RecordOrder);
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
+
+    /// <inheritdoc />
+    public bool RecordedInProbe { get; set; }
 
     /// <summary>Creates a unary lazy node (one input).</summary>
     public LazyNode(
@@ -162,6 +189,8 @@ internal sealed class LazyNode<T> : ILazyNode
     public void Realize(IEngine engine)
     {
         if (IsRealized) return;
+        if (RecordedInProbe || GraphMode.IsProbe) throw new ObjectiveProbeAbortedException(OpName);
+        if (GraphMode.Current is { IsProbe: false, TraceKind: GraphTraceKind.Training } tracing) tracing.HostReadOp ??= OpName;
 
         // Mark as realized BEFORE executing to prevent re-entrant auto-materialization.
         // The output tensor's AsSpan()/AsWritableSpan() checks LazySource.IsRealized —

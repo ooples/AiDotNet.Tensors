@@ -542,8 +542,13 @@ public partial class CpuEngine
     /// The per-chunk backward scratch (<see cref="LstmBackwardScratch"/>) is allocated on the first backward, so a
     /// forward-only use never pays for it.
     /// </summary>
-    internal sealed class LstmTrainWorkspace
+    internal sealed class LstmTrainWorkspace : Compilation.ISignatureScratch
     {
+        // Every buffer is this step's: the forward rewrites the transposed weights, bias, gates and states from its
+        // inputs before anything reads them. So a closure-objective signature compares only the size; the shapes
+        // themselves are the node's inputs and output, which the signature already compares.
+        int Compilation.ISignatureScratch.SignatureLength => Gates.Length;
+
         public LstmTrainWorkspace(int batch, int seqLen, int inFeatures, int hidden)
         {
             Batch = batch;

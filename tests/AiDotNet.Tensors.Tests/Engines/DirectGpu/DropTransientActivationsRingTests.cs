@@ -17,6 +17,29 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public class DropTransientActivationsRingTests
 {
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference CacheAndDrop(DirectGpuTensorEngine engine)
+    {
+        var snapshot = engine.ActivationCacheTimestampSnapshot();
+        var cached = Cache(engine);
+        var reference = new WeakReference(cached.Key);
+        engine.DropTransientActivationsCreatedAfter(snapshot, null);
+        Assert.Equal(1, cached.Buffer.DisposeCount);
+        return reference;
+    }
+
+    [Fact]
+    public void Recent_key_history_does_not_keep_evicted_host_arrays_alive()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        var reference = CacheAndDrop(engine);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Assert.False(reference.IsAlive);
+        GC.KeepAlive(engine);
+    }
+
     private sealed class TrackingGpuBuffer : IGpuBuffer
     {
         public int DisposeCount;

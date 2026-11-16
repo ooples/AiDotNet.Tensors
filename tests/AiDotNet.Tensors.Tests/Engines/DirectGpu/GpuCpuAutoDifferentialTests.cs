@@ -813,7 +813,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "MaxPool3DWithTensorIndices(Tensor<T>,Int32[],Int32[],out Tensor<Int32>)",
         "MaxPool3DBackwardWithTensorIndices(Tensor<T>,Tensor<Int32>,Int32[],Int32[],Int32[])",
         "ReduceMaxBackwardWithTensorIndices(Tensor<T>,Tensor<Int32>,Int32[],Int32[])",
-        "MultiresolutionHashEncoding(Tensor<T>,Tensor<T>[],Int32[],Int32)",
+        "MultiresolutionHashEncoding(Tensor<T>,Tensor<T>[],Int32,Double,Int32,HashGridAlignment)",
         "PitchShift(Tensor<T>,Int32,Double,Int32,Int32)",
         "ReorderToNchwc(Tensor<T>,TensorLayout)",
         "Spectrogram(Tensor<T>,Int32,Int32,Int32,Tensor<T>)",
