@@ -172,15 +172,72 @@ public sealed class ResidentHostMirrorRangeTests
 
         engine.BindResidentBuffer(view, viewBuffer, backend);
 
-        Assert.NotSame(sourceCallback, view._gpuMaterializerCallback);
+        Assert.Same(sourceCallback, view._gpuMaterializerCallback);
         Assert.Same(sourceCallback, source._gpuMaterializerCallback);
         Assert.Same(sourceBuffer, source._gpuBuffer);
-        // Re-arm the source's own saved callback after the shared vector's registration was replaced by the view.
-        source.MarkModified(syncPoint: null);
-        Assert.Equal(new[] { 1f, 2f }, source.ToArray());
-        Assert.Equal(1, state.DownloadBufferCalls);
+        // No repair/re-arm: binding a slice preserves the rest of the source's pending value.
+        Assert.Equal(new[] { 1f, 9f }, source.ToArray());
+        Assert.Equal(new[] { 9f }, view.ToArray());
+        Assert.Equal(2, state.DownloadBufferCalls);
         Assert.Equal(0, sourceBuffer.DisposeCount);
         Assert.Equal(0, viewBuffer.DisposeCount);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void OverlappingViews_LastRearmedWriterWins_BeforeAndAfterMaterialization(bool hostless, bool readViewFirst)
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var source = hostless
+            ? Tensor<float>.CreateGpuResident(new[] { 3 }, TensorDevice.OpenCL)
+            : new Tensor<float>(new float[3], new[] { 3 });
+        using var original = new MockGpuBuffer(new[] { 10f, 20f, 30f });
+        using var updated = new MockGpuBuffer(new[] { 1f, 2f, 3f });
+        using var slice = new MockGpuBuffer(new[] { 8f, 9f });
+        engine.BindResidentBuffer(source, original, backend);
+        using var view = source.CreateNarrowView(0, 1, 3, recordAutodiff: false);
+        engine.BindResidentBuffer(view, slice, backend);
+        if (hostless) Assert.Null(source.GetBackingArrayForCacheLookupUnsafe());
+
+        if (readViewFirst) Assert.Equal(new[] { 8f, 9f }, view.ToArray());
+        Assert.Equal(new[] { 10f, 8f, 9f }, source.ToArray());
+        Assert.Equal(new[] { 8f, 9f }, view.ToArray());
+        Assert.Equal(2, state.DownloadBufferCalls);
+
+        // Rebinding the older member must move its existing membership to the end. The untouched
+        // sibling must also survive migration from vector-keyed to array-keyed synchronization.
+        engine.BindResidentBuffer(source, updated, backend);
+        Assert.Equal(new[] { 2f, 3f }, view.ToArray());
+        Assert.Equal(new[] { 1f, 2f, 3f }, source.ToArray());
+        Assert.Equal(4, state.DownloadBufferCalls);
+        engine.BindResidentBuffer(view, slice, backend);
+        Assert.Equal(new[] { 1f, 8f, 9f }, source.ToArray());
+        Assert.Equal(6, state.DownloadBufferCalls);
+    }
+
+    [Fact]
+    public void DetachedHostlessView_DoesNotOverwriteItsSourcesPendingDownload()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var source = Tensor<float>.CreateGpuResident(new[] { 2 }, TensorDevice.OpenCL);
+        using var sourceBuffer = new MockGpuBuffer(new[] { 1f, 2f });
+        using var viewBuffer = new MockGpuBuffer(new[] { 9f });
+        engine.BindResidentBuffer(source, sourceBuffer, backend);
+        using var view = source.CreateNarrowView(0, 1, 2, recordAutodiff: false);
+        engine.BindResidentBuffer(view, viewBuffer, backend);
+        ResidentHostMirror.Detach(view);
+
+        Assert.Equal(new[] { 1f, 2f }, source.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
     }
 
     [Fact]

@@ -6502,6 +6502,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void ArmLazyResidentDownload<T>(Tensor<T> tensor, IGpuBuffer buffer, IDirectGpuBackend backend)
     {
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;
+        // Views share their vector before host allocation too: download every resident slice
+        // through one callback rather than displacing a sibling's pending materializer.
+        if (Helpers.ResidentHostMirror.ArmDownload(tensor)) return;
         var state = tensor._gpuMaterializerCallback?.Target as LazyResidentDownload<T>;
         if (state is null || !state.Owns(tensor)) state = new LazyResidentDownload<T>(tensor, buffer, backend);
         else state.Rebind(buffer, backend);

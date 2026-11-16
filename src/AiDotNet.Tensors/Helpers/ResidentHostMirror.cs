@@ -16,10 +16,9 @@ namespace AiDotNet.Tensors.Helpers;
 /// <remarks>
 /// <para>
 /// Host reads are keyed by the storage's backing array, and AiDotNet parameters are commonly views into ONE shared
-/// parameter buffer. A per-tensor registration therefore could not work: registration is first-write-wins per key,
-/// so a second view either lost its download or displaced the first view's, and the old per-tensor callback copied
-/// the view's device data to index 0 of the shared array — onto another parameter. Members are grouped per backing
-/// array instead: ONE registration refreshes every resident view on that array, each into its own slice, and the
+/// parameter buffer. A per-tensor registration would displace another view's pending download, and copying
+/// the view's device data to index 0 would overwrite another parameter. Members are grouped per shared
+/// storage instead: ONE registration refreshes every resident view, each into its own slice, and the
 /// copy goes into the existing array (never a replacement), because other views and owners alias it.
 /// </para>
 /// </remarks>
@@ -33,13 +32,15 @@ internal static class ResidentHostMirror
 
         private void Download(object key)
         {
-            var array = (T[])key;
+            var vector = key as VectorBase<T>;
+            var array = vector is null ? (T[])key : vector.GetBackingArrayUnsafe() ?? new T[vector.Length];
             WeakReference<Tensor<T>>[] members;
             lock (Members) members = Members.ToArray();
             foreach (var weak in members)
             {
                 if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
-                if (!ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)) continue; // re-homed since
+                if (!ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)
+                    && (vector is null || !ReferenceEquals(t.DataVector, vector))) continue; // re-homed since
                 // A member bound to a pooled scratch buffer that was since released (ClearActionScratchPool) has
                 // nothing to contribute; its host slice is already the value. One such member must not abort the
                 // host read for every other view on the array.
@@ -56,6 +57,13 @@ internal static class ResidentHostMirror
                 var values = DirectGpuEngine.FromFloatArray<T>(floats);
                 Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
             }
+            if (vector is not null)
+            {
+                // Publish only after every slice downloaded successfully. Subsequent array-backed binds
+                // must keep this same group, including siblings that have not been rebound yet.
+                _groups.GetValue(array, _ => this);
+                vector.MaterializeBacking(array);
+            }
         }
     }
 
@@ -66,34 +74,35 @@ internal static class ResidentHostMirror
 
     /// <summary>
     /// Enrols a tensor whose device buffer holds (or is about to hold) its authoritative value, so a download of
-    /// its backing array refreshes its slice. Returns the backing-array key, or null when the tensor cannot be
-    /// mirrored (non-contiguous view, or no managed backing array) — callers keep their previous behaviour then.
+    /// its shared storage refreshes its slice. Until a host array exists, the shared vector is the key.
+    /// Returns null for a non-contiguous view or a tensor without a resident buffer.
     /// </summary>
     internal static object? Attach<T>(Tensor<T> tensor)
     {
         if (!HasContiguousResidentBuffer(tensor)) return null;
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (array is null) return null;
-        var group = (Group<T>)_groups.GetValue(array, static _ => new Group<T>());
+        object key = (object?)array ?? tensor.DataVector;
+        var group = (Group<T>)_groups.GetValue(key, static _ => new Group<T>());
         lock (group.Members)
         {
-            bool attached = false;
+            WeakReference<Tensor<T>>? existing = null;
             for (int i = group.Members.Count - 1; i >= 0; i--)
             {
                 if (!group.Members[i].TryGetTarget(out var member))
                     group.Members.RemoveAt(i);
                 else if (ReferenceEquals(member, tensor))
                 {
-                    if (attached) group.Members.RemoveAt(i);
-                    else attached = true;
+                    existing ??= group.Members[i];
+                    group.Members.RemoveAt(i);
                 }
             }
-            if (!attached) group.Members.Add(new WeakReference<Tensor<T>>(tensor));
+            // Latest device writer wins overlapping ranges, without allocating on repeated binds.
+            group.Members.Add(existing ?? new WeakReference<Tensor<T>>(tensor));
         }
-        tensor._gpuMaterializerKey = array;
+        tensor._gpuMaterializerKey = key;
         tensor._gpuMaterializerCallback = group.Callback;
-        HostShadowMemory.Track(array);   // a host copy kept beside the device value (GpuMemoryStats)
-        return array;
+        if (array is not null) HostShadowMemory.Track(array);
+        return key;
     }
 
     /// <summary>
@@ -134,8 +143,8 @@ internal static class ResidentHostMirror
     /// </summary>
     internal static void Detach<T>(Tensor<T> tensor)
     {
-        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not { } array) return;
-        if (!_groups.TryGetValue(array, out var g) || g is not Group<T> group) return;
+        object key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
+        if (!_groups.TryGetValue(key, out var g) || g is not Group<T> group) return;
         lock (group.Members)
             group.Members.RemoveAll(w => !w.TryGetTarget(out var m) || ReferenceEquals(m, tensor));
     }
