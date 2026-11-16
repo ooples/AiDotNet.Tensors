@@ -1,6 +1,4 @@
 using System;
-using System.Collections.Concurrent;
-using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
@@ -99,44 +97,46 @@ public sealed class ResidentHostMirrorRangeTests
     }
 
     [Fact]
-    public void RepeatedParameterBufferMoves_PreserveCacheMetadataAndOwners_WithoutAllocating()
+    public void UnmaterializedParameter_ReusesCallbackAcrossPingPong_AndRekeysAfterHostRead()
     {
-        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
         using var direct = new DirectGpuEngine(backend);
         using var engine = new DirectGpuTensorEngine(direct);
-        using var parameter = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
-        engine.RegisterResidentParamBuffer(parameter);
-        var original = Assert.IsType<MockGpuBuffer>(parameter.TryGetGpuBuffer());
-        using var alternate = new MockGpuBuffer(new[] { 3f, 4f });
-        var cacheField = typeof(DirectGpuTensorEngine).GetField("_persistentBufferCache", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        var cache = (ConcurrentDictionary<object, GpuBufferCacheEntry>)cacheField.GetValue(engine)!;
-        var key = parameter.GetBackingArrayForCacheLookupUnsafe()!;
-        var role = cache[key].Role;
-        cache[key].Version = 17;
-        for (int i = 0; i < 100; i++)
+        using var parameter = Tensor<float>.CreateGpuResident(new[] { 2 }, TensorDevice.OpenCL);
+        using var first = new MockGpuBuffer(new[] { 1f, 2f });
+        using var second = new MockGpuBuffer(new[] { 3f, 4f });
+        engine.BindResidentBuffer(parameter, first, backend);
+        var callback = parameter._gpuMaterializerCallback;
+        void Replay(int step)
         {
-            engine.MovePersistentParameterBuffer(parameter, original, alternate);
-            engine.MovePersistentParameterBuffer(parameter, alternate, original);
+            var source = step % 2 == 0 ? second : first;
+            var target = step % 2 == 0 ? first : second;
+            engine.MovePersistentParameterBuffer(parameter, source, target);
+            engine.BindResidentBuffer(parameter, target, backend);
+            engine.CommitParameterUpdatedOnDevice(parameter, target, backend, syncPoint: null);
         }
+        for (int i = 0; i < 100; i++) Replay(i);
 
         long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 1000; i++)
-        {
-            var from = i % 2 == 0 ? original : alternate;
-            var to = i % 2 == 0 ? alternate : original;
-            engine.MovePersistentParameterBuffer(parameter, from, to);
-        }
+        for (int i = 0; i < 1000; i++) Replay(i);
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-
-        Assert.Same(original, cache[key].Buffer);
-        Assert.Equal(role, cache[key].Role);
-        Assert.Equal(17, cache[key].Version);
-        Assert.Equal(0, original.DisposeCount);
-        Assert.Equal(0, alternate.DisposeCount);
-        engine.MovePersistentParameterBuffer(parameter, original, alternate);
-        Assert.Same(alternate, cache[key].Buffer);
-        engine.MovePersistentParameterBuffer(parameter, alternate, original);
         Assert.Equal(0, allocated);
+        Assert.Null(parameter.GetBackingArrayForCacheLookupUnsafe());
+        Assert.Same(callback, parameter._gpuMaterializerCallback);
+        Assert.Equal(new[] { 3f, 4f }, parameter.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
+
+        // After materialization the normal array mirror replaces the vector callback and sees the new binding.
+        engine.MovePersistentParameterBuffer(parameter, second, first);
+        engine.BindResidentBuffer(parameter, first, backend);
+        engine.CommitParameterUpdatedOnDevice(parameter, first, backend, syncPoint: null);
+        Assert.Equal(new[] { 1f, 2f }, parameter.ToArray());
+        Assert.Equal(2, state.DownloadBufferCalls);
+        Assert.Equal(new[] { 1f, 2f }, parameter.ToArray());
+        Assert.Equal(2, state.DownloadBufferCalls);
+        Assert.Equal(0, first.DisposeCount);
+        Assert.Equal(0, second.DisposeCount);
     }
 
     [Fact]

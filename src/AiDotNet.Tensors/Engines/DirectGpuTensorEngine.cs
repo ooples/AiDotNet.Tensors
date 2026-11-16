@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 internal sealed class GpuBufferCacheEntry : IDisposable
 {
-    public IGpuBuffer Buffer { get; private set; }
+    public IGpuBuffer Buffer { get; }
     public PersistentTensorRole Role { get; }
     public int Version { get; set; }
 
@@ -28,10 +28,6 @@ internal sealed class GpuBufferCacheEntry : IDisposable
         Role = role;
         Version = 0;
     }
-
-    // A captured optimizer owns both ping-pong buffers; moving its cache pointer retires neither.
-    // The publisher must hold the engine's persistent-buffer lock and verify the expected prior owner.
-    internal void RebindWithoutRelease(IGpuBuffer buffer) => Buffer = buffer;
 
     public void Dispose()
     {
@@ -4346,7 +4342,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_persistentBufferLock)
         {
             if (!_persistentBufferCache.TryGetValue(arr, out var existing) || !ReferenceEquals(existing.Buffer, from)) return;
-            existing.RebindWithoutRelease(to);
+            _persistentBufferCache[arr] = new GpuBufferCacheEntry(to, existing.Role) { Version = existing.Version };
         }
     }
 
@@ -6505,25 +6501,54 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static void ArmLazyResidentDownload<T>(Tensor<T> tensor, IGpuBuffer buffer, IDirectGpuBackend backend)
     {
-        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;   // array-backed: BindResidentBuffer armed it
-        var capturedBuffer = buffer;
-        var capturedBackend = backend;
-        Helpers.HostSync.Remove(tensor.DataVector);
-        Helpers.HostSync.Register(tensor.DataVector, obj =>
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;
+        var state = tensor._gpuMaterializerCallback?.Target as LazyResidentDownload<T>;
+        if (state is null) state = new LazyResidentDownload<T>(buffer, backend);
+        else state.Rebind(buffer, backend);
+        var key = tensor.DataVector;
+        tensor._gpuMaterializerKey = key;
+        tensor._gpuMaterializerCallback = state.Callback;
+        Helpers.HostSync.Remove(key);
+        Helpers.HostSync.Register(key, state.Callback);
+    }
+
+    // One callback per unmaterialized tensor: a captured optimizer swaps its device buffer each step.
+    // This state borrows the buffer; the plan's existing owners remain responsible for releasing it.
+    private sealed class LazyResidentDownload<T>
+    {
+        private readonly object _sync = new();
+        private IGpuBuffer _buffer;
+        private IDirectGpuBackend _backend;
+        internal readonly Action<object> Callback;
+
+        internal LazyResidentDownload(IGpuBuffer buffer, IDirectGpuBackend backend)
         {
-            var vec = (LinearAlgebra.VectorBase<T>)obj;
-            var converted = DirectGpuEngine.FromFloatArray<T>(capturedBackend.DownloadBuffer(capturedBuffer));
+            _buffer = buffer;
+            _backend = backend;
+            Callback = Download;
+        }
+
+        internal void Rebind(IGpuBuffer buffer, IDirectGpuBackend backend)
+        {
+            lock (_sync) { _buffer = buffer; _backend = backend; }
+        }
+
+        private void Download(object key)
+        {
+            IGpuBuffer buffer;
+            IDirectGpuBackend backend;
+            lock (_sync) { buffer = _buffer; backend = _backend; }
+            var vec = (LinearAlgebra.VectorBase<T>)key;
+            var converted = DirectGpuEngine.FromFloatArray<T>(backend.DownloadBuffer(buffer));
             if (converted.Length == vec.Length)
-            {
                 vec.MaterializeBacking(converted);
-            }
             else
             {
                 var logical = new T[vec.Length];
                 Array.Copy(converted, logical, Math.Min(converted.Length, logical.Length));
                 vec.MaterializeBacking(logical);
             }
-        });
+        }
     }
 
     private ActivationCacheEntry? RekeyActivationCacheForResidentBinding<T>(
