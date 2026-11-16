@@ -3236,6 +3236,14 @@ public sealed class GradientTape<T> : IDisposable
         KeepAfterTape(tensor);
     }
 
+    /// <summary>Hands a named output to a consumer that outlives both this tape and its caller's arena.</summary>
+    internal void RetainOutputForCaller(Tensor<T> tensor)
+    {
+        Retain(tensor);
+        HoldOverStepBoundary(tensor);
+        Helpers.TensorArena.TransferOutputOwnership(tensor);
+    }
+
     /// <summary>
     /// Marks a tensor to retain its gradient after backward, even if it's a non-leaf tensor.
     /// Like PyTorch's tensor.retain_grad().

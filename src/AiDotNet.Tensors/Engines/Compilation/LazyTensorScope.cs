@@ -75,6 +75,18 @@ internal sealed class LazyTensorScope : IDisposable
     }
 
     private readonly HashSet<object> _retainedOutputs = new(ReferenceEqualityComparer<object>.Instance);
+    private readonly Dictionary<string, object> _namedRetainedOutputs = new(StringComparer.Ordinal);
+
+    internal IReadOnlyDictionary<string, object> NamedRetainedOutputs => _namedRetainedOutputs;
+
+    internal void RetainOutput<T>(string key, Tensor<T> output)
+    {
+        if (string.IsNullOrEmpty(key)) throw new ArgumentException("A retained output key must be nonempty.", nameof(key));
+        if (_namedRetainedOutputs.ContainsKey(key))
+            throw new InvalidOperationException($"The retained output key '{key}' is already registered in this forward.");
+        RetainOutput(output);
+        _namedRetainedOutputs.Add(key, output);
+    }
 
     internal bool HasRetainedOutputs => _retainedOutputs.Count != 0;
 

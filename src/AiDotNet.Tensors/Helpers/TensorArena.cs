@@ -691,6 +691,21 @@ public sealed class TensorArena : IDisposable
     /// state remains stable for the arena's lifetime.
     /// </remarks>
     internal void PinExistingTensor<T>(LinearAlgebra.Tensor<T> tensor)
+        => ExtractExistingTensor(tensor, keepPinned: true);
+
+    // A named result belongs to its consumer, beyond both tape and caller-arena disposal. Transfer its existing
+    // storage, without a host copy: no arena may reshape an alias or return this array to a reuse pool. Unlike
+    // persistent model state, the arena must not strongly pin each generation until a long caller scope ends.
+    internal static void TransferOutputOwnership<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        for (var arena = _current; arena is not null; arena = arena._previous)
+            arena.ExtractExistingTensor(tensor, keepPinned: false);
+    }
+
+    private System.Runtime.CompilerServices.ConditionalWeakTable<Array, object>? _callerOwnedArrays;
+    private static readonly object CallerOwnedMarker = new();
+
+    private void ExtractExistingTensor<T>(LinearAlgebra.Tensor<T> tensor, bool keepPinned)
     {
         if (_disposed || tensor is null)
             return;
@@ -707,17 +722,17 @@ public sealed class TensorArena : IDisposable
             {
                 if (_tensorRing[bucketIndex] is not List<object> bucket)
                     continue;
-
-                for (int itemIndex = 0; itemIndex < bucket.Count; itemIndex++)
+                for (int itemIndex = bucket.Count - 1; itemIndex >= 0; itemIndex--)
                 {
-                    if (!ReferenceEquals(bucket[itemIndex], tensor))
+                    // StopGradient and shape views can share a ring tensor's storage. Removing only the named
+                    // wrapper would leave its producer alias available for reshaping and overwriting on reset.
+                    if (bucket[itemIndex] is not LinearAlgebra.Tensor<T> alias
+                        || !ReferenceEquals(alias.GetLiveBackingArrayOrNull(), backing))
                         continue;
-
                     bucket.RemoveAt(itemIndex);
                     if (_tensorRingCursors![bucketIndex] > itemIndex)
                         _tensorRingCursors[bucketIndex]--;
                     ownedByArena = true;
-                    break;
                 }
             }
         }
@@ -757,6 +772,25 @@ public sealed class TensorArena : IDisposable
                 ownedByArena = true;
             }
         }
+        if (_pendingCarryReturn is { } carry && ReferenceEquals(carry.arr, backing))
+        {
+            _pendingCarryReturn = null;
+            ownedByArena = true;
+        }
+        if (!keepPinned)
+        {
+            for (int i = _pinnedArrays.Count - 1; i >= 0; i--)
+                if (ReferenceEquals(_pinnedArrays[i], backing))
+                {
+                    _pinnedArrays.RemoveAt(i);
+                    ownedByArena = true;
+                }
+            if (ownedByArena)
+                (_callerOwnedArrays ??= new System.Runtime.CompilerServices.ConditionalWeakTable<Array, object>())
+                    .GetValue(backing, _ => CallerOwnedMarker);
+            return;
+        }
+
 
         if (!ownedByArena)
             return;
@@ -966,7 +1000,7 @@ public sealed class TensorArena : IDisposable
         if (_disposed) return;
         // A buffer pinned since it was issued belongs to the model now (PinExistingTensor), however dead the step's
         // last use of it looked.
-        if (IsPinned(buffer.Array)) return;
+        if (IsPinned(buffer.Array) || (_callerOwnedArrays?.TryGetValue(buffer.Array, out _) ?? false)) return;
         var key = (buffer.Array.GetType().GetElementType()!, buffer.Array.Length);
         _poolFree ??= new Dictionary<(Type, int), Stack<Array>>();
         if (!_poolFree.TryGetValue(key, out var arrays))

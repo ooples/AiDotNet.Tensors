@@ -45,6 +45,30 @@ public static class GradientRecording
         throw new InvalidOperationException("RetainOutput must be called while recording a training forward, before compilation or backward.");
     }
 
+    /// <summary>Retains a named forward result for a training invocation's output handoff.</summary>
+    /// <remarks>Keys are nonempty, ordinal, and unique within the forward. A compiled plan binds each key to
+    /// its own result, including when a cached plan is selected again. This does not copy or retain gradients.</remarks>
+    /// <typeparam name="T">The result's element type.</typeparam>
+    /// <param name="key">The stable output name within this objective.</param>
+    /// <param name="output">A result produced by the active training forward.</param>
+    public static void RetainOutput<T>(string key, Tensor<T> output)
+    {
+        if (string.IsNullOrEmpty(key)) throw new ArgumentException("A retained output key must be nonempty.", nameof(key));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (IsTrainingTrace && GraphMode.Current is { } scope)
+        {
+            scope.RetainOutput(key, output);
+            return;
+        }
+        if (GradientTape<T>.Current is { } tape && !NoGradScope<T>.IsSuppressed)
+        {
+            RetainedOutputCapture<T>.RegisterEager(tape, key, output);
+            tape.RetainOutputForCaller(output);
+            return;
+        }
+        throw new InvalidOperationException("RetainOutput must be called while recording a training forward, before compilation or backward.");
+    }
+
     /// <summary>True while the forward is being traced for a compiled training plan.</summary>
     public static bool IsTrainingTrace => GraphMode.IsActive && !GraphMode.IsInferenceTrace;
 

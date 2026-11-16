@@ -104,7 +104,8 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
     /// parameter's storage) in first-use order; each is an <see cref="ISignatureTensor"/>.
     /// </summary>
     internal static ObjectiveSignature Build<T>(
-        IReadOnlyList<ILazyNode> nodes, Tensor<T>[] parameters, out object[] leaves, object? loss = null)
+        IReadOnlyList<ILazyNode> nodes, Tensor<T>[] parameters, out object[] leaves, object? loss = null,
+        IReadOnlyDictionary<string, object>? retainedOutputs = null)
     {
         if (nodes is null) throw new ArgumentNullException(nameof(nodes));
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
@@ -115,6 +116,24 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             reason = builder.AddNode(i, nodes[i]);
 
         if (reason is null && loss is not null) reason = builder.AddLoss(loss);
+        if (reason is null && retainedOutputs is { Count: > 0 })
+        {
+            builder.Tokens.Add("named-retained-outputs");
+            builder.Tokens.Add(retainedOutputs.Count);
+            foreach (var output in retainedOutputs.OrderBy(item => item.Key, StringComparer.Ordinal))
+            {
+                builder.Tokens.Add(output.Key);
+                if (output.Value is not ISignatureTensor tensor)
+                {
+                    reason = "a named retained output is not a tensor";
+                    break;
+                }
+                builder.Tokens.Add(tensor.ElementType);
+                builder.Tokens.Add(new ArrayToken(tensor.SignatureShape));
+                reason = builder.AddTensorReference(output.Value, "retained output", output.Key);
+                if (reason is not null) break;
+            }
+        }
         leaves = builder.Leaves.ToArray();
         return new ObjectiveSignature(builder.Tokens.ToArray(), nodes.Count, reason);
     }
