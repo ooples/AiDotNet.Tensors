@@ -331,6 +331,7 @@ public sealed partial class CudaBackend
 
     /// <summary>Test hook: runs on the capturing thread right after the step capture opens.</summary>
     internal static Action? TestHookInsideCapture;
+    internal static Action<string>? TestHookCapturedCopy;
 
     /// <summary>
     /// Test hook: runs on the capturing thread after the gate is released and the graph's nodes are counted, before the
@@ -756,6 +757,7 @@ public sealed partial class CudaBackend
     public void CopyBufferDtoD(IGpuBuffer source, IGpuBuffer destination, long byteCount)
     {
         if (source is null || destination is null || byteCount <= 0) return;
+        if (TestHookCapturedCopy is { } trace && IsCapturingOnThisThread) trace($"CopyBufferDtoD bytes={byteCount}");
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, (ulong)byteCount, _stream), "cuMemcpyDtoDAsync(graph)");

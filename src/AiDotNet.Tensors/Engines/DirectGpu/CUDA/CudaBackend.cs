@@ -11062,6 +11062,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
+        if (TestHookCapturedCopy is { } trace && IsCapturingOnThisThread) trace($"Copy floats={size}");
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
@@ -17332,6 +17333,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
+        if (TestHookCapturedCopy is { } trace && IsCapturingOnThisThread) trace($"Copy strided floats={length}");
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 

@@ -36,7 +36,7 @@ public class LayerNormCompiledTests
                 input.IncrementVersion();
                 var expected = engine.LayerNorm(input, gamma, beta, 1e-5, out _, out _);
                 var actual = plan.Execute();
-                Assert.Equal(new[] { 2, 2 }, actual.Shape);
+                Assert.Equal(new[] { 2, 2 }, actual.Shape.ToArray());
                 AssertClose(Array.ConvertAll(expected.ToArray(), value => (double)value), actual.ToArray(),
                     $"implicit inference step {step}");
             }
@@ -91,7 +91,7 @@ public class LayerNormCompiledTests
                 input.IncrementVersion();
                 var expected = engine.GroupNorm(input, 2, gamma, beta, 1e-5, out _, out _);
                 var actual = plan.Execute();
-                Assert.Equal(output.Shape, actual.Shape);
+                Assert.Equal(output.Shape.ToArray(), actual.Shape.ToArray());
                 AssertClose(Array.ConvertAll(expected.ToArray(), value => (double)value), actual.ToArray(),
                     $"group normalization step {step}");
             }
