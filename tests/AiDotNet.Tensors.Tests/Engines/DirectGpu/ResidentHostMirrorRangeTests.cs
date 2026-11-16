@@ -155,6 +155,35 @@ public sealed class ResidentHostMirrorRangeTests
     }
 
     [Fact]
+    public void RebindingMetadataView_DoesNotRedirectTheSourcesMaterializer()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var source = Tensor<float>.CreateGpuResident(new[] { 2 }, TensorDevice.OpenCL);
+        using var sourceBuffer = new MockGpuBuffer(new[] { 1f, 2f });
+        using var viewBuffer = new MockGpuBuffer(new[] { 9f });
+        engine.BindResidentBuffer(source, sourceBuffer, backend);
+        var sourceCallback = source._gpuMaterializerCallback;
+        using var view = source.CreateNarrowView(0, 1, 2, recordAutodiff: false);
+        Assert.Same(sourceCallback, view._gpuMaterializerCallback);
+        Assert.Null(source.GetBackingArrayForCacheLookupUnsafe());
+
+        engine.BindResidentBuffer(view, viewBuffer, backend);
+
+        Assert.NotSame(sourceCallback, view._gpuMaterializerCallback);
+        Assert.Same(sourceCallback, source._gpuMaterializerCallback);
+        Assert.Same(sourceBuffer, source._gpuBuffer);
+        // Re-arm the source's own saved callback after the shared vector's registration was replaced by the view.
+        source.MarkModified(syncPoint: null);
+        Assert.Equal(new[] { 1f, 2f }, source.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
+        Assert.Equal(0, sourceBuffer.DisposeCount);
+        Assert.Equal(0, viewBuffer.DisposeCount);
+    }
+
+    [Fact]
     public void AnUnregisteredHostTensor_HasNoCoveringDeviceBuffer()
     {
         using var tensor = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });

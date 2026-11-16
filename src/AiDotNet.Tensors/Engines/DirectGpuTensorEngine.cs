@@ -6503,7 +6503,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;
         var state = tensor._gpuMaterializerCallback?.Target as LazyResidentDownload<T>;
-        if (state is null) state = new LazyResidentDownload<T>(buffer, backend);
+        if (state is null || !state.Owns(tensor)) state = new LazyResidentDownload<T>(tensor, buffer, backend);
         else state.Rebind(buffer, backend);
         var key = tensor.DataVector;
         tensor._gpuMaterializerKey = key;
@@ -6516,17 +6516,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // This state borrows the buffer; the plan's existing owners remain responsible for releasing it.
     private sealed class LazyResidentDownload<T>
     {
+        private readonly WeakReference<Tensor<T>> _owner;
         private readonly object _sync = new();
         private IGpuBuffer _buffer;
         private IDirectGpuBackend _backend;
         internal readonly Action<object> Callback;
 
-        internal LazyResidentDownload(IGpuBuffer buffer, IDirectGpuBackend backend)
+        internal LazyResidentDownload(Tensor<T> owner, IGpuBuffer buffer, IDirectGpuBackend backend)
         {
+            _owner = new WeakReference<Tensor<T>>(owner);
             _buffer = buffer;
             _backend = backend;
             Callback = Download;
         }
+
+        // Metadata views copy callbacks but must never redirect the originating tensor's download state.
+        internal bool Owns(Tensor<T> tensor) => _owner.TryGetTarget(out var owner) && ReferenceEquals(owner, tensor);
 
         internal void Rebind(IGpuBuffer buffer, IDirectGpuBackend backend)
         {
