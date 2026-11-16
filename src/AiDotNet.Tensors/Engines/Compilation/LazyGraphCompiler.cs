@@ -11,6 +11,7 @@ internal sealed class LazyGraphCompiler
 {
     private readonly List<ILazyGraphOptimizationPass> _passes;
 
+    /// <summary>Creates the compiler with its optimization passes, for an inference or a training compilation.</summary>
     /// <param name="forTraining">True when the compiled graph will be differentiated (a training plan): fusions
     /// without a backward are not applied.</param>
     /// <param name="observableOutputs">Nodes whose outputs must remain independently observable after execution.</param>
