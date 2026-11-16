@@ -737,7 +737,6 @@
 1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.TensorIndexAdd<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, int, AiDotNet.Tensors.LinearAlgebra.Tensor<int>, AiDotNet.Tensors.LinearAlgebra.Tensor<T>)
 1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.TensorIndexPut<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, AiDotNet.Tensors.LinearAlgebra.Tensor<int>[], AiDotNet.Tensors.LinearAlgebra.Tensor<T>, bool)
 8	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.TensorIsClose<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, AiDotNet.Tensors.LinearAlgebra.Tensor<T>, T, T, bool)
-1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.TensorIsFinite<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>)
 1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.TensorIsNan<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>)
 4	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.TensorKLDivLoss<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, AiDotNet.Tensors.LinearAlgebra.Tensor<T>)
 1	TENS0011|AiDotNet.Tensors.Engines.CpuEngine.TensorKron<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, AiDotNet.Tensors.LinearAlgebra.Tensor<T>)
