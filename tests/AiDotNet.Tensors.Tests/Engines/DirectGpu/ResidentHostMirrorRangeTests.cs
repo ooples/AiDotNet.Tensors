@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Concurrent;
+using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
@@ -94,6 +96,47 @@ public sealed class ResidentHostMirrorRangeTests
         engine.CommitParameterUpdatedOnDevice(parameter, buffer, backend, syncPoint: null);
         Assert.Equal(new[] { 7f, 9f }, parameter.ToArray());
         Assert.Equal(2, state.DownloadBufferCalls);
+    }
+
+    [Fact]
+    public void RepeatedParameterBufferMoves_PreserveCacheMetadataAndOwners_WithoutAllocating()
+    {
+        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var parameter = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        engine.RegisterResidentParamBuffer(parameter);
+        var original = Assert.IsType<MockGpuBuffer>(parameter.TryGetGpuBuffer());
+        using var alternate = new MockGpuBuffer(new[] { 3f, 4f });
+        var cacheField = typeof(DirectGpuTensorEngine).GetField("_persistentBufferCache", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var cache = (ConcurrentDictionary<object, GpuBufferCacheEntry>)cacheField.GetValue(engine)!;
+        var key = parameter.GetBackingArrayForCacheLookupUnsafe()!;
+        var role = cache[key].Role;
+        cache[key].Version = 17;
+        for (int i = 0; i < 100; i++)
+        {
+            engine.MovePersistentParameterBuffer(parameter, original, alternate);
+            engine.MovePersistentParameterBuffer(parameter, alternate, original);
+        }
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1000; i++)
+        {
+            var from = i % 2 == 0 ? original : alternate;
+            var to = i % 2 == 0 ? alternate : original;
+            engine.MovePersistentParameterBuffer(parameter, from, to);
+        }
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Same(original, cache[key].Buffer);
+        Assert.Equal(role, cache[key].Role);
+        Assert.Equal(17, cache[key].Version);
+        Assert.Equal(0, original.DisposeCount);
+        Assert.Equal(0, alternate.DisposeCount);
+        engine.MovePersistentParameterBuffer(parameter, original, alternate);
+        Assert.Same(alternate, cache[key].Buffer);
+        engine.MovePersistentParameterBuffer(parameter, alternate, original);
+        Assert.Equal(0, allocated);
     }
 
     [Fact]

@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </summary>
 internal sealed class GpuBufferCacheEntry : IDisposable
 {
-    public IGpuBuffer Buffer { get; }
+    public IGpuBuffer Buffer { get; private set; }
     public PersistentTensorRole Role { get; }
     public int Version { get; set; }
 
@@ -28,6 +28,10 @@ internal sealed class GpuBufferCacheEntry : IDisposable
         Role = role;
         Version = 0;
     }
+
+    // A captured optimizer owns both ping-pong buffers; moving its cache pointer retires neither.
+    // The publisher must hold the engine's persistent-buffer lock and verify the expected prior owner.
+    internal void RebindWithoutRelease(IGpuBuffer buffer) => Buffer = buffer;
 
     public void Dispose()
     {
@@ -4269,8 +4273,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
             if (flatBuffer is null) return;
+            var capFlat = flatBuffer; var capFlatBackend = backend;
             Helpers.HostSync.Remove(flat);
-            ArmParameterBufferDownload(flat, flatBuffer, backend);
+            Helpers.HostSync.Register(flat, a =>
+            {
+                var dst = (float[])a;
+                if (dst.Length >= capFlat.Size)
+                {
+                    capFlatBackend.DownloadBuffer(capFlat, dst);
+                    return;
+                }
+                float[] f = capFlatBackend.DownloadBuffer(capFlat);
+                System.Array.Copy(f, dst, System.Math.Min(f.Length, dst.Length));
+            });
             return;
         }
         var arr = param.GetBackingArrayForCacheLookupUnsafe();
@@ -4301,24 +4316,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (!Helpers.HostSync.IsPending(arr))
         {
-            ArmParameterBufferDownload(arr, buffer, backend);
-        }
-    }
-
-    // Captured fallback state belongs only to a newly armed callback, not every parameter commit.
-    private static void ArmParameterBufferDownload(object key, IGpuBuffer buffer, IDirectGpuBackend backend)
-    {
-        Helpers.HostSync.Register(key, a =>
-        {
-            var dst = (float[])a;
-            if (dst.Length >= buffer.Size)
+            var capBuf = buffer; var capBackend = backend;
+            Helpers.HostSync.Register(arr, a =>
             {
-                backend.DownloadBuffer(buffer, dst);
-                return;
-            }
-            float[] values = backend.DownloadBuffer(buffer);
-            System.Array.Copy(values, dst, System.Math.Min(values.Length, dst.Length));
-        });
+                var dst = (float[])a;
+                if (dst.Length >= capBuf.Size)
+                {
+                    capBackend.DownloadBuffer(capBuf, dst);
+                    return;
+                }
+                float[] f = capBackend.DownloadBuffer(capBuf);
+                System.Array.Copy(f, dst, System.Math.Min(f.Length, dst.Length));
+            });
+        }
     }
 
     /// <summary>
@@ -4336,7 +4346,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         lock (_persistentBufferLock)
         {
             if (!_persistentBufferCache.TryGetValue(arr, out var existing) || !ReferenceEquals(existing.Buffer, from)) return;
-            _persistentBufferCache[arr] = new GpuBufferCacheEntry(to, existing.Role) { Version = existing.Version };
+            existing.RebindWithoutRelease(to);
         }
     }
 
