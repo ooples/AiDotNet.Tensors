@@ -710,8 +710,9 @@ public sealed class TensorArena : IDisposable
         if (_disposed || tensor is null)
             return;
 
-        T[]? backing = tensor.GetLiveBackingArrayOrNull();
-        if (backing is null)
+        // Ownership concerns the whole storage slab, not this view's logical offset/strides/length.
+        // This identity lookup neither realizes deferred values nor reads stale device-backed data.
+        if (!((LinearAlgebra.IBackingArraySource)tensor).TryGetBackingArray(out var backing) || backing is null)
             return;
 
         bool ownedByArena = false;
@@ -726,8 +727,8 @@ public sealed class TensorArena : IDisposable
                 {
                     // StopGradient and shape views can share a ring tensor's storage. Removing only the named
                     // wrapper would leave its producer alias available for reshaping and overwriting on reset.
-                    if (bucket[itemIndex] is not LinearAlgebra.Tensor<T> alias
-                        || !ReferenceEquals(alias.GetLiveBackingArrayOrNull(), backing))
+                    if (bucket[itemIndex] is not LinearAlgebra.IBackingArraySource alias
+                        || !alias.TryGetBackingArray(out var aliasBacking) || !ReferenceEquals(aliasBacking, backing))
                         continue;
                     bucket.RemoveAt(itemIndex);
                     if (_tensorRingCursors![bucketIndex] > itemIndex)

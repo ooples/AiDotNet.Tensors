@@ -15,6 +15,70 @@ public sealed class NamedRetainedOutputTests : IDisposable
     private readonly IEngine _prior = AiDotNetEngine.Current;
     public void Dispose() => AiDotNetEngine.Current = _prior;
 
+    [Theory]
+    [InlineData("offset", 64)]
+    [InlineData("strided", 64)]
+    [InlineData("offset-strided", 32768)]
+    public void Partial_and_strided_named_views_transfer_the_whole_storage_slab(string layout, int rows)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        int count = rows * 3, start = rows / 2;
+        var parameter = new Tensor<double>(Enumerable.Range(0, count).Select(value => (double)value).ToArray(), new[] { rows, 3 });
+        var expected = new List<double>();
+        if (layout == "offset")
+            for (int i = start * 3; i < count; i++) expected.Add(2.0 * i);
+        else
+            for (int column = 0; column < 3; column++)
+                for (int row = layout == "offset-strided" ? start : 0; row < rows; row++)
+                    expected.Add(2.0 * (row * 3 + column));
+        int[] shape = layout == "offset" ? new[] { start, 3 }
+            : layout == "strided" ? new[] { 3, rows } : new[] { 3, start };
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        Tensor<double> detached;
+        Tensor<double> retained;
+        object storage;
+        using (var arena = TensorArena.Create())
+        {
+            using (var tape = new GradientTape<double>())
+            {
+                detached = engine.StopGradient(engine.TensorMultiplyScalar(parameter, 2.0));
+                retained = layout == "strided" ? detached.Transpose(new[] { 1, 0 })
+                    : engine.TensorNarrow(detached, 0, start, start);
+                if (layout == "offset-strided") retained = retained.Transpose(new[] { 1, 0 });
+                Assert.Null(retained.GetLiveBackingArrayOrNull()); // The old logical-layout accessor cannot name this slab.
+                Assert.Same(detached._storage, retained._storage);
+                storage = retained._storage;
+                GradientRecording.RetainOutput("generation", retained);
+                RetainedOutputCapture<double>.PublishEager(tape);
+            }
+            Assert.True(((IBackingArraySource)retained).TryGetBackingArray(out var backing));
+            Assert.NotNull(backing);
+            arena.ReturnIssued(new TensorArena.IssuedBuffer(backing!, -1, 0));
+            for (int step = 0; step < 3; step++)
+            {
+                arena.Reset();
+                for (int rent = 0; rent < 3; rent++)
+                {
+                    var scratch = arena.TryRentTensor<double>(count, new[] { count })!;
+                    scratch.AsWritableSpan().Fill(-9.0);
+                    Assert.NotSame(detached, scratch);
+                }
+                Assert.Equal(new[] { rows, 3 }, detached.Shape.ToArray());
+                Assert.Equal(shape, retained.Shape.ToArray());
+                Assert.Same(storage, retained._storage);
+                Assert.Equal(expected, retained.ToArray());
+                Assert.Equal(0, arena.PinnedArrayCount);
+            }
+        }
+        outputs.Complete();
+        Assert.Same(retained, outputs.Get("generation"));
+        using (var next = TensorArena.Create())
+            for (int i = 0; i < 8; i++) next.TryRentTensor<double>(count, new[] { count })!.AsWritableSpan().Fill(-77.0);
+        Assert.Equal(shape, retained.Shape.ToArray());
+        Assert.Equal(expected, retained.ToArray());
+    }
+
     [Fact]
     public void Finite_forward_with_nonfinite_gradients_cannot_publish_a_discarded_update()
     {
