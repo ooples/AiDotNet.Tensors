@@ -1923,6 +1923,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        if (Volatile.Read(ref _cublasWarmStarted) == 0) StartCublasWarmup();
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Cuda);
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
         LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
@@ -6789,6 +6790,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // Every per-thread cuBLAS handle ever created, independent of the ThreadLocal: an abandoned backend is disposed after
     // the GC has finalized that ThreadLocal (its Values then throws), and its handles still have to be destroyed.
     private readonly ConcurrentQueue<ThreadCublas> _allThreadCublas = new();
+
+    // The first cuBLAS handle loads cublas64/cublasLt64 (hundreds of MB, ~50 ms) and initializes the library; done
+    // lazily, that lands inside the first training step's graph capture. The first host upload of an adopted GPU
+    // engine (weights, the first batch) starts a throwaway handle on a pool thread so the load overlaps model setup;
+    // the per-thread handle created later then only pays cublasCreate. Gated on the engine being current so a process
+    // that auto-detected the GPU but runs on the CPU engine never maps cuBLAS. AIDOTNET_CUBLAS_PREWARM=0 disables it.
+    private int _cublasWarmStarted;
+    private System.Threading.Tasks.Task? _cublasWarmup;
+
+    private void StartCublasWarmup()
+    {
+        if (!AiDotNetEngine.Current.Is<DirectGpuTensorEngine>()) return;
+        if (Interlocked.Exchange(ref _cublasWarmStarted, 1) != 0) return;
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_PREWARM") == "0") return;
+        _cublasWarmup = System.Threading.Tasks.Task.Run(() =>
+        {
+            try
+            {
+                using var _ = PushContext();
+                if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+            }
+            catch (Exception) { /* best effort: the real handle reports any failure on first use */ }
+        });
+    }
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
     // cuMemFree) from the GC finalizer thread races with op threads' driver entry and faults with an
@@ -19576,6 +19601,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Dispose()
     {
+        try { _cublasWarmup?.Wait(); } catch (Exception) { }
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
     }
