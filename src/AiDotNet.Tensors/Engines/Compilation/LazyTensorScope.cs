@@ -155,10 +155,13 @@ internal sealed class LazyTensorScope : IDisposable
     /// same place the tape's does. Before this, a frozen sub-network run under no-grad inside a compiled objective
     /// (a T5 encoder under a decoder-only loss) received the full gradient and the optimizer moved it. FP16
     /// activation-storage nodes (<see cref="Half"/>) stand in for a float forward, so the float scope governs them too.
+    /// A compatibility trace (<see cref="GraphMode.Enable"/>) counts as well: <c>CompileTraining</c> accepts one whose
+    /// parameters are unshared, and its no-grad ops must stop the gradient there just the same. Inference traces carry
+    /// no gradient anyway.
     /// </summary>
     private bool RecordsWithoutGradient<T>()
-        => _traceKind == GraphTraceKind.Training
-           && (NoGradScope<T>.IsSuppressed || (typeof(T) == typeof(Half) && NoGradScope<float>.IsSuppressed));
+        => _traceKind is GraphTraceKind.Training or GraphTraceKind.Compatibility
+           &&(NoGradScope<T>.IsSuppressed || (typeof(T) == typeof(Half) && NoGradScope<float>.IsSuppressed));
 
     /// <summary>The backward a node recorded now carries: none inside a no-grad scope (see <see cref="RecordsWithoutGradient{T}"/>).</summary>
     private BackwardFunction<T>? GradientEdge<T>(BackwardFunction<T>? backwardFn, out bool noGrad)

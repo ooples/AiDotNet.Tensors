@@ -31,9 +31,11 @@ public class NoGradTrainingTraceTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)] // matmul + 1-D bias add: the shape the training fusion pass rewrites to FusedLinear
-    public void CompiledPlan_GivesNoGradientToOpsRecordedUnderNoGrad_LikeTheEagerTape(bool withBias)
+    [InlineData(false, false)]
+    [InlineData(true, false)] // matmul + 1-D bias add: the shape the training fusion pass rewrites to FusedLinear
+    [InlineData(false, true)] // a GraphMode.Enable() (compatibility) trace compiled for training
+    [InlineData(true, true)]
+    public void CompiledPlan_GivesNoGradientToOpsRecordedUnderNoGrad_LikeTheEagerTape(bool withBias, bool compatibility)
     {
         var engine = new CpuEngine();
         var x = Input();
@@ -52,7 +54,7 @@ public class NoGradTrainingTraceTests
         var bias = withBias ? Bias() : null;
         var head = Head();
         var parameters = bias is null ? new[] { frozen, head } : new[] { frozen, bias, head };
-        using var scope = GraphMode.EnableTraining(parameters);
+        using var scope = compatibility ? GraphMode.Enable() : GraphMode.EnableTraining(parameters);
         var loss = Loss(engine, x, frozen, bias, head);
         using var plan = scope.CompileTraining(parameters, loss);
         plan.ConfigureOptimizer(OptimizerType.Adam, 0.003f, 0.9f, 0.999f, 1e-8f, 0f);
@@ -119,5 +121,55 @@ public class NoGradTrainingTraceTests
         var actual = compiled.Gradients[0].ToArray();
         var want = expected.ToArray();
         for (int i = 0; i < want.Length; i++) Assert.Equal(want[i], actual[i], 4);
+    }
+
+    // y = x @ W, then y += b in place under NoGradScope, then loss = sum(y * head). The eager tape records nothing for
+    // the write: y keeps the matmul's history, so W gets x^T head (the write passes the gradient through unchanged), b
+    // gets nothing, and head gets the written y. The compiled plan must reach the matmul through the write.
+    private static Tensor<float> InPlaceLoss(IEngine engine, Tensor<float> x, Tensor<float> weight, Tensor<float> bias, Tensor<float> head)
+    {
+        var y = engine.TensorMatMul(x, weight);
+        using (new NoGradScope<float>()) engine.TensorAddInPlace(y, bias);
+        return engine.ReduceSum(engine.TensorMultiply(y, head), null);
+    }
+
+    private static Tensor<float> SquareBias() => new(new[] { 0.1f, -0.2f, 0.3f, 0.4f }, new[] { 2, 2 });
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CompiledPlan_PassesGradientThroughAnInPlaceWriteRecordedUnderNoGrad_LikeTheEagerTape(bool compatibility)
+    {
+        var engine = new CpuEngine();
+        var x = Input();
+
+        var eagerWeight = Frozen();
+        var eagerBias = SquareBias();
+        var eagerHead = Head();
+        Dictionary<Tensor<float>, Tensor<float>> eager;
+        using (var tape = new GradientTape<float>())
+            eager = tape.ComputeGradients(InPlaceLoss(engine, x, eagerWeight, eagerBias, eagerHead));
+        Assert.True(eager.ContainsKey(eagerWeight));
+        Assert.False(eager.ContainsKey(eagerBias));
+
+        var weight = Frozen();
+        var bias = SquareBias();
+        var head = Head();
+        var parameters = new[] { weight, bias, head };
+        using var scope = compatibility ? GraphMode.Enable() : GraphMode.EnableTraining(parameters);
+        var loss = InPlaceLoss(engine, x, weight, bias, head);
+        using var plan = scope.CompileTraining(parameters, loss);
+        plan.ConfigureOptimizer(OptimizerType.SGD, 0f, 0f, 0f, 0f, 0f);
+        plan.Step();
+
+        var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+        void AssertClose(float[] want, float[] actual)
+        {
+            Assert.Equal(want.Length, actual.Length);
+            for (int i = 0; i < want.Length; i++) Assert.Equal(want[i], actual[i], 5);
+        }
+        AssertClose(eager[eagerWeight].ToArray(), compiled.Gradients[0].ToArray());
+        Assert.All(compiled.Gradients[1].ToArray(), g => Assert.Equal(0f, g));
+        AssertClose(eager[eagerHead].ToArray(), compiled.Gradients[2].ToArray());
     }
 }
