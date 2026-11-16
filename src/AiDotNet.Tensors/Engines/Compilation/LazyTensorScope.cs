@@ -161,7 +161,7 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     private bool RecordsWithoutGradient<T>()
         => _traceKind is GraphTraceKind.Training or GraphTraceKind.Compatibility
-           &&(NoGradScope<T>.IsSuppressed || (typeof(T) == typeof(Half) && NoGradScope<float>.IsSuppressed));
+           && (NoGradScope<T>.IsSuppressed || (typeof(T) == typeof(Half) && NoGradScope<float>.IsSuppressed));
 
     /// <summary>The backward a node recorded now carries: none inside a no-grad scope (see <see cref="RecordsWithoutGradient{T}"/>).</summary>
     private BackwardFunction<T>? GradientEdge<T>(BackwardFunction<T>? backwardFn, out bool noGrad)
