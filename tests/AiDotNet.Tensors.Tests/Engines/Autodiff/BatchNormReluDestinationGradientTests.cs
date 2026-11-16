@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
@@ -136,6 +137,9 @@ public sealed class BatchNormReluDestinationGradientTests : IClassFixture<Direct
     {
         Skip.IfNot(_fixture.IsAvailable && _fixture.Engine is not null, "No direct GPU backend available.");
         var gpu = _fixture.Engine ?? throw new InvalidOperationException("The fixture reported a GPU without an engine.");
+        var varianceBackend = Assert.IsAssignableFrom<IBatchNormVarianceBackend>(gpu.GetBackend());
+        Assert.True(varianceBackend.AcceptsTrainingShape(2, 2, 2),
+            "The register BatchNorm kernel for the regression shape is unavailable.");
         Verify(gpu, resident);
     }
 }
