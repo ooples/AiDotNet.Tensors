@@ -163,6 +163,7 @@ public sealed class OperationReorderingPassTests
         public bool ReadsStorageOf(object tensor) => false;
         public int ConsumerCount { get; set; }
         public IEngine RecordingEngine { get; set; } = null!;
+        public bool RecordedUnderNoGrad { get; set; }
         public void Realize(IEngine engine) { }
         public ILazyNode[] GetInputNodes() => _inputs;
         public void ClearOutputLazySource() { }

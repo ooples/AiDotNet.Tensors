@@ -149,6 +149,25 @@ internal sealed class LazyTensorScope : IDisposable
         => _isProbe ? Tensor<TOut>.CreateDeferred(outputShape) : TensorAllocator.RentUninitialized<TOut>(outputShape);
 
     /// <summary>
+    /// Whether an op of element type <typeparamref name="T"/> recorded now is inside a <see cref="NoGradScope{T}"/> of a
+    /// training trace. The eager tape records nothing there; the trace still records the op (each replay must refresh
+    /// its value, as <c>StopGradient</c>'s node does) but without a backward, so a compiled plan's gradient stops at the
+    /// same place the tape's does. Before this, a frozen sub-network run under no-grad inside a compiled objective
+    /// (a T5 encoder under a decoder-only loss) received the full gradient and the optimizer moved it. FP16
+    /// activation-storage nodes (<see cref="Half"/>) stand in for a float forward, so the float scope governs them too.
+    /// </summary>
+    private bool RecordsWithoutGradient<T>()
+        => _traceKind == GraphTraceKind.Training
+           && (NoGradScope<T>.IsSuppressed || (typeof(T) == typeof(Half) && NoGradScope<float>.IsSuppressed));
+
+    /// <summary>The backward a node recorded now carries: none inside a no-grad scope (see <see cref="RecordsWithoutGradient{T}"/>).</summary>
+    private BackwardFunction<T>? GradientEdge<T>(BackwardFunction<T>? backwardFn, out bool noGrad)
+    {
+        noGrad = RecordsWithoutGradient<T>();
+        return noGrad ? null : backwardFn;
+    }
+
+    /// <summary>
     /// Records a unary operation as a lazy node. Returns a tensor whose data
     /// is not yet computed — it will be materialized during Realize().
     /// </summary>
@@ -164,7 +183,8 @@ internal sealed class LazyTensorScope : IDisposable
         // Allocate output tensor with correct shape but uninitialized data
         var output = RentOutput<T>(outputShape);
 
-        var node = new LazyNode<T>(opType, opName, input, output, execute, backwardFn, savedState);
+        backwardFn = GradientEdge(backwardFn, out bool noGrad);
+        var node = new LazyNode<T>(opType, opName, input, output, execute, backwardFn, savedState) { RecordedUnderNoGrad = noGrad };
         output.LazySource = node;
         AddNode(node);
 
@@ -182,7 +202,10 @@ internal sealed class LazyTensorScope : IDisposable
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
 
         var output = RentOutput<TOut>(outputShape);
-        var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute);
+        var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute)
+        {
+            RecordedUnderNoGrad = RecordsWithoutGradient<TIn>() || RecordsWithoutGradient<TOut>(),
+        };
         output.LazySource = node;
         AddNode(node);
         return output;
@@ -204,7 +227,12 @@ internal sealed class LazyTensorScope : IDisposable
         object[]? savedState = null)
     {
         var output = RentOutput<TOut>(outputShape);
-        var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute, backwardFn, savedState);
+        // A cast across a no-grad boundary of either element type bridges no gradient.
+        bool noGrad = RecordsWithoutGradient<TIn>() || RecordsWithoutGradient<TOut>();
+        var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute, noGrad ? null : backwardFn, savedState)
+        {
+            RecordedUnderNoGrad = noGrad,
+        };
         output.LazySource = node;
         AddNode(node);
         return output;
@@ -223,7 +251,8 @@ internal sealed class LazyTensorScope : IDisposable
     {
         var output = RentOutput<T>(outputShape);
 
-        var node = new LazyNode<T>(opType, opName, input0, input1, output, execute, backwardFn, savedState);
+        backwardFn = GradientEdge(backwardFn, out bool noGrad);
+        var node = new LazyNode<T>(opType, opName, input0, input1, output, execute, backwardFn, savedState) { RecordedUnderNoGrad = noGrad };
         output.LazySource = node;
         AddNode(node);
 
@@ -256,10 +285,11 @@ internal sealed class LazyTensorScope : IDisposable
     {
         // The caller already built the view with shared storage — we just
         // attach it to the graph so the compile step sees a producing node.
+        backwardFn = GradientEdge(backwardFn, out bool noGrad);
         var node = new LazyNode<T>(opType, opName, input, view,
             execute: (_, _) => { /* storage is shared; nothing to compute */ },
             backwardFn,
-            savedState);
+            savedState) { RecordedUnderNoGrad = noGrad };
         view.LazySource = node;
         AddNode(node);
         return view;
@@ -279,8 +309,9 @@ internal sealed class LazyTensorScope : IDisposable
         BackwardFunction<T>? backwardFn = null,
         object[]? savedState = null)
     {
+        backwardFn = GradientEdge(backwardFn, out bool noGrad);
         var node = new LazyNode<T>(
-            opType, opName, input, output, execute, backwardFn, savedState);
+            opType, opName, input, output, execute, backwardFn, savedState) { RecordedUnderNoGrad = noGrad };
         output.LazySource = node;
         AddNode(node);
         return output;
@@ -325,8 +356,9 @@ internal sealed class LazyTensorScope : IDisposable
         if (inputs.Length == 0)
             throw new ArgumentException("A materialized graph operation must have at least one tensor input.", nameof(inputs));
 
+        backwardFn = GradientEdge(backwardFn, out bool noGrad);
         var node = new LazyNode<T>(
-            opType, opName, inputs, output, execute, backwardFn, savedState);
+            opType, opName, inputs, output, execute, backwardFn, savedState) { RecordedUnderNoGrad = noGrad };
         output.LazySource = node;
         AddNode(node);
         return output;
@@ -401,11 +433,12 @@ internal sealed class LazyTensorScope : IDisposable
         // Output = target itself (shared storage). Subsequent ops that
         // consume target see this node as the source, ensuring topological
         // order keeps the in-place mutation before its consumers.
+        backwardFn = GradientEdge(backwardFn, out bool noGrad);
         var node = new LazyNode<T>(
             opType, opName, inputs, target, execute,
             backwardFn: backwardFn,
             savedState: savedState,
-            externalPrerequisite: prevProducer);
+            externalPrerequisite: prevProducer) { RecordedUnderNoGrad = noGrad };
         // Every node that read the target since its prior producer must run before this write: an in-place write of
         // another tensor that reads it (y += x before x *= 2), a reader of a view sharing its storage (copy(view(x))),
         // and a cross-type reader. Only the target's own chain of writes is ordered by the prior-producer edge instead.
@@ -445,7 +478,8 @@ internal sealed class LazyTensorScope : IDisposable
     {
         var output = RentOutput<T>(outputShape);
 
-        var node = new LazyNode<T>(opType, opName, inputs, output, execute, backwardFn, savedState);
+        backwardFn = GradientEdge(backwardFn, out bool noGrad);
+        var node = new LazyNode<T>(opType, opName, inputs, output, execute, backwardFn, savedState) { RecordedUnderNoGrad = noGrad };
         output.LazySource = node;
         AddNode(node);
 

@@ -105,6 +105,9 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
     /// <inheritdoc />
     public bool RecordedInProbe { get; set; }
 
+    /// <inheritdoc />
+    public bool RecordedUnderNoGrad { get; set; }
+
     /// <summary>Creates a unary lazy node (one input).</summary>
     public LazyNode(
         LazyNodeType opType,

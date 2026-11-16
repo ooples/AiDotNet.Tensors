@@ -38,6 +38,9 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     object? ISignableLazyNode.AuxiliaryOutput => null;
     public bool RecordedInProbe { get; set; }
 
+    /// <inheritdoc />
+    public bool RecordedUnderNoGrad { get; set; }
+
     public LazyNodeType OpType { get; }
     public string OpName { get; }
     public int[] OutputShape { get; }
