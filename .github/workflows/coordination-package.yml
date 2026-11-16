@@ -79,7 +79,7 @@ jobs:
           --configuration Release --framework net10.0
           -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
           -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
-          --filter 'FullyQualifiedName~LstmClosureReplayTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~LstmFusedBackwardGradientDoubleTests|FullyQualifiedName~CompiledFusedLstmTrainingTests'
+          --filter 'FullyQualifiedName~LstmClosureReplayTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~LstmFusedBackwardGradientDoubleTests|FullyQualifiedName~CompiledFusedLstmTrainingTests|FullyQualifiedName~TensorFinitePredicateTests'
           --logger 'trx;LogFileName=lstm-signature.trx'
           --results-directory artifacts/coordination/TestResults
 
@@ -116,10 +116,10 @@ jobs:
           trx = root / 'TestResults/lstm-signature.trx'
           results = ET.parse(trx).getroot()
           counters = results.find('.//{*}Counters').attrib
-          assert int(counters['total']) == 37, counters
-          assert int(counters['passed']) == 37, counters
+          assert int(counters['total']) == 47, counters
+          assert int(counters['passed']) == 47, counters
           assert int(counters['failed']) == 0, counters
-          assert int(counters['executed']) == 37, counters
+          assert int(counters['executed']) == 47, counters
           assert results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', counters
 
           checksums = {}
