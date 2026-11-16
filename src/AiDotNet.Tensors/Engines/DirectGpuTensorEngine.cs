@@ -6494,27 +6494,52 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// pool owns. Nothing is allocated on the host unless something reads it there. ViT's uncaptured steps allocated (and
     /// zeroed) 110 MB of never-read host arrays per step for these outputs, most of the process's peak resident set.
     /// </summary>
-    private static void ArmLazyResidentDownload<T>(Tensor<T> tensor, IGpuBuffer buffer, IDirectGpuBackend backend)
+    private sealed class LazyResidentDownload<T>
     {
-        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;   // array-backed: BindResidentBuffer armed it
-        var capturedBuffer = buffer;
-        var capturedBackend = backend;
-        Helpers.HostSync.Remove(tensor.DataVector);
-        Helpers.HostSync.Register(tensor.DataVector, obj =>
+        internal IGpuBuffer Buffer;
+        internal IDirectGpuBackend Backend;
+        internal readonly Action<object> Callback;
+
+        internal LazyResidentDownload(IGpuBuffer buffer, IDirectGpuBackend backend)
+        {
+            Buffer = buffer;
+            Backend = backend;
+            Callback = Download;
+        }
+
+        private void Download(object obj)
         {
             var vec = (LinearAlgebra.VectorBase<T>)obj;
-            var converted = DirectGpuEngine.FromFloatArray<T>(capturedBackend.DownloadBuffer(capturedBuffer));
+            var converted = DirectGpuEngine.FromFloatArray<T>(Backend.DownloadBuffer(Buffer));
             if (converted.Length == vec.Length)
-            {
                 vec.MaterializeBacking(converted);
-            }
             else
             {
                 var logical = new T[vec.Length];
                 Array.Copy(converted, logical, Math.Min(converted.Length, logical.Length));
                 vec.MaterializeBacking(logical);
             }
-        });
+        }
+    }
+
+    private static void ArmLazyResidentDownload<T>(Tensor<T> tensor, IGpuBuffer buffer, IDirectGpuBackend backend)
+    {
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;
+        // Captured steps rebind these tensors every replay. Reuse the callback while following the current buffer.
+        if (tensor._gpuMaterializerCallback?.Target is not LazyResidentDownload<T> download)
+        {
+            download = new LazyResidentDownload<T>(buffer, backend);
+            tensor._gpuMaterializerCallback = download.Callback;
+        }
+        else
+        {
+            download.Buffer = buffer;
+            download.Backend = backend;
+        }
+        var key = tensor.DataVector;
+        tensor._gpuMaterializerKey = key;
+        Helpers.HostSync.Remove(key);
+        Helpers.HostSync.Register(key, download.Callback);
     }
 
     private ActivationCacheEntry? RekeyActivationCacheForResidentBinding<T>(
