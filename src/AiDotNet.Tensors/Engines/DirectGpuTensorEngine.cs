@@ -5033,6 +5033,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Whether <paramref name="buffer"/> still holds device memory. A native handle covers CUDA, HIP, OpenCL, Vulkan
+    /// and Metal; a WebGPU buffer has no native handle (its buffer lives on the JS side), so its own validity is used.
+    /// </summary>
+    private static bool IsLiveDeviceBuffer(IGpuBuffer buffer)
+        => buffer.Handle != IntPtr.Zero
+#if NET7_0_OR_GREATER
+           || buffer is DirectGpu.WebGpu.WebGpuBuffer { IsValid: true }
+#endif
+           ;
+
+    /// <summary>
     /// Writes a device-resident <paramref name="src"/> into <paramref name="dest"/> whose host storage is still deferred
     /// (a GPU training trace's node output) with a device copy into a buffer <paramref name="dest"/> owns, instead of
     /// downloading it into a new host array. Runs where the resident alias cannot (a value realized while the forward
@@ -5048,13 +5059,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!src.IsContiguous || src._storageOffset != 0 || src.Length != dest.Length) return false;
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return false;
-        if (src._gpuBuffer is not { } srcBuf || srcBuf.Handle == IntPtr.Zero || !ReferenceEquals(src._gpuBackend, backend)
+        if (src._gpuBuffer is not { } srcBuf || !IsLiveDeviceBuffer(srcBuf) || !ReferenceEquals(src._gpuBackend, backend)
             || srcBuf.Size < dest.Length)
             return false;
         // The device copy must be the current value of src: a host write after the device result was bound makes the
         // host authoritative (version moved, no download pending), and the host copy below handles that.
         if (src._gpuBufferVersion != src.GpuCacheVersion) return false;
         if (backend is IGpuGraphCapture capture && capture.IsStreamCapturing()) return false;
+        // Vulkan defers an upload made inside an open batch to EndBatch and its Copy rejects such a buffer; the host
+        // copy below reads it correctly.
+        if (srcBuf is DirectGpu.Vulkan.VulkanGpuBuffer { HasPendingBatchUpload: true }) return false;
         IGpuBuffer? copy = null;
         try
         {
@@ -6075,6 +6089,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             return HandleBufferTooLarge<T>(ex, callerName);
         }
+    }
+
+    /// <summary>
+    /// A destination whose host storage is still deferred (a GPU training trace's node output) and that no device buffer
+    /// backs yet: an <c>*Into</c> op writes it by binding its device result (<see cref="BindDeferredHostResult"/>) rather
+    /// than downloading into a host array it does not have. The trace realizes such outputs when the forward needs a
+    /// value early; the host path allocated a host array per output there, kept for the plan's lifetime.
+    /// </summary>
+    private static bool IsUnboundDeferredHostDestination<T>(Tensor<T> destination, int elementCount)
+        => typeof(T) == typeof(float) && destination.HasDeferredHostStorage && !destination.IsSparse
+            && destination.IsContiguous && destination._storageOffset == 0 && destination.Length == elementCount
+            && destination._gpuBuffer is null;
+
+    /// <summary>
+    /// Makes <paramref name="output"/> the device copy of <paramref name="destination"/> (deferred host storage, see
+    /// <see cref="IsUnboundDeferredHostDestination"/>), owned by it; a host read downloads it.
+    /// </summary>
+    private static void BindDeferredHostResult<T>(IDirectGpuBackend backend, OwnedBuffer output, Tensor<T> destination)
+    {
+        destination.IncrementVersion();
+        destination._gpuBuffer = output.Buffer;
+        destination._gpuBackend = backend;
+        destination._gpuBufferVersion = destination.GpuCacheVersion;
+        destination._ownsGpuBuffer = true;
+        RegisterHostDownload<T>(destination.DataVector, backend, output.Buffer);
+        output.RelinquishOwnership();
     }
 
     private static bool TryGetSimpleCpuDestinationArray<T>(Tensor<T> destination, int elementCount, out T[] destinationArray)
@@ -7448,7 +7488,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        if (!TryGetSimpleCpuDestinationArray(destination, left.Length, out var destinationArray))
+        bool deferredDestination = IsUnboundDeferredHostDestination(destination, left.Length);
+        T[] destinationArray = null!;
+        if (!deferredDestination && !TryGetSimpleCpuDestinationArray(destination, left.Length, out destinationArray))
             return false;
 
         try
@@ -7473,7 +7515,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     op(backend, bufferA.Buffer, bufferB.Buffer, output.Buffer, left.Length);
                 }
 
-                DownloadGpuBufferInto(backend, output, destination, destinationArray, left.Length);
+                if (deferredDestination) BindDeferredHostResult(backend, output, destination);
+                else DownloadGpuBufferInto(backend, output, destination, destinationArray, left.Length);
                 Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
                 return true;
             }
@@ -7519,7 +7562,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryRunScalarInto", capabilityGap); /* fall through to the host-download path below */ }
         }
 
-        if (!TryGetSimpleCpuDestinationArray(destination, input.Length, out var destinationArray))
+        bool deferredDestination = IsUnboundDeferredHostDestination(destination, input.Length);
+        T[] destinationArray = null!;
+        if (!deferredDestination && !TryGetSimpleCpuDestinationArray(destination, input.Length, out destinationArray))
             return false;
 
         try
@@ -7529,7 +7574,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 op(backend, bufferA.Buffer, output.Buffer, ToFloatScalar(scalar), input.Length);
-                DownloadGpuBufferInto(backend, output, destination, destinationArray, input.Length);
+                if (deferredDestination) BindDeferredHostResult(backend, output, destination);
+                else DownloadGpuBufferInto(backend, output, destination, destinationArray, input.Length);
                 return true;
             }
             catch
@@ -26033,6 +26079,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
                     });
                 }
+                else if (output.HasDeferredHostStorage && output.IsContiguous && output._storageOffset == 0)
+                {
+                    // A training trace's node output has no host array to key the download on; key it on the
+                    // storage, so a host read still downloads this permute's result instead of unwritten memory.
+                    RegisterHostDownload<T>(output.DataVector, backend, outBuf);
+                }
             }
             else
             {
@@ -26040,6 +26092,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
                 backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
+                if (IsUnboundDeferredHostDestination(output, output.Length))
+                {
+                    BindDeferredHostResult(backend, bufOut, output);
+                    return;
+                }
                 using var dstLease = output.LeaseArray();
                 var dst = dstLease.Array;
                 DownloadGpuBufferInto(backend, bufOut, output, dst, output.Length);
