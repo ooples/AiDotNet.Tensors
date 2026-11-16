@@ -105,6 +105,9 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
     /// <inheritdoc />
     public bool RecordedInProbe { get; set; }
 
+    /// <inheritdoc />
+    public bool RecordedUnderNoGrad { get; set; }
+
     /// <summary>Creates a unary lazy node (one input).</summary>
     public LazyNode(
         LazyNodeType opType,
@@ -294,8 +297,17 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
         => GetInputNodes(includeEarlierReaders: true);
 
     // Execution ordering edges keep old reads ahead of in-place writes; they do not carry derivatives.
+    // An in-place write recorded under NoGradScope is not on the eager tape at all: the target keeps its producer's
+    // history, so the gradient of the target's later uses reaches that producer as if the write were not there (torch's
+    // no_grad in-place write does the same). The write itself adds no derivative, to the target or its other operands:
+    // only the prior writer stays reachable, and the write's own backward stays null.
     internal ILazyNode[] GetGradientInputNodes()
-        => BackwardFn is null ? Array.Empty<ILazyNode>() : GetInputNodes(includeEarlierReaders: false);
+    {
+        if (BackwardFn is not null) return GetInputNodes(includeEarlierReaders: false);
+        return RecordedUnderNoGrad && PriorWriter is { } prior && !ReferenceEquals(prior, this)
+            ? new[] { prior }
+            : Array.Empty<ILazyNode>();
+    }
 
     private ILazyNode[] GetInputNodes(bool includeEarlierReaders)
     {

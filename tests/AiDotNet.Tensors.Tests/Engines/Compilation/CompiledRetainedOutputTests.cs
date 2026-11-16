@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -87,6 +88,98 @@ public sealed class CompiledRetainedOutputTests : IDisposable
         }
     }
 
+    // A host plan pools forward-only outputs by forward liveness (PoolForwardOnlyOutputs): an add read only by adds
+    // shares its array with a later one. The undeclared plan proves this graph pools; the declared output must keep
+    // its own array, or it holds a later add's values once the step returns.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Declared_output_is_not_pooled_with_later_forward_only_outputs(bool declare)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        const int length = 1 << 16;
+        var input = new Tensor<float>([length]);
+        var parameter = new Tensor<float>([length]);
+        parameter.AsWritableSpan().Fill(0.25f);
+        Tensor<float> first;
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(new[] { parameter }))
+        {
+            first = engine.TensorAdd(input, parameter);
+            if (declare) GradientRecording.RetainOutput(first);
+            var second = engine.TensorAdd(first, input);
+            var third = engine.TensorAdd(second, input);
+            var fourth = engine.TensorAdd(third, input);
+            engine.ReduceSum(fourth, null);
+            plan = scope.CompileTraining(new[] { parameter });
+        }
+        using (plan)
+        {
+            if (!declare)
+            {
+                Assert.True(plan.PooledForwardOutputCount > 0, "this graph no longer pools: the declared case proves nothing");
+                return;
+            }
+            for (int step = 1; step <= 3; step++)
+            {
+                input.AsWritableSpan().Fill(step);
+                input.IncrementVersion();
+                Assert.Equal(length * (4f * step + 0.25f), plan.Step().ToArray()[0], length * 1e-3f);
+                foreach (float value in first.ToArray()) Assert.Equal(step + 0.25f, value);
+            }
+        }
+    }
+
+    // MatMul -> broadcast add of a 1-D bias -> ReLU is what the linear fusion rewrites into one FusedLinear node, which
+    // never writes the matmul's own output. The undeclared plan proves this graph fuses; declaring the matmul result
+    // (or the pre-activation sum) must keep that node, with the same loss and gradients.
+    [Theory]
+    [InlineData(0)]   // nothing declared: the control
+    [InlineData(1)]   // the matmul result
+    [InlineData(2)]   // the pre-activation sum
+    public void Declared_interior_of_a_fusable_linear_chain_is_still_computed(int declared)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var input = new Tensor<float>([4, 4]);
+        var weight = new Tensor<float>([4, 4]);
+        var bias = new Tensor<float>([4]);
+        weight.AsWritableSpan().Fill(0.25f);
+        bias.AsWritableSpan().Fill(0.5f);
+        Tensor<float> product, sum;
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(new[] { weight, bias }))
+        {
+            product = engine.TensorMatMul(input, weight);
+            if (declared == 1) GradientRecording.RetainOutput(product);
+            sum = engine.TensorBroadcastAdd(product, bias);
+            if (declared == 2) GradientRecording.RetainOutput(sum);
+            engine.ReduceSum(engine.ReLU(sum), null);
+            plan = scope.CompileTraining(new[] { weight, bias });
+        }
+        using (plan)
+        {
+            bool fused = plan.BackwardStepKinds.Any(kind => kind.IndexOf("FusedLinear", StringComparison.Ordinal) >= 0);
+            if (declared == 0)
+            {
+                Assert.True(fused, "this graph no longer fuses (" + string.Join(", ", plan.BackwardStepKinds)
+                    + "): the declared cases prove nothing");
+                return;
+            }
+            for (int step = 1; step <= 3; step++)
+            {
+                input.AsWritableSpan().Fill(step);
+                input.IncrementVersion();
+                Assert.Equal(16f * (step + 0.5f), plan.Step().ToArray()[0]);
+                foreach (float value in product.ToArray().Take(declared == 1 ? 16 : 0)) Assert.Equal((float)step, value);
+                foreach (float value in sum.ToArray().Take(declared == 2 ? 16 : 0)) Assert.Equal(step + 0.5f, value);
+                foreach (float gradient in plan.Gradients[0].ToArray()) Assert.Equal(4f * step, gradient);
+                foreach (float gradient in plan.Gradients[1].ToArray()) Assert.Equal(4f, gradient);
+            }
+        }
+    }
+
     [Fact]
     public void Declared_matmul_result_remains_observable_across_linear_activation_fusion()
     {
@@ -115,6 +208,74 @@ public sealed class CompiledRetainedOutputTests : IDisposable
                 foreach (float value in retained.ToArray()) Assert.Equal((float)step, value);
                 foreach (float gradient in plan.Gradients[0].ToArray()) Assert.Equal(4f * step, gradient);
             }
+    }
+
+    // The embedding gather a device step writes straight into its output (this file's original defect, on every device
+    // backend, not only under CUDA graph replay): read on some steps and not others, the declared rows must be the rows
+    // of that step's ids.
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Declared_embedding_rows_follow_each_steps_indices(bool gpu, bool floatIndices)
+    {
+        DirectGpuTensorEngine? device = null;
+        if (gpu)
+        {
+            try { device = new DirectGpuTensorEngine(); }
+            catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+            Skip.If(device is null || !device.IsGpuAvailable, "No direct GPU backend available.");
+        }
+        using (device)
+        {
+            IEngine engine = device is null ? new CpuEngine() : device;
+            AiDotNetEngine.Current = engine;
+            const int vocab = 32, width = 8, batch = 16;
+            var table = new Tensor<float>([vocab, width]);
+            var tableSpan = table.AsWritableSpan();
+            for (int i = 0; i < tableSpan.Length; i++) tableSpan[i] = i * 0.125f;
+            var hostTable = table.ToArray();
+            var weight = new Tensor<float>([width, 4]);
+            weight.AsWritableSpan().Fill(0.25f);
+            var ids = new Tensor<int>([batch]);
+            var floatIds = new Tensor<float>([batch]);
+            var parameters = new[] { table, weight };
+            if (gpu) foreach (var p in parameters) p.Gpu();
+            Tensor<float> rows;
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                rows = floatIndices
+                    ? engine.TensorEmbeddingLookupFromFloatIndices(table, floatIds)
+                    : engine.TensorEmbeddingLookup<float, int>(table, ids);
+                GradientRecording.RetainOutput(rows);
+                var hidden = engine.TensorMatMul(rows, weight);
+                engine.ReduceSum(engine.TensorMultiply(hidden, hidden), null);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                var rng = new Random(9);
+                for (int step = 0; step < 8; step++)
+                {
+                    var picked = new int[batch];
+                    for (int i = 0; i < batch; i++) picked[i] = rng.Next(vocab);
+                    picked.AsSpan().CopyTo(ids.AsWritableSpan());
+                    var floats = floatIds.AsWritableSpan();
+                    for (int i = 0; i < batch; i++) floats[i] = picked[i];
+                    ids.IncrementVersion();
+                    floatIds.IncrementVersion();
+                    plan.Step();
+                    if (step is 1 or 2 or 5) continue;   // unread steps: the next read must still be its own step's rows
+                    var actual = rows.ToArray();
+                    Assert.Equal(batch * width, actual.Length);
+                    for (int i = 0; i < batch; i++)
+                        for (int c = 0; c < width; c++)
+                            Assert.Equal(hostTable[picked[i] * width + c], actual[i * width + c]);
+                }
+            }
+        }
     }
 
     [Fact]
