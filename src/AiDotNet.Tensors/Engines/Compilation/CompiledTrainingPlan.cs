@@ -1421,8 +1421,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void CommitDeviceParameterUpdate(Engines.DirectGpuTensorEngine engine, int p,
         Engines.DirectGpu.IGpuBuffer buffer, Engines.DirectGpu.IDirectGpuBackend backend)
     {
-        if (typeof(T) == typeof(float))
-            engine.CommitParameterUpdatedOnDevice((Tensor<float>)(object)_parameters[p], buffer, backend, syncPoint: null);
+        long diagnosticStart = AllocationStamp();
+        try
+        {
+            if (typeof(T) == typeof(float))
+                engine.CommitParameterUpdatedOnDevice((Tensor<float>)(object)_parameters[p], buffer, backend, syncPoint: null);
+        }
+        finally { AllocationDelta(12, diagnosticStart); }
     }
 
     /// <summary>
@@ -3963,16 +3968,57 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    // TEMPORARY allocation investigation; remove after the bounded hardware diagnostic run.
+    [ThreadStatic] internal static long[]? AllocationDiagnostics;
+    [ThreadStatic] private static bool t_allocationDiagnosticStepActive;
+    private static long AllocationStamp()
+    {
+#if NETCOREAPP
+        return !t_allocationDiagnosticStepActive || AllocationDiagnostics is null ? 0 : GC.GetAllocatedBytesForCurrentThread();
+#else
+        return 0;
+#endif
+    }
+    private static void AllocationDelta(int phase, long before)
+    {
+        if (t_allocationDiagnosticStepActive && AllocationDiagnostics is { Length: 16 } counters)
+            counters[phase] += AllocationStamp() - before;
+    }
+
     private Tensor<T> StepLocked()
     {
+        var diagnostic = AllocationDiagnostics;
+        if (diagnostic is { Length: 16 }) Array.Clear(diagnostic, 0, diagnostic.Length);
+        t_allocationDiagnosticStepActive = diagnostic is { Length: 16 };
+        long stepStart = AllocationStamp();
+        long resolveStart = AllocationStamp();
         ResolvePingPongClaims(force: false);
+        AllocationDelta(3, resolveStart);
         // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
         // cannot upload parameters into buffers another thread's StepCore is reading.
         lock (_stepSync)
         {
-            ClearPlanBufferReleaseMarks();
-            UploadHostWrittenParameters();
-            return StepCore();
+            try
+            {
+                long phaseStart = AllocationStamp();
+                ClearPlanBufferReleaseMarks();
+                AllocationDelta(1, phaseStart);
+                phaseStart = AllocationStamp();
+                UploadHostWrittenParameters();
+                AllocationDelta(2, phaseStart);
+                return StepCore();
+            }
+            finally
+            {
+                if (diagnostic is { Length: 16 })
+                {
+                    diagnostic[13] = _parameters.Length;
+                    diagnostic[14] = _capturedOptimizer is null ? 0 : 1;
+                    diagnostic[15] = _capturedOptimizer?.PingPong is null ? 0 : 1;
+                }
+                AllocationDelta(0, stepStart);
+                t_allocationDiagnosticStepActive = false;
+            }
         }
     }
 
@@ -4170,6 +4216,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     InvalidateCapturedStepGraph();
                     return StepResidentOrEager();
                 }
+                long replayPhaseStart = AllocationStamp();
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
                 if (_stepIo is not null ? !StepIoInputsStillBound(cb) : !RefreshGraphInputInPlace(cb))
                 {
@@ -4179,18 +4226,31 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _graphStepDisabled = true;
                     return StepEager();
                 }
+                AllocationDelta(3, replayPhaseStart);
+                replayPhaseStart = AllocationStamp();
                 if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, _stepGraphExec);
                 else LaunchStepGraph(cb, _stepGraphExec);
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
+                AllocationDelta(4, replayPhaseStart);
+                replayPhaseStart = AllocationStamp();
                 RefreshLossFromCapturedGraph(gte);
+                AllocationDelta(5, replayPhaseStart);
                 if (_capturedOptimizer is { } capturedReplay)
                 {
-                    capturedReplay.AfterReplay?.Invoke();   // the graph ran the update
+                    replayPhaseStart = AllocationStamp();
+                    capturedReplay.AfterReplay?.Invoke();
+                    AllocationDelta(6, replayPhaseStart);   // the graph ran the update
                     return _lossOutput;
                 }
+                replayPhaseStart = AllocationStamp();
                 RegularizeAndClipGradients();
+                AllocationDelta(7, replayPhaseStart);
+                replayPhaseStart = AllocationStamp();
                 CommitHostOptimizerGradients();
+                AllocationDelta(8, replayPhaseStart);
+                replayPhaseStart = AllocationStamp();
                 InvokeOptimizerUpdate();
+                AllocationDelta(9, replayPhaseStart);
                 return _lossOutput;
             }
         }
@@ -7185,7 +7245,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                     if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine) && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
                     {
+                        long bindDiagnosticStart = AllocationStamp();
                         rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                        AllocationDelta(11, bindDiagnosticStart);
                         CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
                     }
                 }
@@ -7208,7 +7270,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                     if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine) && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
                     {
+                        long bindDiagnosticStart = AllocationStamp();
                         rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                        AllocationDelta(11, bindDiagnosticStart);
                         CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
                     }
                 }
@@ -7433,7 +7497,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // .Register TryAdds, so it's a no-op if a read is still pending, and re-arms after one fired).
                     if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var _rebindEngine))
                     {
+                        long bindDiagnosticStart = AllocationStamp();
                         _rebindEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
+                        AllocationDelta(11, bindDiagnosticStart);
                         CommitDeviceParameterUpdate(_rebindEngine, p, gpuP, gpuBe);
                     }
                     continue;
@@ -7714,8 +7780,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var target = set == 1 && pingPong is not null ? pingPong[p] : a;
                     var source = from == 1 && pingPong is not null ? pingPong[p] : a;
                     if (typeof(T) == typeof(float))
+                    {
+                        long moveDiagnosticStart = AllocationStamp();
                         rebindEngine.MovePersistentParameterBuffer((Tensor<float>)(object)_parameters[p], source, target);
+                        AllocationDelta(10, moveDiagnosticStart);
+                    }
+                    long bindDiagnosticStart = AllocationStamp();
                     rebindEngine.BindResidentBuffer(_parameters[p], target, beBind);
+                    AllocationDelta(11, bindDiagnosticStart);
                     CommitDeviceParameterUpdate(rebindEngine, p, target, beBind);
                 }
             }
@@ -8302,7 +8374,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // the old host weights over it. Every float32 parameter reaches this branch now, not just FP16 plans.
                     if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var groupedEngine))
                     {
+                        long bindDiagnosticStart = AllocationStamp();
                         groupedEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
+                        AllocationDelta(11, bindDiagnosticStart);
                         CommitDeviceParameterUpdate(groupedEngine, p, gpuP, gpuBe);
                     }
                     continue;

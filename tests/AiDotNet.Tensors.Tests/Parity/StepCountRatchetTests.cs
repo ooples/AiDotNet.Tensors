@@ -3,6 +3,7 @@ using System;
 using System.IO;
 using System.Text.Json;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
 using Xunit;
 using Xunit.Abstractions;
@@ -32,7 +33,15 @@ public abstract class StepCountRatchetBase
     {
         string root = PyTorchParityInventory.FindRepositoryRoot()
             ?? throw new InvalidOperationException("parity/ is missing from this checkout.");
-        var counts = HeadToHeadNetworkHarness.MeasureCompiledStepCounts(root, network, gpu);
+        // TEMPORARY diagnostic state is allocated before, and printed after, the measurement window.
+        var allocationPhases = gpu is null ? null : new long[16];
+        CompiledTrainingPlan<float>.AllocationDiagnostics = allocationPhases;
+        HeadToHeadNetworkHarness.StepCounts counts;
+        try { counts = HeadToHeadNetworkHarness.MeasureCompiledStepCounts(root, network, gpu); }
+        finally { CompiledTrainingPlan<float>.AllocationDiagnostics = null; }
+        if (allocationPhases is not null)
+            _output.WriteLine("ALLOCATION LAST STEP [total,clear,upload,resolveAndInputIo,launch,lossRefresh,afterReplay,regularize,hostGradCommit,optimizer,move,bind,deviceCommit,paramCount,captured,pingpong]: "
+                + string.Join(",", allocationPhases));
         // CPU allocations can differ between the AVX2 and AVX-512 code paths, and CUDA graphs between devices (routes are
         // tuned per device), so each count is keyed by what it depends on. An unseeded combination defers with its value.
         // CUDA graphs also depend on whether cuDNN serves the convolutions: its kernels replace the engine's own, so the
