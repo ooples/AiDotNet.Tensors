@@ -83,6 +83,18 @@ jobs:
           --logger 'trx;LogFileName=lstm-signature.trx'
           --results-directory artifacts/coordination/TestResults
 
+      # These 26 CPU cases are mandatory and must all execute and pass. CompiledRetainedOutputTests
+      # includes a CUDA-only whole-step capture case; its separate GPU coverage cannot satisfy this gate.
+      - name: Verify named-output ownership regressions (mandatory CPU)
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-build --no-restore
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter 'FullyQualifiedName~NamedRetainedOutputTests|FullyQualifiedName~TensorArenaPinnedTests|FullyQualifiedName~TapeOwnedArenaLifetimeTests'
+          --logger 'trx;LogFileName=retained-output-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
       - name: Verify package contents and write provenance
         shell: python
         run: |
@@ -122,8 +134,59 @@ jobs:
           assert int(counters['executed']) == 99, counters
           assert results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', counters
 
+          retention_trx = root / 'TestResults/retained-output-signature.trx'
+          retention_results = ET.parse(retention_trx).getroot()
+          retention_counters = retention_results.find('.//{*}Counters').attrib
+          assert int(retention_counters['total']) == 26, retention_counters
+          assert int(retention_counters['passed']) == 26, retention_counters
+          assert int(retention_counters['failed']) == 0, retention_counters
+          assert int(retention_counters['executed']) == 26, retention_counters
+          assert retention_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', retention_counters
+          # Pin case identities as well as counts: a duplicate/replaced theory case cannot mask an omission.
+          retention_cases = {
+              'AiDotNet.Tensors.Tests.Engines.Compilation.NamedRetainedOutputTests': [
+                  'Compiled_handoff_requires_outer_success_and_expires_at_the_next_step_or_disposal',
+                  'Eager_keys_are_nonempty_unique_and_ordinal_even_without_a_capture',
+                  'Finite_forward_with_nonfinite_gradients_cannot_publish_a_discarded_update',
+                  'Named_stopgradient_view_survives_caller_arena_reset_disposal_and_pool_reuse(rows: 256, columns: 256)',
+                  'Named_stopgradient_view_survives_caller_arena_reset_disposal_and_pool_reuse(rows: 32, columns: 3)',
+                  'Nested_and_parallel_captures_do_not_publish_each_others_outputs',
+                  'Partial_and_strided_named_views_transfer_the_whole_storage_slab(layout: "offset", rows: 64)',
+                  'Partial_and_strided_named_views_transfer_the_whole_storage_slab(layout: "offset-strided", rows: 32768)',
+                  'Partial_and_strided_named_views_transfer_the_whole_storage_slab(layout: "strided", rows: 64)',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "duplicate")',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "missing")',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "moved")',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "renamed")',
+                  'Repeated_named_handoffs_do_not_accumulate_strong_arena_pins',
+                  'Warmup_only_and_failed_outer_invocations_cannot_publish_outputs',
+              ],
+              'AiDotNet.Tensors.Tests.Helpers.TensorArenaPinnedTests': [
+                  'PinnedArrayCount_GrowsOnEachRent_AndDoesNotResetOnReset',
+                  'Pinned_NotReissuedAsScratch_AfterReset',
+                  'Pinned_SurvivesReset_ContentsPreserved',
+                  'RegisterPersistentTensor_PromotesExistingScratchTensor',
+                  'RentPinnedOnGpu_NoGpuAllocator_FallsBackToPinned',
+                  'RentPinnedOnGpu_ZeroSize_ReturnsUsableTensor',
+                  'RentPinned_NoActiveArena_FallsBackToCleanAllocation',
+                  'RentPinned_ZeroSize_ReturnsUsableTensor',
+              ],
+              'AiDotNet.Tensors.Tests.Engines.Autodiff.TapeOwnedArenaLifetimeTests': [
+                  'BuffersNothingReferences_AreReusedByLaterTapes',
+                  'TensorsKeptPastTheirTape_SurviveLaterTapes(rows: 128, inner: 512, cols: 64)',
+                  'TensorsKeptPastTheirTape_SurviveLaterTapes(rows: 256, inner: 512, cols: 256)',
+              ],
+          }
+          assert [len(cases) for cases in retention_cases.values()] == [15, 8, 3]
+          expected_cases = {f'{class_name}.{case}' for class_name, cases in retention_cases.items() for case in cases}
+          case_results = retention_results.findall('.//{*}UnitTestResult')
+          actual_cases = {result.attrib['testName'] for result in case_results}
+          assert len(case_results) == len(actual_cases) == 26, 'Duplicate or missing retention case results'
+          assert actual_cases == expected_cases, {'missing': sorted(expected_cases - actual_cases), 'unexpected': sorted(actual_cases - expected_cases)}
+          assert all(result.attrib['outcome'] == 'Passed' for result in case_results), 'A mandatory retention case did not pass'
+
           checksums = {}
-          for path in [package, trx]:
+          for path in [package, trx, retention_trx]:
               checksums[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
           manifest = {
               'repository': os.environ['GITHUB_REPOSITORY'],
@@ -134,6 +197,10 @@ jobs:
               'testedBinary': tested_binary.as_posix(),
               'testedAndPackagedNet10BinarySha256': tested_binary_sha256,
               'testCounters': counters,
+              'retainedOutputTestCounters': retention_counters,
+              'retainedOutputTestCases': sorted(actual_cases),
+              'mandatoryCpuTestCount': 125,
+              'separateGpuCoverage': 'CompiledRetainedOutputTests CUDA whole-step capture is not part of the mandatory CPU gate.',
               'sha256': checksums,
               'workflowRun': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
               'runAttempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
