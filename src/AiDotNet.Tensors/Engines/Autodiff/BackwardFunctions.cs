@@ -31,8 +31,13 @@ internal enum StftAdjointTarget
     Phase
 }
 
+// Forward refreshes these statistics before any backward or statistic consumer reads them.
+// Their values are replay scratch; only the immutable row count belongs to the objective signature.
 internal sealed class LayerNormStateRef<T> : Compilation.ISignatureScratch
 {
+    internal LayerNormStateRef(int rows) => SignatureLength = rows;
+
+    public int SignatureLength { get; }
     public Tensor<T>? Mean;
     public Tensor<T>? Variance;
 
