@@ -36,6 +36,15 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <inheritdoc/>
+    // The public op owns validation, graph-mode recording and the tape; its forward and backward bodies are the
+    // internal virtuals below, which run the CUDA kernels. Overridden here so the GPU coverage is visible on the
+    // engine's interface map (BackendCompletenessTests) rather than hidden behind the internal hooks.
+    public override Tensor<T> GraphAttentionCsr<T>(
+        Tensor<T> transformed, Tensor<T> attention, CsrGraph graph,
+        double negativeSlope = 0.2, double dropoutRate = 0.0, Random? dropoutRandom = null)
+        => base.GraphAttentionCsr(transformed, attention, graph, negativeSlope, dropoutRate, dropoutRandom);
+
     internal override Tensor<T> GraphAttentionCsrForward<T>(
         Tensor<T> transformed, Tensor<T> attention, CsrGraph graph, double slope, double rate, uint seed)
     {
