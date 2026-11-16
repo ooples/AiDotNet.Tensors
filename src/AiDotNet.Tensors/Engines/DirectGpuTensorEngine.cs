@@ -4253,7 +4253,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal bool IsBoundDeviceAuthoritative<T>(Tensor<T> tensor)
     {
-        if (tensor._gpuBuffer is not { } bound || bound.Handle == System.IntPtr.Zero) return false;
+        // Buffer identity only, on every backend: a handle is no liveness test there (a WebGPU buffer's Handle is always
+        // zero). Reading the bound buffer is what any eager op on the tensor does; a captured graph, which bakes the
+        // pointer in, re-checks the handle before each replay (CompiledTrainingPlan.ForeignParametersStillBound).
+        if (tensor._gpuBuffer is not { } bound) return false;
         lock (_deviceAuthoritativeParameters)
             return _deviceAuthoritativeParameters.TryGetValue(tensor, out var committed) && ReferenceEquals(committed, bound);
     }
