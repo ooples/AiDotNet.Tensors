@@ -41,7 +41,7 @@ public sealed class ResidentHostMirrorRangeTests
     }
 
     [Fact]
-    public void RepeatedAttach_AllocatesNothing_AndDownloadsTheReboundBufferOnce()
+    public void RepeatedAttach_DownloadsReboundBufferOnce_AndHonorsDetachment()
     {
         var state = new MockBackendState();
         var backend = MockDirectGpuBackend.Create(state);
@@ -54,10 +54,15 @@ public sealed class ResidentHostMirrorRangeTests
         ResidentHostMirror.Attach(tensor);
         for (int i = 0; i < 100; i++) ResidentHostMirror.Attach(tensor);
 
+        // .NET Framework lacks this allocation metric; replay and functional checks run on every target.
+#if NETCOREAPP
         long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
         for (int i = 0; i < 1000; i++) ResidentHostMirror.Attach(tensor);
+#if NETCOREAPP
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
         Assert.Equal(0, allocated);
+#endif
 
         // Membership follows the tensor, not its old device buffer. Reattaching must neither duplicate
         // its download nor leave the prior buffer authoritative after an optimizer swaps buffers.
@@ -72,7 +77,7 @@ public sealed class ResidentHostMirrorRangeTests
     }
 
     [Fact]
-    public void RepeatedParameterCommit_AllocatesNothing_AndPreservesFreshHostReads()
+    public void RepeatedParameterCommit_PreservesVersionsAndFreshHostReads()
     {
         var state = new MockBackendState();
         var backend = MockDirectGpuBackend.Create(state);
@@ -83,11 +88,16 @@ public sealed class ResidentHostMirrorRangeTests
         for (int i = 0; i < 100; i++)
             engine.CommitParameterUpdatedOnDevice(parameter, buffer, backend, syncPoint: null);
 
+        // .NET Framework lacks this allocation metric; replay and functional checks run on every target.
+#if NETCOREAPP
         long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
         for (int i = 0; i < 1000; i++)
             engine.CommitParameterUpdatedOnDevice(parameter, buffer, backend, syncPoint: null);
+#if NETCOREAPP
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
         Assert.Equal(0, allocated);
+#endif
         Assert.Equal(parameter.GpuCacheVersion, parameter._gpuBufferVersion);
         Assert.Equal(new[] { 7f, 9f }, parameter.ToArray());
         Assert.Equal(1, state.DownloadBufferCalls);
@@ -97,7 +107,7 @@ public sealed class ResidentHostMirrorRangeTests
     }
 
     [Fact]
-    public void UnmaterializedParameter_ReusesCallbackAcrossPingPong_AndRekeysAfterHostRead()
+    public void UnmaterializedParameter_ReplayRebindsLatestBuffer_AndRekeysAfterHostRead()
     {
         var state = new MockBackendState();
         var backend = MockDirectGpuBackend.Create(state);
@@ -118,10 +128,15 @@ public sealed class ResidentHostMirrorRangeTests
         }
         for (int i = 0; i < 100; i++) Replay(i);
 
+        // .NET Framework lacks this allocation metric; replay and functional checks run on every target.
+#if NETCOREAPP
         long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
         for (int i = 0; i < 1000; i++) Replay(i);
+#if NETCOREAPP
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
         Assert.Equal(0, allocated);
+#endif
         Assert.Null(parameter.GetBackingArrayForCacheLookupUnsafe());
         Assert.Same(callback, parameter._gpuMaterializerCallback);
         Assert.Equal(new[] { 3f, 4f }, parameter.ToArray());
