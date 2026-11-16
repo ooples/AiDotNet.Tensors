@@ -32,6 +32,7 @@ public sealed partial class CudaBackend
     private readonly bool _directPtxResidualRmsNormOptedIn =
         DirectPtxFeatureGate.IsResidualRmsNormEnabled;
     private readonly object _directPtxLock = new();
+    internal static Action? TestHookInsideDirectPtxSolverLock;
     private DirectPtxCapturePinSet? _activeDirectPtxCapturePins;
     private Dictionary<IntPtr, DirectPtxCapturePinSet>? _directPtxGraphPins;
     private readonly DirectPtxKernelCache<DirectPtxAttentionKey, PtxOnlineFusedAttention128x64Kernel>
@@ -807,8 +808,12 @@ public sealed partial class CudaBackend
             }
             if (hot is null) capturing = IsStreamCapturingCurrentContext();
             var planKey = new DirectPtxCholesky4x4PlanKey(batchCount);
+            // Capture launches enter the context gate before the PTX cache. The cold solver path
+            // must use that order too: its single-flight tuner opens a CUDA capture while holding the cache.
+            lock (CaptureGateFor(_cudaContext))
             lock (_directPtxLock)
             {
+                TestHookInsideDirectPtxSolverLock?.Invoke();
                 if (capturing && !_directPtxCholesky4x4Plans.TryGetValue(planKey, out _))
                 {
                     DirectPtxLastError =

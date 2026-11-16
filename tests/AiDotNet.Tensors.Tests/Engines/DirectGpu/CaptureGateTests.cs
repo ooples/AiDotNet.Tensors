@@ -17,6 +17,53 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public class CaptureGateTests
 {
     [SkippableFact]
+    public void First_use_solver_tuning_takes_the_capture_gate_before_the_cache_lock()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        if (gpu?.GetBackend() is not CudaBackend)
+        {
+            gpu?.Dispose();
+            Skip.If(true, "CUDA backend did not resolve.");
+        }
+        using (gpu)
+        {
+            var cuda = (CudaBackend)gpu!.GetBackend()!;
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+            int major = (int)typeof(CudaBackend).GetField("_ccMajor", flags)!.GetValue(cuda)!;
+            int minor = (int)typeof(CudaBackend).GetField("_ccMinor", flags)!.GetValue(cuda)!;
+            Skip.If(major != 8 || minor != 6, "Direct PTX Cholesky 4x4 requires SM86.");
+            const int batch = 1024;
+            var matrices = new float[batch * 16];
+            for (int i = 0; i < batch; i++)
+                for (int d = 0; d < 4; d++) matrices[i * 16 + d * 5] = 4f;
+            using var input = cuda.AllocateBuffer(matrices);
+            using var output = cuda.AllocateBuffer(matrices.Length);
+            using var info = cuda.AllocateBuffer(batch);
+            bool? prior = DirectPtxFeatureGate.Cholesky4x4ExperimentOverride;
+            var priorHook = CudaBackend.TestHookInsideDirectPtxSolverLock;
+            bool? gateFree = null;
+            try
+            {
+                DirectPtxFeatureGate.Cholesky4x4ExperimentOverride = true;
+                CudaBackend.TestHookInsideDirectPtxSolverLock = () =>
+                    gateFree = GateFreeFromAnotherThread(CudaBackend.CaptureGateFor(cuda.CudaContextHandle));
+                Assert.True(cuda.TryDirectPtxCholesky4x4(input, output, info, batch, 4, upper: false), cuda.DirectPtxLastError);
+                Assert.Equal(false, gateFree);
+                var factors = cuda.DownloadBuffer(output);
+                for (int i = 0; i < batch; i++)
+                    for (int d = 0; d < 4; d++) Assert.Equal(2f, factors[i * 16 + d * 5], 4);
+            }
+            finally
+            {
+                DirectPtxFeatureGate.Cholesky4x4ExperimentOverride = prior;
+                CudaBackend.TestHookInsideDirectPtxSolverLock = priorHook;
+            }
+        }
+    }
+
+    [SkippableFact]
     public void A_failed_capture_setup_releases_the_gate_the_depth_and_the_pins()
     {
         DirectGpuTensorEngine? gpu = null;
@@ -29,14 +76,14 @@ public class CaptureGateTests
         using (gpu)
         {
             var cuda = (CudaBackend)gpu!.GetBackend()!;
-            // Tuning holds the PTX cache monitor while its runtime opens a capture. Backend capture
-            // enters the context gate before collecting kernel pins: these must be one reentrant monitor.
+            // Ordinary cache access must stay independent: another thread can run an op on the main
+            // stream while this thread captures on its private stream and waits for that op.
             var ptxGate = typeof(CudaBackend).GetField("_directPtxLock",
                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!.GetValue(cuda);
             Assert.NotNull(ptxGate);
             lock (ptxGate!)
-                Assert.False(GateFreeFromAnotherThread(CudaBackend.CaptureGateFor(cuda.CudaContextHandle)),
-                    "A capture can enter while a tuner owns the PTX cache, allowing lock inversion.");
+                Assert.True(GateFreeFromAnotherThread(CudaBackend.CaptureGateFor(cuda.CudaContextHandle)),
+                    "Ordinary PTX cache access must not hold the capture gate.");
             CudaBackend.TestHookCaptureSetup = () => throw new InvalidOperationException("injected capture setup failure");
             try
             {
