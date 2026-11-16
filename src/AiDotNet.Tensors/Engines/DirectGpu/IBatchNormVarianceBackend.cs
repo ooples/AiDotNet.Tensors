@@ -38,3 +38,4 @@ internal interface IBatchNormVarianceBackend
         int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput = null, IGpuBuffer? gradResidual = null,
         IGpuBuffer? beta = null, IGpuBuffer? gradOutput2 = null, bool accumulateGradInput = false);
 }
+

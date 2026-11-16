@@ -9,6 +9,59 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("DirectGpuSerial")]
 public sealed class BatchNormAffineFoldTests
 {
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(2, false)]
+    [InlineData(3, false)]
+    [InlineData(0, true)]
+    [InlineData(1, true)]
+    [InlineData(2, true)]
+    [InlineData(3, true)]
+    public void EveryOperandMutationOrReplacementRecomputesAndReleasesOnlySupersededEntries(int operand, bool replace)
+    {
+        var engine = new CpuEngine();
+        var values = new[] { 1.2, .3, -.4, .8 };
+        var inputs = Array.ConvertAll(values, value => new Tensor<double>(new[] { value }, new[] { 1 }));
+        var released = new System.Collections.Generic.List<Tensor<double>>();
+        (Tensor<double> Scale, Tensor<double> Shift) Fold() => CpuEngine.BatchNormAffineFold<double>.Get(
+            engine, inputs[0], inputs[1], inputs[2], inputs[3], .01, released.Add);
+        var first = Fold();
+        if (replace) inputs[operand] = new Tensor<double>(new[] { values[operand] + .2 }, new[] { 1 });
+        else inputs[operand].SetFlat(0, values[operand] + .2);
+        var changed = Fold();
+        Assert.NotSame(first.Scale, changed.Scale);
+        double scale = inputs[0][0] / Math.Sqrt(inputs[3][0] + .01);
+        Assert.Equal(scale, changed.Scale[0], 13);
+        Assert.Equal(inputs[1][0] - inputs[2][0] * scale, changed.Shift[0], 13);
+        // A new gamma is a distinct weak cache key; only replacement of that key's existing entry releases it.
+        Assert.Equal(operand == 0 && replace ? 0 : 2, released.Count);
+        if (released.Count > 0)
+        {
+            Assert.Same(first.Scale, released[0]);
+            Assert.Same(first.Shift, released[1]);
+        }
+        Assert.Same(changed.Scale, Fold().Scale);
+        Assert.Equal(operand == 0 && replace ? 0 : 2, released.Count);
+    }
+
+    [Fact]
+    public void CpuCacheResultsOutliveTheCallingTensorScope()
+    {
+        var engine = new CpuEngine();
+        var gamma = new Tensor<double>(new[] { 2d }, new[] { 1 });
+        var beta = new Tensor<double>(new[] { .3 }, new[] { 1 });
+        var mean = new Tensor<double>(new[] { -.4 }, new[] { 1 });
+        var variance = new Tensor<double>(new[] { .8 }, new[] { 1 });
+        (Tensor<double> Scale, Tensor<double> Shift) folded;
+        using (TensorScope.Begin())
+            folded = CpuEngine.BatchNormAffineFold<double>.Get(engine, gamma, beta, mean, variance, .01);
+        Assert.Equal(2 / Math.Sqrt(.81), folded.Scale[0], 13);
+        Assert.Equal(.3 + .4 * 2 / Math.Sqrt(.81), folded.Shift[0], 13);
+        Assert.Same(folded.Scale, CpuEngine.BatchNormAffineFold<double>.Get(engine, gamma, beta, mean, variance, .01).Scale);
+    }
+
+
     [Fact]
     public void Double_precision_and_cache_invalidation_follow_the_tensor_operands()
     {

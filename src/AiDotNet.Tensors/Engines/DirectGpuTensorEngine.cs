@@ -6478,10 +6478,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // registration is per array, displaced the other views' pending downloads.)
         if (Helpers.ResidentHostMirror.ArmDownload(t))
             return;
-        var capBuf = buf; var capBackend = backend;
-        Helpers.HostSync.Register(arr, a =>
+        ArmUnmirroredResidentDownload<T>(arr, buf, backend);
+    }
+
+    // Keep the cold fallback's closure out of BindResidentBuffer's allocation-free mirror path.
+    private static void ArmUnmirroredResidentDownload<T>(object array, IGpuBuffer buffer, IDirectGpuBackend backend)
+    {
+        Helpers.HostSync.Register(array, a =>
         {
-            float[] f = capBackend.DownloadBuffer(capBuf);
+            float[] f = backend.DownloadBuffer(buffer);
             var conv = DirectGpuEngine.FromFloatArray<T>(f);
             System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
         });
@@ -6496,25 +6501,64 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static void ArmLazyResidentDownload<T>(Tensor<T> tensor, IGpuBuffer buffer, IDirectGpuBackend backend)
     {
-        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;   // array-backed: BindResidentBuffer armed it
-        var capturedBuffer = buffer;
-        var capturedBackend = backend;
-        Helpers.HostSync.Remove(tensor.DataVector);
-        Helpers.HostSync.Register(tensor.DataVector, obj =>
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not null) return;
+        // Views share their vector before host allocation too: download every resident slice
+        // through one callback rather than displacing a sibling's pending materializer.
+        if (Helpers.ResidentHostMirror.ArmDownload(tensor)) return;
+        var state = tensor._gpuMaterializerCallback?.Target as LazyResidentDownload<T>;
+        if (state is null || !state.Owns(tensor)) state = new LazyResidentDownload<T>(tensor, buffer, backend);
+        else state.Rebind(buffer, backend);
+        var key = tensor.DataVector;
+        tensor._gpuMaterializerKey = key;
+        tensor._gpuMaterializerCallback = state.Callback;
+        Helpers.HostSync.Remove(key);
+        Helpers.HostSync.Register(key, state.Callback);
+    }
+
+    // One callback per unmaterialized tensor: a captured optimizer swaps its device buffer each step.
+    // This state borrows the buffer; the plan's existing owners remain responsible for releasing it.
+    private sealed class LazyResidentDownload<T>
+    {
+        private readonly WeakReference<Tensor<T>> _owner;
+        private readonly object _sync = new();
+        private IGpuBuffer _buffer;
+        private IDirectGpuBackend _backend;
+        internal readonly Action<object> Callback;
+
+        internal LazyResidentDownload(Tensor<T> owner, IGpuBuffer buffer, IDirectGpuBackend backend)
         {
-            var vec = (LinearAlgebra.VectorBase<T>)obj;
-            var converted = DirectGpuEngine.FromFloatArray<T>(capturedBackend.DownloadBuffer(capturedBuffer));
+            _owner = new WeakReference<Tensor<T>>(owner);
+            _buffer = buffer;
+            _backend = backend;
+            Callback = Download;
+        }
+
+        // Metadata views copy callbacks but must never redirect the originating tensor's download state.
+        internal bool Owns(Tensor<T> tensor) => _owner.TryGetTarget(out var owner) && ReferenceEquals(owner, tensor);
+
+        internal void Rebind(IGpuBuffer buffer, IDirectGpuBackend backend)
+        {
+            lock (_sync) { _buffer = buffer; _backend = backend; }
+        }
+
+        private void Download(object key)
+        {
+            IGpuBuffer buffer;
+            IDirectGpuBackend backend;
+            lock (_sync) { buffer = _buffer; backend = _backend; }
+            var vec = (LinearAlgebra.VectorBase<T>)key;
+            var converted = DirectGpuEngine.FromFloatArray<T>(backend.DownloadBuffer(buffer));
             if (converted.Length == vec.Length)
-            {
                 vec.MaterializeBacking(converted);
-            }
+
             else
             {
                 var logical = new T[vec.Length];
                 Array.Copy(converted, logical, Math.Min(converted.Length, logical.Length));
                 vec.MaterializeBacking(logical);
             }
-        });
+        }
+
     }
 
     private ActivationCacheEntry? RekeyActivationCacheForResidentBinding<T>(

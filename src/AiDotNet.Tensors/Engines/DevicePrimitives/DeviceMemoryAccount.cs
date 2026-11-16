@@ -235,8 +235,7 @@ internal static class HostShadowMemory
     {
         if (array is null || array.Length == 0) return;
         if (s_arrays.TryGetValue(array, out _)) return;
-        long bytes = (long)array.Length * ElementBytes(array);
-        s_arrays.GetValue(array, _ => new Charge(bytes));
+        s_arrays.GetValue(array, static key => new Charge((long)key.Length * ElementBytes(key)));
     }
 
     // Managed element size: Buffer.ByteLength covers primitive arrays; anything else counts as a reference slot.
