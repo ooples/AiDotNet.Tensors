@@ -28428,7 +28428,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     ? new[] { 1 }
                     : input._shape.Take(input.Rank - traceNormDims).ToArray();
                 // The backward reads replay-time statistics through a reference holder; no trace-time values.
-                var stateRef = new LayerNormStateRef<T>();
+                int statisticRows = 1;
+                foreach (int dimension in statisticShape) statisticRows *= dimension;
+                var stateRef = new LayerNormStateRef<T>(statisticRows);
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
                     new[] { input, gamma, beta }, input._shape,
                     (eng, output) =>

@@ -127,18 +127,27 @@ public class LayerNormCompiledTests
         var input = new Tensor<double>(new[] { 1d, 3d, 5d, 9d }, new[] { 2, 2 });
         var gamma = new Tensor<double>(new[] { 1d, 1d }, new[] { 2 });
         var beta = new Tensor<double>(new[] { 0d, 0d }, new[] { 2 });
-        ICompiledTrainingPlan<double> plan;
-        using (var scope = GraphMode.Enable())
+        var parameters = new[] { input, gamma, beta };
+        Tensor<double> Objective()
         {
             var output = engine.LayerNorm(input, gamma, beta, 1e-5, out var mean, out var variance);
-            var loss = engine.TensorAdd(engine.ReduceSum(output, null),
+            return engine.TensorAdd(engine.ReduceSum(output, null),
                 engine.ReduceSum(engine.TensorAdd(mean, variance), null));
-            plan = scope.CompileTraining(new[] { input, gamma, beta }, loss);
         }
+        using var recording = ClosureObjectiveGuard<double>.BeginRecording();
+        CompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+            plan = scope.CompileTraining(parameters, Objective());
         using (plan)
         {
+            var guard = ClosureObjectiveGuard<double>.TakeRecorded(out var reason);
+            Assert.True(guard is not null, reason);
+            guard!.AttachTo(plan);
+            Assert.Equal(ClosureGuardResult.Matched, guard.TryRebind(Objective, parameters, out _));
             Assert.Equal(14d, plan.Step().ToArray()[0], 10);
             input.AsWritableSpan()[0] = 5d;
+            input.IncrementVersion();
+            Assert.Equal(ClosureGuardResult.Matched, guard.TryRebind(Objective, parameters, out _));
             Assert.Equal(16d, plan.Step().ToArray()[0], 10);
             // Statistics are detached outputs; the differentiable normalization still trains beta.
             Assert.Equal(new[] { 2d, 2d }, plan.Gradients[2].ToArray());
