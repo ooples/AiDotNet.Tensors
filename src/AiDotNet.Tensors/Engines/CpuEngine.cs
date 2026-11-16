@@ -38765,6 +38765,15 @@ public partial class CpuEngine : ITensorLevelEngine
         BeginHostScalarRead(tensor);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
+        if (tensor is SparseTensor<T> sparse)
+        {
+            // Duplicate coordinates represent one logical value: combine them before squaring.
+            // Reduce the stored values without materializing the logical dense matrix.
+            var coalesced = sparse.Coalesce();
+            if (coalesced.NonZeroCount == 0) return MathHelper.GetNumericOperations<T>().Zero;
+            tensor = new Tensor<T>(new[] { coalesced.NonZeroCount }, coalesced.DataVector);
+        }
+
 #if NET5_0_OR_GREATER
         if (typeof(T) == typeof(float))
         {
