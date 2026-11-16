@@ -25,6 +25,8 @@ internal static class OpRegistry
         "TensorTridiagonalSolve",
         // Fused GRU sequence: one node, fused BPTT on the host and the device (#1568)
         "GruSequenceForward",
+        // Sparse multi-head graph attention: one node, fused CSR forward/backward on the host and the device
+        "GraphAttentionCsr",
 
         // Tensor-level unary maths with their own backward (CpuEngine.ElementwiseExtra)
         "TensorAcosh", "TensorAsinh", "TensorExp2", "TensorExpm1", "TensorLog10", "TensorLog1p", "TensorLog2",
