@@ -638,12 +638,39 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             foreach (var (view, _) in views) Unbind(view, isResult: false);
         Unbind(_lossGradSeed);
         Unbind(_lossGradDest);
+        // A declared output (GradientRecording.RetainOutput) is a result too: the caller reads it after the step, and
+        // its device buffer is one the plan keeps (never leased, lent or evicted), so it is still there to land.
+        // Treated as an intermediate, its pending download was dropped below and a read after anything that retires
+        // the graph (ConfigureOptimizer, ApplyGradients, another plan claiming the parameters) returned the host
+        // copy of an earlier step.
+        // A declared output whose download FAILED (a CUDA copy error, a disposed buffer) keeps its device binding and its
+        // pending download: HostSync re-arms a download that throws, and unbinding would drop it, so the caller's next
+        // read would return an earlier step's host copy without an error. Left pending, that read retries the download
+        // and reports the failure. Retirement itself does not throw (Dispose runs it).
+        HashSet<Tensor<T>>? unlanded = null;
+        if (landResults)
+            foreach (var output in _retainedOutputs.Where(output => output._gpuBuffer is not null && !ReleasedByCaller(output)))
+            {
+                try
+                {
+                    if (output.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
+                    Helpers.HostSync.TryMaterialize(output.DataVector);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    (unlanded ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)).Add(output);
+                    System.Diagnostics.Trace.TraceWarning(
+                        "A declared output of a compiled training step could not be copied to the host when the plan's device "
+                        + "step was retired; it stays on the device and its next read retries the copy. " + ex.Message);
+                }
+            }
         // The pre-pass (and the aborted capture) ran every forward op on the capture path, where GPU ops bind their
         // outputs - the loss and every intermediate - to stable resident buffers. Left bound, the eager step after a
         // failed capture served those stale device copies: with a composed loss (ReduceMean over (pred - y)^2) the
         // reported loss froze at the last warmup step's value and the backward read stale intermediates.
         if (_forwardSteps is not null)
-            foreach (var step in _forwardSteps) Unbind(step.OutputBuffer, isResult: ReferenceEquals(step.OutputBuffer, _lossOutput));
+            foreach (var step in _forwardSteps.Where(step => unlanded?.Contains(step.OutputBuffer) != true))
+                Unbind(step.OutputBuffer, isResult: ReferenceEquals(step.OutputBuffer, _lossOutput));
         Unbind(_lossOutput);
         // The pre-pass bound every external input (the batch and target slots) to a stable device buffer holding THAT
         // step's data - the captured graph re-uploads them per replay (RefreshGraphInputInPlace), the eager step does
@@ -653,6 +680,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var leaf in GraphExternalLeaves()) Unbind(leaf);
         _ownedLeafBuffers.Clear();
     }
+
+    // The caller disposed the tensor, or released its device data (a host read of it then throws the release message):
+    // there is no value left to land, and landing it would only throw.
+    private static bool ReleasedByCaller(Tensor<T> output)
+        => output.IsDisposed
+           || (output.GetBackingArrayForCacheLookupUnsafe() is { } array && Helpers.HostSync.IsReleased(array))
+           || Helpers.HostSync.IsReleased(output.DataVector);
 
     /// <summary>
     /// A graph launch runs no host code, so the loss it just wrote on the device never re-arms its host download: the

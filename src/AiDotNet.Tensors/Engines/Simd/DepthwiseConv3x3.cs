@@ -32,6 +32,14 @@ internal static unsafe partial class DepthwiseConv3x3
     /// <summary>A/B and test switch: true sends every shape to the generic loops.</summary>
     internal static bool s_disable;
 
+    /// <summary>
+    /// Whether the batch-norm epilogue rounds its multiply-add once (FMA), as <see cref="NchwcBatchNorm"/> does on the
+    /// same hardware. A test clears it to run the form used where there is no FMA.
+    /// </summary>
+#if NET5_0_OR_GREATER
+    internal static bool s_epilogueFma = Fma.IsSupported;
+#endif
+
     [ThreadStatic] private static float[]? t_scratch;
 
     /// <summary>Whether these kernels cover the convolution.</summary>
@@ -425,17 +433,25 @@ internal static unsafe partial class DepthwiseConv3x3
 
     /// <summary>
     /// One channel's batch-norm epilogue, clamp(v * Scale + Bias, Low, High), rounded as <see cref="NchwcBatchNorm"/>
-    /// rounds it: a fused multiply-add where FMA is available (the lanes of a vector one by one otherwise), and the
-    /// clamp with the bound first, so a NaN passes through. Default: no epilogue.
+    /// rounds it: a fused multiply-add where FMA is available, the product and the sum rounded separately otherwise, and
+    /// the clamp with the bound first, so a NaN passes through. Every form stays in vector registers: the form without
+    /// FMA (Arm64, x86 without FMA, .NET Framework) used to copy each vector to a new array, clamp its lanes one by one
+    /// and build a vector from it, two heap allocations for every vector of outputs. Default: no epilogue.
     /// </summary>
     private readonly struct Epilogue
     {
         private readonly float _scale, _bias, _low, _high;
         private readonly bool _on;
+#if NET5_0_OR_GREATER
+        private readonly bool _fused;
+#endif
 
         internal Epilogue(float scale, float bias, float low, float high)
         {
             _scale = scale; _bias = bias; _low = low; _high = high; _on = true;
+#if NET5_0_OR_GREATER
+            _fused = s_epilogueFma;
+#endif
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -443,30 +459,48 @@ internal static unsafe partial class DepthwiseConv3x3
         {
             if (!_on) return v;
 #if NET5_0_OR_GREATER
-            if (Vector<float>.Count == 8 && Fma.IsSupported)
+            if (_fused)
             {
-                var r = Fma.MultiplyAdd(v.AsVector256(), Vector256.Create(_scale), Vector256.Create(_bias));
-                return Avx.Min(Vector256.Create(_high), Avx.Max(Vector256.Create(_low), r)).AsVector();
+                if (Vector<float>.Count == 8)
+                {
+                    var r = Fma.MultiplyAdd(v.AsVector256(), Vector256.Create(_scale), Vector256.Create(_bias));
+                    return Avx.Min(Vector256.Create(_high), Avx.Max(Vector256.Create(_low), r)).AsVector();
+                }
+                if (Vector<float>.Count == 4)
+                {
+                    var r = Fma.MultiplyAdd(v.AsVector128(), Vector128.Create(_scale), Vector128.Create(_bias));
+                    return Sse.Min(Vector128.Create(_high), Sse.Max(Vector128.Create(_low), r)).AsVector();
+                }
+                return ApplyFusedLanes(v);
             }
 #endif
-            var lanes = new float[Vector<float>.Count];
-            v.CopyTo(lanes);
-            for (int i = 0; i < lanes.Length; i++) lanes[i] = ApplyScalar(lanes[i]);
-            return new Vector<float>(lanes);
+            // v < low ? low : v, then v > high ? high : v, as NchwcBatchNorm's scalar clamp: a NaN fails both
+            // comparisons and passes through, and a negative zero is kept.
+            var low = new Vector<float>(_low);
+            var high = new Vector<float>(_high);
+            var unfused = v * new Vector<float>(_scale) + new Vector<float>(_bias);
+            unfused = Vector.ConditionalSelect(Vector.LessThan(unfused, low), low, unfused);
+            return Vector.ConditionalSelect(Vector.GreaterThan(unfused, high), high, unfused);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private float ApplyScalar(float x)
-        {
 #if NET5_0_OR_GREATER
-            float r = Fma.IsSupported ? MathF.FusedMultiplyAdd(x, _scale, _bias) : x * _scale + _bias;
-#else
-            float r = x * _scale + _bias;
-#endif
-            if (r < _low) r = _low;
-            if (r > _high) r = _high;
-            return r;
+        // FMA with a vector width that has no form above (16 lanes, when the runtime is told to prefer 512-bit vectors).
+        // Not inlined: the lanes live on this frame, which a loop in the caller would otherwise grow every iteration.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private Vector<float> ApplyFusedLanes(Vector<float> v)
+        {
+            Span<float> lanes = stackalloc float[Vector<float>.Count];
+            v.CopyTo(lanes);
+            for (int i = 0; i < lanes.Length; i++)
+            {
+                float r = MathF.FusedMultiplyAdd(lanes[i], _scale, _bias);
+                if (r < _low) r = _low;
+                if (r > _high) r = _high;
+                lanes[i] = r;
+            }
+            return new Vector<float>(lanes);
         }
+#endif
     }
 
     private static void Store(Vector<float> v, float* row, int ow, int oW, float* tail)

@@ -86,9 +86,12 @@ public class RunningStatisticsTests
     [SkippableFact]
     public void Gpu_update_matches_the_ema_from_first_touch_onward()
     {
-        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "No CUDA driver.");
-        using var engine = new DirectGpuTensorEngine();
-        Skip.IfNot(engine.IsGpuAvailable, "No DirectGpu backend.");
+        // Any DirectGpu backend: the update is IDirectGpuBackend.Scale and AddScaled, which every backend has.
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "No DirectGpu backend.");
+        using var engine = gpu!;
         Check(engine);
         CheckGraphModeReplay(engine);
     }
