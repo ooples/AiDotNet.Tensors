@@ -47,6 +47,8 @@ public sealed partial class CudaBackend
         }
 
         Release(ref _convColScratch);
+        Release(ref _convTransposeXt);
+        Release(ref _convTransposeCol);
         Release(ref _convDgradPartials);
         Release(ref _convEngineDgradPartials);
         Release(ref _convEngineDgradWeights);

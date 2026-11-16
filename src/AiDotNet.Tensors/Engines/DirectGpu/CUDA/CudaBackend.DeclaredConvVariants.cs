@@ -306,6 +306,10 @@ public sealed partial class CudaBackend
         {
             case DeclaredConvVariant.TransposeForward:
                 // A = transposed input x [B, inC, H, W] (the convolution's output gradient), Output = y.
+                if (TryConvTranspose2DGemm(a.A, a.B, a.Output, null, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                        a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH,
+                        a.PadW))
+                    return true;
                 Conv2DBackwardInput(a.A, a.B, a.Output, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth,
                     a.InChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
                     1, 1);
