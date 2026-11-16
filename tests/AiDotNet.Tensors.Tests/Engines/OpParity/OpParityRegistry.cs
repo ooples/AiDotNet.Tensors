@@ -2222,6 +2222,15 @@ public static class OpParityRegistry
             }
         };
 
+        // Sparse (CSR) graph attention: 2 graphs of 4 nodes, 2 heads x 3 features, self-loops plus a ring.
+        var csrGraph = new CsrGraph(4, new[] { 0, 2, 4, 6, 8 }, new[] { 0, 1, 1, 2, 2, 3, 0, 3 });
+        var csrWh = OpInput.Rand(5014, new[] { 8, 6 });
+        var csrAttn = OpInput.Rand(5015, new[] { 2, 6 });
+        yield return new OpCase("GraphAttentionCsr[2x4,h2f3]", "attention",
+            e => e.GraphAttentionCsr(csrWh.F(), csrAttn.F(), csrGraph, 0.2),
+            e => e.GraphAttentionCsr(csrWh.D(), csrAttn.D(), csrGraph, 0.2),
+            ParityTol.Accum(1e-3), opMethod: "GraphAttentionCsr");
+
         // Occupancy-grid update: grid [64]=(gridSize 4)^3, densities [5], positions [5,3] in [0,4).
         var occ = OpInput.Rand(5020, new[] { 64 }, 0.0, 1.0);
         var dens = OpInput.Rand(5021, new[] { 5 }, 0.0, 1.0);
