@@ -208,6 +208,9 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             {
                 GraphMode.SetCurrent(scope);
                 var loss = forward();
+                if (scope.HasRetainedOutputs)
+                    throw new NotSupportedException("Mixed-precision compiled plans do not support retained outputs.");
+
                 scope.MarkCompiled();
                 return Compile(loss, engine);
             }
@@ -229,6 +232,10 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     {
         if (finalOutput is null) throw new ArgumentNullException(nameof(finalOutput));
         engine ??= AiDotNetEngine.Current;
+        if (GraphMode.Current is { HasRetainedOutputs: true } retainedScope
+            && finalOutput.LazySource is ILazyNode retainedRoot && retainedScope.Nodes.Contains(retainedRoot))
+            throw new NotSupportedException("Mixed-precision compiled plans do not support retained outputs.");
+
         if (finalOutput.LazySource is not ILazyNode root)
             throw new InvalidOperationException("finalOutput has no lazy source — nothing to compile.");
 

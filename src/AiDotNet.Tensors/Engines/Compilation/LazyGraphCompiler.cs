@@ -13,11 +13,12 @@ internal sealed class LazyGraphCompiler
 
     /// <param name="forTraining">True when the compiled graph will be differentiated (a training plan): fusions
     /// without a backward are not applied.</param>
-    internal LazyGraphCompiler(bool forTraining = false)
+    /// <param name="observableOutputs">Nodes whose outputs must remain independently observable after execution.</param>
+    internal LazyGraphCompiler(bool forTraining = false, HashSet<ILazyNode>? observableOutputs = null)
     {
         _passes = new List<ILazyGraphOptimizationPass>
         {
-            new CpuFusionPass(forTraining),
+            new CpuFusionPass(forTraining, observableOutputs),
             new DeadCodeEliminationPass(),
             new OperationReorderingPass(),
             new MemoryPlanningPass()

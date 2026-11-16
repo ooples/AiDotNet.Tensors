@@ -61,6 +61,7 @@ public sealed class BatchNormAffineFoldTests
         Assert.Same(folded.Scale, CpuEngine.BatchNormAffineFold<double>.Get(engine, gamma, beta, mean, variance, .01).Scale);
     }
 
+
     [Fact]
     public void Double_precision_and_cache_invalidation_follow_the_tensor_operands()
     {

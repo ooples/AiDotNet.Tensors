@@ -6547,6 +6547,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var converted = DirectGpuEngine.FromFloatArray<T>(backend.DownloadBuffer(buffer));
             if (converted.Length == vec.Length)
                 vec.MaterializeBacking(converted);
+
             else
             {
                 var logical = new T[vec.Length];
@@ -6554,6 +6555,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 vec.MaterializeBacking(logical);
             }
         }
+
     }
 
     private ActivationCacheEntry? RekeyActivationCacheForResidentBinding<T>(
@@ -7141,6 +7143,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={idxBuf.Size} impliedV={tableBuf.Size/embeddingDim}");
             backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
+            // A device write must re-arm host synchronization as well as publishing its resident buffer.
             BindResidentBuffer(output, outBuf, backend);
             return true;
         }

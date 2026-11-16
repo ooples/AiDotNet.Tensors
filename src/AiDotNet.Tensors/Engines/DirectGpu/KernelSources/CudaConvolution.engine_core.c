@@ -344,4 +344,3 @@ __device__ __forceinline__ void conv2d_fprop_ig_body(
         }
     }
 }
-

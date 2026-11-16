@@ -4808,6 +4808,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     return new[] { freshMean, freshVariance };
                 },
                 operationName: "GroupNormIntoStatistics");
+            // These statistics belong to the preceding Into call, whose destination is the primary result.
+            foreach (var node in statistics.Select(statistic => statistic.LazySource).OfType<LazyNode<T>>())
+                node.PrimaryOutput = output;
+
             mean = statistics[0];
             variance = statistics[1];
             return;
@@ -28356,22 +28360,6 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    /// <summary>
-    /// The shape of LayerNorm's per-row statistics when <paramref name="gamma"/> and <paramref name="beta"/> span the
-    /// input's trailing dimensions (the leading dimensions, or [1] when gamma covers the whole input); null otherwise.
-    /// </summary>
-    private static int[]? LayerNormStatShape<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta)
-    {
-        int normDims = gamma.Rank;
-        if (gamma.Length == 0 || beta.Length != gamma.Length || normDims > input.Rank) return null;
-        for (int i = 0; i < normDims; i++)
-            if (gamma._shape[i] != input._shape[input.Rank - normDims + i]) return null;
-        var stat = new int[Math.Max(1, input.Rank - normDims)];
-        if (input.Rank == normDims) stat[0] = 1;
-        else for (int i = 0; i < stat.Length; i++) stat[i] = input._shape[i];
-        return stat;
-    }
-
     public virtual Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("LayerNorm");
@@ -28429,57 +28417,22 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
-                int[] lnShape;
-                Tensor<T>? eagerResult = null;
-                if (this is DirectGpuTensorEngine && LayerNormStatShape(input, gamma, beta) is { } statShape)
-                {
-                    // The GPU trace needs only the shapes: the realized forward sets the statistics the backward reads
-                    // (stateRef below). An eager pass here ran LayerNorm at trace time, which realized every lazy node
-                    // upstream and copied each result to the host: on ViT 470 MB of forward buffers written on the host
-                    // that the device plan never reads, most of the training process's peak resident set.
-                    lnShape = (int[])input._shape.Clone();
-                    mean = Tensor<T>.CreateDeferred(statShape);
-                    variance = Tensor<T>.CreateDeferred((int[])statShape.Clone());
-                }
-                else
-                {
-                    var savedScope = GraphMode.Current;
-                    GraphMode.SetCurrent(null);
-                    eagerResult = LayerNorm(ci, cg, cb, ce, out mean, out variance);
-                    lnShape = eagerResult._shape;
-                    GraphMode.SetCurrent(savedScope);
-                }
-                // AiDotNet#1331: mean/variance returned by the compile-time
-                // eager call are stale once the lazy graph replays — the
-                // forward replay re-runs LayerNorm on the freshly-computed
-                // input, but the savedState mean/variance tensors are NOT
-                // re-updated, so the backward kernel reads compile-time
-                // values (zero, since the lazy input was uninitialized at
-                // compile time). The result: gradGamma and dL/dInput silently
-                // become zero, gamma never trains, and every parameter
-                // upstream of any LayerNorm stops learning. Fix: the lazy
-                // execute callback recomputes mean/variance via the
-                // out-param overload and copies them into the SAME tensor
-                // instances the savedState slot holds, so the backward
-                // reads fresh values on every plan.Step().
-                // AiDotNet#1331 follow-up (2026-06-05): the compile-time mean/variance
-                // (captured here) can be sized for a DIFFERENT input rank than the
-                // realize-time forward computes — the lazy graph fed LayerNorm a
-                // [B, D] tensor at trace but [B, S, D] at replay, so the trace-time
-                // mean is [B] (32) while replay needs [B, S] (1024). The old code
-                // CopyTo'd fresh -> captured and threw "Destination is too short",
-                // which silently disabled the ENTIRE fused compiled-training path for
-                // every transformer (LayerNorm is in every block). Fix: route the
-                // realize-time mean/variance to the backward via a mutable holder
-                // (reference swap, no copy, no size assumption). LayerNormBackward
-                // unwraps the holder; the eager paths still pass raw tensors.
-                var stateRef = new LayerNormStateRef<T> { Mean = mean, Variance = variance };
+                // Recording uses shape metadata; actual reads realize the normalization and its statistics.
+                int traceNormDims = gamma.Rank;
+                if (traceNormDims > input.Rank)
+                    throw new ArgumentException("Gamma has more dimensions than input.", nameof(gamma));
+                for (int i = 0; i < traceNormDims; i++)
+                    if (gamma._shape[i] != input._shape[input.Rank - traceNormDims + i])
+                        throw new ArgumentException("Gamma shape must match the trailing input dimensions.", nameof(gamma));
+                var statisticShape = input.Rank == traceNormDims
+                    ? new[] { 1 }
+                    : input._shape.Take(input.Rank - traceNormDims).ToArray();
+                // The backward reads replay-time statistics through a reference holder; no trace-time values.
+                var stateRef = new LayerNormStateRef<T>();
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "LayerNorm",
-                    new[] { input, gamma, beta }, lnShape,
+                    new[] { input, gamma, beta }, input._shape,
                     (eng, output) =>
                     {
-                        // GPU-resident compiled-step path: normalize into output's stable buffer + stable mean/var
-                        // scratch (no fresh alloc that aborts CUDA-graph capture). Falls back to the eager path.
                         if (eng.TryGet<DirectGpuTensorEngine>(out var lnGpu)
                             && lnGpu.TryLayerNormResidentInto(output, ci, cg, cb, ce, out var rMean, out var rVar))
                         {
@@ -28489,16 +28442,15 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                         var r = eng.LayerNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                        // Hand the correctly-shaped realize-time stats to backward
-                        // by reference — avoids the trace-vs-replay size mismatch.
                         stateRef.Mean = freshMean;
                         stateRef.Variance = freshVar;
                     },
                     BackwardFunctions<T>.LayerNormBackward, new object[] { stateRef, stateRef, epsilon });
-                if (eagerResult is null) return lazyResult;   // GPU trace: realized when something needs it
-                using var eagerResultKeep2 = new KeepAliveScope(eagerResult);
-                using var lazyResultKeep2 = new KeepAliveScope(lazyResult);
-                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
+                // Downstream dependencies schedule consumers after the current replay's statistics refresh.
+                mean = scope.RecordUnary(LazyNodeType.Custom, "LayerNormMean", lazyResult, statisticShape,
+                    (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, stateRef.Mean!, output));
+                variance = scope.RecordUnary(LazyNodeType.Custom, "LayerNormVariance", lazyResult, statisticShape,
+                    (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, stateRef.Variance!, output));
                 return lazyResult;
             }
         }
