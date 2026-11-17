@@ -12882,7 +12882,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 /// <summary>
 /// HIP GPU buffer wrapper implementing IGpuBuffer.
 /// </summary>
-internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
 {
     // The DeviceMemoryReclaim epoch of this buffer's current charge (set at each allocation or pool hit).
     internal long ReclaimEpoch = -1;
@@ -12902,6 +12902,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal bool IsReleased =>
         Volatile.Read(ref _poolState) != 0 || (_viewParent is HipGpuBuffer parent && parent.IsReleased);
     private readonly IGpuBuffer? _viewParent;
+    IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
     private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
     // Device memory another library owns (a DLPack import): never pooled or freed here; releasing the buffer waits for
     // the device's queued work and then runs this once. _isExternal is fixed at construction, so the release path is
