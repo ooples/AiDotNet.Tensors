@@ -1571,8 +1571,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateBuffer(float[] data)
         {
-            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
-                return BufferAllocationDiagnostics.Observe("OpenCL", (long)data.Length * sizeof(float), (this, data),
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+                return BufferAllocationDiagnostics.Observe("OpenCL", BufferAllocationDiagnostics.Primitive32Bytes(data), (this, data),
                     static state => state.Item1.AllocateBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");

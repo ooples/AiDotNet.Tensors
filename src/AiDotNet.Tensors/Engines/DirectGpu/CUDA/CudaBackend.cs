@@ -1934,8 +1934,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
-        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
-            return BufferAllocationDiagnostics.Observe("CUDA", (long)data.Length * sizeof(float), (this, data),
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", BufferAllocationDiagnostics.Primitive32Bytes(data), (this, data),
                 static state => state.Item1.AllocateBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");

@@ -18,9 +18,10 @@ internal static class CpuStorageAllocationDiagnostics
     private static readonly RequestRecorder Recorder = new();
     internal static bool IsInsideRequest => RequestRecorder.IsInside;
 
-    internal static long ShapeBytes<T>(int[] shape)
+    internal static long ShapeBytes<T>(int[]? shape)
     {
         // Let the allocator retain its own validation/exception contract; invalid requests never count.
+        if (shape is null) return 0;
         long length = 1;
         foreach (int dimension in shape)
         {

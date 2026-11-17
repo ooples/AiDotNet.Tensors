@@ -525,7 +525,7 @@ public static class TensorAllocator
     /// </summary>
     public static Tensor<T> RentUninitialized<T>(int[] shape)
     {
-        if (CpuStorageAllocationDiagnostics.Enabled && !CpuStorageAllocationDiagnostics.IsInsideRequest && shape is not null)
+        if (CpuStorageAllocationDiagnostics.Enabled && !CpuStorageAllocationDiagnostics.IsInsideRequest)
             return CpuStorageAllocationDiagnostics.Observe("tensor.RentUninitialized", CpuStorageAllocationDiagnostics.ShapeBytes<T>(shape),
                 shape, static value => RentUninitialized<T>(value));
         int totalSize = 1;
