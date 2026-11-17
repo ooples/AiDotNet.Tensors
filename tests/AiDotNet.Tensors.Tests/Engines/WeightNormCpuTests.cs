@@ -156,6 +156,34 @@ public sealed class WeightNormCpuTests
     }
 
     [Fact]
+    public void TiedDirectionAndGainClaimFirstWriteOnceThenAccumulateBothContributions()
+    {
+        var engine = new CpuEngine();
+        var values = new[] { -.4, .2, .9 };
+        var upstream = new[] { .3, -.1, .4 };
+        var tied = Tensor<double>(values, new[] { 3 });
+        var h = Tensor<double>(upstream, new[] { 3 });
+        var gradient = new Tensor<double>(new[] { 3 }); gradient.Fill(19);
+        var expected = new double[3];
+        const double step = 1e-6;
+        double Objective() => Forward(values, values, .001).Zip(upstream, (a, b) => a * b).Sum();
+        for (int i = 0; i < 3; i++)
+        {
+            double original = values[i];
+            values[i] = original + step; double plus = Objective();
+            values[i] = original - step; double minus = Objective();
+            values[i] = original;
+            expected[i] = (plus - minus) / (2 * step);
+        }
+        engine.TensorWeightNormBackwardInto(h, tied, tied, gradient, gradient, .001,
+            accumulateDirection: false, accumulateGain: true);
+        Close(expected, gradient.ToArray(), 1e-9);
+        engine.TensorWeightNormBackwardInto(h, tied, tied, gradient, gradient, .001,
+            accumulateDirection: true, accumulateGain: true);
+        Close(expected.Select(x => 2 * x).ToArray(), gradient.ToArray(), 2e-9);
+    }
+
+    [Fact]
     public void StridedSourcesAndDestinationsUseLogicalElementOrder()
     {
         var engine = new CpuEngine();
