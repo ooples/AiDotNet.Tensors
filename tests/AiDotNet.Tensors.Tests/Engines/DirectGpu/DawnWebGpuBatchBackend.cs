@@ -111,6 +111,17 @@ internal sealed class DawnWebGpuBatchBackend : DelegatingGpuBackend, IGpuBatchEx
         => _portable.ReduceLogVariance(input, output, outerSize, reduceSize);
     public void CumSumAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
         => _portable.CumSumAxis(input, output, outerSize, innerSize);
+    public void WeightNorm(IGpuBuffer direction, IGpuBuffer gain, IGpuBuffer output, int rows, int columns, float epsilon)
+        => _launch(BatchExecutionCudaKernels.WeightNorm, checked(rows * 256), direction, gain, output, rows, columns, epsilon);
+    public void WeightNormStats(IGpuBuffer gradOutput, IGpuBuffer direction, IGpuBuffer stats, int rows, int columns, float epsilon)
+        => _launch(BatchExecutionCudaKernels.WeightNormStats, checked(rows * 256), gradOutput, direction, stats, rows, columns, epsilon);
+    public void WeightNormDirectionGradient(IGpuBuffer gradOutput, IGpuBuffer direction, IGpuBuffer gain, IGpuBuffer stats,
+        IGpuBuffer gradDirection, int rows, int columns, bool accumulate)
+        => _launch(BatchExecutionCudaKernels.WeightNormDirectionGrad, checked(rows * columns),
+            gradOutput, direction, gain, stats, gradDirection, rows, columns, accumulate ? 1 : 0);
+    public void WeightNormGainGradient(IGpuBuffer stats, IGpuBuffer gradGain, int rows, bool accumulate)
+        => _launch(BatchExecutionCudaKernels.WeightNormGainGrad, rows, stats, gradGain, rows, accumulate ? 1 : 0);
+
     public void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
         => _portable.NormalizeL2(input, output, outerSize, innerSize);
     public void LogSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
