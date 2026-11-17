@@ -99,6 +99,12 @@ internal static class TrainingPlanWriter
         writer.Write(nameBytes.Length);
         writer.Write(nameBytes);
 
+        writer.Write((byte)((step.RecordedUnderNoGrad ? 1 : 0) | (step.BackwardFn is not null ? 2 : 0)));
+        var differentiableInputs = step.DifferentiableInputIndices;
+        writer.Write(differentiableInputs?.Length ?? -1);
+        if (differentiableInputs is not null)
+            foreach (int index in differentiableInputs) writer.Write(index);
+
         writer.Write(step.Inputs.Length);
         for (int j = 0; j < step.Inputs.Length; j++)
             writer.Write(tensorMap.GetId(step.Inputs[j]));

@@ -107,6 +107,9 @@ public sealed partial class CudaBackend
         private uint _initialApplied;
         private MultiTensorTable? _gradientTable;   // private to this graph (see PrepareOptimizer)
         private MultiTensorTable? _adamTable;
+        private IGpuBuffer? _acceptedOffsets; // optional private int64 per-parameter offsets; no all-zero allocation
+        private long _minimumAcceptedOffset;
+        private bool _appliedInitialized;
         private readonly MultiTensorTable?[] _pingPong = new MultiTensorTable?[2];   // A -> B, B -> A (PrepareSgdPingPong)
         private IGpuBuffer? _pingPongPartials;   // a double per chunk
         private IGpuBuffer? _pingPongDone;       // the kernel's finished-block counter, zero between launches
@@ -214,8 +217,11 @@ public sealed partial class CudaBackend
 
         public void InitializeAppliedSteps(uint applied)
         {
+            if (_minimumAcceptedOffset < -(long)applied)
+                throw new ArgumentOutOfRangeException(nameof(applied), "The applied count would make a captured parameter age negative.");
             EnsureOptimizerBuffers();   // the prologue (recorded first) resolves the learning rate into them
             _initialApplied = applied;
+            _appliedInitialized = true;
             using var _ = _backend.PushContext();
             // state[0] = replays done (the caller waited for every launched replay), state[1] = applied.
             var bytes = new byte[16];
@@ -271,17 +277,61 @@ public sealed partial class CudaBackend
         }
 
         public void PrepareOptimizer(IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
-            IReadOnlyList<IGpuBuffer>? firstMoments, IReadOnlyList<IGpuBuffer>? secondMoments, IReadOnlyList<int> sizes)
+            IReadOnlyList<IGpuBuffer>? firstMoments, IReadOnlyList<IGpuBuffer>? secondMoments, IReadOnlyList<int> sizes,
+            IReadOnlyList<long>? acceptedUpdateOffsets = null)
         {
+            if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+            if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+            if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+            int n = parameters.Count;
+            if (gradients.Count != n || sizes.Count != n ||
+                (firstMoments is null) != (secondMoments is null) ||
+                (firstMoments is not null && firstMoments.Count != n) ||
+                (secondMoments is not null && secondMoments.Count != n) ||
+                (acceptedUpdateOffsets is not null && acceptedUpdateOffsets.Count != n))
+                throw new ArgumentException("Optimizer tables and accepted-update offsets must have one entry per parameter.");
+            long minimumOffset = 0;
+            byte[]? offsetBytes = null;
+            if (acceptedUpdateOffsets is not null)
+            {
+                // Clone before ownership changes; the caller may reuse its list after this method returns.
+                for (int i = 0; i < n; i++)
+                {
+                    long offset = acceptedUpdateOffsets[i];
+                    if (offset > 0 || offset < -(long)uint.MaxValue ||
+                        (offset != 0 && (!_appliedInitialized || offset < -(long)_initialApplied)))
+                        throw new ArgumentOutOfRangeException(nameof(acceptedUpdateOffsets),
+                            "Offsets must describe nonnegative accepted ages no greater than the initialized global age.");
+                    if (offset != 0 && firstMoments is null)
+                        throw new ArgumentException("Accepted-update offsets apply only to Adam optimizers.", nameof(acceptedUpdateOffsets));
+                    if (offset != 0 && offsetBytes is null) offsetBytes = new byte[checked(n * sizeof(long))];
+                    if (offsetBytes is not null) BitConverter.GetBytes(offset).CopyTo(offsetBytes, i * sizeof(long));
+                    minimumOffset = Math.Min(minimumOffset, offset);
+                }
+            }
             EnsureOptimizerBuffers();
-            _gradientTable?.Dispose();
-            _gradientTable = _backend.BuildGradientTable(gradients, sizes);
-            _adamTable?.Dispose();
-            _adamTable = firstMoments is not null && secondMoments is not null
-                ? _backend.BuildAdamTable(parameters, gradients, firstMoments, secondMoments, sizes)
-                : null;
+            MultiTensorTable? gradientTable = null, adamTable = null;
+            IGpuBuffer? offsets = null;
+            try
+            {
+                gradientTable = _backend.BuildGradientTable(gradients, sizes);
+                if (firstMoments is not null && secondMoments is not null)
+                    adamTable = _backend.BuildAdamTable(parameters, gradients, firstMoments, secondMoments, sizes);
+                if (offsetBytes is not null)
+                {
+                    offsets = _backend.AllocateByteBuffer(offsetBytes.Length);
+                    _backend.UploadByteBuffer(offsets, offsetBytes);
+                }
+            }
+            catch
+            {
+                gradientTable?.Dispose(); adamTable?.Dispose(); offsets?.Dispose();
+                throw;
+            }
+            _gradientTable?.Dispose(); _adamTable?.Dispose(); _acceptedOffsets?.Dispose();
+            _gradientTable = gradientTable; _adamTable = adamTable; _acceptedOffsets = offsets;
+            _minimumAcceptedOffset = minimumOffset;
         }
-
         public void CaptureSgdUpdate(IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
             IReadOnlyList<int> sizes, float weightDecay)
         {
@@ -325,13 +375,13 @@ public sealed partial class CudaBackend
             IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments, IReadOnlyList<int> sizes,
             float beta1, float beta2, float epsilon, float weightDecay)
         {
-            if (_gradientTable is null || _adamTable is null)
+            if (_gradientTable is null || _adamTable is null || _dynamicScalars is null || _state is null)
                 throw new InvalidOperationException("PrepareOptimizer was not called before the capture.");
             _backend.MultiTensorSumOfSquares(_gradientTable, _guard!, zeroFirst: false);   // the epilogue re-zeroes it
-            // learningRate and step are placeholders: the kernel reads both from the dynamic scalars.
+            // Learning rate remains global; each leaf's accepted age comes from integer state plus its offset.
             _backend.MultiTensorAdamImpl(decoupled ? "adamw_multi_tensor_update" : "adam_multi_tensor_update",
                 parameters, gradients, firstMoments, secondMoments, sizes, 0f, beta1, beta2, epsilon, weightDecay, 1,
-                _guard, _dynamicScalars!.Handle, _adamTable);
+                _guard, _dynamicScalars.Handle, _adamTable, _acceptedOffsets?.Handle ?? IntPtr.Zero, _state.Handle);
         }
 
         public void Flush()
@@ -435,6 +485,7 @@ public sealed partial class CudaBackend
             _guard?.Dispose();
             _gradientTable?.Dispose();
             _adamTable?.Dispose();
+            _acceptedOffsets?.Dispose();
             DisposePingPong();
             if (_results != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_results);
             _results = IntPtr.Zero;

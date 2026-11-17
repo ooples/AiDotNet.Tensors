@@ -40000,7 +40000,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { condition, x, y }, x._shape,
                     (eng, output) => { var r = eng.TensorWhere(cc, cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     backwardFn,
-                    savedState);
+                    savedState, differentiableInputIndices: new[] { 1, 2 });
             }
         }
         var yOrig = y;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.

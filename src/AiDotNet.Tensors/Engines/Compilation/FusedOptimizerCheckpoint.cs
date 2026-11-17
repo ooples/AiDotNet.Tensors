@@ -306,7 +306,28 @@ internal sealed class FusedOptimizerCheckpoint
     public double[]? GroupWeightDecays { get; set; }
 
     public FusedOptimizerScalarCheckpoint Scalars { get; set; } = new FusedOptimizerScalarCheckpoint();
+    public FusedLbfgsHistoryCheckpoint? LbfgsHistory { get; set; }
+    /// <summary>The immutable canonical active subspace of a coupled optimizer; null for separable methods.</summary>
+    public bool[]? FixedActiveDomain { get; set; }
     public FusedOptimizerParameterCheckpoint[] Parameters { get; set; } = System.Array.Empty<FusedOptimizerParameterCheckpoint>();
+
+    internal static bool RequiresFixedActiveDomain(OptimizerType type)
+        => type is OptimizerType.LBFGS or OptimizerType.TrustRegion or OptimizerType.ConjugateGradient
+            or OptimizerType.HypergradientSGD or OptimizerType.DAdaptationSGD or OptimizerType.ScheduleFreeSGD;
+}
+
+internal sealed class FusedLbfgsHistoryCheckpoint
+{
+    public float[][] S { get; set; } = System.Array.Empty<float[]>();
+    public float[][] Y { get; set; } = System.Array.Empty<float[]>();
+    public float[] Rho { get; set; } = System.Array.Empty<float>();
+    public float[] PrevParam { get; set; } = System.Array.Empty<float>();
+    public float[] PrevGrad { get; set; } = System.Array.Empty<float>();
+    public int Count { get; set; }
+    public int Head { get; set; }
+    public bool HasPrev { get; set; }
+    public float GammaNum { get; set; }
+    public float GammaDen { get; set; }
 }
 
 internal sealed class FusedOptimizerScalarCheckpoint
@@ -329,6 +350,9 @@ internal sealed class FusedOptimizerScalarCheckpoint
 
 internal sealed class FusedOptimizerParameterCheckpoint
 {
+    /// <summary>Accepted updates of this canonical parameter, distinct from the plan's scheduler step.</summary>
+    public long AcceptedUpdates { get; set; }
+
     public float[]? MFloat { get; set; }
     public float[]? VFloat { get; set; }
     public float[]? VMaxFloat { get; set; }

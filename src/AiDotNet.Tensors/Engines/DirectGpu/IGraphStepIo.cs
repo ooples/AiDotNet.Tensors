@@ -100,12 +100,15 @@ internal interface IGraphStepIo : IDisposable
     /// <summary>
     /// Builds, before the capture, the device tables the captured optimizer reads (the graph keeps them, so another
     /// tensor list replacing the backend's shared tables cannot invalidate it). <paramref name="firstMoments"/> and
-    /// <paramref name="secondMoments"/> are null for SGD.
+    /// <paramref name="secondMoments"/> are null for SGD. The optional accepted-update offsets are signed differences
+    /// between each parameter's accepted age and the initialized global age, in parameter order. Nonzero offsets
+    /// require <see cref="InitializeAppliedSteps"/> first; null or all zero uses no offset-table allocation.
     /// </summary>
     void PrepareOptimizer(System.Collections.Generic.IReadOnlyList<IGpuBuffer> parameters,
         System.Collections.Generic.IReadOnlyList<IGpuBuffer> gradients,
         System.Collections.Generic.IReadOnlyList<IGpuBuffer>? firstMoments,
-        System.Collections.Generic.IReadOnlyList<IGpuBuffer>? secondMoments, System.Collections.Generic.IReadOnlyList<int> sizes);
+        System.Collections.Generic.IReadOnlyList<IGpuBuffer>? secondMoments, System.Collections.Generic.IReadOnlyList<int> sizes,
+        System.Collections.Generic.IReadOnlyList<long>? acceptedUpdateOffsets = null);
 
     /// <summary>
     /// Records, inside the capture, the gradients' finiteness reduction and a plain-SGD update of every tensor that

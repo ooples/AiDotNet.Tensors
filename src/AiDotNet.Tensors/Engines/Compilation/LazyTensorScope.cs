@@ -489,12 +489,14 @@ internal sealed class LazyTensorScope : IDisposable
         int[] outputShape,
         Action<IEngine, Tensor<T>> execute,
         BackwardFunction<T>? backwardFn = null,
-        object[]? savedState = null)
+        object[]? savedState = null,
+        int[]? differentiableInputIndices = null)
     {
         var output = RentOutput<T>(outputShape);
 
         backwardFn = GradientEdge(backwardFn, out bool noGrad);
         var node = new LazyNode<T>(opType, opName, inputs, output, execute, backwardFn, savedState) { RecordedUnderNoGrad = noGrad };
+        node.SetDifferentiableInputIndices(differentiableInputIndices);
         output.LazySource = node;
         AddNode(node);
 

@@ -28,6 +28,8 @@ internal static class OpReplay
     {
         return opType switch
         {
+            OpType.StopGradient => ReplayStopGradient(engine, inputs),
+            OpType.TensorAddInPlace => ReplayAddInPlace(engine, inputs),
             // ── Parameterless unary ─────────────────────────────────
             OpType.Sigmoid       => engine.Sigmoid(inputs[0]),
             OpType.Tanh          => engine.Tanh(inputs[0]),
@@ -130,6 +132,21 @@ internal static class OpReplay
             _ => throw new NotSupportedException(
                 $"OpType {opType} ('{opName}') is not supported for training plan replay."),
         };
+    }
+
+    private static Tensor<T> ReplayStopGradient<T>(IEngine engine, Tensor<T>[] inputs)
+    {
+        if (inputs.Length != 1)
+            throw new InvalidDataException($"StopGradient replay requires exactly 1 input, got {inputs.Length}.");
+        return engine.StopGradient(inputs[0]);
+    }
+
+    private static Tensor<T> ReplayAddInPlace<T>(IEngine engine, Tensor<T>[] inputs)
+    {
+        if (inputs.Length != 2)
+            throw new InvalidDataException($"TensorAddInPlace replay requires exactly 2 inputs, got {inputs.Length}.");
+        engine.TensorAddInPlace(inputs[0], inputs[1]);
+        return inputs[0];
     }
 
     private static Tensor<int> SavedIndices(object[]? savedState, string opName) =>

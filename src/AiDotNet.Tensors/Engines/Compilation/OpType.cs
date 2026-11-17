@@ -110,6 +110,9 @@ internal enum OpType : byte
     GroupedQueryAttention,
     TensorScatter,
     TensorIndexSelect,
+    // Training-gradient boundaries and in-place history; appended without changing existing ordinals.
+    StopGradient,
+    TensorAddInPlace,
 }
 
 internal static class OpTypeParser
@@ -191,6 +194,8 @@ internal static class OpTypeParser
         "GroupedQueryAttention" => OpType.GroupedQueryAttention,
         "TensorScatter" => OpType.TensorScatter,
         "TensorIndexSelect" => OpType.TensorIndexSelect,
+        "StopGradient" => OpType.StopGradient,
+        "TensorAddInPlace" => OpType.TensorAddInPlace,
         _ => OpType.Unknown,
     };
 }

@@ -25,8 +25,28 @@ internal delegate Tensor<TIn>? CrossTypeBackwardFunction<TIn, TOut>(
 /// <see cref="BackwardFn"/>, the differentiable FP32↔FP16 cast that bridges the two grad spaces in
 /// mixed-precision (#555) training.
 /// </summary>
-internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNode
+internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNode, ICompiledForwardNode, ICrossTypeNodeMetadata
 {
+    Type ICrossTypeNodeMetadata.InputElementType => typeof(TIn);
+    Type ICrossTypeNodeMetadata.OutputElementType => typeof(TOut);
+    bool ICrossTypeNodeMetadata.HasBackward => BackwardFn is not null;
+    Action<IEngine> ICompiledForwardNode.CompileForwardAction() => engine =>
+    {
+        DirectGpuTensorEngine.s_currentForwardOp = OpName;
+        Execute(engine, Output);
+        ForwardOnlyHeterogeneousReplay.CommitOutput(Output, OpName);
+        IsRealized = true;
+    };
+
+    void ICompiledForwardNode.ProtectDeviceState(HashSet<object> keys) { }
+
+    void ICompiledForwardNode.DetachDeviceBindings(HashSet<DirectGpu.IGpuBuffer> released, HashSet<IntPtr> handles, HashSet<object> retained)
+    {
+        ForwardOnlyHeterogeneousReplay.DetachTensor(Output, released, handles,
+            !retained.Contains(Output) && !retained.Contains(((ITensorStorageLeaseSource)Output).StorageIdentity));
+        ForwardOnlyHeterogeneousReplay.DetachTensor(Input, released, handles);
+    }
+
     Type ISignableLazyNode.OutputElementType => typeof(TOut);
     object ISignableLazyNode.OutputTensor => Output;
     int ISignableLazyNode.SignatureInputCount => 1;
@@ -36,6 +56,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     object[]? ISignableLazyNode.SavedStateObjects => SavedState;
     bool ISignableLazyNode.ReplaysHostStateFlag => false;
     object? ISignableLazyNode.AuxiliaryOutput => null;
+    int[]? ISignableLazyNode.DifferentiableInputIndices => null;
     public bool RecordedInProbe { get; set; }
 
     /// <inheritdoc />
