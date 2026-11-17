@@ -22,6 +22,12 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
             for (int storage = 0; storage < 3; storage++) yield return new object[] { rows, columns, layers, storage };
     }
 
+    public static IEnumerable<object[]> FinalizerCases()
+    {
+        foreach (var (rows, columns) in new[] { (2, 257), (8, 17) })
+            for (int storage = 0; storage < 3; storage++) yield return new object[] { rows, columns, storage };
+    }
+
     [Theory]
     [MemberData(nameof(Cases))]
     public void CpuPrimitiveCompositionRetainsEveryParameterGradient(int rows, int columns, int layers, int storage)
@@ -37,7 +43,22 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
         Verify(engine, rows, columns, layers, storage);
     }
 
-    private static void Verify(IEngine engine, int rows, int columns, int layers, int storage)
+    [Theory]
+    [MemberData(nameof(FinalizerCases))]
+    public void CpuUnmaterializedComposedGradientsSurviveProducerFinalizers(int rows, int columns, int storage)
+        => Verify(new CpuEngine(), rows, columns, layers: 6, storage, forceFinalizers: true);
+
+    [SkippableTheory]
+    [MemberData(nameof(FinalizerCases))]
+    public void CudaUnmaterializedComposedGradientsSurviveProducerFinalizers(int rows, int columns, int storage)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No direct GPU backend available.");
+        var engine = _fixture.Engine ?? throw new InvalidOperationException();
+        Skip.IfNot(engine.Name.IndexOf("CUDA", StringComparison.OrdinalIgnoreCase) >= 0, "This regression requires CUDA.");
+        Verify(engine, rows, columns, layers: 6, storage, forceFinalizers: true);
+    }
+
+    private static void Verify(IEngine engine, int rows, int columns, int layers, int storage, bool forceFinalizers = false)
     {
         var previous = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
@@ -61,6 +82,7 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
             {
                 var parameters = new Parameters(data, storage, createViews: storage != 2);
                 List<(string Name, Tensor<float> Actual, double[] Expected)> retained;
+                Dictionary<Tensor<float>, Tensor<float>> gradients;
                 using (var tape = new GradientTape<float>())
                 {
                     if (storage == 2) parameters.CreateViews();
@@ -75,7 +97,7 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
                     var seed = new Tensor<float>((float[])data.Seed.Clone(), data.Shape);
                     var loss = engine.ReduceSum(engine.TensorMultiply(activation, seed), null, false);
                     var sources = parameters.Sources();
-                    var gradients = tape.ComputeGradients(loss, sources);
+                    gradients = tape.ComputeGradients(loss, sources);
                     retained = new List<(string, Tensor<float>, double[])>();
                     var expected = data.ExpectedGradients();
                     if (storage == 2)
@@ -100,7 +122,17 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
                     if (round == 0) Compare(retained, "at-return");
                 }
                 ApplyUnrelatedPressure(engine, data.Shape);
-                Compare(retained, round == 0 ? "after-more-ops" : "first-read-after-more-ops");
+                if (forceFinalizers)
+                {
+                    // The dictionary and every returned gradient remain strongly reachable while producer
+                    // temporaries/finalizers are collected. In round one no gradient host read has happened.
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                }
+                Compare(retained, forceFinalizers ? "after-producer-finalizers" :
+                    round == 0 ? "after-more-ops" : "first-read-after-more-ops");
+                GC.KeepAlive(gradients);
             }
         }
         finally { AiDotNetEngine.Current = previous; }
