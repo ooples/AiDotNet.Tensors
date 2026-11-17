@@ -36,6 +36,7 @@ internal static class ResidentHostMirror
             var array = vector is null ? (T[])key : vector.GetBackingArrayUnsafe() ?? new T[vector.Length];
             WeakReference<Tensor<T>>[] members;
             lock (Members) members = Members.ToArray();
+            bool downloaded = false;
             foreach (var weak in members)
             {
                 if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
@@ -49,6 +50,7 @@ internal static class ResidentHostMirror
                 {
                     try { gpuBackend.DownloadBuffer(gpuBuffer, floatArray); }
                     catch (ObjectDisposedException) { continue; }
+                    downloaded = true;
                     continue;
                 }
                 float[] floats;
@@ -56,7 +58,12 @@ internal static class ResidentHostMirror
                 catch (ObjectDisposedException) { continue; }
                 var values = DirectGpuEngine.FromFloatArray<T>(floats);
                 Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
+                downloaded = true;
             }
+            // A pending device write has no proven current host copy. Do not turn
+            // an empty weak-reader list into a successfully materialized zero array.
+            if (!downloaded)
+                throw new InvalidOperationException("The resident host mirror has no live reader for its pending device value.");
             if (vector is not null)
             {
                 // Publish only after every slice downloaded successfully. Subsequent array-backed binds
@@ -103,6 +110,33 @@ internal static class ResidentHostMirror
         tensor._gpuMaterializerCallback = group.Callback;
         if (array is not null) HostShadowMemory.Track(array);
         return key;
+    }
+
+    /// <summary>
+    /// Keeps an existing mirror reader reachable through an equivalent metadata view.
+    /// A partial view that merely inherited its parent's whole buffer is not enrolled.
+    /// </summary>
+    internal static void AttachShapeAlias<T>(Tensor<T> source, Tensor<T> view)
+    {
+        if (!source.IsContiguous || !view.IsContiguous || source._storageOffset != view._storageOffset
+            || source.Length != view.Length || !ReferenceEquals(source.StorageIdentity, view.StorageIdentity)
+            || !ReferenceEquals(source._gpuBuffer, view._gpuBuffer)
+            || source._gpuMaterializerCallback?.Target is not Group<T> group)
+            return;
+        lock (group.Members)
+        {
+            int sourceIndex = -1;
+            for (int i = 0; i < group.Members.Count; i++)
+                if (group.Members[i].TryGetTarget(out var member))
+                {
+                    if (ReferenceEquals(member, view)) return;
+                    if (ReferenceEquals(member, source)) sourceIndex = i;
+                }
+            if (sourceIndex < 0) return;
+            // Alias creation is not a device write. Preserve the writer ordering:
+            // a newer overlapping member must still override this source's range.
+            group.Members.Insert(sourceIndex + 1, new WeakReference<Tensor<T>>(view));
+        }
     }
 
     /// <summary>

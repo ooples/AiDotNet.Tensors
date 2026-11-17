@@ -350,6 +350,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ShareGpuStateWith(view);
         // Same storage => same GpuCacheVersion; carry "current" only if the source's buffer was current.
         view._gpuBufferVersion = _gpuBufferVersion == GpuCacheVersion ? view.GpuCacheVersion : -1;
+        Helpers.ResidentHostMirror.AttachShapeAlias(this, view);
     }
 
     /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>
