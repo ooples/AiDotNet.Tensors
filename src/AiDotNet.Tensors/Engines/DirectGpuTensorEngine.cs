@@ -23258,26 +23258,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorLeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
-        using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend))
-            return base.TensorLeakyReLU(tensor, alpha);
-
-        try
-        {
-            float alphaFloat = ToFloatScalar(alpha);
-            using var bufferA = GetOrAllocateBuffer(backend, tensor);
-            using var bufferB = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
-            backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
-            var gpuOutput = DeferTensorResult<T>(backend, bufferB.Buffer, tensor.Length, tensor.Shape._dims);
-            bufferB.RelinquishOwnership();
-            Autodiff.DifferentiableOps.RecordUnary("LeakyReLU", gpuOutput, tensor,
-                Autodiff.BackwardFunctions<T>.LeakyReLUBackward,
-                savedState: new object[] { (double)alphaFloat });
-            return gpuOutput;
-        }
-        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorLeakyReLU", capabilityGap);
-            return base.TensorLeakyReLU(tensor, alpha);
-        }
+        var output = LeakyReLU(tensor, alpha);
+        output.Layout = tensor.Layout;
+        return output;
     }
 
     public override Tensor<T> TensorMish<T>(Tensor<T> tensor)
@@ -28058,18 +28041,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LeakyReLU<T>(Tensor<T> tensor, T alpha)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend))
+        // Record the canonical semantic node; its replay calls LeakyReLUInto with graph recording suspended.
+        if (Compilation.GraphMode.IsActive)
             return base.LeakyReLU(tensor, alpha);
-        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+        if (!TryGetBackend(out var backend) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.LeakyReLU(tensor, alpha);
 
         try
         {
             float alphaFloat = ToFloatScalar(alpha);
-            using var bufferA = GetOrAllocateBuffer(backend, tensor);
-            var bufferB = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
-            backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
-            var gpuOutput = DeferTensorResult<T>(backend, bufferB.Buffer, tensor.Length, tensor.Shape.ToArray());
+            Tensor<T>? gpuOutput = null;
+            if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled)
+            {
+                var resident = CreateResidentOutput<T>(backend, tensor.Shape._dims);
+                if (TryUnaryResidentInto(resident, tensor,
+                    (be, input, output, size) => be.LeakyRelu(input, output, alphaFloat, size), "LeakyReLU"))
+                    gpuOutput = resident;
+            }
+            if (gpuOutput is null)
+            {
+                using var bufferA = GetOrAllocateBuffer(backend, tensor);
+                using var bufferB = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
+                backend.LeakyRelu(bufferA.Buffer, bufferB.Buffer, alphaFloat, tensor.Length);
+                gpuOutput = DeferTensorResult<T>(backend, bufferB.Buffer, tensor.Length, tensor.Shape.ToArray());
+                bufferB.RelinquishOwnership();
+            }
             Autodiff.DifferentiableOps.RecordUnary("LeakyReLU", gpuOutput, tensor,
                 Autodiff.BackwardFunctions<T>.LeakyReLUBackward,
                 savedState: new object[] { (double)alphaFloat });
