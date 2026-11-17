@@ -3,6 +3,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 public sealed partial class HipBackend : IRfftMagnitudeKernels
 {
+    IRfftNativePlan? IRfftMagnitudeKernels.GetOptimizedRealFftPlan(int n, int rows, bool inverse) => null;
     void IRfftMagnitudeKernels.RfftMagnitude(IGpuBuffer spectrum, IGpuBuffer output, int rows, int n, int spectrumStride, float epsilon)
         => LaunchBatch(BatchExecutionCudaKernels.RfftMagnitude, checked(rows * (n / 2 + 1)), spectrum, output, rows, n, spectrumStride, epsilon);
     void IRfftMagnitudeKernels.RfftMagnitudeSeed(IGpuBuffer spectrum, IGpuBuffer upstream, IGpuBuffer seed, int rows, int n, int spectrumStride, float epsilon)

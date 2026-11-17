@@ -44,6 +44,7 @@ void main() {
 
 public sealed partial class VulkanBackend : IRfftMagnitudeKernels
 {
+    IRfftNativePlan? IRfftMagnitudeKernels.GetOptimizedRealFftPlan(int n, int rows, bool inverse) => null;
     void IRfftMagnitudeKernels.RfftMagnitude(IGpuBuffer spectrum, IGpuBuffer output, int rows, int n, int spectrumStride, float epsilon)
         => GlslNaryOp(VulkanBatchExecutionKernels.RfftMagnitudeShaders.Magnitude, new[] { spectrum, output },
             checked(rows * (n / 2 + 1)), new[] { Bits(rows), Bits(n), Bits(spectrumStride), FloatBits(epsilon) });

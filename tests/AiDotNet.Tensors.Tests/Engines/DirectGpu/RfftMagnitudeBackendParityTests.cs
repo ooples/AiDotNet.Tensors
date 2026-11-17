@@ -26,6 +26,7 @@ public sealed class RfftMagnitudeBackendParityTests
         using var spectrum = backend.AllocateBuffer(count * 2); using var seed = backend.AllocateBuffer(count * 2);
         using var upstream = backend.AllocateBuffer(weights); using var magnitude = backend.AllocateBuffer(rows * bins);
         using var gradient = backend.AllocateBuffer(Enumerable.Repeat(.375f, count).ToArray());
+        backend.Fill(zero, 0, count);
         long before = GpuLaunchProbe.ReadbackBytes;
         backend.BatchedFFT(input, zero, re, im, rows, n, inverse: false);
         backend.StridedScatter(re, spectrum, 0, 2, count); backend.StridedScatter(im, spectrum, 1, 2, count);

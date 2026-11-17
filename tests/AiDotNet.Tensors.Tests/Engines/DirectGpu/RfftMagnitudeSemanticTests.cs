@@ -58,7 +58,8 @@ public sealed class RfftMagnitudeSemanticTests : IClassFixture<DirectGpuTensorEn
                     else
                     {
                         plan.Step(); gradient = plan.Gradients[0];
-                        Assert.Contains("specialized:TensorRfftMagnitude", Assert.IsType<CompiledTrainingPlan<float>>(plan).BackwardStepKinds);
+                        Assert.Contains(engine.SupportsGpu ? "generic:TensorRfftMagnitude" : "specialized:TensorRfftMagnitude",
+                            Assert.IsType<CompiledTrainingPlan<float>>(plan).BackwardStepKinds);
                     }
                     // Retained magnitude and accumulated input VJP are independent
                     // double-DFT oracles, checked after the entire backward completes.

@@ -44,7 +44,7 @@ public sealed partial class CudaBackend
         }
     }
 
-    private static RealFftPlan CreateRealFftPlan(int n, int rows, bool inverse, IntPtr stream)
+    private RealFftPlan CreateRealFftPlan(int n, int rows, bool inverse, IntPtr stream)
     {
         CuFftNative.Check(CuFftNative.Create(out int handle), "cufftCreate");
         try
@@ -53,7 +53,7 @@ public sealed partial class CudaBackend
             CuFftNative.Check(CuFftNative.MakePlan1d(handle, n, inverse ? 0x29 : 0x2a, rows, out _), "cufftMakePlan1d");
             CuFftNative.Check(CuFftNative.SetStream(handle, stream), "cufftSetStream");
             CuFftNative.Check(CuFftNative.GetSize(handle, out var bytes), "cufftGetSize");
-            return new RealFftPlan(handle, checked((int)((bytes.ToUInt64() + 3) / 4)), inverse, stream);
+            return new RealFftPlan(this, handle, checked((int)((bytes.ToUInt64() + 3) / 4)), inverse, stream);
         }
         catch { CuFftNative.Destroy(handle); throw; }
     }
@@ -95,13 +95,17 @@ public sealed partial class CudaBackend
         }
     }
 
-    internal sealed class RealFftPlan
+    internal sealed class RealFftPlan : IRfftNativePlan
     {
+        private readonly CudaBackend _owner;
         internal int Handle;
         internal int WorkspaceFloats { get; }
         internal bool Inverse { get; }
         internal IntPtr Stream { get; }
-        internal RealFftPlan(int handle, int workspaceFloats, bool inverse, IntPtr stream)
-        { Handle = handle; WorkspaceFloats = workspaceFloats; Inverse = inverse; Stream = stream; }
+        int IRfftNativePlan.WorkspaceFloats => WorkspaceFloats;
+        void IRfftNativePlan.Execute(IGpuBuffer input, IGpuBuffer output, IGpuBuffer? workspace)
+            => _owner.ExecuteRealFft(this, input, output, workspace);
+        internal RealFftPlan(CudaBackend owner, int handle, int workspaceFloats, bool inverse, IntPtr stream)
+        { _owner = owner; Handle = handle; WorkspaceFloats = workspaceFloats; Inverse = inverse; Stream = stream; }
     }
 }
