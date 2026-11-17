@@ -1,5 +1,5 @@
 using System;
-using AiDotNet.Tensors.Autodiff;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;

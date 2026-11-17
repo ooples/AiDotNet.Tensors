@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-using AiDotNet.Tensors.Autodiff;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -45,7 +45,7 @@ public sealed class CompiledGpuFrozenForwardLeaseTests
             var throughView = engine.Reshape(engine.Reshape(frozenResult, new[] { 1, 64, 64 }), new[] { 64, 64 });
             var predicted = engine.TensorMatMul(input, weight);
             var gated = engine.TensorMultiply(predicted, throughView);
-            var loss = engine.ReduceMean(engine.TensorMultiply(gated, gated), null);
+            var loss = engine.ReduceMean(engine.TensorMultiply(gated, gated), new[] { 0, 1 }, keepDims: false);
             plan = scope.CompileTraining(parameters, loss);
         }
         using (plan)
