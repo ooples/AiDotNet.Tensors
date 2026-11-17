@@ -39779,7 +39779,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capStart = (int[])start.Clone();
                 var capLength = (int[])length.Clone();
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSlice", tensor, capLength,
-                    (eng, output) => { var r = eng.TensorSlice(captured, capStart, capLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        // Replay can write the planned CPU destination directly. Custom engines retain their
+                        // virtual TensorSlice implementation, and device engines retain their resident route.
+                        if (eng.GetType() == typeof(CpuEngine)
+                            && TryCopyCompiledSliceInto(captured, capStart, capLength, output)) return;
+                        var r = eng.TensorSlice(captured, capStart, capLength);
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                    },
                     BackwardFunctions<T>.SliceBackward, new object[] { capStart });
             }
         }
