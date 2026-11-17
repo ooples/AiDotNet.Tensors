@@ -5186,7 +5186,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// step of each forward action and the last reading action per step (-1 where none qualifies), or null.
     /// </summary>
     private static (int[] StepOfAction, int[] ReleaseAfter)? ForwardSpanLeasePlan(List<CompiledStep<T>> forwardSteps,
-        ForwardEmit[] emitKinds, Tensor<T>[] parameters, Tensor<T> lossOutput, HashSet<Tensor<T>> retainedOutputs)
+        ForwardEmit[] emitKinds, Tensor<T>[] parameters, Tensor<T> lossOutput, HashSet<Tensor<T>> retainedOutputs,
+        HashSet<int>? backwardSteps)
     {
         // Tiny outputs stay kept: leasing them saves little and costs per-step bookkeeping.
         const int MinLeasedLength = 1 << 10;
@@ -5229,7 +5230,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             foreach (int r in outputReaders)
             {
                 var reader = forwardSteps[r];
-                if (emitKinds[r] != ForwardEmit.Rebuildable || !BackwardIgnoresForwardInputs(reader)) return -1;
+                if (emitKinds[r] != ForwardEmit.Rebuildable
+                    || (backwardSteps is null || backwardSteps.Contains(r)) && !BackwardIgnoresForwardInputs(reader)) return -1;
                 last = Math.Max(last, actionOf[r]);
                 if (IsReshape(reader))
                 {
@@ -5249,7 +5251,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var step = forwardSteps[i];
             var output = step.OutputBuffer;
             if (emitKinds[i] != ForwardEmit.Rebuildable || output.Length < MinLeasedLength
-                || producers[output] != i || !BackwardIgnoresForwardOutput(step))
+                || producers[output] != i
+                || (backwardSteps is null || backwardSteps.Contains(i)) && !BackwardIgnoresForwardOutput(step))
                 continue;
             int last = LastReader(output, 0);
             if (last <= actionOf[i]) continue;
@@ -11240,9 +11243,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             scope.ReleaseStorageLeases();
             DropStorageOfRemovedOutputs(scope.Nodes, optimized, forwardSteps, parameters);
             if (dataReplay is null) plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
+            // Only complete coverage proves a step has no emitted backward. This includes explicit NoGrad forwards
+            // and frozen-parameter chains that were excluded by the requested gradient set.
+            var backwardReadSteps = actionCoverage.Count == backwardActions.Count && actionCoverage.All(covered => covered is not null)
+                ? new HashSet<int>(actionCoverage.OfType<int[]>().SelectMany(covered => covered))
+                : null;
+
             plan._pooledForwardOutputs = pooledForwardOutputs;
             if (dataReplay is null && typeof(T) == typeof(float) && engine.SupportsGpu && fp16HeteroOrder is null
-                && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput, retainedOutputs) is { } spans)
+                && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput, retainedOutputs, backwardReadSteps) is { } spans)
             {
                 plan._spanStepOfAction = spans.StepOfAction;
                 plan._spanReleaseAfter = spans.ReleaseAfter;
