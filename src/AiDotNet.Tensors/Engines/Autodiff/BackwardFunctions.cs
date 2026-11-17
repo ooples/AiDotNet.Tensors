@@ -9964,8 +9964,20 @@ internal static partial class BackwardFunctions<T>
         for (int i = 0; i < dX.Length; i++)
         {
             double xd = xs[i];
-            // Use the same asymptotic digamma formula as TensorDigamma.
+            // Reflection bounds recurrence work even for very large negative arguments.
+            // Nonpositive integer poles and negative infinity have no digamma derivative.
+            if (double.IsNegativeInfinity(xd) || (xd < 0 && xd == System.Math.Floor(xd)))
+            {
+                dX[i] = ops.Multiply(dY[i], ops.FromDouble(double.NaN));
+                continue;
+            }
             double shift = 0;
+            if (xd < 0)
+            {
+                // Reduce modulo one before multiplying by pi to preserve the fractional part.
+                shift = -System.Math.PI / System.Math.Tan(System.Math.PI * (xd % 1.0));
+                xd = 1.0 - xd;
+            }
             while (xd < 10.0) { shift -= 1.0 / xd; xd += 1.0; }
             double inv = 1.0 / xd; double inv2 = inv * inv;
             double series = System.Math.Log(xd) - 0.5 * inv
@@ -9998,7 +10010,25 @@ internal static partial class BackwardFunctions<T>
         for (int i = 0; i < dX.Length; i++)
         {
             double xd = xs[i];
-            // Trigamma asymptotic with recurrence shift — same as Polygamma(1, x).
+            if (double.IsNegativeInfinity(xd))
+            {
+                dX[i] = ops.Multiply(dY[i], ops.FromDouble(double.NaN));
+                continue;
+            }
+            if (xd <= 0 && xd == System.Math.Floor(xd))
+            {
+                dX[i] = ops.Multiply(dY[i], ops.FromDouble(double.PositiveInfinity));
+                continue;
+            }
+            // psi'(x) = pi^2 / sin^2(pi*x) - psi'(1-x), with bounded positive recurrence.
+            double reflection = 0;
+            bool reflected = xd < 0;
+            if (reflected)
+            {
+                double sin = System.Math.Sin(System.Math.PI * (xd % 1.0));
+                reflection = System.Math.PI * System.Math.PI / (sin * sin);
+                xd = 1.0 - xd;
+            }
             double shift = 0;
             while (xd < 6.0) { shift += 1.0 / (xd * xd); xd += 1.0; }
             double inv = 1.0 / xd; double inv2 = inv * inv;
@@ -10006,7 +10036,8 @@ internal static partial class BackwardFunctions<T>
                 + inv2 * inv * (1.0 / 6.0
                   - inv2 * (1.0 / 30.0
                     - inv2 * (1.0 / 42.0)));
-            dX[i] = ops.Multiply(dY[i], ops.FromDouble(shift + series));
+            double derivative = reflected ? reflection - (shift + series) : shift + series;
+            dX[i] = ops.Multiply(dY[i], ops.FromDouble(derivative));
         }
         DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
     }

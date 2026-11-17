@@ -104,7 +104,7 @@ public sealed class RankDeficientSvdConvergenceTests
         var (u, s, vh) = Linalg.Svd(Matrix(3, 3, input), fullMatrices);
         decimal[] sm = s.GetDataArray();
 
-        Assert.True(decimal.Abs(sm[0] - 14m) < 1e-25m, $"sigma_0 = {sm[0]}");
+        Assert.True(Math.Abs(sm[0] - 14m) < 1e-25m, $"sigma_0 = {sm[0]}");
         Assert.True(sm[1] < 1e-25m, $"sigma_1 = {sm[1]}");
         Assert.True(sm[2] < 1e-25m, $"sigma_2 = {sm[2]}");
         AssertOrthonormalAndReconstructs(
