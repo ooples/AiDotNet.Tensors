@@ -1,0 +1,344 @@
+name: Coordination validation package
+
+on:
+  push:
+    branches: [codex/2524-native-replay-1512]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'build/**'
+      - 'Directory.*'
+      - 'global.json'
+      - 'NuGet.Config'
+      - 'nuget.config'
+      - '.github/workflows/coordination-package.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coordination-package-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  AIDOTNET_DIRECTGPU_BACKENDS: none
+  AIDOTNET_OPENCL_ALLOW_CPU: '1'
+  BASELINE_SHA: c66c748fe4805e87708b942483e3b629d3a6e404
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Identify exact source and unique package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
+          version="0.151.3-coordination.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.g${GITHUB_SHA:0:12}"
+          echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=tensors-coordination-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73
+        with:
+          dotnet-version: |
+            10.0.x
+            8.0.x
+
+      - name: Install and verify OpenCL runtime for state-adjoint regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd clinfo
+          clinfo
+      # No framework override: normal pack builds all five declared TFMs and runs
+      # the project's analyzers, public API checks and package validation.
+      - name: Build and pack all target frameworks
+        run: >-
+          dotnet pack src/AiDotNet.Tensors/AiDotNet.Tensors.csproj
+          --configuration Release --output artifacts/coordination/packages
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          -m:2
+
+      - name: Verify LSTM replay and gradient regressions
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter 'FullyQualifiedName~LstmClosureReplayTests|FullyQualifiedName~LstmFinalStateGradientTests|FullyQualifiedName~LstmFusedBackwardGradientDoubleTests|FullyQualifiedName~CompiledFusedLstmTrainingTests|FullyQualifiedName~TensorFinitePredicateTests|FullyQualifiedName~SparseTensorSumOfSquaresTests'
+          --logger 'trx;LogFileName=lstm-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
+      # These 46 CPU cases are mandatory and must all execute and pass. CompiledRetainedOutputTests
+      # includes a CUDA-only whole-step capture case; its separate GPU coverage cannot satisfy this gate.
+      - name: Verify named-output ownership regressions (mandatory CPU)
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-build --no-restore
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter 'FullyQualifiedName~NamedRetainedOutputTests|FullyQualifiedName~TensorArenaPinnedTests|FullyQualifiedName~TapeOwnedArenaLifetimeTests'
+          --logger 'trx;LogFileName=retained-output-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
+      - name: Verify heterogeneous replay and optimizer enrollment (mandatory CPU)
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-build --no-restore
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter 'FullyQualifiedName~ForwardOnlyHeterogeneousTrainingTests|FullyQualifiedName~NoGradTrainingTraceTests|FullyQualifiedName~CompiledEnrollmentCheckpointTests|FullyQualifiedName~CompiledOptimizerEnrollmentTests'
+          --logger 'trx;LogFileName=optimizer-enrollment-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
+      - name: Verify BatchNorm and SearchSorted replay (mandatory CPU)
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-build --no-restore
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter '(FullyQualifiedName~BatchNormReplayTests|FullyQualifiedName~SearchSortedReplayTests)&Category!=GPU'
+          --logger 'trx;LogFileName=normalization-search-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
+      - name: Verify package contents and write provenance
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          import zipfile
+
+          root = Path('artifacts/coordination')
+          packages = list((root / 'packages').glob('AiDotNet.Tensors.*.nupkg'))
+          assert len(packages) == 1, f'Expected one tensor package, got {packages}'
+          package = packages[0]
+          frameworks = ['net10.0', 'net8.0', 'net471', 'net462', 'netstandard2.0']
+          with zipfile.ZipFile(package) as archive:
+              for framework in frameworks:
+                  assert f'lib/{framework}/AiDotNet.Tensors.dll' in archive.namelist(), framework
+              nuspec = ET.fromstring(archive.read('AiDotNet.Tensors.nuspec'))
+              version = nuspec.find('.//{*}version').text
+              assert version == os.environ['PACKAGE_VERSION'], version
+              packaged_binary_sha256 = hashlib.sha256(archive.read('lib/net10.0/AiDotNet.Tensors.dll')).hexdigest()
+
+          # The test project uses the SDK's default bin/Configuration/TFM output
+          # layout. Compare its actual loaded dependency with the packed asset.
+          tested_binary = Path('tests/AiDotNet.Tensors.Tests/bin/Release/net10.0/AiDotNet.Tensors.dll')
+          assert tested_binary.is_file(), f'Missing tested tensor assembly: {tested_binary}'
+          tested_binary_sha256 = hashlib.sha256(tested_binary.read_bytes()).hexdigest()
+          assert tested_binary_sha256 == packaged_binary_sha256, 'Tests did not exercise the packaged net10.0 binary'
+
+          trx = root / 'TestResults/lstm-signature.trx'
+          results = ET.parse(trx).getroot()
+          counters = results.find('.//{*}Counters').attrib
+          assert int(counters['total']) == 100, counters
+          assert int(counters['passed']) == 100, counters
+          assert int(counters['failed']) == 0, counters
+          assert int(counters['executed']) == 100, counters
+          assert results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', counters
+
+          def canonical_signature_name(name):
+              # Only these exact numeric argument aliases differ between Windows and Linux.
+              aliases = {
+                  'AiDotNet.Tensors.Tests.Engines.SparseTensorSumOfSquaresTests.NonFiniteStoredValues_RetainTheirClassification(value: \u221e)': 'AiDotNet.Tensors.Tests.Engines.SparseTensorSumOfSquaresTests.NonFiniteStoredValues_RetainTheirClassification(value: Infinity)',
+                  'AiDotNet.Tensors.Tests.Engines.SparseTensorSumOfSquaresTests.NonFiniteStoredValues_RetainTheirClassification(value: -\u221e)': 'AiDotNet.Tensors.Tests.Engines.SparseTensorSumOfSquaresTests.NonFiniteStoredValues_RetainTheirClassification(value: -Infinity)',
+              }
+              return aliases.get(name, name)
+          signature_rows = results.findall('.//{*}UnitTestResult')
+          signature_names = [row.attrib['testName'] for row in signature_rows]
+          assert len(signature_names) == len(set(signature_names)) == 100, 'Duplicate or missing first-group case results'
+          assert all(row.attrib['outcome'] == 'Passed' for row in signature_rows)
+          canonical_signature_names = [canonical_signature_name(name) for name in signature_names]
+          assert len(set(canonical_signature_names)) == 100, 'Duplicate canonical first-group case identities'
+          assert hashlib.sha256('\n'.join(sorted(canonical_signature_names)).encode('utf-8')).hexdigest() == '3b7c46909e4a2eda7a81c4ddd0f78b1cc0cf18bf8c7e22d23b1dd90cc1d6b54e'
+
+          retention_trx = root / 'TestResults/retained-output-signature.trx'
+          retention_results = ET.parse(retention_trx).getroot()
+          retention_counters = retention_results.find('.//{*}Counters').attrib
+          assert int(retention_counters['total']) == 46, retention_counters
+          assert int(retention_counters['passed']) == 46, retention_counters
+          assert int(retention_counters['failed']) == 0, retention_counters
+          assert int(retention_counters['executed']) == 46, retention_counters
+          assert retention_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', retention_counters
+          # Pin case identities as well as counts: a duplicate/replaced theory case cannot mask an omission.
+          retention_cases = {
+              'AiDotNet.Tensors.Tests.Engines.Compilation.NamedRetainedOutputTests': [
+                  'Child_capture_disposal_preserves_the_parent_owned_update_and_parent_publication',
+                  'Compiled_handoff_requires_outer_success_and_expires_at_the_next_step_or_disposal',
+                  'Eager_keys_are_nonempty_unique_and_ordinal_even_without_a_capture',
+                  'Finite_forward_with_nonfinite_gradients_cannot_publish_a_discarded_update',
+                  'Foreign_thread_capture_completion_or_disposal_leaves_the_lexical_owner_active(complete: False)',
+                  'Foreign_thread_capture_completion_or_disposal_leaves_the_lexical_owner_active(complete: True)',
+                  'Immediate_post_backward_publication_keeps_the_completed_nonpersistent_recording(streaming: False)',
+                  'Immediate_post_backward_publication_keeps_the_completed_nonpersistent_recording(streaming: True)',
+                  'Named_output_from_outer_arena_survives_when_detached_inner_arena_is_active',
+                  'Named_stopgradient_view_survives_caller_arena_reset_disposal_and_pool_reuse(rows: 256, columns: 256)',
+                  'Named_stopgradient_view_survives_caller_arena_reset_disposal_and_pool_reuse(rows: 32, columns: 3)',
+                  'Nested_and_parallel_captures_do_not_publish_each_others_outputs',
+                  'Parent_update_disposal_waits_for_the_nested_capture_to_finish',
+                  'Partial_and_strided_named_views_transfer_the_whole_storage_slab(layout: "offset", rows: 64)',
+                  'Partial_and_strided_named_views_transfer_the_whole_storage_slab(layout: "offset-strided", rows: 32768)',
+                  'Partial_and_strided_named_views_transfer_the_whole_storage_slab(layout: "strided", rows: 64)',
+                  'Persistent_retained_graph_can_publish_the_same_recording_after_repeated_backwards(streaming: False)',
+                  'Persistent_retained_graph_can_publish_the_same_recording_after_repeated_backwards(streaming: True)',
+                  'Premature_capture_disposal_preserves_its_owned_update_and_publication_for_completion',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "duplicate")',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "missing")',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "moved")',
+                  'Probe_checks_the_retained_output_schema_and_graph_producer(change: "renamed")',
+                  'Rejected_foreign_thread_update_disposal_does_not_dispose_or_clear_the_owner',
+                  'Rejected_out_of_order_update_disposal_preserves_the_live_scope_stack',
+                  'Repeated_named_handoffs_do_not_accumulate_strong_arena_pins',
+                  'Reset_or_dispose_discards_even_an_immediately_completed_recording(dispose: False)',
+                  'Reset_or_dispose_discards_even_an_immediately_completed_recording(dispose: True)',
+                  'Streaming_reset_starts_a_fresh_named_output_recording_even_after_callback_failure(failCallback: False)',
+                  'Streaming_reset_starts_a_fresh_named_output_recording_even_after_callback_failure(failCallback: True)',
+                  'Tape_reset_clears_eager_key_registrations_while_preserving_same_forward_uniqueness',
+                  'Unretained_second_forward_does_not_publish_an_earlier_recording(streaming: False, failFirstCallback: False)',
+                  'Unretained_second_forward_does_not_publish_an_earlier_recording(streaming: True, failFirstCallback: False)',
+                  'Unretained_second_forward_does_not_publish_an_earlier_recording(streaming: True, failFirstCallback: True)',
+                  'Warmup_only_and_failed_outer_invocations_cannot_publish_outputs',
+              ],
+              'AiDotNet.Tensors.Tests.Helpers.TensorArenaPinnedTests': [
+                  'PinnedArrayCount_GrowsOnEachRent_AndDoesNotResetOnReset',
+                  'Pinned_NotReissuedAsScratch_AfterReset',
+                  'Pinned_SurvivesReset_ContentsPreserved',
+                  'RegisterPersistentTensor_PromotesExistingScratchTensor',
+                  'RentPinnedOnGpu_NoGpuAllocator_FallsBackToPinned',
+                  'RentPinnedOnGpu_ZeroSize_ReturnsUsableTensor',
+                  'RentPinned_NoActiveArena_FallsBackToCleanAllocation',
+                  'RentPinned_ZeroSize_ReturnsUsableTensor',
+              ],
+              'AiDotNet.Tensors.Tests.Engines.Autodiff.TapeOwnedArenaLifetimeTests': [
+                  'BuffersNothingReferences_AreReusedByLaterTapes',
+                  'TensorsKeptPastTheirTape_SurviveLaterTapes(rows: 128, inner: 512, cols: 64)',
+                  'TensorsKeptPastTheirTape_SurviveLaterTapes(rows: 256, inner: 512, cols: 256)',
+              ],
+          }
+          assert [len(cases) for cases in retention_cases.values()] == [35, 8, 3]
+          expected_cases = {f'{class_name}.{case}' for class_name, cases in retention_cases.items() for case in cases}
+          case_results = retention_results.findall('.//{*}UnitTestResult')
+          actual_cases = {result.attrib['testName'] for result in case_results}
+          assert len(case_results) == len(actual_cases) == 46, 'Duplicate or missing retention case results'
+          assert actual_cases == expected_cases, {'missing': sorted(expected_cases - actual_cases), 'unexpected': sorted(actual_cases - expected_cases)}
+          assert all(result.attrib['outcome'] == 'Passed' for result in case_results), 'A mandatory retention case did not pass'
+
+          enrollment_trx = root / 'TestResults/optimizer-enrollment-signature.trx'
+          enrollment_results = ET.parse(enrollment_trx).getroot()
+          enrollment_counters = enrollment_results.find('.//{*}Counters').attrib
+          assert enrollment_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', enrollment_counters
+          for key, value in enrollment_counters.items():
+              assert int(value) == (112 if key in ('total', 'executed', 'passed') else 0), enrollment_counters
+          assert all(key in enrollment_counters for key in ('total', 'executed', 'passed', 'failed')), enrollment_counters
+          enrollment_rows = enrollment_results.findall('.//{*}UnitTestResult')
+          enrollment_names = [row.attrib['testName'] for row in enrollment_rows]
+          assert len(enrollment_names) == len(set(enrollment_names)) == 112, 'Duplicate or missing enrollment case results'
+          assert all(row.attrib['outcome'] == 'Passed' for row in enrollment_rows), 'A mandatory enrollment case did not pass'
+          # Independently fixed identities, derived from the reviewed source cases and actual TRX discovery.
+          # Hash UTF-8 ordinal-sorted full testName strings joined by LF, with no trailing LF.
+          enrollment_groups = {
+              'heterogeneousReplay': ('ForwardOnlyHeterogeneousTrainingTests', 15, 'de0075e3f1733158969ac80614c060ec5503fca2c224f1d20a7fc639921b4d6d'),
+              'noGrad': ('NoGradTrainingTraceTests', 9, '337e7ee0a35bee20cfbd1eac8233c492ef750437ab57409b4a29fe5af3ae05e5'),
+              'optimizerEnrollment': ('CompiledOptimizerEnrollmentTests', 43, '359f487a34663544290a09d33b38529875bedf4e6719aff3b82aa931782b691f'),
+              'enrollmentCheckpoint': ('CompiledEnrollmentCheckpointTests', 45, 'b2f5b9623413affe4f9f44f18a746660381060e92f8abee472de1bdd64e11548'),
+          }
+          enrollment_evidence = {}
+          grouped_names = set()
+          for prefix, (class_name, count, digest) in enrollment_groups.items():
+              full_prefix = f'AiDotNet.Tensors.Tests.Engines.Compilation.{class_name}.'
+              names = sorted(name for name in enrollment_names if name.startswith(full_prefix))
+              assert len(names) == count, (prefix, names)
+              assert hashlib.sha256('\n'.join(names).encode('utf-8')).hexdigest() == digest, (prefix, names)
+              grouped_names.update(names)
+              group_counters = {key: str(count if key in ('total', 'executed', 'passed') else 0) for key in enrollment_counters}
+              enrollment_evidence[prefix + 'TestCounters'] = group_counters
+              enrollment_evidence[prefix + 'TestCases'] = names
+          assert grouped_names == set(enrollment_names), 'Unexpected mandatory enrollment case class'
+
+          replay_trx = root / 'TestResults/normalization-search-signature.trx'
+          replay_results = ET.parse(replay_trx).getroot()
+          replay_counters = replay_results.find('.//{*}Counters').attrib
+          assert replay_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', replay_counters
+          for key, value in replay_counters.items():
+              assert int(value) == (20 if key in ('total', 'executed', 'passed') else 0), replay_counters
+          assert all(key in replay_counters for key in ('total', 'executed', 'passed', 'failed')), replay_counters
+          # Identities verified from the actual 278-case native test run.
+          expected_replay_cases = {
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_closure_rebind_refreshes_output_statistics_and_saved_backward(rank: 1)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_closure_rebind_refreshes_output_statistics_and_saved_backward(rank: 2)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_closure_rebind_refreshes_output_statistics_and_saved_backward(rank: 3)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_closure_rebind_refreshes_output_statistics_and_saved_backward(rank: 4)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_derived_input_and_statistics_stay_lazy_and_preserve_layout(rank: 1)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_derived_input_and_statistics_stay_lazy_and_preserve_layout(rank: 2)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_derived_input_and_statistics_stay_lazy_and_preserve_layout(rank: 3)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Double_derived_input_and_statistics_stay_lazy_and_preserve_layout(rank: 4)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Half_rank3_replay_preserves_float32_statistics_for_backward',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Rank1_eager_and_compiled_gradients_match_the_single_observation_oracle(useHalf: False)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.BatchNormReplayTests.Rank1_eager_and_compiled_gradients_match_the_single_observation_oracle(useHalf: True)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Batched_replay_uses_each_current_row(right: False)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Batched_replay_uses_each_current_row(right: True)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Closure_guard_rebinds_both_fresh_operands_without_recompilation',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Plan_leases_second_operand_after_its_caller_arena_is_reset',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Replay_refreshes_both_operands_and_preserves_exact_boundary_and_NaN_indices(useDouble: False, right: False)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Replay_refreshes_both_operands_and_preserves_exact_boundary_and_NaN_indices(useDouble: False, right: True)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Replay_refreshes_both_operands_and_preserves_exact_boundary_and_NaN_indices(useDouble: True, right: False)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Replay_refreshes_both_operands_and_preserves_exact_boundary_and_NaN_indices(useDouble: True, right: True)',
+              'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Second_operand_is_read_before_a_later_in_place_write',
+          }
+          replay_rows = replay_results.findall('.//{*}UnitTestResult')
+          replay_names = [row.attrib['testName'] for row in replay_rows]
+          assert len(replay_names) == len(set(replay_names)) == 20, 'Duplicate or missing replay case results'
+          assert set(replay_names) == expected_replay_cases, {'missing': sorted(expected_replay_cases - set(replay_names)), 'unexpected': sorted(set(replay_names) - expected_replay_cases)}
+          assert all(row.attrib['outcome'] == 'Passed' for row in replay_rows), 'A mandatory replay case did not pass'
+
+          checksums = {}
+          for path in [package, trx, retention_trx, enrollment_trx, replay_trx]:
+              checksums[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+          manifest = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'sourceCommit': os.environ['GITHUB_SHA'],
+              'baselineCommit': os.environ['BASELINE_SHA'],
+              'packageVersion': version,
+              'targetFrameworks': frameworks,
+              'testedBinary': tested_binary.as_posix(),
+              'testedAndPackagedNet10BinarySha256': tested_binary_sha256,
+              'testCounters': counters,
+              'canonicalTestCasesSha256': '3b7c46909e4a2eda7a81c4ddd0f78b1cc0cf18bf8c7e22d23b1dd90cc1d6b54e',
+              'retainedOutputTestCounters': retention_counters,
+              'retainedOutputTestCases': sorted(actual_cases),
+              **enrollment_evidence,
+              'normalizationSearchTestCounters': replay_counters,
+              'normalizationSearchTestCases': sorted(replay_names),
+              'mandatoryCpuTestCount': 278,
+              'separateGpuCoverage': 'CompiledRetainedOutputTests CUDA whole-step capture is not part of the mandatory CPU gate.',
+              'sha256': checksums,
+              'workflowRun': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'runAttempt': int(os.environ['GITHUB_RUN_ATTEMPT']),
+          }
+          (root / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          (root / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in checksums.items()))
+
+      - name: Upload validated package and evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: artifacts/coordination/
+          if-no-files-found: error
+          retention-days: 14
