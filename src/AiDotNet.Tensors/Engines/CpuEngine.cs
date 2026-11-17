@@ -30310,37 +30310,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
-            {
-                var ci = input; var cg = gamma; var cb = beta; int cn = numGroups; double ce = epsilon;
-                var savedScope = GraphMode.Current;
-                GraphMode.SetCurrent(null);
-                var eagerResult = GroupNorm(ci, cn, cg, cb, ce, out mean, out variance);
-                GraphMode.SetCurrent(savedScope);
-                // AiDotNet#1331: refresh mean/variance on every plan.Step.
-                var capturedGNMean = mean; var capturedGNVar = variance;
-                // SavedState order MUST match BackwardFunctions<T>.GroupNormBackward's
-                // read order: [numGroups, mean, variance, epsilon]. Previously this was
-                // [mean, variance, numGroups, epsilon] causing InvalidCastException in
-                // backward (Tensor cast as int at savedState[0]). Fixed per #178.
-                var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "GroupNorm",
-                    new[] { input, gamma, beta }, eagerResult._shape,
-                    (eng, output) =>
-                    {
-                        var r = eng.GroupNorm(ci, cn, cg, cb, ce, out var freshMean, out var freshVar);
-                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                        DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedGNMean);
-                        DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedGNVar);
-                        CarryLowPrecisionStatistic(freshMean, capturedGNMean);
-                        CarryLowPrecisionStatistic(freshVar, capturedGNVar);
-                    },
-                    // SavedState order per #178 fix above: numGroups must come first so
-                    // GroupNormBackward reads savedState[0] as int (not as Tensor).
-                    BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
-                using var eagerResultKeep3 = new KeepAliveScope(eagerResult);
-                using var lazyResultKeep3 = new KeepAliveScope(lazyResult);
-                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
-                return lazyResult;
-            }
+                return RecordGroupNormTraining(scope, input, numGroups, gamma, beta, epsilon, out mean, out variance);
         }
 
         // Preserve original input ref for tape recording (#257).

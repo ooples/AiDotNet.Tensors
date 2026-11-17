@@ -26220,6 +26220,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
         if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        // A training trace records the node (CpuEngine.GroupNorm); its replay runs this device path with tracing suspended.
+        if (Compilation.GraphMode.IsActive) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 

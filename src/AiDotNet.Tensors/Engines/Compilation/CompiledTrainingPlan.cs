@@ -12624,6 +12624,36 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
+        // Lazy training GroupNorm (CpuEngine.RecordGroupNormTraining): the backward and the statistic consumers read
+        // a holder rather than trace-time tensors, so the replay hands the holder this step's statistics instead of
+        // copying into saved buffers. Float and double keep the write-into-output kernel; Half and BFloat16 take the
+        // engine op, whose float32 statistics GroupNormInto's generic path would not reproduce.
+        if (step.OpType == OpType.GroupNorm && step.Inputs.Length == 3 && step.Inputs[0].IsContiguous
+            && step.SavedState is { Length: >= 4 }
+            && step.SavedState[0] is int numGroupsRef
+            && step.SavedState[1] is GroupNormStateRef<T> gnStateRef
+            && ReferenceEquals(step.SavedState[2], gnStateRef)
+            && step.SavedState[3] is double epsilonRef)
+        {
+            var inp = step.Inputs[0];
+            var gamma = step.Inputs[1];
+            var beta = step.Inputs[2];
+            var o = step.OutputBuffer;
+            bool intoKernel = typeof(T) == typeof(float) || typeof(T) == typeof(double);
+            return eng =>
+            {
+                Tensor<T> freshMean, freshVar;
+                if (intoKernel && eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
+                    cpuEng.GroupNormInto(o, inp, numGroupsRef, gamma, beta, epsilonRef, out freshMean, out freshVar);
+                else
+                {
+                    var result = eng.GroupNorm(inp, numGroupsRef, gamma, beta, epsilonRef, out freshMean, out freshVar);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, o);
+                }
+                gnStateRef.Refresh(freshMean, freshVar);
+            };
+        }
+
         // LogSoftmax forward: pinned SIMD FusedLogSoftmaxRow per row -- a row is the LAST axis, so only a step recorded
         // over that axis (the axis the node saves; old nodes without it were last-axis). Taking any rank-2 LogSoftmax
         // here replayed a log-softmax over axis 0 as one over axis 1: wrong values, which looked like the compiled plan

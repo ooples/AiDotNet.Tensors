@@ -42,6 +42,43 @@ internal sealed class LayerNormStateRef<T> : Compilation.ISignatureScratch
     public Tensor<T>? Variance;
 }
 
+// A lazy GroupNorm's per-(sample, group) statistics: the forward replaces them every replay, the backward and the
+// statistic consumers read them. Only the immutable statistic count belongs to the objective signature.
+internal sealed class GroupNormStateRef<T> : Compilation.ISignatureScratch
+{
+    private Tensor<T>? _mean;
+    private Tensor<T>? _variance;
+
+    internal GroupNormStateRef(int statistics) => SignatureLength = statistics;
+
+    public int SignatureLength { get; }
+
+    internal void Refresh(Tensor<T> mean, Tensor<T> variance)
+    {
+        if (mean.Length != SignatureLength || variance.Length != SignatureLength)
+            throw new InvalidOperationException(
+                $"GroupNorm replay produced {mean.Length} means and {variance.Length} variances; the recorded node holds {SignatureLength}.");
+        if (_mean is { } previousMean && !ReferenceEquals(previousMean, mean)
+            && previousMean._gpuBuffer is null && !previousMean.HasPendingGpuData)
+        {
+            TensorAllocator.Return(previousMean);
+        }
+        if (_variance is { } previousVariance && !ReferenceEquals(previousVariance, variance)
+            && previousVariance._gpuBuffer is null && !previousVariance.HasPendingGpuData)
+        {
+            TensorAllocator.Return(previousVariance);
+        }
+        _mean = mean;
+        _variance = variance;
+    }
+
+    internal Tensor<T> RequireMean() => _mean ?? throw new InvalidOperationException(
+        "GroupNorm statistics were read before the node's forward ran (lazy/compiled-path wiring bug).");
+
+    internal Tensor<T> RequireVariance() => _variance ?? throw new InvalidOperationException(
+        "GroupNorm statistics were read before the node's forward ran (lazy/compiled-path wiring bug).");
+}
+
 /// <summary>
 /// Contains backward function implementations for all differentiable engine operations.
 /// Each method is a <see cref="BackwardFunction{T}"/> that computes input gradients
@@ -2276,8 +2313,9 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numGroups = (int)savedState[0];
-        var mean = (Tensor<T>)savedState[1];
-        var variance = (Tensor<T>)savedState[2];
+        // A lazy training node keeps one holder in both statistic slots; the eager tape keeps the tensors.
+        var mean = savedState[1] is GroupNormStateRef<T> meanRef ? meanRef.RequireMean() : (Tensor<T>)savedState[1];
+        var variance = savedState[2] is GroupNormStateRef<T> varianceRef ? varianceRef.RequireVariance() : (Tensor<T>)savedState[2];
         var epsilon = (double)savedState[3];
         if (TrySecondOrderGroupNorm(gradOutput, inputs, engine, grads, numGroups, epsilon)) return;
 
