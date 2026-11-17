@@ -6837,6 +6837,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
         if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorMultiplyScalarInPlace", (e, x) => e.TensorMultiplyScalar(x, scalar)); return; }
 
+        // The SIMD and generic kernels write unmarked storage. Notify views, saved tensors and derived-weight
+        // caches once before any of those paths mutates it, as the binary in-place operators do.
+        a.IncrementVersion();
+
         int length = a.Length;
 
         // Float fast path: SIMD MultiplyScalar with parallel chunking
