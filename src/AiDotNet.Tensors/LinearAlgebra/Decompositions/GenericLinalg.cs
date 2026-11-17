@@ -1032,7 +1032,10 @@ internal static class GenericLinalg<T>
             for (int j = 0; j < n; j++) v[i * n + j] = i == j ? Real<T>.One : Real<T>.Zero;
 
         Real<T> tol = Eps * Real<T>.Int(Math.Max(m, 1));
+        Real<T> cancelTol = Real<T>.Int(2) * Real<T>.Sqrt(Real<T>.Int(Math.Max(4, n))) * Eps;
         Real<T> one = Real<T>.One, two = Real<T>.Int(2);
+        var absA = new Real<T>[m * n];
+        for (int i = 0; i < absA.Length; i++) absA[i] = Real<T>.Abs(a[i]);
         var colP = new Real<T>[m];
         var colQ = new Real<T>[m];
         bool converged = false;
@@ -1088,6 +1091,7 @@ internal static class GenericLinalg<T>
                 }
             }
             if (!rotated) { converged = true; break; }
+            DeflateCancelledColumns(a, absA, w, v, m, n, cancelTol);
         }
         if (!converged && largestCosine > Real<T>.Int(JacobiStallFactor * n) * tol)
             throw new ArithmeticException(
@@ -1121,6 +1125,56 @@ internal static class GenericLinalg<T>
         }
         CompleteOrthonormalColumns(uOut, m, uCols, filled);
         return (uOut, sOut, vOut);
+    }
+
+    /// <summary>
+    /// Zeroes any working column <c>w[:, j]</c> whose fresh residual <c>A · V[:, j]</c> satisfies the
+    /// componentwise Oettli-Prager bound <c>|(A · V)[i, j]| &lt;= cancelTol · (|A| · |V|)[i, j]</c> in every row.
+    /// In rank-deficient inputs with nullity &gt;= 2, two cancelled nullspace columns otherwise retain pure
+    /// rounding residuals whose normalized inner product stays O(1), cycling forever across sweeps. Testing
+    /// the fresh entrywise relative bound against <c>|A| · |V|</c> preserves both row-graded and column-graded
+    /// tiny singular values down to subnormal scales.
+    /// </summary>
+    private static void DeflateCancelledColumns(
+        Real<T>[] a, Real<T>[] absA, Real<T>[] w, Real<T>[] v, int m, int n, Real<T> cancelTol)
+    {
+        for (int j = 0; j < n; j++)
+        {
+            bool anyNonZero = false;
+            for (int i = 0; i < m; i++)
+            {
+                if (!w[i * n + j].IsZero)
+                {
+                    anyNonZero = true;
+                    break;
+                }
+            }
+            if (!anyNonZero) continue;
+
+            bool cancelled = true;
+            for (int i = 0; i < m; i++)
+            {
+                Real<T> sum = Real<T>.Zero;
+                Real<T> scale = Real<T>.Zero;
+                int rowOff = i * n;
+                for (int k = 0; k < n; k++)
+                {
+                    Real<T> vkj = v[k * n + j];
+                    sum += a[rowOff + k] * vkj;
+                    scale += absA[rowOff + k] * Real<T>.Abs(vkj);
+                }
+                if (Real<T>.Abs(sum) > cancelTol * scale || Real<T>.Abs(w[rowOff + j]) > cancelTol * scale)
+                {
+                    cancelled = false;
+                    break;
+                }
+            }
+
+            if (cancelled)
+            {
+                for (int i = 0; i < m; i++) w[i * n + j] = Real<T>.Zero;
+            }
+        }
     }
 
     /// <summary>
