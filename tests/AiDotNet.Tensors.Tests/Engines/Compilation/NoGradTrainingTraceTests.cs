@@ -13,6 +13,32 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class NoGradTrainingTraceTests
 {
+    [Fact]
+    public void No_grad_parameters_are_absent_from_updates_even_with_nonzero_decoupled_weight_decay()
+    {
+        var engine = new CpuEngine();
+        var frozen = new Tensor<float>(new[] { 2f }, new[] { 1 });
+        var head = new Tensor<float>(new[] { 3f }, new[] { 1 });
+        Tensor<float> Objective()
+        {
+            Tensor<float> data;
+            using (new NoGradScope<float>()) data = engine.TensorMultiplyScalar(frozen, 2f);
+            return engine.ReduceSum(engine.TensorMultiply(data, head), null, false);
+        }
+        using (var tape = new GradientTape<float>())
+        {
+            var gradients = tape.ComputeGradients(Objective());
+            Assert.False(gradients.ContainsKey(frozen));
+            Assert.Equal(4f, gradients[head].ToArray()[0]);
+        }
+        using var scope = GraphMode.EnableTraining(new[] { frozen, head });
+        using var plan = scope.CompileTraining(new[] { frozen, head }, Objective());
+        plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.1, weightDecay: 0.2);
+        Assert.Equal(12f, plan.Step().ToArray()[0]);
+        Assert.Equal(2f, frozen.ToArray()[0]);
+        Assert.Equal(2.84f, head.ToArray()[0], 5); // 3*(1 - .1*.2) - .1, with head gradient 4.
+    }
+
     private static Tensor<float> Frozen() => new(new[] { 0.5f, -1f, 2f, 0.25f, 1.5f, -0.75f }, new[] { 3, 2 });
     private static Tensor<float> Bias() => new(new[] { 0.1f, -0.2f }, new[] { 2 });
     private static Tensor<float> Head() => new(new[] { 1f, -2f, 0.5f, 3f }, new[] { 2, 2 });

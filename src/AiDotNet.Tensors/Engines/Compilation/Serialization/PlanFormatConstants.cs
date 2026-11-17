@@ -49,7 +49,8 @@ internal static class PlanFormatConstants
     /// Version 14 adds the SGD-momentum learning-rate-in-velocity switch (FusedOptimizerExtras.VelocityIncludesLearningRate)
     /// to the fused-optimizer extras. It selects the update rule, so version 13 plans are rejected rather than read misaligned.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 14;
+    // Version 15 preserves gradient boundaries, accepted parameter ages and coupled optimizers' fixed active domains.
+    internal const ushort CurrentFormatVersion = 15;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:

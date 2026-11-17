@@ -1795,23 +1795,7 @@ public partial class CpuEngine
     public virtual Tensor<Bit> TensorIsFinite<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        var ops = MathHelper.GetNumericOperations<T>();
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        using var srcLease = tensor.Lease();
-        var src = srcLease.Span;
-        var result = new Bit[src.Length];
-        for (int i = 0; i < src.Length; i++)
-        {
-            bool finite = !ops.IsNaN(src[i]);
-            // Also check for ±∞ via round-trip to double (when T is fp).
-            if (finite)
-            {
-                double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
-                finite = !double.IsInfinity(d);
-            }
-            result[i] = finite ? Bit.True : Bit.False;
-        }
-        return new Tensor<Bit>(result, tensor._shape);
+        return ClassifyRealValues(tensor, infinityOnly: false);
     }
 
     /// <inheritdoc/>
@@ -1833,17 +1817,115 @@ public partial class CpuEngine
     public virtual Tensor<Bit> TensorIsInf<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        return ClassifyRealValues(tensor, infinityOnly: true);
+    }
+
+    private static Tensor<Bit> ClassifyRealValues<T>(Tensor<T> tensor, bool infinityOnly)
+    {
+        if (!SupportsRealValuePredicates<T>())
+            throw new NotSupportedException($"Real-valued finiteness predicates are not supported for {typeof(T)}.");
+        tensor.RealizeLazySource();
+        if (tensor is SparseTensor<T> sparse) return ClassifySparseRealValues(sparse, infinityOnly);
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        using var srcLease = tensor.Lease();
-        var src = srcLease.Span;
-        var result = new Bit[src.Length];
-        for (int i = 0; i < src.Length; i++)
+        var result = new Bit[tensor.Length];
+        if (typeof(T) == typeof(float))
         {
-            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
-            result[i] = double.IsInfinity(d) ? Bit.True : Bit.False;
+            using var lease = ((Tensor<float>)(object)tensor).Lease();
+            var values = lease.Span;
+            for (int i = 0; i < values.Length; i++)
+            {
+                bool matches = infinityOnly ? float.IsInfinity(values[i])
+                    : !float.IsNaN(values[i]) && !float.IsInfinity(values[i]);
+                result[i] = matches ? Bit.True : Bit.False;
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            using var lease = ((Tensor<double>)(object)tensor).Lease();
+            var values = lease.Span;
+            for (int i = 0; i < values.Length; i++)
+            {
+                bool matches = infinityOnly ? double.IsInfinity(values[i])
+                    : !double.IsNaN(values[i]) && !double.IsInfinity(values[i]);
+                result[i] = matches ? Bit.True : Bit.False;
+            }
+        }
+        else if (typeof(T) == typeof(Half))
+        {
+            using var lease = ((Tensor<Half>)(object)tensor).Lease();
+            var values = lease.Span;
+            for (int i = 0; i < values.Length; i++)
+            {
+                bool matches = infinityOnly ? Half.IsInfinity(values[i])
+                    : !Half.IsNaN(values[i]) && !Half.IsInfinity(values[i]);
+                result[i] = matches ? Bit.True : Bit.False;
+            }
+        }
+        else if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
+        {
+            using var lease = ((Tensor<AiDotNet.Tensors.NumericOperations.BFloat16>)(object)tensor).Lease();
+            var values = lease.Span;
+            for (int i = 0; i < values.Length; i++)
+            {
+                bool matches = infinityOnly ? AiDotNet.Tensors.NumericOperations.BFloat16.IsInfinity(values[i])
+                    : AiDotNet.Tensors.NumericOperations.BFloat16.IsFinite(values[i]);
+                result[i] = matches ? Bit.True : Bit.False;
+            }
+        }
+        else if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.Float8E4M3))
+        {
+            using var lease = ((Tensor<AiDotNet.Tensors.NumericOperations.Float8E4M3>)(object)tensor).Lease();
+            var values = lease.Span;
+            // E4M3 has NaN encodings but no infinity encoding.
+            for (int i = 0; i < values.Length; i++)
+                result[i] = !infinityOnly && !values[i].IsNaN ? Bit.True : Bit.False;
+        }
+        else if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.Float8E5M2))
+        {
+            using var lease = ((Tensor<AiDotNet.Tensors.NumericOperations.Float8E5M2>)(object)tensor).Lease();
+            var values = lease.Span;
+            for (int i = 0; i < values.Length; i++)
+            {
+                bool matches = infinityOnly ? values[i].IsInfinity : !values[i].IsNaN && !values[i].IsInfinity;
+                result[i] = matches ? Bit.True : Bit.False;
+            }
+        }
+        else
+        {
+            // Supported non-floating element types cannot represent NaN or infinity.
+            result.AsSpan().Fill(infinityOnly ? Bit.False : Bit.True);
         }
         return new Tensor<Bit>(result, tensor._shape);
     }
+
+    private static bool SupportsRealValuePredicates<T>()
+        => typeof(T) == typeof(float) || typeof(T) == typeof(double) || typeof(T) == typeof(Half)
+            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)
+            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.Float8E4M3)
+            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.Float8E5M2)
+            || typeof(T) == typeof(decimal) || typeof(T) == typeof(byte) || typeof(T) == typeof(sbyte)
+            || typeof(T) == typeof(short) || typeof(T) == typeof(ushort) || typeof(T) == typeof(int)
+            || typeof(T) == typeof(uint) || typeof(T) == typeof(long) || typeof(T) == typeof(ulong)
+            || typeof(T) == typeof(Bit) || typeof(T) == typeof(bool);
+
+    private static Tensor<Bit> ClassifySparseRealValues<T>(SparseTensor<T> sparse, bool infinityOnly)
+    {
+        var result = new Bit[sparse.Length];
+        // Implicit zeros are finite and never infinite.
+        if (!infinityOnly) result.AsSpan().Fill(Bit.True);
+        var coalesced = sparse.Coalesce();
+        if (coalesced.NonZeroCount > 0)
+        {
+            var stored = new Tensor<T>(new[] { coalesced.NonZeroCount }, coalesced.DataVector);
+            var classified = ClassifyRealValues(stored, infinityOnly);
+            using var lease = classified.Lease();
+            var masks = lease.Span;
+            for (int i = 0; i < masks.Length; i++)
+                result[coalesced.RowIndices[i] * sparse.Columns + coalesced.ColumnIndices[i]] = masks[i];
+        }
+        return new Tensor<Bit>(result, sparse._shape);
+    }
+
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorTriu<T>(Tensor<T> tensor, int diagonal = 0)

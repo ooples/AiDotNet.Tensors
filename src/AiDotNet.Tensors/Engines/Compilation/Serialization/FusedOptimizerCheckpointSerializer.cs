@@ -6,6 +6,7 @@ internal static class FusedOptimizerCheckpointSerializer
 {
     internal static void Write(BinaryWriter writer, FusedOptimizerCheckpoint? checkpoint)
     {
+        if (checkpoint is not null) ValidateStateMetadata(checkpoint);
         writer.Write(checkpoint is not null);
         if (checkpoint is null) return;
 
@@ -30,60 +31,168 @@ internal static class FusedOptimizerCheckpointSerializer
         WriteOptimizerTypeArray(writer, checkpoint.GroupOptimizerTypes);
         WriteDoubleArray(writer, checkpoint.GroupWeightDecays);
         WriteScalars(writer, checkpoint.Scalars);
+        WriteFixedActiveDomain(writer, checkpoint.FixedActiveDomain);
 
         writer.Write(checkpoint.Parameters.Length);
         for (int i = 0; i < checkpoint.Parameters.Length; i++)
             WriteParameter(writer, checkpoint.Parameters[i]);
+        WriteLbfgsHistory(writer, checkpoint.LbfgsHistory);
     }
 
     /// <param name="reader">The reader positioned at the checkpoint.</param>
-    /// <param name="doubleHyperparameters">Whether beta1, beta2, epsilon and weight decay were written as double (every
-    /// writer since they became double). False reads the older single-precision layout, so optimizer state exported
-    /// before the change still imports.</param>
-    /// <param name="hasVelocityIncludesLearningRate">Whether the extras end with the
-    /// <see cref="FusedOptimizerExtras.VelocityIncludesLearningRate"/> flag (plan format 14, optimizer-state version 5).
-    /// Older payloads end the extras one byte earlier, and reading the flag from them would consume the first byte of
-    /// the LR-schedule count. They restore it as false, the velocity rule they were saved with.</param>
-    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader, bool doubleHyperparameters = true,
-        bool hasVelocityIncludesLearningRate = true)
+    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader)
     {
         if (!reader.ReadBoolean()) return null;
-        double ReadHyperparameter() => doubleHyperparameters ? reader.ReadDouble() : reader.ReadSingle();
 
         var checkpoint = new FusedOptimizerCheckpoint
         {
             OptimizerType = (OptimizerType)reader.ReadInt32(),
             IsGrouped = reader.ReadBoolean(),
             OptimizerStep = reader.ReadInt32(),
-            Beta1 = ReadHyperparameter(),
-            Beta2 = ReadHyperparameter(),
-            Epsilon = ReadHyperparameter(),
-            WeightDecay = ReadHyperparameter(),
+            Beta1 = reader.ReadDouble(),
+            Beta2 = reader.ReadDouble(),
+            Epsilon = reader.ReadDouble(),
+            WeightDecay = reader.ReadDouble(),
             MomentStorageMode = (FusedMomentStorageMode)reader.ReadInt32(),
             Int8MomentBlockSize = reader.ReadInt32(),
             Int8MinQuantizedLength = reader.ReadInt32(),
             MaxGradNorm = reader.ReadDouble(),
-            Extras = ReadExtras(reader, hasVelocityIncludesLearningRate),
+            Extras = ReadExtras(reader),
             Schedules = ReadLrSchedules(reader),
             ParamToGroup = ReadIntArray(reader),
             GroupOptimizerTypes = ReadOptimizerTypeArray(reader),
-            GroupWeightDecays = doubleHyperparameters
-                ? ReadDoubleArray(reader)
-                : ReadFloatArray(reader) is { } singles ? System.Array.ConvertAll(singles, wd => (double)wd) : null,
+            GroupWeightDecays = ReadDoubleArray(reader),
             Scalars = ReadScalars(reader),
+            FixedActiveDomain = ReadFixedActiveDomain(reader),
         };
 
         int paramCount = reader.ReadInt32();
         if (paramCount < 0)
             throw new InvalidDataException($"Fused optimizer parameter-state count {paramCount} cannot be negative.");
-        // Each parameter state writes at least 12 array-length prefixes (4 bytes each) even when every
+        if (checkpoint.FixedActiveDomain is { } domain && domain.Length != paramCount)
+            throw new InvalidDataException("The fixed active domain must contain one entry per canonical parameter.");
+        // Each parameter state writes its age and at least 12 array-length prefixes even when every
         // array is null, so bound the count against the remaining stream before allocating — a corrupt
         // count (e.g. 0x7FFFFFFF) would otherwise allocate a multi-GB array up front.
-        EnsureFitsRemaining(reader, (long)paramCount * (12 * sizeof(int)), "parameter-state array");
+        EnsureFitsRemaining(reader, (long)paramCount * (sizeof(long) + 12 * sizeof(int)), "parameter-state array");
         checkpoint.Parameters = new FusedOptimizerParameterCheckpoint[paramCount];
         for (int i = 0; i < paramCount; i++)
             checkpoint.Parameters[i] = ReadParameter(reader);
+        checkpoint.LbfgsHistory = ReadLbfgsHistory(reader);
+        ValidateStateMetadata(checkpoint);
         return checkpoint;
+    }
+
+    private static void ValidateStateMetadata(FusedOptimizerCheckpoint checkpoint)
+    {
+        ValidateLbfgsHistory(checkpoint);
+        if (checkpoint.OptimizerStep < 0)
+            throw new InvalidDataException("The optimizer step cannot be negative.");
+        bool requiresDomain = FusedOptimizerCheckpoint.RequiresFixedActiveDomain(checkpoint.OptimizerType);
+        if (requiresDomain != (checkpoint.FixedActiveDomain is not null))
+            throw new InvalidDataException("A fixed active domain is required exactly for coupled optimizer methods.");
+        if (checkpoint.FixedActiveDomain is { } domain && (checkpoint.IsGrouped || domain.Length != checkpoint.Parameters.Length))
+            throw new InvalidDataException("The fixed active domain must describe the ungrouped canonical parameter slots.");
+        for (int i = 0; i < checkpoint.Parameters.Length; i++)
+        {
+            long age = checkpoint.Parameters[i].AcceptedUpdates;
+            if (age < 0 || age > checkpoint.OptimizerStep)
+                throw new InvalidDataException(
+                    $"Parameter {i} accepted update count {age} must be between zero and optimizer step {checkpoint.OptimizerStep}.");
+        }
+    }
+
+    internal static void ValidateLbfgsHistory(FusedOptimizerCheckpoint checkpoint)
+    {
+        var h = checkpoint.LbfgsHistory;
+        if ((checkpoint.OptimizerType == OptimizerType.LBFGS && !checkpoint.IsGrouped) != (h is not null))
+            throw new InvalidDataException("L-BFGS history is required exactly for an ungrouped L-BFGS optimizer.");
+        if (h is null) return;
+        int memory = Math.Max(1, checkpoint.Extras.LbfgsMemorySize);
+        if (h.S is null || h.Y is null || h.Rho is null || h.PrevParam is null || h.PrevGrad is null
+            || h.S.Length != memory || h.Y.Length != memory || h.Rho.Length != memory
+            || h.PrevParam.Length != h.PrevGrad.Length || h.Count < 0 || h.Count > memory
+            || h.Head < 0 || h.Head >= memory || (!h.HasPrev && h.Count != 0))
+            throw new InvalidDataException("Invalid L-BFGS history dimensions or ring position.");
+        ValidateFinite(h.PrevParam); ValidateFinite(h.PrevGrad); ValidateFinite(h.Rho);
+        for (int i = 0; i < memory; i++)
+        {
+            if (h.S[i] is null || h.Y[i] is null || h.S[i].Length != h.PrevParam.Length || h.Y[i].Length != h.PrevParam.Length)
+                throw new InvalidDataException("L-BFGS history vectors must have the canonical flattened width.");
+            ValidateFinite(h.S[i]); ValidateFinite(h.Y[i]);
+        }
+        if (float.IsNaN(h.GammaNum) || float.IsInfinity(h.GammaNum)
+            || float.IsNaN(h.GammaDen) || float.IsInfinity(h.GammaDen))
+            throw new InvalidDataException("L-BFGS history scaling must be finite.");
+    }
+
+    private static void ValidateFinite(float[] values)
+    {
+        foreach (float value in values)
+            if (float.IsNaN(value) || float.IsInfinity(value))
+                throw new InvalidDataException("L-BFGS history vectors must be finite.");
+    }
+
+    private static void WriteLbfgsHistory(BinaryWriter writer, FusedLbfgsHistoryCheckpoint? h)
+    {
+        writer.Write(h is not null);
+        if (h is null) return;
+        writer.Write(h.Count); writer.Write(h.Head); writer.Write(h.HasPrev);
+        writer.Write(h.GammaNum); writer.Write(h.GammaDen);
+        WriteFloatArray(writer, h.PrevParam); WriteFloatArray(writer, h.PrevGrad); WriteFloatArray(writer, h.Rho);
+        writer.Write(h.S.Length);
+        for (int i = 0; i < h.S.Length; i++) { WriteFloatArray(writer, h.S[i]); WriteFloatArray(writer, h.Y[i]); }
+    }
+
+    private static FusedLbfgsHistoryCheckpoint? ReadLbfgsHistory(BinaryReader reader)
+    {
+        byte present = reader.ReadByte();
+        if (present == 0) return null;
+        if (present != 1) throw new InvalidDataException("Invalid L-BFGS history presence flag.");
+        var h = new FusedLbfgsHistoryCheckpoint
+        {
+            Count = reader.ReadInt32(), Head = reader.ReadInt32(),
+        };
+        byte hasPrev = reader.ReadByte();
+        if (hasPrev > 1) throw new InvalidDataException("Invalid L-BFGS previous-iterate flag.");
+        h.HasPrev = hasPrev == 1;
+        h.GammaNum = reader.ReadSingle(); h.GammaDen = reader.ReadSingle();
+        h.PrevParam = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS previous parameters.");
+        h.PrevGrad = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS previous gradient.");
+        h.Rho = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS curvature reciprocals.");
+        int count = reader.ReadInt32();
+        if (count < 0) throw new InvalidDataException("Negative L-BFGS history size.");
+        EnsureFitsRemaining(reader, (long)count * 2 * sizeof(int), "L-BFGS history");
+        h.S = new float[count][]; h.Y = new float[count][];
+        for (int i = 0; i < count; i++)
+        {
+            h.S[i] = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS displacement.");
+            h.Y[i] = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS gradient difference.");
+        }
+        return h;
+    }
+
+    private static void WriteFixedActiveDomain(BinaryWriter writer, bool[]? domain)
+    {
+        writer.Write(domain?.Length ?? -1);
+        if (domain is not null)
+            foreach (bool active in domain) writer.Write((byte)(active ? 1 : 0));
+    }
+
+    private static bool[]? ReadFixedActiveDomain(BinaryReader reader)
+    {
+        int count = reader.ReadInt32();
+        if (count == -1) return null;
+        if (count < 0) throw new InvalidDataException("The fixed active domain count cannot be negative.");
+        EnsureFitsRemaining(reader, count, "fixed active domain");
+        var domain = new bool[count];
+        for (int i = 0; i < count; i++)
+        {
+            byte active = reader.ReadByte();
+            if (active > 1) throw new InvalidDataException("A fixed active domain entry must be zero or one.");
+            domain[i] = active == 1;
+        }
+        return domain;
     }
 
     private static void WriteExtras(BinaryWriter writer, FusedOptimizerExtras extras)
@@ -143,7 +252,7 @@ internal static class FusedOptimizerCheckpointSerializer
         return present ? value : null;
     }
 
-    private static FusedOptimizerExtras ReadExtras(BinaryReader reader, bool hasVelocityIncludesLearningRate)
+    private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
         => new FusedOptimizerExtras
         {
             Momentum = reader.ReadSingle(),
@@ -174,7 +283,7 @@ internal static class FusedOptimizerCheckpointSerializer
             AmsgradDisableBiasCorrection = reader.ReadBoolean(),
             AmsgradExactBeta1 = ReadNullableDouble(reader),
             AmsgradExactBeta2 = ReadNullableDouble(reader),
-            VelocityIncludesLearningRate = hasVelocityIncludesLearningRate && reader.ReadBoolean(),
+            VelocityIncludesLearningRate = reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)
@@ -232,6 +341,7 @@ internal static class FusedOptimizerCheckpointSerializer
 
     private static void WriteParameter(BinaryWriter writer, FusedOptimizerParameterCheckpoint p)
     {
+        writer.Write(p.AcceptedUpdates);
         WriteFloatArray(writer, p.MFloat);
         WriteFloatArray(writer, p.VFloat);
         WriteFloatArray(writer, p.VMaxFloat);
@@ -249,6 +359,7 @@ internal static class FusedOptimizerCheckpointSerializer
     private static FusedOptimizerParameterCheckpoint ReadParameter(BinaryReader reader)
         => new FusedOptimizerParameterCheckpoint
         {
+            AcceptedUpdates = reader.ReadInt64(),
             MFloat = ReadFloatArray(reader),
             VFloat = ReadFloatArray(reader),
             VMaxFloat = ReadFloatArray(reader),

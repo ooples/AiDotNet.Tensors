@@ -1,5 +1,21 @@
 namespace AiDotNet.Tensors.Engines.Compilation;
 
+/// <summary>Compiles a single forward dispatch without recursively realizing its producers.</summary>
+internal interface ICompiledForwardNode
+{
+    Action<IEngine> CompileForwardAction();
+    void ProtectDeviceState(HashSet<object> keys);
+    void DetachDeviceBindings(HashSet<DirectGpu.IGpuBuffer> released, HashSet<IntPtr> handles, HashSet<object> retained);
+}
+
+/// <summary>Describes the gradient boundary of a node crossing element types.</summary>
+internal interface ICrossTypeNodeMetadata
+{
+    Type InputElementType { get; }
+    Type OutputElementType { get; }
+    bool HasBackward { get; }
+}
+
 /// <summary>
 /// Type-erased interface for lazy computation nodes. Allows LazyTensorScope
 /// to manage nodes across different element types (float, double, etc.)

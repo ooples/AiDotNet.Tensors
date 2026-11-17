@@ -73,7 +73,9 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             if (node.IsRealized) blocked.Add(node);
             // Recorded under a NoGradScope: the node has no backward on purpose, and a fused replacement would bring
             // one back (FusedLinear's), sending gradient into what the forward ran detached.
-            if (_forTraining && node.RecordedUnderNoGrad) blocked.Add(node);
+            if (_forTraining && (node.RecordedUnderNoGrad
+                || node is ISignableLazyNode { BackwardDelegate: null }
+                || node is ISignableLazyNode { DifferentiableInputIndices: not null })) blocked.Add(node);
             if (node is not IInPlaceReadOrdering ordered || ordered.EarlierReaders.Count == 0) continue;
             blocked.Add(node);
             foreach (var reader in ordered.EarlierReaders) blocked.Add(reader);
