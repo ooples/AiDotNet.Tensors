@@ -125,7 +125,13 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
     internal static void PublishEager(GradientTape<T> tape)
     {
         if (_current is not { } capture) return;
-        capture._published = capture._eager.TryGetValue(tape, out var outputs)
+        // Destructive backward advances the epoch before the accepted update publishes its outputs.
+        // Older registrations belong to a previous forward, even if this forward retained no keys.
+        long epoch = tape.RecordingEpoch;
+        bool eligible = EagerRegistrations.TryGetValue(tape, out var registration) && registration.Epoch >= 0
+            && (registration.Epoch == epoch || registration.Epoch == epoch - 1);
+        if (!eligible) capture._eager.Remove(tape);
+        capture._published = eligible && capture._eager.TryGetValue(tape, out var outputs)
             ? new Dictionary<string, Tensor<T>>(outputs, StringComparer.Ordinal)
             : new Dictionary<string, Tensor<T>>(StringComparer.Ordinal);
         capture._plan = null;

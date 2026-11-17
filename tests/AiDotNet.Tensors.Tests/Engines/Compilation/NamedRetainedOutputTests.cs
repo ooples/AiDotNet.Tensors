@@ -558,4 +558,137 @@ public sealed class NamedRetainedOutputTests : IDisposable
         Assert.True(thread.Join(TimeSpan.FromSeconds(10)), "The foreign-thread scope operation did not return.");
         return failure;
     }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Unretained_second_forward_does_not_publish_an_earlier_recording(bool streaming, bool failFirstCallback)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        });
+        var first = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", first);
+        CompleteBackward(tape, engine.ReduceSum(first, null), parameter, 2.0, streaming, failFirstCallback);
+        Assert.Equal(1, tape.RecordingEpoch);
+        if (!failFirstCallback) PublishAccepted(tape);
+
+        // This is a real new forward and accepted update, but it deliberately registers no retained output.
+        var second = engine.TensorMultiplyScalar(parameter, 4.0);
+        CompleteBackward(tape, engine.ReduceSum(second, null), parameter, 4.0, streaming, failCallback: false);
+        Assert.Equal(2, tape.RecordingEpoch);
+        PublishAccepted(tape);
+        outputs.Complete();
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() => outputs.Get("generation"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Immediate_post_backward_publication_keeps_the_completed_nonpersistent_recording(bool streaming)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        });
+        var generated = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", generated);
+        CompleteBackward(tape, engine.ReduceSum(generated, null), parameter, 2.0, streaming, failCallback: false);
+        Assert.Equal(1, tape.RecordingEpoch);
+        PublishAccepted(tape);
+        outputs.Complete();
+        Assert.Equal(10.0, outputs.Get("generation").ToArray()[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Persistent_retained_graph_can_publish_the_same_recording_after_repeated_backwards(bool streaming)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = true,
+            StreamingGraphRetention = StreamingGraphRetentionMode.RetainUntilTapeDisposal,
+        });
+        var generated = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", generated);
+        var loss = engine.ReduceSum(generated, null);
+        for (int update = 0; update < 2; update++)
+        {
+            CompleteBackward(tape, loss, parameter, 2.0, streaming, failCallback: false);
+            Assert.Equal(0, tape.RecordingEpoch);
+            PublishAccepted(tape);
+        }
+        outputs.Complete();
+        Assert.Equal(10.0, outputs.Get("generation").ToArray()[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Reset_or_dispose_discards_even_an_immediately_completed_recording(bool dispose)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions { Persistent = false });
+        var generated = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", generated);
+        CompleteBackward(tape, engine.ReduceSum(generated, null), parameter, 2.0, streaming: false, failCallback: false);
+        if (dispose) tape.Dispose();
+        else tape.Reset();
+        PublishAccepted(tape);
+        outputs.Complete();
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() => outputs.Get("generation"));
+    }
+
+    private static void PublishAccepted(GradientTape<double> tape)
+    {
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(update.Accepted);
+        RetainedOutputCapture<double>.PublishEager(tape);
+    }
+
+    private static void CompleteBackward(GradientTape<double> tape, Tensor<double> loss, Tensor<double> parameter,
+        double expectedGradient, bool streaming, bool failCallback)
+    {
+        if (!streaming)
+        {
+            Assert.False(failCallback);
+            Assert.Equal(expectedGradient, tape.ComputeGradients(loss, new[] { parameter })[parameter].ToArray()[0]);
+            return;
+        }
+        int callbacks = 0;
+        void Consume(Tensor<double> source, Tensor<double> gradient)
+        {
+            Assert.Same(parameter, source);
+            Assert.Equal(expectedGradient, gradient.ToArray()[0]);
+            callbacks++;
+            if (failCallback) throw new ApplicationException("callback failed");
+        }
+        if (failCallback)
+            Assert.Throws<ApplicationException>(() => tape.ComputeGradientsStreaming(loss, new[] { parameter }, Consume));
+        else
+            tape.ComputeGradientsStreaming(loss, new[] { parameter }, Consume);
+        Assert.Equal(1, callbacks);
+    }
+
 }
