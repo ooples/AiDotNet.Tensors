@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.151.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.151.1...v0.151.2) (2026-11-17)
+
+
+### Bug Fixes
+
+* **compilation:** preserve gradient enrollment and training replay ([#1766](https://github.com/ooples/AiDotNet.Tensors/issues/1766)) ([dcfcf5a](https://github.com/ooples/AiDotNet.Tensors/commit/dcfcf5ad1fceddfddf7008c2590a30463c82e141))
+
 ## [0.151.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.151.0...v0.151.1) (2026-11-16)
 
 
