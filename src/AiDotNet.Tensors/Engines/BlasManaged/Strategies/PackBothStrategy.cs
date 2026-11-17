@@ -564,7 +564,7 @@ internal static class PackBothStrategy
         // fast path. Without alignment the NT path silently falls back to
         // regular cached stores (still correct, just no perf win).
         const int PackBAlignment = 32;
-        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(packBBytes + PackBAlignment - 1);
+        byte[] packBArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<byte>(packBBytes + PackBAlignment - 1, "workspace.blas_parallel_packB");
         int packBAlignedOffset;
         unsafe
         {
@@ -930,7 +930,7 @@ internal static class PackBothStrategy
         // the sole dispatch path now (PR #762 removed the #85 L3-domain-PINNED experimental pool),
         // so there is no per-CCX pinning to replicate for — every participant reads the one copy.
         int nCopies = 1;
-        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)(packAElemsPerCopy * nCopies));
+        var packAArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<float>((int)(packAElemsPerCopy * nCopies), "workspace.blas_naxis_packA");
         try
         {
             for (int pIdx = 0; pIdx < numKPanels; pIdx++)
@@ -965,7 +965,7 @@ internal static class PackBothStrategy
 
                     // Private per-thread packed-B for this N-block: [K-panel][Kc × packedNc].
                     int bPanelStride = kcL * packedNc;
-                    byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
+                    byte[] packBArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<byte>(numKPanelsL * bPanelStride * sizeof(float), "workspace.blas_naxis_packB");
                     try
                     {
                         // Single shared packed-A copy (PR #762 removed per-CCX pinning/replication).
@@ -1108,7 +1108,7 @@ internal static class PackBothStrategy
         long packBAllElems = (long)numKPanels * kc * packedNc;
 
         const int PackBAlignment = 32;
-        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent((int)(packBAllElems * elemSize) + PackBAlignment - 1);
+        byte[] packBArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<byte>((int)(packBAllElems * elemSize) + PackBAlignment - 1, "workspace.blas_single_region_packB");
         int packBAlignedOffset;
         fixed (byte* pbPtr = packBArr)
         {

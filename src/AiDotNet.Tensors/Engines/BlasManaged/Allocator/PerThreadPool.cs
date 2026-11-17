@@ -50,6 +50,7 @@ internal sealed class PerThreadPool
         if (bytes <= 0) return Span<byte>.Empty;
         if (_packA is null || _packA.Length < bytes)
             _packA = new byte[bytes];
+        Helpers.CpuStorageAllocationDiagnostics.Record<byte>("workspace.blas_private_packA", bytes);
         return _packA.AsSpan(0, bytes);
     }
 
@@ -62,6 +63,7 @@ internal sealed class PerThreadPool
         if (bytes <= 0) return Span<byte>.Empty;
         if (_packB is null || _packB.Length < bytes)
             _packB = new byte[bytes];
+        Helpers.CpuStorageAllocationDiagnostics.Record<byte>("workspace.blas_private_packB", bytes);
         return _packB.AsSpan(0, bytes);
     }
 

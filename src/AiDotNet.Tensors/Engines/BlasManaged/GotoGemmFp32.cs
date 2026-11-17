@@ -510,8 +510,8 @@ internal static class GotoGemmFp32
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
         int mTail = effMc - mFull;
         // +Mr rows: the zero-padded M-tail sub-panel; +8: the SIMD A-pack transpose may store 2 past the last tile.
-        float[] paArr = ArrayPool<float>.Shared.Rent((mc + Mr) * kc + 8);
-        float[] pbArr = ArrayPool<float>.Shared.Rent(kc * nc);
+        float[] paArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<float>((mc + Mr) * kc + 8, "workspace.blas_goto_tile_packA");
+        float[] pbArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<float>(kc * nc, "workspace.blas_goto_tile_packB");
         try
         {
             fixed (float* pa = paArr, pb = pbArr)
