@@ -10,8 +10,30 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// operation later (during Realize) or to fuse it with adjacent operations.
 /// </summary>
 /// <typeparam name="T">The numeric element type.</typeparam>
-internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLazyNode
+internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLazyNode, ICompiledForwardNode
 {
+    Action<IEngine> ICompiledForwardNode.CompileForwardAction() => engine =>
+    {
+        DirectGpuTensorEngine.s_currentForwardOp = OpName;
+        Execute(engine, Output);
+        ForwardOnlyHeterogeneousReplay.CommitOutput(Output, OpName);
+        IsRealized = true;
+    };
+
+    void ICompiledForwardNode.ProtectDeviceState(HashSet<object> keys)
+    {
+        if (WritesInPlace) ForwardOnlyHeterogeneousReplay.ProtectTensor(keys, Output);
+    }
+
+    void ICompiledForwardNode.DetachDeviceBindings(HashSet<DirectGpu.IGpuBuffer> released, HashSet<IntPtr> handles, HashSet<object> retained)
+    {
+        ForwardOnlyHeterogeneousReplay.DetachTensor(Output, released, handles,
+            !WritesInPlace && !retained.Contains(Output) && !retained.Contains(((ITensorStorageLeaseSource)Output).StorageIdentity));
+        foreach (var input in GetInputsArray()) ForwardOnlyHeterogeneousReplay.DetachTensor(input, released, handles);
+        if (SavedState is { } saved)
+            foreach (var tensor in saved.OfType<Tensor<T>>()) ForwardOnlyHeterogeneousReplay.DetachTensor(tensor, released, handles);
+    }
+
     Type ISignableLazyNode.OutputElementType => typeof(T);
     object ISignableLazyNode.OutputTensor => Output;
     // InputCount is 0xFF for 4+ inputs; the overflow array holds inputs 3 and up.
@@ -29,6 +51,42 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
     bool ISignableLazyNode.ReplaysHostStateFlag => ReplaysHostState;
     internal object? AuxiliaryOutput { get; set; }
     object? ISignableLazyNode.AuxiliaryOutput => AuxiliaryOutput;
+    int[]? ISignableLazyNode.DifferentiableInputIndices => DifferentiableInputIndices;
+
+    private int[]? _differentiableInputIndices;
+    internal int[]? DifferentiableInputIndices => _differentiableInputIndices is null
+        ? null : (int[])_differentiableInputIndices.Clone();
+
+    // This declares the backward callback's edge contract, not a numerical test of its result.
+    // Callbacks must implement the canonical derivative only for these input positions.
+    internal void SetDifferentiableInputIndices(int[]? indices)
+    {
+        if (indices is not null)
+        {
+            int previous = -1;
+            int count = InputsOverflow is { } extra ? 3 + extra.Length : InputCount;
+            foreach (int index in indices)
+            {
+                if (index <= previous || index >= count)
+                    throw new ArgumentException("Differentiable input indices must be sorted, unique and in range.", nameof(indices));
+                previous = index;
+            }
+        }
+        int inputCount = InputsOverflow is { } overflow ? 3 + overflow.Length : InputCount;
+        _differentiableInputIndices = indices is null || indices.Length == inputCount
+            ? null : (int[])indices.Clone();
+    }
+
+    internal IEnumerable<Tensor<T>> GetDifferentiableInputs()
+    {
+        if (BackwardFn is null) yield break;
+        var inputs = GetInputsArray();
+        if (_differentiableInputIndices is null)
+        {
+            foreach (var input in inputs) yield return input;
+        }
+        else foreach (int index in _differentiableInputIndices) yield return inputs[index];
+    }
 
 
     // ═══ Operation identity ═══
@@ -104,6 +162,9 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
 
     /// <inheritdoc />
     public bool RecordedInProbe { get; set; }
+
+    /// <inheritdoc />
+    public bool RecordedUnderNoGrad { get; set; }
 
     /// <summary>Creates a unary lazy node (one input).</summary>
     public LazyNode(
@@ -294,8 +355,29 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
         => GetInputNodes(includeEarlierReaders: true);
 
     // Execution ordering edges keep old reads ahead of in-place writes; they do not carry derivatives.
+    // An in-place write recorded under NoGradScope is not on the eager tape at all: the target keeps its producer's
+    // history, so the gradient of the target's later uses reaches that producer as if the write were not there (torch's
+    // no_grad in-place write does the same). The write itself adds no derivative, to the target or its other operands:
+    // only the prior writer stays reachable, and the write's own backward stays null.
     internal ILazyNode[] GetGradientInputNodes()
-        => BackwardFn is null ? Array.Empty<ILazyNode>() : GetInputNodes(includeEarlierReaders: false);
+    {
+        if (BackwardFn is not null)
+        {
+            if (_differentiableInputIndices is null) return GetInputNodes(includeEarlierReaders: false);
+            var nodes = new List<ILazyNode>();
+            var inputs = GetInputsArray();
+            foreach (int index in _differentiableInputIndices)
+            {
+                var producer = index == 0 && WritesInPlace ? PriorWriter
+                    : LazyNodeOrder.ProducerAsOf(inputs[index].LazySource, RecordOrder);
+                if (producer is not null && !ReferenceEquals(producer, this)) nodes.Add(producer);
+            }
+            return nodes.ToArray();
+        }
+        return RecordedUnderNoGrad && PriorWriter is { } prior && !ReferenceEquals(prior, this)
+            ? new[] { prior }
+            : Array.Empty<ILazyNode>();
+    }
 
     private ILazyNode[] GetInputNodes(bool includeEarlierReaders)
     {

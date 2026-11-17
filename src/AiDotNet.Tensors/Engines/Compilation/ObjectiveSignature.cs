@@ -24,6 +24,7 @@ internal interface ISignableLazyNode : ILazyNode
     bool ReplaysHostStateFlag { get; }
     object? AuxiliaryOutput { get; }
     bool RecordedInProbe { get; set; }
+    int[]? DifferentiableInputIndices { get; }
 }
 
 /// <summary>
@@ -307,6 +308,11 @@ internal sealed class ObjectiveSignature : IEquatable<ObjectiveSignature>
             Tokens.Add(n.OutputElementType);
             Tokens.Add(new ArrayToken(n.OutputShape));
             Tokens.Add(n.ReplaysHostStateFlag);
+            // A no-grad node differs from the same op recorded with gradient (no backward, never fused), so a step
+            // that leaves the scope must not replay a plan traced inside it, or the reverse.
+            Tokens.Add(n.RecordedUnderNoGrad);
+            Tokens.Add(n.DifferentiableInputIndices is not null);
+            if (n.DifferentiableInputIndices is { } edges) Tokens.Add(new ArrayToken(edges));
             Tokens.Add(n.RecordingEngine?.GetType() ?? typeof(void));
 
             Tokens.Add(n.SignatureInputCount);

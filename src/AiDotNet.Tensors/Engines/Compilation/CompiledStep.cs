@@ -34,6 +34,29 @@ internal sealed class CompiledStep<T>
     /// </summary>
     internal bool ReplaysHostState { get; init; }
 
+    /// <summary>Preserves an explicit no-grad boundary when this forward is serialized and traced again.</summary>
+    internal bool RecordedUnderNoGrad { get; init; }
+
+    private int[]? _differentiableInputIndices;
+
+    /// <summary>Null means every input; otherwise the sorted, distinct derivative-bearing input indices.</summary>
+    internal int[]? DifferentiableInputIndices
+    {
+        get => _differentiableInputIndices is null ? null : (int[])_differentiableInputIndices.Clone();
+        init
+        {
+            if (value is null) return;
+            int previous = -1;
+            foreach (int index in value)
+            {
+                if (index <= previous || index >= Inputs.Length)
+                    throw new ArgumentException("Differentiable input indices must be sorted, distinct and in range.", nameof(value));
+                previous = index;
+            }
+            _differentiableInputIndices = (int[])value.Clone();
+        }
+    }
+
     /// <summary>Type-safe operation type for compiled plan dispatch (avoids string comparisons).</summary>
     internal readonly OpType OpType;
 

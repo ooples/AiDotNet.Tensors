@@ -14929,7 +14929,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes, float learningRate, float beta1, float beta2, float epsilon,
-        float weightDecay, int step, IGpuBuffer? finiteGuard, IntPtr dynamicScalars, MultiTensorTable? ownTable)
+        float weightDecay, int step, IGpuBuffer? finiteGuard, IntPtr dynamicScalars, MultiTensorTable? ownTable,
+        IntPtr acceptedOffsets = default, IntPtr appliedState = default)
     {
         if (parameters is null) throw new ArgumentNullException(nameof(parameters));
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
@@ -14947,7 +14948,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
-        void** args = stackalloc void*[16];
+        void** args = stackalloc void*[18];
         IntPtr guardH = finiteGuard?.Handle ?? IntPtr.Zero;
         lock (_adamTableSync)
         {
@@ -14965,6 +14966,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             args[7] = &learningRate; args[8] = &beta1; args[9] = &beta2; args[10] = &epsilon;
             args[11] = &weightDecay; args[12] = &step; args[13] = &chunkSize; args[14] = &guardH;
             args[15] = &dynamicScalars;
+            args[16] = &acceptedOffsets; args[17] = &appliedState;
             LaunchKernel(kernel, (uint)table.TotalChunks, DefaultBlockSize, args);
         }
     }

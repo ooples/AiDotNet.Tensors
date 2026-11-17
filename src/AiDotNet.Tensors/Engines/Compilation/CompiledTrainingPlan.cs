@@ -41,6 +41,62 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // topological order to produce the Half activation buffers (the device-resident, capture-pure VRAM win).
     // Null ⇒ no FP16 activation nodes ⇒ the normal float-only path is used (zero behavior change).
     private readonly ILazyNode[]? _fp16HeteroOrder;
+    private ForwardOnlyHeterogeneousReplay? _dataForwardReplay;
+    internal bool HasForwardOnlyHeterogeneousReplay => _dataForwardReplay is not null;
+    internal string? StaticScheduleUnsupportedReason => _dataForwardReplay is null ? null : ForwardOnlyHeterogeneousReplay.UnsupportedScheduleReason;
+    private bool[] _graphGradientMembership;
+    private bool[] _optimizerGradientMembership;
+    private long[] _parameterAcceptedUpdates;
+    private bool[]? _pendingParameterAgeMembership;
+    private bool[]? _fixedActiveDomainMask;
+    private static bool RequiresFixedActiveDomain(OptimizerType optimizer)
+        => FusedOptimizerCheckpoint.RequiresFixedActiveDomain(optimizer);
+
+    private Tensor<T>[] ActiveOptimizerGradients() => _optimizerGradientMembership.All(active => active)
+        ? _gradients : _gradients.Where((_, index) => IsOptimizerParameterActive(index)).ToArray();
+
+    private bool IsOptimizerParameterActive(int index) => _optimizerGradientMembership[index];
+    private static bool HasCanonicalDerivative(CompiledStep<T> step) =>
+        step.BackwardFn is not null && !step.RecordedUnderNoGrad && step.DifferentiableInputIndices is null;
+
+    private static IEnumerable<Tensor<T>> DifferentiableInputs(CompiledStep<T> step)
+    {
+        if (step.BackwardFn is null) yield break;
+        if (step.DifferentiableInputIndices is { } indices)
+        {
+            foreach (int index in indices) yield return step.Inputs[index];
+        }
+        else foreach (var input in step.Inputs) yield return input;
+    }
+    private int NextParameterUpdateAge(int index) => checked((int)(_parameterAcceptedUpdates[index] + 1));
+    private static float ParameterBiasCorrection(float beta, int age) => 1f - MathF.Pow(beta, age);
+    private static double ParameterBiasCorrection(double beta, int age) => 1.0 - Math.Pow(beta, age);
+    private IEnumerable<int[]> ActiveParameterAgeGroups()
+        => Enumerable.Range(0, _parameters.Length).Where(IsOptimizerParameterActive)
+            .GroupBy(index => _parameterAcceptedUpdates[index]).Select(group => group.ToArray());
+
+    private static TSlot[] ProjectSlots<TSlot>(TSlot[] slots, int[] indices)
+        => indices.Length == slots.Length ? slots : indices.Select(index => slots[index]).ToArray();
+    private static IReadOnlyList<TSlot> ProjectList<TSlot>(IReadOnlyList<TSlot> slots, int[] indices)
+        => indices.Length == slots.Count ? slots : indices.Select(index => slots[index]).ToArray();
+    private void AdvanceParameterAges(bool[] membership)
+    {
+        for (int p = 0; p < membership.Length; p++)
+            if (membership[p]) _parameterAcceptedUpdates[p]++;
+    }
+    private void AdvanceParameterAges(bool[] membership, uint updates)
+    {
+        for (int p = 0; p < membership.Length; p++)
+            if (membership[p]) _parameterAcceptedUpdates[p] = checked(_parameterAcceptedUpdates[p] + updates);
+    }
+    internal IReadOnlyList<long> ParameterAcceptedUpdates
+    {
+        get
+        {
+            ResolveDeferredFiniteness();
+            return Array.AsReadOnly((long[])_parameterAcceptedUpdates.Clone());
+        }
+    }
 
     // FP16-IN-CAPTURE: the paged mixed-precision plan built once from _fp16HeteroOrder. Its forward/backward
     // carry the TESTED activation-paging lifecycle (PageOut/PageIn) that frees the transient float up-cast
@@ -464,6 +520,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lossOutput = lossOutput;
         _engine = engine;
         _parameters = parameters;
+        _graphGradientMembership = Enumerable.Repeat(true, parameters.Length).ToArray();
+        _optimizerGradientMembership = _graphGradientMembership;
+        _parameterAcceptedUpdates = new long[parameters.Length];
         _originalParameterToUnique = originalParameterToUnique;
         _preAllocatedGrads = preAllocatedGrads;
         _gradients = gradients;
@@ -519,6 +578,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped after the
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
+        // Land captured counters/parameter ages while the old moment storage is still owned.
+        InvalidateCapturedStepGraph();
         LeaveSharedMoments();
         DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
@@ -554,8 +615,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _lossReadback = null;
         }
 
-        // Free the captured training-step graph, if any.
-        InvalidateCapturedStepGraph();
         _fp16PagedPlan?.Dispose();
         _fp16PagedPlan = null;
         _storageLeases?.Dispose();
@@ -993,6 +1052,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public uint InitialApplied { get; set; }
         public uint LaunchedAtCapture { get; set; }
         public int SkipsRecorded { get; set; }
+        public uint AgesApplied { get; set; }
+        public bool[]? ParameterMembership { get; set; }
 
         // ---- ping-pong (null PingPong: the update runs in place in one graph) ----
         /// <summary>Each parameter's second weight buffer; the parity-1 graph reads the weights from these.</summary>
@@ -1179,6 +1240,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int skipped = replays - (int)(applied - optimizer.InitialApplied);
         for (int s = optimizer.SkipsRecorded; s < skipped; s++) _nonFiniteStepsSkipped++;
         optimizer.SkipsRecorded = Math.Max(optimizer.SkipsRecorded, skipped);
+        if (applied > optimizer.AgesApplied)
+        {
+            AdvanceParameterAges(optimizer.ParameterMembership ?? _graphGradientMembership, applied - optimizer.AgesApplied);
+            optimizer.AgesApplied = applied;
+        }
         _optimizerStep = (int)applied;
         if (launched > 0)
         {
@@ -1197,6 +1263,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         optimizer.InitialApplied = (uint)Math.Max(0, _optimizerStep);
         optimizer.LaunchedAtCapture = _stepIoLaunched;
         optimizer.SkipsRecorded = 0;
+        optimizer.AgesApplied = optimizer.InitialApplied;
         io.InitializeAppliedSteps(optimizer.InitialApplied);
     }
 
@@ -1616,7 +1683,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _parameters[p].Grad = own;
         }
     }
-    public int ForwardStepCount => _forwardActions.Length;
+    public int ForwardStepCount => _dataForwardReplay?.Count ?? _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
 
     /// <summary>
@@ -1804,7 +1871,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             var step = forwardSteps[i];
-            if (step.BackwardFn is null) continue;
+            if (!HasCanonicalDerivative(step)) continue;
             bool reshape = step.OpName == "Reshape" && step.Inputs.Length == 1;
             // An elementwise add's backward hands each operand the output gradient unchanged, so an operand used only
             // here (a residual branch's output) can view it too. Its step still runs for an operand that cannot (the
@@ -1930,7 +1997,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             producer[step.OutputBuffer] = i;
             // Detached statistics and observation-only branches impose forward ordering, not gradient writes.
             if (step.BackwardFn is null) continue;
-            foreach (var input in step.Inputs)
+            foreach (var input in DifferentiableInputs(step))
             {
                 if (input is null) continue;
                 if (!consumers.TryGetValue(input, out var list)) consumers[input] = list = new List<int>();
@@ -1954,7 +2021,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int a = forwardSteps.Count - 1; a >= 0; a--)
         {
             var step = forwardSteps[a];
-            if (step.BackwardFn is null) continue;
+            if (!HasCanonicalDerivative(step)) continue;
             bool reshape = step.OpName == "Reshape" && step.Inputs.Length == 1;
             bool add = step.OpType == OpType.TensorAdd && step.Inputs.Length == 2
                 && !ReferenceEquals(step.Inputs[0], step.Inputs[1]);
@@ -2061,7 +2128,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>> gradMap,
         System.Collections.Generic.List<Tensor<T>> allGrads,
         out System.Collections.Generic.HashSet<int> decidedFusedSteps,
-        out System.Collections.Generic.HashSet<int> decidedSkippableReduceSum)
+        out System.Collections.Generic.HashSet<int> decidedSkippableReduceSum,
+        bool allowProjectedFusion)
     {
         var idOf = new System.Collections.Generic.Dictionary<Tensor<T>, int>(allTensors.Count);
         var tensorById = new System.Collections.Generic.List<Tensor<T>>(allTensors.Count);
@@ -2092,7 +2160,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dummies and are discarded.
         decidedFusedSteps = new System.Collections.Generic.HashSet<int>();
         decidedSkippableReduceSum = new System.Collections.Generic.HashSet<int>();
-        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+        if (allowProjectedFusion && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
         {
             var dummyByShape = new System.Collections.Generic.Dictionary<string, Tensor<T>>();
             var tempGrad = new System.Collections.Generic.Dictionary<Tensor<T>, Tensor<T>>(tc);
@@ -2228,6 +2296,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // adds pinned GCHandles to _pinnedHandles. Dispose() short-circuits
         // on _disposed, so handles added here after disposal would leak.
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        if (_dataForwardReplay is not null) throw new NotSupportedException(ForwardOnlyHeterogeneousReplay.UnsupportedScheduleReason);
         if (_isFrozenWeights) return;
         if (_forwardSteps is null)
             throw new InvalidOperationException(
@@ -2472,6 +2541,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         for (int p = 0; p < gpuGradients.Length; p++)
         {
+            if (!IsOptimizerParameterActive(p)) continue;
             gpuGradients[p] = null;
             if (gpuParameters[p] is null || gpuBackends[p] is not { } backend)
                 continue;
@@ -2520,6 +2590,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         for (int p = 0; p < gpuBackends.Length; p++)
         {
+            if (!IsOptimizerParameterActive(p)) continue;
             if (gpuBackends[p] is not { } backend || scratchByParameter[p] is not null)
                 continue;
 
@@ -2568,6 +2639,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // device work; no optimizer state or parameter has been touched at this point.
         for (int p = 0; p < gradArrays.Length && gradientsFinite; p++)
         {
+            if (!IsOptimizerParameterActive(p)) continue;
             if (gpuGradients[p] is not null)
                 continue;
 
@@ -2604,6 +2676,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // zero from any tensor while unused tail entries remain one.
             for (int p = 0; p < gpuFinitenessReductionLengths.Length; p++)
             {
+                if (!IsOptimizerParameterActive(p)) continue;
                 int reductionLength = gpuFinitenessReductionLengths[p];
                 if (reductionLength <= 0)
                     continue;
@@ -2624,6 +2697,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             for (int p = 0; p < gpuGradients.Length; p++)
             {
+                if (!IsOptimizerParameterActive(p)) continue;
                 if (gpuGradients[p] is not { } gpuGradient || lengths[p] <= 0)
                     continue;
 
@@ -2641,6 +2715,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             for (int p = 0; p < gpuFinitenessReductionLengths.Length && gradientsFinite; p++)
             {
+                if (!IsOptimizerParameterActive(p)) continue;
                 int reductionLength = gpuFinitenessReductionLengths[p];
                 if (reductionLength <= 0)
                     continue;
@@ -2673,6 +2748,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             for (int p = 0; p < paramArrays.Length; p++)
             {
+                if (!IsOptimizerParameterActive(p)) continue;
                 var parameters = paramArrays[p];
                 if (parameters is null || parameters.Length == 0) continue;
                 Array.Copy(scheduleFreeEvalCopies[p], 0, parameters, paramOffsets[p], lengths[p]);
@@ -2739,7 +2815,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         try
         {
+            ResolveDeferredFiniteness();
+            if (!_optimizerGradientMembership.Any(active => active)) return;
+            if (_optimizerStep == int.MaxValue)
+                throw new InvalidOperationException("The optimizer's accepted global step counter is exhausted.");
+            for (int p = 0; p < _parameterAcceptedUpdates.Length; p++)
+                if (IsOptimizerParameterActive(p) && (_parameterAcceptedUpdates[p] < 0 || _parameterAcceptedUpdates[p] > _optimizerStep))
+                    throw new InvalidOperationException("A parameter's accepted-update age is inconsistent with the optimizer's global step.");
+            int previousStep = _optimizerStep;
             _optimizerUpdate?.Invoke();
+            if (_optimizerStep > previousStep)
+            {
+                if (_finitenessDeferred) _pendingParameterAgeMembership = (bool[])_optimizerGradientMembership.Clone();
+                else AdvanceParameterAges(_optimizerGradientMembership);
+            }
         }
         finally
         {
@@ -2771,6 +2860,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         double sumSquares = System.Runtime.InteropServices.MemoryMarshal.Read<double>(readback.Read());
         if (double.IsNaN(sumSquares) || double.IsInfinity(sumSquares))
             MarkOptimizerStepDiscarded();
+        else if (_pendingParameterAgeMembership is { } membership)
+            AdvanceParameterAges(membership);
+        _pendingParameterAgeMembership = null;
     }
     private Engines.DirectGpu.IDirectGpuBackend? _finitenessBackend;
     private readonly List<Engines.DirectGpu.IGpuBuffer> _finitenessBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
@@ -2803,6 +2895,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         sizes.Clear();
         for (int p = 0; p < gpuGradients.Length; p++)
         {
+            if (!IsOptimizerParameterActive(p)) continue;
             if (gpuGradients[p] is not { } gradient || lengths[p] <= 0)
                 continue;
             if (gpuBackends[p] is not Engines.DirectGpu.IDeviceScalarOps { SupportsMultiTensorSumOfSquares: true } || gpuBackends[p] is not Engines.DirectGpu.IGpuBatchExecution owner)
@@ -2871,6 +2964,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool gradientsFinite = true;
         for (int p = 0; p < gradArrays.Length && gradientsFinite; p++)
         {
+            if (!IsOptimizerParameterActive(p)) continue;
             var gradients = gradArrays[p];
             var parameters = paramArrays[p];
             if (gradients is null || gradients.Length == 0 ||
@@ -3201,6 +3295,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (ReferenceEquals(previous, this)) return;
         if (previous is not CompiledTrainingPlan<T> source)
             throw new ArgumentException($"Cannot continue the optimizer of a {previous.GetType().Name}.", nameof(previous));
+        if (source._fixedActiveDomainMask is { } fixedDomain && !fixedDomain.SequenceEqual(_graphGradientMembership))
+            throw new InvalidOperationException("A coupled optimizer's history belongs to a fixed active-variable domain; continuation requires the same differentiable parameter membership.");
         if (source._parameters.Length != _parameters.Length)
             throw new ArgumentException(
                 $"The previous plan trains {source._parameters.Length} parameters, this one {_parameters.Length}.", nameof(previous));
@@ -3293,7 +3389,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var target = _optimizerRuntimeState!;
         source.ResolveDeferredFiniteness();
         ResolveDeferredFiniteness();   // this plan's in-flight replays land before its count is replaced
+        // Active membership and per-parameter ages determine captured device tables.
+        // Retire those tables before adopting another plan's optimizer timeline.
+        if (_capturedOptimizer is not null) InvalidateCapturedStepGraph();
         _optimizerStep = source._optimizerStep;
+        _parameterAcceptedUpdates = source._parameterAcceptedUpdates;
         SyncCapturedOptimizerStep();
         _maxGradNorm = source._maxGradNorm;
         _nonFiniteGradientPolicy = source._nonFiniteGradientPolicy;
@@ -3392,8 +3492,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         bool afterClip = _l2Order == GradientRegularizationOrder.ClipThenRegularize;
         if (!afterClip) ApplyL2Regularization();
-        if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
-            ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+        var activeGradients = ActiveOptimizerGradients();
+        if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(activeGradients, _maxGradNorm))
+            ClipGradientsGlobalL2(activeGradients, _maxGradNorm);
         if (afterClip) ApplyL2Regularization();
     }
 
@@ -3410,6 +3511,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var strength = numOps.FromDouble(_l2Regularization);
         for (int p = 0; p < _parameters.Length; p++)
         {
+            if (!IsOptimizerParameterActive(p)) continue;
             var grad = _gradients[p];
             if (grad is null) continue;
             var param = _parameters[p];
@@ -3483,6 +3585,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <param name="segmentSize">Steps per checkpoint segment. 0 = auto (sqrt(N)).</param>
     public void EnableCheckpointing(int segmentSize = 0)
     {
+        if (_dataForwardReplay is not null) throw new NotSupportedException(ForwardOnlyHeterogeneousReplay.UnsupportedScheduleReason);
         // Wrap forward actions as CompiledSteps for the checkpointing system.
         // Each action writes to _lossOutput as a pass-through output reference —
         // the actual outputs are in the action's captured closures.
@@ -3902,6 +4005,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         try
         {
             // Every compiled GPU step holds the engine lock, then its plan lock.
@@ -3932,6 +4036,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <param name="gradients">Each trained parameter's gradient, keyed by the parameter tensor (by reference).</param>
     internal bool TryApplyGradients(IReadOnlyDictionary<Tensor<T>, Tensor<T>> gradients)
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         if (gradients is null) throw new ArgumentNullException(nameof(gradients));
         if (_optimizerUpdate is null) return false;
         if (_preForwardParamTransform is not null)
@@ -3946,15 +4051,34 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private bool ApplyGradientsLocked(IReadOnlyDictionary<Tensor<T>, Tensor<T>> gradients)
     {
+        // Validate and read the whole supplied batch before touching any live slot or optimizer state.
+        var membership = new bool[_parameters.Length];
+        var prepared = new T[_parameters.Length][];
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            prepared[p] = new T[_parameters[p].Length];
+            if (!gradients.TryGetValue(_parameters[p], out var gradient) || gradient is null) continue;
+            if (!gradient._shape.SequenceEqual(_parameters[p]._shape))
+                throw new ArgumentException($"Parameter {p}'s supplied gradient shape does not match its canonical parameter.", nameof(gradients));
+            gradient.CopyLogicalTo(prepared[p]);
+            membership[p] = true;
+        }
+        if (_fixedActiveDomainMask is { } domain && !domain.SequenceEqual(membership))
+            throw new InvalidOperationException("External gradients cannot change a coupled optimizer's fixed active-variable domain.");
         ResolvePingPongClaims(force: false);
         lock (_stepSync)
         {
+            ResolveDeferredFiniteness();
             // An update captured into the step graph owns the device step count (the step I/O's applied count) and, for
             // ping-pong SGD, may hold the current weights in the second buffer set. The update below runs the eager
             // optimizer on the plan's own buffers and advances _optimizerStep: retire the captured graph first, which
             // copies the current weights back and lands the device count, so this update starts from both and the next
             // capture re-seeds from what it leaves.
             if (_capturedOptimizer is not null) InvalidateCapturedStepGraph();
+            var previousMembership = _optimizerGradientMembership;
+            _optimizerGradientMembership = membership;
+            try
+            {
             UploadHostWrittenParameters();
             using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
             using var graphModeSuspension = GraphMode.SuspendRecording();
@@ -3962,15 +4086,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 var slot = _gradients[p];
                 if (slot is null) continue;
-                var values = new T[slot.Length];
-                if (gradients.TryGetValue(_parameters[p], out var gradient) && gradient is not null)
-                {
-                    if (gradient.Length != slot.Length)
-                        throw new ArgumentException(
-                            $"Parameter {p}'s gradient has {gradient.Length} elements; the parameter has {slot.Length}.",
-                            nameof(gradients));
-                    gradient.CopyLogicalTo(values);
-                }
+                var values = prepared[p];
                 slot.CopyFromArray(values);
                 // After a device step the optimizer reads the gradient's device buffer (and a host array it bound
                 // before that buffer took over), not the host copy just written: put the same values there and mark it
@@ -3985,6 +4101,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             RegularizeAndClipGradients();
             CommitHostOptimizerGradients();
             InvokeOptimizerUpdate();
+            }
+            finally { _optimizerGradientMembership = previousMembership; }
         }
         return true;
     }
@@ -4113,6 +4231,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // The eager warmup steps' verdicts first: the device's applied count starts from the host's.
                             ResolveDeferredFiniteness();
                             capturedOptimizer.InitialApplied = (uint)Math.Max(0, _optimizerStep);
+                            capturedOptimizer.AgesApplied = capturedOptimizer.InitialApplied;
                             _stepIo.InitializeAppliedSteps(capturedOptimizer.InitialApplied);
                             capturedOptimizer.Prepare?.Invoke(_stepIo);
                             capturedOptimizer.LaunchedAtCapture = 0;
@@ -5372,6 +5491,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // float-only forward steps dropped the Half nodes. Produces device-resident Half activations.
             RunFp16HeteroForward(engine);
         }
+        else if (_dataForwardReplay is not null)
+        {
+            _dataForwardReplay.Execute(engine);
+        }
         else if (_checkpointing is not null)
         {
             _checkpointing.ForwardWithCheckpoints();
@@ -5845,6 +5968,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private void DetachReleasedBindings(HashSet<Engines.DirectGpu.IGpuBuffer> released)
     {
+        if (_dataForwardReplay is { } dataReplay)
+        {
+            var retained = new HashSet<object>(_retainedOutputs.Cast<object>(), ReferenceEqualityComparer<object>.Instance);
+            if (_lossGradDest is not null) retained.Add(_lossGradDest);
+            dataReplay.DetachDeviceBindings(released, retained);
+        }
         // A forward output borrows the buffer of the result it aliases (a StopGradient, a reshape) or keeps the
         // activation it was written into, and is recomputed next step: it is unbound whatever was released, as the
         // graph step does. In-place state keeps the only current value on the device; the loss was materialized.
@@ -5888,6 +6017,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private HashSet<object> BuildStepEvictionProtectSet()
     {
         var protect = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        _dataForwardReplay?.ProtectDeviceState(protect);
         for (int i = 0; i < _gradients.Length; i++)
             AddActivationCacheKeys(protect, _gradients[i]);
         // Every live gradient-map entry, not only the parameters' compile-time buffers: the backward can REPLACE an
@@ -5958,11 +6088,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ValidatePlanOptimizerSupport(optimizerType, typeof(T) == typeof(float), hasGpuParams, ex.Nesterov);
         ValidateWeightDecayCompatibility(optimizerType, weightDecay);
         ex.Validate();
+        if (_momentStorageMode == FusedMomentStorageMode.Int8BlockQuantized
+            && optimizerType is not (OptimizerType.Adam or OptimizerType.AdamW))
+            throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam and AdamW.");
         if (typeof(T) == typeof(float))
         {
             // A float plan updates in float: the hyperparameters narrow once here, exactly as they did when the
             // public signature took float.
             ConfigureOptimizerFloat(optimizerType, schedule, (float)beta1, (float)beta2, (float)eps, (float)weightDecay, ex);
+            _fixedActiveDomainMask = RequiresFixedActiveDomain(optimizerType)
+                ? (bool[])_optimizerGradientMembership.Clone() : null;
             return;
         }
         if (typeof(T) == typeof(double))
@@ -5971,6 +6106,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // extras-driven optimizers are float-only and were already rejected
             // by ValidatePlanOptimizerSupport above for double.
             ConfigureOptimizerDouble(optimizerType, schedule, beta1, beta2, eps, weightDecay, ex);
+            _fixedActiveDomainMask = RequiresFixedActiveDomain(optimizerType)
+                ? (bool[])_optimizerGradientMembership.Clone() : null;
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -6085,6 +6222,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             double groupWeightDecay = groupWeightDecays?[g] ?? weightDecay;
             ValidatePlanOptimizerSupport(groupType, isFloatPlan, hasGpuParams, nesterov);
             ValidateWeightDecayCompatibility(groupType, groupWeightDecay);
+            if (_momentStorageMode == FusedMomentStorageMode.Int8BlockQuantized
+                && groupType is not (OptimizerType.Adam or OptimizerType.AdamW))
+                throw new NotSupportedException("Int8 block-quantized fused moments are supported only for Adam and AdamW.");
         }
         // Drop any Schedule-Free pre-forward hook left over from a prior ungrouped
         // ConfigureOptimizer(ScheduleFreeSGD); a grouped optimizer never sets one,
@@ -6124,11 +6264,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ConfigureOptimizerFloatGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup,
                 (float)beta1, (float)beta2, (float)eps, (float)weightDecay,
                 groupWds is null ? null : System.Array.ConvertAll(groupWds, wd => (float)wd), ex);
+            _fixedActiveDomainMask = null;
             return;
         }
         if (typeof(T) == typeof(double))
         {
             ConfigureOptimizerDoubleGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds, ex);
+            _fixedActiveDomainMask = null;
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -6333,11 +6475,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     /// <summary>True when no parameter takes the device update path (a resident buffer on a GPU backend).</summary>
-    private static bool AllParametersOnHost(
+    private bool AllParametersOnHost(
         Engines.DirectGpu.IGpuBuffer?[] gpuParam, Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends)
     {
         for (int p = 0; p < gpuParam.Length; p++)
-            if (gpuParam[p] is not null && gpuBackends[p] is not null) return false;
+            if (IsOptimizerParameterActive(p) && gpuParam[p] is not null && gpuBackends[p] is not null) return false;
         return true;
     }
 
@@ -6413,15 +6555,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // or to retune lr via re-configure with a fresh schedule).
         // The device buffers resolved below come from the parameters' bindings: another plan's ping-pong update must
         // first bring them back to the shared buffers.
+        ResolveDeferredFiniteness();
+        InvalidateCapturedStepGraph();
         ResolvePingPongClaims(force: true);
         LeaveSharedMoments();
         DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
-        // A captured step graph holds kernel nodes wired to the OLD optimizer state
-        // buffers + update; those are about to be freed/replaced, so drop it (replay
-        // would otherwise launch against freed device memory or stale wiring).
-        InvalidateCapturedStepGraph();
 
         // Pre-allocate optimizer state buffers for each parameter
         int paramCount = _parameters.Length;
@@ -6686,6 +6826,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _finitenessDeferred = false;
         _optimizerStep = 0;
+        _parameterAcceptedUpdates = new long[_parameters.Length];
+        _pendingParameterAgeMembership = null;
         var b1 = beta1;
         var b2 = beta2;
         var epsVal = eps;
@@ -6705,11 +6847,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float exTrustRadius = extras.TrustRegionRadius;
         float exHyperLr = extras.HyperLr;
         int exLbfgsMemory = Math.Max(1, extras.LbfgsMemorySize);
-        // L-BFGS operates on the flat concatenation of every parameter; size that once here. The buffers
-        // themselves are attached to the runtime state further down, once it exists.
+        // Preserve canonical history offsets while every reduction visits only the fixed active subspace.
         int lbfgsTotal = 0;
+        var lbfgsActiveRanges = new List<(int Start, int End)>();
         if (optimizerType == OptimizerType.LBFGS)
-            for (int p = 0; p < paramCount; p++) lbfgsTotal += lengths[p];
+            for (int p = 0; p < paramCount; p++)
+            {
+                if (IsOptimizerParameterActive(p)) lbfgsActiveRanges.Add((lbfgsTotal, lbfgsTotal + lengths[p]));
+                lbfgsTotal += lengths[p];
+            }
         float exGrowth = extras.DGrowthRate;
 
         // Schedule-Free SGD (#499): z (SGD trajectory) and x (eval/average)
@@ -6733,6 +6879,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
                 for (int p = 0; p < paramCount; p++)
                 {
+                    if (!IsOptimizerParameterActive(p)) continue;
                     int lenY = lengths[p];
                     if (paramArrays[p].Length == 0) continue;
                     fixed (float* pY = &paramArrays[p][paramOffsets[p]], pZ = m[p], pX = v[p])
@@ -6817,10 +6964,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Engines.DirectGpu.IMultiTensorGpuOptimizerBackend? mtBackend = null;
             List<Engines.DirectGpu.IGpuBuffer>? mtParams = null, mtGrads = null, mtM = null, mtV = null;
             List<int>? mtSizes = null;
+            var activeIndices = Enumerable.Range(0, paramCount).Where(IsOptimizerParameterActive).ToArray();
+            int firstActive = activeIndices[0];
             if ((optType == OptimizerType.Adam || optType == OptimizerType.AdamW)
                 && paramCount > 0
-                && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend mtCandidate
-                && !(gpuBackends[0] is Engines.DirectGpu.IGpuGraphCapture cbMt && cbMt.IsStreamCapturing()))
+                && gpuBackends[firstActive] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend mtCandidate
+                && !(gpuBackends[firstActive] is Engines.DirectGpu.IGpuGraphCapture cbMt && cbMt.IsStreamCapturing()))
             {
                 var candidateParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
                 var candidateGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
@@ -6830,6 +6979,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bool eligible = true;
                 for (int p = 0; eligible && p < paramCount; p++)
                 {
+                    if (!IsOptimizerParameterActive(p)) continue;
                     if (!ReferenceEquals(gpuBackends[p], mtCandidate)) { eligible = false; break; }
                     if (gpuParam[p] is not { } gp) { eligible = false; break; }
                     if (gpuMomentStorage[p] != FusedMomentStorageMode.Float32) { eligible = false; break; }
@@ -6840,7 +6990,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (gradResident is null) { eligible = false; break; }
                     candidateParams.Add(gp); candidateGrads.Add(gradResident); candidateM.Add(gm); candidateV.Add(gv); candidateSizes.Add(lp);
                 }
-                if (eligible && candidateParams.Count == paramCount)
+                if (eligible && candidateParams.Count == activeIndices.Length)
                 {
                     mtBackend = mtCandidate;
                     mtParams = candidateParams; mtGrads = candidateGrads; mtM = candidateM; mtV = candidateV; mtSizes = candidateSizes;
@@ -6852,8 +7002,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool mtSgd = false;
             if (optType == OptimizerType.SGD
                 && paramCount > 0
-                && gpuBackends[0] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend sgdCandidate
-                && !(gpuBackends[0] is Engines.DirectGpu.IGpuGraphCapture cbSgd && cbSgd.IsStreamCapturing()))
+                && gpuBackends[firstActive] is Engines.DirectGpu.IMultiTensorGpuOptimizerBackend sgdCandidate
+                && !(gpuBackends[firstActive] is Engines.DirectGpu.IGpuGraphCapture cbSgd && cbSgd.IsStreamCapturing()))
             {
                 var candidateParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
                 var candidateGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
@@ -6861,6 +7011,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 bool eligible = true;
                 for (int p = 0; eligible && p < paramCount; p++)
                 {
+                    if (!IsOptimizerParameterActive(p)) continue;
                     if (!ReferenceEquals(gpuBackends[p], sgdCandidate)) { eligible = false; break; }
                     if (gpuParam[p] is not { } gp) { eligible = false; break; }
                     if (lengths[p] <= 0) { eligible = false; break; }
@@ -6916,7 +7067,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 for (int p = 0; p < paramCount; p++)
                 {
                     int len2 = lengths[p];
-                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) { off += len2; continue; }
+                    if (!IsOptimizerParameterActive(p) || gradArrays[p].Length == 0 || paramArrays[p].Length == 0) { off += len2; continue; }
                     fixed (float* pGrad = &gradArrays[p][gradOffsets[p]])
                         for (int i = 0; i < len2; i++) q[off + i] = pGrad[i];
                     off += len2;
@@ -6933,7 +7084,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     for (int p = 0; p < paramCount; p++)
                     {
                         int len2 = lengths[p];
-                        if (paramArrays[p].Length == 0) { o2 += len2; continue; }
+                        if (!IsOptimizerParameterActive(p) || paramArrays[p].Length == 0) { o2 += len2; continue; }
                         fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
                             for (int i = 0; i < len2; i++)
                             {
@@ -6966,12 +7117,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     for (int p = 0; p < paramCount; p++)
                     {
                         int len2 = lengths[p];
-                        if (paramArrays[p].Length == 0) { o3 += len2; continue; }
+                        if (!IsOptimizerParameterActive(p) || paramArrays[p].Length == 0) { o3 += len2; continue; }
                         fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
                             for (int i = 0; i < len2; i++) prevX[o3 + i] = pParam[i];
                         o3 += len2;
                     }
-                    Array.Copy(q, prevG, lbfgsTotal);
+                    foreach (var range in lbfgsActiveRanges) Array.Copy(q, range.Start, prevG, range.Start, range.End - range.Start);
                     st.LbfgsHasPrev = true;
                 }
 
@@ -6983,16 +7134,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var sS = S[slot];
                     var yS = Y[slot];
                     double dot = 0;
-                    for (int i = 0; i < lbfgsTotal; i++) dot += (double)sS[i] * q[i];
+                    foreach (var range in lbfgsActiveRanges)
+                        for (int i = range.Start; i < range.End; i++) dot += (double)sS[i] * q[i];
                     float a = rho[slot] * (float)dot;
                     alpha[slot] = a;
-                    for (int i = 0; i < lbfgsTotal; i++) q[i] -= a * yS[i];
+                    foreach (var range in lbfgsActiveRanges)
+                        for (int i = range.Start; i < range.End; i++) q[i] -= a * yS[i];
                 }
 
                 // Initial inverse-Hessian scaling gamma = (s.y)/(y.y) from the newest pair. Without it the
                 // first iterations take a raw gradient-sized step and L-BFGS loses most of its advantage.
                 float gamma = (count > 0 && st.LbfgsGammaDen > 0f) ? st.LbfgsGammaNum / st.LbfgsGammaDen : 1f;
-                for (int i = 0; i < lbfgsTotal; i++) q[i] *= gamma;
+                foreach (var range in lbfgsActiveRanges)
+                    for (int i = range.Start; i < range.End; i++) q[i] *= gamma;
 
                 // Forward loop: oldest pair first. beta = rho_i * (y_i . r); r += s_i * (alpha_i - beta).
                 for (int j = count - 1; j >= 0; j--)
@@ -7001,10 +7155,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var sS = S[slot];
                     var yS = Y[slot];
                     double dot = 0;
-                    for (int i = 0; i < lbfgsTotal; i++) dot += (double)yS[i] * q[i];
+                    foreach (var range in lbfgsActiveRanges)
+                        for (int i = range.Start; i < range.End; i++) dot += (double)yS[i] * q[i];
                     float b = rho[slot] * (float)dot;
                     float diff = alpha[slot] - b;
-                    for (int i = 0; i < lbfgsTotal; i++) q[i] += diff * sS[i];
+                    foreach (var range in lbfgsActiveRanges)
+                        for (int i = range.Start; i < range.End; i++) q[i] += diff * sS[i];
                 }
 
                 // q now holds H*g, the quasi-Newton direction (before negation). No line search here: the
@@ -7015,7 +7171,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 for (int p = 0; p < paramCount; p++)
                 {
                     int len2 = lengths[p];
-                    if (paramArrays[p].Length == 0) { o4 += len2; continue; }
+                    if (!IsOptimizerParameterActive(p) || paramArrays[p].Length == 0) { o4 += len2; continue; }
                     fixed (float* pParam = &paramArrays[p][paramOffsets[p]])
                         for (int i = 0; i < len2; i++) pParam[i] -= lr * q[o4 + i];
                     o4 += len2;
@@ -7036,7 +7192,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // step has one gradient and no loss evaluation. Callers adapt it between configurations,
                 // which is where AiDotNet's TrustRegionOptimizer already does it (per epoch).
                 double norm2 = 0;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
@@ -7050,7 +7206,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (gradNorm > 1e-10)
                 {
                     float alphaTr = (float)Math.Min(exTrustRadius / gradNorm, lr);
-                    for (int p = 0; p < paramCount; p++)
+                    foreach (int p in activeIndices)
                     {
                         if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                         int len2 = lengths[p];
@@ -7074,7 +7230,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 //   if d.g >= 0: d = -g                (Powell restart)
                 //   x   += lr*d
                 double gg = 0;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
@@ -7090,7 +7246,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
                 // Build d into m[p], then test whether it still descends.
                 double dg = 0;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
@@ -7107,7 +7263,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // uphill while the optimizer still reported progress. Rebuild as steepest descent.
                 bool restart = dg >= 0;
                 if (restart)
-                    for (int p = 0; p < paramCount; p++)
+                    foreach (int p in activeIndices)
                     {
                         if (gradArrays[p].Length == 0) continue;
                         int len2 = lengths[p];
@@ -7115,7 +7271,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             for (int i = 0; i < len2; i++) pD[i] = -pGrad[i];
                     }
 
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
@@ -7141,7 +7297,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // honored (was previously frozen at GetLr(1)); a constant schedule
                 // reduces to plain hypergradient from that base.
                 double inner = 0;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
@@ -7150,7 +7306,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 scalarState.HypergradientAdjustment += exHyperLr * (float)inner;
                 float newLr = lr + scalarState.HypergradientAdjustment;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     // Skip params with no gradient OR no materialized weight backing (#1738).
                     if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
@@ -7167,7 +7323,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Defazio & Mishchenko 2023 (growth-bounded, Prodigy). s, ‖s‖², r are GLOBAL.
                 float gamma = scalarState.DAdaptationEstimate * lr;
                 double gNorm2 = 0, sNorm2 = 0;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     if (gradArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
@@ -7184,7 +7340,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 float dCapped = float.IsPositiveInfinity(exGrowth) ? dHat : Math.Min(dHat, scalarState.DAdaptationEstimate * exGrowth);
                 float dNew = Math.Max(scalarState.DAdaptationEstimate, dCapped);
                 float gammaNew = dNew * lr;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     // Skip params with no gradient OR no materialized weight backing (#1738).
                     if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
@@ -7207,7 +7363,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // every per-param call consumes the SAME weightSum and returns
                 // the SAME new value — capture it once.
                 float wsNext = scalarState.ScheduleFreeWeightSum;
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
                     int len2 = lengths[p];
@@ -7237,7 +7393,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     mtBackend.SgdMultiTensorUpdateGuarded(mtParams, mtGrads, mtSizes, lr, (float)wd, sgdGuard);
                 else
                     mtBackend.SgdMultiTensorUpdate(mtParams, mtGrads, mtSizes, lr, (float)wd);
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                     if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine) && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
@@ -7251,16 +7407,22 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (mtBackend is not null && mtParams is not null && mtGrads is not null && mtM is not null
                 && mtV is not null && mtSizes is not null)
             {
-                if (_finitenessDeferred && _finitenessGuard is { } finiteGuard)
-                    mtBackend.AdamMultiTensorUpdateGuarded(optType == OptimizerType.AdamW,
-                        mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep, finiteGuard);
-                else if (optType == OptimizerType.AdamW)
-                    mtBackend.AdamWMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
-                else
-                    mtBackend.AdamMultiTensorUpdate(mtParams, mtGrads, mtM, mtV, mtSizes, lr, b1, b2, epsVal, wd, _optimizerStep);
+                foreach (var group in Enumerable.Range(0, activeIndices.Length).GroupBy(position => _parameterAcceptedUpdates[activeIndices[position]]))
+                {
+                    var positions = group.ToArray();
+                    int age = NextParameterUpdateAge(activeIndices[positions[0]]);
+                    var gp = ProjectList(mtParams, positions); var gg = ProjectList(mtGrads, positions);
+                    var gm = ProjectList(mtM, positions); var gv = ProjectList(mtV, positions); var gs = ProjectList(mtSizes, positions);
+                    if (_finitenessDeferred && _finitenessGuard is { } finiteGuard)
+                        mtBackend.AdamMultiTensorUpdateGuarded(optType == OptimizerType.AdamW,
+                            gp, gg, gm, gv, gs, lr, b1, b2, epsVal, wd, age, finiteGuard);
+                    else if (optType == OptimizerType.AdamW)
+                        mtBackend.AdamWMultiTensorUpdate(gp, gg, gm, gv, gs, lr, b1, b2, epsVal, wd, age);
+                    else mtBackend.AdamMultiTensorUpdate(gp, gg, gm, gv, gs, lr, b1, b2, epsVal, wd, age);
+                }
                 // Per-param post-update bookkeeping (version sync + re-arm deferred download),
                 // mirroring the per-tensor GPU path so eval/forward see the fresh resident weights.
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in activeIndices)
                 {
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                     if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine) && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
@@ -7277,21 +7439,32 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // model of many small tensors one tensor at a time on this thread.
             if (optType == OptimizerType.AdamW && !useBf16Moments && !useInt8Moments && AllParametersOnHost(gpuParam, gpuBackends))
             {
-                FusedOptimizer.AdamWUpdateMultiParallel(paramArrays, paramOffsets, gradArrays, gradOffsets, m, v, lengths,
-                    paramCount, lr, b1, b2, epsVal, wd, stepBc1, stepBc2, ref adamWSegments);
-                for (int p = 0; p < paramCount; p++)
+                foreach (var indices in ActiveParameterAgeGroups())
                 {
-                    if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
-                    MarkHostWeightMutated(p);
+                    int age = NextParameterUpdateAge(indices[0]);
+                    float bc1 = age == _optimizerStep ? stepBc1 : ParameterBiasCorrection(b1, age);
+                    float bc2 = age == _optimizerStep ? stepBc2 : ParameterBiasCorrection(b2, age);
+                    int[]? segments = indices.Length == paramCount ? adamWSegments : null;
+                    FusedOptimizer.AdamWUpdateMultiParallel(ProjectSlots(paramArrays, indices), ProjectSlots(paramOffsets, indices),
+                        ProjectSlots(gradArrays, indices), ProjectSlots(gradOffsets, indices), ProjectSlots(m, indices),
+                        ProjectSlots(v, indices), ProjectSlots(lengths, indices), indices.Length,
+                        lr, b1, b2, epsVal, wd, bc1, bc2, ref segments);
+                    if (indices.Length == paramCount) adamWSegments = segments;
+                    foreach (int p in indices)
+                        if (gradArrays[p].Length != 0 && paramArrays[p].Length != 0) MarkHostWeightMutated(p);
                 }
                 return;
             }
 
             for (int p = 0; p < paramCount; p++)
             {
+                if (!IsOptimizerParameterActive(p)) continue;
+                int parameterStep = NextParameterUpdateAge(p);
+                var parameterBc1 = parameterStep == _optimizerStep ? stepBc1 : ParameterBiasCorrection(b1, parameterStep);
+                var parameterBc2 = parameterStep == _optimizerStep ? stepBc2 : ParameterBiasCorrection(b2, parameterStep);
                 int len = lengths[p];
 
-                if (_optimizerStep <= 10 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1")
+                if (parameterStep <= 10 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1")
                 {
                     try
                     {
@@ -7305,10 +7478,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             if (paramResNow is not null) { var w = be.DownloadBuffer(paramResNow); double s = 0; for (int i = 0; i < w.Length; i++) s += System.Math.Abs((double)w[i]); paramL1 = s; }
                         }
                         System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_opt_diag.txt"),
-                            $"step{_optimizerStep} p={p} len={len} paramBufMatch={ReferenceEquals(gpuParam[p], paramResNow)} " +
+                            $"step{parameterStep} p={p} len={len} paramBufMatch={ReferenceEquals(gpuParam[p], paramResNow)} " +
                             $"gradResidentNow={(gradResNow != null)} gradL2={gradL2:E4} paramL1={paramL1:E6}" + System.Environment.NewLine);
                     }
-                    catch (Exception dex) { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_opt_diag.txt"), $"step{_optimizerStep} p={p} DIAG-ERR {dex.Message}" + System.Environment.NewLine); }
+                    catch (Exception dex) { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_opt_diag.txt"), $"step{parameterStep} p={p} DIAG-ERR {dex.Message}" + System.Environment.NewLine); }
                 }
 
                 // GPU path: dispatch to backend-native fused optimizer kernel.
@@ -7348,7 +7521,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         gradBuf = gpuBe.AllocateBuffer(uploadGrad);
                         gradTransient = true;
                     }
-                    bool diagAU = p == 0 && _optimizerStep == 6 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1";
+                    bool diagAU = p == 0 && parameterStep == 6 && System.Environment.GetEnvironmentVariable("AIDOTNET_OPT_DIAG") == "1";
                     double auBefore = -1, auGrad = -1;
                     if (diagAU) { try { gpuBe.Synchronize(); var w = gpuBe.DownloadBuffer(gpuP); double s = 0; for (int i = 0; i < w.Length; i++) s += System.Math.Abs((double)w[i]); auBefore = s; var gg = gpuBe.DownloadBuffer(gradBuf); double s2 = 0; for (int i = 0; i < gg.Length; i++) s2 += System.Math.Abs((double)gg[i]); auGrad = s2; } catch { } }
                     try
@@ -7366,17 +7539,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                             $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
                                     compressedGpuBe.AdamUpdateBf16(
                                         gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
                                 {
                                     LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
-                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: false, _int8MomentBlockSize, len);
+                                        lr, b1, b2, epsVal, parameterStep, wd, decoupled: false, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
                                     gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 break;
                             case OptimizerType.AdamW:
@@ -7387,17 +7560,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                             $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
                                     compressedGpuBe.AdamWUpdateBf16(
                                         gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
                                 {
                                     LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
-                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: true, _int8MomentBlockSize, len);
+                                        lr, b1, b2, epsVal, parameterStep, wd, decoupled: true, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
                                     gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 break;
                             case OptimizerType.AMSGrad:
@@ -7406,17 +7579,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
                                     if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), 0f, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), 0f, parameterStep, len);
                                 }
                                 else
                                 {
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), wd, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), wd, parameterStep, len);
                                 }
                                 break;
                             case OptimizerType.Nadam:
                                 gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                    lr, b1, b2, epsVal, wd, parameterStep, len);
                                 break;
                             case OptimizerType.RMSprop:
                                 gpuBe.RmspropUpdate(gpuP, gradBuf, gpuV[p]!,
@@ -7454,7 +7627,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 break;
                             case OptimizerType.AdaMax:
                                 gpuBe.AdamaxUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                    lr, b1, b2, epsVal, wd, parameterStep, len);
                                 break;
                             default:
                                 throw new NotSupportedException(
@@ -7538,31 +7711,31 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             if (useBf16Moments)
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
-                                        lr, b1, b2, epsVal, _optimizerStep);
+                                        lr, b1, b2, epsVal, parameterStep);
                             else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
                                         pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
-                                        lr, b1, b2, epsVal, _optimizerStep);
+                                        lr, b1, b2, epsVal, parameterStep);
                             else
                                 FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, stepBc1, stepBc2);
+                                    lr, b1, b2, epsVal, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AdamW:
                             if (useBf16Moments)
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamWUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep);
+                                        lr, b1, b2, epsVal, wd, parameterStep);
                             else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
                                         pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
-                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupledWeightDecay: true);
+                                        lr, b1, b2, epsVal, parameterStep, wd, decoupledWeightDecay: true);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
+                                    lr, b1, b2, epsVal, wd, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -7581,7 +7754,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
+                                AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), parameterStep);
                             break;
                         // #76: float-only kernel-backed optimizers. Buffer slots:
                         // pM=first moment/velocity, pV=second moment/accumulator
@@ -7594,17 +7767,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.NadamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, parameterStep);
                             break;
                         case OptimizerType.RAdam:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.RAdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, parameterStep);
                             break;
                         case OptimizerType.LAMB:
                             FusedOptimizer.LAMBUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
+                                lr, b1, b2, epsVal, wd, parameterStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
                             break;
                         case OptimizerType.RMSprop:
                             if (wd != 0f)
@@ -7631,7 +7804,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AdaMaxUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, parameterStep);
                             break;
                         // #76: optimizers needing extra hyperparameters (FusedOptimizerExtras).
                         case OptimizerType.AdaDelta:
@@ -7653,15 +7826,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         case OptimizerType.ASGD:
                             {
                                 // η_t = lr/(1+λ·lr·t)^α ; μ_t = 1/max(1, t−t0); ax=pM.
-                                float etaT = lr / (float)Math.Pow(1.0 + extras.Lambd * lr * _optimizerStep, extras.Alpha);
-                                float muT = 1f / Math.Max(1f, _optimizerStep - extras.T0);
+                                float etaT = lr / (float)Math.Pow(1.0 + extras.Lambd * lr * parameterStep, extras.Alpha);
+                                float muT = 1f / Math.Max(1f, parameterStep - extras.T0);
                                 FusedOptimizer.ASGDUpdateSimd(pParam, pGrad, pM, len,
                                     etaT, extras.Lambd, extras.Alpha, wd, muT);
                             }
                             break;
                         case OptimizerType.Rprop:
                             // prevGrad=pM (zero-init); stepSize=pV (seed to the initial step on step 1).
-                            if (_optimizerStep == 1)
+                            if (parameterStep == 1)
                                 for (int i = 0; i < len; i++) pV[i] = extras.RpropInitialStep;
                             FusedOptimizer.RpropUpdate(pParam, pGrad, pM, pV, len,
                                 extras.RpropEtaPlus, extras.RpropEtaMinus, extras.RpropStepMin, extras.RpropStepMax);
@@ -7706,6 +7879,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // host work. Anything else keeps the update above, run after each replay.
         _capturedOptimizerFactory = () =>
         {
+            ResolveDeferredFiniteness();
             if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
                 || paramCount == 0 || _l2Regularization != 0f || _maxGradNorm > 0.0)
                 return null;
@@ -7715,10 +7889,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var capM = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
             var capV = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
             var capSizes = new List<int>(paramCount);
-            var owner = gpuBackends[0];
+            var capIndices = Enumerable.Range(0, paramCount).Where(IsOptimizerParameterActive).ToArray();
+            if (capIndices.Length == 0) return null;
+            var capOffsets = capIndices.Select(p => _parameterAcceptedUpdates[p] - _optimizerStep).ToArray();
+            var owner = gpuBackends[capIndices[0]];
             if (owner is not Engines.DirectGpu.IGpuGraphCapture) return null;
             bool adam = optType != OptimizerType.SGD;
-            for (int p = 0; p < paramCount; p++)
+            foreach (int p in capIndices)
             {
                 if (!ReferenceEquals(gpuBackends[p], owner) || gpuParam[p] is not { } gp || gpuGrad[p] is not { } gg
                     || lengths[p] <= 0)
@@ -7735,6 +7912,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 else if (pingPong is not null) io.CaptureSgdPingPongUpdate(0, (float)wd);
                 else io.CaptureSgdUpdate(capParams, capGrads, capSizes, (float)wd);
             });
+            captured.ParameterMembership = (bool[])_optimizerGradientMembership.Clone();
             captured.Prepare = io =>
             {
                 if (pingPong is not null)
@@ -7758,18 +7936,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         RejectPingPong("its tables could not be built: " + prepareFailure.Message);
                     }
                 }
-                io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes);
+                io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes, adam ? capOffsets : null);
             };
             // Binds every parameter to buffer set `set` (0: the plan's own, 1: the ping-pong second buffers) as the
             // authoritative copy everywhere it is looked up; `from` is the set the persistent weight cache names now.
             void BindSet(int set, int from)
             {
                 if (!_engine.TryGet<Engines.DirectGpuTensorEngine>(out var rebindEngine)) return;
-                for (int p = 0; p < paramCount; p++)
+                for (int position = 0; position < capIndices.Length; position++)
                 {
+                    int p = capIndices[position];
                     if (gpuParam[p] is not { } a || gpuBackends[p] is not { } beBind) continue;
-                    var target = set == 1 && pingPong is not null ? pingPong[p] : a;
-                    var source = from == 1 && pingPong is not null ? pingPong[p] : a;
+                    var target = set == 1 && pingPong is not null ? pingPong[position] : a;
+                    var source = from == 1 && pingPong is not null ? pingPong[position] : a;
                     if (typeof(T) == typeof(float))
                         rebindEngine.MovePersistentParameterBuffer((Tensor<float>)(object)_parameters[p], source, target);
                     rebindEngine.BindResidentBuffer(_parameters[p], target, beBind);
@@ -7780,7 +7959,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 // The device updated every parameter (in place, or into the other buffer set): keep the host's view of
                 // them in step, as the multi-tensor path above does after its launch.
-                for (int p = 0; p < paramCount; p++)
+                foreach (int p in capIndices)
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                 int previous = captured.Latest;
                 if (captured.PingPong is not null) captured.Latest ^= 1;
@@ -7800,7 +7979,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (captured.Latest == 1 && live)
                     {
                         // Stream-ordered after every replay: the current weights back into the plan's own buffers.
-                        for (int p = 0; p < paramCount; p++) owner.Copy(pingPong[p], gpuParam[p]!, lengths[p]);
+                        for (int position = 0; position < capIndices.Length; position++)
+                        {
+                            int p = capIndices[position];
+                            owner.Copy(pingPong[position], gpuParam[p]!, lengths[p]);
+                        }
                         BindSet(0, 1);
                     }
                     captured.Latest = 0;
@@ -7878,13 +8061,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
         // See ConfigureOptimizerFloat for the rationale.
+        ResolveDeferredFiniteness();
+        InvalidateCapturedStepGraph();
         LeaveSharedMoments();
         DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
-        // Drop any captured step graph wired to the old optimizer state (see
-        // ConfigureOptimizerFloat — replay would target freed/stale buffers).
-        InvalidateCapturedStepGraph();
 
         int paramCount = _parameters.Length;
         int groupCount = groupSchedules.Count;
@@ -8121,6 +8303,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _finitenessDeferred = false;
         _optimizerStep = 0;
+        _parameterAcceptedUpdates = new long[_parameters.Length];
+        _pendingParameterAgeMembership = null;
         var b1 = beta1;
         var b2 = beta2;
         var epsVal = eps;
@@ -8200,6 +8384,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             for (int p = 0; p < paramCount; p++)
             {
+                if (!IsOptimizerParameterActive(p)) continue;
+                int parameterStep = NextParameterUpdateAge(p);
+                var parameterBc1 = parameterStep == _optimizerStep ? stepBc1 : ParameterBiasCorrection(b1, parameterStep);
+                var parameterBc2 = parameterStep == _optimizerStep ? stepBc2 : ParameterBiasCorrection(b2, parameterStep);
                 int len = lengths[p];
                 int grp = paramGroup[p];
                 float lr = groupLrs[grp];
@@ -8244,17 +8432,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                             $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
                                     compressedGpuBe.AdamUpdateBf16(
                                         gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
                                 {
                                     LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
-                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: false, _int8MomentBlockSize, len);
+                                        lr, b1, b2, epsVal, parameterStep, wd, decoupled: false, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
                                     gpuBe.AdamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 break;
                             case OptimizerType.AdamW:
@@ -8265,17 +8453,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                             $"BFloat16 fused optimizer moments are not implemented by GPU backend '{gpuBe.BackendName}'.");
                                     compressedGpuBe.AdamWUpdateBf16(
                                         gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 else if (gpuMomentStorage[p] == FusedMomentStorageMode.Int8BlockQuantized)
                                 {
                                     LaunchAdam8Bit(gpuBe, gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuMScales[p]!, gpuVScales[p]!,
-                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupled: true, _int8MomentBlockSize, len);
+                                        lr, b1, b2, epsVal, parameterStep, wd, decoupled: true, _int8MomentBlockSize, len);
                                 }
                                 else
                                 {
                                     gpuBe.AdamWUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        lr, b1, b2, epsVal, wd, parameterStep, len);
                                 }
                                 break;
                             case OptimizerType.AMSGrad:
@@ -8284,17 +8472,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
                                     if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), 0f, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), 0f, parameterStep, len);
                                 }
                                 else
                                 {
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), wd, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), wd, parameterStep, len);
                                 }
                                 break;
                             case OptimizerType.Nadam:
                                 gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                    lr, b1, b2, epsVal, wd, parameterStep, len);
                                 break;
                             case OptimizerType.RMSprop:
                                 gpuBe.RmspropUpdate(gpuP, gradBuf, gpuV[p]!,
@@ -8332,7 +8520,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 break;
                             case OptimizerType.AdaMax:
                                 gpuBe.AdamaxUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                    lr, b1, b2, epsVal, wd, parameterStep, len);
                                 break;
                             default:
                                 throw new NotSupportedException(
@@ -8389,31 +8577,31 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             if (useBf16Moments)
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
-                                        lr, b1, b2, epsVal, _optimizerStep);
+                                        lr, b1, b2, epsVal, parameterStep);
                             else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
                                         pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
-                                        lr, b1, b2, epsVal, _optimizerStep);
+                                        lr, b1, b2, epsVal, parameterStep);
                             else
                                 FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, stepBc1, stepBc2);
+                                    lr, b1, b2, epsVal, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AdamW:
                             if (useBf16Moments)
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamWUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep);
+                                        lr, b1, b2, epsVal, wd, parameterStep);
                             else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
                                         pParam, pGrad, pMq, pVq, pMs, pVs, len, _int8MomentBlockSize,
-                                        lr, b1, b2, epsVal, _optimizerStep, wd, decoupledWeightDecay: true);
+                                        lr, b1, b2, epsVal, parameterStep, wd, decoupledWeightDecay: true);
                             else
                                 FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
+                                    lr, b1, b2, epsVal, wd, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -8432,7 +8620,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
+                                AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), parameterStep);
                             break;
                         // #76: float-only kernel-backed optimizers (see ConfigureOptimizerFloat
                         // for the buffer-slot / hyperparameter-mapping rationale).
@@ -8440,17 +8628,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.NadamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, parameterStep);
                             break;
                         case OptimizerType.RAdam:
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.RAdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, parameterStep);
                             break;
                         case OptimizerType.LAMB:
                             FusedOptimizer.LAMBUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
+                                lr, b1, b2, epsVal, wd, parameterStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
                             break;
                         case OptimizerType.RMSprop:
                             if (wd != 0f)
@@ -8477,7 +8665,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AdaMaxUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                lr, b1, b2, epsVal, parameterStep);
                             break;
                         // #76: optimizers needing extra hyperparameters (FusedOptimizerExtras).
                         case OptimizerType.AdaDelta:
@@ -8495,14 +8683,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.ASGD:
                             {
-                                float etaT = lr / (float)Math.Pow(1.0 + extras.Lambd * lr * _optimizerStep, extras.Alpha);
-                                float muT = 1f / Math.Max(1f, _optimizerStep - extras.T0);
+                                float etaT = lr / (float)Math.Pow(1.0 + extras.Lambd * lr * parameterStep, extras.Alpha);
+                                float muT = 1f / Math.Max(1f, parameterStep - extras.T0);
                                 FusedOptimizer.ASGDUpdateSimd(pParam, pGrad, pM, len,
                                     etaT, extras.Lambd, extras.Alpha, wd, muT);
                             }
                             break;
                         case OptimizerType.Rprop:
-                            if (_optimizerStep == 1)
+                            if (parameterStep == 1)
                                 for (int i = 0; i < len; i++) pV[i] = extras.RpropInitialStep;
                             FusedOptimizer.RpropUpdate(pParam, pGrad, pM, pV, len,
                                 extras.RpropEtaPlus, extras.RpropEtaMinus, extras.RpropStepMin, extras.RpropStepMax);
@@ -8543,12 +8731,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         OptimizerType optimizerType, LrSchedule schedule, double beta1, double beta2, double eps, double weightDecay,
         FusedOptimizerExtras extras)
     {
+        ResolveDeferredFiniteness();
+        InvalidateCapturedStepGraph();
         LeaveSharedMoments();
         DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
-        InvalidateCapturedStepGraph();
 
         // Mirror of ConfigureOptimizerFloat for double parameters. PR #319
         // follow-up: tape-trained Tensor<double> models (e.g. ViT-Base in
@@ -8624,6 +8813,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _optimizerStep = 0;
+        _parameterAcceptedUpdates = new long[_parameters.Length];
+        _pendingParameterAgeMembership = null;
         double b1 = beta1;
         double b2 = beta2;
         double epsVal = eps;
@@ -8675,24 +8866,33 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // loop below (same math, same per-tensor SIMD/scalar-tail split). This
             // (non-grouped double) path is pure CPU fp32-moment AdamW — no GPU-resident
             // or bf16/int8 branch to preserve — so the fast path is unconditional here.
-            if (multiTensorEligible && optType == OptimizerType.AdamW)
+            if (multiTensorEligible && optType is OptimizerType.Adam or OptimizerType.AdamW)
             {
-                FusedOptimizer.AdamWUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
-                    lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
-                for (int p = 0; p < paramCount; p++) MarkHostWeightMutated(p);
-                return;
-            }
-            if (multiTensorEligible && optType == OptimizerType.Adam)
-            {
-                FusedOptimizer.AdamUpdateSimdMulti(paramArrays, gradArrays, m, v, lengths, paramCount,
-                    lr, b1, b2, epsVal, stepBc1, stepBc2);
-                for (int p = 0; p < paramCount; p++) MarkHostWeightMutated(p);
+                foreach (var indices in ActiveParameterAgeGroups())
+                {
+                    int age = NextParameterUpdateAge(indices[0]);
+                    double bc1 = age == _optimizerStep ? stepBc1 : ParameterBiasCorrection(b1, age);
+                    double bc2 = age == _optimizerStep ? stepBc2 : ParameterBiasCorrection(b2, age);
+                    if (optType == OptimizerType.AdamW)
+                        FusedOptimizer.AdamWUpdateSimdMulti(ProjectSlots(paramArrays, indices), ProjectSlots(gradArrays, indices),
+                            ProjectSlots(m, indices), ProjectSlots(v, indices), ProjectSlots(lengths, indices), indices.Length,
+                            lr, b1, b2, epsVal, wd, bc1, bc2);
+                    else
+                        FusedOptimizer.AdamUpdateSimdMulti(ProjectSlots(paramArrays, indices), ProjectSlots(gradArrays, indices),
+                            ProjectSlots(m, indices), ProjectSlots(v, indices), ProjectSlots(lengths, indices), indices.Length,
+                            lr, b1, b2, epsVal, bc1, bc2);
+                    foreach (int p in indices) MarkHostWeightMutated(p);
+                }
                 return;
             }
             for (int p = 0; p < paramCount; p++)
             {
                 // Skip params with no gradient OR no materialized weight backing (#1738).
                 if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                if (!IsOptimizerParameterActive(p)) continue;
+                int parameterStep = NextParameterUpdateAge(p);
+                var parameterBc1 = parameterStep == _optimizerStep ? stepBc1 : ParameterBiasCorrection(b1, parameterStep);
+                var parameterBc2 = parameterStep == _optimizerStep ? stepBc2 : ParameterBiasCorrection(b2, parameterStep);
                 int len = lengths[p];
                 fixed (double* pParam = &paramArrays[p][paramOffsets[p]],
                        pGrad = &gradArrays[p][gradOffsets[p]],
@@ -8705,11 +8905,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.Adam:
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, stepBc1, stepBc2);
+                                lr, b1, b2, epsVal, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
+                                lr, b1, b2, epsVal, wd, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -8728,7 +8928,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
+                                AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), parameterStep);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -8756,12 +8956,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         double[]? groupWeightDecays,
         FusedOptimizerExtras extras)
     {
+        ResolveDeferredFiniteness();
+        InvalidateCapturedStepGraph();
         LeaveSharedMoments();
         DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _preForwardParamTransform = null;
-        InvalidateCapturedStepGraph();
 
         int paramCount = _parameters.Length;
         int groupCount = groupSchedules.Count;
@@ -8822,6 +9023,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _optimizerStep = 0;
+        _parameterAcceptedUpdates = new long[_parameters.Length];
+        _pendingParameterAgeMembership = null;
         double b1 = beta1;
         double b2 = beta2;
         double epsVal = eps;
@@ -8877,6 +9080,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 // Skip params with no gradient OR no materialized weight backing (#1738).
                 if (gradArrays[p].Length == 0 || paramArrays[p].Length == 0) continue;
+                if (!IsOptimizerParameterActive(p)) continue;
+                int parameterStep = NextParameterUpdateAge(p);
+                var parameterBc1 = parameterStep == _optimizerStep ? stepBc1 : ParameterBiasCorrection(b1, parameterStep);
+                var parameterBc2 = parameterStep == _optimizerStep ? stepBc2 : ParameterBiasCorrection(b2, parameterStep);
                 int len = lengths[p];
                 int grp = paramGroup[p];
                 double lr = groupLrs[grp];
@@ -8896,11 +9103,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.Adam:
                             FusedOptimizer.AdamUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, stepBc1, stepBc2);
+                                lr, b1, b2, epsVal, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AdamW:
                             FusedOptimizer.AdamWUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, stepBc1, stepBc2);
+                                lr, b1, b2, epsVal, wd, parameterBc1, parameterBc2);
                             break;
                         case OptimizerType.AMSGrad:
                             // AMSGrad (#74): Adam with a running max of v̂ so the
@@ -8919,7 +9126,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
+                                AmsLr(extras, lr, b1, b2, parameterStep), b1, b2, AmsEps(extras, epsVal, b1, b2, parameterStep), parameterStep);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -8963,6 +9170,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             GroupOptimizerTypes = rt.GroupOptimizerTypes is null ? null : (OptimizerType[])rt.GroupOptimizerTypes.Clone(),
             GroupWeightDecays = rt.GroupWeightDecays is null ? null : (double[])rt.GroupWeightDecays.Clone(),
             OptimizerStep = _optimizerStep,
+            FixedActiveDomain = _fixedActiveDomainMask is null ? null : (bool[])_fixedActiveDomainMask.Clone(),
             Beta1 = rt.Beta1,
             Beta2 = rt.Beta2,
             Epsilon = rt.Epsilon,
@@ -8982,6 +9190,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 ScheduleFreeWeightSum = rt.Scalars.ScheduleFreeWeightSum,
                 ConjugateGradientPrevGradNorm2 = rt.Scalars.CgPrevGradNorm2,
             },
+            LbfgsHistory = rt.OptimizerType == OptimizerType.LBFGS ? new FusedLbfgsHistoryCheckpoint
+            {
+                S = rt.LbfgsS!.Select(row => (float[])row.Clone()).ToArray(),
+                Y = rt.LbfgsY!.Select(row => (float[])row.Clone()).ToArray(),
+                Rho = (float[])rt.LbfgsRho!.Clone(),
+                PrevParam = (float[])rt.LbfgsPrevParam!.Clone(),
+                PrevGrad = (float[])rt.LbfgsPrevGrad!.Clone(),
+                Count = rt.LbfgsCount, Head = rt.LbfgsHead, HasPrev = rt.LbfgsHasPrev,
+                GammaNum = rt.LbfgsGammaNum, GammaDen = rt.LbfgsGammaDen,
+            } : null,
             Parameters = new FusedOptimizerParameterCheckpoint[_parameters.Length],
         };
 
@@ -8997,6 +9215,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (checkpoint.Parameters.Length != _parameters.Length)
             throw new InvalidDataException(
                 $"Optimizer checkpoint has {checkpoint.Parameters.Length} parameter states but plan has {_parameters.Length} parameters.");
+        if (checkpoint.OptimizerStep < 0 || checkpoint.Parameters.Any(parameter => parameter is null
+            || parameter.AcceptedUpdates < 0 || parameter.AcceptedUpdates > checkpoint.OptimizerStep))
+            throw new InvalidDataException("Optimizer parameter accepted-update ages must be nonnegative and no greater than the global accepted step.");
+        bool coupled = RequiresFixedActiveDomain(checkpoint.OptimizerType);
+        if (coupled != (checkpoint.FixedActiveDomain is not null)
+            || checkpoint.FixedActiveDomain is { } domain && (domain.Length != _parameters.Length
+                || !domain.SequenceEqual(_graphGradientMembership)))
+            throw new InvalidDataException("A coupled optimizer checkpoint must preserve the plan's fixed active-variable domain.");
+        FusedOptimizerCheckpointSerializer.ValidateLbfgsHistory(checkpoint);
+        if (checkpoint.LbfgsHistory is { } history
+            && history.PrevParam.LongLength != _parameters.Sum(parameter => (long)parameter.Length))
+            throw new InvalidDataException("L-BFGS history width does not match the plan's canonical parameter layout.");
 
         // Restoring reconfigures the optimizer before per-parameter state sizes can be checked against the freshly
         // allocated buffers, so a payload that fails part-way must not leave a half-restored plan behind: put the
@@ -9057,13 +9287,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Releases the configured fused optimizer so the plan steps without one, as before configuration.</summary>
     private void ClearFusedOptimizer()
     {
+        ResolveDeferredFiniteness();
+        InvalidateCapturedStepGraph();
         DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);
         _optimizerRuntimeState = null;
         _capturedOptimizerFactory = null;
         _optimizerUpdate = null;
+        _fixedActiveDomainMask = null;
         _optimizerStep = 0;
-        InvalidateCapturedStepGraph();
+        _parameterAcceptedUpdates = new long[_parameters.Length];
+        _pendingParameterAgeMembership = null;
     }
 
     /// <param name="liveSchedules">Schedule instances to configure with in place of the checkpoint's, one per
@@ -9128,6 +9362,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         rt.Scalars.DAdaptationRAccum = checkpoint.Scalars.DAdaptationRAccum;
         rt.Scalars.ScheduleFreeWeightSum = checkpoint.Scalars.ScheduleFreeWeightSum;
         rt.Scalars.CgPrevGradNorm2 = checkpoint.Scalars.ConjugateGradientPrevGradNorm2;
+        if (checkpoint.LbfgsHistory is { } history)
+        {
+            rt.LbfgsS = history.S.Select(row => (float[])row.Clone()).ToArray();
+            rt.LbfgsY = history.Y.Select(row => (float[])row.Clone()).ToArray();
+            rt.LbfgsRho = (float[])history.Rho.Clone();
+            rt.LbfgsPrevParam = (float[])history.PrevParam.Clone();
+            rt.LbfgsPrevGrad = (float[])history.PrevGrad.Clone();
+            rt.LbfgsCount = history.Count; rt.LbfgsHead = history.Head; rt.LbfgsHasPrev = history.HasPrev;
+            rt.LbfgsGammaNum = history.GammaNum; rt.LbfgsGammaDen = history.GammaDen;
+        }
 
         for (int p = 0; p < checkpoint.Parameters.Length; p++)
             RestoreOptimizerParameterState(rt, p, checkpoint.Parameters[p]);
@@ -9137,6 +9381,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         var state = new FusedOptimizerParameterCheckpoint
         {
+            AcceptedUpdates = _parameterAcceptedUpdates[p],
             MFloat = CopyNonEmpty(rt.MFloat, p),
             VFloat = CopyNonEmpty(rt.VFloat, p),
             VMaxFloat = CopyNonEmpty(rt.VMaxFloat, p),
@@ -9198,6 +9443,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int p,
         FusedOptimizerParameterCheckpoint state)
     {
+        _parameterAcceptedUpdates[p] = state.AcceptedUpdates;
         if (rt.GpuBackends is not null && rt.GpuBackends[p] is { } backend)
         {
             var gpuMode = rt.GpuMomentStorage?[p] ?? FusedMomentStorageMode.Float32;
@@ -9328,35 +9574,35 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // AMSGrad with AmsgradDisableBiasCorrection (Reddi et al. 2018, Algorithm 2): the bias-corrected kernels compute
     // the uncorrected update exactly when given a rescaled learning rate and epsilon (FusedOptimizer.ToUncorrectedAmsgrad).
     // The step is the one about to run, so this is evaluated per step, like the kernels' own corrections.
-    private float AmsLr(FusedOptimizerExtras extras, float lr, float b1, float b2)
+    private float AmsLr(FusedOptimizerExtras extras, float lr, float b1, float b2, int parameterStep)
     {
         if (!extras.AmsgradDisableBiasCorrection) return lr;
         float eps = 0f;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, parameterStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return lr;
     }
 
-    private float AmsEps(FusedOptimizerExtras extras, float eps, float b1, float b2)
+    private float AmsEps(FusedOptimizerExtras extras, float eps, float b1, float b2, int parameterStep)
     {
         if (!extras.AmsgradDisableBiasCorrection) return eps;
         float lr = 0f;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, parameterStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return eps;
     }
 
-    private double AmsLr(FusedOptimizerExtras extras, double lr, double b1, double b2)
+    private double AmsLr(FusedOptimizerExtras extras, double lr, double b1, double b2, int parameterStep)
     {
         if (!extras.AmsgradDisableBiasCorrection) return lr;
         double eps = 0.0;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, parameterStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return lr;
     }
 
-    private double AmsEps(FusedOptimizerExtras extras, double eps, double b1, double b2)
+    private double AmsEps(FusedOptimizerExtras extras, double eps, double b1, double b2, int parameterStep)
     {
         if (!extras.AmsgradDisableBiasCorrection) return eps;
         double lr = 0.0;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, parameterStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return eps;
     }
     private static FusedOptimizerExtras CloneFusedOptimizerExtras(FusedOptimizerExtras extras)
@@ -9464,6 +9710,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         cancellationToken.ThrowIfCancellationRequested();
+        if (_dataForwardReplay is not null) throw new NotSupportedException(ForwardOnlyHeterogeneousReplay.UnsupportedScheduleReason);
 
         TrainingPlanWriter.Write(stream, this);
         return Task.CompletedTask;
@@ -9516,16 +9763,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (reader.ReadInt32() != OptimizerStateMagic)
                 throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
             int version = reader.ReadInt32();
-            // Version 3 wrote the hyperparameters as float, and versions 3 and 4 have no velocity flag. Both are
-            // still read, so state exported before either change imports unchanged (with the float-rounded values
-            // and the velocity rule it was saved with).
-            if (version != OptimizerStateVersion && version != NoVelocityFlagOptimizerStateVersion
-                && version != SingleHyperparameterOptimizerStateVersion)
+            if (version != OptimizerStateVersion)
                 throw new InvalidDataException(
                     $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
-            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader,
-                doubleHyperparameters: version >= NoVelocityFlagOptimizerStateVersion,
-                hasVelocityIncludesLearningRate: version >= OptimizerStateVersion);
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader);
         }
         catch (EndOfStreamException ex)
         {
@@ -9545,9 +9786,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     //    one layout and a reader cannot tell which it holds: every version 2 payload is rejected, never misread.
     // 4: beta1, beta2, epsilon and weight decay became double (format 11).
     // 5: the extras gained VelocityIncludesLearningRate (format 14).
-    private const int OptimizerStateVersion = 5;
-    private const int NoVelocityFlagOptimizerStateVersion = 4;
-    private const int SingleHyperparameterOptimizerStateVersion = 3;
+    // 6: per-parameter accepted-update ages and fixed coupled-optimizer enrollment domain.
+    // Earlier payloads cannot identify absent-gradient history and are deliberately rejected.
+    private const int OptimizerStateVersion = 6;
 
     /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)
@@ -9732,10 +9973,23 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var ancestor = pendingLossNodes.Pop();
             if (!lossAncestors.Add(ancestor)) continue;
+            if (ancestor is ICrossTypeNodeMetadata { HasBackward: false }) continue;
             var gradientInputs = ancestor is LazyNode<T> typedAncestor
                 ? typedAncestor.GetGradientInputNodes() : ancestor.GetInputNodes();
             foreach (var inputNode in gradientInputs) pendingLossNodes.Push(inputNode);
         }
+
+        // Membership means a derivative edge exists, not that its current numerical value is nonzero.
+        var gradientMembers = new HashSet<Tensor<T>>();
+        if ((explicitLoss ?? recordedLastOutput) is { } directLoss) gradientMembers.Add(directLoss);
+        foreach (var node in lossAncestors.OfType<LazyNode<T>>())
+            foreach (var input in node.GetDifferentiableInputs()) gradientMembers.Add(input);
+
+        // The complete foreign-data schedule is distinct from the typed backward projection.
+        var dataReplay = ForwardOnlyHeterogeneousReplay.Create<T>(optimized);
+        // Specialization may inspect typed input storage. A foreign producer must not be
+        // recursively realized while those delegates are built (RNG and writes run at Step only).
+        dataReplay?.DetachOutputs();
 
         // Collect all forward steps
         var forwardSteps = new List<CompiledStep<T>>();
@@ -9749,7 +10003,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     typed.Output,
                     typed.GetInputsArray(),
                     lossAncestors.Contains(typed) ? typed.BackwardFn : null,
-                    typed.SavedState) { ReplaysHostState = typed.ReplaysHostState });
+                    typed.SavedState)
+                {
+                    ReplaysHostState = typed.ReplaysHostState,
+                    RecordedUnderNoGrad = typed.RecordedUnderNoGrad,
+                    DifferentiableInputIndices = typed.DifferentiableInputIndices,
+                });
                 // CRITICAL (issue #350 root cause): clear LazySource on every
                 // forward-step output BEFORE the plan starts executing. Each
                 // call to plan.Step() runs the lazy execute via the
@@ -9787,7 +10046,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the known Half node types should route through it — a future non-FP16
             // heterogeneous graph must not be misrouted here.
             bool hasFp16Nodes = false;
-            if (typeof(T) == typeof(float))
+            if (typeof(T) == typeof(float) && dataReplay is null)
             {
                 foreach (var n in optimized)
                 {
@@ -9828,7 +10087,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // accumulate guards use this; forward fusion still sees every reader through consumerCount.
         var gradWriterCount = new Dictionary<Tensor<T>, int>();
         foreach (var step in forwardSteps.Where(s => s.BackwardFn != null))
-            foreach (var inp in step.Inputs)
+            foreach (var inp in DifferentiableInputs(step))
                 gradWriterCount[inp] = gradWriterCount.TryGetValue(inp, out int writers) ? writers + 1 : 1;
 
         // Pre-allocate gradient buffers for all tensors
@@ -9880,7 +10139,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             gradPoolReZeroByPosition = BuildPooledGradMap(allTensors, forwardSteps, parameters,
                 fusionConsumerCount, engine, gradMap, allGrads,
-                out decidedFusedSteps, out decidedSkippableReduceSum);
+                out decidedFusedSteps, out decidedSkippableReduceSum, allowProjectedFusion: dataReplay is null);
         }
         else
         {
@@ -9952,7 +10211,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // for the fused action stream when assigning shared buffers, so we run the
         // real fusion pass against the aliased gradMap here exactly as on the
         // non-pooled path (the drift guard later asserts the decisions matched).
-        if (typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion
+        if (dataReplay is null && typeof(T) == typeof(float) && Optimization.TensorCodecOptions.Current.EnableDataflowFusion
             && !preferGenericForGpu)
         {
             TryFuseForwardBackward(forwardSteps, gradMap, fusionConsumerCount, engine,
@@ -9998,7 +10257,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Analytic backward is pooling-COMPATIBLE (each analytic step is still one
         // backward action covering one forward step; BuildPooledGradMap accounted
         // for it, incl. its skippable-ReduceSum, in the action coverage).
-        if (typeof(T) == typeof(float) && !preferGenericForGpu)
+        if (dataReplay is null && typeof(T) == typeof(float) && !preferGenericForGpu)
         {
             DetectAnalyticLossMatMulBackward(forwardSteps, fusionConsumerCount, gradMap,
                 analyticBackwardSpecs, skippableReduceSumIndices, analyticForwardSpecs,
@@ -10025,7 +10284,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Default off; opt in via AIDOTNET_SLICE_PREFIX_FUSION=1 for
         // workloads where the per-call MKL setup is small relative to
         // the saved MAC work (very large M, or N_full >> N_used).
-        if (typeof(T) == typeof(float) && !useGradPool
+        if (dataReplay is null && typeof(T) == typeof(float) && !useGradPool
             && Environment.GetEnvironmentVariable("AIDOTNET_SLICE_PREFIX_FUSION") == "1")
         {
             DetectMatMulSlicePrefixFusion(forwardSteps, fusionConsumerCount, gradMap,
@@ -10047,7 +10306,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Saliency maps and adversarial examples need the input gradient; training does not, so it stays off.
         requiresGradTensors.UnionWith(RequestedInputGradientLeaves(forwardSteps));
         foreach (var fwdStep in forwardSteps)
-            foreach (var fwdInput in fwdStep.Inputs)
+            foreach (var fwdInput in DifferentiableInputs(fwdStep))
                 if (fwdInput is not null && requiresGradTensors.Contains(fwdInput))
                 {
                     requiresGradTensors.Add(fwdStep.OutputBuffer);
@@ -10059,7 +10318,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var consumedByConvEpilogue = new HashSet<int>();
         var convEpilogueChains = new Dictionary<int, int[]>();
         var convEpilogueDeadInternals = new List<Tensor<T>>();
-        if (typeof(T) == typeof(float) && !useGradPool && !preferGenericForGpu
+        if (dataReplay is null && typeof(T) == typeof(float) && !useGradPool && !preferGenericForGpu
             && engine.Is<CpuEngine>() && !engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
         {
@@ -10086,7 +10345,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Before any forward or backward specialization captures an array; tensors a fusion builder above captured are
         // excluded. AIDOTNET_COMPILED_FORWARD_POOL=0 turns it off.
         int pooledForwardOutputs = 0;
-        if ((typeof(T) == typeof(float) || typeof(T) == typeof(double)) && !useGradPool && !preferGenericForGpu
+        if (dataReplay is null && (typeof(T) == typeof(float) || typeof(T) == typeof(double)) && !useGradPool && !preferGenericForGpu
             && !engine.SupportsGpu && fp16HeteroOrder is null
             && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_FORWARD_POOL") != "0")
         {
@@ -10215,7 +10474,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // the generic engine-dispatched form — any specialized/fused closure is
         // host-only and would freeze under graph replay. (No forward pruning, so the
         // count comparison is exact.)
-        bool graphForwardPure = genericForwardCount == allForwardActions.Count;
+        bool graphForwardPure = dataReplay is null && genericForwardCount == allForwardActions.Count;
 
         // Build backward actions: specialized per-step + fused backward for fused groups
         var backwardActions = new List<Action<IEngine>>();
@@ -10703,6 +10962,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (fp16HeteroOrder is not null)
                 for (int i = 0; i < fp16HeteroOrder.Length; i++)
                     fp16HeteroOrder[i].AddStorageLeases(storageLeases);
+            dataReplay?.AcquireStorage(storageLeases);
             storageLeases.Add(lossOutput);
 
             var plan = new CompiledTrainingPlan<T>(
@@ -10731,6 +10991,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 forwardFixedActions,
                 storageLeases);
             storageLeases = null;
+            plan._dataForwardReplay = dataReplay;
+            plan._graphGradientMembership = parameters.Select(gradientMembers.Contains).ToArray();
+            plan._optimizerGradientMembership = plan._graphGradientMembership;
             plan._liveGradientMap = gradMap;
             if (fp16HeteroOrder is null)
                 plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
@@ -10758,9 +11021,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (deferrable.Count > 0 && engine.Is<DirectGpuTensorEngine>()) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
             scope.ReleaseStorageLeases();
             DropStorageOfRemovedOutputs(scope.Nodes, optimized, forwardSteps, parameters);
-            plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
+            if (dataReplay is null) plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
             plan._pooledForwardOutputs = pooledForwardOutputs;
-            if (typeof(T) == typeof(float) && engine.SupportsGpu && fp16HeteroOrder is null
+            if (dataReplay is null && typeof(T) == typeof(float) && engine.SupportsGpu && fp16HeteroOrder is null
                 && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput, retainedOutputs) is { } spans)
             {
                 plan._spanStepOfAction = spans.StepOfAction;
@@ -13718,6 +13981,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         System.Runtime.CompilerServices.StrongBox<bool>? claimsFirstWrite = null,
         Dictionary<Tensor<T>, int>? gradWriterCount = null)
     {
+        // A specialization implements the full canonical derivative. A declared partial callback
+        // must retain its own edge contract; replacing it would resurrect excluded derivatives.
+        if (step.DifferentiableInputIndices is not null) return null;
         // claimsFirstWrite is set when the returned delegate writes each multi-consumer input's gradient through
         // AccumulatesInto (claiming the step's first write) rather than always adding into a zeroed buffer.
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
@@ -15407,7 +15673,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var step0 = steps[i];
             var step1 = steps[i + 1];
             var step2 = steps[i + 2];
-            if (step0.BackwardFn is null || step1.BackwardFn is null || step2.BackwardFn is null) continue;
+            if (!HasCanonicalDerivative(step0) || !HasCanonicalDerivative(step1) || !HasCanonicalDerivative(step2)) continue;
 
             // Pattern: MatMul[i] → activation[i+1] → MatMul[i+2]
             // where the activation's input is MatMul[i]'s output, and
@@ -15673,7 +15939,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             var matmul = forwardSteps[i];
             var reduce = forwardSteps[i + 1];
-            if (matmul.BackwardFn is null || reduce.BackwardFn is null) continue;
+            if (!HasCanonicalDerivative(matmul) || !HasCanonicalDerivative(reduce)) continue;
 
             if (matmul.OpName != "TensorMatMul") continue;
             if (reduce.OpName != "ReduceSum") continue;
@@ -15956,7 +16222,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int convIdx = 0; convIdx < steps.Count; convIdx++)
         {
             var conv = steps[convIdx];
-            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || conv.BackwardFn == null || Taken(convIdx)) continue;
+            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || !HasCanonicalDerivative(conv) || Taken(convIdx)) continue;
             if (conv.SavedState is not { Length: >= 3 } convState
                 || convState[0] is not int[] stride || convState[1] is not int[] padding
                 || convState[2] is not int[] dilation) continue;
@@ -15969,7 +16235,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             var biasStep = steps[biasIdx];
             if (biasStep.OpName != "TensorChannelBiasAdd" || biasStep.Inputs.Length != 2
-                || !ReferenceEquals(biasStep.Inputs[0], convOut) || biasStep.BackwardFn == null) continue;
+                || !ReferenceEquals(biasStep.Inputs[0], convOut) || !HasCanonicalDerivative(biasStep)) continue;
             var bias = biasStep.Inputs[1];
             var biasOut = biasStep.OutputBuffer;
             if (bias.Rank != 1 || bias._shape[0] != convOut._shape[1] || !bias.IsContiguous
@@ -15982,7 +16248,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 var reluStep = steps[reluIdx];
                 if (reluStep.OpType == OpType.ReLU && reluStep.Inputs.Length == 1
-                    && ReferenceEquals(reluStep.Inputs[0], biasOut) && reluStep.BackwardFn != null
+                    && ReferenceEquals(reluStep.Inputs[0], biasOut) && HasCanonicalDerivative(reluStep)
                     && reluStep.OutputBuffer.IsContiguous && reluStep.OutputBuffer.Length == biasOut.Length)
                 {
                     relu = true;
@@ -16139,7 +16405,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var matmul = forwardSteps[i];
             var slice = forwardSteps[i + 1];
-            if (matmul.BackwardFn is null || slice.BackwardFn is null) continue;
+            if (!HasCanonicalDerivative(matmul) || !HasCanonicalDerivative(slice)) continue;
 
             if (matmul.OpName != "TensorMatMul") continue;
             if (slice.OpName != "TensorSlice") continue;
@@ -16287,7 +16553,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             var step0 = steps[i];
             var step1 = steps[i + 1];
-            if (step0.BackwardFn is null || step1.BackwardFn is null) continue;
+            if (!HasCanonicalDerivative(step0) || !HasCanonicalDerivative(step1)) continue;
 
             if (step0.OpName != "TensorMatMul" || step1.OpName != "TensorMatMul") continue;
             if (step0.Inputs.Length != 2 || step1.Inputs.Length != 2) continue;

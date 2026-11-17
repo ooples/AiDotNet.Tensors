@@ -208,14 +208,20 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update(
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int chunkSize,
     const double* __restrict__ finiteGuard,
-    const float* __restrict__ dyn)
+    const float* __restrict__ dyn,
+    const long long* __restrict__ acceptedOffsets,
+    const unsigned int* __restrict__ appliedState)
 {
     // A non-finite gradient sum of squares (written on the device before this launch) discards the whole
     // step: no moment or parameter is written, exactly as the host-side check skipped the launch.
     if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
-    // dyn (optional): device float[2] = this step's learning rate and step number, for a captured step.
-    if (dyn != 0) { learningRate = dyn[0]; step = (int)dyn[1]; }
+    // Keep the global accepted count in integer arithmetic until after applying each leaf's offset.
+    if (dyn != 0) learningRate = dyn[0];
     int t = chunkTensor[blockIdx.x];
+    long long acceptedStep = appliedState != 0
+        ? (long long)appliedState[1] + 1 + (acceptedOffsets != 0 ? acceptedOffsets[t] : 0)
+        : (dyn != 0 ? (long long)dyn[1] : (long long)step);
+    if (acceptedStep < 1) return; // defensive only: PrepareOptimizer validates every offset before capture
     int base = chunkStart[blockIdx.x];
     int i = base + threadIdx.x;
     int size = sizes[t];
@@ -234,8 +240,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / bias_correction(beta1, (float)step);
-    float vHat = vVal / bias_correction(beta2, (float)step);
+    float mHat = mVal / bias_correction(beta1, (float)acceptedStep);
+    float vHat = vVal / bias_correction(beta2, (float)acceptedStep);
     param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
@@ -250,14 +256,20 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
     float learningRate, float beta1, float beta2, float epsilon,
     float weightDecay, int step, int chunkSize,
     const double* __restrict__ finiteGuard,
-    const float* __restrict__ dyn)
+    const float* __restrict__ dyn,
+    const long long* __restrict__ acceptedOffsets,
+    const unsigned int* __restrict__ appliedState)
 {
     // A non-finite gradient sum of squares (written on the device before this launch) discards the whole
     // step: no moment or parameter is written, exactly as the host-side check skipped the launch.
     if (finiteGuard != 0 && !isfinite(*finiteGuard)) return;
-    // dyn (optional): device float[2] = this step's learning rate and step number, for a captured step.
-    if (dyn != 0) { learningRate = dyn[0]; step = (int)dyn[1]; }
+    // Keep the global accepted count in integer arithmetic until after applying each leaf's offset.
+    if (dyn != 0) learningRate = dyn[0];
     int t = chunkTensor[blockIdx.x];
+    long long acceptedStep = appliedState != 0
+        ? (long long)appliedState[1] + 1 + (acceptedOffsets != 0 ? acceptedOffsets[t] : 0)
+        : (dyn != 0 ? (long long)dyn[1] : (long long)step);
+    if (acceptedStep < 1) return; // defensive only: PrepareOptimizer validates every offset before capture
     int base = chunkStart[blockIdx.x];
     int i = base + threadIdx.x;
     int size = sizes[t];
@@ -276,8 +288,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
     float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
     m[i] = mVal;
     v[i] = vVal;
-    float mHat = mVal / bias_correction(beta1, (float)step);
-    float vHat = vVal / bias_correction(beta2, (float)step);
+    float mHat = mVal / bias_correction(beta1, (float)acceptedStep);
+    float vHat = vVal / bias_correction(beta2, (float)acceptedStep);
     param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 

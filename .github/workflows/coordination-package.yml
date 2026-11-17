@@ -95,6 +95,16 @@ jobs:
           --logger 'trx;LogFileName=retained-output-signature.trx'
           --results-directory artifacts/coordination/TestResults
 
+      - name: Verify heterogeneous replay and optimizer enrollment (mandatory CPU)
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-build --no-restore
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter 'FullyQualifiedName~ForwardOnlyHeterogeneousTrainingTests|FullyQualifiedName~NoGradTrainingTraceTests|FullyQualifiedName~CompiledEnrollmentCheckpointTests|FullyQualifiedName~CompiledOptimizerEnrollmentTests'
+          --logger 'trx;LogFileName=optimizer-enrollment-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
       - name: Verify package contents and write provenance
         shell: python
         run: |
@@ -185,8 +195,40 @@ jobs:
           assert actual_cases == expected_cases, {'missing': sorted(expected_cases - actual_cases), 'unexpected': sorted(actual_cases - expected_cases)}
           assert all(result.attrib['outcome'] == 'Passed' for result in case_results), 'A mandatory retention case did not pass'
 
+          enrollment_trx = root / 'TestResults/optimizer-enrollment-signature.trx'
+          enrollment_results = ET.parse(enrollment_trx).getroot()
+          enrollment_counters = enrollment_results.find('.//{*}Counters').attrib
+          assert enrollment_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', enrollment_counters
+          for key, value in enrollment_counters.items():
+              assert int(value) == (105 if key in ('total', 'executed', 'passed') else 0), enrollment_counters
+          assert all(key in enrollment_counters for key in ('total', 'executed', 'passed', 'failed')), enrollment_counters
+          enrollment_rows = enrollment_results.findall('.//{*}UnitTestResult')
+          enrollment_names = [row.attrib['testName'] for row in enrollment_rows]
+          assert len(enrollment_names) == len(set(enrollment_names)) == 105, 'Duplicate or missing enrollment case results'
+          assert all(row.attrib['outcome'] == 'Passed' for row in enrollment_rows), 'A mandatory enrollment case did not pass'
+          # Independently fixed identities, derived from the reviewed source cases and actual TRX discovery.
+          # Hash UTF-8 ordinal-sorted full testName strings joined by LF, with no trailing LF.
+          enrollment_groups = {
+              'heterogeneousReplay': ('ForwardOnlyHeterogeneousTrainingTests', 15, 'de0075e3f1733158969ac80614c060ec5503fca2c224f1d20a7fc639921b4d6d'),
+              'noGrad': ('NoGradTrainingTraceTests', 9, '337e7ee0a35bee20cfbd1eac8233c492ef750437ab57409b4a29fe5af3ae05e5'),
+              'optimizerEnrollment': ('CompiledOptimizerEnrollmentTests', 43, '359f487a34663544290a09d33b38529875bedf4e6719aff3b82aa931782b691f'),
+              'enrollmentCheckpoint': ('CompiledEnrollmentCheckpointTests', 38, '71f778ef513854883c35373163eb00e8fc4978b5a43c930cf8b1ccf411c41cd0'),
+          }
+          enrollment_evidence = {}
+          grouped_names = set()
+          for prefix, (class_name, count, digest) in enrollment_groups.items():
+              full_prefix = f'AiDotNet.Tensors.Tests.Engines.Compilation.{class_name}.'
+              names = sorted(name for name in enrollment_names if name.startswith(full_prefix))
+              assert len(names) == count, (prefix, names)
+              assert hashlib.sha256('\n'.join(names).encode('utf-8')).hexdigest() == digest, (prefix, names)
+              grouped_names.update(names)
+              group_counters = {key: str(count if key in ('total', 'executed', 'passed') else 0) for key in enrollment_counters}
+              enrollment_evidence[prefix + 'TestCounters'] = group_counters
+              enrollment_evidence[prefix + 'TestCases'] = names
+          assert grouped_names == set(enrollment_names), 'Unexpected mandatory enrollment case class'
+
           checksums = {}
-          for path in [package, trx, retention_trx]:
+          for path in [package, trx, retention_trx, enrollment_trx]:
               checksums[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
           manifest = {
               'repository': os.environ['GITHUB_REPOSITORY'],
@@ -199,7 +241,8 @@ jobs:
               'testCounters': counters,
               'retainedOutputTestCounters': retention_counters,
               'retainedOutputTestCases': sorted(actual_cases),
-              'mandatoryCpuTestCount': 125,
+              **enrollment_evidence,
+              'mandatoryCpuTestCount': 230,
               'separateGpuCoverage': 'CompiledRetainedOutputTests CUDA whole-step capture is not part of the mandatory CPU gate.',
               'sha256': checksums,
               'workflowRun': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",

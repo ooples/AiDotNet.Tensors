@@ -58,6 +58,7 @@ public sealed class LazyGraphCompilerPerformanceTests
         public bool ReadsStorageOf(object tensor) => false;
         public int ConsumerCount { get; set; }
         public IEngine RecordingEngine { get; set; } = StubEngine;
+        public bool RecordedUnderNoGrad { get; set; }
 
         public void Realize(IEngine engine) => IsRealized = true;
         public ILazyNode[] GetInputNodes() => _inputs;

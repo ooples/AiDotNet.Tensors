@@ -1,5 +1,21 @@
 namespace AiDotNet.Tensors.Engines.Compilation;
 
+/// <summary>Compiles a single forward dispatch without recursively realizing its producers.</summary>
+internal interface ICompiledForwardNode
+{
+    Action<IEngine> CompileForwardAction();
+    void ProtectDeviceState(HashSet<object> keys);
+    void DetachDeviceBindings(HashSet<DirectGpu.IGpuBuffer> released, HashSet<IntPtr> handles, HashSet<object> retained);
+}
+
+/// <summary>Describes the gradient boundary of a node crossing element types.</summary>
+internal interface ICrossTypeNodeMetadata
+{
+    Type InputElementType { get; }
+    Type OutputElementType { get; }
+    bool HasBackward { get; }
+}
+
 /// <summary>
 /// Type-erased interface for lazy computation nodes. Allows LazyTensorScope
 /// to manage nodes across different element types (float, double, etc.)
@@ -52,6 +68,12 @@ internal interface ILazyNode
     /// </summary>
     IEngine RecordingEngine { get; set; }
 
+    /// <summary>
+    /// Whether the node was recorded inside a <see cref="Autodiff.NoGradScope{T}"/>. Such a node keeps its forward (a
+    /// replay refreshes its value) but carries no backward, so a compiled plan stops gradient at it exactly where the
+    /// eager tape records nothing. A training fusion pass never rewrites it: the fused node would carry a backward.
+    /// </summary>
+    bool RecordedUnderNoGrad { get; set; }
 
     /// <summary>Execute this node, materializing its output tensor's data.</summary>
     void Realize(IEngine engine);
