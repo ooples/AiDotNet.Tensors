@@ -9953,22 +9953,18 @@ internal static partial class BackwardFunctions<T>
             AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorDigamma(inputs[0]), engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
+
         var x = inputs[0];
         var xs = RoIAlignPlan.ToDoubles(x);
-        using var dYLease = gradOutput.Lease();
-        var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
-        using var dXLease = gX.LeaseWritable();
-        var dX = dXLease.Span;
-        for (int i = 0; i < dX.Length; i++)
+        // Evaluate in double precision, then apply the upstream gradient through the engine.
+        for (int i = 0; i < xs.Length; i++)
         {
             double xd = xs[i];
             // Reflection bounds recurrence work even for very large negative arguments.
             // Nonpositive integer poles and negative infinity have no digamma derivative.
             if (double.IsNegativeInfinity(xd) || (xd < 0 && xd == System.Math.Floor(xd)))
             {
-                dX[i] = ops.Multiply(dY[i], ops.FromDouble(double.NaN));
+                xs[i] = double.NaN;
                 continue;
             }
             double shift = 0;
@@ -9983,9 +9979,9 @@ internal static partial class BackwardFunctions<T>
             double series = System.Math.Log(xd) - 0.5 * inv
                 - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0
                     - inv2 * (1.0 / 132.0 - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))));
-            dX[i] = ops.Multiply(dY[i], ops.FromDouble(shift + series));
+            xs[i] = shift + series;
         }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        AccumulateScaled(grads, x, gradOutput, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
     }
 
     /// <summary>Digamma backward: d/dx digamma(x) = trigamma(x).</summary>
@@ -9999,25 +9995,21 @@ internal static partial class BackwardFunctions<T>
             AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorPolygamma(1, inputs[0]), engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
+
         var x = inputs[0];
         var xs = RoIAlignPlan.ToDoubles(x);
-        using var dYLease = gradOutput.Lease();
-        var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
-        using var dXLease = gX.LeaseWritable();
-        var dX = dXLease.Span;
-        for (int i = 0; i < dX.Length; i++)
+        // Evaluate in double precision, then apply the upstream gradient through the engine.
+        for (int i = 0; i < xs.Length; i++)
         {
             double xd = xs[i];
             if (double.IsNegativeInfinity(xd))
             {
-                dX[i] = ops.Multiply(dY[i], ops.FromDouble(double.NaN));
+                xs[i] = double.NaN;
                 continue;
             }
             if (xd <= 0 && xd == System.Math.Floor(xd))
             {
-                dX[i] = ops.Multiply(dY[i], ops.FromDouble(double.PositiveInfinity));
+                xs[i] = double.PositiveInfinity;
                 continue;
             }
             // psi'(x) = pi^2 / sin^2(pi*x) - psi'(1-x), with bounded positive recurrence.
@@ -10036,10 +10028,9 @@ internal static partial class BackwardFunctions<T>
                 + inv2 * inv * (1.0 / 6.0
                   - inv2 * (1.0 / 30.0
                     - inv2 * (1.0 / 42.0)));
-            double derivative = reflected ? reflection - (shift + series) : shift + series;
-            dX[i] = ops.Multiply(dY[i], ops.FromDouble(derivative));
+            xs[i] = reflected ? reflection - (shift + series) : shift + series;
         }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        AccumulateScaled(grads, x, gradOutput, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
     }
 
     /// <summary>I0 backward: d/dx I₀(x) = I₁(x).</summary>

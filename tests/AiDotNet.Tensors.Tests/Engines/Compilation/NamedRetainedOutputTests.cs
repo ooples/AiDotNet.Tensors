@@ -428,7 +428,11 @@ public sealed class NamedRetainedOutputTests : IDisposable
         AiDotNetEngine.Current = engine;
         var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
         using var outputs = RetainedOutputCapture<double>.Begin();
-        using (var tape = new GradientTape<double>())
+        using (var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        }))
         {
             var first = engine.TensorMultiplyScalar(parameter, 2.0);
             GradientRecording.RetainOutput("generation", first);
