@@ -1,0 +1,17 @@
+{
+  "schema": "weightnorm-metal-source-binding-v1",
+  "source_commit": "8ac36f18081bbec724156f3529723282ba603409",
+  "source_archive_pathspec": "src/AiDotNet.Tensors/Engines/DirectGpu",
+  "source_archive_sha256": "83067b7b00545f5423dd5b217b1af687cd902bd7cc54642d9dbf09cfd385b155",
+  "payload_manifest_sha256": "f64c7f97c1adff01ec05d1362ee81030c52707a63ec61d6d959309822468ca11",
+  "assemblies_sha256": {
+    "AiDotNet.Tensors.dll": "9ecb2bca07566a640ea4fd19efe9a352dd04e6140db1c12e2d8fdadd1dff8627",
+    "AiDotNet.Evolution.dll": "e88331586027426352fc8e1f13efa5eb69d645c10e311c5e11fb4a5d6d4bc8e3"
+  },
+  "payloads": {
+    "batch.metal": {"sha256": "02ebbd045e83f9f05ac0e44d95059768998d4ed54818839ec7f6f468b51fbebf", "bytes": 92254, "strict": true},
+    "convt.metal": {"sha256": "d7f05f4bb1091656e5da660ced9bd44be8683e816b9f51f1b676c831dc2dd0d0", "bytes": 1928, "strict": false}
+  },
+  "origin": "perf2561/finish-weightnorm-backend-compilers-8ac36f18-attempt4",
+  "claim": "Compile exact complete exported libraries with Apple's Metal compiler. No GPU runtime or performance claim."
+}

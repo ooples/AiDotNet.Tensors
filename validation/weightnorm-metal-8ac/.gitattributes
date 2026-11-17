@@ -1,0 +1,4 @@
+*.py text eol=lf
+*.json text eol=lf
+*.metal -text
+payload-manifest.json -text
