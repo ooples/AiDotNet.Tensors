@@ -40,8 +40,8 @@ public partial class CpuEngine
                 Mc = 96, Nc = 256, Kc = 256,
                 BetaZero = true,
             };
-            var panel = ArrayPool<float>.Shared.Rent(panelFloats);
-            var product = accumulate ? ArrayPool<float>.Shared.Rent(checked(outChannels * columns)) : null;
+            var panel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(panelFloats, "workspace.conv1d_panel");
+            var product = accumulate ? CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(outChannels * columns), "workspace.conv1d_product") : null;
             try
             {
                 for (int block = worker; block < blocks; block += workers)
@@ -118,7 +118,7 @@ public partial class CpuEngine
         var d = destination.GetCpuBackingForContiguousWrite(out int dOffset);
         if (g is null || k is null || d is null) return false;
 
-        var flipped = ArrayPool<float>.Shared.Rent(checked(inChannels * outChannels * kernelWidth));
+        var flipped = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(inChannels * outChannels * kernelWidth), "workspace.conv1d_flipped");
         try
         {
             CpuParallelSettings.ParallelForOrSerial(0, inChannels, (long)inChannels * outChannels * kernelWidth, ic =>
