@@ -1,5 +1,6 @@
 using System.IO;
 using System.Text;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -26,14 +27,21 @@ internal static class TrainingPlanReader
         public readonly int[] InputIds;
         public readonly int OutputId;
         public readonly object[]? SavedState;
+        public readonly bool RecordedUnderNoGrad;
+        public readonly bool HasBackward;
+        public readonly int[]? DifferentiableInputIndices;
 
-        public RawOp(OpType opType, string opName, int[] inputIds, int outputId, object[]? savedState)
+        public RawOp(OpType opType, string opName, int[] inputIds, int outputId, object[]? savedState,
+            bool recordedUnderNoGrad, bool hasBackward, int[]? differentiableInputIndices)
         {
             OpType = opType;
             OpName = opName;
             InputIds = inputIds;
             OutputId = outputId;
             SavedState = savedState;
+            RecordedUnderNoGrad = recordedUnderNoGrad;
+            HasBackward = hasBackward;
+            DifferentiableInputIndices = differentiableInputIndices;
         }
     }
 
@@ -125,6 +133,7 @@ internal static class TrainingPlanReader
         if (savedStepCount != stepCount)
             throw new InvalidDataException(
                 $"Training plan step count mismatch: header says {stepCount}, op section says {savedStepCount}.");
+        RequireWithinStream(bodyStream, (long)savedStepCount * PlanFormatConstants.MinTrainingStepDescriptorBytes, nameof(savedStepCount));
         var rawOps = new RawOp[savedStepCount];
         for (int i = 0; i < savedStepCount; i++)
             rawOps[i] = ReadRawOp<T>(reader, tensorTable, bodyStream);
@@ -140,6 +149,7 @@ internal static class TrainingPlanReader
         // The forward graph MUST reference the caller's parameter objects
         // so the training compiler can find them during gradient analysis
         // and backward closures accumulate into the right buffers.
+        var parameterIds = new HashSet<int>();
         for (int i = 0; i < paramCount; i++)
         {
             int paramTensorId = reader.ReadInt32();
@@ -147,21 +157,33 @@ internal static class TrainingPlanReader
                 throw new InvalidDataException(
                     $"Training plan parameter {i} references tensor ID {paramTensorId} " +
                     $"out of range [0, {tensorTable.Length}). The file is corrupt.");
+            if (!parameterIds.Add(paramTensorId))
+                throw new InvalidDataException($"Training plan parameter {i} repeats tensor ID {paramTensorId}.");
             tensorTable[paramTensorId] = callerParameters[i];
         }
 
-        // ── Gradient buffer shapes (skip — the compiler allocates its own) ─
+        // Gradient buffers are reconstructed, but their metadata must describe these canonical parameters.
         int gradCount = reader.ReadInt32();
         RequireNonNegative(gradCount, nameof(gradCount));
+        if (gradCount != paramCount)
+            throw new InvalidDataException($"Gradient count mismatch: file has {gradCount}, expected {paramCount}.");
         for (int i = 0; i < gradCount; i++)
         {
             int gradRank = reader.ReadInt32();
             RequireNonNegative(gradRank, nameof(gradRank));
             RequireWithinStream(bodyStream, (long)gradRank * sizeof(int), nameof(gradRank));
-            for (int d = 0; d < gradRank; d++) reader.ReadInt32();
+            if (gradRank != callerParameters[i].Rank)
+                throw new InvalidDataException($"Gradient {i} rank does not match its parameter.");
+            for (int d = 0; d < gradRank; d++)
+                if (reader.ReadInt32() != callerParameters[i]._shape[d])
+                    throw new InvalidDataException($"Gradient {i} shape does not match its parameter.");
         }
 
-        var optimizerCheckpoint = FusedOptimizerCheckpointSerializer.Read(reader);
+        var expectedParamLengths = new int[paramCount];
+        for (int i = 0; i < paramCount; i++) expectedParamLengths[i] = callerParameters[i].Length;
+        var optimizerCheckpoint = FusedOptimizerCheckpointSerializer.Read(reader, expectedParameterLengths: expectedParamLengths);
+        if (optimizerCheckpoint is not null && optimizerCheckpoint.Parameters.Length != paramCount)
+            throw new InvalidDataException("Optimizer parameter-state count does not match the canonical parameter count.");
 
         // ── Phase 2: Replay forward ops through engine under GraphMode ──
         // Each engine call under GraphMode returns a NEW lazy tensor. We must
@@ -212,6 +234,24 @@ internal static class TrainingPlanReader
                     inputs[j] = inputTensor;
                 }
 
+                // Each omitted operand occurrence gets its own forward identity with a permanent gradient stop.
+                // Tensor-key filtering would be wrong for Multiply(p, p) when only one occurrence carries gradient,
+                // or when the omitted operand's producer also feeds a live branch elsewhere in the graph.
+                if (op.HasBackward && op.DifferentiableInputIndices is { } derivativeInputs)
+                {
+                    int derivative = 0;
+                    for (int j = 0; j < inputs.Length; j++)
+                    {
+                        if (derivative < derivativeInputs.Length && derivativeInputs[derivative] == j)
+                        {
+                            derivative++;
+                            continue;
+                        }
+                        if (inputs[j].LazySource is not LazyNode<T> { OpName: "StopGradient", BackwardFn: null, WritesInPlace: false })
+                            inputs[j] = engine.StopGradient(inputs[j]);
+                    }
+                }
+
                 if ((uint)op.OutputId >= (uint)liveTensors.Length)
                 {
                     throw new InvalidDataException(
@@ -219,8 +259,12 @@ internal static class TrainingPlanReader
                         $"which is out of range [0, {liveTensors.Length}). The plan file is corrupt.");
                 }
 
-                var output = OpReplay.ReplayThroughEngine(
-                    engine, op.OpType, op.OpName, inputs, op.SavedState, tensorTable[op.OutputId]._shape);
+                Tensor<T>? output;
+                // Rebuild the operation's own derivative only when the saved graph carried it. A permanent
+                // gradient stop and a no-grad in-place write remain distinct through the metadata below.
+                using (op.HasBackward && !op.RecordedUnderNoGrad ? null : new NoGradScope<T>())
+                    output = OpReplay.ReplayThroughEngine(
+                        engine, op.OpType, op.OpName, inputs, op.SavedState, tensorTable[op.OutputId]._shape);
                 if (output is null)
                 {
                     // ReplayThroughEngine returned null because this runtime
@@ -234,6 +278,19 @@ internal static class TrainingPlanReader
                         "Re-compile from source instead of loading this plan.");
                 }
 
+                if (output.LazySource is not LazyNode<T> restoredNode)
+                    throw new InvalidDataException($"Training plan op {i} ('{op.OpName}') did not record a typed operation.");
+                bool noGradIdentity = op.RecordedUnderNoGrad && restoredNode.WritesInPlace && restoredNode.PriorWriter is not null;
+                if (op.HasBackward && restoredNode.BackwardFn is null && !noGradIdentity)
+                    throw new InvalidDataException($"Training plan op {i} ('{op.OpName}') cannot restore its backward function.");
+                restoredNode.RecordedUnderNoGrad = op.RecordedUnderNoGrad;
+                var restoredInputs = restoredNode.GetInputsArray();
+                // A registered composite (for example FusedLinear) can expand to several native nodes. Its final
+                // node has different input positions; the operand stops above already preserve the original edges.
+                if (restoredInputs.Length == inputs.Length
+                    && restoredInputs.Zip(inputs, ReferenceEquals).All(equal => equal))
+                    restoredNode.SetDifferentiableInputIndices(op.DifferentiableInputIndices);
+
                 liveTensors[op.OutputId] = output;
             }
 
@@ -241,10 +298,21 @@ internal static class TrainingPlanReader
             if (optimizerCheckpoint is not null)
             {
                 if (plan is not CompiledTrainingPlan<T> concrete)
+                {
+                    plan.Dispose();
                     throw new InvalidDataException(
                         "Training plan loader produced an unknown ICompiledTrainingPlan implementation; " +
                         "cannot restore fused optimizer checkpoint state.");
-                concrete.RestoreFusedOptimizerCheckpoint(optimizerCheckpoint);
+                }
+                try
+                {
+                    concrete.RestoreFusedOptimizerCheckpoint(optimizerCheckpoint);
+                }
+                catch
+                {
+                    concrete.Dispose();
+                    throw;
+                }
             }
             return plan;
         }
@@ -262,6 +330,19 @@ internal static class TrainingPlanReader
             throw new InvalidDataException(
                 $"Training plan op name was truncated: expected {nameLen} bytes, got {nameBytes.Length}.");
         string opName = Encoding.UTF8.GetString(nameBytes);
+        byte gradientFlags = reader.ReadByte();
+        if ((gradientFlags & ~PlanFormatConstants.OpGradientFlagsMask) != 0)
+            throw new InvalidDataException($"Training plan op '{opName}' has invalid gradient flags {gradientFlags}.");
+        int derivativeCount = reader.ReadInt32();
+        if (derivativeCount < -1)
+            throw new InvalidDataException($"Training plan op '{opName}' has invalid derivative input count {derivativeCount}.");
+        int[]? differentiableInputs = null;
+        if (derivativeCount >= 0)
+        {
+            RequireWithinStream(bodyStream, (long)derivativeCount * sizeof(int), nameof(derivativeCount));
+            differentiableInputs = new int[derivativeCount];
+            for (int i = 0; i < derivativeCount; i++) differentiableInputs[i] = reader.ReadInt32();
+        }
         // A plan written before this runtime knew the op stored OpType.Unknown; its name still identifies it.
         if (opType == OpType.Unknown)
             opType = OpTypeParser.Parse(opName);
@@ -272,8 +353,27 @@ internal static class TrainingPlanReader
         var inputIds = new int[inputCount];
         for (int j = 0; j < inputCount; j++)
             inputIds[j] = reader.ReadInt32();
+        if (differentiableInputs is not null)
+        {
+            int previous = -1;
+            foreach (int index in differentiableInputs)
+            {
+                if (index <= previous || index >= inputCount)
+                    throw new InvalidDataException($"Training plan op '{opName}' has unsorted, repeated or out-of-range derivative inputs.");
+                previous = index;
+            }
+        }
 
         int outputId = reader.ReadInt32();
+        if (opType == OpType.TensorAddInPlace)
+        {
+            if (inputCount != 2 || outputId != inputIds[0])
+                throw new InvalidDataException("TensorAddInPlace must write to its first of exactly two inputs.");
+            // The target is an alias, not a replaceable operand. Wrapping it in StopGradient would mutate a copy
+            // and change the forward. RecordInPlace does not declare a target-detaching partial-edge contract.
+            if (differentiableInputs is not null && (differentiableInputs.Length == 0 || differentiableInputs[0] != 0))
+                throw new InvalidDataException("TensorAddInPlace derivative metadata cannot exclude its mutation target.");
+        }
 
         // SavedState must be read now (it's in-stream), but tensor refs
         // inside it may point to pre-substitution tensor table entries.
@@ -282,7 +382,10 @@ internal static class TrainingPlanReader
         // that the compiler produces fresh during re-compilation.
         var savedState = SavedStateSerializer.Read<T>(reader, tensorTable);
 
-        return new RawOp(opType, opName, inputIds, outputId, savedState);
+        return new RawOp(opType, opName, inputIds, outputId, savedState,
+            recordedUnderNoGrad: (gradientFlags & PlanFormatConstants.OpGradientFlagRecordedUnderNoGrad) != 0,
+            hasBackward: (gradientFlags & PlanFormatConstants.OpGradientFlagHasBackward) != 0,
+            differentiableInputIndices: differentiableInputs);
     }
 
     // ── Validation helpers ──────────────────────────────────────────────

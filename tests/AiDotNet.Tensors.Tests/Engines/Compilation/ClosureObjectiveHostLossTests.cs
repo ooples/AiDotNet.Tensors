@@ -59,6 +59,22 @@ public class ClosureObjectiveHostLossTests
         return (guard, reason);
     }
 
+    private static (ClosureObjectiveGuard<float>? guard, string? reason) CompileRejectedHostLoss(
+        Func<Tensor<float>> objective, Tensor<float>[] parameters)
+    {
+        using var recording = ClosureObjectiveGuard<float>.BeginRecording();
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var loss = objective();
+            // A tape callback cannot supply the missing lazy producer required for compiled replay.
+            var error = Assert.Throws<ArgumentException>(() => scope.CompileTraining(parameters, loss));
+            Assert.Equal("explicitLoss", error.ParamName);
+            Assert.Contains("The explicit loss must be produced by an operation recorded in this training scope.", error.Message);
+        }
+        var guard = ClosureObjectiveGuard<float>.TakeRecorded(out var reason);
+        return (guard, reason);
+    }
+
     [Fact]
     public void Host_loss_with_a_recorded_backward_records_no_guard()
     {
@@ -68,7 +84,7 @@ public class ClosureObjectiveHostLossTests
         var parameters = new[] { w };
 
         // No tape: the custom backward is not even recorded. The read of the traced product is the first refusal.
-        var (guard, reason) = CompileGuarded(() => HostLoss(engine, x, w), parameters);
+        var (guard, reason) = CompileRejectedHostLoss(() => HostLoss(engine, x, w), parameters);
         _out.WriteLine(reason);
         Assert.Null(guard);
         Assert.Contains("reads 'TensorMatMul' on the host while it is traced", reason);
@@ -76,7 +92,7 @@ public class ClosureObjectiveHostLossTests
         // Under a tape (an eager training step around the trace): the custom record itself is named.
         using (new GradientTape<float>())
         {
-            (guard, reason) = CompileGuarded(() => HostLoss(engine, x, w), parameters);
+            (guard, reason) = CompileRejectedHostLoss(() => HostLoss(engine, x, w), parameters);
             _out.WriteLine(reason);
             Assert.Null(guard);
             Assert.Contains("records 'HostSquaredSum' on the gradient tape", reason);

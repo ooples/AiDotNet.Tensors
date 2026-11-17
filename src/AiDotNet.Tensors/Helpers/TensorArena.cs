@@ -489,15 +489,48 @@ public sealed class TensorArena : IDisposable
     // Every backing array an arena has issued, for as long as the array lives. An arena array outlives the step that
     // rented it: Reset hands it to the next rent of this arena, and Dispose hands it to the cross-arena persistent pool
     // and so to a later arena. Anything that recycles tensors on its own terms (TensorPool) must therefore never keep
-    // one, or the same buffer ends up behind two live tensors. Weak keys, so tracking never extends an array's life.
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Array, object> s_issuedArrays = new();
-    private static readonly object s_issuedMarker = new();
+    // one, or the same buffer ends up behind two live tensors. Weak keys and weak arena targets never extend life.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Array, IssuedOwnerChain> s_issuedArrays = new();
 
-    private static void MarkIssued(Array array)
+    private sealed class IssuedOwnerChain
     {
-        if (!s_issuedArrays.TryGetValue(array, out _))
-            s_issuedArrays.Add(array, s_issuedMarker);
+        private readonly object _gate = new();
+        private readonly List<WeakReference<TensorArena>> _owners = new(1);
+
+        internal void Record(TensorArena arena)
+        {
+            lock (_gate)
+            {
+                for (int i = _owners.Count - 1; i >= 0; i--)
+                {
+                    if (!_owners[i].TryGetTarget(out var existing) || existing._disposed)
+                        _owners.RemoveAt(i);
+                    else if (ReferenceEquals(existing, arena))
+                        return;
+                }
+                _owners.Add(new WeakReference<TensorArena>(arena));
+            }
+        }
+
+        internal TensorArena[] SnapshotLive()
+        {
+            lock (_gate)
+            {
+                var live = new List<TensorArena>(_owners.Count);
+                for (int i = _owners.Count - 1; i >= 0; i--)
+                {
+                    if (!_owners[i].TryGetTarget(out var existing) || existing._disposed)
+                        _owners.RemoveAt(i);
+                    else
+                        live.Add(existing);
+                }
+                return live.ToArray();
+            }
+        }
     }
+
+    private void MarkIssued(Array array)
+        => s_issuedArrays.GetValue(array, static _ => new IssuedOwnerChain()).Record(this);
 
     /// <summary>True when <paramref name="array"/> was issued by an arena, which may reissue it.</summary>
     internal static bool IsArenaIssued(Array array) => s_issuedArrays.TryGetValue(array, out _);
@@ -556,9 +589,12 @@ public sealed class TensorArena : IDisposable
     /// dispose or reset this arena — pair with <see cref="Reset"/> between iterations to reuse its
     /// buffers. Only valid on a detached arena (one the caller owns across iterations).
     /// </summary>
+    private TensorArena? _activationPredecessor;
+
     public ActivationScope Activate()
     {
         var saved = _current;
+        _activationPredecessor = saved;
         _current = this;
         return new ActivationScope(this, saved);
     }
@@ -591,7 +627,10 @@ public sealed class TensorArena : IDisposable
             // Only unwind if we are still the innermost activation; a nested scope activated
             // after us owns _current until it disposes.
             if (ReferenceEquals(_current, _activated))
+            {
+                _activated._activationPredecessor = null;
                 _current = _saved;
+            }
         }
     }
 
@@ -691,12 +730,52 @@ public sealed class TensorArena : IDisposable
     /// state remains stable for the arena's lifetime.
     /// </remarks>
     internal void PinExistingTensor<T>(LinearAlgebra.Tensor<T> tensor)
+        => ExtractExistingTensor(tensor, keepPinned: true);
+
+    // A named result belongs to its consumer, beyond both tape and caller-arena disposal. Transfer its existing
+    // storage, without a host copy: no arena may reshape an alias or return this array to a reuse pool. Unlike
+    // persistent model state, the arena must not strongly pin each generation until a long caller scope ends.
+    internal static void TransferOutputOwnership<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        if (tensor is null) return;
+        HashSet<TensorArena>? visited = null;
+        if (_current is not null)
+        {
+            visited = new HashSet<TensorArena>();
+            var pending = new Stack<TensorArena>();
+            pending.Push(_current);
+            while (pending.Count > 0)
+            {
+                var arena = pending.Pop();
+                if (!visited.Add(arena)) continue;
+                arena.ExtractExistingTensor(tensor, keepPinned: false);
+                if (arena._previous is { } prev) pending.Push(prev);
+                if (arena._activationPredecessor is { } saved) pending.Push(saved);
+            }
+        }
+        if (((LinearAlgebra.IBackingArraySource)tensor).TryGetBackingArray(out var backing)
+            && backing is not null
+            && s_issuedArrays.TryGetValue(backing, out var chain))
+        {
+            foreach (var owner in chain.SnapshotLive())
+            {
+                if (visited is not null && !visited.Add(owner)) continue;
+                owner.ExtractExistingTensor(tensor, keepPinned: false);
+            }
+        }
+    }
+
+    private System.Runtime.CompilerServices.ConditionalWeakTable<Array, object>? _callerOwnedArrays;
+    private static readonly object CallerOwnedMarker = new();
+
+    private void ExtractExistingTensor<T>(LinearAlgebra.Tensor<T> tensor, bool keepPinned)
     {
         if (_disposed || tensor is null)
             return;
 
-        T[]? backing = tensor.GetLiveBackingArrayOrNull();
-        if (backing is null)
+        // Ownership concerns the whole storage slab, not this view's logical offset/strides/length.
+        // This identity lookup neither realizes deferred values nor reads stale device-backed data.
+        if (!((LinearAlgebra.IBackingArraySource)tensor).TryGetBackingArray(out var backing) || backing is null)
             return;
 
         bool ownedByArena = false;
@@ -707,17 +786,17 @@ public sealed class TensorArena : IDisposable
             {
                 if (_tensorRing[bucketIndex] is not List<object> bucket)
                     continue;
-
-                for (int itemIndex = 0; itemIndex < bucket.Count; itemIndex++)
+                for (int itemIndex = bucket.Count - 1; itemIndex >= 0; itemIndex--)
                 {
-                    if (!ReferenceEquals(bucket[itemIndex], tensor))
+                    // StopGradient and shape views can share a ring tensor's storage. Removing only the named
+                    // wrapper would leave its producer alias available for reshaping and overwriting on reset.
+                    if (bucket[itemIndex] is not LinearAlgebra.IBackingArraySource alias
+                        || !alias.TryGetBackingArray(out var aliasBacking) || !ReferenceEquals(aliasBacking, backing))
                         continue;
-
                     bucket.RemoveAt(itemIndex);
                     if (_tensorRingCursors![bucketIndex] > itemIndex)
                         _tensorRingCursors[bucketIndex]--;
                     ownedByArena = true;
-                    break;
                 }
             }
         }
@@ -757,6 +836,25 @@ public sealed class TensorArena : IDisposable
                 ownedByArena = true;
             }
         }
+        if (_pendingCarryReturn is { } carry && ReferenceEquals(carry.arr, backing))
+        {
+            _pendingCarryReturn = null;
+            ownedByArena = true;
+        }
+        if (!keepPinned)
+        {
+            for (int i = _pinnedArrays.Count - 1; i >= 0; i--)
+                if (ReferenceEquals(_pinnedArrays[i], backing))
+                {
+                    _pinnedArrays.RemoveAt(i);
+                    ownedByArena = true;
+                }
+            if (ownedByArena)
+                (_callerOwnedArrays ??= new System.Runtime.CompilerServices.ConditionalWeakTable<Array, object>())
+                    .GetValue(backing, _ => CallerOwnedMarker);
+            return;
+        }
+
 
         if (!ownedByArena)
             return;
@@ -966,7 +1064,7 @@ public sealed class TensorArena : IDisposable
         if (_disposed) return;
         // A buffer pinned since it was issued belongs to the model now (PinExistingTensor), however dead the step's
         // last use of it looked.
-        if (IsPinned(buffer.Array)) return;
+        if (IsPinned(buffer.Array) || (_callerOwnedArrays?.TryGetValue(buffer.Array, out _) ?? false)) return;
         var key = (buffer.Array.GetType().GetElementType()!, buffer.Array.Length);
         _poolFree ??= new Dictionary<(Type, int), Stack<Array>>();
         if (!_poolFree.TryGetValue(key, out var arrays))

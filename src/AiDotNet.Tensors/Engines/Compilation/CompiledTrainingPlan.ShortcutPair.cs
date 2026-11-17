@@ -29,7 +29,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         // Kind 3: a 3x3/s2/p1/d1 step; kind 1: a 1x1/s2/p0/d1 step; 0 otherwise.
         int Kind(CompiledStep<T> s)
         {
-            if (s.OpType != OpType.Conv2D || s.Inputs.Length != 2 || s.BackwardFn?.Method != conv2DBackward
+            if (s.OpType != OpType.Conv2D || s.Inputs.Length != 2 || !HasCanonicalDerivative(s) || s.BackwardFn?.Method != conv2DBackward
                 || s.SavedState is not { Length: >= 3 } st || st[0] is not int[] stride || st[1] is not int[] pad
                 || st[2] is not int[] dil || stride.Length != 2 || pad.Length != 2 || dil.Length != 2
                 || stride[0] != 2 || stride[1] != 2 || dil[0] != 1 || dil[1] != 1 || s.Inputs[1].Rank != 4)
