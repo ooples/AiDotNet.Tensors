@@ -612,6 +612,87 @@ public sealed class CompiledEnrollmentCheckpointTests
         => bytes.Length - (ParameterPayloadBytes(checkpoint)
             + sizeof(int) + Assert.IsType<bool[]>(checkpoint.FixedActiveDomain).Length + sizeof(int) + sizeof(byte));
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void Canonical_parameter_length_bypasses_only_the_non_seekable_byte_budget(int bytesPerElement)
+    {
+        // Exercise length validation itself: the stream holds four bytes and no large array is allocated.
+        const int budgetBytes = 256 * 1024 * 1024;
+        int boundaryLength = budgetBytes / bytesPerElement;
+        int oversizedLength = boundaryLength + 1;
+        var method = typeof(FusedOptimizerCheckpointSerializer).GetMethod(
+            "ReadArrayLength", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var readLength = (Func<BinaryReader, string, int, int, bool, int>)method.CreateDelegate(
+            typeof(Func<BinaryReader, string, int, int, bool, int>));
+
+        int ReadPrefix(int length, int maximum, bool canonical, bool seekable = false)
+        {
+            using Stream stream = seekable
+                ? new MemoryStream(BitConverter.GetBytes(length))
+                : new NonSeekableReadStream(BitConverter.GetBytes(length));
+            using var reader = new BinaryReader(stream);
+            return readLength(reader, "test parameter array", bytesPerElement, maximum, canonical);
+        }
+
+        Assert.Equal(boundaryLength, ReadPrefix(boundaryLength, boundaryLength, canonical: false));
+        Assert.Equal(oversizedLength, ReadPrefix(oversizedLength, oversizedLength, canonical: true));
+        Assert.Contains("non-seekable budget",
+            Assert.Throws<InvalidDataException>(() => ReadPrefix(
+                oversizedLength, oversizedLength, canonical: false)).Message);
+        // A plan-supplied maximum is insufficient if the serialized length does not equal it.
+        Assert.Contains("non-seekable budget",
+            Assert.Throws<InvalidDataException>(() => ReadPrefix(
+                oversizedLength, oversizedLength + 1, canonical: true)).Message);
+        Assert.Contains("exceeds maximum",
+            Assert.Throws<InvalidDataException>(() => ReadPrefix(
+                oversizedLength, oversizedLength - 1, canonical: true)).Message);
+        Assert.Contains("remain",
+            Assert.Throws<InvalidDataException>(() => ReadPrefix(
+                oversizedLength, oversizedLength, canonical: true, seekable: true)).Message);
+    }
+
+    [Fact]
+    public void Non_seekable_serializer_roundtrip_preserves_canonical_parameter_arrays()
+    {
+        var checkpoint = new FusedOptimizerCheckpoint
+        {
+            OptimizerType = OptimizerType.AdamW,
+            OptimizerStep = 2,
+            Parameters = new[]
+            {
+                new FusedOptimizerParameterCheckpoint
+                {
+                    AcceptedUpdates = 2,
+                    MFloat = new[] { 1f, 2f, 3f }, VFloat = new[] { 4f, 5f, 6f },
+                },
+                new FusedOptimizerParameterCheckpoint
+                {
+                    AcceptedUpdates = 1,
+                    MDouble = new[] { 1.25, 2.5, 3.75 }, VDouble = new[] { 4.25, 5.5, 6.75 },
+                },
+                new FusedOptimizerParameterCheckpoint
+                {
+                    MBFloat16 = new ushort[] { 1, 2, 3 }, VBFloat16 = new ushort[] { 4, 5, 6 },
+                },
+                new FusedOptimizerParameterCheckpoint
+                {
+                    MQuantized = new byte[] { 1, 2, 3 }, VQuantized = new byte[] { 4, 5, 6 },
+                    MScales = new[] { 0.125 }, VScales = new[] { 0.25 },
+                },
+            },
+        };
+        byte[] serialized = Serialize(checkpoint);
+        using var stream = new NonSeekableReadStream(serialized);
+        using var reader = new BinaryReader(stream);
+        var restored = Assert.IsType<FusedOptimizerCheckpoint>(FusedOptimizerCheckpointSerializer.Read(
+            reader, expectedParameterLengths: new[] { 3, 3, 3, 3 }));
+        Assert.Equal(serialized, Serialize(restored));
+    }
+
+
     [Fact]
     public void Non_seekable_checkpoint_stream_rejects_oversized_counts_before_allocation()
     {

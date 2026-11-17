@@ -432,21 +432,22 @@ internal static class FusedOptimizerCheckpointSerializer
         int maxDoubleElems = expectedParameterLength ?? (int)(MaxUntrustedParameterBufferBytes / sizeof(double));
         int maxUShortElems = expectedParameterLength ?? (int)(MaxUntrustedParameterBufferBytes / sizeof(ushort));
         int maxByteElems = expectedParameterLength ?? (int)MaxUntrustedParameterBufferBytes;
+        bool hasCanonicalParameterLength = expectedParameterLength.HasValue;
         return new FusedOptimizerParameterCheckpoint
         {
             AcceptedUpdates = hasEnrollmentMetadata ? reader.ReadInt64() : defaultAcceptedUpdates,
-            MFloat = ReadFloatArray(reader, maxFloatElems),
-            VFloat = ReadFloatArray(reader, maxFloatElems),
-            VMaxFloat = ReadFloatArray(reader, maxFloatElems),
-            MDouble = ReadDoubleArray(reader, maxDoubleElems),
-            VDouble = ReadDoubleArray(reader, maxDoubleElems),
-            VMaxDouble = ReadDoubleArray(reader, maxDoubleElems),
-            MBFloat16 = ReadUShortArray(reader, maxUShortElems),
-            VBFloat16 = ReadUShortArray(reader, maxUShortElems),
-            MQuantized = ReadByteArray(reader, maxByteElems),
-            VQuantized = ReadByteArray(reader, maxByteElems),
-            MScales = ReadDoubleArray(reader, maxDoubleElems),
-            VScales = ReadDoubleArray(reader, maxDoubleElems),
+            MFloat = ReadFloatArray(reader, maxFloatElems, hasCanonicalParameterLength),
+            VFloat = ReadFloatArray(reader, maxFloatElems, hasCanonicalParameterLength),
+            VMaxFloat = ReadFloatArray(reader, maxFloatElems, hasCanonicalParameterLength),
+            MDouble = ReadDoubleArray(reader, maxDoubleElems, hasCanonicalParameterLength),
+            VDouble = ReadDoubleArray(reader, maxDoubleElems, hasCanonicalParameterLength),
+            VMaxDouble = ReadDoubleArray(reader, maxDoubleElems, hasCanonicalParameterLength),
+            MBFloat16 = ReadUShortArray(reader, maxUShortElems, hasCanonicalParameterLength),
+            VBFloat16 = ReadUShortArray(reader, maxUShortElems, hasCanonicalParameterLength),
+            MQuantized = ReadByteArray(reader, maxByteElems, hasCanonicalParameterLength),
+            VQuantized = ReadByteArray(reader, maxByteElems, hasCanonicalParameterLength),
+            MScales = ReadDoubleArray(reader, maxDoubleElems, hasCanonicalParameterLength),
+            VScales = ReadDoubleArray(reader, maxDoubleElems, hasCanonicalParameterLength),
         };
     }
 
@@ -457,9 +458,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write(values[i]);
     }
 
-    private static float[]? ReadFloatArray(BinaryReader reader, int maxElements)
+    private static float[]? ReadFloatArray(BinaryReader reader, int maxElements, bool hasCanonicalParameterLength = false)
     {
-        int length = ReadArrayLength(reader, "float[]", sizeof(float), maxElements);
+        int length = ReadArrayLength(reader, "float[]", sizeof(float), maxElements, hasCanonicalParameterLength);
         if (length < 0) return null;
         var values = new float[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadSingle();
@@ -473,9 +474,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write(values[i]);
     }
 
-    private static double[]? ReadDoubleArray(BinaryReader reader, int maxElements)
+    private static double[]? ReadDoubleArray(BinaryReader reader, int maxElements, bool hasCanonicalParameterLength = false)
     {
-        int length = ReadArrayLength(reader, "double[]", sizeof(double), maxElements);
+        int length = ReadArrayLength(reader, "double[]", sizeof(double), maxElements, hasCanonicalParameterLength);
         if (length < 0) return null;
         var values = new double[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadDouble();
@@ -521,9 +522,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write(values[i]);
     }
 
-    private static ushort[]? ReadUShortArray(BinaryReader reader, int maxElements)
+    private static ushort[]? ReadUShortArray(BinaryReader reader, int maxElements, bool hasCanonicalParameterLength = false)
     {
-        int length = ReadArrayLength(reader, "ushort[]", sizeof(ushort), maxElements);
+        int length = ReadArrayLength(reader, "ushort[]", sizeof(ushort), maxElements, hasCanonicalParameterLength);
         if (length < 0) return null;
         var values = new ushort[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadUInt16();
@@ -537,9 +538,9 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(values);
     }
 
-    private static byte[]? ReadByteArray(BinaryReader reader, int maxElements)
+    private static byte[]? ReadByteArray(BinaryReader reader, int maxElements, bool hasCanonicalParameterLength = false)
     {
-        int length = ReadArrayLength(reader, "byte[]", 1, maxElements);
+        int length = ReadArrayLength(reader, "byte[]", 1, maxElements, hasCanonicalParameterLength);
         if (length < 0) return null;
         var values = reader.ReadBytes(length);
         if (values.Length != length)
@@ -548,7 +549,7 @@ internal static class FusedOptimizerCheckpointSerializer
         return values;
     }
 
-    private static int ReadArrayLength(BinaryReader reader, string field, int bytesPerElement, int maxElements)
+    private static int ReadArrayLength(BinaryReader reader, string field, int bytesPerElement, int maxElements, bool hasCanonicalParameterLength = false)
     {
         int length = reader.ReadInt32();
         if (length < -1)
@@ -557,7 +558,11 @@ internal static class FusedOptimizerCheckpointSerializer
             throw new InvalidDataException(
                 $"Fused optimizer {field} length {length} exceeds maximum allowed {maxElements}.");
         if (length > 0)
-            EnsureFitsBudget(reader, (long)length * bytesPerElement, MaxUntrustedParameterBufferBytes, field);
+        {
+            // Only an exact match to a plan-owned length is trusted; a maximum alone is not provenance.
+            EnsureFitsBudget(reader, (long)length * bytesPerElement, MaxUntrustedParameterBufferBytes, field,
+                hasCanonicalParameterLength && length == maxElements);
+        }
         return length;
     }
 
@@ -565,12 +570,12 @@ internal static class FusedOptimizerCheckpointSerializer
     /// Guards against a corrupt/truncated checkpoint claiming an element count whose payload exceeds
     /// either the remaining seekable stream bytes or the non-seekable allocation budget.
     /// </summary>
-    private static void EnsureFitsBudget(BinaryReader reader, long requiredBytes, long nonSeekableBudgetBytes, string field)
+    private static void EnsureFitsBudget(BinaryReader reader, long requiredBytes, long nonSeekableBudgetBytes, string field, bool canonicalParameterLength = false)
     {
         var stream = reader.BaseStream;
         if (!stream.CanSeek)
         {
-            if (requiredBytes > nonSeekableBudgetBytes)
+            if (!canonicalParameterLength && requiredBytes > nonSeekableBudgetBytes)
                 throw new InvalidDataException(
                     $"Fused optimizer {field} claims {requiredBytes} byte(s), exceeding the non-seekable budget of {nonSeekableBudgetBytes} byte(s).");
             return;
