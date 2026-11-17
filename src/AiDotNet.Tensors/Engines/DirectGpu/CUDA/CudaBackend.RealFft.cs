@@ -74,6 +74,7 @@ public sealed partial class CudaBackend
             CuFftNative.Check(plan.Inverse
                 ? CuFftNative.ExecC2C(plan.Handle, input.Handle, output.Handle, 1)
                 : CuFftNative.ExecR2C(plan.Handle, input.Handle, output.Handle), plan.Inverse ? "cufftExecC2C" : "cufftExecR2C");
+            GpuLaunchProbe.OnLaunch(); // One successful native vendor dispatch, not its internal kernel count.
             RealFftExecutions++;
         }
     }
