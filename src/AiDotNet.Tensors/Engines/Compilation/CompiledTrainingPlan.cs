@@ -14115,6 +14115,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+        // Partial reductions broadcast their upstream gradient directly into the existing accumulator. Resolve this
+        // before the sole-writer/zero-offset guards: the writer handles accumulation and actual storage offsets.
+        var reducedBackward = BuildCpuReducedGradientBackward(step, gradMap, gradWriterCount ?? consumerCount, engine);
+        if (reducedBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return reducedBackward;
+        }
+
 
         // Every unary specialization below WRITES its input's gradient (CopyTo, or Array.Clear then fill) rather
         // than accumulating into it. That is only correct when this step is the input's sole consumer. With more
