@@ -48,9 +48,10 @@ internal static class BufferAllocationDiagnostics
                 ["scope"] = "Successful backend buffer requests including framework workspaces and pool hits; excludes views and delegated duplicate calls.",
                 ["backends"] = backends,
             },
+            ["cpu_storage_requested"] = Helpers.CpuStorageAllocationDiagnostics.Snapshot(),
             // Explicitly unknown: these categories cannot be inferred from buffer requests or GC object bytes.
-            ["cpu_tensor_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
-            ["gpu_tensor_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified_tensor_vs_workspace_scope" },
+            ["cpu_framework_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
+            ["gpu_framework_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified_api_coverage" },
             ["cpu_backing"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
             ["gpu_backing"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
         };
