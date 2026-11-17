@@ -47,9 +47,10 @@ public partial class CpuEngine
         using var keepInput = new KeepAliveScope(input);
         using var keepOutput = new KeepAliveScope(output);
         var destination = output.IsContiguous ? output.DataUnmarked : default;
-        ReadOnlyMemory<T> source = input.IsContiguous ? input.ReadOnlyDataUnmarked : input.ToArray();
-        if (output.IsContiguous ? source.Span.Overlaps(destination.Span)
-            : ReferenceEquals(input.StorageIdentity, output.StorageIdentity))
+        // Separate FromMemory wrappers can physically alias without sharing a storage-identity object.
+        // A strided destination has no single logical span to test, so snapshot that rare fallback conservatively.
+        ReadOnlyMemory<T> source = input.IsContiguous && output.IsContiguous ? input.ReadOnlyDataUnmarked : input.ToArray();
+        if (output.IsContiguous && source.Span.Overlaps(destination.Span))
             source = input.ToArray();
         RfftMagnitudeRows(source, default, destination, output.IsContiguous ? null : output,
             rows, length, bins, epsilon, backward: false, accumulate: false);
@@ -64,12 +65,10 @@ public partial class CpuEngine
         using var keepUpstream = new KeepAliveScope(gradOutput);
         using var keepDestination = new KeepAliveScope(gradInput);
         var destination = gradInput.IsContiguous ? gradInput.DataUnmarked : default;
-        ReadOnlyMemory<T> source = input.IsContiguous ? input.ReadOnlyDataUnmarked : input.ToArray();
-        ReadOnlyMemory<T> upstream = gradOutput.IsContiguous ? gradOutput.ReadOnlyDataUnmarked : gradOutput.ToArray();
-        bool SourceOverlaps(Tensor<T> tensor, ReadOnlyMemory<T> values) => gradInput.IsContiguous
-            ? values.Span.Overlaps(destination.Span) : ReferenceEquals(tensor.StorageIdentity, gradInput.StorageIdentity);
-        if (SourceOverlaps(input, source)) source = input.ToArray();
-        if (SourceOverlaps(gradOutput, upstream)) upstream = gradOutput.ToArray();
+        ReadOnlyMemory<T> source = input.IsContiguous && gradInput.IsContiguous ? input.ReadOnlyDataUnmarked : input.ToArray();
+        ReadOnlyMemory<T> upstream = gradOutput.IsContiguous && gradInput.IsContiguous ? gradOutput.ReadOnlyDataUnmarked : gradOutput.ToArray();
+        if (gradInput.IsContiguous && source.Span.Overlaps(destination.Span)) source = input.ToArray();
+        if (gradInput.IsContiguous && upstream.Span.Overlaps(destination.Span)) upstream = gradOutput.ToArray();
         RfftMagnitudeRows(source, upstream, destination, gradInput.IsContiguous ? null : gradInput,
             rows, length, bins, epsilon, backward: true, accumulate);
         gradInput.IncrementVersion();
