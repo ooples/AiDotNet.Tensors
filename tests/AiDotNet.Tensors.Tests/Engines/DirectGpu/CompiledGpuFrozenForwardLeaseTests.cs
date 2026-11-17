@@ -59,7 +59,7 @@ public sealed class CompiledGpuFrozenForwardLeaseTests
                 input[0] = 0.125f + step * 0.01f;
                 losses.Add(plan.Step().ToArray()[0]);
             }
-            return (weight.ToArray(), losses.ToArray(), compiled.ScratchBufferBytes, compiled.ForwardSpanLeaseCandidates);
+            return (weight.ToArray(), losses.ToArray(), compiled.LastStepScratchBytesBeforeTransfer, compiled.ForwardSpanLeaseCandidates);
         }
     }
 
@@ -84,9 +84,11 @@ public sealed class CompiledGpuFrozenForwardLeaseTests
             var previousEngine = AiDotNetEngine.Current;
             bool previousLeases = CompiledTrainingPlan<float>.LeaseForwardOutputs;
             bool? previousInputGradients = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
+            bool previousObservation = CompiledTrainingPlan<float>.ObserveScratchStorageForTests;
             try
             {
                 CompiledTrainingPlan<float>.CompiledInputGradientsForTests = false;
+                CompiledTrainingPlan<float>.ObserveScratchStorageForTests = true;
                 AiDotNetEngine.Current = new CpuEngine();
                 var expected = Train(AiDotNetEngine.Current, noGrad, captured);
                 AiDotNetEngine.Current = gpu;
@@ -111,6 +113,7 @@ public sealed class CompiledGpuFrozenForwardLeaseTests
                 AiDotNetEngine.Current = previousEngine;
                 CompiledTrainingPlan<float>.LeaseForwardOutputs = previousLeases;
                 CompiledTrainingPlan<float>.CompiledInputGradientsForTests = previousInputGradients;
+                CompiledTrainingPlan<float>.ObserveScratchStorageForTests = previousObservation;
             }
         }
     }

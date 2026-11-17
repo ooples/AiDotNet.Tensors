@@ -5124,6 +5124,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>Test hook: the bytes of those buffers.</summary>
     internal long ScratchBufferBytes => _scratchPool?.BufferBytes ?? 0;
+    /// <summary>Enables the test-only unique-native-handle working-storage observation.</summary>
+    internal static bool ObserveScratchStorageForTests { get; set; }
+    /// <summary>Actual unique native backing after the last executed body cleanup, before any broker transfer.</summary>
+    internal long LastStepScratchBytesBeforeTransfer { get; private set; }
+
 
     // The scratch pool's pin count when the live step graph(s) were captured, or -1 with none live (see
     // StepScratchPool.PinnedCount): a replay first checks no executed body has pinned a slot since.
@@ -5375,6 +5380,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Not waiting for the finalizers: they only queue the frees, which the next allocation drains, and a
                 // finalizer that needs a lock this step holds would deadlock a wait.
                 if (dropped >= DroppedScratchCollectBytes) GC.Collect();
+            }
+            if (ObserveScratchStorageForTests && executed && completed && _scratchPool is { } observedScratch)
+            {
+                long bytes = 0;
+                foreach (var category in observedScratch.SnapshotStorage(_forwardActions.Length).Values)
+                    bytes += category.Bytes;
+                LastStepScratchBytesBeforeTransfer = bytes;
             }
         }
     }
