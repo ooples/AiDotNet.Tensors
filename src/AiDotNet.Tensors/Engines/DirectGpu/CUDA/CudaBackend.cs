@@ -1110,9 +1110,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         try
         {
-            string cacheDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "AiDotNet", "Tensors", "kernel_cache");
+            string? root = Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_CACHE_DIR");
+            string cacheDir = string.IsNullOrWhiteSpace(root)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "AiDotNet", "Tensors", "kernel_cache")
+                : Path.Combine(root, "CUDA", "Nvrtc");
             Directory.CreateDirectory(cacheDir);
             return cacheDir;
         }

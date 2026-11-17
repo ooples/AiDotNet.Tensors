@@ -604,6 +604,12 @@ internal static class DirectPtxCubinArtifactCache
             string? directory = Environment.GetEnvironmentVariable(CacheEnvironmentVariable);
             if (string.IsNullOrWhiteSpace(directory))
             {
+                string? root = Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_CACHE_DIR");
+                if (!string.IsNullOrWhiteSpace(root))
+                    directory = System.IO.Path.Combine(root, "CUDA", "DirectPtx");
+            }
+            if (string.IsNullOrWhiteSpace(directory))
+            {
                 string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
                 if (string.IsNullOrWhiteSpace(local))
                     return null;
