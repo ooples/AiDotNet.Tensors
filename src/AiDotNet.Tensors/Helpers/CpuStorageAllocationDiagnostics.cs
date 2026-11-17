@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
@@ -37,6 +38,22 @@ internal static class CpuStorageAllocationDiagnostics
     {
         if (Enabled && !IsInsideRequest && length > 0)
             Recorder.Record(tag, (long)length * Unsafe.SizeOf<T>());
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static T[] RentWorkspace<T>(int minimumLength, string tag)
+    {
+        T[] array = ArrayPool<T>.Shared.Rent(minimumLength);
+        Record<T>(tag, minimumLength);
+        return array;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static T[] NewNumericArray<T>(int length, string tag)
+    {
+        T[] array = new T[length];
+        Record<T>(tag, length);
+        return array;
     }
 
     internal static Dictionary<string, object> Snapshot()

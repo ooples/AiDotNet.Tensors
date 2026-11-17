@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -51,5 +52,24 @@ public sealed class CpuStorageAllocationDiagnosticsTests
         Assert.Equal(72, Counter("bytes") - beforeBytes);
         Assert.Equal(3, Counter("count") - beforeCount);
         Assert.Equal("partial_numeric_storage_request_boundaries", CpuStorageAllocationDiagnostics.Snapshot()["coverage"]);
+    }
+
+    [SkippableFact]
+    public void WorkspacePoolCountsRequestedBytesRatherThanRoundedArrayCapacity()
+    {
+        Skip.IfNot(CpuStorageAllocationDiagnostics.Enabled, "Set AIDOTNET_BUFFER_ALLOC_DIAG=1 before process launch.");
+        static long Counter(string unit) => Convert.ToInt64(CpuStorageAllocationDiagnostics.Snapshot()[unit]);
+        long beforeBytes = Counter("bytes"), beforeCount = Counter("count");
+        float[] workspace = CpuStorageAllocationDiagnostics.RentWorkspace<float>(6, "workspace.test");
+        try
+        {
+            Assert.True(workspace.Length >= 6);
+            Assert.Equal(24, Counter("bytes") - beforeBytes);
+            Assert.Equal(1, Counter("count") - beforeCount);
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                CpuStorageAllocationDiagnostics.RentWorkspace<float>(-1, "workspace.test"));
+            Assert.Equal(1, Counter("count") - beforeCount);
+        }
+        finally { ArrayPool<float>.Shared.Return(workspace); }
     }
 }
