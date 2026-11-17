@@ -1571,6 +1571,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateBuffer(float[] data)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+                return BufferAllocationDiagnostics.Observe("OpenCL", (long)data.Length * sizeof(float), (this, data),
+                    static state => state.Item1.AllocateBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
@@ -1602,6 +1605,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateBuffer(int size)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+                return BufferAllocationDiagnostics.Observe("OpenCL", (long)size * sizeof(float), (this, size),
+                    static state => state.Item1.AllocateBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             DrainCollectedBuffers();
@@ -4609,6 +4615,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateByteBuffer(int size)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+                return BufferAllocationDiagnostics.Observe("OpenCL", (long)size * sizeof(byte), (this, size),
+                    static state => state.Item1.AllocateByteBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
@@ -9258,6 +9267,9 @@ KERNEL VARIANTS (A/B testing):
 
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+                return BufferAllocationDiagnostics.Observe("OpenCL", (long)data.Length * sizeof(float), (this, data),
+                    static state => state.Item1.AllocateIntBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (data is null)

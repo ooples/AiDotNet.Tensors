@@ -1574,6 +1574,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe IGpuBuffer AllocateBuffer(float[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         var size = (UIntPtr)(data.Length * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
@@ -1656,6 +1659,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public IGpuBuffer AllocateBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
@@ -1685,6 +1691,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// </summary>
     public IGpuBuffer AllocateBufferUninitialized(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBufferUninitialized(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         long sizeInBytes = (long)size * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("HIP", sizeInBytes, MaxBufferAllocBytes, DeviceName);
@@ -3723,6 +3732,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)size * sizeof(byte), (this, size),
+                static state => state.Item1.AllocateByteBuffer(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)size;
         // Issue #285: per-allocation cap check before hipMalloc.
@@ -5975,6 +5987,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         if (data is null) throw new ArgumentNullException(nameof(data));
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
