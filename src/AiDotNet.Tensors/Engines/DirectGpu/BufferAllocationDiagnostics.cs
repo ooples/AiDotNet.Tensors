@@ -13,6 +13,7 @@ internal static class BufferAllocationDiagnostics
 {
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("AIDOTNET_BUFFER_ALLOC_DIAG") == "1";
     private static readonly RequestRecorder Recorder = new();
+    private static readonly Totals CudaNativeApiRequests = new();
     internal static bool IsInsideRequest => RequestRecorder.IsInside;
 
     // Keep diagnostics from changing a backend's existing null-validation order or exception type.
@@ -23,6 +24,11 @@ internal static class BufferAllocationDiagnostics
 
     internal static TResult Observe<TState, TResult>(string backend, long bytes, TState state, Func<TState, TResult> allocate)
         => Recorder.Observe(backend, bytes, state, allocate);
+
+    internal static void RecordCudaNativeApiRequest(long bytes)
+    {
+        if (Enabled && bytes > 0) CudaNativeApiRequests.Add(bytes);
+    }
 
     // The benchmark accesses this internal diagnostic reflectively, so the public library API need not grow.
     internal static Dictionary<string, object> Snapshot()
@@ -52,6 +58,13 @@ internal static class BufferAllocationDiagnostics
                 ["backends"] = backends,
             },
             ["cpu_storage_requested"] = Helpers.CpuStorageAllocationDiagnostics.Snapshot(),
+            ["gpu_native_api_requested"] = new Dictionary<string, object>
+            {
+                ["bytes"] = CudaNativeApiRequests.Bytes,
+                ["count"] = CudaNativeApiRequests.Count,
+                ["coverage"] = Enabled ? "cuda_tracker_hook_sites_only" : "disabled",
+                ["scope"] = "Successful CUDA native allocation API requests at GpuMemoryTracker.OnAlloc hook sites. Includes cuMemAllocAsync driver-pool suballocations; not physical backing allocation count or complete vendor allocation coverage.",
+            },
             // Explicitly unknown: these categories cannot be inferred from buffer requests or GC object bytes.
             ["cpu_framework_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
             ["gpu_framework_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified_api_coverage" },
