@@ -16,7 +16,8 @@ public partial class CpuEngine
         float[] input, float[] kernel, float[] output,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
         int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
-        int outputHeight, int outputWidth)
+        int outputHeight, int outputWidth, bool accumulate = false, int inputStorageOffset = 0, int outputStorageOffset = 0,
+        int kernelStorageOffset = 0)
     {
         if (height != 1 || kernelHeight != 1 || outputHeight != 1 || padH != 0 || strideH != 1
             || kernelWidth <= 1 || (long)inChannels * kernelWidth * outputWidth < 1_048_576)
@@ -37,8 +38,10 @@ public partial class CpuEngine
                 NumThreads = 1,
                 PackingMode = BlasManaged.PackingMode.ForcePackBoth,
                 Mc = 96, Nc = 256, Kc = 256,
+                BetaZero = true,
             };
             var panel = ArrayPool<float>.Shared.Rent(panelFloats);
+            var product = accumulate ? ArrayPool<float>.Shared.Rent(checked(outChannels * columns)) : null;
             try
             {
                 for (int block = worker; block < blocks; block += workers)
@@ -48,7 +51,7 @@ public partial class CpuEngine
                     int count = Math.Min(columns, outputWidth - from);
                     for (int channel = 0; channel < inChannels; channel++)
                     {
-                        int inputRow = (image * inChannels + channel) * width;
+                        int inputRow = inputStorageOffset + (image * inChannels + channel) * width;
                         for (int tap = 0; tap < kernelWidth; tap++)
                         {
                             var target = panel.AsSpan((channel * kernelWidth + tap) * count, count);
@@ -70,20 +73,67 @@ public partial class CpuEngine
                         }
                     }
 
-                    int outputOffset = checked(image * outChannels * outputWidth + from);
+                    int outputOffset = checked(outputStorageOffset + image * outChannels * outputWidth + from);
+                    var result = product is null ? output.AsSpan(outputOffset) : product.AsSpan();
                     BlasManaged.BlasManaged.Gemm<float>(
-                        kernel.AsSpan(0, outChannels * k), k, false,
+                        kernel.AsSpan(kernelStorageOffset, outChannels * k), k, false,
                         panel.AsSpan(0, k * count), count, false,
-                        output.AsSpan(outputOffset), outputWidth,
+                        result, product is null ? outputWidth : count,
                         outChannels, count, k, options);
+                    if (product is not null)
+                        for (int oc = 0; oc < outChannels; oc++)
+                        {
+                            var destination = output.AsSpan(outputOffset + oc * outputWidth, count);
+                            var source = product.AsSpan(oc * count, count);
+                            for (int j = 0; j < count; j++) destination[j] += source[j];
+                        }
                 }
             }
             finally
             {
                 ArrayPool<float>.Shared.Return(panel);
+                if (product is not null) ArrayPool<float>.Shared.Return(product);
             }
         }, deterministicSafe: true);
         t_conv1DColumnPanelRuns++;
         return true;
+    }
+
+    // dX for a stride-one waveform convolution is another dilated convolution, with channel axes swapped and taps
+    // reversed. The generic col2im route materializes Cin*kW*outputWidth floats before scattering them back to dX.
+    private static bool TryConv1DBackwardInputColumnPanels(
+        LinearAlgebra.Tensor<float> destination, LinearAlgebra.Tensor<float> gradient, LinearAlgebra.Tensor<float> kernel,
+        int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outputHeight, int outputWidth, bool accumulate)
+    {
+        long transposedPadding = (long)dilationW * (kernelWidth - 1) - padW;
+        if (height != 1 || kernelHeight != 1 || outputHeight != 1 || strideH != 1 || strideW != 1 || padH != 0
+            || kernelWidth <= 1 || transposedPadding < 0 || transposedPadding > int.MaxValue
+            || !gradient.IsContiguous || !kernel.IsContiguous
+            || (long)outChannels * kernelWidth * width < 1_048_576)
+            return false;
+        var g = gradient.GetCpuBackingForStridedRead(out int gOffset);
+        var k = kernel.GetCpuBackingForStridedRead(out int kOffset);
+        var d = destination.GetCpuBackingForContiguousWrite(out int dOffset);
+        if (g is null || k is null || d is null) return false;
+
+        var flipped = ArrayPool<float>.Shared.Rent(checked(inChannels * outChannels * kernelWidth));
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, inChannels, (long)inChannels * outChannels * kernelWidth, ic =>
+            {
+                for (int oc = 0; oc < outChannels; oc++)
+                    for (int tap = 0; tap < kernelWidth; tap++)
+                        flipped[(ic * outChannels + oc) * kernelWidth + tap] =
+                            k[kOffset + (oc * inChannels + ic) * kernelWidth + kernelWidth - 1 - tap];
+            }, deterministicSafe: true);
+            return TryConv1DColumnPanels(g, flipped, d, batch, outChannels, 1, outputWidth, inChannels, 1, kernelWidth,
+                1, 1, 0, (int)transposedPadding, 1, dilationW, 1, width, accumulate, gOffset, dOffset);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(flipped);
+        }
     }
 }
