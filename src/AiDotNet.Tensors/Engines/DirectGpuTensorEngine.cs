@@ -23428,17 +23428,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
+        if (!TryGetBackend(out var backend)) return null;
 
         // Compiled execution needs a stable, capture-safe scratch address. Keep the existing
         // resident-step route rather than allocating a fresh eager buffer during graph capture.
         if (ResidentStepActive)
         {
-            var capturedOutput = new Tensor<T>(new T[a.Length], a.Shape._dims);
+            var capturedOutput = CreateResidentOutput<T>(backend, a.Shape._dims);
             return TryRunBinaryInto(capturedOutput, a, b, kernel) ? capturedOutput : null;
         }
 
-        if (!TryGetBackend(out var backend))
-            return null;
         // Resolve uploads and strided views on device as well. Returning a host array from
         // TryRunBinary here used to de-resident small recurrent states during training.
         using var left = GetOrAllocateBuffer(backend, a);
@@ -23871,7 +23870,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var bufG = ResolveResidentBufferNoUpload(backend, gradOutput, M * N);
                 var bufOperand = ResolveResidentBufferNoUpload(backend, operand, operandLength);
                 if (bufG is null || bufOperand is null) return false;
-                var result = new Tensor<T>(new T[(long)rows * cols], new[] { rows, cols });
+                var result = CreateResidentOutput<T>(backend, new[] { rows, cols });
                 var resultBuf = GetOrCreateResidentBuffer(backend, result, rows * cols, fullyWritten: true);
                 if (resultBuf.Handle == IntPtr.Zero || resultBuf.Size < (long)rows * cols) return false;
                 Launch(bufG, bufOperand, resultBuf);
@@ -24317,7 +24316,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         AliasDiag($"ReluBackward bail gradRes={gR is not null} inputRes={iR is not null} inContig={input.IsContiguous} inShape=[{string.Join(",", input._shape)}]");
                     if (gR is not null && iR is not null)
                     {
-                        var rOut = new Tensor<T>(new T[gradOutput.Length], gradOutput.Shape._dims);
+                        var rOut = CreateResidentOutput<T>(backend, gradOutput.Shape._dims);
                         var oResBuf = GetOrCreateResidentBuffer(backend, rOut, gradOutput.Length, fullyWritten: true);
                         if (oResBuf.Handle != System.IntPtr.Zero && oResBuf.Size >= gradOutput.Length)
                         {
@@ -24913,10 +24912,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+        using var __residentOutputOp = EnterGpuOp();
+        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+            && TryGetBackend(out var residentBackend))
         {
             float sf = scalar is float f0 ? f0 : Convert.ToSingle(scalar);
-            var rout = new Tensor<T>(new T[tensor.Length], tensor.Shape._dims);
+            var rout = CreateResidentOutput<T>(residentBackend, tensor.Shape._dims);
             if (TryUnaryResidentInto(rout, tensor, (b, i, o, n) => b.Scale(i, o, sf, n), "ScaleResident"))
             {
                 Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", rout, tensor,
@@ -28221,7 +28222,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // bias-add runs inside the captured forward, where a deferred materializer races activation-
                 // cache eviction (issue #226) and aborts replay. Fresh output → its resident buffer becomes a
                 // graph alloc node under capture; downstream reads it on-device with no re-upload.
-                var outT = new Tensor<T>(new T[a.Length], a.Shape._dims);
+                var outT = CreateResidentOutput<T>(beCh, a.Shape._dims);
                 var outBuf = GetOrCreateResidentBuffer(beCh, outT, a.Length, fullyWritten: true);
                 if (abuf.Buffer.Handle != System.IntPtr.Zero && bbuf.Buffer.Handle != System.IntPtr.Zero
                     && outBuf.Handle != System.IntPtr.Zero && outBuf.Size >= a.Length)
