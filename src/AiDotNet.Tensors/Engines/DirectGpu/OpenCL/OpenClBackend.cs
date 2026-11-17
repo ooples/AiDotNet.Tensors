@@ -14808,9 +14808,11 @@ KERNEL VARIANTS (A/B testing):
     /// OpenCL GPU buffer wrapper implementing IGpuBuffer.
     /// Uses pure P/Invoke with no managed GPU runtime dependency.
     /// </summary>
-    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
     {
         internal readonly DirectOpenClBuffer Buffer;
+        private readonly IGpuBuffer? _viewParent;
+        IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
         private readonly Action<DirectOpenClGpuBuffer>? _returnToPool;
         private int _poolState;
         internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
@@ -14833,9 +14835,10 @@ KERNEL VARIANTS (A/B testing):
         /// <param name="account">The device's memory counters, for a fresh allocation; null for a view or a pool's new
         /// wrapper of memory already counted.</param>
         public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null,
-            DeviceMemoryAccount? account = null)
+            DeviceMemoryAccount? account = null, IGpuBuffer? viewParent = null)
         {
             Buffer = buffer;
+            _viewParent = viewParent;
             _returnToPool = returnToPool;
             _size = buffer.Length;
             _memory.OnAllocated(account, (long)buffer.Length * sizeof(float));
