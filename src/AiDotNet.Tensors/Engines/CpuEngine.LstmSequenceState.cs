@@ -43,20 +43,26 @@ public partial class CpuEngine
         Tensor<double> wIh, Tensor<double> wHh, Tensor<double>? bIh, Tensor<double>? bHh,
         int batch, int steps, int inFeatures, int hidden, bool sequence, bool states)
     {
-        var inputs = new List<Tensor<double>> { input, wIh, wHh };
-        int AddOptional(Tensor<double>? value)
-        {
-            if (value is null) return -1;
-            int index = inputs.Count; inputs.Add(value); return index;
-        }
+        // Match the float recorder's fixed input packing. A local AddOptional helper would capture
+        // its mutable List in the Execute display class, although Execute never reads that builder.
+        var inputs = new Tensor<double>[3 + (bIh is null ? 0 : 1) + (bHh is null ? 0 : 1)
+            + (h0 is null ? 0 : 1) + (c0 is null ? 0 : 1)];
+        int next = 0;
+        inputs[next++] = input;
+        inputs[next++] = wIh;
+        inputs[next++] = wHh;
+        int biasInput = bIh is null ? -1 : next; if (bIh is not null) inputs[next++] = bIh;
+        int biasHidden = bHh is null ? -1 : next; if (bHh is not null) inputs[next++] = bHh;
+        int initialHidden = h0 is null ? -1 : next; if (h0 is not null) inputs[next++] = h0;
+        int initialCell = c0 is null ? -1 : next; if (c0 is not null) inputs[next] = c0;
         var meta = new[] { batch, steps, inFeatures, hidden, sequence ? 1 : 0,
-            AddOptional(bIh), AddOptional(bHh), AddOptional(h0), AddOptional(c0), states ? 1 : 0 };
+            biasInput, biasHidden, initialHidden, initialCell, states ? 1 : 0 };
         var gates = new double[batch * steps * 4 * hidden];
         var cells = new double[batch * (steps + 1) * hidden];
         var hiddens = new double[cells.Length];
         var saved = new object[] { gates, cells, hiddens, meta };
         var shape = LstmTrainingOutputShape(batch, steps, hidden, sequence, states);
-        return scope.RecordVariadic(LazyNodeType.Custom, "LstmSequenceTrain", inputs.ToArray(), shape,
+        return scope.RecordVariadic(LazyNodeType.Custom, "LstmSequenceTrain", inputs, shape,
             (engine, output) =>
             {
                 // The host recorder is never selected for a device engine. Keep the plan's output
