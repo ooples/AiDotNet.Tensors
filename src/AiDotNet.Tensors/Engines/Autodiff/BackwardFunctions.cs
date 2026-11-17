@@ -9917,8 +9917,7 @@ internal static partial class BackwardFunctions<T>
         }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        using var xSrcLease = x.Lease();
-        var xSrc = xSrcLease.Span;
+        var xs = RoIAlignPlan.ToDoubles(x);
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
@@ -9926,7 +9925,7 @@ internal static partial class BackwardFunctions<T>
         var dX = dXLease.Span;
         for (int i = 0; i < dX.Length; i++)
         {
-            double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
+            double xd = xs[i];
             // Use the same asymptotic digamma formula as TensorDigamma.
             double shift = 0;
             while (xd < 10.0) { shift -= 1.0 / xd; xd += 1.0; }
@@ -9952,8 +9951,7 @@ internal static partial class BackwardFunctions<T>
         }
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        using var xSrcLease = x.Lease();
-        var xSrc = xSrcLease.Span;
+        var xs = RoIAlignPlan.ToDoubles(x);
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
@@ -9961,7 +9959,7 @@ internal static partial class BackwardFunctions<T>
         var dX = dXLease.Span;
         for (int i = 0; i < dX.Length; i++)
         {
-            double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
+            double xd = xs[i];
             // Trigamma asymptotic with recurrence shift — same as Polygamma(1, x).
             double shift = 0;
             while (xd < 6.0) { shift += 1.0 / (xd * xd); xd += 1.0; }
@@ -10702,18 +10700,16 @@ internal static partial class BackwardFunctions<T>
         }
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var xs = RoIAlignPlan.ToDoubles(input);
         using var goLease = gradOutput.Lease();
         var go = goLease.Span;
         using var dstLease = grad.LeaseWritable();
         var dst = dstLease.Span;
         var zero = ops.Zero;
-        for (int i = 0; i < src.Length; i++)
+        for (int i = 0; i < xs.Length; i++)
         {
-            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
             // net471 lacks double.IsFinite — check NaN/Infinity explicitly.
-            bool isFinite = !(double.IsNaN(d) || double.IsInfinity(d));
+            bool isFinite = !(double.IsNaN(xs[i]) || double.IsInfinity(xs[i]));
             dst[i] = isFinite ? go[i] : zero;
         }
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);

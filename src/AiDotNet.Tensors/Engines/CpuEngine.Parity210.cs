@@ -950,7 +950,7 @@ public partial class CpuEngine
         double acc = 0;
         for (int k = 0; k < d; k++)
         {
-            double diff = System.Convert.ToDouble(s[offA + k]) - System.Convert.ToDouble(s[offB + k]);
+            double diff = PNormScalarToDouble(ops, s[offA + k]) - PNormScalarToDouble(ops, s[offB + k]);
             acc = AccumulateNorm(acc, System.Math.Abs(diff), order, p);
         }
         return ops.FromDouble(FinishNorm(acc, order, p));
@@ -980,16 +980,29 @@ public partial class CpuEngine
             return ops.FromFloat(FinishNormF(sumF, order, p));
         }
 
-        // Non-float T (e.g. double) keeps the double-precision path — the
+        // Non-float T (e.g. double, Half, BFloat16) keeps the double-precision path — the
         // library only commits to GPU/CPU bit-equivalence for the float fast
-        // path, and a double-typed caller is opting in to higher precision.
+        // path, and non-float callers convert via INumericOperations<T>.
         double acc = 0;
         for (int k = 0; k < d; k++)
         {
-            double diff = System.Convert.ToDouble(a[offA + k]) - System.Convert.ToDouble(b[offB + k]);
+            double diff = PNormScalarToDouble(ops, a[offA + k]) - PNormScalarToDouble(ops, b[offB + k]);
             acc = AccumulateNorm(acc, System.Math.Abs(diff), order, p);
         }
         return ops.FromDouble(FinishNorm(acc, order, p));
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static double PNormScalarToDouble<T>(Interfaces.INumericOperations<T> ops, T value)
+    {
+        if (typeof(T) == typeof(double))
+            return System.Runtime.CompilerServices.Unsafe.As<T, double>(ref value);
+        if (typeof(T) == typeof(Half))
+            return (double)(float)System.Runtime.CompilerServices.Unsafe.As<T, Half>(ref value);
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16))
+            return (double)AiDotNet.Tensors.NumericOperations.BFloat16.ToFloat(
+                System.Runtime.CompilerServices.Unsafe.As<T, AiDotNet.Tensors.NumericOperations.BFloat16>(ref value));
+        return ops.ToDouble(value);
     }
 
     /// <summary>
