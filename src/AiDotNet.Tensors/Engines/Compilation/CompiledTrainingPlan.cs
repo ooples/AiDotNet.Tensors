@@ -5011,32 +5011,52 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int forwardActionCount, int backwardActionCount)
     {
         var schedule = new List<(long, Engines.DirectGpu.IGpuBuffer)>?[backwardActionCount];
+        var lastByStorage = new Dictionary<object, int>(Autodiff.ReferenceEqualityComparer<object>.Instance);
         var lastByBuffer = new Dictionary<Engines.DirectGpu.IGpuBuffer, int>(
             Autodiff.ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
-        void Bind(Tensor<T>? t)
+        IEnumerable<Tensor<T>> Tensors()
         {
-            if (t is null || t.TryGetGpuBuffer() is not { } buffer) return;
-            int last = _lastBackwardReads!.TryGetValue(t, out int a) ? a : -1;
-            lastByBuffer[buffer] = lastByBuffer.TryGetValue(buffer, out int prior)
-                ? (prior < 0 || last < 0 ? -1 : Math.Max(prior, last))
-                : last;
+            if (_forwardSteps is { } steps)
+                foreach (var step in steps)
+                {
+                    yield return step.OutputBuffer;
+                    foreach (var input in step.Inputs) yield return input;
+                    if (step.SavedState is { } state)
+                        foreach (var item in state)
+                            if (item is Tensor<T> tensor) yield return tensor;
+                }
+            foreach (var parameter in _parameters) yield return parameter;
+            yield return _lossOutput;
+            foreach (var output in _retainedOutputs) yield return output;
+            foreach (var output in _namedRetainedOutputs.Values) yield return output;
+            foreach (var leaf in _requestedInputGradientLeaves) yield return leaf;
         }
-        if (_forwardSteps is { } steps)
-            foreach (var step in steps)
-            {
-                Bind(step.OutputBuffer);
-                foreach (var input in step.Inputs) Bind(input);
-                if (step.SavedState is { } state)
-                    foreach (var item in state)
-                        if (item is Tensor<T> t) Bind(t);
-            }
-        foreach (var p in _parameters) Bind(p);
-        Bind(_lossOutput);
+        static int Merge(int prior, int last) => prior < 0 || last < 0 ? -1 : Math.Max(prior, last);
+        // A public offset/strided view need not have its own GPU binding. Its shared storage still makes the
+        // whole resident sibling observable, so propagate never-lend and last-reader constraints through storage.
+        foreach (var tensor in Tensors())
+        {
+            int last = _lastBackwardReads!.TryGetValue(tensor, out int action) ? action : -1;
+            object storage = tensor.StorageIdentity;
+            lastByStorage[storage] = lastByStorage.TryGetValue(storage, out int prior) ? Merge(prior, last) : last;
+        }
+        foreach (var output in _retainedOutputs) lastByStorage[output.StorageIdentity] = -1;
+        foreach (var output in _namedRetainedOutputs.Values) lastByStorage[output.StorageIdentity] = -1;
+        // Native sub-views can instead have distinct tensor storage and distinct wrapper/offset handles. Their
+        // complete allocation root is one lifetime: a retained Narrow view must keep its source out of grad scratch.
+        foreach (var tensor in Tensors())
+        {
+            if (tensor.TryGetGpuBuffer() is not { } buffer) continue;
+            var root = Engines.DirectGpu.GpuBufferViewRoot.Of(buffer);
+            int last = lastByStorage[tensor.StorageIdentity];
+            lastByBuffer[root] = lastByBuffer.TryGetValue(root, out int prior) ? Merge(prior, last) : last;
+        }
         foreach (var entry in lastByBuffer)
         {
             var buffer = entry.Key;
             int last = entry.Value;
-            if (last < 0 || last >= backwardActionCount || !pool.Keys.TryGetValue(buffer, out long key)) continue;
+            if (buffer.Handle == IntPtr.Zero || last < 0 || last >= backwardActionCount
+                || !pool.Keys.TryGetValue(buffer, out long key)) continue;
             if ((int)(key >> 32) >= forwardActionCount || !pool.Slots.TryGetValue(key, out var slot)
                 || !ReferenceEquals(slot, buffer)) continue;
             (schedule[last] ??= new List<(long, Engines.DirectGpu.IGpuBuffer)>()).Add((key, buffer));
