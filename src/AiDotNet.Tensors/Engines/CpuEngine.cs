@@ -11198,12 +11198,15 @@ public partial class CpuEngine : ITensorLevelEngine
             && height == 1 && kernelHeight == 1 && outputHeight == 1
             && (long)inChannels * kernelWidth * outputWidth >= 1_048_576)
         {
-            inputData ??= input.GetReadOnlyDataArray();
-            kernelData ??= kernel.GetReadOnlyDataArray();
-            outputData ??= output.GetDataArray();
-            if (TryConv1DColumnPanels(inputData, kernelData, outputData,
-                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth))
+            int inOffP = 0, kOffP = 0, outOffP = 0;
+            var inArrP = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOffP) : null);
+            var kArrP = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOffP) : null);
+            var outArrP = outputData ?? output.GetCpuBackingForContiguousWrite(out outOffP);
+            if (inArrP is not null && kArrP is not null && outArrP is not null
+                && TryConv1DColumnPanels(inArrP, kArrP, outArrP,
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth,
+                    inputStorageOffset: inOffP, outputStorageOffset: outOffP, kernelStorageOffset: kOffP))
                 return;
         }
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
@@ -15686,6 +15689,20 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = preAllocatedOutput ?? (fullyWrittenByRoute
             ? TensorAllocator.RentUninitialized<T>([batch, outChannels, outputHeight, outputWidth])
             : TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]));
+        // The NCHW dispatcher reads/writes raw storage with offsets. Materializing arrays before it would
+        // copy an arena/view destination and discard its writes; it also copies every offset-bearing input.
+        if (typeof(T) == typeof(float) && input.Layout == LinearAlgebra.TensorLayout.Nchw)
+        {
+            DispatchFloatConv2D((Tensor<float>)(object)input, (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result, null, null, null,
+                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
+                new object[] { stride, padding, dilation });
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
+            return result;
+        }
+
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
         using var outputDataLease = result.LeaseArray();
@@ -16950,6 +16967,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
+            if (TryConv1DBackwardInputColumnPanels((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
+                (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
+                return;
             // FUSED FAST PATH (transposed-convolution identity). For stride=1,
             // dilation=1 and a non-negative symmetric transposed padding, the
             // input-gradient equals a FORWARD convolution of gradOutput with the
