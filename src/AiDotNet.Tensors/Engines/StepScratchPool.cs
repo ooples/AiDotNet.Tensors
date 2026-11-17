@@ -235,6 +235,7 @@ internal sealed class StepScratchPool
         buffer = _free[pick];
         _free[pick] = _free[_free.Count - 1];
         _free.RemoveAt(_free.Count - 1);
+        BufferAllocationDiagnostics.RecordStepScratchReuse(length);
         return true;
     }
 
@@ -271,6 +272,7 @@ internal sealed class StepScratchPool
         else _leases.Add((key, buffer));
         _leasedThisRun.Add(buffer);
         Keys[buffer] = key;
+        if (pick >= 0) BufferAllocationDiagnostics.RecordStepScratchReuse(length);
         return buffer;
     }
 
