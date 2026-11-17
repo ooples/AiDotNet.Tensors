@@ -1054,12 +1054,6 @@ public sealed class GradientTape<T> : IDisposable
                 }
                 Array.Clear(steps, 0, steps.Length);
                 _entries.Reset();
-            }
-            else if (!_options.Persistent)
-            {
-                // Non-persistent tapes drop the whole arena here, so they're safe to
-                // re-record from scratch — no consumed-guard needed.
-                _entries.Reset();
                 _recordingEpoch++;
             }
             if (_options.Persistent && _releaseStreamingActivations)

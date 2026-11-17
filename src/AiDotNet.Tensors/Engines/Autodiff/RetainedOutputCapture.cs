@@ -7,6 +7,8 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// <summary>A lexical handoff from one successful training invocation to its consumer.</summary>
 internal sealed class RetainedOutputCapture<T> : IDisposable
 {
+    // Intentional per-thread lexical stacks: Begin pushes; Complete/Dispose restore the parent only in nesting order.
+    // These are ambient scope bindings, not process-wide shared capture state.
     [ThreadStatic] private static RetainedOutputCapture<T>? _current;
     [ThreadStatic] private static EagerUpdateScope? _activeUpdate;
     private static readonly ConditionalWeakTable<GradientTape<T>, EagerTapeRegistration> EagerRegistrations = new();
@@ -72,13 +74,15 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
         public void Dispose()
         {
             if (_disposed) return;
+            if (!ReferenceEquals(_activeUpdate, this) || !ReferenceEquals(_current, _owner))
+                throw new InvalidOperationException("Retained output update scopes must be disposed in nesting order on their creating thread.");
             _disposed = true;
             if (!Accepted)
             {
                 _owner._published = null;
                 _owner._plan = null;
             }
-            if (ReferenceEquals(_activeUpdate, this)) _activeUpdate = _parent;
+            _activeUpdate = _parent;
         }
     }
 
