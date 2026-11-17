@@ -5220,6 +5220,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ((BackwardFunction<T>)BackwardFunctions<T>.ReshapeBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.MatMulBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.Conv2DBackward).Method,
+        ((BackwardFunction<T>)BackwardFunctions<T>.WeightNormBackward).Method,
     };
 
     private static readonly HashSet<System.Reflection.MethodInfo> s_backwardIgnoresInputs = new()
@@ -14350,6 +14351,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+        var weightNormBackward = BuildWeightNormBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
+        if (weightNormBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return weightNormBackward;
+        }
+
         // Partial reductions broadcast their upstream gradient directly into the existing accumulator. Resolve this
         // before the sole-writer/zero-offset guards: the writer handles accumulation and actual storage offsets.
         var reducedBackward = BuildCpuReducedGradientBackward(step, gradMap, gradWriterCount ?? consumerCount, engine);

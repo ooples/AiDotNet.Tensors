@@ -22,7 +22,7 @@ internal static partial class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource;
+    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource + WeightNormSource;
 
     private const string CoreSource = @"
 #ifndef INFINITY
@@ -468,6 +468,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const un
 
     public static string[] GetKernelNames() => new[]
     {
+        WeightNorm, WeightNormStats, WeightNormDirectionGrad, WeightNormGainGrad,
         "bx_full_reduce", "bx_row_reduce", "bx_row_map", "bx_scalar", "bx_unary", "bx_sincos", "bx_reduce_backward",
         "bx_broadcast_first", "bx_gated_backward", "bx_concat_axis", "bx_slice_last_axis", "bx_set_slice_last_axis",
         "bx_slice_axis", "bx_set_slice_axis", "bx_stack2", "bx_window_2d", "bx_tile_last_axis", "bx_repeat_elements",

@@ -1,4 +1,8 @@
 #nullable enable
+AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.WeightNorm(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! direction, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gain, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int columns, float epsilon) -> void
+AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.WeightNormDirectionGradient(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradOutput, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! direction, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gain, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! stats, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradDirection, int rows, int columns, bool accumulate) -> void
+AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.WeightNormGainGradient(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! stats, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradGain, int rows, bool accumulate) -> void
+AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.WeightNormStats(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradOutput, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! direction, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! stats, int rows, int columns, float epsilon) -> void
 AiDotNet.Tensors.Helpers.SecureSeededRandom.Dispose() -> void
 AiDotNet.Tensors.LinearAlgebra.Tensor<T>.ToDLPack(AiDotNet.Tensors.Interop.DLPackStream consumerStream = default(AiDotNet.Tensors.Interop.DLPackStream)) -> nint
 AiDotNet.Tensors.LinearAlgebra.Tensor<T>.ToDLPackLegacy(AiDotNet.Tensors.Interop.DLPackStream consumerStream = default(AiDotNet.Tensors.Interop.DLPackStream)) -> nint
