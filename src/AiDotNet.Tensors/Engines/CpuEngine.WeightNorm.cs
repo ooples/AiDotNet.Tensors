@@ -131,6 +131,13 @@ public partial class CpuEngine
             }, deterministicSafe: true);
             return;
         }
+        WeightNormForwardRowsGeneric(direction, gain, output, rows, columns, epsilon);
+    }
+
+    [ScalarKernel("Element types other than float and double require their numeric operations; float and double use the SIMD row kernels above.")]
+    private static void WeightNormForwardRowsGeneric<T>(ReadOnlyMemory<T> direction, ReadOnlyMemory<T> gain,
+        Memory<T> output, int rows, int columns, double epsilon)
+    {
         var ops = MathHelper.GetNumericOperations<T>();
         var epsilonValue = ops.FromDouble(epsilon);
         CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * columns, row =>
@@ -220,6 +227,15 @@ public partial class CpuEngine
             }, deterministicSafe: true);
             return;
         }
+        WeightNormBackwardRowsGeneric(gradOutput, direction, gain, gradDirection, gradGain, writeDirection, writeGain,
+            rows, columns, epsilon, accumulateDirection, accumulateGain);
+    }
+
+    [ScalarKernel("Element types other than float and double require their numeric operations; float and double use the SIMD row VJP above.")]
+    private static void WeightNormBackwardRowsGeneric<T>(ReadOnlyMemory<T> gradOutput, ReadOnlyMemory<T> direction,
+        ReadOnlyMemory<T> gain, Memory<T> gradDirection, Memory<T> gradGain, bool writeDirection, bool writeGain,
+        int rows, int columns, double epsilon, bool accumulateDirection, bool accumulateGain)
+    {
         var ops = MathHelper.GetNumericOperations<T>();
         var epsilonValue = ops.FromDouble(epsilon);
         CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * columns, row =>
@@ -287,8 +303,15 @@ public partial class CpuEngine
         }
         else
         {
-            for (int i = 0; i < values.Length; i++) output[i] = accumulate ? ops.Add(output[i], values[i]) : values[i];
+            CommitWeightNormStridedResult(output, values, accumulate);
         }
         output.IncrementVersion();
+    }
+
+    [ScalarKernel("Only the strided alias fallback uses logical tensor writes to preserve arbitrary layout and copy-on-write; contiguous destinations use span operations above.")]
+    private static void CommitWeightNormStridedResult<T>(Tensor<T> output, T[] values, bool accumulate)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < values.Length; i++) output[i] = accumulate ? ops.Add(output[i], values[i]) : values[i];
     }
 }
