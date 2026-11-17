@@ -520,4 +520,46 @@ public sealed class CompiledOptimizerHandoverIsolationTests
             Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
         }
     }
+
+    [Fact]
+    public void Foreign_type_no_grad_in_place_write_preserves_prior_writer_gradient_only()
+    {
+        var engine = new CpuEngine();
+        var master = new Tensor<float>(new[] { 2f, -1.5f }, new[] { 2 });
+        var detached = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        var parameters = new[] { master, detached };
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            Tensor<Half> CastMaster(Tensor<float> value, string name) =>
+                scope.RecordCrossTypeWithBackward<float, Half>(
+                    LazyNodeType.Custom, name, value, new[] { 2 },
+                    (e, o) => MixedPrecisionCast.CastToFp16(value).AsSpan().CopyTo(o.AsWritableSpan()),
+                    (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradient));
+            var halfMaster = CastMaster(master, "LiveMasterToHalf");
+            var halfDetached = CastMaster(detached, "DetachedOperandToHalf");
+            var live = engine.TensorMultiplyScalar(halfMaster, (Half)3);
+            using (new NoGradScope<Half>())
+                engine.TensorAddInPlace(live, halfDetached);
+            var halfLoss = engine.ReduceSum(live, null, false);
+            var loss = scope.RecordCrossTypeWithBackward<Half, float>(
+                LazyNodeType.Custom, "PriorWriterLossToFloat", halfLoss, halfLoss.Shape.ToArray(),
+                (e, o) => MixedPrecisionCast.CastToFp32(halfLoss).AsSpan().CopyTo(o.AsWritableSpan()),
+                (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradient));
+            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters, loss));
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.1);
+            // Forward sum: (3 * 2 + 1) + (3 * -1.5 + 2) = 4.5.
+            // NoGrad addition passes the prior writer's identity gradient, not its added operand's.
+            Assert.Equal(4.5f, plan.Step().ToArray()[0]);
+            Assert.Equal(new[] { 3f, 3f }, plan.Gradients[0].ToArray());
+            Assert.Equal(new[] { 0f, 0f }, plan.Gradients[1].ToArray());
+            Assert.InRange(Math.Abs(master[0] - (2f - 0.1f * 3f)), 0, 1e-6f);
+            Assert.InRange(Math.Abs(master[1] - (-1.5f - 0.1f * 3f)), 0, 1e-6f);
+            Assert.Equal(new[] { 1f, 2f }, detached.ToArray());
+            Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
+        }
+    }
 }
