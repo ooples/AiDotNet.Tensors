@@ -4240,6 +4240,38 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return owned.Buffer;
     }
 
+    // Tensors whose bound device buffer holds their current value while the host copy may lag: parameters an optimizer
+    // updated in place (CommitParameterUpdatedOnDevice) and the in-place state a compiled plan keeps on the device (a
+    // BatchNorm running statistic). Keyed by tensor, with that buffer; weak, so an entry goes with its tensor.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, IGpuBuffer> _deviceAuthoritativeParameters = new();
+
+    /// <summary>
+    /// Whether <paramref name="tensor"/> is still bound to a device buffer its owner updates on the device (see
+    /// <see cref="NoteBoundDeviceAuthoritative"/>): the device copy is the authoritative one and the host copy may be
+    /// stale. Another compiled plan that reads such a tensor (a GAN generator's step reading the discriminator's
+    /// weights and running statistics) must read that buffer, not upload the tensor's host copy into one of its own.
+    /// </summary>
+    internal bool IsBoundDeviceAuthoritative<T>(Tensor<T> tensor)
+    {
+        // Buffer identity only, on every backend: a handle is no liveness test there (a WebGPU buffer's Handle is always
+        // zero). Reading the bound buffer is what any eager op on the tensor does; a captured graph, which bakes the
+        // pointer in, re-checks the handle before each replay (CompiledTrainingPlan.ForeignParametersStillBound).
+        if (tensor._gpuBuffer is not { } bound) return false;
+        lock (_deviceAuthoritativeParameters)
+            return _deviceAuthoritativeParameters.TryGetValue(tensor, out var committed) && ReferenceEquals(committed, bound);
+    }
+
+    /// <summary>Records that <paramref name="tensor"/>'s current value lives in <paramref name="buffer"/>, its binding,
+    /// which its owner updates on the device.</summary>
+    internal void NoteBoundDeviceAuthoritative(object tensor, IGpuBuffer buffer)
+    {
+        lock (_deviceAuthoritativeParameters)
+        {
+            _deviceAuthoritativeParameters.Remove(tensor);
+            _deviceAuthoritativeParameters.Add(tensor, buffer);
+        }
+    }
+
     /// <summary>
     /// Records that an optimizer updated <paramref name="param"/>'s device buffer in place (PyTorch-style: the
     /// weights live on the device). The device copy becomes authoritative: forwards read it (the persistent-cache
@@ -4287,6 +4319,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = param.GetBackingArrayForCacheLookupUnsafe();
         param._gpuBuffer = buffer;
         param._gpuBackend = backend;
+        NoteBoundDeviceAuthoritative(param, buffer);
         if (arr is not null)
         {
             Helpers.HostSync.Remove(arr);
