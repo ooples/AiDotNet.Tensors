@@ -72,4 +72,19 @@ public sealed class CpuStorageAllocationDiagnosticsTests
         }
         finally { ArrayPool<float>.Shared.Return(workspace); }
     }
+
+    [SkippableFact]
+    public void PrivateBlasPoolRequestsStayDistinctFromPersistentBackingCapacity()
+    {
+        Skip.IfNot(CpuStorageAllocationDiagnostics.Enabled, "Set AIDOTNET_BUFFER_ALLOC_DIAG=1 before process launch.");
+        static long Counter(string unit) => Convert.ToInt64(CpuStorageAllocationDiagnostics.Snapshot()[unit]);
+        var pool = new AiDotNet.Tensors.Engines.BlasManaged.PerThreadPool();
+        long beforeBytes = Counter("bytes"), beforeCount = Counter("count");
+        pool.RentPackA(10);
+        pool.RentPackA(5);
+        pool.RentPackB(8);
+        Assert.Equal(23, Counter("bytes") - beforeBytes);
+        Assert.Equal(3, Counter("count") - beforeCount);
+        Assert.Equal(18, pool.TotalBytesHeld);
+    }
 }
