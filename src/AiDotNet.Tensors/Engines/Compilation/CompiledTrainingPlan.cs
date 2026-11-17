@@ -917,6 +917,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     internal void DisableGraphStep()
     {
+        // Only an explicit decision made before graph preparation authorizes cross-plan backing reuse.
+        // A failed/retired capture can leave pointer-bearing native caches even after its graph handle is gone.
+        _workspaceExplicitGraphDisable = !_graphPreparationStarted && GraphCaptureFailureReason is null;
+
         InvalidateCapturedStepGraph();
         _graphStepDisabled = true;
     }
@@ -4344,6 +4348,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (!_graphEvictionSuspended) { gte.BeginGraphLifetime(); _graphEvictionSuspended = true; }
                 if (_stepGraphExec == IntPtr.Zero)
                 {
+                    _graphPreparationStarted = true;
+
                     ReleaseUnusedMemoryBeforeFirstResidentStep(gte);
                     // Nothing else on the engine starts compiled GPU work while this records (see
                     // DirectGpuTensorEngine.NoteCompiledStepThread); released when this block exits.
@@ -5328,7 +5334,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_scratchPool is { } leasingPool)
         {
             leasingPool.FirstLeasedAction = leaseBackwardOutputs ? _forwardActions.Length : int.MaxValue;
-            _workspaceSharingBodyAllowed = CanShareTransientWorkspace(redirectEngine!);
+            _workspaceSharingBodyAllowed = redirectEngine is not null && CanShareTransientWorkspace(redirectEngine);
             leasingPool.WorkspaceBroker = _workspaceSharingBodyAllowed
                 ? redirectEngine!.CompiledWorkspaceBroker : null;
         }

@@ -17,13 +17,16 @@ internal sealed partial class CompiledTrainingPlan<T>
     private readonly HashSet<IGpuBuffer> _workspaceCandidates = new(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
     private readonly List<Tensor<T>> _workspaceDetach = new();
     private bool _workspaceSharingBodyAllowed;
+    private bool _workspaceExplicitGraphDisable;
+    private bool _graphPreparationStarted;
     internal long SharedWorkspaceBytesLastStep { get; private set; }
     internal int SharedWorkspaceSlotsLastStep { get; private set; }
 
     // Capturable plans keep private stable pointers for their complete lifetime. The foreign-leaf guard's sticky
     // DisableGraphStep decision is authoritative; a transient capture failure or warmup is not permission to share.
     private bool CanShareTransientWorkspace(DirectGpuTensorEngine engine) => ShareTransientWorkspaceForTests
-        && typeof(T) == typeof(float) && _graphStepDisabled && _graphStepEligible && !HasLiveStepGraph
+        && typeof(T) == typeof(float) && _workspaceExplicitGraphDisable && !_graphPreparationStarted
+        && _graphStepDisabled && _graphStepEligible && !HasLiveStepGraph
         && !_residentStepFailed && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null
         && !_isFrozenWeights && _lastBackwardReads is not null && _forwardSteps is not null
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers

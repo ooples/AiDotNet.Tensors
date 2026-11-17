@@ -116,6 +116,7 @@ public sealed class CompiledGpuSharedWorkspaceTests
 
     [SkippableTheory]
     [InlineData("capturable")]
+    [InlineData("capture_failure")]
     [InlineData("observer")]
     [InlineData("sanitize")]
     public void PotentialCaptureAndObservationKeepPrivateBacking(string mode)
@@ -127,11 +128,21 @@ public sealed class CompiledGpuSharedWorkspaceTests
         try
         {
             AiDotNetEngine.Current = gpu;
-            using var plan = Compile(gpu, Values(8, 8, 1), Values(8, 8, 2), false, mode != "capturable");
+            using var plan = Compile(gpu, Values(8, 8, 1), Values(8, 8, 2), false,
+                mode is not ("capturable" or "capture_failure"));
+            if (mode == "capture_failure") plan.FailNextCaptureForTesting = true;
             if (mode == "observer") CompiledTrainingPlan<float>.ForwardStepObserver = (_, _, _) => { };
             if (mode == "sanitize") CompiledTrainingPlan<float>.SanitizeForwardBuffers = true;
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < (mode == "capture_failure" ? 8 : 4); i++)
             {
+                Assert.True(float.IsFinite(plan.Step().ToArray()[0]));
+                Assert.Equal(0, plan.SharedWorkspaceBytesLastStep);
+            }
+            if (mode == "capture_failure")
+            {
+                Assert.Contains("capture failure forced for testing", Assert.IsType<string>(plan.GraphCaptureFailureReason));
+                // A later explicit disable cannot authorize backing that has already participated in graph preparation.
+                plan.DisableGraphStep();
                 Assert.True(float.IsFinite(plan.Step().ToArray()[0]));
                 Assert.Equal(0, plan.SharedWorkspaceBytesLastStep);
             }
