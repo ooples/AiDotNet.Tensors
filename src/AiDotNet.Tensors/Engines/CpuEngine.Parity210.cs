@@ -1908,11 +1908,21 @@ public partial class CpuEngine
             || typeof(T) == typeof(uint) || typeof(T) == typeof(long) || typeof(T) == typeof(ulong)
             || typeof(T) == typeof(Bit) || typeof(T) == typeof(bool);
 
+    private static bool CanRepresentNonFiniteRealValues<T>()
+        => typeof(T) == typeof(float) || typeof(T) == typeof(double) || typeof(T) == typeof(Half)
+            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)
+            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.Float8E4M3)
+            || typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.Float8E5M2);
+
     private static Tensor<Bit> ClassifySparseRealValues<T>(SparseTensor<T> sparse, bool infinityOnly)
     {
         var result = new Bit[sparse.Length];
         // Implicit zeros are finite and never infinite.
         if (!infinityOnly) result.AsSpan().Fill(Bit.True);
+        // Non-floating real types cannot represent NaN or infinity, and coalescing duplicate
+        // decimal.MaxValue entries would overflow checked addition.
+        if (!CanRepresentNonFiniteRealValues<T>())
+            return new Tensor<Bit>(result, sparse._shape);
         var coalesced = sparse.Coalesce();
         if (coalesced.NonZeroCount > 0)
         {

@@ -4,6 +4,13 @@ namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
 
 internal static class FusedOptimizerCheckpointSerializer
 {
+    private const int MaxUntrustedScheduleCount = 1_048_576;
+    private const int MaxUntrustedScheduleElements = 65_536;
+    private const int MaxUntrustedParameterCount = 4_194_304;
+    private const int MaxLbfgsMemorySize = 4096;
+    private const long MaxUntrustedMetadataBytes = 16L * 1024 * 1024;
+    private const long MaxUntrustedParameterBufferBytes = 256L * 1024 * 1024;
+
     internal static void Write(BinaryWriter writer, FusedOptimizerCheckpoint? checkpoint)
     {
         if (checkpoint is not null) ValidateStateMetadata(checkpoint);
@@ -40,45 +47,82 @@ internal static class FusedOptimizerCheckpointSerializer
     }
 
     /// <param name="reader">The reader positioned at the checkpoint.</param>
-    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader)
+    /// <param name="doubleHyperparameters">Whether beta1, beta2, epsilon and weight decay were written as double.</param>
+    /// <param name="hasVelocityIncludesLearningRate">Whether the extras end with the VelocityIncludesLearningRate flag.</param>
+    /// <param name="hasEnrollmentMetadata">Whether fixed active domain, per-parameter accepted-update ages, and L-BFGS history are serialized.</param>
+    /// <param name="expectedParameterLengths">Optional canonical parameter element lengths known by the caller before reading.</param>
+    internal static FusedOptimizerCheckpoint? Read(
+        BinaryReader reader,
+        bool doubleHyperparameters = true,
+        bool hasVelocityIncludesLearningRate = true,
+        bool hasEnrollmentMetadata = true,
+        int[]? expectedParameterLengths = null)
     {
         if (!reader.ReadBoolean()) return null;
+        double ReadHyperparameter() => doubleHyperparameters ? reader.ReadDouble() : reader.ReadSingle();
+
+        int? expectedParamCount = expectedParameterLengths?.Length;
+        long? expectedTotalElements = null;
+        if (expectedParameterLengths is not null)
+        {
+            long sum = 0;
+            for (int i = 0; i < expectedParameterLengths.Length; i++)
+                sum = checked(sum + expectedParameterLengths[i]);
+            expectedTotalElements = sum;
+        }
 
         var checkpoint = new FusedOptimizerCheckpoint
         {
             OptimizerType = (OptimizerType)reader.ReadInt32(),
             IsGrouped = reader.ReadBoolean(),
             OptimizerStep = reader.ReadInt32(),
-            Beta1 = reader.ReadDouble(),
-            Beta2 = reader.ReadDouble(),
-            Epsilon = reader.ReadDouble(),
-            WeightDecay = reader.ReadDouble(),
+            Beta1 = ReadHyperparameter(),
+            Beta2 = ReadHyperparameter(),
+            Epsilon = ReadHyperparameter(),
+            WeightDecay = ReadHyperparameter(),
             MomentStorageMode = (FusedMomentStorageMode)reader.ReadInt32(),
             Int8MomentBlockSize = reader.ReadInt32(),
             Int8MinQuantizedLength = reader.ReadInt32(),
             MaxGradNorm = reader.ReadDouble(),
-            Extras = ReadExtras(reader),
-            Schedules = ReadLrSchedules(reader),
-            ParamToGroup = ReadIntArray(reader),
-            GroupOptimizerTypes = ReadOptimizerTypeArray(reader),
-            GroupWeightDecays = ReadDoubleArray(reader),
-            Scalars = ReadScalars(reader),
-            FixedActiveDomain = ReadFixedActiveDomain(reader),
+            Extras = ReadExtras(reader, hasVelocityIncludesLearningRate),
         };
+        checkpoint.Schedules = ReadLrSchedules(reader, expectedParamCount);
+        int maxParamGroupEntries = expectedParamCount ?? MaxUntrustedParameterCount;
+        checkpoint.ParamToGroup = ReadIntArray(reader, maxParamGroupEntries);
+        if (expectedParamCount is int exactParamCount
+            && checkpoint.ParamToGroup is { } p2g
+            && p2g.Length != exactParamCount)
+        {
+            throw new InvalidDataException("Optimizer parameter-to-group mapping count does not match the canonical parameter count.");
+        }
+        int maxGroupEntries = Math.Max(checkpoint.Schedules.Length, expectedParamCount ?? MaxUntrustedScheduleCount);
+        checkpoint.GroupOptimizerTypes = ReadOptimizerTypeArray(reader, maxGroupEntries);
+        checkpoint.GroupWeightDecays = doubleHyperparameters
+            ? ReadDoubleArray(reader, maxGroupEntries)
+            : ReadFloatArray(reader, maxGroupEntries) is { } singles ? System.Array.ConvertAll(singles, wd => (double)wd) : null;
+        checkpoint.Scalars = ReadScalars(reader);
+        checkpoint.FixedActiveDomain = hasEnrollmentMetadata ? ReadFixedActiveDomain(reader, expectedParamCount) : null;
 
         int paramCount = reader.ReadInt32();
         if (paramCount < 0)
             throw new InvalidDataException($"Fused optimizer parameter-state count {paramCount} cannot be negative.");
+        if (expectedParamCount is int expectedCount && paramCount != expectedCount)
+            throw new InvalidDataException("Optimizer parameter-state count does not match the canonical parameter count.");
         if (checkpoint.FixedActiveDomain is { } domain && domain.Length != paramCount)
             throw new InvalidDataException("The fixed active domain must contain one entry per canonical parameter.");
-        // Each parameter state writes its age and at least 12 array-length prefixes even when every
-        // array is null, so bound the count against the remaining stream before allocating — a corrupt
-        // count (e.g. 0x7FFFFFFF) would otherwise allocate a multi-GB array up front.
-        EnsureFitsRemaining(reader, (long)paramCount * (sizeof(long) + 12 * sizeof(int)), "parameter-state array");
+        if (paramCount > MaxUntrustedParameterCount)
+            throw new InvalidDataException($"Fused optimizer parameter-state count {paramCount} exceeds maximum {MaxUntrustedParameterCount}.");
+        // Each parameter state writes its age (in v6+) and at least 12 array-length prefixes even when every
+        // array is null, so bound the count against both the stream and the untrusted metadata budget before allocating.
+        EnsureFitsBudget(
+            reader,
+            (long)paramCount * ((hasEnrollmentMetadata ? sizeof(long) : 0) + 12 * sizeof(int)),
+            MaxUntrustedMetadataBytes,
+            "parameter-state array");
         checkpoint.Parameters = new FusedOptimizerParameterCheckpoint[paramCount];
         for (int i = 0; i < paramCount; i++)
-            checkpoint.Parameters[i] = ReadParameter(reader);
-        checkpoint.LbfgsHistory = ReadLbfgsHistory(reader);
+            checkpoint.Parameters[i] = ReadParameter(reader, hasEnrollmentMetadata, checkpoint.OptimizerStep, expectedParameterLengths?[i]);
+        checkpoint.LbfgsHistory = hasEnrollmentMetadata ? ReadLbfgsHistory(reader, checkpoint, expectedTotalElements) : null;
         ValidateStateMetadata(checkpoint);
         return checkpoint;
     }
@@ -144,11 +188,19 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < h.S.Length; i++) { WriteFloatArray(writer, h.S[i]); WriteFloatArray(writer, h.Y[i]); }
     }
 
-    private static FusedLbfgsHistoryCheckpoint? ReadLbfgsHistory(BinaryReader reader)
+    private static FusedLbfgsHistoryCheckpoint? ReadLbfgsHistory(
+        BinaryReader reader,
+        FusedOptimizerCheckpoint checkpoint,
+        long? expectedTotalElements)
     {
         byte present = reader.ReadByte();
         if (present == 0) return null;
         if (present != 1) throw new InvalidDataException("Invalid L-BFGS history presence flag.");
+        if (checkpoint.OptimizerType != OptimizerType.LBFGS || checkpoint.IsGrouped)
+            throw new InvalidDataException("L-BFGS history is required exactly for an ungrouped L-BFGS optimizer.");
+        int memory = Math.Max(1, checkpoint.Extras.LbfgsMemorySize);
+        if (memory > MaxLbfgsMemorySize)
+            throw new InvalidDataException($"L-BFGS history memory size {memory} exceeds maximum {MaxLbfgsMemorySize}.");
         var h = new FusedLbfgsHistoryCheckpoint
         {
             Count = reader.ReadInt32(), Head = reader.ReadInt32(),
@@ -157,17 +209,24 @@ internal static class FusedOptimizerCheckpointSerializer
         if (hasPrev > 1) throw new InvalidDataException("Invalid L-BFGS previous-iterate flag.");
         h.HasPrev = hasPrev == 1;
         h.GammaNum = reader.ReadSingle(); h.GammaDen = reader.ReadSingle();
-        h.PrevParam = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS previous parameters.");
-        h.PrevGrad = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS previous gradient.");
-        h.Rho = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS curvature reciprocals.");
+        int maxVectorWidth = expectedTotalElements is long total && total <= int.MaxValue
+            ? (int)total
+            : (int)(MaxUntrustedParameterBufferBytes / sizeof(float));
+        h.PrevParam = ReadFloatArray(reader, maxVectorWidth) ?? throw new InvalidDataException("Missing L-BFGS previous parameters.");
+        if (expectedTotalElements is long exactTotal && h.PrevParam.LongLength != exactTotal)
+            throw new InvalidDataException("L-BFGS history width does not match the plan's canonical parameter layout.");
+        h.PrevGrad = ReadFloatArray(reader, h.PrevParam.Length) ?? throw new InvalidDataException("Missing L-BFGS previous gradient.");
+        h.Rho = ReadFloatArray(reader, memory) ?? throw new InvalidDataException("Missing L-BFGS curvature reciprocals.");
         int count = reader.ReadInt32();
         if (count < 0) throw new InvalidDataException("Negative L-BFGS history size.");
-        EnsureFitsRemaining(reader, (long)count * 2 * sizeof(int), "L-BFGS history");
+        if (count != memory)
+            throw new InvalidDataException("Invalid L-BFGS history dimensions or ring position.");
+        EnsureFitsBudget(reader, (long)count * 2 * sizeof(int), MaxUntrustedMetadataBytes, "L-BFGS history");
         h.S = new float[count][]; h.Y = new float[count][];
         for (int i = 0; i < count; i++)
         {
-            h.S[i] = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS displacement.");
-            h.Y[i] = ReadFloatArray(reader) ?? throw new InvalidDataException("Missing L-BFGS gradient difference.");
+            h.S[i] = ReadFloatArray(reader, h.PrevParam.Length) ?? throw new InvalidDataException("Missing L-BFGS displacement.");
+            h.Y[i] = ReadFloatArray(reader, h.PrevParam.Length) ?? throw new InvalidDataException("Missing L-BFGS gradient difference.");
         }
         return h;
     }
@@ -179,12 +238,16 @@ internal static class FusedOptimizerCheckpointSerializer
             foreach (bool active in domain) writer.Write((byte)(active ? 1 : 0));
     }
 
-    private static bool[]? ReadFixedActiveDomain(BinaryReader reader)
+    private static bool[]? ReadFixedActiveDomain(BinaryReader reader, int? expectedParameterCount)
     {
         int count = reader.ReadInt32();
         if (count == -1) return null;
         if (count < 0) throw new InvalidDataException("The fixed active domain count cannot be negative.");
-        EnsureFitsRemaining(reader, count, "fixed active domain");
+        if (expectedParameterCount is int expected && count != expected)
+            throw new InvalidDataException("The fixed active domain must contain one entry per canonical parameter.");
+        if (count > MaxUntrustedParameterCount)
+            throw new InvalidDataException($"The fixed active domain count {count} exceeds maximum {MaxUntrustedParameterCount}.");
+        EnsureFitsBudget(reader, count, MaxUntrustedMetadataBytes, "fixed active domain");
         var domain = new bool[count];
         for (int i = 0; i < count; i++)
         {
@@ -252,7 +315,7 @@ internal static class FusedOptimizerCheckpointSerializer
         return present ? value : null;
     }
 
-    private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
+    private static FusedOptimizerExtras ReadExtras(BinaryReader reader, bool hasVelocityIncludesLearningRate)
         => new FusedOptimizerExtras
         {
             Momentum = reader.ReadSingle(),
@@ -283,7 +346,7 @@ internal static class FusedOptimizerCheckpointSerializer
             AmsgradDisableBiasCorrection = reader.ReadBoolean(),
             AmsgradExactBeta1 = ReadNullableDouble(reader),
             AmsgradExactBeta2 = ReadNullableDouble(reader),
-            VelocityIncludesLearningRate = reader.ReadBoolean(),
+            VelocityIncludesLearningRate = hasVelocityIncludesLearningRate && reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)
@@ -297,21 +360,24 @@ internal static class FusedOptimizerCheckpointSerializer
         }
     }
 
-    private static FusedLrScheduleCheckpoint[] ReadLrSchedules(BinaryReader reader)
+    private static FusedLrScheduleCheckpoint[] ReadLrSchedules(BinaryReader reader, int? expectedParameterCount)
     {
         int count = reader.ReadInt32();
         if (count < 0)
             throw new InvalidDataException($"Fused optimizer LR schedule count {count} cannot be negative.");
+        int maxSchedules = expectedParameterCount is int pCount ? Math.Max(1, pCount) : MaxUntrustedScheduleCount;
+        if (count > maxSchedules)
+            throw new InvalidDataException($"Fused optimizer LR schedule count {count} exceeds maximum {maxSchedules}.");
         // Each schedule writes kind(4) + a double[] + an int[] (>= 4 bytes each) → >= 12 bytes.
-        EnsureFitsRemaining(reader, (long)count * (sizeof(int) + 2 * sizeof(int)), "LR schedule");
+        EnsureFitsBudget(reader, (long)count * (sizeof(int) + 2 * sizeof(int)), MaxUntrustedMetadataBytes, "LR schedule");
         var schedules = new FusedLrScheduleCheckpoint[count];
         for (int i = 0; i < count; i++)
         {
             schedules[i] = new FusedLrScheduleCheckpoint
             {
                 Kind = (FusedLrScheduleKind)reader.ReadInt32(),
-                Doubles = ReadDoubleArray(reader) ?? System.Array.Empty<double>(),
-                Ints = ReadIntArray(reader) ?? System.Array.Empty<int>(),
+                Doubles = ReadDoubleArray(reader, MaxUntrustedScheduleElements) ?? System.Array.Empty<double>(),
+                Ints = ReadIntArray(reader, MaxUntrustedScheduleElements) ?? System.Array.Empty<int>(),
             };
             // Reject unknown kinds / wrong arity now, so a malformed schedule fails at load rather
             // than throwing IndexOutOfRange deep inside GetLr mid-training.
@@ -356,23 +422,33 @@ internal static class FusedOptimizerCheckpointSerializer
         WriteDoubleArray(writer, p.VScales);
     }
 
-    private static FusedOptimizerParameterCheckpoint ReadParameter(BinaryReader reader)
-        => new FusedOptimizerParameterCheckpoint
+    private static FusedOptimizerParameterCheckpoint ReadParameter(
+        BinaryReader reader,
+        bool hasEnrollmentMetadata,
+        int defaultAcceptedUpdates,
+        int? expectedParameterLength)
+    {
+        int maxFloatElems = expectedParameterLength ?? (int)(MaxUntrustedParameterBufferBytes / sizeof(float));
+        int maxDoubleElems = expectedParameterLength ?? (int)(MaxUntrustedParameterBufferBytes / sizeof(double));
+        int maxUShortElems = expectedParameterLength ?? (int)(MaxUntrustedParameterBufferBytes / sizeof(ushort));
+        int maxByteElems = expectedParameterLength ?? (int)MaxUntrustedParameterBufferBytes;
+        return new FusedOptimizerParameterCheckpoint
         {
-            AcceptedUpdates = reader.ReadInt64(),
-            MFloat = ReadFloatArray(reader),
-            VFloat = ReadFloatArray(reader),
-            VMaxFloat = ReadFloatArray(reader),
-            MDouble = ReadDoubleArray(reader),
-            VDouble = ReadDoubleArray(reader),
-            VMaxDouble = ReadDoubleArray(reader),
-            MBFloat16 = ReadUShortArray(reader),
-            VBFloat16 = ReadUShortArray(reader),
-            MQuantized = ReadByteArray(reader),
-            VQuantized = ReadByteArray(reader),
-            MScales = ReadDoubleArray(reader),
-            VScales = ReadDoubleArray(reader),
+            AcceptedUpdates = hasEnrollmentMetadata ? reader.ReadInt64() : defaultAcceptedUpdates,
+            MFloat = ReadFloatArray(reader, maxFloatElems),
+            VFloat = ReadFloatArray(reader, maxFloatElems),
+            VMaxFloat = ReadFloatArray(reader, maxFloatElems),
+            MDouble = ReadDoubleArray(reader, maxDoubleElems),
+            VDouble = ReadDoubleArray(reader, maxDoubleElems),
+            VMaxDouble = ReadDoubleArray(reader, maxDoubleElems),
+            MBFloat16 = ReadUShortArray(reader, maxUShortElems),
+            VBFloat16 = ReadUShortArray(reader, maxUShortElems),
+            MQuantized = ReadByteArray(reader, maxByteElems),
+            VQuantized = ReadByteArray(reader, maxByteElems),
+            MScales = ReadDoubleArray(reader, maxDoubleElems),
+            VScales = ReadDoubleArray(reader, maxDoubleElems),
         };
+    }
 
     private static void WriteFloatArray(BinaryWriter writer, float[]? values)
     {
@@ -381,9 +457,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write(values[i]);
     }
 
-    private static float[]? ReadFloatArray(BinaryReader reader)
+    private static float[]? ReadFloatArray(BinaryReader reader, int maxElements)
     {
-        int length = ReadArrayLength(reader, "float[]", sizeof(float));
+        int length = ReadArrayLength(reader, "float[]", sizeof(float), maxElements);
         if (length < 0) return null;
         var values = new float[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadSingle();
@@ -397,9 +473,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write(values[i]);
     }
 
-    private static double[]? ReadDoubleArray(BinaryReader reader)
+    private static double[]? ReadDoubleArray(BinaryReader reader, int maxElements)
     {
-        int length = ReadArrayLength(reader, "double[]", sizeof(double));
+        int length = ReadArrayLength(reader, "double[]", sizeof(double), maxElements);
         if (length < 0) return null;
         var values = new double[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadDouble();
@@ -413,9 +489,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write(values[i]);
     }
 
-    private static int[]? ReadIntArray(BinaryReader reader)
+    private static int[]? ReadIntArray(BinaryReader reader, int maxElements)
     {
-        int length = ReadArrayLength(reader, "int[]", sizeof(int));
+        int length = ReadArrayLength(reader, "int[]", sizeof(int), maxElements);
         if (length < 0) return null;
         var values = new int[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadInt32();
@@ -429,9 +505,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write((int)values[i]);
     }
 
-    private static OptimizerType[]? ReadOptimizerTypeArray(BinaryReader reader)
+    private static OptimizerType[]? ReadOptimizerTypeArray(BinaryReader reader, int maxElements)
     {
-        int length = ReadArrayLength(reader, "OptimizerType[]", sizeof(int));
+        int length = ReadArrayLength(reader, "OptimizerType[]", sizeof(int), maxElements);
         if (length < 0) return null;
         var values = new OptimizerType[length];
         for (int i = 0; i < length; i++) values[i] = (OptimizerType)reader.ReadInt32();
@@ -445,9 +521,9 @@ internal static class FusedOptimizerCheckpointSerializer
         for (int i = 0; i < values.Length; i++) writer.Write(values[i]);
     }
 
-    private static ushort[]? ReadUShortArray(BinaryReader reader)
+    private static ushort[]? ReadUShortArray(BinaryReader reader, int maxElements)
     {
-        int length = ReadArrayLength(reader, "ushort[]", sizeof(ushort));
+        int length = ReadArrayLength(reader, "ushort[]", sizeof(ushort), maxElements);
         if (length < 0) return null;
         var values = new ushort[length];
         for (int i = 0; i < length; i++) values[i] = reader.ReadUInt16();
@@ -461,9 +537,9 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(values);
     }
 
-    private static byte[]? ReadByteArray(BinaryReader reader)
+    private static byte[]? ReadByteArray(BinaryReader reader, int maxElements)
     {
-        int length = ReadArrayLength(reader, "byte[]", 1);
+        int length = ReadArrayLength(reader, "byte[]", 1, maxElements);
         if (length < 0) return null;
         var values = reader.ReadBytes(length);
         if (values.Length != length)
@@ -472,26 +548,33 @@ internal static class FusedOptimizerCheckpointSerializer
         return values;
     }
 
-    private static int ReadArrayLength(BinaryReader reader, string field, int bytesPerElement)
+    private static int ReadArrayLength(BinaryReader reader, string field, int bytesPerElement, int maxElements)
     {
         int length = reader.ReadInt32();
         if (length < -1)
             throw new InvalidDataException($"Fused optimizer {field} length {length} is invalid.");
+        if (length > maxElements)
+            throw new InvalidDataException(
+                $"Fused optimizer {field} length {length} exceeds maximum allowed {maxElements}.");
         if (length > 0)
-            EnsureFitsRemaining(reader, (long)length * bytesPerElement, field);
+            EnsureFitsBudget(reader, (long)length * bytesPerElement, MaxUntrustedParameterBufferBytes, field);
         return length;
     }
 
     /// <summary>
-    /// Guards against a corrupt/truncated checkpoint claiming an element count whose payload can't
-    /// fit the remaining stream — allocating for it first would let a bad file OOM the process. Only
-    /// enforceable on a seekable stream; on a non-seekable stream the per-element reads still fail on
-    /// EOF, just without the up-front allocation guard.
+    /// Guards against a corrupt/truncated checkpoint claiming an element count whose payload exceeds
+    /// either the remaining seekable stream bytes or the non-seekable allocation budget.
     /// </summary>
-    private static void EnsureFitsRemaining(BinaryReader reader, long requiredBytes, string field)
+    private static void EnsureFitsBudget(BinaryReader reader, long requiredBytes, long nonSeekableBudgetBytes, string field)
     {
         var stream = reader.BaseStream;
-        if (!stream.CanSeek) return;
+        if (!stream.CanSeek)
+        {
+            if (requiredBytes > nonSeekableBudgetBytes)
+                throw new InvalidDataException(
+                    $"Fused optimizer {field} claims {requiredBytes} byte(s), exceeding the non-seekable budget of {nonSeekableBudgetBytes} byte(s).");
+            return;
+        }
         long remaining = stream.Length - stream.Position;
         if (requiredBytes > remaining)
             throw new InvalidDataException(

@@ -133,7 +133,7 @@ internal static class TrainingPlanReader
         if (savedStepCount != stepCount)
             throw new InvalidDataException(
                 $"Training plan step count mismatch: header says {stepCount}, op section says {savedStepCount}.");
-        RequireWithinStream(bodyStream, (long)savedStepCount * 14, nameof(savedStepCount));
+        RequireWithinStream(bodyStream, (long)savedStepCount * PlanFormatConstants.MinTrainingStepDescriptorBytes, nameof(savedStepCount));
         var rawOps = new RawOp[savedStepCount];
         for (int i = 0; i < savedStepCount; i++)
             rawOps[i] = ReadRawOp<T>(reader, tensorTable, bodyStream);
@@ -179,7 +179,9 @@ internal static class TrainingPlanReader
                     throw new InvalidDataException($"Gradient {i} shape does not match its parameter.");
         }
 
-        var optimizerCheckpoint = FusedOptimizerCheckpointSerializer.Read(reader);
+        var expectedParamLengths = new int[paramCount];
+        for (int i = 0; i < paramCount; i++) expectedParamLengths[i] = callerParameters[i].Length;
+        var optimizerCheckpoint = FusedOptimizerCheckpointSerializer.Read(reader, expectedParameterLengths: expectedParamLengths);
         if (optimizerCheckpoint is not null && optimizerCheckpoint.Parameters.Length != paramCount)
             throw new InvalidDataException("Optimizer parameter-state count does not match the canonical parameter count.");
 
@@ -296,10 +298,21 @@ internal static class TrainingPlanReader
             if (optimizerCheckpoint is not null)
             {
                 if (plan is not CompiledTrainingPlan<T> concrete)
+                {
+                    plan.Dispose();
                     throw new InvalidDataException(
                         "Training plan loader produced an unknown ICompiledTrainingPlan implementation; " +
                         "cannot restore fused optimizer checkpoint state.");
-                concrete.RestoreFusedOptimizerCheckpoint(optimizerCheckpoint);
+                }
+                try
+                {
+                    concrete.RestoreFusedOptimizerCheckpoint(optimizerCheckpoint);
+                }
+                catch
+                {
+                    concrete.Dispose();
+                    throw;
+                }
             }
             return plan;
         }
@@ -318,7 +331,7 @@ internal static class TrainingPlanReader
                 $"Training plan op name was truncated: expected {nameLen} bytes, got {nameBytes.Length}.");
         string opName = Encoding.UTF8.GetString(nameBytes);
         byte gradientFlags = reader.ReadByte();
-        if ((gradientFlags & ~3) != 0)
+        if ((gradientFlags & ~PlanFormatConstants.OpGradientFlagsMask) != 0)
             throw new InvalidDataException($"Training plan op '{opName}' has invalid gradient flags {gradientFlags}.");
         int derivativeCount = reader.ReadInt32();
         if (derivativeCount < -1)
@@ -370,7 +383,8 @@ internal static class TrainingPlanReader
         var savedState = SavedStateSerializer.Read<T>(reader, tensorTable);
 
         return new RawOp(opType, opName, inputIds, outputId, savedState,
-            recordedUnderNoGrad: (gradientFlags & 1) != 0, hasBackward: (gradientFlags & 2) != 0,
+            recordedUnderNoGrad: (gradientFlags & PlanFormatConstants.OpGradientFlagRecordedUnderNoGrad) != 0,
+            hasBackward: (gradientFlags & PlanFormatConstants.OpGradientFlagHasBackward) != 0,
             differentiableInputIndices: differentiableInputs);
     }
 

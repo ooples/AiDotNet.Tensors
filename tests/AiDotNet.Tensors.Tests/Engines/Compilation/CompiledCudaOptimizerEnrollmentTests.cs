@@ -20,9 +20,10 @@ public sealed class CompiledCudaOptimizerEnrollmentTests
         if (!backend.IsAvailable)
         {
             backend.Dispose();
-            // In the CUDA lane absence is a failure, never a successful skipped validation.
-            Assert.False(Environment.GetEnvironmentVariable("AIDOTNET_EXPECT_GPU_BACKEND") == "CUDA",
-                "The validation lane requires a working CUDA backend.");
+            // Absence is a failure in any lane that requires a GPU, never a skipped validation.
+            bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1"
+                || Environment.GetEnvironmentVariable("AIDOTNET_EXPECT_GPU_BACKEND") == "CUDA";
+            Assert.False(required, "The validation lane requires a working CUDA backend.");
             Skip.If(true, "No CUDA device available.");
         }
         return backend;
@@ -258,6 +259,50 @@ public sealed class CompiledCudaOptimizerEnrollmentTests
         Assert.Equal(4u, io.AppliedSteps);
         io.PrepareOptimizer([p], [g], [m], [v], [1]);
         Assert.Null(field.GetValue(io));
+    }
+
+    [SkippableFact]
+    public void Frozen_parameter_read_in_sgd_step_graph_preserves_ping_pong_parity_graphs()
+    {
+        using var probe = RequireCuda();
+        var prior = AiDotNetEngine.Current;
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.GetBackend() is CudaBackend, "DirectGpuTensorEngine did not select CudaBackend.");
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var frozen = new Tensor<float>(new[] { 1.5f, -0.5f, 2.0f, 0.25f }, new[] { 2, 2 });
+            var active = new Tensor<float>(new[] { 0.75f, -1.25f, 0.5f, 1.0f }, new[] { 2, 2 });
+            frozen.Gpu();
+            active.Gpu();
+            var parameters = new[] { frozen, active };
+
+            CompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                Tensor<float> frozenTerm;
+                using (new NoGradScope<float>())
+                    frozenTerm = gpu.TensorMultiplyScalar(frozen, 2f);
+                var prod = gpu.TensorMultiply(frozenTerm, active);
+                var loss = gpu.ReduceSum(prod, null, false);
+                plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters, loss));
+            }
+
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.05);
+                for (int s = 0; s < 6; s++) plan.Step();
+
+                if (Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0"
+                    && Environment.GetEnvironmentVariable("AIDOTNET_SGD_PINGPONG") != "0")
+                {
+                    Assert.True(plan.ReplaysParityGraphs, plan.PingPongRejectionReason ?? plan.GraphCaptureFailureReason);
+                }
+                Assert.Equal(new[] { 1.5f, -0.5f, 2.0f, 0.25f }, frozen.ToArray());
+                Assert.Equal(new long[] { 0, 6 }, plan.ParameterAcceptedUpdates);
+            }
+        }
+        finally { AiDotNetEngine.Current = prior; }
     }
 }
 #endif

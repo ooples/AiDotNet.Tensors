@@ -4,8 +4,13 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 internal interface ICompiledForwardNode
 {
     Action<IEngine> CompileForwardAction();
-    void ProtectDeviceState(HashSet<object> keys);
     void DetachDeviceBindings(HashSet<DirectGpu.IGpuBuffer> released, HashSet<IntPtr> handles, HashSet<object> retained);
+}
+
+/// <summary>Protects persistent or in-place device state from post-step intermediate detachment.</summary>
+internal interface IDeviceStateProtectionNode
+{
+    void ProtectDeviceState(HashSet<object> keys);
 }
 
 /// <summary>Describes the gradient boundary of a node crossing element types.</summary>
@@ -14,6 +19,7 @@ internal interface ICrossTypeNodeMetadata
     Type InputElementType { get; }
     Type OutputElementType { get; }
     bool HasBackward { get; }
+    object? DifferentiableInputTensor { get; }
 }
 
 /// <summary>

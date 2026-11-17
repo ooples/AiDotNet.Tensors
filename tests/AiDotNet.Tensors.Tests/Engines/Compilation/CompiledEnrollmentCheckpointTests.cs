@@ -539,6 +539,7 @@ public sealed class CompiledEnrollmentCheckpointTests
         using (var valid = new BinaryReader(new MemoryStream(bytes)))
             Assert.Equal(checkpoint.FixedActiveDomain, Assert.IsType<FusedOptimizerCheckpoint>(FusedOptimizerCheckpointSerializer.Read(valid)).FixedActiveDomain);
         int countOffset = FixedDomainOffset(bytes, checkpoint);
+        Assert.Equal(2, BitConverter.ToInt32(bytes, countOffset));
         BitConverter.GetBytes(invalidCount).CopyTo(bytes, countOffset);
         using var reader = new BinaryReader(new MemoryStream(bytes));
         Assert.Throws<InvalidDataException>(() => FusedOptimizerCheckpointSerializer.Read(reader));
@@ -549,7 +550,9 @@ public sealed class CompiledEnrollmentCheckpointTests
     {
         var checkpoint = DomainCheckpoint();
         var bytes = Serialize(checkpoint);
-        bytes[FixedDomainOffset(bytes, checkpoint) + sizeof(int)] = 2;
+        int countOffset = FixedDomainOffset(bytes, checkpoint);
+        Assert.Equal(2, BitConverter.ToInt32(bytes, countOffset));
+        bytes[countOffset + sizeof(int)] = 2;
         using var reader = new BinaryReader(new MemoryStream(bytes));
         Assert.Throws<InvalidDataException>(() => FusedOptimizerCheckpointSerializer.Read(reader));
     }
@@ -584,9 +587,158 @@ public sealed class CompiledEnrollmentCheckpointTests
         return stream.ToArray();
     }
 
+    private static int ParameterPayloadBytes(FusedOptimizerCheckpoint checkpoint)
+    {
+        int total = checkpoint.Parameters.Length * (sizeof(long) + 12 * sizeof(int));
+        foreach (var p in checkpoint.Parameters)
+        {
+            if (p.MFloat is { } mf) total += mf.Length * sizeof(float);
+            if (p.VFloat is { } vf) total += vf.Length * sizeof(float);
+            if (p.VMaxFloat is { } vmf) total += vmf.Length * sizeof(float);
+            if (p.MDouble is { } md) total += md.Length * sizeof(double);
+            if (p.VDouble is { } vd) total += vd.Length * sizeof(double);
+            if (p.VMaxDouble is { } vmd) total += vmd.Length * sizeof(double);
+            if (p.MBFloat16 is { } mb) total += mb.Length * sizeof(ushort);
+            if (p.VBFloat16 is { } vb) total += vb.Length * sizeof(ushort);
+            if (p.MQuantized is { } mq) total += mq.Length;
+            if (p.VQuantized is { } vq) total += vq.Length;
+            if (p.MScales is { } ms) total += ms.Length * sizeof(double);
+            if (p.VScales is { } vs) total += vs.Length * sizeof(double);
+        }
+        return total;
+    }
+
     private static int FixedDomainOffset(byte[] bytes, FusedOptimizerCheckpoint checkpoint)
-        => bytes.Length - (checkpoint.Parameters.Length * (sizeof(long) + 12 * sizeof(int))
-            + sizeof(int) + Assert.IsType<bool[]>(checkpoint.FixedActiveDomain).Length + sizeof(int));
+        => bytes.Length - (ParameterPayloadBytes(checkpoint)
+            + sizeof(int) + Assert.IsType<bool[]>(checkpoint.FixedActiveDomain).Length + sizeof(int) + sizeof(byte));
+
+    [Fact]
+    public void Non_seekable_checkpoint_stream_rejects_oversized_counts_before_allocation()
+    {
+        var engine = new CpuEngine();
+        var parameters = new[] { Scalar<float>(2), Scalar<float>(3), Scalar<float>(4) };
+        using var plan = Compile(engine, parameters, freezeFirst: true);
+        plan.ConfigureOptimizer(OptimizerType.ConjugateGradient, LrSchedule.Constant(0.02));
+        plan.Step();
+
+        var validExport = Assert.IsType<byte[]>(plan.ExportOptimizerState());
+        using (var nonSeekableValid = new NonSeekableReadStream(validExport))
+            plan.ImportOptimizerState(nonSeekableValid);
+
+        // Corrupt fixed-active-domain count to int.MaxValue inside an ExportOptimizerState payload.
+        var checkpoint = Assert.IsType<FusedOptimizerCheckpoint>(plan.CaptureFusedOptimizerCheckpoint());
+        var corruptDomain = (byte[])validExport.Clone();
+        int domainCountOffset = FixedDomainOffset(corruptDomain, checkpoint);
+        Assert.Equal(3, BitConverter.ToInt32(corruptDomain, domainCountOffset));
+        BitConverter.GetBytes(int.MaxValue).CopyTo(corruptDomain, domainCountOffset);
+        using (var stream = new NonSeekableReadStream(corruptDomain))
+            Assert.Throws<InvalidDataException>(() => plan.ImportOptimizerState(stream));
+
+        // Corrupt parameter-state count to int.MaxValue on an AdamW export.
+        using var adamPlan = Compile(engine, parameters, freezeFirst: false);
+        adamPlan.ConfigureOptimizer(OptimizerType.AdamW, LrSchedule.Constant(0.02));
+        adamPlan.Step();
+        var adamExport = Assert.IsType<byte[]>(adamPlan.ExportOptimizerState());
+        var adamCkpt = Assert.IsType<FusedOptimizerCheckpoint>(adamPlan.CaptureFusedOptimizerCheckpoint());
+        int paramCountOffset = adamExport.Length - (ParameterPayloadBytes(adamCkpt) + sizeof(int) + sizeof(byte));
+        Assert.Equal(3, BitConverter.ToInt32(adamExport, paramCountOffset));
+        var corruptParams = (byte[])adamExport.Clone();
+        BitConverter.GetBytes(int.MaxValue).CopyTo(corruptParams, paramCountOffset);
+        using (var stream = new NonSeekableReadStream(corruptParams))
+            Assert.Throws<InvalidDataException>(() => adamPlan.ImportOptimizerState(stream));
+
+        // Corrupt L-BFGS history ring count to int.MaxValue in non-seekable serializer read.
+        var lbfgs = new FusedOptimizerCheckpoint
+        {
+            OptimizerType = OptimizerType.LBFGS,
+            OptimizerStep = 1,
+            FixedActiveDomain = new[] { true },
+            Extras = new FusedOptimizerExtras { LbfgsMemorySize = 2 },
+            Parameters = new[] { new FusedOptimizerParameterCheckpoint { AcceptedUpdates = 1 } },
+            LbfgsHistory = new FusedLbfgsHistoryCheckpoint
+            {
+                Count = 0,
+                Head = 0,
+                HasPrev = false,
+                PrevParam = new[] { 1f },
+                PrevGrad = new[] { 2f },
+                Rho = new[] { 0f, 0f },
+                S = new[] { new[] { 0f }, new[] { 0f } },
+                Y = new[] { new[] { 0f }, new[] { 0f } },
+            },
+        };
+        var lbfgsBytes = Serialize(lbfgs);
+        // Trailing bytes of L-BFGS history: count(4) + 2 * (S[i](8) + Y[i](8)) = 36 bytes -> count is at Length - 36.
+        int historyCountOffset = lbfgsBytes.Length - (sizeof(int) + 2 * 2 * (sizeof(int) + sizeof(float)));
+        Assert.Equal(2, BitConverter.ToInt32(lbfgsBytes, historyCountOffset));
+        BitConverter.GetBytes(int.MaxValue).CopyTo(lbfgsBytes, historyCountOffset);
+        using var lbfgsStream = new NonSeekableReadStream(lbfgsBytes);
+        using var lbfgsReader = new BinaryReader(lbfgsStream);
+        Assert.Throws<InvalidDataException>(() => FusedOptimizerCheckpointSerializer.Read(lbfgsReader));
+    }
+
+    [Fact]
+    public async Task TrainingPlanReader_disposes_compiled_plan_when_checkpoint_restore_is_rejected()
+    {
+        var engine = new CpuEngine();
+        var parameters = new[] { new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 2, 2 }) };
+        byte[] planBytes;
+        FusedOptimizerCheckpoint sourceCkpt;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var y = engine.TensorLog(engine.TensorExp(parameters[0]));
+            var loss = engine.ReduceSum(y, null, false);
+            using var sourcePlan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters, loss));
+            sourcePlan.ConfigureOptimizer(OptimizerType.ConjugateGradient, LrSchedule.Constant(0.01));
+            sourcePlan.Step();
+            sourceCkpt = Assert.IsType<FusedOptimizerCheckpoint>(sourcePlan.CaptureFusedOptimizerCheckpoint());
+            using var ms = new MemoryStream();
+            await sourcePlan.SaveAsync(ms);
+            planBytes = ms.ToArray();
+        }
+
+        // Flip FixedActiveDomain[0] from true (1) to false (0) and recompute footer checksum so
+        // FusedOptimizerCheckpointSerializer.Read succeeds while RestoreFusedOptimizerCheckpoint rejects domain mismatch.
+        int bodyEnd = planBytes.Length - 16;
+        int domainOffset = bodyEnd - (ParameterPayloadBytes(sourceCkpt)
+            + sizeof(int) + Assert.IsType<bool[]>(sourceCkpt.FixedActiveDomain).Length + sizeof(int) + sizeof(byte));
+        Assert.Equal(1, BitConverter.ToInt32(planBytes, domainOffset));
+        Assert.Equal(1, planBytes[domainOffset + sizeof(int)]);
+        planBytes[domainOffset + sizeof(int)] = 0;
+        RewriteFooter(planBytes);
+
+        using var corruptStream = new MemoryStream(planBytes, writable: false);
+        Assert.Throws<InvalidDataException>(() => TrainingPlanReader.Read<float>(corruptStream, engine, parameters));
+    }
+
+    private sealed class NonSeekableReadStream : Stream
+    {
+        private readonly byte[] _data;
+        private int _position;
+
+        public NonSeekableReadStream(byte[] data) => _data = data;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int available = Math.Min(count, _data.Length - _position);
+            if (available <= 0) return 0;
+            Buffer.BlockCopy(_data, _position, buffer, offset, available);
+            _position += available;
+            return available;
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
 
     private static int FindFirstGradientFlags(byte[] bytes)
         => FindGradientFlags(bytes, null);

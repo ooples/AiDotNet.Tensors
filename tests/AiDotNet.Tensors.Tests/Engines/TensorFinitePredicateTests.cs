@@ -196,4 +196,25 @@ public sealed class TensorFinitePredicateTests
         Assert.All(engine.TensorIsFinite(sparse).ToArray(), bit => Assert.True((bool)bit));
         Assert.All(engine.TensorIsInf(sparse).ToArray(), bit => Assert.False((bool)bit));
     }
+
+    [Fact]
+    public void SparseNonFloatingTypes_SkipCoalescingAndDoNotOverflowOnDuplicateMaxValue()
+    {
+        var engine = new CpuEngine();
+        var decSparse = new SparseTensor<decimal>(
+            2, 2,
+            new[] { 0, 0, 1 },
+            new[] { 1, 1, 0 },
+            new[] { decimal.MaxValue, decimal.MaxValue, decimal.MinValue });
+        Assert.All(engine.TensorIsFinite(decSparse).ToArray(), bit => Assert.True((bool)bit));
+        Assert.All(engine.TensorIsInf(decSparse).ToArray(), bit => Assert.False((bool)bit));
+
+        var intSparse = new SparseTensor<int>(
+            2, 2,
+            new[] { 1, 1 },
+            new[] { 1, 1 },
+            new[] { int.MaxValue, int.MaxValue });
+        Assert.All(engine.TensorIsFinite(intSparse).ToArray(), bit => Assert.True((bool)bit));
+        Assert.All(engine.TensorIsInf(intSparse).ToArray(), bit => Assert.False((bool)bit));
+    }
 }

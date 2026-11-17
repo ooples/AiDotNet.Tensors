@@ -62,7 +62,9 @@ internal sealed class ForwardOnlyHeterogeneousReplay
 
     internal void ProtectDeviceState(HashSet<object> keys)
     {
-        foreach (ICompiledForwardNode node in _nodes) node.ProtectDeviceState(keys);
+        foreach (var node in _nodes)
+            if (node is IDeviceStateProtectionNode stateful)
+                stateful.ProtectDeviceState(keys);
     }
 
     internal void DetachDeviceBindings(HashSet<DirectGpu.IGpuBuffer> released, HashSet<object> retained)

@@ -384,4 +384,63 @@ public sealed class CompiledOptimizerHandoverIsolationTests
         var bytes = Assert.IsType<byte[]>(planA.ExportOptimizerState());
         Assert.NotEmpty(bytes);
     }
+
+    [Fact]
+    public void Float_master_weights_feeding_differentiable_fp16_cast_bridges_enroll_in_optimizer()
+    {
+        var engine = new CpuEngine();
+        var activeMaster = new Tensor<float>(new[] { 2.0f, -1.5f }, new[] { 2 });
+        var detachedMaster = new Tensor<float>(new[] { 3.0f, 4.0f }, new[] { 2 });
+        var parameters = new[] { activeMaster, detachedMaster };
+
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var activeHalf = scope.RecordCrossTypeWithBackward<float, Half>(
+                LazyNodeType.Custom,
+                "CastToFp16",
+                activeMaster,
+                new[] { 2 },
+                (e, o) => MixedPrecisionCast.CastToFp16(activeMaster).AsSpan().CopyTo(o.AsWritableSpan()),
+                (gradOut, inp, o, s, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
+
+            // Cast bridge recorded inside NoGradScope must not enroll detachedMaster.
+            Tensor<Half> detachedHalf;
+            using (new NoGradScope<float>())
+            {
+                detachedHalf = scope.RecordCrossTypeWithBackward<float, Half>(
+                    LazyNodeType.Custom,
+                    "CastToFp16Detached",
+                    detachedMaster,
+                    new[] { 2 },
+                    (e, o) => MixedPrecisionCast.CastToFp16(detachedMaster).AsSpan().CopyTo(o.AsWritableSpan()),
+                    (gradOut, inp, o, s, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
+            }
+
+            var sumHalf = engine.TensorAdd(engine.TensorMultiply(activeHalf, activeHalf), detachedHalf);
+            var lossHalf = engine.ReduceSum(sumHalf, null, false);
+            var lossFloat = scope.RecordCrossTypeWithBackward<Half, float>(
+                LazyNodeType.Custom,
+                "CastToFp32",
+                lossHalf,
+                lossHalf.Shape.ToArray(),
+                (e, o) => MixedPrecisionCast.CastToFp32(lossHalf).AsSpan().CopyTo(o.AsWritableSpan()),
+                (gradOut, inp, o, s, e) => MixedPrecisionCast.CastToFp32Backward(gradOut));
+
+            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters, lossFloat));
+        }
+
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.1, weightDecay: 0.05);
+            float initial0 = activeMaster[0];
+            float initial1 = activeMaster[1];
+            plan.Step();
+
+            Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
+            Assert.NotEqual(initial0, activeMaster[0]);
+            Assert.NotEqual(initial1, activeMaster[1]);
+            Assert.Equal(new[] { 3.0f, 4.0f }, detachedMaster.ToArray());
+        }
+    }
 }

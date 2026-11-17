@@ -134,6 +134,15 @@ internal static class PlanFormatConstants
     // parameters and constants, by value id), so the plan runs on the caller's live weights and holds no copy of them.
     internal const byte TensorFlagExternal     = 0x10;
 
+    // ── Training step gradient flags & descriptor bounds ────────────────────
+    internal const byte OpGradientFlagRecordedUnderNoGrad = 0x01;
+    internal const byte OpGradientFlagHasBackward         = 0x02;
+    internal const byte OpGradientFlagsMask               = OpGradientFlagRecordedUnderNoGrad | OpGradientFlagHasBackward;
+
+    // Conservative minimum byte width of one serialized training op descriptor:
+    // opType(1) + nameLen(4) + gradientFlags(1) + derivativeCount(4) + inputCount(4).
+    internal const int MinTrainingStepDescriptorBytes = 14;
+
     // Upper bound on the elements a plan file may make the reader allocate (every tensor in the table, data-bearing or
     // not), unless the caller passes its own. A plan names its intermediate buffers by shape only, so without a bound a
     // few bytes could ask for gigabytes.

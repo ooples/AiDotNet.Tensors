@@ -1060,6 +1060,7 @@ public sealed class GradientTape<T> : IDisposable
                 // Non-persistent tapes drop the whole arena here, so they're safe to
                 // re-record from scratch — no consumed-guard needed.
                 _entries.Reset();
+                _recordingEpoch++;
             }
             if (_options.Persistent && _releaseStreamingActivations)
             {
@@ -1407,7 +1408,11 @@ public sealed class GradientTape<T> : IDisposable
                 Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
             }
 
-            if (!_options.Persistent) _entries.Reset();
+            if (!_options.Persistent)
+            {
+                _entries.Reset();
+                _recordingEpoch++;
+            }
             return result;
         }
 
@@ -1844,6 +1849,7 @@ public sealed class GradientTape<T> : IDisposable
             if (!_options.Persistent)
             {
                 _entries.Reset();
+                _recordingEpoch++;
             }
 
             return filtered;
@@ -1859,6 +1865,7 @@ public sealed class GradientTape<T> : IDisposable
         if (!_options.Persistent)
         {
             _entries.Reset();
+            _recordingEpoch++;
         }
 
         return grads;
@@ -2942,6 +2949,8 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     private HashSet<Tensor<T>>? _opaqueOutputs;
+    private long _recordingEpoch;
+    internal long RecordingEpoch => _recordingEpoch;
 
     public void Reset()
     {
@@ -2952,6 +2961,8 @@ public sealed class GradientTape<T> : IDisposable
 
         ReleaseSavedStatePins(_entries.Count);
         _entries.Reset();
+        _recordingEpoch++;
+        RetainedOutputCapture<T>.DiscardEagerRecording(this);
         _opaqueOutputs = null;
         // The cached backward chain addresses the entries just dropped.
         _cachedDelegateChain?.Clear();
@@ -3476,6 +3487,8 @@ public sealed class GradientTape<T> : IDisposable
 
         // Return arena to thread-local cache for reuse by next GradientTape
         _entries.Reset();
+        _recordingEpoch++;
+        RetainedOutputCapture<T>.DiscardEagerRecording(this);
         _cachedArena = _entries;
         // A persistent tape's gradient caches hold this step's recorded outputs (and through them their device
         // buffers); a disposed tape that its owner keeps referencing must not pin them past the step boundary.

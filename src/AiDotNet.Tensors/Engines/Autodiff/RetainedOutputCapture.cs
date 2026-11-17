@@ -9,7 +9,13 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
 {
     [ThreadStatic] private static RetainedOutputCapture<T>? _current;
     [ThreadStatic] private static EagerUpdateScope? _activeUpdate;
-    private static readonly ConditionalWeakTable<GradientTape<T>, HashSet<string>> EagerKeys = new();
+    private static readonly ConditionalWeakTable<GradientTape<T>, EagerTapeRegistration> EagerRegistrations = new();
+
+    private sealed class EagerTapeRegistration
+    {
+        internal long Epoch = -1;
+        internal readonly HashSet<string> Keys = new(StringComparer.Ordinal);
+    }
     private readonly RetainedOutputCapture<T>? _parent;
     private readonly Dictionary<GradientTape<T>, Dictionary<string, Tensor<T>>> _eager = new();
     private IReadOnlyDictionary<string, Tensor<T>>? _published;
@@ -84,13 +90,31 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
 
     internal static void RegisterEager(GradientTape<T> tape, string key, Tensor<T> output)
     {
-        var keys = EagerKeys.GetValue(tape, _ => new HashSet<string>(StringComparer.Ordinal));
-        if (!keys.Add(key))
+        var state = EagerRegistrations.GetValue(tape, static _ => new EagerTapeRegistration());
+        if (state.Epoch != tape.RecordingEpoch)
+        {
+            state.Epoch = tape.RecordingEpoch;
+            state.Keys.Clear();
+            for (var stale = _current; stale is not null; stale = stale._parent)
+                stale._eager.Remove(tape);
+        }
+        if (!state.Keys.Add(key))
             throw new InvalidOperationException($"The retained output key '{key}' is already registered in this forward.");
         if (_current is not { } capture) return;
         if (!capture._eager.TryGetValue(tape, out var outputs))
             capture._eager.Add(tape, outputs = new Dictionary<string, Tensor<T>>(StringComparer.Ordinal));
         outputs.Add(key, output);
+    }
+
+    internal static void DiscardEagerRecording(GradientTape<T> tape)
+    {
+        if (EagerRegistrations.TryGetValue(tape, out var state))
+        {
+            state.Epoch = -1;
+            state.Keys.Clear();
+        }
+        for (var capture = _current; capture is not null; capture = capture._parent)
+            capture._eager.Remove(tape);
     }
 
     // Only a completed update marks a tape as the producer. Shape warm-ups do not update and cannot publish.

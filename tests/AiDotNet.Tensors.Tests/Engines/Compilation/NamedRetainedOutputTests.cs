@@ -349,4 +349,73 @@ public sealed class NamedRetainedOutputTests : IDisposable
         Assert.Equal(10.0, values[0]);
         Assert.Equal(14.0, values[1]);
     }
+
+    [Fact]
+    public void Tape_reset_clears_eager_key_registrations_while_preserving_same_forward_uniqueness()
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using (var tape = new GradientTape<double>(new GradientTapeOptions { Persistent = true }))
+        {
+            var first = engine.TensorMultiplyScalar(new Tensor<double>(new[] { 2.0 }, new[] { 1 }), 3.0);
+            var stale = engine.TensorMultiplyScalar(new Tensor<double>(new[] { 9.0 }, new[] { 1 }), 2.0);
+            GradientRecording.RetainOutput("generation", first);
+            GradientRecording.RetainOutput("stale", stale);
+            Assert.Throws<InvalidOperationException>(() => GradientRecording.RetainOutput("generation", first));
+
+            tape.Reset();
+
+            var second = engine.TensorMultiplyScalar(new Tensor<double>(new[] { 5.0 }, new[] { 1 }), 4.0);
+            GradientRecording.RetainOutput("generation", second);
+            Assert.Throws<InvalidOperationException>(() => GradientRecording.RetainOutput("generation", second));
+            RetainedOutputCapture<double>.PublishEager(tape);
+        }
+        outputs.Complete();
+        Assert.Equal(20.0, outputs.Get("generation").ToArray()[0]);
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() => outputs.Get("stale"));
+    }
+
+    [Fact]
+    public void Named_output_from_outer_arena_survives_when_detached_inner_arena_is_active()
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        const int length = 128;
+        var seed = new Tensor<double>(Enumerable.Range(0, length).Select(i => (double)(i + 1)).ToArray(), new[] { length });
+        var expected = seed.ToArray().Select(v => v * 3.0).ToArray();
+        Tensor<double> retained;
+
+        using var capture = RetainedOutputCapture<double>.Begin();
+        using var detached = TensorArena.CreateDetached();
+        using (var outer = TensorArena.Create())
+        {
+            using (var tape = new GradientTape<double>())
+            {
+                retained = engine.StopGradient(engine.TensorMultiplyScalar(seed, 3.0));
+                using (detached.Activate())
+                {
+                    var innerScratch = Assert.IsType<Tensor<double>>(detached.TryRentTensor<double>(length, new[] { length }));
+                    innerScratch.AsWritableSpan().Fill(-1.0);
+                    GradientRecording.RetainOutput("generation", retained);
+                }
+                RetainedOutputCapture<double>.PublishEager(tape);
+            }
+
+            // Force multiple outer-arena resets and rentals to prove the outer arena released both wrapper and array.
+            for (int step = 0; step < 4; step++)
+            {
+                outer.Reset();
+                for (int rent = 0; rent < 4; rent++)
+                {
+                    var scratch = Assert.IsType<Tensor<double>>(outer.TryRentTensor<double>(length, new[] { length }));
+                    scratch.AsWritableSpan().Fill(-42.0);
+                    Assert.NotSame(retained, scratch);
+                }
+                Assert.Equal(expected, retained.ToArray());
+            }
+        }
+        capture.Complete();
+        Assert.Equal(expected, capture.Get("generation").ToArray());
+    }
 }

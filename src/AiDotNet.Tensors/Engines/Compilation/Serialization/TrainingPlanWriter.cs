@@ -99,7 +99,10 @@ internal static class TrainingPlanWriter
         writer.Write(nameBytes.Length);
         writer.Write(nameBytes);
 
-        writer.Write((byte)((step.RecordedUnderNoGrad ? 1 : 0) | (step.BackwardFn is not null ? 2 : 0)));
+        byte gradientFlags = (byte)(
+            (step.RecordedUnderNoGrad ? PlanFormatConstants.OpGradientFlagRecordedUnderNoGrad : 0)
+            | (step.BackwardFn is not null ? PlanFormatConstants.OpGradientFlagHasBackward : 0));
+        writer.Write(gradientFlags);
         var differentiableInputs = step.DifferentiableInputIndices;
         writer.Write(differentiableInputs?.Length ?? -1);
         if (differentiableInputs is not null)
