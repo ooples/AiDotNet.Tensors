@@ -21,10 +21,12 @@ public sealed class CompiledTransientWorkspaceBrokerTests
         var a = engine.CreateScratchPool();
         var b = engine.CreateScratchPool();
         var previous = DirectGpuTensorEngine.EnterScratchPool(a);
+        engine.SuspendActivationEviction();
         try
         {
             using (engine.EnterCompiledCapturePath())
             {
+                Assert.True(engine.ResidentStepActive);
                 a.WorkspaceBroker = broker;
                 b.WorkspaceBroker = broker;
                 engine.SetCurrentScratchAction(0);
@@ -57,7 +59,11 @@ public sealed class CompiledTransientWorkspaceBrokerTests
             Assert.All(state.AllocatedBuffers, buffer => Assert.Equal(1, buffer.DisposeCount));
             Assert.Null(broker.TryRent(backend, 32)); // A released HIP/mock wrapper may retain a nonzero handle.
         }
-        finally { DirectGpuTensorEngine.RestoreScratchPool(previous); }
+        finally
+        {
+            DirectGpuTensorEngine.RestoreScratchPool(previous);
+            engine.ResumeActivationEviction();
+        }
     }
 
     [Fact]
@@ -93,10 +99,12 @@ public sealed class CompiledTransientWorkspaceBrokerTests
         var failedPool = engine.CreateScratchPool();
         var nextPool = engine.CreateScratchPool();
         var previous = DirectGpuTensorEngine.EnterScratchPool(failedPool);
+        engine.SuspendActivationEviction();
         try
         {
             using (engine.EnterCompiledCapturePath())
             {
+                Assert.True(engine.ResidentStepActive);
                 failedPool.WorkspaceBroker = broker;
                 engine.SetCurrentScratchAction(0);
                 Assert.Same(first, engine.RentActionScratchOrAllocate(backend, 32, fullyWritten: true));
@@ -114,6 +122,7 @@ public sealed class CompiledTransientWorkspaceBrokerTests
         {
             DirectGpuTensorEngine.RestoreScratchPool(previous);
             engine.ClearActionScratchPool();
+            engine.ResumeActivationEviction();
         }
     }
 

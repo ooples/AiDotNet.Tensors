@@ -102,8 +102,8 @@ public sealed class CompiledGpuSharedWorkspaceTests
             Assert.Equal(expected.Samples.Count, shared.Samples.Count);
             for (int sample = 0; sample < shared.Samples.Count; sample++)
             {
-                AssertClose(expected.Samples[sample], shared.Samples[sample]);
-                AssertClose(isolated.Samples[sample], shared.Samples[sample]);
+                AssertClose(expected.Samples[sample], isolated.Samples[sample], $"CPU vs sharing-off sample {sample}");
+                AssertClose(isolated.Samples[sample], shared.Samples[sample], $"sharing-off vs sharing-on sample {sample}");
             }
         }
         finally
@@ -169,11 +169,11 @@ public sealed class CompiledGpuSharedWorkspaceTests
         return gpu;
     }
 
-    private static void AssertClose(float[] expected, float[] actual)
+    private static void AssertClose(float[] expected, float[] actual, string context)
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(expected[i] - actual[i]) <= 2e-6f + 3e-3f * Math.Abs(expected[i]),
-                $"[{i}]: expected {expected[i]}, actual {actual[i]}");
+                $"{context}[{i}]: expected {expected[i]}, actual {actual[i]}");
     }
 }
