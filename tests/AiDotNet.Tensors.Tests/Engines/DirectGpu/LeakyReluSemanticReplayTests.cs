@@ -51,6 +51,7 @@ public sealed class LeakyReluSemanticReplayTests : IClassFixture<DirectGpuTensor
                 using var scope = GraphMode.Enable();
                 var loss = Objective();
                 Assert.NotNull(output!.LazySource); // DirectGPU must record the semantic node rather than execute it here.
+                scope.RetainOutput(output); // This test observes the activation after backward; its workspace must stay live.
                 plan = scope.CompileTraining(new[] { input, bias }, loss);
             }
             using (plan)
@@ -85,8 +86,10 @@ public sealed class LeakyReluSemanticReplayTests : IClassFixture<DirectGpuTensor
                         double expected = x > 0 ? x : actualSlope * x;
                         double derivative = ops.ToDouble(seed[i]) * (x > 0 ? 1 : actualSlope);
                         expectedBias[channel] += derivative;
-                        Assert.InRange(Math.Abs(ops.ToDouble(actual[i]) - expected), 0, tolerance);
-                        Assert.InRange(Math.Abs(ops.ToDouble(dx[i]) - derivative), 0, tolerance);
+                        Assert.True(Math.Abs(ops.ToDouble(actual[i]) - expected) <= tolerance,
+                            $"step={step} index={i} x={x} alpha={actualSlope}: output={ops.ToDouble(actual[i])}, expected={expected}");
+                        Assert.True(Math.Abs(ops.ToDouble(dx[i]) - derivative) <= tolerance,
+                            $"step={step} index={i} x={x} alpha={actualSlope}: dx={ops.ToDouble(dx[i])}, expected={derivative}");
                     }
                     for (int c = 0; c < 2; c++) Assert.InRange(Math.Abs(ops.ToDouble(db[c]) - expectedBias[c]), 0, tolerance);
                 }

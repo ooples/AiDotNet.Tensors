@@ -100,7 +100,7 @@ extern ""C"" __global__ __launch_bounds__(256) void leaky_relu_backward(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    gradInput[idx] = input[idx] >= 0.0f ? gradOutput[idx] : alpha * gradOutput[idx];
+    gradInput[idx] = input[idx] > 0.0f ? gradOutput[idx] : alpha * gradOutput[idx];
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void elu(

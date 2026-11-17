@@ -27,8 +27,8 @@ public sealed partial class MetalBackend
         using var encoder = _commandQueue.CreateScopedComputeEncoder();
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(aBuffer, 0);
-        encoder.SetBytes(alpha, 1);
-        encoder.SetBuffer(bBuffer, 2);
+        encoder.SetBuffer(bBuffer, 1);
+        encoder.SetBytes(alpha, 2);
         encoder.SetBytes((uint)size, 3);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
@@ -294,8 +294,8 @@ public sealed partial class MetalBackend
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(goBuffer, 0);
         encoder.SetBuffer(iBuffer, 1);
-        encoder.SetBytes(alpha, 2);
-        encoder.SetBuffer(giBuffer, 3);
+        encoder.SetBuffer(giBuffer, 2);
+        encoder.SetBytes(alpha, 3);
         encoder.SetBytes((uint)size, 4);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
