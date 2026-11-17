@@ -5225,6 +5225,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ((BackwardFunction<T>)BackwardFunctions<T>.MatMulBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.Conv2DBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.WeightNormBackward).Method,
+        ((BackwardFunction<T>)BackwardFunctions<T>.RfftMagnitudeBackward).Method,
     };
 
     private static readonly HashSet<System.Reflection.MethodInfo> s_backwardIgnoresInputs = new()

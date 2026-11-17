@@ -2,7 +2,6 @@
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
-using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -65,11 +64,11 @@ public partial class DirectGpuTensorEngine
         // take Re(IFFT(seed)). cuFFT is unnormalized; portable inverse is 1/N.
         using var transformed = AllocateTransientScratch(backend, checked(rows * n * 2), fullyWritten: true);
         float scale;
-        var plan = backend is CudaBackend cuda ? cuda.GetRealFftPlan(n, rows, inverse: true) : null;
-        if (plan is not null && backend is CudaBackend vendor)
+        var plan = kernels.GetOptimizedRealFftPlan(n, rows, inverse: true);
+        if (plan is not null)
         {
             using var workspace = plan.WorkspaceFloats == 0 ? default : AllocateTransientScratch(backend, plan.WorkspaceFloats, fullyWritten: true);
-            vendor.ExecuteRealFft(plan, seed.Buffer, transformed.Buffer, plan.WorkspaceFloats == 0 ? null : workspace.Buffer);
+            plan.Execute(seed.Buffer, transformed.Buffer, plan.WorkspaceFloats == 0 ? null : workspace.Buffer);
             scale = 1;
         }
         else
@@ -121,15 +120,15 @@ public partial class DirectGpuTensorEngine
 
     private OwnedBuffer RfftSpectrum(IDirectGpuBackend backend, IGpuBuffer input, int rows, int n, out int stride)
     {
-        var plan = backend is CudaBackend cuda ? cuda.GetRealFftPlan(n, rows, inverse: false) : null;
+        var plan = ((IRfftMagnitudeKernels)backend).GetOptimizedRealFftPlan(n, rows, inverse: false);
         stride = plan is null ? n : n / 2 + 1;
         var spectrum = AllocateTransientScratch(backend, checked(rows * stride * 2), fullyWritten: true);
         try
         {
-            if (plan is not null && backend is CudaBackend vendor)
+            if (plan is not null)
             {
                 using var workspace = plan.WorkspaceFloats == 0 ? default : AllocateTransientScratch(backend, plan.WorkspaceFloats, fullyWritten: true);
-                vendor.ExecuteRealFft(plan, input, spectrum.Buffer, plan.WorkspaceFloats == 0 ? null : workspace.Buffer);
+                plan.Execute(input, spectrum.Buffer, plan.WorkspaceFloats == 0 ? null : workspace.Buffer);
             }
             else
             {
