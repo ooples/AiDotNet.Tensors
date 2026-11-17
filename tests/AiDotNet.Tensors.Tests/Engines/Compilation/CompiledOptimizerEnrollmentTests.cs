@@ -438,9 +438,86 @@ public sealed class CompiledOptimizerHandoverIsolationTests
             plan.Step();
 
             Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
-            Assert.NotEqual(initial0, activeMaster[0]);
-            Assert.NotEqual(initial1, activeMaster[1]);
+            // Independent scalar AdamW recurrence: d(sum(master^2))/d(master) = [4, -3].
+            static double Expected(double value, double gradient)
+            {
+                double firstMoment = 0.1 * gradient;
+                double secondMoment = 0.001 * gradient * gradient;
+                double correctedFirst = firstMoment / (1 - 0.9);
+                double correctedSecond = secondMoment / (1 - 0.999);
+                return value * (1 - 0.1 * 0.05)
+                    - 0.1 * correctedFirst / (Math.Sqrt(correctedSecond) + 1e-8);
+            }
+            Assert.InRange(Math.Abs(activeMaster[0] - Expected(initial0, 4)), 0, 2e-6);
+            Assert.InRange(Math.Abs(activeMaster[1] - Expected(initial1, -3)), 0, 2e-6);
             Assert.Equal(new[] { 3.0f, 4.0f }, detachedMaster.ToArray());
+        }
+    }
+
+    [Fact]
+    public void Explicit_leaf_loss_without_a_recorded_producer_is_rejected()
+    {
+        var engine = new CpuEngine();
+        var parameter = new Tensor<float>(new[] { 2f }, new[] { 1 });
+        using var scope = GraphMode.EnableTraining(new[] { parameter });
+        _ = engine.TensorMultiply(parameter, parameter);
+        var error = Assert.Throws<ArgumentException>(() => scope.CompileTraining(new[] { parameter }, parameter));
+        Assert.Contains("produced by an operation recorded", error.Message);
+    }
+
+    [Fact]
+    public void Foreign_type_no_grad_operation_does_not_enroll_its_float_master()
+    {
+        var engine = new CpuEngine();
+        var master = new Tensor<float>(new[] { 2f, -1.5f }, new[] { 2 });
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(new[] { master }))
+        {
+            var half = scope.RecordCrossTypeWithBackward<float, Half>(
+                LazyNodeType.Custom, "MasterToHalf", master, new[] { 2 },
+                (e, o) => MixedPrecisionCast.CastToFp16(master).AsSpan().CopyTo(o.AsWritableSpan()),
+                (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradient));
+            Tensor<Half> detached;
+            using (new NoGradScope<Half>())
+                detached = engine.TensorMultiply(half, half);
+            var floating = scope.RecordCrossTypeWithBackward<Half, float>(
+                LazyNodeType.Custom, "DetachedToFloat", detached, new[] { 2 },
+                (e, o) => MixedPrecisionCast.CastToFp32(detached).AsSpan().CopyTo(o.AsWritableSpan()),
+                (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradient));
+            var loss = engine.ReduceSum(floating, null, false);
+            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(new[] { master }, loss));
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.1, weightDecay: 0.2);
+            plan.Step();
+            Assert.Equal(new[] { 2f, -1.5f }, master.ToArray());
+            Assert.Equal(new long[] { 0 }, plan.ParameterAcceptedUpdates);
+        }
+    }
+
+    [Fact]
+    public void Explicit_intermediate_loss_survives_linear_fusion()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 3f }, new[] { 1, 1 });
+        var weight = new Tensor<float>(new[] { 2f }, new[] { 1, 1 });
+        var bias = new Tensor<float>(new[] { 10f }, new[] { 1 });
+        var parameters = new[] { weight, bias };
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var selectedLoss = engine.TensorMatMul(input, weight);
+            _ = engine.TensorAdd(selectedLoss, bias);
+            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters, selectedLoss));
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.1);
+            plan.Step();
+            Assert.InRange(Math.Abs(weight[0] - 1.7f), 0, 1e-6f);
+            Assert.Equal(10f, bias[0]);
+            Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
         }
     }
 }

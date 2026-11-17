@@ -299,6 +299,10 @@ public sealed class CompiledCudaOptimizerEnrollmentTests
                     Assert.True(plan.ReplaysParityGraphs, plan.PingPongRejectionReason ?? plan.GraphCaptureFailureReason);
                 }
                 Assert.Equal(new[] { 1.5f, -0.5f, 2.0f, 0.25f }, frozen.ToArray());
+                // Six SGD updates with constant gradient 2 * frozen.
+                var expected = new[] { -0.15f, -0.95f, -0.7f, 0.85f };
+                var actual = active.ToArray();
+                for (int i = 0; i < expected.Length; i++) Close(expected[i], actual[i]);
                 Assert.Equal(new long[] { 0, 6 }, plan.ParameterAcceptedUpdates);
             }
         }

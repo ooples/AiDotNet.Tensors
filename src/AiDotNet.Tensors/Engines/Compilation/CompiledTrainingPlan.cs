@@ -10042,6 +10042,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var retainedOutputs = scope.RetainedOutputClosure<T>();
         var observableNodes = new HashSet<ILazyNode>(scope.Nodes.OfType<LazyNode<T>>()
             .Where(node => retainedOutputs.Contains(node.Output)));
+        if (explicitLoss is not null)
+            foreach (var node in scope.Nodes)
+                if (node is ISignableLazyNode signable && ReferenceEquals(signable.OutputTensor, explicitLoss))
+                    observableNodes.Add(node);
         var compiler = new LazyGraphCompiler(forTraining: true, observableOutputs: observableNodes);
         var optimized = compiler.Compile(scope.Nodes);
 
@@ -10052,6 +10056,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ? optimized.LastOrDefault(node => node is ISignableLazyNode signable && ReferenceEquals(signable.OutputTensor, lossTarget))
             : null;
         lossRoot ??= explicitLoss is null ? optimized.OfType<LazyNode<T>>().LastOrDefault() : null;
+        if (explicitLoss is not null && lossRoot is null)
+            throw new ArgumentException("The explicit loss must be produced by an operation recorded in this training scope.", nameof(explicitLoss));
         var lossAncestors = new HashSet<ILazyNode>();
         var pendingLossNodes = new Stack<ILazyNode>();
         if (lossRoot is not null) pendingLossNodes.Push(lossRoot);
@@ -10060,6 +10066,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var ancestor = pendingLossNodes.Pop();
             if (!lossAncestors.Add(ancestor)) continue;
             if (ancestor is ICrossTypeNodeMetadata { HasBackward: false }) continue;
+            if (ancestor is not LazyNode<T> && ancestor.RecordedUnderNoGrad)
+            {
+                // An in-place NoGrad write preserves the target's earlier gradient history,
+                // but its other operands must not enroll in the optimizer.
+                if (ancestor.PriorWriter is { } prior && !ReferenceEquals(prior, ancestor))
+                    pendingLossNodes.Push(prior);
+                continue;
+            }
             var gradientInputs = ancestor is LazyNode<T> typedAncestor
                 ? typedAncestor.GetGradientInputNodes() : ancestor.GetInputNodes();
             foreach (var inputNode in gradientInputs) pendingLossNodes.Push(inputNode);
