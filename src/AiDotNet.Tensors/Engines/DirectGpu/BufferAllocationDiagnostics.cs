@@ -15,6 +15,7 @@ internal static class BufferAllocationDiagnostics
     private static readonly RequestRecorder Recorder = new();
     private static readonly Totals CudaNativeApiRequests = new();
     private static readonly Totals CompiledWorkspaceLoans = new();
+    private static readonly Totals StepScratchReuseRequests = new();
     internal static bool IsInsideRequest => RequestRecorder.IsInside;
 
     // Keep diagnostics from changing a backend's existing null-validation order or exception type.
@@ -35,6 +36,12 @@ internal static class BufferAllocationDiagnostics
     {
         if (Enabled && requestedFloat32Length > 0)
             CompiledWorkspaceLoans.Add((long)requestedFloat32Length * sizeof(float));
+    }
+
+    internal static void RecordStepScratchReuse(int requestedFloat32Length)
+    {
+        if (Enabled && requestedFloat32Length > 0)
+            StepScratchReuseRequests.Add((long)requestedFloat32Length * sizeof(float));
     }
 
     // The benchmark accesses this internal diagnostic reflectively, so the public library API need not grow.
@@ -71,6 +78,13 @@ internal static class BufferAllocationDiagnostics
                 ["count"] = CompiledWorkspaceLoans.Count,
                 ["coverage"] = Enabled ? "successful_compiled_broker_loans_only" : "disabled",
                 ["scope"] = "Successful cross-plan compiled workspace loans at CompiledTransientWorkspaceBroker.TryRent. Requested float32 length, including reused capacity; excludes failed rents, stable slot lookups, aliases/views and native backing API acquisitions. Other private pool/arena borrow routes require separate coverage.",
+            },
+            ["gpu_step_scratch_reuse_requested"] = new Dictionary<string, object>
+            {
+                ["bytes"] = StepScratchReuseRequests.Bytes,
+                ["count"] = StepScratchReuseRequests.Count,
+                ["coverage"] = Enabled ? "successful_step_scratch_free_loans_only" : "disabled",
+                ["scope"] = "Successful reused-free-buffer acquisitions in StepScratchPool.Lease and TryTakeFree. Requested float32 length; excludes backend allocation misses (counted by backend API), retained stable-slot lookups, aliases/views, cross-plan broker loans and native backing API acquisitions.",
             },
             ["gpu_native_api_requested"] = new Dictionary<string, object>
             {
