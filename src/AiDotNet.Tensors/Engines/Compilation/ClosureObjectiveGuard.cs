@@ -99,7 +99,8 @@ internal sealed class ClosureObjectiveGuard<T>
         }
 
         var signature = ObjectiveSignature.Build(nodes, parameters, out var leaves,
-            explicitLoss ?? (nodes.Count > 0 ? (nodes[nodes.Count - 1] as ISignableLazyNode)?.OutputTensor : null));
+            explicitLoss ?? (nodes.Count > 0 ? (nodes[nodes.Count - 1] as ISignableLazyNode)?.OutputTensor : null),
+            scope.NamedRetainedOutputs);
         if (!signature.Signable)
         {
             recording.Reason = signature.UnsignableReason;
@@ -258,7 +259,7 @@ internal sealed class ClosureObjectiveGuard<T>
                 reason = unreplayable;
                 return ClosureGuardResult.Unsignable;
             }
-            signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves, loss);
+            signature = ObjectiveSignature.Build(scope.Nodes, parameters, out leaves, loss, scope.NamedRetainedOutputs);
             if (signature.Signable && DisconnectedReason(scope, loss, parameters) is { } disconnected)
             {
                 reason = disconnected;

@@ -336,6 +336,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Forward outputs sharing arrays by forward liveness (PoolForwardOnlyOutputs).
     private int _pooledForwardOutputs;
     private HashSet<Tensor<T>> _retainedOutputs = new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+    private IReadOnlyDictionary<string, Tensor<T>> _namedRetainedOutputs =
+        new Dictionary<string, Tensor<T>>(StringComparer.Ordinal);
+    private long _retainedOutputStep;
+    private bool _retainedOutputsAvailable;
+
+    internal void ValidateRetainedOutputStep(long step)
+    {
+        lock (_stepSync)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+            if (!_retainedOutputsAvailable || step != _retainedOutputStep)
+                throw new InvalidOperationException("The retained output belongs to an expired or unsuccessful training step.");
+        }
+    }
 
     /// <summary>Test hook: how many forward-only outputs share arrays under forward-output pooling.</summary>
     internal int PooledForwardOutputCount => _pooledForwardOutputs;
@@ -3922,13 +3936,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
-        // Every compiled step on a GPU engine holds the engine's step lock (see DirectGpuTensorEngine.CompiledStepLock).
-        // Taking it only once the engine was seen shared left a race: a step that read "not shared" kept running
-        // unlocked beside the first step of the thread that made it shared. Uncontended, the lock costs nothing.
-        var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
-        gpuEngine?.NoteCompiledStepThread(_planId);
-        if (gpuEngine is null) return StepLocked();
-        lock (gpuEngine.CompiledStepLock) return StepLocked();
+        try
+        {
+            // Every compiled GPU step holds the engine lock, then its plan lock.
+            var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
+            gpuEngine?.NoteCompiledStepThread(_planId);
+            if (gpuEngine is null) return StepLocked();
+            lock (gpuEngine.CompiledStepLock) return StepLocked();
+        }
+        catch
+        {
+            lock (_stepSync) _retainedOutputsAvailable = false;
+            throw;
+        }
     }
 
     /// <summary>
@@ -4010,6 +4030,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // cannot upload parameters into buffers another thread's StepCore is reading.
         lock (_stepSync)
         {
+            _retainedOutputsAvailable = false;
+
             ClearPlanBufferReleaseMarks();
             UploadHostWrittenParameters();
             var loss = StepCore();
@@ -4017,6 +4039,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (_retainedOutputs.Count > 0 && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var outputEngine))
                 foreach (var output in _retainedOutputs.Where(output => output._gpuBuffer is not null && output._gpuBackend is not null))
                     outputEngine.BindResidentBuffer(output, output._gpuBuffer!, output._gpuBackend!);
+            if (_namedRetainedOutputs.Count > 0 || RetainedOutputCapture<T>.IsActive)
+            {
+                // Device-guarded optimizers may return before their skip verdict is read back.
+                // A handoff must resolve that verdict before treating this forward as a successful update.
+                ResolveDeferredFiniteness();
+                if (!_lastStepSkippedNonFiniteGradients)
+                {
+                    _retainedOutputsAvailable = true;
+                    RetainedOutputCapture<T>.PublishCompiled(this, _namedRetainedOutputs, ++_retainedOutputStep);
+                }
+            }
+
             return loss;
         }
     }
@@ -10736,6 +10770,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
                     parameters, lossOutput);
             plan._retainedOutputs = retainedOutputs;
+            plan._namedRetainedOutputs = scope.NamedRetainedOutputs.ToDictionary(
+                item => item.Key, item => (Tensor<T>)item.Value, StringComparer.Ordinal);
+
             if (plan._lastBackwardReads is { } lastReads)
                 foreach (var output in retainedOutputs) lastReads.Remove(output);
             plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
