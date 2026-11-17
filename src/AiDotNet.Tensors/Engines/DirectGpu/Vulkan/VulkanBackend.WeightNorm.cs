@@ -10,13 +10,13 @@ internal static partial class VulkanBatchExecutionKernels
 shared float normPart[256];
 void main() {
     int row = int(gl_WorkGroupID.x); int lane = int(gl_LocalInvocationID.x);
-    if (row >= p.rows) return;
+    if (row >= rows) return;
     float sum = 0.0;
-    for (int j = lane; j < p.columns; j += 256) { float x = v[row * p.columns + j]; sum += x * x; }
+    for (int j = lane; j < columns; j += 256) { float x = v[row * columns + j]; sum += x * x; }
     normPart[lane] = sum; barrier();
     for (int s = 128; s > 0; s /= 2) { if (lane < s) normPart[lane] += normPart[lane + s]; barrier(); }
-    float scale = g[row] * (1.0 / sqrt(normPart[0] + p.epsilon));
-    for (int j = lane; j < p.columns; j += 256) w[row * p.columns + j] = v[row * p.columns + j] * scale;
+    float scale = g[row] * (1.0 / sqrt(normPart[0] + epsilon));
+    for (int j = lane; j < columns; j += 256) w[row * columns + j] = v[row * columns + j] * scale;
 }
 ");
         internal static readonly string Stats = Shader(new[] { "r:h", "r:v", "w:stats" },
@@ -24,34 +24,34 @@ void main() {
 shared float normPart[256]; shared float dotPart[256];
 void main() {
     int row = int(gl_WorkGroupID.x); int lane = int(gl_LocalInvocationID.x);
-    if (row >= p.rows) return;
+    if (row >= rows) return;
     float sum = 0.0; float dot = 0.0;
-    for (int j = lane; j < p.columns; j += 256) {
-        float x = v[row * p.columns + j]; sum += x * x; dot += h[row * p.columns + j] * x;
+    for (int j = lane; j < columns; j += 256) {
+        float x = v[row * columns + j]; sum += x * x; dot += h[row * columns + j] * x;
     }
     normPart[lane] = sum; dotPart[lane] = dot; barrier();
     for (int s = 128; s > 0; s /= 2) {
         if (lane < s) { normPart[lane] += normPart[lane + s]; dotPart[lane] += dotPart[lane + s]; }
         barrier();
     }
-    if (lane == 0) { stats[2 * row] = 1.0 / sqrt(normPart[0] + p.epsilon); stats[2 * row + 1] = dotPart[0]; }
+    if (lane == 0) { stats[2 * row] = 1.0 / sqrt(normPart[0] + epsilon); stats[2 * row + 1] = dotPart[0]; }
 }
 ");
         internal static readonly string DirectionGrad = Shader(new[] { "r:h", "r:v", "r:g", "r:stats", "rw:dv" },
             "int rows; int columns; int accumulate;", @"
 void main() {
-    int i = bx_gid(); if (i >= p.rows * p.columns) return;
-    int row = i / p.columns; float inv = stats[2 * row];
+    int i = bx_gid(); if (i >= rows * columns) return;
+    int row = i / columns; float inv = stats[2 * row];
     float value = (g[row] * inv) * (h[i] - v[i] * (stats[2 * row + 1] * inv * inv));
-    dv[i] = p.accumulate != 0 ? dv[i] + value : value;
+    dv[i] = accumulate != 0 ? dv[i] + value : value;
 }
 ");
         internal static readonly string GainGrad = Shader(new[] { "r:stats", "rw:dg" },
             "int rows; int accumulate;", @"
 void main() {
-    int row = bx_gid(); if (row >= p.rows) return;
+    int row = bx_gid(); if (row >= rows) return;
     float value = stats[2 * row + 1] * stats[2 * row];
-    dg[row] = p.accumulate != 0 ? dg[row] + value : value;
+    dg[row] = accumulate != 0 ? dg[row] + value : value;
 }
 ");
     }
