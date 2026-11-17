@@ -39783,7 +39783,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // Replay can write the planned CPU destination directly. Custom engines retain their
                         // virtual TensorSlice implementation, and device engines retain their resident route.
-                        if (eng.GetType() == typeof(CpuEngine)
+                        if (eng.Unwrap().GetType() == typeof(CpuEngine)
                             && TryCopyCompiledSliceInto(captured, capStart, capLength, output)) return;
                         var r = eng.TensorSlice(captured, capStart, capLength);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
