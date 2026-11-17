@@ -27,7 +27,8 @@ namespace AiDotNet.Tensors.Engines;
 internal sealed class StepScratchPool
 {
     // Every pooled buffer, whichever pool holds it: a tensor wrapping one does not own it (ReleaseDeadDeviceStorage).
-    private static readonly ConditionalWeakTable<IGpuBuffer, StepScratchPool> s_pooled = new();
+    private static readonly ConditionalWeakTable<IGpuBuffer, object> s_pooled = new();
+    private static readonly object s_pooledMarker = new();
 
     internal StepScratchPool(DirectGpuTensorEngine engine) => Engine = engine;
 
@@ -62,8 +63,9 @@ internal sealed class StepScratchPool
 
     internal void Track(IGpuBuffer buffer)
     {
-        s_pooled.Remove(buffer);
-        s_pooled.Add(buffer, this);
+        // Ownership lives in Slots/free lists. The marker only prevents tensor/cache owners from disposing scratch.
+        // Moving backing between a plan and the broker must not allocate a new weak-table entry or retain its old pool.
+        s_pooled.GetValue(buffer, static _ => s_pooledMarker);
     }
 
     internal static void Untrack(IGpuBuffer buffer) => s_pooled.Remove(buffer);
@@ -89,6 +91,46 @@ internal sealed class StepScratchPool
     /// assignment of the run it recorded; it is replayed in stream order, so the reuse it recorded stays valid.
     /// </summary>
     internal int FirstLeasedAction { get; set; } = int.MaxValue;
+
+    // Set only for a permanently uncaptured plan's executing body. Other plans never see this route.
+    internal CompiledTransientWorkspaceBroker? WorkspaceBroker { get; set; }
+    internal bool HasOutstandingWorkspaceLeases => _leases.Count != 0 || _spanning.Count != 0;
+    private readonly List<long> _workspaceTransferKeys = new();
+    private readonly HashSet<IGpuBuffer> _workspaceTransferred = new();
+
+    internal void CollectTransferableForwardSlots(int forwardActions, Func<IGpuBuffer, bool> eligible,
+        HashSet<IGpuBuffer> result)
+    {
+        foreach (var slot in Slots)
+            if ((int)(slot.Key >> 32) < forwardActions && !_pinned.Contains(slot.Key) && eligible(slot.Value))
+                result.Add(slot.Value);
+        // One backing cannot be lent while a pinned/backward/other arena slot still names it.
+        foreach (var slot in Slots)
+            if ((int)(slot.Key >> 32) >= forwardActions || _pinned.Contains(slot.Key)) result.Remove(slot.Value);
+        foreach (var buffer in Transient.Values) result.Remove(buffer);
+    }
+
+    internal long TransferForwardSlots(HashSet<IGpuBuffer> buffers, IDirectGpuBackend backend,
+        CompiledTransientWorkspaceBroker broker, out int transferred)
+    {
+        _workspaceTransferKeys.Clear();
+        _workspaceTransferred.Clear();
+        foreach (var slot in Slots) if (buffers.Contains(slot.Value)) _workspaceTransferKeys.Add(slot.Key);
+        long bytes = 0;
+        foreach (long key in _workspaceTransferKeys)
+        {
+            var buffer = Slots[key];
+            Slots.Remove(key);
+            Keys.Remove(buffer);
+            _leasedThisRun.Remove(buffer);
+            if (!_workspaceTransferred.Add(buffer)) continue;
+            broker.Return(backend, buffer);
+            bytes += buffer.SizeInBytes;
+        }
+        transferred = _workspaceTransferred.Count;
+        return bytes;
+    }
+
 
     /// <summary>Slots once seen outliving their action (<see cref="EndLeases"/>): kept for good from then on.</summary>
     private readonly HashSet<long> _pinned = new();

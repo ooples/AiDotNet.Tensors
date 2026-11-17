@@ -4556,6 +4556,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             gte.SuspendActivationEviction();
             long snapshot = gte.ActivationCacheTimestampSnapshot();
             bool ran = false;
+            bool completedWorkspaceStep = false;
+
             try
             {
                 if (TryRunResidentBody(gte, cb))
@@ -4568,6 +4570,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     RegularizeAndClipGradients();   // in the order the eager and graph steps use
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
+                    completedWorkspaceStep = true;
+
                     return _lossOutput;
                 }
             }
@@ -4577,6 +4581,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (ran)
                 {
                     // Keep forward values readable without forcing a host download.
+                    if (completedWorkspaceStep) ReturnTransientWorkspace(gte, cb);
+
                     var released = new HashSet<Engines.DirectGpu.IGpuBuffer>(ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
                     gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false, released);
                     DetachReleasedBindings(released);
@@ -5320,7 +5326,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Kept per output instead, a CUDA step held the sum of its backward outputs (DDPM: ~2.8 GB of 9.8 GB).
         bool leaseBackwardOutputs = redirectEngine is not null && LeaseBackwardScratch;
         if (_scratchPool is { } leasingPool)
+        {
             leasingPool.FirstLeasedAction = leaseBackwardOutputs ? _forwardActions.Length : int.MaxValue;
+            _workspaceSharingBodyAllowed = CanShareTransientWorkspace(redirectEngine!);
+            leasingPool.WorkspaceBroker = _workspaceSharingBodyAllowed
+                ? redirectEngine!.CompiledWorkspaceBroker : null;
+        }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
         _gradientDeferral?.Reset();
@@ -5336,6 +5347,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
                 redirectEngine.FirstWriteRedirects = null;
+                if (_scratchPool is { } finishedPool) finishedPool.WorkspaceBroker = null;
+
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
             if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = outerTrackAdoptions;

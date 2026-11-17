@@ -6456,6 +6456,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             pool.Keys[reused] = key;
             return reused;
         }
+        if (pool.WorkspaceBroker?.TryRent(backend, length) is { } shared)
+        {
+            if (!fullyWritten)
+            {
+                if (backend is IDeviceZeroFill zeroShared) zeroShared.ZeroBuffer(shared, length);
+                else backend.Fill(shared, 0f, length);
+            }
+            pool.Slots[key] = shared;
+            pool.Track(shared);
+            pool.Keys[shared] = key;
+            return shared;
+        }
+
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         pool.Slots[key] = nb;
         pool.Track(nb);
@@ -6509,6 +6522,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// step will run on this plan (eval is terminal); a replay after this would read freed device memory.</summary>
     public void ClearActionScratchPool()
     {
+        _compiledWorkspaceBroker?.Release();
+        _compiledWorkspaceBroker = null;
+
         StepScratchPool[] pools;
         lock (_scratchPools)
         {
@@ -31061,6 +31077,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // go of its device buffer while the backend can still do both. Only when this engine frees the backend; a
         // shared backend keeps serving them.
         if (_ownsDirectGpu) _ownedResults.EvacuateAll();
+        _compiledWorkspaceBroker?.Release();
+        _compiledWorkspaceBroker = null;
 
         // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these
         // buffers: their host arrays download before the buffers are freed.
