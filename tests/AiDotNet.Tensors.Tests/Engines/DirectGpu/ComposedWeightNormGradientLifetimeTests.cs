@@ -58,13 +58,33 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
         Verify(engine, rows, columns, layers: 6, storage, forceFinalizers: true);
     }
 
-    private static void Verify(IEngine engine, int rows, int columns, int layers, int storage, bool forceFinalizers = false)
+    [Theory]
+    [InlineData(2, 2, 3, 0)]
+    [InlineData(16, 8, 7, 1)]
+    public void CpuRankFourMultiAxisCompositionRetainsGradients(int rows, int channels, int kernel, int storage)
+        => Verify(new CpuEngine(), rows, channels * kernel, layers: 6, storage,
+            forceFinalizers: true, channels, multiAxis: true);
+
+    [SkippableTheory]
+    [InlineData(2, 2, 3, 0)]
+    [InlineData(16, 8, 7, 1)]
+    public void CudaRankFourMultiAxisCompositionRetainsGradients(int rows, int channels, int kernel, int storage)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No direct GPU backend available.");
+        var engine = _fixture.Engine ?? throw new InvalidOperationException();
+        Skip.IfNot(engine.Name.IndexOf("CUDA", StringComparison.OrdinalIgnoreCase) >= 0, "This regression requires CUDA.");
+        Verify(engine, rows, channels * kernel, layers: 6, storage,
+            forceFinalizers: true, channels, multiAxis: true);
+    }
+
+    private static void Verify(IEngine engine, int rows, int columns, int layers, int storage,
+        bool forceFinalizers = false, int channels = 1, bool multiAxis = false)
     {
         var previous = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
         try
         {
-            var data = new Inputs(rows, columns, layers);
+            var data = new Inputs(rows, columns, layers, channels);
             // Production constructs and evaluates the model before its isolated training-gradient check.
             // Warm resident primitive paths without a tape, using distinct owning tensors.
             using (var noGrad = new NoGradScope<float>())
@@ -73,7 +93,7 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
                 var value = new Tensor<float>((float[])data.Initial.Clone(), data.Shape);
                 for (int layer = 0; layer < layers; layer++)
                     value = engine.TensorAdd(value, engine.TensorMultiply(value,
-                        ComposedKernel(engine, warm.Direction[layer], warm.Gain[layer])));
+                        ComposedKernel(engine, warm.Direction[layer], warm.Gain[layer], multiAxis)));
                 Assert.True(float.IsFinite(value[0]));
             }
             // First read at ComputeGradients return; second round deliberately leaves the result unread until after
@@ -89,7 +109,7 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
                     var activation = new Tensor<float>((float[])data.Initial.Clone(), data.Shape);
                     for (int layer = 0; layer < layers; layer++)
                     {
-                        var weights = ComposedKernel(engine, parameters.Direction[layer], parameters.Gain[layer]);
+                        var weights = ComposedKernel(engine, parameters.Direction[layer], parameters.Gain[layer], multiAxis);
                         // A sequence of actual differentiable operators gives earlier-produced gradients time to
                         // survive the rest of backward; each layer has an independent scalar reference below.
                         activation = engine.TensorAdd(activation, engine.TensorMultiply(activation, weights));
@@ -139,8 +159,18 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
     }
 
     // Exact old NormedConv1DLayer composition: no semantic fused forward or VJP is called here.
-    private static Tensor<float> ComposedKernel(IEngine engine, Tensor<float> direction, Tensor<float> gain)
+    private static Tensor<float> ComposedKernel(IEngine engine, Tensor<float> direction, Tensor<float> gain, bool multiAxis = false)
     {
+        if (multiAxis)
+        {
+            // Independent equivalent control for rank-four broadcast/reduction and its reshaped gradient owners.
+            var norm = engine.TensorPow(engine.TensorAddScalar(engine.ReduceSum(
+                engine.TensorMultiply(direction, direction), new[] { 1, 2, 3 }, keepDims: true), 1e-24f), -.5f);
+            var scale4 = engine.TensorMultiply(engine.Reshape(gain, new[] { direction.Shape[0], 1, 1, 1 }), norm);
+            var kernel4 = engine.TensorMultiply(direction, scale4);
+            engine.InvalidatePersistentTensor(kernel4);
+            return kernel4;
+        }
         int rows = direction.Shape[0], columns = direction.Length / rows;
         var matrix = engine.Reshape(direction, new[] { rows, columns });
         var inverse = engine.TensorPow(engine.TensorAddScalar(
@@ -243,10 +273,10 @@ public sealed class ComposedWeightNormGradientLifetimeTests : IClassFixture<Dire
         internal readonly float[][] Direction, Gain;
         internal readonly float[] Initial, Seed;
 
-        internal Inputs(int rows, int columns, int layers)
+        internal Inputs(int rows, int columns, int layers, int channels = 1)
         {
             Rows = rows; Columns = columns; Layers = layers; Length = rows * columns;
-            Shape = new[] { rows, 1, 1, columns };
+            Shape = new[] { rows, channels, 1, columns / channels };
             Direction = new float[layers][]; Gain = new float[layers][];
             for (int layer = 0; layer < layers; layer++)
             {
