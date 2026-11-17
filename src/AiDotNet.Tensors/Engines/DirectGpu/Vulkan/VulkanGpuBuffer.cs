@@ -10,12 +10,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Wraps a Vulkan device-local storage buffer and host-visible staging buffer
 /// as an <see cref="IGpuBuffer"/> for use with <see cref="IDirectGpuBackend"/> operations.
 /// </summary>
-public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
 {
     internal readonly VulkanBuffer Storage;
     internal readonly VulkanBuffer Staging;
     private int _disposed;
     private readonly VulkanGpuBuffer? _viewParent;
+    IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
     private VulkanBackend? _batchUploadOwner;
     // What GpuMemoryStats counts for the device-local storage buffer (the staging buffer is host-visible memory).
     private DeviceMemoryHold _memory;

@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// 3. Read data by copying to MAP_READ buffer, then mapping
 /// </para>
 /// </remarks>
-public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
+public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, IGpuBufferViewSource
 {
     internal const WebGpuBufferUsage DefaultStorageUsage =
         WebGpuBufferUsage.Storage | WebGpuBufferUsage.CopySrc | WebGpuBufferUsage.CopyDst;
@@ -65,6 +65,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable
     private readonly int _offsetBytes;
     // A view keeps its parent reachable, so the parent's finalizer cannot destroy memory the view still addresses.
     private readonly WebGpuBuffer? _viewParent;
+    IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
     private AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryHold _memory; // what GpuMemoryStats counts (nothing for a view)
     private long _reclaimCharge;
     private long _reclaimEpoch = -1;

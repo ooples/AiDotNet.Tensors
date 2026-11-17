@@ -14311,7 +14311,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     private static bool IsReleased(IGpuBuffer buffer)
     {
-        while (buffer is IGpuBufferViewSource view) buffer = view.ViewParent;
+        buffer = GpuBufferViewRoot.Of(buffer);
         return buffer.Handle == IntPtr.Zero || (buffer is CudaGpuBuffer cuda && cuda.IsReleased);
     }
 
