@@ -144,6 +144,44 @@ public sealed class RfftMagnitudeCpuTests
     }
 
     [Fact]
+    public void StridedForwardDestinationSnapshotsDistinctMemoryWrappersOverTheSameArray()
+    {
+        var engine = new CpuEngine();
+        var shared = Enumerable.Range(0, 40).Select(i => .3 * Math.Sin(.2 + i * .17)).ToArray();
+        var input = Tensor<double>.FromMemory(shared.AsMemory(1, 16), new[] { 2, 8 });
+        var output = Tensor<double>.FromMemory(shared.AsMemory(7, 10), new[] { 5, 2 }).Transpose(new[] { 1, 0 });
+        Assert.NotSame(input.StorageIdentity, output.StorageIdentity);
+        Assert.False(output.IsContiguous);
+        double first = shared[0], last = shared[39];
+        var expected = Oracle(input.ToArray(), new double[10], 8, .25).Magnitude;
+        engine.TensorRfftMagnitudeInto(output, input, .25);
+        AssertClose(expected, output.ToArray(), 2e-11);
+        Assert.Equal(first, shared[0]); Assert.Equal(last, shared[39]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StridedAdjointSnapshotsDistinctMemoryWrappersForBothPrimalAndUpstream(bool accumulate)
+    {
+        var engine = new CpuEngine();
+        var shared = Enumerable.Range(0, 40).Select(i => .3 * Math.Sin(.4 + i * .19)).ToArray();
+        var input = Tensor<double>.FromMemory(shared.AsMemory(1, 16), new[] { 2, 8 });
+        var upstream = Tensor<double>.FromMemory(shared.AsMemory(7, 10), new[] { 2, 5 });
+        var gradient = Tensor<double>.FromMemory(shared.AsMemory(4, 16), new[] { 8, 2 }).Transpose(new[] { 1, 0 });
+        Assert.NotSame(input.StorageIdentity, gradient.StorageIdentity);
+        Assert.NotSame(upstream.StorageIdentity, gradient.StorageIdentity);
+        Assert.False(gradient.IsContiguous);
+        double first = shared[0], last = shared[39];
+        var initial = gradient.ToArray();
+        var expected = Oracle(input.ToArray(), upstream.ToArray(), 8, .25).Gradient;
+        if (accumulate) expected = expected.Select((value, i) => value + initial[i]).ToArray();
+        engine.TensorRfftMagnitudeBackwardInto(upstream, input, gradient, .25, accumulate);
+        AssertClose(expected, gradient.ToArray(), 2e-11);
+        Assert.Equal(first, shared[0]); Assert.Equal(last, shared[39]);
+    }
+
+    [Fact]
     public void DecimalUsesExistingCpuFftConversionContract()
     {
         var engine = new CpuEngine();
