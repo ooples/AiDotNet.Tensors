@@ -14,6 +14,7 @@ internal static class BufferAllocationDiagnostics
     internal static readonly bool Enabled = Environment.GetEnvironmentVariable("AIDOTNET_BUFFER_ALLOC_DIAG") == "1";
     private static readonly RequestRecorder Recorder = new();
     private static readonly Totals CudaNativeApiRequests = new();
+    private static readonly Totals CompiledWorkspaceLoans = new();
     internal static bool IsInsideRequest => RequestRecorder.IsInside;
 
     // Keep diagnostics from changing a backend's existing null-validation order or exception type.
@@ -28,6 +29,12 @@ internal static class BufferAllocationDiagnostics
     internal static void RecordCudaNativeApiRequest(long bytes)
     {
         if (Enabled && bytes > 0) CudaNativeApiRequests.Add(bytes);
+    }
+
+    internal static void RecordCompiledWorkspaceLoan(int requestedFloat32Length)
+    {
+        if (Enabled && requestedFloat32Length > 0)
+            CompiledWorkspaceLoans.Add((long)requestedFloat32Length * sizeof(float));
     }
 
     // The benchmark accesses this internal diagnostic reflectively, so the public library API need not grow.
@@ -58,6 +65,13 @@ internal static class BufferAllocationDiagnostics
                 ["backends"] = backends,
             },
             ["cpu_storage_requested"] = Helpers.CpuStorageAllocationDiagnostics.Snapshot(),
+            ["gpu_compiled_workspace_loan_requested"] = new Dictionary<string, object>
+            {
+                ["bytes"] = CompiledWorkspaceLoans.Bytes,
+                ["count"] = CompiledWorkspaceLoans.Count,
+                ["coverage"] = Enabled ? "successful_compiled_broker_loans_only" : "disabled",
+                ["scope"] = "Successful cross-plan compiled workspace loans at CompiledTransientWorkspaceBroker.TryRent. Requested float32 length, including reused capacity; excludes failed rents, stable slot lookups, aliases/views and native backing API acquisitions. Other private pool/arena borrow routes require separate coverage.",
+            },
             ["gpu_native_api_requested"] = new Dictionary<string, object>
             {
                 ["bytes"] = CudaNativeApiRequests.Bytes,
