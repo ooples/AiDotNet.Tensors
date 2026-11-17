@@ -133,6 +133,40 @@ internal sealed class StepScratchPool
     }
 
     /// <summary>
+    /// Metadata-only retention snapshot. Each live native handle is assigned to its first owning category, in the
+    /// order listed below; borrowed/lent references therefore cannot inflate the total. Does not download or free data.
+    /// </summary>
+    internal IReadOnlyDictionary<string, (int Count, long Bytes)> SnapshotStorage(int forwardActionCount)
+    {
+        var result = new Dictionary<string, (int Count, long Bytes)>
+        {
+            ["slots_forward"] = (0, 0),
+            ["slots_backward"] = (0, 0),
+            ["transient"] = (0, 0),
+            ["free"] = (0, 0),
+            ["leases"] = (0, 0),
+            ["spanning"] = (0, 0),
+        };
+        var handles = new HashSet<IntPtr>();
+        void Add(string category, IGpuBuffer buffer)
+        {
+            if (buffer.Handle == IntPtr.Zero || !handles.Add(buffer.Handle)) return;
+            var previous = result[category];
+            result[category] = (previous.Count + 1, previous.Bytes + buffer.SizeInBytes);
+        }
+        foreach (var slot in Slots)
+            if ((int)(slot.Key >> 32) < forwardActionCount) Add("slots_forward", slot.Value);
+        foreach (var slot in Slots)
+            if ((int)(slot.Key >> 32) >= forwardActionCount) Add("slots_backward", slot.Value);
+        foreach (var buffer in Transient.Values) Add("transient", buffer);
+        foreach (var buffer in _free) Add("free", buffer);
+        foreach (var lease in _leases) Add("leases", lease.Buffer);
+        foreach (var buffer in _spanning.Keys) Add("spanning", buffer);
+        return result;
+    }
+
+
+    /// <summary>
     /// Set by the plan around a forward action that writes an output it will span-lease: a slot that action allocates for
     /// the first time takes a free buffer (<see cref="TryTakeFree"/>) instead of a new one.
     /// </summary>

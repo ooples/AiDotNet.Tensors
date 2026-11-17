@@ -159,6 +159,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly long _planId = System.Threading.Interlocked.Increment(ref s_nextPlanId);
     /// <summary>Set when <see cref="TryRunResidentBody"/> threw; later steps use StepEager.</summary>
     private bool _residentStepFailed;
+    private string? _residentStepFailureReason;
+
     private bool _graphEvictionSuspended;   // eviction suspended for the graph lifetime (resumed on Dispose)
     private int _graphEagerFwd;              // # leading forward steps run EAGERLY outside the captured graph (0 in capture mode)
     private bool _graphHasEmbedding;         // first forward step is the embedding → captured INSIDE the graph as an
@@ -1833,11 +1835,44 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Unobservable gradient placeholders excluded from physical host/device residency.</summary>
     internal int PrunedGradientBufferCount { get; private set; }
     private bool _tracedRetainedStorage;
+    private long _diagnosticObservations;
+    private long _planGraphReplayCount;
+
 
     // Diagnostic metadata only: never obtains readable spans, realizes deferred tensors or downloads device values.
     private void TraceRetainedStorageOnce()
     {
-        if (_tracedRetainedStorage || Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") != "1") return;
+        bool storage = Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1";
+        if (!storage && !s_graphStepDiagnosticsEnabled) return;
+        // Match the execution lock order so diagnostics cannot observe another step halfway through rebinding.
+        if (_engine.As<Engines.DirectGpuTensorEngine>() is { } gpu)
+        {
+            lock (gpu.CompiledStepLock)
+                lock (_stepSync) TracePlanDiagnosticsCore(storage);
+        }
+        else lock (_stepSync) TracePlanDiagnosticsCore(storage);
+    }
+
+    private void TracePlanDiagnosticsCore(bool storage)
+    {
+        long observation = ++_diagnosticObservations;
+        string failure = (GraphCaptureFailureReason ?? "(none)").Replace('\r', ' ').Replace('\n', ' ');
+        string residentFailure = (_residentStepFailureReason ?? "(none)").Replace('\r', ' ').Replace('\n', ' ');
+        AiDotNetEngine.LogDiagnostic($"[PLAN-EXEC] plan={_planId} parameters={_parameters.Length} observation={observation} graph_enabled={s_graphStepEnabled} eligible={_graphStepEligible} disabled={_graphStepDisabled} graph_bound={_stepGraphExec != IntPtr.Zero} warmup_calls={_graphStepCalls} plan_replays={_planGraphReplayCount} process_replays={GraphReplayCount} resident_failed={_residentStepFailed} data_forward_replay={_dataForwardReplay is not null} checkpointing={_checkpointing is not null} half_training={_fp16HeteroOrder is not null} span_candidates={ForwardSpanLeaseCandidates} failure={failure} resident_failure={residentFailure}");
+        if (storage && _scratchPool is { } pool)
+        {
+            var categories = pool.SnapshotStorage(_forwardActions.Length);
+            long bytes = 0;
+            int count = 0;
+            foreach (var category in categories)
+            {
+                bytes += category.Value.Bytes;
+                count += category.Value.Count;
+                AiDotNetEngine.LogDiagnostic($"[PLAN-SCRATCH] plan={_planId} observation={observation} category={category.Key} handles={category.Value.Count} bytes={category.Value.Bytes}");
+            }
+            AiDotNetEngine.LogDiagnostic($"[PLAN-SCRATCH] plan={_planId} observation={observation} unique_handles={count} unique_bytes={bytes} overlap_with_tensor_storage=True");
+        }
+        if (_tracedRetainedStorage || !storage) return;
         _tracedRetainedStorage = true;
         var hostArrays = new HashSet<object>();
         var deviceHandles = new HashSet<IntPtr>();
@@ -4472,6 +4507,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, _stepGraphExec);
                 else LaunchStepGraph(cb, _stepGraphExec);
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
+                _planGraphReplayCount++;
+
                 RefreshLossFromCapturedGraph(gte);
                 if (_capturedOptimizer is { } capturedReplay)
                 {
@@ -4769,6 +4806,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // The body binds step buffers to the device; StepEager writes them on the host, so the stale device
             // copies must go (see DetachCapturePathBindings).
             _residentStepFailed = true;
+            _residentStepFailureReason = ex.GetType().Name + ": " + ex.Message;
+
             DetachCapturePathBindings();
             if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
             Engines.DirectGpu.GpuLaunchProbe.OnFallback("CompiledTrainingPlan.StepResident", ex);
