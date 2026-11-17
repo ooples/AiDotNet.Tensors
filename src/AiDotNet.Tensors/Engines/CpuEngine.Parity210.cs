@@ -3793,11 +3793,6 @@ public partial class CpuEngine
     private Tensor<int> SearchSortedBatched<T>(Tensor<T> sortedSequence, Tensor<T> values, bool right)
     {
         int rank = sortedSequence.Rank;
-        if (values.Rank != rank)
-            throw new ArgumentException($"SearchSorted: values must have the sorted sequence's rank {rank}; got {values.Rank}.");
-        for (int d = 0; d < rank - 1; d++)
-            if (values._shape[d] != sortedSequence._shape[d])
-                throw new ArgumentException($"SearchSorted: leading dim {d} is {values._shape[d]} vs {sortedSequence._shape[d]}.");
         int s = sortedSequence._shape[rank - 1], v = values._shape[rank - 1], rows = values.Length / Math.Max(1, v);
         var seq = sortedSequence.GetFlattenedData();
         var vals = values.GetFlattenedData();
@@ -3883,6 +3878,30 @@ public partial class CpuEngine
         if (values == null) throw new ArgumentNullException(nameof(values));
         if (sortedSequence.Rank == 0)
             throw new ArgumentException("SearchSorted expects a sorted sequence of rank >= 1");
+        if (sortedSequence.Rank > 1)
+        {
+            if (values.Rank != sortedSequence.Rank)
+                throw new ArgumentException($"SearchSorted: values must have the sorted sequence's rank {sortedSequence.Rank}; got {values.Rank}.");
+            for (int d = 0; d < sortedSequence.Rank - 1; d++)
+                if (values._shape[d] != sortedSequence._shape[d])
+                    throw new ArgumentException($"SearchSorted: leading dim {d} is {values._shape[d]} vs {sortedSequence._shape[d]}.");
+        }
+
+        // Searching is discrete forward data, but both current operands must be replayed before its integer output.
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var sequence = sortedSequence;
+            var searchedValues = values;
+            return scope.RecordCrossType<T, int>(LazyNodeType.Custom, "TensorSearchSorted",
+                sequence, searchedValues, values._shape,
+                (engine, output) =>
+                {
+                    using var result = engine.TensorSearchSorted(sequence, searchedValues, right);
+                    DirectGpuTensorEngine.CopyResultInto(engine, result, output);
+                });
+        }
+
         if (sortedSequence.Rank > 1)
             return SearchSortedBatched(sortedSequence, values, right);
 

@@ -26639,68 +26639,29 @@ public partial class CpuEngine : ITensorLevelEngine
             return outputs[0];
         }
 
-        // GraphMode: execute eagerly (out params), but record result in graph for compiled plan
+        // Record training normalization without evaluating a potentially lazy input during the trace.
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
-                // A 4D float input on the CPU is normalized straight into the recorded output below, reading the input's
-                // live array: the eager path copied a pool-padded input whole (GetReadOnlyDataArray) and normalized into
-                // a fresh result it then copied into the recorded output -- two activation-sized temporaries per BatchNorm,
-                // over a quarter of everything a DenseNet-121 training trace allocated. A GPU engine defers the same way:
-                // the eager path normalized on the device, then the copy realized the node (normalizing again, and
-                // realizing every unrealized producer above it) and downloaded the result; the pooled eager result kept
-                // its device buffer, 1.1 GB of trace-time BatchNorm outputs held all run on DenseNet-121.
-                bool directIntoRecorded = typeof(T) == typeof(float) && input.Rank == 4
-                    && input.IsContiguous && gamma.IsContiguous && beta.IsContiguous
-                    && gamma.Length == input._shape[1] && beta.Length == input._shape[1];
-                var savedScope = GraphMode.Current;
-                GraphMode.SetCurrent(null);
-                Tensor<T>? eagerResult = null;
-                try
+                // Rank 3 is [C,H,W], unlike rank 2 [N,C] and rank 4 [N,C,H,W].
+                // Rank 1 retains the existing single-sample [C] convention.
+                int channels = input.Rank switch
                 {
-                    if (directIntoRecorded)
-                    {
-                        mean = new Tensor<T>(new[] { input._shape[1] });
-                        variance = new Tensor<T>(new[] { input._shape[1] });
-                    }
-                    else
-                    {
-                        eagerResult = BatchNorm(ci, cg, cb, ce, out mean, out variance);
-                    }
-                }
-                finally
-                {
-                    // PR #352: try/finally ensures GraphMode is restored even
-                    // if the eager BatchNorm throws — without this, a failure
-                    // here would leave GraphMode disabled and subsequent
-                    // graph-mode ops would silently degrade to eager.
-                    GraphMode.SetCurrent(savedScope);
-                }
-                // PR #352: bind THIS engine to the scope so the compiled plan
-                // replays on the same engine the user called the op on (issue
-                // #350: scope captures AiDotNetEngine.Current at scope-
-                // construction time, which on auto-detect-GPU systems is
-                // DirectGpuTensorEngine — wrong if the user explicitly calls
-                // a CPU instance, since BN results would be GPU-routed at
-                // Step time and diverge from the CPU eager-time output).
-                scope.BindEngineIfUnset(this);
-                // AiDotNet#1331: capture mean/variance refs so the lazy
-                // replay below can refresh them on every plan.Step (training
-                // mean/variance evolve with the data). PR #359 review (Thread
-                // 13): BatchNorm rents eagerResult/freshMean/freshVar from the
-                // pool; return them after copying their contents so the BN
-                // GraphMode path does not leak three tensors per replay.
+                    1 or 3 => input._shape[0],
+                    2 or 4 => input._shape[1],
+                    _ => throw new ArgumentException("BatchNorm requires an input of rank 1, 2, 3, or 4.", nameof(input)),
+                };
+                mean = new Tensor<T>(new[] { channels });
+                variance = new Tensor<T>(new[] { channels });
                 var capturedMean = mean; var capturedVar = variance;
-                // Record in graph so compiled plan captures the dependency
                 var lazyResult = scope.RecordVariadic(LazyNodeType.Custom, "BatchNorm",
-                    new[] { input, gamma, beta }, eagerResult?._shape ?? (int[])input._shape.Clone(),
+                    new[] { input, gamma, beta }, (int[])input._shape.Clone(),
                     (eng, output) =>
                     {
-                        // Normalize straight into the plan's buffers: computing into fresh tensors and copying all three in
-                        // was a third of a DenseNet training step's main-thread copy time.
+                        // Preserve the float NCHW fast path; all other supported layouts run only on replay.
                         if (eng.Is<CpuEngine>() && !eng.SupportsGpu
                             && TryBatchNormTrainingFloatInto(ci, cg, cb, ce, output, capturedMean, capturedVar))
                             return;
@@ -26722,24 +26683,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
                 using var lazyResultKeep1 = new KeepAliveScope(lazyResult);
-                // The direct path leaves the node unrealized, like every other recorded op: a read realizes it (and its
-                // statistics outputs below realize it first). Normalizing here made the trace compute its whole forward,
-                // which wrote every recorded output - including the ones the compiled plan then drops (a fused
-                // BatchNorm's normalized output, a fused convolution chain's raw output): on DenseNet-121, 1.5 GB of
-                // arrays paged in at compile only to be freed, the training run's peak resident memory.
-                if (eagerResult is not null)
-                {
-                    using var eagerResultKeep1 = new KeepAliveScope(eagerResult);
-                    eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
-                    Helpers.TensorAllocator.Return(eagerResult);
-                }
-                // Hand the batch statistics out as outputs OF this node. The replay above refreshes capturedMean /
-                // capturedVar as a side effect the plan cannot see, so a consumer reading them directly - the
-                // running-statistics EMA every BatchNorm layer keeps - depended only on leaf tensors and the plan's
-                // schedule was free to run it BEFORE this node: each step then folded in the PREVIOUS step's batch
-                // statistics (measured: AiDotNet GraFPrint's compiled running mean after two steps was exactly
-                // 0.9 * rm1 + 0.1 * mean(step 1)). Nodes that take the normalized output as input order every
-                // consumer after the refresh.
+                // Explicit outputs order every statistics consumer after this step's normalization.
                 mean = BatchStatisticOutput(scope, lazyResult, capturedMean, "BatchNormBatchMean");
                 variance = BatchStatisticOutput(scope, lazyResult, capturedVar, "BatchNormBatchVariance");
                 return lazyResult;
@@ -27610,6 +27554,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        // Forward interprets [C] as one observation [1,C]; use the matching backward layout.
+        // Keep the same statistics objects so low-precision backward retains their FP32 carry.
+        if (input.Rank == 1)
+        {
+            if (gradOutput.Rank != 1 || gradOutput.Length != input.Length)
+                throw new ArgumentException("Rank-1 BatchNorm requires a matching rank-1 output gradient.", nameof(gradOutput));
+            int[] rows = new[] { 1, input.Length };
+            var gradient = BatchNormBackward(Reshape(gradOutput, rows), Reshape(input, rows),
+                gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
+            return Reshape(gradient, (int[])input._shape.Clone());
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);

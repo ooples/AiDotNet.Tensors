@@ -5175,6 +5175,8 @@ public partial class DirectGpuTensorEngine
 
         if (sortedSequence is null) throw new ArgumentNullException(nameof(sortedSequence));
         if (values is null) throw new ArgumentNullException(nameof(values));
+        if (GraphMode.IsActive)
+            return base.TensorSearchSorted(sortedSequence, values, right);
         if (typeof(T) != typeof(float) || sortedSequence.Rank != 1 || !TryGetBackend(out var backend))
             return base.TensorSearchSorted(sortedSequence, values, right);
         try

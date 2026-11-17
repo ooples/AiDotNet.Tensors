@@ -44,12 +44,13 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
         ForwardOnlyHeterogeneousReplay.DetachTensor(Output, released, handles,
             !retained.Contains(Output) && !retained.Contains(((ITensorStorageLeaseSource)Output).StorageIdentity));
         ForwardOnlyHeterogeneousReplay.DetachTensor(Input, released, handles);
+        if (Input1 is not null) ForwardOnlyHeterogeneousReplay.DetachTensor(Input1, released, handles);
     }
 
     Type ISignableLazyNode.OutputElementType => typeof(TOut);
     object ISignableLazyNode.OutputTensor => Output;
-    int ISignableLazyNode.SignatureInputCount => 1;
-    object? ISignableLazyNode.GetSignatureInput(int index) => index == 0 ? Input : null;
+    int ISignableLazyNode.SignatureInputCount => Input1 is null ? 1 : 2;
+    object? ISignableLazyNode.GetSignatureInput(int index) => index == 0 ? Input : index == 1 ? Input1 : null;
     Delegate ISignableLazyNode.ExecuteDelegate => Execute;
     Delegate? ISignableLazyNode.BackwardDelegate => BackwardFn;
     object[]? ISignableLazyNode.SavedStateObjects => SavedState;
@@ -72,12 +73,15 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
 
     /// <inheritdoc />
     public bool ReadsStorageOf(object tensor)
-        => tensor is Tensor<TIn> target && Input is not null
-            && (ReferenceEquals(Input, target) || Input.SharesStorageWith(target));
+        => tensor is Tensor<TIn> target &&
+            ((Input is not null && (ReferenceEquals(Input, target) || Input.SharesStorageWith(target))) ||
+             (Input1 is not null && (ReferenceEquals(Input1, target) || Input1.SharesStorageWith(target))));
     public int ConsumerCount { get; set; }
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
     public readonly Tensor<TIn> Input;
+    // A second operand is supported only for forward-only operations; differentiable casts remain unary.
+    public readonly Tensor<TIn>? Input1;
     public readonly Tensor<TOut> Output;
     public readonly Action<IEngine, Tensor<TOut>> Execute;
 
@@ -93,11 +97,15 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
         Tensor<TOut> output,
         Action<IEngine, Tensor<TOut>> execute,
         CrossTypeBackwardFunction<TIn, TOut>? backwardFn = null,
-        object[]? savedState = null)
+        object[]? savedState = null,
+        Tensor<TIn>? input1 = null)
     {
+        if (input1 is not null && backwardFn is not null)
+            throw new ArgumentException("A binary cross-type node must be forward-only.", nameof(backwardFn));
         OpType = opType;
         OpName = opName;
         Input = input;
+        Input1 = input1;
         Output = output;
         OutputShape = output._shape;
         Execute = execute;
@@ -142,12 +150,18 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
             var asOf = LazyNodeOrder.ProducerAsOf(latest, RecordOrder);
             if (asOf is { IsRealized: false } inputNode)
                 inputNode.Realize(engine);
+            var latest1 = Input1?.LazySource;
+            var asOf1 = LazyNodeOrder.ProducerAsOf(latest1, RecordOrder);
+            if (asOf1 is { IsRealized: false } inputNode1)
+                inputNode1.Realize(engine);
 
             // Execute with the input showing its producer as of this node, as LazyNode does: a read of the input
             // auto-realizes its LazySource, which for a tensor written in place later in the trace is that later write,
             // so this node would have read the written value and the plan would run the write a second time.
             var shown = latest is not null && !ReferenceEquals(asOf, latest) ? Input : null;
+            var shown1 = latest1 is not null && !ReferenceEquals(asOf1, latest1) ? Input1 : null;
             if (shown is not null) shown.LazySource = asOf;
+            if (shown1 is not null) shown1.LazySource = asOf1;
             try
             {
                 Execute(engine, Output);
@@ -155,6 +169,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
             finally
             {
                 if (shown is not null) shown.LazySource = latest;
+                if (shown1 is not null) shown1.LazySource = latest1;
             }
         }
         catch
@@ -172,8 +187,11 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
 
     public ILazyNode[] GetInputNodes()
     {
-        if (LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder) is { } node)
-            return new[] { node };
+        var node = LazyNodeOrder.ProducerAsOf(Input?.LazySource, RecordOrder);
+        var node1 = LazyNodeOrder.ProducerAsOf(Input1?.LazySource, RecordOrder);
+        if (node is not null)
+            return node1 is not null && !ReferenceEquals(node, node1) ? new[] { node, node1 } : new[] { node };
+        if (node1 is not null) return new[] { node1 };
         return Array.Empty<ILazyNode>();
     }
 
@@ -195,6 +213,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     public void AddStorageLeases(TensorStorageLeaseSet leases)
     {
         leases.Add(Input);
+        if (Input1 is not null) leases.Add(Input1);
         leases.Add(Output);
         leases.AddSavedState(SavedState);
     }

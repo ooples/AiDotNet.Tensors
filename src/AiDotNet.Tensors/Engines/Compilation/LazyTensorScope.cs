@@ -226,9 +226,32 @@ internal sealed class LazyTensorScope : IDisposable
         return output;
     }
 
+    /// <summary>Records a two-input cross-type data operation. Both operands participate in ordering and leases;
+    /// no derivative is defined across this node.</summary>
+    internal Tensor<TOut> RecordCrossType<TIn, TOut>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<TIn> input0,
+        Tensor<TIn> input1,
+        int[] outputShape,
+        Action<IEngine, Tensor<TOut>> execute)
+    {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+        if (input0 is null) throw new ArgumentNullException(nameof(input0));
+        if (input1 is null) throw new ArgumentNullException(nameof(input1));
+        var output = RentOutput<TOut>(outputShape);
+        var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input0, output, execute, input1: input1)
+        {
+            RecordedUnderNoGrad = RecordsWithoutGradient<TIn>() || RecordsWithoutGradient<TOut>(),
+        };
+        output.LazySource = node;
+        AddNode(node);
+        return output;
+    }
+
     /// <summary>
-    /// Records a cross-type operation WITH a backward — the mixed-precision (#555) cast node. Identical
-    /// to <see cref="RecordCrossType{TIn,TOut}"/> for the forward, but the node carries a
+    /// Records a cross-type operation WITH a backward — the mixed-precision (#555) cast node. Like the unary
+    /// forward-only recorder, but the node carries a
     /// <see cref="CrossTypeBackwardFunction{TIn,TOut}"/> so the compiled backward walk can bridge the
     /// gradient from the output's dtype grad space into the input's.
     /// </summary>
