@@ -15,6 +15,9 @@ internal static class BufferAllocationDiagnostics
     private static readonly RequestRecorder Recorder = new();
     internal static bool IsInsideRequest => RequestRecorder.IsInside;
 
+    // Keep diagnostics from changing a backend's existing null-validation order or exception type.
+    internal static long Primitive32Bytes(Array? data) => data is null ? 0 : (long)data.Length * sizeof(float);
+
     internal static T Observe<T>(string backend, long bytes, Func<T> allocate)
         => Recorder.Observe(backend, bytes, allocate);
 
