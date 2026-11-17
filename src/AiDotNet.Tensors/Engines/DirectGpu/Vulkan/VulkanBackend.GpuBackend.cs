@@ -264,6 +264,9 @@ public sealed unsafe partial class VulkanBackend
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("Vulkan", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));
@@ -334,6 +337,9 @@ public sealed unsafe partial class VulkanBackend
 
     public IGpuBuffer AllocateBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("Vulkan", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
@@ -442,6 +448,9 @@ public sealed unsafe partial class VulkanBackend
 
     public IGpuBuffer AllocateIntBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("Vulkan", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Int buffer size must be positive.");
@@ -451,6 +460,9 @@ public sealed unsafe partial class VulkanBackend
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("Vulkan", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));
@@ -483,6 +495,9 @@ public sealed unsafe partial class VulkanBackend
     /// </remarks>
     public IGpuBuffer AllocateByteBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("Vulkan", (long)size * sizeof(byte), (this, size),
+                static state => state.Item1.AllocateByteBuffer(state.Item2));
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Byte buffer size must be positive.");
