@@ -9956,12 +9956,13 @@ internal static partial class BackwardFunctions<T>
 
         var x = inputs[0];
         var xs = RoIAlignPlan.ToDoubles(x);
-        // Evaluate in double precision, then apply the upstream gradient through the engine.
+        // Keep the derivative and its upstream product in double until the final conversion to T.
         for (int i = 0; i < xs.Length; i++)
         {
             double xd = xs[i];
             // Reflection bounds recurrence work even for very large negative arguments.
             // Nonpositive integer poles and negative infinity have no digamma derivative.
+            // Exact equality identifies integer poles; adjacent representable nonintegers are not poles.
             if (double.IsNegativeInfinity(xd) || (xd < 0 && xd == System.Math.Floor(xd)))
             {
                 xs[i] = double.NaN;
@@ -9981,7 +9982,9 @@ internal static partial class BackwardFunctions<T>
                     - inv2 * (1.0 / 132.0 - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))));
             xs[i] = shift + series;
         }
-        AccumulateScaled(grads, x, gradOutput, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
+        var upstream = RoIAlignPlan.ToDoubles(gradOutput);
+        for (int i = 0; i < xs.Length; i++) xs[i] *= upstream[i];
+        DifferentiableOps.AccumulateGrad(grads, x, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
     }
 
     /// <summary>Digamma backward: d/dx digamma(x) = trigamma(x).</summary>
@@ -9998,7 +10001,7 @@ internal static partial class BackwardFunctions<T>
 
         var x = inputs[0];
         var xs = RoIAlignPlan.ToDoubles(x);
-        // Evaluate in double precision, then apply the upstream gradient through the engine.
+        // Keep the derivative and its upstream product in double until the final conversion to T.
         for (int i = 0; i < xs.Length; i++)
         {
             double xd = xs[i];
@@ -10007,6 +10010,7 @@ internal static partial class BackwardFunctions<T>
                 xs[i] = double.NaN;
                 continue;
             }
+            // Exact equality identifies integer poles; adjacent representable nonintegers are not poles.
             if (xd <= 0 && xd == System.Math.Floor(xd))
             {
                 xs[i] = double.PositiveInfinity;
@@ -10030,7 +10034,9 @@ internal static partial class BackwardFunctions<T>
                     - inv2 * (1.0 / 42.0)));
             xs[i] = reflected ? reflection - (shift + series) : shift + series;
         }
-        AccumulateScaled(grads, x, gradOutput, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
+        var upstream = RoIAlignPlan.ToDoubles(gradOutput);
+        for (int i = 0; i < xs.Length; i++) xs[i] *= upstream[i];
+        DifferentiableOps.AccumulateGrad(grads, x, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
     }
 
     /// <summary>I0 backward: d/dx I₀(x) = I₁(x).</summary>

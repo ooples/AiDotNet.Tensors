@@ -75,6 +75,58 @@ public sealed class GammaBackwardDomainTests
         Assert.InRange(Math.Abs(digamma[0] * distance * distance - 1), 0, 2e-15);
     }
 
+    [Theory]
+    [InlineData(true, false, 0.001)]
+    [InlineData(true, false, -0.001)]
+    [InlineData(true, false, 0.0)]
+    [InlineData(true, true, 0.001)]
+    [InlineData(true, true, -0.001)]
+    [InlineData(true, true, 0.0)]
+    [InlineData(false, false, 1e-10)]
+    [InlineData(false, false, -1e-10)]
+    [InlineData(false, false, 0.0)]
+    [InlineData(false, true, 1e-10)]
+    [InlineData(false, true, -1e-10)]
+    [InlineData(false, true, 0.0)]
+    public void Small_upstream_is_applied_before_the_only_narrowing_conversion(bool half, bool digamma, double upstream)
+    {
+        if (half) AssertFinalRounding<Half>(digamma, digamma ? 0.001 : 1e-5, upstream);
+        else AssertFinalRounding<float>(digamma, digamma ? 1e-20 : 1e-40, upstream);
+    }
+
+    private static void AssertFinalRounding<T>(bool digamma, double input, double upstream)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        T originalInput = ops.FromDouble(input), originalUpstream = ops.FromDouble(upstream);
+        var x = new Tensor<T>(new[] { originalInput }, new[] { 1 });
+        var go = new Tensor<T>(new[] { originalUpstream }, new[] { 1 });
+        double representedInput = ops.ToDouble(originalInput), representedUpstream = ops.ToDouble(originalUpstream);
+        // Independent Laurent expansions about zero, evaluated at the represented input rather than its decimal literal:
+        // psi(x) = -1/x - gamma + zeta(2)*x - zeta(3)*x^2 + O(x^3),
+        // psi'(x) = 1/x^2 + zeta(2) - 2*zeta(3)*x + 3*zeta(4)*x^2 + O(x^3).
+        // Here x <= 0.001001, so omitted terms are far below a final Half/float rounding interval.
+        const double eulerGamma = 0.5772156649015328606, zeta3 = 1.2020569031595942854;
+        double zeta2 = Math.PI * Math.PI / 6, x2 = representedInput * representedInput;
+        double slope = digamma
+            ? 1 / x2 + zeta2 - 2 * zeta3 * representedInput + Math.Pow(Math.PI, 4) / 30 * x2
+            : -1 / representedInput - eulerGamma + zeta2 * representedInput - zeta3 * x2;
+        Assert.False(double.IsInfinity(slope) || double.IsNaN(slope));
+        Assert.True(double.IsInfinity(ops.ToDouble(ops.FromDouble(slope))), "The unscaled slope must overflow T in this regression.");
+        T expected = ops.FromDouble(slope * representedUpstream);
+        Assert.False(double.IsInfinity(ops.ToDouble(expected)) || double.IsNaN(ops.ToDouble(expected)));
+
+        var gradients = new Dictionary<Tensor<T>, Tensor<T>>();
+        var output = new Tensor<T>(new[] { 1 });
+        var engine = new CpuEngine();
+        if (digamma)
+            BackwardFunctions<T>.DigammaBackward(go, new[] { x }, output, Array.Empty<object>(), engine, gradients);
+        else
+            BackwardFunctions<T>.LgammaBackward(go, new[] { x }, output, Array.Empty<object>(), engine, gradients);
+        Assert.Equal(expected, gradients[x][0]);
+        Assert.Equal(originalInput, x[0]);
+        Assert.Equal(originalUpstream, go[0]);
+    }
+
     private static (Tensor<T> Lgamma, Tensor<T> Digamma) Backward<T>(double[] values, double upstream = 1)
     {
         var ops = MathHelper.GetNumericOperations<T>();
