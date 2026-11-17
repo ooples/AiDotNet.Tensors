@@ -14351,6 +14351,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+        var rfftMagnitudeBackward = BuildRfftMagnitudeBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
+        if (rfftMagnitudeBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return rfftMagnitudeBackward;
+        }
         var weightNormBackward = BuildWeightNormBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
         if (weightNormBackward is not null)
         {
