@@ -60,6 +60,21 @@ public sealed class GammaBackwardDomainTests
         Assert.Equal(double.PositiveInfinity, digamma[1]);
     }
 
+    [Theory]
+    [InlineData(-0.9999999999999999)]
+    [InlineData(-1.0000000000000002)]
+    [InlineData(-1.9999999999999998)]
+    [InlineData(-2.0000000000000004)]
+    public void Adjacent_negative_poles_preserve_relative_distance(double x)
+    {
+        var (lgamma, digamma) = Backward<double>(new[] { x });
+        double distance = x - Math.Round(x);
+        // psi(-n + d) = -1/d + O(1), psi'(-n + d) = 1/d^2 + O(1).
+        // At these adjacent representable inputs the regular terms contribute less than the scaled tolerance.
+        Assert.InRange(Math.Abs(lgamma[0] * distance + 1), 0, 2e-15);
+        Assert.InRange(Math.Abs(digamma[0] * distance * distance - 1), 0, 2e-15);
+    }
+
     private static (Tensor<T> Lgamma, Tensor<T> Digamma) Backward<T>(double[] values, double upstream = 1)
     {
         var ops = MathHelper.GetNumericOperations<T>();

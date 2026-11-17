@@ -9974,8 +9974,8 @@ internal static partial class BackwardFunctions<T>
             double shift = 0;
             if (xd < 0)
             {
-                // Reduce modulo one before multiplying by pi to preserve the fractional part.
-                shift = -System.Math.PI / System.Math.Tan(System.Math.PI * (xd % 1.0));
+                // Reduce to the nearest integer first, preserving relative distance to negative poles.
+                shift = -System.Math.PI / System.Math.Tan(System.Math.PI * (xd - System.Math.Round(xd)));
                 xd = 1.0 - xd;
             }
             while (xd < 10.0) { shift -= 1.0 / xd; xd += 1.0; }
@@ -10025,7 +10025,7 @@ internal static partial class BackwardFunctions<T>
             bool reflected = xd < 0;
             if (reflected)
             {
-                double sin = System.Math.Sin(System.Math.PI * (xd % 1.0));
+                double sin = System.Math.Sin(System.Math.PI * (xd - System.Math.Round(xd)));
                 reflection = System.Math.PI * System.Math.PI / (sin * sin);
                 xd = 1.0 - xd;
             }
