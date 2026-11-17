@@ -1830,6 +1830,82 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// buffers across disjoint-lifetime intermediates.</summary>
     internal int PreAllocatedGradBufferCount => _preAllocatedGrads.Length;
 
+    /// <summary>Unobservable gradient placeholders excluded from physical host/device residency.</summary>
+    internal int PrunedGradientBufferCount { get; private set; }
+    private bool _tracedRetainedStorage;
+
+    // Diagnostic metadata only: never obtains readable spans, realizes deferred tensors or downloads device values.
+    private void TraceRetainedStorageOnce()
+    {
+        if (_tracedRetainedStorage || Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") != "1") return;
+        _tracedRetainedStorage = true;
+        var hostArrays = new HashSet<object>();
+        var deviceHandles = new HashSet<IntPtr>();
+        var rows = new SortedDictionary<string, (long Host, long Device)>();
+        void Add(string category, long host, long device)
+        {
+            rows.TryGetValue(category, out var previous);
+            rows[category] = (previous.Host + host, previous.Device + device);
+        }
+        void Device(string category, Engines.DirectGpu.IGpuBuffer? buffer)
+        {
+            if (buffer is not null && buffer.Handle != IntPtr.Zero && deviceHandles.Add(buffer.Handle))
+                Add(category, 0, buffer.SizeInBytes);
+        }
+        void Host(string category, Array? array, int elementBytes)
+        {
+            if (array is not null && hostArrays.Add(array)) Add(category, array.LongLength * elementBytes, 0);
+        }
+        void Tensor(string category, Tensor<T>? tensor)
+        {
+            if (tensor is null) return;
+            Host(category, tensor.GetBackingArrayForCacheLookupUnsafe(), System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
+            Device(category, tensor._gpuBuffer);
+        }
+        foreach (var parameter in _parameters) Tensor("parameters", parameter);
+        foreach (var gradient in _preAllocatedGrads) Tensor("gradients", gradient);
+        Tensor("gradients", _lossGradSeed);
+        Tensor("gradients", _lossGradDest);
+        foreach (var buffer in _gpuOptimizerBuffers) Device("optimizer", buffer);
+        if (_optimizerRuntimeState is { } runtime)
+        {
+            foreach (var slots in GpuMomentSlots(runtime))
+                foreach (var buffer in slots) Device("optimizer", buffer);
+            foreach (var slots in ArenaMomentSlots(runtime))
+                foreach (var array in slots)
+                    if (array is float[]) Host("optimizer", array, sizeof(float));
+                    else if (array is double[]) Host("optimizer", array, sizeof(double));
+        }
+        if (_forwardSteps is { } steps)
+        {
+            var outputs = new HashSet<Tensor<T>>(steps.Select(step => step.OutputBuffer));
+            foreach (var step in steps) Tensor("forward outputs", step.OutputBuffer);
+            foreach (var step in steps)
+            {
+                foreach (var input in step.Inputs)
+                    if (!outputs.Contains(input)) Tensor("external leaves/constants", input);
+                if (step.SavedState is not { } saved) continue;
+                foreach (var item in saved)
+                {
+                    if (item is Tensor<T> tensor) Tensor("saved state", tensor);
+                    else if (item is T[] array) Host("saved state", array, System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
+                }
+            }
+        }
+        long hostBytes = 0, deviceBytes = 0;
+        foreach (var row in rows)
+        {
+            hostBytes += row.Value.Host;
+            deviceBytes += row.Value.Device;
+            AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} parameters={_parameters.Length} {row.Key}: host={row.Value.Host / 1048576.0:F1}MB device={row.Value.Device / 1048576.0:F1}MB");
+        }
+        AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} observed unique host={hostBytes / 1048576.0:F1}MB device={deviceBytes / 1048576.0:F1}MB; pruned_gradients={PrunedGradientBufferCount}");
+        if (_scratchPool is { } scratch)
+            AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} scratch pool holds {scratch.BufferCount} buffers/{scratch.BufferBytes / 1048576.0:F1}MB (overlaps observed device handles)");
+    }
+
+
+
     /// <summary>Clears the pooled physical buffers scheduled to change tenant
     /// before backward action <paramref name="actionIndex"/>, so a reused buffer is
     /// zero before its next tenant's gradient accumulation begins.</summary>
@@ -4050,8 +4126,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // Every compiled GPU step holds the engine lock, then its plan lock.
             var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
             gpuEngine?.NoteCompiledStepThread(_planId);
-            if (gpuEngine is null) return StepLocked();
-            lock (gpuEngine.CompiledStepLock) return StepLocked();
+            Tensor<T> result;
+            if (gpuEngine is null) result = StepLocked();
+            else lock (gpuEngine.CompiledStepLock) result = StepLocked();
+            TraceRetainedStorageOnce();
+            return result;
         }
         catch
         {
@@ -11028,13 +11107,29 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Gradient pooling: shared arrays for gradients with disjoint lifetimes, an own array for every other one.
         int[][]? deferredZeroByAction = null;
+        int prunedGradientBufferCount = 0;
+
         bool[]? pooledGradients = null;
         if (gradPlaceholders is not null)
         {
             try
             {
-                (deferredZeroByAction, pooledGradients) = PoolGradientBuffers(backwardActions, actionCoverage, forwardSteps,
+                int[]? gradientIndexRemap;
+                (deferredZeroByAction, pooledGradients, gradientIndexRemap) = PoolGradientBuffers(backwardActions, actionCoverage, forwardSteps,
                     gradMap, allGrads, parameters, lossOutput, gradPlaceholders, t_gradAliasTargets);
+                if (gradientIndexRemap is not null)
+                {
+                    prunedGradientBufferCount = gradientIndexRemap.Count(index => index < 0);
+                    if (genericGradIndices is not null)
+                        genericGradIndices = genericGradIndices.Select(index => gradientIndexRemap[index]).Where(index => index >= 0).ToArray();
+                    if (eagerFirstWriteCandidates is not null)
+                    {
+                        var compactCandidates = new bool[allGrads.Count];
+                        for (int g = 0; g < gradientIndexRemap.Length; g++)
+                            if (gradientIndexRemap[g] >= 0) compactCandidates[gradientIndexRemap[g]] = eagerFirstWriteCandidates[g];
+                        eagerFirstWriteCandidates = compactCandidates;
+                    }
+                }
             }
             finally
             {
@@ -11128,6 +11223,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
+            plan.PrunedGradientBufferCount = prunedGradientBufferCount;
+
             plan._pooledGradients = pooledGradients;
             plan._deferredZeroByAction = deferredZeroByAction;
             plan._deferredZeroPending = pooledGradients is null ? null : new bool[pooledGradients.Length];
@@ -11315,7 +11412,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// zeroing, since an earlier tenant used the array), and which gradients are pooled. On DenseNet-121 the per-tensor
     /// gradients were 3.1 GB while at most ~0.2 GB is ever live at once.
     /// </summary>
-    private static (int[][]? Schedule, bool[]? Pooled) PoolGradientBuffers(
+    private static (int[][]? Schedule, bool[]? Pooled, int[]? IndexRemap) PoolGradientBuffers(
         List<Action<IEngine>> backwardActions, List<int[]?> coverage, List<CompiledStep<T>> forwardSteps,
         Dictionary<Tensor<T>, Tensor<T>> gradMap, List<Tensor<T>> allGrads, Tensor<T>[] parameters, Tensor<T> lossOutput,
         HashSet<Tensor<T>> placeholders, Dictionary<Tensor<T>, Tensor<T>>? aliasTargets = null)
@@ -11324,7 +11421,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var pooled = new bool[count];
         var schedule = new List<int>?[actions];
         bool anyPooled = false;
-        // Pooling is modeled only when every action reports the forward steps it covers.
+        int[]? indexRemap = null;
+        // An unknown backward action may observe any gradient, so neither pooling nor pruning is safe.
         int[][]? covered = coverage.Count == actions && coverage.All(steps => steps is not null)
             ? coverage.OfType<int[]>().ToArray()
             : null;
@@ -11338,8 +11436,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var readBeforeWrite = new bool[count];
             for (int g = 0; g < count; g++) { firstWrite[g] = None; lastUse[g] = -1; }
             var actionWrites = new HashSet<int>();
-            // The pooled index of a tensor's gradient, or None when it has no gradient being pooled. A gradient that is an
-            // alias view (aliasTargets) is its target's: a use of the view is a use of the target's buffer.
             int GradIndex(Tensor<T> t)
             {
                 if (!gradMap.TryGetValue(t, out var grad)) return None;
@@ -11348,16 +11444,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             for (int a = 0; a < actions; a++)
             {
-                // Writes first: a fused action (a conv epilogue chain) writes and reads its internal gradients itself, in
-                // one atomic action, so only a read that neither an earlier action nor this one writes is a read of a
-                // gradient nobody produced.
+                // Writes precede reads within an atomic fused action. An alias passthrough is only a use.
                 actionWrites.Clear();
                 foreach (int s in covered[a])
                 {
-                    // An input gradient that IS the step's output gradient (an alias: a reshape's, an add's) is not
-                    // written by this step, only passed through, so it is a use, not a write. Counting it as a write hid
-                    // a gradient nothing writes (a dead branch's) from the read-before-write check: it was pooled, and
-                    // from the second step on its backward read the previous tenant's values into live gradients.
                     int passthrough = GradIndex(forwardSteps[s].OutputBuffer);
                     foreach (int w in forwardSteps[s].Inputs.Select(GradIndex).Where(i => i != None))
                     {
@@ -11375,20 +11465,31 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             var excluded = new HashSet<Tensor<T>>(parameters.Select(p => gradMap.TryGetValue(p, out var pg) ? pg : null).OfType<Tensor<T>>());
             if (gradMap.TryGetValue(lossOutput, out var lossGrad)) excluded.Add(lossGrad);
-            // Requested input gradients are read through .Grad after the step: each keeps an array of its own.
             foreach (var leaf in RequestedInputGradientLeaves(forwardSteps))
                 if (gradMap.TryGetValue(leaf, out var leafGrad)) excluded.Add(leafGrad);
+            if (aliasTargets is not null)
+            {
+                // A requested result may itself be an alias. Its physical target must remain observable too.
+                foreach (var gradient in excluded.ToArray())
+                    if (aliasTargets.TryGetValue(gradient, out var target)) excluded.Add(target);
+            }
 
             var tenants = new List<int>();
+            var unused = new HashSet<Tensor<T>>();
+            var aliasRoots = aliasTargets is null ? new HashSet<Tensor<T>>() : new HashSet<Tensor<T>>(aliasTargets.Values);
             for (int g = 0; g < count; g++)
-                if (placeholders.Contains(allGrads[g]) && !excluded.Contains(allGrads[g])
-                    && firstWrite[g] != None && !readBeforeWrite[g] && allGrads[g].Length > 0)
+            {
+                var gradient = allGrads[g];
+                if (!placeholders.Contains(gradient) || excluded.Contains(gradient)) continue;
+                if (firstWrite[g] == None && lastUse[g] < 0 && !aliasRoots.Contains(gradient))
+                    unused.Add(gradient);
+                else if (firstWrite[g] != None && !readBeforeWrite[g] && gradient.Length > 0)
                     tenants.Add(g);
+            }
             tenants.Sort((x, y) => firstWrite[x] != firstWrite[y] ? firstWrite[x].CompareTo(firstWrite[y]) : lastUse[x].CompareTo(lastUse[y]));
-
             var arrayOf = AssignPooledArrays(tenants, firstWrite, lastUse, allGrads, out var capacity);
             if (Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
-                TraceGradientPooling(tenants, capacity, allGrads, placeholders, excluded, firstWrite, readBeforeWrite);
+                TraceGradientPooling(tenants, capacity, allGrads, placeholders, excluded, firstWrite, readBeforeWrite, unused);
 
             var arrays = new T[capacity.Count][];
             for (int b = 0; b < arrays.Length; b++) arrays[b] = new T[capacity[b]];
@@ -11402,18 +11503,50 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 anyPooled = true;
                 (schedule[firstWrite[g]] ??= new List<int>()).Add(g);
             }
-            // The alias views of a pooled target read its new array (a host read of a view, a host-path op on it).
             if (aliasTargets is not null)
                 foreach (var alias in aliasTargets)
                     if (indexOf.TryGetValue(alias.Value, out int t) && pooled[t]) RepointAliasView(alias.Key, alias.Value);
+
+            if (unused.Count > 0)
+            {
+                // A NoGrad/disconnected forward branch still needs values, but no backward action reads or writes its
+                // internal gradients. Keeping these in the physical list allocated multi-GB zero buffers on both host
+                // and device. Preserve a lazily materialized exact zero in the map, outside residency and clear loops.
+                var zeros = unused.ToDictionary(gradient => gradient,
+                    gradient => Tensor<T>.CreateDeferred((int[])gradient._shape.Clone()));
+                foreach (var tensor in gradMap.Keys.ToArray())
+                    if (zeros.TryGetValue(gradMap[tensor], out var zero)) gradMap[tensor] = zero;
+                indexRemap = new int[count];
+                int next = 0;
+                for (int g = 0; g < count; g++)
+                {
+                    if (unused.Contains(allGrads[g]))
+                    {
+                        indexRemap[g] = -1;
+                        placeholders.Remove(allGrads[g]);
+                    }
+                    else
+                    {
+                        indexRemap[g] = next;
+                        allGrads[next++] = allGrads[g];
+                    }
+                }
+                allGrads.RemoveRange(next, count - next);
+                var compactPooled = new bool[next];
+                for (int g = 0; g < count; g++)
+                    if (indexRemap[g] >= 0) compactPooled[indexRemap[g]] = pooled[g];
+                pooled = compactPooled;
+                for (int a = 0; a < actions; a++)
+                    if (schedule[a] is { } indices)
+                        for (int i = 0; i < indices.Count; i++) indices[i] = indexRemap[indices[i]];
+            }
         }
 
-        // Everything still a placeholder (unpooled, or pooling not modeled for this plan) gets an array of its own.
         foreach (var grad in placeholders.ToArray()) MaterializeIfGradPlaceholder(grad);
-        if (!anyPooled) return (null, null);
+        if (!anyPooled) return (null, null, indexRemap);
         var result = new int[actions][];
         for (int a = 0; a < actions; a++) result[a] = schedule[a]?.ToArray() ?? Array.Empty<int>();
-        return (result, pooled);
+        return (result, pooled, indexRemap);
     }
     /// <summary>
     /// AIDOTNET_GRAD_POOL_DIAG=1: why each gradient is or is not pooled, by count and bytes, through the engine log
@@ -11421,7 +11554,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// each hold an array (and on a GPU a device buffer) of their own for the plan's life.
     /// </summary>
     private static void TraceGradientPooling(List<int> tenants, List<int> capacity, List<Tensor<T>> allGrads,
-        HashSet<Tensor<T>> placeholders, HashSet<Tensor<T>> excluded, int[] firstWrite, bool[] readBeforeWrite)
+        HashSet<Tensor<T>> placeholders, HashSet<Tensor<T>> excluded, int[] firstWrite, bool[] readBeforeWrite,
+        HashSet<Tensor<T>> unused)
     {
         int esz = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
         var tenantSet = new HashSet<int>(tenants);
@@ -11437,6 +11571,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             string reason = tenantSet.Contains(g) ? "pooled tenant"
                 : !placeholders.Contains(grad) ? "own array before pooling (fetched at build, or reshape-aliased)"
                 : excluded.Contains(grad) ? "excluded (parameter, loss or requested input gradient)"
+                : unused.Contains(grad) ? "pruned (no backward read/write and no public result)"
+
                 : firstWrite[g] == int.MaxValue ? "never written by a covered action"
                 : readBeforeWrite[g] ? "read before written"
                 : "empty";
