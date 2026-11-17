@@ -34,7 +34,7 @@ public partial class DirectGpuTensorEngine
         var backend = RequireRfftBackend<T>();
         RequireRfftDestination(output);
         if (rows == 0) return;
-        using var source = GetResidentOrPersistentInputBuffer(backend, input);
+        using var source = GetRfftInputBuffer(backend, input);
         // All input reads finish before the output is written, including actual
         // overlapping input/output views. The spectrum is action-local scratch.
         using var spectrum = RfftSpectrum(backend, source.Buffer, rows, n, out int stride);
@@ -55,8 +55,8 @@ public partial class DirectGpuTensorEngine
         var backend = RequireRfftBackend<T>();
         RequireRfftDestination(gradInput);
         if (rows == 0) return;
-        using var source = GetResidentOrPersistentInputBuffer(backend, input);
-        using var upstream = GetResidentOrPersistentInputBuffer(backend, gradOutput);
+        using var source = GetRfftInputBuffer(backend, input);
+        using var upstream = GetRfftInputBuffer(backend, gradOutput);
         using var spectrum = RfftSpectrum(backend, source.Buffer, rows, n, out int stride);
         using var seed = AllocateTransientScratch(backend, checked(rows * n * 2), fullyWritten: true);
         var kernels = (IRfftMagnitudeKernels)backend;
@@ -101,6 +101,22 @@ public partial class DirectGpuTensorEngine
     {
         if (!IsCanonicalDenseAllocation(destination))
             throw new NotSupportedException("DirectGpu real FFT magnitude destinations must be dense contiguous zero-offset allocations. No host fallback was performed.");
+    }
+
+    private OwnedBuffer GetRfftInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> input)
+    {
+        if (!IsPartialView(input)) return GetResidentOrPersistentInputBuffer(backend, input);
+        // The general resolver may eventually call Contiguous() on the host.
+        // Native FFT never silently downloads an unsupported resident layout.
+        if (!IsFp16Resident(input))
+        {
+            if (TryResolveDeviceParameterView(backend, input, out var parameter, out bool owned))
+                return new OwnedBuffer(parameter, ownsBuffer: owned);
+            if (!input.IsContiguous && TryPermuteViewOnDevice(backend, input, out var permutation)) return permutation;
+            if (TrySliceViewOnDevice(backend, input, out var slice)) return slice;
+            if (TrySliceResidentMemberOnDevice(backend, input, out var member)) return member;
+        }
+        throw new NotSupportedException("The real FFT input view has no native layout route on this backend. No host fallback was performed.");
     }
 
     private OwnedBuffer RfftSpectrum(IDirectGpuBackend backend, IGpuBuffer input, int rows, int n, out int stride)
