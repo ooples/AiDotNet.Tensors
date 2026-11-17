@@ -11195,6 +11195,18 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 #endif
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && height == 1 && kernelHeight == 1 && outputHeight == 1
+            && (long)inChannels * kernelWidth * outputWidth >= 1_048_576)
+        {
+            inputData ??= input.GetReadOnlyDataArray();
+            kernelData ??= kernel.GetReadOnlyDataArray();
+            outputData ??= output.GetDataArray();
+            if (TryConv1DColumnPanels(inputData, kernelData, outputData,
+                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth))
+                return;
+        }
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))
         {
             Conv2DForwardBatchedFloat(
