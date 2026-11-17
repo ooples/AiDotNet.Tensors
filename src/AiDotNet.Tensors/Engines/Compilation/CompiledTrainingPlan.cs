@@ -15021,57 +15021,54 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var input = step.Inputs[0];
             var kernel = step.Inputs[1];
             var output = step.OutputBuffer;
-            if (!gradMap.ContainsKey(output) || !gradMap.ContainsKey(input) || !gradMap.ContainsKey(kernel))
-                return null;
-            // Saved state shape mirrors what BackwardFunctions.Conv2DBackward
-            // expects: [stride: int[], padding: int[], dilation: int[]].
-            // Some call paths extend savedState past index 2; same as the
-            // Conv2D forward specialization we tolerate that.
+            bool needInputGrad = requiresGrad is null || requiresGrad.Contains(input);
+            bool needKernelGrad = requiresGrad is null || requiresGrad.Contains(kernel);
+            if (!gradMap.ContainsKey(output) || (needInputGrad && !gradMap.ContainsKey(input))
+                || (needKernelGrad && !gradMap.ContainsKey(kernel))) return null;
+            // Saved state mirrors the canonical Conv2D derivative: stride, padding, dilation.
             var savedState = step.SavedState;
-            if (savedState == null || savedState.Length < 3
-                || savedState[0] is not int[] stride
-                || savedState[1] is not int[] padding
-                || savedState[2] is not int[] dilation)
+            if (savedState is not { Length: >= 3 } || savedState[0] is not int[] stride
+                || savedState[1] is not int[] padding || savedState[2] is not int[] dilation)
                 return null;
             var gradOut = gradMap[output];
-            var gradInput = gradMap[input];
-            var gradKernel = gradMap[kernel];
-            bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
-            bool accumKernel = consumerCount.ContainsKey(kernel) && consumerCount[kernel] > 1;
-            // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
-            bool needInputGrad = requiresGrad is null || requiresGrad.Contains(input);
-            // Capture shapes so the closure doesn't walk Tensor.Shape every
-            // Step (microoptimization but matters at 19+ Conv calls per iter).
+            var gradInput = needInputGrad ? gradMap[input] : null;
+            var gradKernel = needKernelGrad ? gradMap[kernel] : null;
+            bool sharedInput = consumerCount.TryGetValue(input, out int inputUses) && inputUses > 1;
+            bool sharedKernel = consumerCount.TryGetValue(kernel, out int kernelUses) && kernelUses > 1;
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             var inShape = (int[])input._shape.Clone();
             var kShape = (int[])kernel._shape.Clone();
-            var capStride = stride;
-            var capPadding = padding;
-            var capDilation = dilation;
             return eng =>
             {
+                bool addInput = needInputGrad && AccumulatesInto(gradInput!, sharedInput);
+                bool addKernel = needKernelGrad && AccumulatesInto(gradKernel!, sharedKernel);
                 if (eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu)
                 {
                     if (needInputGrad)
-                        cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
-                            capStride, capPadding, capDilation, accumInput);
-                    cpu.Conv2DBackwardKernelInto(gradKernel, gradOut, input, kShape,
-                        capStride, capPadding, capDilation, accumKernel);
+                        cpu.Conv2DBackwardInputInto(gradInput!, gradOut, kernel, inShape,
+                            stride, padding, dilation, addInput);
+                    // A generator update needs dX through a critic, but its frozen critic kernels need no dW.
+                    if (needKernelGrad)
+                        cpu.Conv2DBackwardKernelInto(gradKernel!, gradOut, input, kShape,
+                            stride, padding, dilation, addKernel);
                 }
                 else
                 {
-                    // Non-CpuEngine fallback — match the eager path semantics.
                     if (needInputGrad)
                     {
-                        var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, capStride, capPadding, capDilation);
-                        if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
-                        else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                        var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, stride, padding, dilation);
+                        if (addInput) eng.TensorAddInto(gradInput!, gradInput!, gi);
+                        else gi.AsSpan().CopyTo(gradInput!.AsWritableSpan());
                     }
-                    var gk = eng.Conv2DBackwardKernel(gradOut, input, kShape, capStride, capPadding, capDilation);
-                    if (accumKernel) eng.TensorAddInto(gradKernel, gradKernel, gk);
-                    else gk.AsSpan().CopyTo(gradKernel.AsWritableSpan());
+                    if (needKernelGrad)
+                    {
+                        var gk = eng.Conv2DBackwardKernel(gradOut, input, kShape, stride, padding, dilation);
+                        if (addKernel) eng.TensorAddInto(gradKernel!, gradKernel!, gk);
+                        else gk.AsSpan().CopyTo(gradKernel!.AsWritableSpan());
+                    }
                 }
                 if (needInputGrad) input.Grad = gradInput;
-                kernel.Grad = gradKernel;
+                if (needKernelGrad) kernel.Grad = gradKernel;
             };
         }
 
