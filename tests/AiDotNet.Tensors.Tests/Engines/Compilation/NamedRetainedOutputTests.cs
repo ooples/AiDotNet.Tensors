@@ -691,4 +691,41 @@ public sealed class NamedRetainedOutputTests : IDisposable
         Assert.Equal(1, callbacks);
     }
 
+    [Fact]
+    public void Premature_capture_disposal_preserves_its_owned_update_and_publication_for_completion()
+    {
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        PublishNamedScalar(23.0);
+        Assert.Throws<InvalidOperationException>(() => outputs.Dispose());
+        Assert.True(RetainedOutputCapture<double>.IsActive);
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(update.Accepted);
+        update.Dispose();
+        outputs.Complete();
+        Assert.Equal(23.0, outputs.Get("generation").ToArray()[0]);
+        Assert.Null(RetainedOutputCapture<double>.BeginEagerUpdate());
+    }
+
+    [Fact]
+    public void Child_capture_disposal_preserves_the_parent_owned_update_and_parent_publication()
+    {
+        using var parent = RetainedOutputCapture<double>.Begin();
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        PublishNamedScalar(31.0);
+        using (var child = RetainedOutputCapture<double>.Begin())
+        {
+            PublishNamedScalar(37.0);
+            child.Dispose(); // The active update belongs to the parent, so aborting this child is valid.
+            Assert.Throws<ObjectDisposedException>(() => child.Get("generation"));
+        }
+        Assert.True(RetainedOutputCapture<double>.IsActive);
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(update.Accepted);
+        update.Dispose();
+        parent.Complete();
+        Assert.Equal(31.0, parent.Get("generation").ToArray()[0]);
+        Assert.Null(RetainedOutputCapture<double>.BeginEagerUpdate());
+    }
+
 }

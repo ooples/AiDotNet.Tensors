@@ -180,6 +180,8 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
         {
             if (!ReferenceEquals(_current, this))
                 throw new InvalidOperationException("Retained output captures must be disposed in nesting order.");
+            if (_activeUpdate?.BelongsTo(this) == true)
+                throw new InvalidOperationException("The producer's update callback has not completed.");
             _current = _parent;
         }
         _disposed = true;
