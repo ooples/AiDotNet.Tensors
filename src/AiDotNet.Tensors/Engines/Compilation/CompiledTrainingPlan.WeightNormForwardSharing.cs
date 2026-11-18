@@ -53,6 +53,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         var writers = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         var protectedStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        var savedArrays = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         var savedVisitor = new WeightNormSavedStorageVisitor(protectedStorage, tensors);
         foreach (var parameter in parameters) { tensors.Add(parameter); protectedStorage.Add(parameter.StorageIdentity); }
         tensors.Add(loss);
@@ -65,6 +66,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             writers[step.OutputBuffer] = writers.TryGetValue(step.OutputBuffer, out int count) ? count + 1 : 1;
             foreach (var input in step.Inputs) tensors.Add(input);
             SavedStateTensorTraversal.Visit(step.SavedState, ref savedVisitor);
+            CollectWeightNormSavedArrays(step.SavedState, savedArrays);
         }
         foreach (var tensor in tensors)
             if (!produced.Contains(tensor)) protectedStorage.Add(tensor.StorageIdentity);
@@ -88,7 +90,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             if (!IsPureWeightNorm(step) || protectedStorage.Contains(output.StorageIdentity)
                 || writers[output] != 1 || storageUsers[output.StorageIdentity] != 1
                 || vectorUsers[output.GraphVectorIdentity] != 1
-                || output.GraphBackingArrayIdentity is { } array && arrayUsers[array] != 1
+                || output.GraphBackingArrayIdentity is { } array && (arrayUsers[array] != 1 || savedArrays.Contains(array))
                 || !output.CanShareUnboundGraphStorage(traceScope?.OwnsStorageLease(output.StorageIdentity) == true))
                 continue;
             eligible.Add(output);
@@ -137,6 +139,13 @@ internal sealed partial class CompiledTrainingPlan<T>
     private static bool IsWeightNormMetadataView(CompiledStep<T> step) => step.OutputBuffer.IsView
         && (step.OpName == "TensorReshape" || step.OpName == "Reshape" || step.OpName == "TensorTranspose"
             || step.OpName == "TensorPermute" || step.OpName == "StopGradient");
+
+    private static void CollectWeightNormSavedArrays(object? saved, HashSet<object> arrays)
+    {
+        if (saved is T[] values) arrays.Add(values);
+        else if (saved is object[] nested)
+            foreach (var value in nested) CollectWeightNormSavedArrays(value, arrays);
+    }
 
     private static bool SameWeightNormPhysicalStorage(Tensor<T> left, Tensor<T> right) =>
         ReferenceEquals(left.StorageIdentity, right.StorageIdentity)
