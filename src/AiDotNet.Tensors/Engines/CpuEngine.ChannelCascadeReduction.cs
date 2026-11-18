@@ -8,8 +8,12 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class CpuEngine
 {
+#if NET5_0_OR_GREATER
     [ThreadStatic] private static int t_channelCascadeReductionRuns;
     internal static int ChannelCascadeReductionRunsOnThisThread => t_channelCascadeReductionRuns;
+#else
+    internal static int ChannelCascadeReductionRunsOnThisThread => 0;
+#endif
 
     private static bool TryChannelCascadeSum<T>(Tensor<T> tensor, int[] axes, bool keepDims,
         [NotNullWhen(true)] out Tensor<T>? result)
