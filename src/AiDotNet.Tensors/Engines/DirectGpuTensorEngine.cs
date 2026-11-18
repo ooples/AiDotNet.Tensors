@@ -7138,10 +7138,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // (non-managed) pass. The index upload (the only HtoD) thus never happens INSIDE the capture (= the 906).
             // The lookup's own slot, keyed by its float-index tensor (the backward's savedState[0]), so a second lookup
             // in the step cannot overwrite these ids before this lookup's backward scatters through them.
-            var capIdx = floatIndices; var capN = numIndices;
-            RegisterEmbIndexRefresh(floatIndices, () => UploadEmbeddingIndices(capIdx, capN, capIdx));
-            if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices, floatIndices);
-            if (!TryGetEmbeddingIndexBuffer(floatIndices, numIndices, out var idxBuf)) return false;
+            IGpuBuffer? idxBuf;
+            if (backend is IResidentIndexBackend converter
+                && ResolveResidentBufferNoUpload(backend, floatIndices, numIndices) is { } deviceIds)
+            {
+                // Ids already on the device - the caller's ids (a plan input, refreshed in place before every replay)
+                // or ids an earlier node of this step computed (an address gathered from a table, as a factored
+                // embedding does): convert them into the lookup's slot on the device, in the step's stream order.
+                // Refreshing the slot from the host before a replay uploaded computed ids one step late (the host copy
+                // holds the previous replay's), and reading them on the host is a download a capture cannot contain.
+                // The conversion truncates; ids are integral, where it equals the host path's rounding.
+                idxBuf = EnsureEmbeddingIndexSlotBuffer(backend, floatIndices, numIndices, refresh: null);
+                converter.ConvertIndicesToInt32(deviceIds, idxBuf, numIndices);
+            }
+            else
+            {
+                var capIdx = floatIndices; var capN = numIndices;
+                RegisterEmbIndexRefresh(floatIndices, () => UploadEmbeddingIndices(capIdx, capN, capIdx));
+                if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices, floatIndices);
+                if (!TryGetEmbeddingIndexBuffer(floatIndices, numIndices, out idxBuf)) return false;
+            }
             if (s_residentSyncDebug) AliasDiag($"EMB-BUFS n={numIndices} dim={embeddingDim} needOut={(long)numIndices*embeddingDim} "
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={idxBuf.Size} impliedV={tableBuf.Size/embeddingDim}");
             backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
@@ -19767,18 +19783,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         foreach (var refresh in refreshes) refresh?.Invoke();
     }
 
-    /// <summary>Convert any-typed token indices to int and upload them into the stable index buffer (allocated once,
-    /// refreshed in place — no per-step cuMemAlloc). Used inline on the eager path and via the registered action on
-    /// the managed (graph) path.</summary>
-    internal void UploadEmbeddingIndices<TIndex>(Tensor<TIndex> indices, int n, object lookupKey)
+    /// <summary>
+    /// The lookup's stable device index buffer, holding at least <paramref name="n"/> ids (allocated, with its host
+    /// staging, only when missing or too small), with <paramref name="refresh"/> as the slot's pre-replay refresh. A
+    /// lookup whose ids the step computes on the device passes null: nothing on the host is newer than them.
+    /// </summary>
+    private IGpuBuffer EnsureEmbeddingIndexSlotBuffer(IDirectGpuBackend backend, object lookupKey, int n, System.Action? refresh)
     {
-        using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend)) return;
         var slot = GetEmbeddingIndexSlot(lookupKey);
-        IGpuBuffer target;
-        int[] host;
         lock (_embIndexLock)
         {
+            slot.Refresh = refresh;
             if (slot.Buffer is null || slot.Capacity < n)
             {
                 // Both allocated before either is published: a staging array that failed to allocate left the slot with
@@ -19795,7 +19810,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 slot.Capacity = n;
                 slot.Host = staging;
             }
-            target = slot.Buffer;
+            return slot.Buffer;
+        }
+    }
+
+    /// <summary>Convert any-typed token indices to int and upload them into the stable index buffer (allocated once,
+    /// refreshed in place — no per-step cuMemAlloc). Used inline on the eager path and via the registered action on
+    /// the managed (graph) path.</summary>
+    internal void UploadEmbeddingIndices<TIndex>(Tensor<TIndex> indices, int n, object lookupKey)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend)) return;
+        var slot = GetEmbeddingIndexSlot(lookupKey);
+        IGpuBuffer target;
+        int[] host;
+        lock (_embIndexLock)
+        {
+            target = EnsureEmbeddingIndexSlotBuffer(backend, lookupKey, n, slot.Refresh);
             host = slot.Host;
         }
         using var rawLease = indices.LeaseArray();
