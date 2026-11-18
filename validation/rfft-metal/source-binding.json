@@ -1,0 +1,25 @@
+{
+  "schema": "rfft-metal-source-binding-v1",
+  "source_commit": "8b853c47ecb5d7cc39fdc5a0141b5d26fc094d36",
+  "source_archive_pathspec": "src/AiDotNet.Tensors/Engines/DirectGpu",
+  "source_archive_sha256": "4db69ad41eede48ca1ee71bf09dd619cc60938dd5e531897ce2e15a51cd82d85",
+  "payload_manifest_sha256": "de92f914e0f41a8206f5ab8afd2fa29e537543c010300bc3e71c342d3fe411ca",
+  "assemblies_sha256": {
+    "AiDotNet.Evolution.dll": "e88331586027426352fc8e1f13efa5eb69d645c10e311c5e11fb4a5d6d4bc8e3",
+    "AiDotNet.Tensors.dll": "a7caa411080b4496bb110502aed7bea4679bdf23a4375788de781ebe256a6d71"
+  },
+  "payloads": {
+    "batch.metal": {
+      "sha256": "b59a19da99bf4611b4f456d41e328e26ddf9c0c2a04169ffeb640c73c6eef1ce",
+      "bytes": 94344,
+      "strict": true
+    },
+    "convt.metal": {
+      "sha256": "d7f05f4bb1091656e5da660ced9bd44be8683e816b9f51f1b676c831dc2dd0d0",
+      "bytes": 1928,
+      "strict": false
+    }
+  },
+  "origin": "C:\\Users\\FranklinMoormann\\source\\repos\\perf2561\\finish-rfft-backend-compilers-8b853c47-attempt1",
+  "claim": "Apple compiler proof of the complete actual production Metal libraries, including WeightNorm and all three RFFT kernels. No runtime or performance claim."
+}
