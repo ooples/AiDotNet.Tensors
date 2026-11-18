@@ -45,7 +45,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         var unwrapped = engine.Unwrap();
         if (Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_WEIGHTNORM_FORWARD_SHARE") == "0"
             || !ReferenceEquals(engine, unwrapped)
-            || (unwrapped.GetType() != typeof(CpuEngine) && unwrapped.GetType() != typeof(DirectGpuTensorEngine))
+            || (engine.Unwrap().GetType() != typeof(CpuEngine) && engine.Unwrap().GetType() != typeof(DirectGpuTensorEngine))
             || traceScope?.HostReadOp is not null || ForwardStepObserver is not null || SanitizeForwardBuffers)
             return 0;
         int normalizations = 0;
