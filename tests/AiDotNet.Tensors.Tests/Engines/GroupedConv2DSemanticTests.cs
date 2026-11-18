@@ -15,6 +15,67 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("CompilationGlobalState")]
 public sealed class GroupedConv2DSemanticTests
 {
+    [Theory]
+    [InlineData(false, false)] [InlineData(false, true)]
+    [InlineData(true, false)] [InlineData(true, true)]
+    public void Parallel_groups_preserve_double_reference_offsets_accumulation_and_thread_invariance(bool twoDimensional, bool accumulate)
+    {
+        var g = twoDimensional
+            ? new GroupedConv2DGeometry(2, 16, 9, 67, 24, 3, 5, 1, 2, 1, 3, 1, 2, 4)
+            : new GroupedConv2DGeometry(2, 32, 1, 521, 48, 1, 5, 1, 2, 0, 3, 1, 2, 4);
+        var engine = new CpuEngine();
+        using var input = Values<float>(g.InputShape);
+        using var kernel = Values<float>(g.KernelShape, .71);
+        using var dy = Values<float>(g.OutputShape, .37);
+        using var xd = new Tensor<double>(input.ToArray().Select(x => (double)x).ToArray(), g.InputShape);
+        using var wd = new Tensor<double>(kernel.ToArray().Select(x => (double)x).ToArray(), g.KernelShape);
+        using var dyd = new Tensor<double>(dy.ToArray().Select(x => (double)x).ToArray(), g.OutputShape);
+        using var expectedY = GroupedConvolution.Forward(engine, xd, wd, g.Stride, g.Padding, g.Dilation, g.Groups);
+        using var expectedDx = new Tensor<double>(Enumerable.Repeat(.25, g.InputCount).ToArray(), g.InputShape);
+        using var expectedDw = new Tensor<double>(Enumerable.Repeat(-.125, g.KernelCount).ToArray(), g.KernelShape);
+        GroupedConvolution.BackwardInto(engine, dyd, xd, wd, expectedDx, expectedDw, g, accumulate, accumulate);
+        int savedThreads = CpuParallelSettings.MaxDegreeOfParallelism;
+        bool savedDeterministic = BlasProvider.IsDeterministicMode;
+        float[][]? serial = null;
+        try
+        {
+            BlasProvider.SetDeterministicMode(true);
+            foreach (int threads in new[] { 1, 4 })
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                const float sentinel = 123.75f;
+                var yData = Enumerable.Repeat(sentinel, g.OutputCount + 14).ToArray();
+                var dxData = Enumerable.Repeat(sentinel, g.InputCount + 14).ToArray();
+                var dwData = Enumerable.Repeat(sentinel, g.KernelCount + 14).ToArray();
+                Array.Fill(dxData, .25f, 7, g.InputCount);
+                Array.Fill(dwData, -.125f, 7, g.KernelCount);
+                using var y = Tensor<float>.FromMemory(yData.AsMemory(7, g.OutputCount), g.OutputShape);
+                using var dx = Tensor<float>.FromMemory(dxData.AsMemory(7, g.InputCount), g.InputShape);
+                using var dw = Tensor<float>.FromMemory(dwData.AsMemory(7, g.KernelCount), g.KernelShape);
+                GroupedConvolution.ForwardInto(engine, y, input, kernel, g);
+                GroupedConvolution.BackwardInto(engine, dy, input, kernel, dx, dw, g, accumulate, accumulate);
+                var actual = new[] { y.ToArray(), dx.ToArray(), dw.ToArray() };
+                var expected = new[] { expectedY.ToArray(), expectedDx.ToArray(), expectedDw.ToArray() };
+                for (int result = 0; result < actual.Length; result++)
+                {
+                    Close(expected[result], actual[result].Select(value => (double)value), 2e-5);
+                    if (serial is not null) Assert.Equal(serial[result], actual[result]);
+                }
+                foreach (var data in new[] { yData, dxData, dwData })
+                {
+                    Assert.All(data.Take(7), value => Assert.Equal(sentinel, value));
+                    Assert.All(data.Skip(data.Length - 7), value => Assert.Equal(sentinel, value));
+                }
+                serial = actual;
+            }
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = savedThreads;
+            BlasProvider.SetDeterministicMode(savedDeterministic);
+        }
+    }
+
     internal static Tensor<T> Values<T>(int[] shape, double phase = 0)
     {
         var ops = MathHelper.GetNumericOperations<T>();
