@@ -118,6 +118,8 @@ else { resultValues[i] = sum; }
     {
         string fields = string.Join(", ", System.Array.ConvertAll(Parameters, name => name + ": i32"));
         string formatted = body.Replace("0.0f", "0.0").Replace("bx_gid()", "i32(gid.x)");
+        // WGSL requires a compound statement even for a one-statement guard.
+        formatted = Regex.Replace(formatted, @"(?m)^([ \t]*if \([^\r\n]*\)) +(return|continue);[ \t]*$", "$1 { $2; }");
         formatted = Regex.Replace(formatted, @"for \(int (\w+) = 0;", "for (var $1: i32 = 0;");
         formatted = Regex.Replace(formatted, @"\bint (\w+) = ", "let $1: i32 = ");
         formatted = Regex.Replace(formatted, @"\bfloat (\w+) = ", "var $1: f32 = ");
