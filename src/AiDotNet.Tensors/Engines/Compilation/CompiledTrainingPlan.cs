@@ -13936,6 +13936,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // computes it correctly.
         if (!leftSpansOutput && !rightSpansOutput) return null;
 
+        // Spectral normalization multiplies its dense weight matrix by a [1,1] inverse sigma.
+        // The generic broadcast replay allocated that entire matrix before copying it into output.
+        // Read the scalar before writing: it may itself be a view into the destination's storage.
+        if (isMultiply && leftSpansOutput && !rightSpansOutput && right.Length == 1)
+        {
+            return engine =>
+            {
+                if (engine.GetType() != typeof(CpuEngine))
+                {
+                    ReplayBroadcastBinaryEagerly(engine, step.OpType, left, right, output);
+                    return;
+                }
+
+                using var scalarKeep = new KeepAliveScope(right);
+                var scalar = right.AsSpanUnmarked()[0];
+                ((CpuEngine)engine).TensorMultiplyScalarInto(output, left, scalar);
+            };
+        }
+
         // Dense float [N,M] op [M] (row-vector / bias shape): a tight indexed loop, kept as a fast
         // sub-case of the one path rather than as a branch that re-decides orientation.
         if (typeof(T) == typeof(float) && leftSpansOutput && !rightSpansOutput
