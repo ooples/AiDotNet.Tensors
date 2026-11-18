@@ -10536,7 +10536,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the recorded node and execute a trace while it is being compiled.
             foreach (var step in forwardSteps)
                 if (step.OutputBuffer.HasDeferredHostStorage
-                    && (!CpuWeightNormWorkspaceEnabled || step.OpType != OpType.TensorWeightNorm))
+                    && (!CpuWeightNormWorkspaceEnabled || engine.Unwrap().GetType() != typeof(CpuEngine)
+                        || step.OpType != OpType.TensorWeightNorm))
                     _ = step.OutputBuffer._storage.GetVector().AsSpanUnmarked().Length;
         }
 
