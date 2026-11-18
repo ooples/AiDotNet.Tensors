@@ -12,10 +12,46 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public sealed class PrivateGradientInferenceDemandTests
 {
+    [Fact]
+    public void Cache_invalidation_marks_weight_version_without_exposing_private_host_payload()
+    {
+        var cpu = new CpuEngine();
+        var array = new[] { 1f, 2f, 3f, 4f };
+        var owner = ResultBufferTracker.TrackFreshPrivateArray(array, 0);
+        using var tensor = Tensor<float>.FromMemory(array, new[] { 2, 2 });
+        using var peer = Assert.IsType<Tensor<float>>(tensor.CloneShared());
+        object storage = tensor.StorageIdentity;
+        long version = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(array);
+        int downloads = 0;
+        HostSync.Register(array, value => { downloads++; Array.Fill((float[])value, 17f); });
+        try
+        {
+            cpu.InvalidatePersistentTensor(tensor);
+            cpu.InvalidatePersistentTensor(peer);
+            Assert.Equal(version + 2, AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(array));
+            Assert.Same(storage, tensor.StorageIdentity);
+            Assert.Same(storage, peer.StorageIdentity);
+            Assert.False(owner.State.Escaped);
+            Assert.Equal(0, downloads);
+            Assert.True(HostSync.IsPending(array));
+            Assert.Equal(new[] { 1f, 2f, 3f, 4f }, array);
+            // Genuine caller raw access still materializes the current payload and permanently protects its owner.
+            Assert.Equal(new[] { 17f, 17f, 17f, 17f }, tensor.AsSpan().ToArray());
+            Assert.Equal(1, downloads);
+            Assert.True(owner.State.Escaped);
+            Assert.Equal(new[] { 17f, 17f, 17f, 17f }, array);
+            Assert.Same(storage, peer.StorageIdentity);
+        }
+        finally { HostSync.Remove(array); }
+        GC.KeepAlive(owner);
+    }
+
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Native_return_protects_unread_public_array_alias_even_with_a_different_native_root(bool sameHostArray)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void Native_return_protects_unread_public_array_alias_even_with_a_different_native_root(bool sameHostArray, bool rawPrivateArrayEscaped)
     {
         var backend = MockDirectGpuBackend.Create(new MockBackendState());
         using var direct = new DirectGpuEngine(backend);
@@ -33,6 +69,8 @@ public sealed class PrivateGradientInferenceDemandTests
         using (var owner = Tensor<float>.FromMemory(privateArray, new[] { 2, 2 })) privateGradient.RebindStorageFrom(owner);
         Assert.Same(publicArray, publicGradient.GraphBackingArrayIdentity);
         Assert.Same(privateArray, privateGradient.GraphBackingArrayIdentity);
+        var escaped = rawPrivateArrayEscaped ? privateGradient.GetDataArray() : null;
+        if (rawPrivateArrayEscaped) { Assert.Same(privateArray, escaped); Assert.True(privateOwner.State.Escaped); }
         var publicBuffer = new NativeCell(4);
         var privateBuffer = new NativeCell(4);
         Bind(publicGradient, publicBuffer, backend);
@@ -48,14 +86,15 @@ public sealed class PrivateGradientInferenceDemandTests
             InferenceWorkspaceDemandScope.BeforeAllocation(backend, 5);
         GC.Collect();
         GC.WaitForPendingFinalizers();
-        Assert.Equal(sameHostArray ? 0 : 1, privateBuffer.Releases);
+        Assert.Equal(sameHostArray || rawPrivateArrayEscaped ? 0 : 1, privateBuffer.Releases);
         Assert.Equal(0, publicBuffer.Releases);
         Assert.Equal(0, publicBuffer.Disposes);
         Assert.Equal(0, downloads);
         Assert.True(HostSync.IsPending(publicArray));
         Assert.Equal(new[] { 37f, 37f, 37f, 37f }, publicView.ToArray());
         Assert.Equal(1, downloads);
-        Assert.Equal(sameHostArray ? 0L : 16L, plan.PrivateGradientNativeReleaseRequestedBytes);
+        Assert.Equal(sameHostArray || rawPrivateArrayEscaped ? 0L : 16L, plan.PrivateGradientNativeReleaseRequestedBytes);
+        GC.KeepAlive(escaped);
         GC.KeepAlive(publicOwner);
         GC.KeepAlive(privateOwner);
     }
