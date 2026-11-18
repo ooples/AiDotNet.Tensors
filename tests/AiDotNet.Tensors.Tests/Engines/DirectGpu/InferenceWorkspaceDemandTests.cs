@@ -126,7 +126,7 @@ public sealed class InferenceWorkspaceDemandTests
     {
         using var gpu = CreateGpu();
         var previous = AiDotNetEngine.Current;
-        bool oldInputGradients = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
+        bool? oldInputGradients = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
         try
         {
             CompiledTrainingPlan<float>.CompiledInputGradientsForTests = inputGradients;
