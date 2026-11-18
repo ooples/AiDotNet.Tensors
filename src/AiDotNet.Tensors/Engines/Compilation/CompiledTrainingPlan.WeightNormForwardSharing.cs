@@ -48,6 +48,10 @@ internal sealed partial class CompiledTrainingPlan<T>
             || (unwrapped.GetType() != typeof(CpuEngine) && unwrapped.GetType() != typeof(DirectGpuTensorEngine))
             || traceScope?.HostReadOp is not null || ForwardStepObserver is not null || SanitizeForwardBuffers)
             return 0;
+        int normalizations = 0;
+        foreach (var step in steps)
+            if (step.OpType == OpType.TensorWeightNorm && ++normalizations == 2) break;
+        if (normalizations < 2) return 0;
 
         var tensors = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
