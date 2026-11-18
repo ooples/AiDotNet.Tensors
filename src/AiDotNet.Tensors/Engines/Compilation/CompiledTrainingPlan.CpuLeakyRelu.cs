@@ -11,7 +11,8 @@ internal sealed partial class CompiledTrainingPlan<T>
         Dictionary<Tensor<T>, Tensor<T>> gradMap, Dictionary<Tensor<T>, int> writerCount,
         IEngine engine, HashSet<Tensor<T>>? required)
     {
-        if (engine.GetType() != typeof(CpuEngine) || step.OpType != OpType.LeakyReLU
+        if (engine.Unwrap().GetType() != typeof(CpuEngine) || !ReferenceEquals(engine, engine.Unwrap())
+            || step.OpType != OpType.LeakyReLU
             || step.Inputs.Length != 1 || step.DifferentiableInputIndices is not null
             || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
             return null;
@@ -34,7 +35,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             MaterializeIfGradPlaceholder(gradOutput);
             MaterializeIfGradPlaceholder(gradInput);
             bool add = AccumulatesInto(gradInput, shared);
-            if (replayEngine.GetType() != typeof(CpuEngine))
+            if (replayEngine.Unwrap().GetType() != typeof(CpuEngine) || !ReferenceEquals(replayEngine, replayEngine.Unwrap()))
             {
                 var value = replayEngine.LeakyReluBackward(gradOutput, input, slope);
                 if (add) replayEngine.TensorAddInto(gradInput, gradInput, value);

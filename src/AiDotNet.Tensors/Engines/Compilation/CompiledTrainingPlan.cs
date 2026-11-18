@@ -13943,7 +13943,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             return engine =>
             {
-                if (engine.GetType() != typeof(CpuEngine))
+                if (engine.Unwrap().GetType() != typeof(CpuEngine) || !ReferenceEquals(engine, engine.Unwrap()))
                 {
                     ReplayBroadcastBinaryEagerly(engine, step.OpType, left, right, output);
                     return;
@@ -13951,7 +13951,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
                 using var scalarKeep = new KeepAliveScope(right);
                 var scalar = right.AsSpanUnmarked()[0];
-                ((CpuEngine)engine).TensorMultiplyScalarInto(output, left, scalar);
+                engine.Cast<CpuEngine>().TensorMultiplyScalarInto(output, left, scalar);
             };
         }
 
