@@ -62,4 +62,21 @@ internal static class InferenceWorkspaceDemandScope
         }
         finally { t_returning = false; }
     }
+
+    /// <summary>A real cache miss may change the working size class; this never touches a live plan allocation.</summary>
+    internal static bool TryReturnIncompatibleIdleCache<TBuffer>(IDirectGpuBackend backend,
+        GpuBufferPool<TBuffer> pool, int elements, GpuBufferPoolAffinity affinity)
+        where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
+    {
+        if (t_engine is not { } engine || t_returning || elements <= 0) return false;
+        long scope = t_scope;
+        try
+        {
+            t_returning = true;
+            if (!engine.IsInferenceIdleCacheDemandEligible(backend)
+                || t_scope != scope || !ReferenceEquals(t_engine, engine)) return false;
+            return pool.ReturnIncompatibleIdleForLargerRequest(elements, affinity) > 0;
+        }
+        finally { t_returning = false; }
+    }
 }
