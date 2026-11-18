@@ -1776,6 +1776,7 @@ public partial class CpuEngine
             }
         }
         var ops = MathHelper.GetNumericOperations<T>();
+        var tensorOrig = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         using var srcLease = tensor.Lease();
         var src = srcLease.Span;
@@ -1783,24 +1784,62 @@ public partial class CpuEngine
         using var dstLease = result.LeaseWritable();
         var dst = dstLease.Span;
 
-        double defaultNan = nan ?? 0.0;
-        // PyTorch defaults posinf / neginf to the max/min finite of the dtype
-        // when not supplied. We use float.MaxValue / -float.MaxValue which is
-        // finite both in fp32 and fp64 (and saturates cleanly for narrower
-        // types via FromDouble).
-        double defaultPosInf = posinf ?? (double)float.MaxValue;
-        double defaultNegInf = neginf ?? -(double)float.MaxValue;
-
+        // Keep finite values bit-exact, and defer replacement conversions until
+        // their category is present (finite integral/decimal inputs ignore them).
+        byte[]? replacements = null;
+        bool hasNan = false, hasPositiveInfinity = false, hasNegativeInfinity = false;
         for (int i = 0; i < src.Length; i++)
         {
-            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
-            if (double.IsNaN(d)) dst[i] = ops.FromDouble(defaultNan);
-            else if (double.IsPositiveInfinity(d)) dst[i] = ops.FromDouble(defaultPosInf);
-            else if (double.IsNegativeInfinity(d)) dst[i] = ops.FromDouble(defaultNegInf);
-            else dst[i] = src[i];
+            var value = src[i];
+            byte replacement = 0;
+            if (ops.IsNaN(value))
+            {
+                replacement = 1;
+                hasNan = true;
+            }
+            else if (ops.IsInfinity(value))
+            {
+                if (ops.GreaterThan(value, ops.Zero))
+                {
+                    replacement = 2;
+                    hasPositiveInfinity = true;
+                }
+                else
+                {
+                    replacement = 3;
+                    hasNegativeInfinity = true;
+                }
+            }
+            if (replacement != 0)
+            {
+                // Most inputs are finite: allocate classification storage only
+                // after finding a value that needs replacement.
+                replacements ??= new byte[src.Length];
+                replacements[i] = replacement;
+            }
+            dst[i] = value;
+        }
+        if (replacements is not null)
+        {
+            var nanValue = hasNan ? ops.FromDouble(nan ?? 0.0) : ops.Zero;
+            var positiveInfinityValue = hasPositiveInfinity
+                ? (posinf.HasValue ? ops.FromDouble(posinf.Value) : ops.MaxValue)
+                : ops.Zero;
+            var negativeInfinityValue = hasNegativeInfinity
+                ? (neginf.HasValue ? ops.FromDouble(neginf.Value) : ops.MinValue)
+                : ops.Zero;
+            for (int i = 0; i < replacements.Length; i++)
+            {
+                switch (replacements[i])
+                {
+                    case 1: dst[i] = nanValue; break;
+                    case 2: dst[i] = positiveInfinityValue; break;
+                    case 3: dst[i] = negativeInfinityValue; break;
+                }
+            }
         }
         DifferentiableOps.RecordUnary(
-            "TensorNanToNum", result, tensor, BackwardFunctions<T>.NanToNumBackward);
+            "TensorNanToNum", result, tensorOrig, BackwardFunctions<T>.NanToNumBackward);
         return result;
     }
 
