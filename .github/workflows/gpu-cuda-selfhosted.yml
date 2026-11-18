@@ -220,9 +220,13 @@ jobs:
           if ($env:DISPATCH_EVENT -ne 'workflow_dispatch' -or $env:REQUESTED_ARCH -ne 'sm86' -or
               $env:PRODUCER_RUN_ID -notmatch '^[1-9][0-9]*$' -or $env:PRODUCER_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
               $env:PRODUCER_ARTIFACT_DIGEST -notmatch '^sha256:[0-9a-f]{64}$' -or
-              $env:SUITE_FILTER -ne 'FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.Captured_Adam_uses_leaf_ages_and_one_finite_verdict|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.Offset_validation_precedes_table_replacement_and_zero_offsets_allocate_no_table|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.Shared_optimizer_handover_recaptures_staggered_ages_and_freezes_inactive_leaf|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Declared_matmul_result_remains_observable_across_linear_activation_fusion|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Declared_output_outside_the_loss_ancestry_is_recomputed_each_step|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Declared_view_survives_later_forward_and_backward_work|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Detached_undefined_derivative_does_not_enter_backward|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Mixed_precision_rejects_retained_outputs_before_detaching_the_trace|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Observation_only_add_does_not_merge_distinct_loss_gradient_buffers|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Observation_only_division_does_not_poison_loss_gradients|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Observation_only_matmul_chain_never_builds_a_fused_backward|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Registration_requires_an_active_uncompiled_training_forward|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Retained_upstream_activation_does_not_accumulate_stale_convolution_gradients|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.ForwardOnlyHeterogeneousGpuTrainingTests.Ordinary_gpu_replay_refreshes_host_written_foreign_data_and_leaf_versions|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Ordinary_gpu_replay_refreshes_both_search_operands|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.DirectGpu.GpuLaneBackendTests.TheEngine_ResolvesTheBackendTheLaneRequires') {
+              $env:SUITE_FILTER -ne 'FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.Captured_Adam_uses_leaf_ages_and_one_finite_verdict|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.Offset_validation_precedes_table_replacement_and_zero_offsets_allocate_no_table|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.Shared_optimizer_handover_recaptures_staggered_ages_and_freezes_inactive_leaf|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Declared_matmul_result_remains_observable_across_linear_activation_fusion|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Declared_output_outside_the_loss_ancestry_is_recomputed_each_step|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Declared_view_survives_later_forward_and_backward_work|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Detached_undefined_derivative_does_not_enter_backward|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Mixed_precision_rejects_retained_outputs_before_detaching_the_trace|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Observation_only_add_does_not_merge_distinct_loss_gradient_buffers|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Observation_only_division_does_not_poison_loss_gradients|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Observation_only_matmul_chain_never_builds_a_fused_backward|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Registration_requires_an_active_uncompiled_training_forward|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.CompiledRetainedOutputTests.Retained_upstream_activation_does_not_accumulate_stale_convolution_gradients|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.ForwardOnlyHeterogeneousGpuTrainingTests.Ordinary_gpu_replay_refreshes_host_written_foreign_data_and_leaf_versions|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Ordinary_gpu_replay_refreshes_both_search_operands|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.DirectGpu.GpuLaneBackendTests.TheEngine_ResolvesTheBackendTheLaneRequires|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.FlashAttentionReplayTests.Ordinary_gpu_replay_executes_device_attention_and_matches_independent_reference|FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.FlashAttentionReplayTests.Cuda_whole_step_capture_contains_flash_attention_and_preserves_retained_output_lifetimes') {
             throw 'Exact-artifact validation requires immutable producer identity, sm86, and the reviewed exact-artifact test selection.'
           }
+          # Exact-artifact qualification requires the real CUDA capture path and rejects missing-device skips.
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'AIDOTNET_CUDA_GRAPH_STEP=1'
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'AIDOTNET_REQUIRE_GPU_TESTS=1'
+
         }
 
     # First, before anything writes: these runners keep caches between jobs, and a full drive failed later steps in ways
@@ -547,7 +551,7 @@ jobs:
             expected_groups = {'testCounters': 100, 'retainedOutputTestCounters': 46,
                 'heterogeneousReplayTestCounters': 15, 'noGradTestCounters': 9,
                 'optimizerEnrollmentTestCounters': 43, 'enrollmentCheckpointTestCounters': 45,
-                'normalizationSearchTestCounters': 20}
+                'normalizationSearchTestCounters': 20, 'flashAttentionTestCounters': 41}
             assert all(n > 0 for n in expected_groups.values()), 'Invalid reviewed CPU group count'
             for key, expected in expected_groups.items():
                 counters = manifest[key]
@@ -623,6 +627,14 @@ jobs:
             assert passed_results('TestResults/optimizer-enrollment-signature.trx', len(union)) == union
 
             packages = [name for name in manifest['sha256'] if name.endswith('.nupkg') and not name.endswith('.snupkg')]
+            flash_names = passed_results('TestResults/flashattention-signature.trx', 41)
+            assert flash_names == set(manifest['flashAttentionTestCases'])
+            assert hashlib.sha256('\n'.join(sorted(flash_names)).encode('utf-8')).hexdigest() == 'c0ecf547676824d37261a97a2e82e311343e8dda956a73315c4023f1c12fa8d4'
+            prior_cpu_names = set(canonical_signature_names) | replay_names | retained | union
+            assert len(prior_cpu_names) == 278, 'Prior mandatory CPU identity union changed'
+            assert not prior_cpu_names.intersection(flash_names), 'Overlapping FlashAttention CPU identities'
+            assert manifest['mandatoryCpuTestCount'] == len(prior_cpu_names | flash_names)
+
             assert len(packages) == 1
             package_bytes = archive.read(packages[0])
             with zipfile.ZipFile(io.BytesIO(package_bytes)) as package:
@@ -1034,9 +1046,21 @@ jobs:
             'AiDotNet.Tensors.Tests.Engines.Compilation.SearchSortedReplayTests.Ordinary_gpu_replay_refreshes_both_search_operands',
             'AiDotNet.Tensors.Tests.Engines.Compilation.ForwardOnlyHeterogeneousGpuTrainingTests.Ordinary_gpu_replay_refreshes_host_written_foreign_data_and_leaf_versions',
         ]
+        # Four identities discovered from the built FA test DLL; execution is mandatory in this lane.
+        flash_gpu_names = [
+            'AiDotNet.Tensors.Tests.Engines.Compilation.FlashAttentionReplayTests.Ordinary_gpu_replay_executes_device_attention_and_matches_independent_reference(causal: False, biasRank: 0)',
+            'AiDotNet.Tensors.Tests.Engines.Compilation.FlashAttentionReplayTests.Ordinary_gpu_replay_executes_device_attention_and_matches_independent_reference(causal: False, biasRank: 4)',
+            'AiDotNet.Tensors.Tests.Engines.Compilation.FlashAttentionReplayTests.Ordinary_gpu_replay_executes_device_attention_and_matches_independent_reference(causal: True, biasRank: 3)',
+            'AiDotNet.Tensors.Tests.Engines.Compilation.FlashAttentionReplayTests.Cuda_whole_step_capture_contains_flash_attention_and_preserves_retained_output_lifetimes',
+        ]
+        assert hashlib.sha256('\n'.join(sorted(flash_gpu_names)).encode('utf-8')).hexdigest() == 'fff5b2c1c0d3a724d470f2ae01cfc4303db1b13bcb4b56c02a655eaa67e99141'
+        prior_gpu_names = set(baseline_names + additional_gpu_names)
+        assert len(prior_gpu_names) == 24, 'Prior exact-artifact identities changed'
+        assert not prior_gpu_names.intersection(flash_gpu_names), 'Overlapping FlashAttention GPU identities'
+
         all_names = [r.attrib['testName'] for r in results]
         assert len(all_names) == len(set(all_names)), 'Duplicate exact-artifact case results'
-        expected_names = set(baseline_names + additional_gpu_names)
+        expected_names = prior_gpu_names | set(flash_gpu_names)
         assert set(all_names) == expected_names, {'missing': sorted(expected_names - set(all_names)), 'unexpected': sorted(set(all_names) - expected_names)}
         assert all(r.attrib['outcome'] == 'Passed' for r in results), 'Exact-artifact case failed or skipped'
         prefix = 'AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.'
@@ -1056,6 +1080,9 @@ jobs:
         assert os.environ['AIDOTNET_EXPECT_TENSORS_DLL_SHA256'] == evidence['packagedDllSha256']
         evidence['priorExactArtifactTestCases'] = baseline_names
         evidence['additionalGpuTestCases'] = additional_gpu_names
+        evidence['flashAttentionGpuTestCases'] = flash_gpu_names
+        evidence['flashAttentionGpuTestCasesSha256'] = 'fff5b2c1c0d3a724d470f2ae01cfc4303db1b13bcb4b56c02a655eaa67e99141'
+
         evidence['exactArtifactTestCases'] = sorted(all_names)
         evidence['cudaTestCases'] = sorted(names)
         evidence['cudaTestCasesSha256'] = actual_identity_hash

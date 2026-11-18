@@ -115,6 +115,17 @@ jobs:
           --logger 'trx;LogFileName=normalization-search-signature.trx'
           --results-directory artifacts/coordination/TestResults
 
+      - name: Verify FlashAttention replay and existing attention regressions (mandatory CPU)
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-build --no-restore
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter '(FullyQualifiedName~FlashAttentionReplayTests|FullyQualifiedName~FlashAttentionCompiledPlanTests|FullyQualifiedName~FlashAttentionBiasTests|FullyQualifiedName~FlashAttentionGenericTests|FullyQualifiedName~FlashAttention2Tests)&Category!=GPU&Category!=Performance'
+          --logger 'trx;LogFileName=flashattention-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
+
       - name: Verify package contents and write provenance
         shell: python
         run: |
@@ -308,8 +319,27 @@ jobs:
           assert set(replay_names) == expected_replay_cases, {'missing': sorted(expected_replay_cases - set(replay_names)), 'unexpected': sorted(set(replay_names) - expected_replay_cases)}
           assert all(row.attrib['outcome'] == 'Passed' for row in replay_rows), 'A mandatory replay case did not pass'
 
+          # Actual local net10 TRX: 41 distinct passing CPU cases, including 11 new replay cases.
+          flash_trx = root / 'TestResults/flashattention-signature.trx'
+          flash_results = ET.parse(flash_trx).getroot()
+          flash_counters = flash_results.find('.//{*}Counters').attrib
+          assert flash_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', flash_counters
+          for key, value in flash_counters.items():
+              assert int(value) == (41 if key in ('total', 'executed', 'passed') else 0), flash_counters
+          assert all(key in flash_counters for key in ('total', 'executed', 'passed', 'failed')), flash_counters
+          flash_rows = flash_results.findall('.//{*}UnitTestResult')
+          flash_names = [row.attrib['testName'] for row in flash_rows]
+          assert len(flash_names) == len(set(flash_names)) == 41, 'Duplicate or missing FlashAttention CPU identities'
+          assert all(row.attrib['outcome'] == 'Passed' for row in flash_rows), 'A mandatory FlashAttention case failed or skipped'
+          assert hashlib.sha256('\n'.join(sorted(flash_names)).encode('utf-8')).hexdigest() == 'c0ecf547676824d37261a97a2e82e311343e8dda956a73315c4023f1c12fa8d4'
+          prior_cpu_names = set(canonical_signature_names) | actual_cases | set(enrollment_names) | set(replay_names)
+          assert len(prior_cpu_names) == 278, 'Prior mandatory CPU identity union changed'
+          assert not prior_cpu_names.intersection(flash_names), 'Overlapping FlashAttention CPU identities'
+          all_cpu_names = prior_cpu_names | set(flash_names)
+
+
           checksums = {}
-          for path in [package, trx, retention_trx, enrollment_trx, replay_trx]:
+          for path in [package, trx, retention_trx, enrollment_trx, replay_trx, flash_trx]:
               checksums[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
           manifest = {
               'repository': os.environ['GITHUB_REPOSITORY'],
@@ -326,7 +356,9 @@ jobs:
               **enrollment_evidence,
               'normalizationSearchTestCounters': replay_counters,
               'normalizationSearchTestCases': sorted(replay_names),
-              'mandatoryCpuTestCount': 278,
+              'flashAttentionTestCounters': flash_counters,
+              'flashAttentionTestCases': sorted(flash_names),
+              'mandatoryCpuTestCount': len(all_cpu_names),
               'separateGpuCoverage': 'CompiledRetainedOutputTests CUDA whole-step capture is not part of the mandatory CPU gate.',
               'sha256': checksums,
               'workflowRun': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
