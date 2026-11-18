@@ -14435,6 +14435,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return weightNormBackward;
         }
+        var groupedBackward = BuildGroupedConv2DBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
+        if (groupedBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return groupedBackward;
+        }
 
         // Partial reductions broadcast their upstream gradient directly into the existing accumulator. Resolve this
         // before the sole-writer/zero-offset guards: the writer handles accumulation and actual storage offsets.

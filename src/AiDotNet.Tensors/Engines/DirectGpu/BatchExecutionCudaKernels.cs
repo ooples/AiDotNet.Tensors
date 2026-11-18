@@ -22,7 +22,7 @@ internal static partial class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource + WeightNormSource + RfftMagnitudeSource + ChannelBiasLeakySource;
+    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource + WeightNormSource + RfftMagnitudeSource + ChannelBiasLeakySource + GroupedConv2DSource;
 
     private const string CoreSource = @"
 #ifndef INFINITY
@@ -469,6 +469,7 @@ extern ""C"" __global__ __launch_bounds__(256) void bx_fft_from_storage(const un
     public static string[] GetKernelNames() => new[]
     {
         ChannelBiasLeaky,
+        GroupedConv2D, GroupedConv2DInputGrad, GroupedConv2DKernelGrad,
         RfftMagnitude, RfftMagnitudeSeed, RfftRealGradient,
         WeightNorm, WeightNormStats, WeightNormDirectionGrad, WeightNormGainGrad,
         "bx_full_reduce", "bx_row_reduce", "bx_row_map", "bx_scalar", "bx_unary", "bx_sincos", "bx_reduce_backward",
