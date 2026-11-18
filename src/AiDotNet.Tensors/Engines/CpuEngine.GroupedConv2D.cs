@@ -17,6 +17,7 @@ public partial class CpuEngine
     {
         RequireGroupedSources(input, kernel, geometry);
         GroupedConvolution.RequireShape(output, geometry.OutputShape, nameof(output));
+        RequireGroupedNchw(output);
         using var noGrad = new NoGradScope<T>();
         using var keepInput = new KeepAliveScope(input);
         using var keepKernel = new KeepAliveScope(kernel);
@@ -57,8 +58,11 @@ public partial class CpuEngine
     {
         RequireGroupedSources(input, kernel, geometry);
         GroupedConvolution.RequireShape(gradOutput, geometry.OutputShape, nameof(gradOutput));
+        RequireGroupedNchw(gradOutput);
         if (gradInput is not null) GroupedConvolution.RequireShape(gradInput, geometry.InputShape, nameof(gradInput));
         if (gradKernel is not null) GroupedConvolution.RequireShape(gradKernel, geometry.KernelShape, nameof(gradKernel));
+        if (gradInput is not null) RequireGroupedNchw(gradInput);
+        if (gradKernel is not null) RequireGroupedNchw(gradKernel);
         if (gradInput is null && gradKernel is null) return;
         using var noGrad = new NoGradScope<T>();
         using var keepInput = new KeepAliveScope(input);
@@ -123,6 +127,14 @@ public partial class CpuEngine
         GroupedConvolution.RequireShape(input, geometry.InputShape, nameof(input));
         GroupedConvolution.RequireShape(kernel, geometry.KernelShape, nameof(kernel));
         if (input.IsSparse || kernel.IsSparse) throw new NotSupportedException("Grouped convolution requires dense tensors.");
+        RequireGroupedNchw(input);
+        RequireGroupedNchw(kernel);
+    }
+
+    private static void RequireGroupedNchw<T>(Tensor<T> tensor)
+    {
+        if (tensor.Layout != TensorLayout.Nchw)
+            throw new NotSupportedException("The grouped CPU core requires canonical NCHW storage; other layouts retain the split engine path.");
     }
 
     private static bool GroupedStorageOverlap<T>(Tensor<T> source, Tensor<T>? destination)
