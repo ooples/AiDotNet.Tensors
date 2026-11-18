@@ -24,8 +24,14 @@ internal sealed partial class CompiledTrainingPlan<T>
     private readonly struct WeightNormSavedStorageVisitor : ISavedStateTensorVisitor
     {
         private readonly HashSet<object> _storages;
-        internal WeightNormSavedStorageVisitor(HashSet<object> storages) => _storages = storages;
-        public void Visit(ITensorStorageLeaseSource tensor) => _storages.Add(tensor.StorageIdentity);
+        private readonly HashSet<Tensor<T>> _tensors;
+        internal WeightNormSavedStorageVisitor(HashSet<object> storages, HashSet<Tensor<T>> tensors)
+        { _storages = storages; _tensors = tensors; }
+        public void Visit(ITensorStorageLeaseSource tensor)
+        {
+            _storages.Add(tensor.StorageIdentity);
+            if (tensor is Tensor<T> typed) _tensors.Add(typed);
+        }
     }
 
     /// <summary>
@@ -47,7 +53,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         var writers = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         var protectedStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
-        var savedVisitor = new WeightNormSavedStorageVisitor(protectedStorage);
+        var savedVisitor = new WeightNormSavedStorageVisitor(protectedStorage, tensors);
         foreach (var parameter in parameters) { tensors.Add(parameter); protectedStorage.Add(parameter.StorageIdentity); }
         tensors.Add(loss);
         protectedStorage.Add(loss.StorageIdentity);
