@@ -279,12 +279,12 @@ public sealed unsafe partial class VulkanBackend
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Vulkan);
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && data.Length > 0)
             return AllocateAndRecordBatchUpload(data);
-        return VulkanGpuBuffer.Create(data, _transfer);
+        return VulkanGpuBuffer.Create(data, _transfer, this);
     }
 
     private VulkanGpuBuffer AllocateAndRecordBatchUpload(float[] data)
     {
-        var buffer = VulkanGpuBuffer.Create(data.Length);
+        var buffer = VulkanGpuBuffer.Create(data.Length, this);
         try
         {
             if (buffer.Staging.Handle == IntPtr.Zero)
@@ -348,7 +348,7 @@ public sealed unsafe partial class VulkanBackend
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
         InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
 
-        return VulkanGpuBuffer.Create(size);
+        return VulkanGpuBuffer.Create(size, this);
     }
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
@@ -459,7 +459,7 @@ public sealed unsafe partial class VulkanBackend
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Int buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
-        return VulkanGpuBuffer.Create(size);
+        return VulkanGpuBuffer.Create(size, this);
     }
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
@@ -479,7 +479,7 @@ public sealed unsafe partial class VulkanBackend
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && floatData.Length > 0)
             return AllocateAndRecordBatchUpload(floatData);
-        return VulkanGpuBuffer.Create(floatData, _transfer);
+        return VulkanGpuBuffer.Create(floatData, _transfer, this);
     }
 
     /// <summary>
@@ -512,7 +512,7 @@ public sealed unsafe partial class VulkanBackend
         long floatCountLong = ((long)size + sizeof(float) - 1) / sizeof(float);
         long actualBytes = floatCountLong * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("Vulkan", actualBytes, MaxBufferAllocBytes, DeviceName);
-        return VulkanGpuBuffer.Create(checked((int)floatCountLong));
+        return VulkanGpuBuffer.Create(checked((int)floatCountLong), this);
     }
 
     #endregion

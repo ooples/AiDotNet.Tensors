@@ -132,6 +132,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     /// Creates a new VulkanGpuBuffer with the given element count.
     /// </summary>
     internal static VulkanGpuBuffer Create(int size)
+        => Create(size, owner: null);
+
+    internal static VulkanGpuBuffer Create(int size, IDirectGpuBackend? owner)
     {
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
@@ -145,27 +148,27 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
         // thousand 16 KB results would be created before the first collection returned any.
         long charge = Math.Max((long)size * sizeof(float), MinimumReclaimCharge);
         long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(charge);
-        var buffer = Rent(size);
+        var buffer = Rent(size, owner);
         // Its owner's Dispose credits the charge back (see Dispose); a view never carries one.
         buffer._reclaimCharge = charge;
         buffer._reclaimEpoch = reclaimEpoch;
         return buffer;
     }
 
-    private static VulkanGpuBuffer Rent(int size)
+    private static VulkanGpuBuffer Rent(int size, IDirectGpuBackend? owner)
     {
         // A rented allocation goes out under a NEW object, never the parked one. A parked object that sat in the pool
         // through a collection has been promoted, and a result dropped while holding a promoted object is not
         // finalized by the young collections that return results to the pool: it came back only at the next older
         // collection, and the pool ran empty in between (measured: every other 2,000-call stretch of an engine loop
         // paid a driver allocation per call). A new object is young, so the next young collection returns it.
-        if (PoolingEnabled && Pool.TryRent(size, out var pooled) &&
+        if (PoolingEnabled && Pool.TryRentForBackend(size, owner, out var pooled) &&
             pooled is not null)
             return FromParked(pooled, size);
         if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss())
         {
             PendingFrees.Drain();
-            if (Pool.TryRent(size, out pooled) && pooled is not null)
+            if (Pool.TryRentForBackend(size, owner, out pooled) && pooled is not null)
                 return FromParked(pooled, size);
         }
         System.Threading.Interlocked.Increment(ref s_driverAllocations);
@@ -228,12 +231,15 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     /// disposed to prevent resource leaks and an exception is thrown.
     /// </remarks>
     internal static VulkanGpuBuffer Create(float[] data, VulkanBufferTransfer transfer)
+        => Create(data, transfer, owner: null);
+
+    internal static VulkanGpuBuffer Create(float[] data, VulkanBufferTransfer transfer, IDirectGpuBackend? owner)
     {
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (data.Length == 0) throw new ArgumentException("Data array must not be empty.", nameof(data));
         if (transfer is null) throw new ArgumentNullException(nameof(transfer));
 
-        var buffer = Create(data.Length);
+        var buffer = Create(data.Length, owner);
         try
         {
             // WriteData returns silently if staging is not host-visible or disposed.
