@@ -674,10 +674,19 @@ public static class CpuParallelSettings
     internal static void ParallelForIndependentWithLocal<TLocal>(
         int fromInclusive, int toExclusive, long totalWork,
         Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
+        => ParallelForIndependentWithLocal(fromInclusive, toExclusive, totalWork, localInit, body, localFinally, int.MaxValue);
+
+    [MethodImpl(Hot)]
+    internal static void ParallelForIndependentWithLocal<TLocal>(
+        int fromInclusive, int toExclusive, long totalWork,
+        Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally,
+        int maximumDegreeOfParallelism)
     {
         if (toExclusive <= fromInclusive) return;
-        int maxDegree = MaxDegreeOfParallelism;
-        if (maxDegree <= 0) throw new ArgumentOutOfRangeException(nameof(MaxDegreeOfParallelism));
+        int globalMaximum = MaxDegreeOfParallelism;
+        if (globalMaximum <= 0) throw new ArgumentOutOfRangeException(nameof(MaxDegreeOfParallelism));
+        if (maximumDegreeOfParallelism <= 0) throw new ArgumentOutOfRangeException(nameof(maximumDegreeOfParallelism));
+        int maxDegree = Math.Min(globalMaximum, maximumDegreeOfParallelism);
         if (maxDegree <= 1 || _inParallelRegion
             || (toExclusive - fromInclusive) <= 1
             || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
