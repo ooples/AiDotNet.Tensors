@@ -14556,6 +14556,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T>? attentionBias = null)
     {
         using var __gpuOp = EnterGpuOp();
+        if (Compilation.GraphMode.IsActive)
+            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
+
         // Same rationale as FusedLinear / GroupedQueryAttention: the GPU
         // FlashAttention kernel produces softmaxStats + output without
         // calling DifferentiableOps.Record*. When a tape is active, defer

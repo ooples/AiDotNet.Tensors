@@ -32666,6 +32666,44 @@ public partial class CpuEngine : ITensorLevelEngine
         if (query == null) throw new ArgumentNullException(nameof(query));
         if (key == null) throw new ArgumentNullException(nameof(key));
         if (value == null) throw new ArgumentNullException(nameof(value));
+        if (query.Rank != 4 || key.Rank != 4 || value.Rank != 4)
+            throw new ArgumentException("FlashAttention requires rank-4 query, key and value tensors.");
+
+        int batch = query._shape[0];
+        int heads = query._shape[1];
+        int seqQ = query._shape[2];
+        int headDim = query._shape[3];
+        int seqK = key._shape[2];
+        if (key._shape[0] != batch || key._shape[1] != heads || key._shape[3] != headDim
+            || value._shape[0] != batch || value._shape[1] != heads
+            || value._shape[2] != seqK || value._shape[3] != headDim)
+            throw new ArgumentException("FlashAttention query, key and value batch, head and head-dimension sizes must match; key and value sequence lengths must match.");
+
+        bool biasBroadcastBatch = false;
+        if (attentionBias is not null)
+        {
+            int biasRank = attentionBias._shape.Length;
+            if (biasRank == 4)
+            {
+                if (attentionBias._shape[0] != batch || attentionBias._shape[1] != heads
+                    || attentionBias._shape[2] != seqQ || attentionBias._shape[3] != seqK)
+                    throw new ArgumentException(
+                        $"4D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+            }
+            else if (biasRank == 3)
+            {
+                if (attentionBias._shape[0] != heads || attentionBias._shape[1] != seqQ || attentionBias._shape[2] != seqK)
+                    throw new ArgumentException(
+                        $"3D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
+                        nameof(attentionBias));
+                biasBroadcastBatch = true;
+            }
+            else
+                throw new ArgumentException(
+                    $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
+                    nameof(attentionBias));
+        }
 
         if (GraphMode.IsInferenceTrace)
         {
@@ -32684,133 +32722,56 @@ public partial class CpuEngine : ITensorLevelEngine
             return outputs[0];
         }
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-
-        int batch = query._shape[0];
-        int heads = query._shape[1];
-        int seqQ = query._shape[2];
-        int headDim = query._shape[3];
-        int seqK = key._shape[2];
-
-        // ────────────────────────────────────────────────────────────────────
-        // Lazy graph mode: record + return placeholder. Mirror of LayerNorm's
-        // GraphMode branch (this file, line ~19498). FlashAttention was
-        // previously the ONLY tape-recorded Engine op missing this branch —
-        // the eager fast paths (FlashAttentionFloat / FlashAttentionDouble)
-        // ran at compile time and returned a materialised Tensor<T>, which
-        // downstream lazy ops captured as a frozen constant. plan.Step()
-        // replayed everything EXCEPT FlashAttention with fresh Q/K/V (so the
-        // Q/K/V projection matmuls saw updated weights and produced new
-        // tensors), but the lazy graph node for the next op consumed the
-        // compile-time FA output — gradients never flowed back to Q/K/V/O,
-        // and the output of the network stayed near the compile-time random-
-        // init result no matter how long training ran.
-        //
-        // Consumer impact (HarmonicEngine PathB at dModel=128 / L=2 /
-        // ctx=64 / 10KB WikiText-2 byte-LM): top-1 0% / top-5 100% / ppl=V
-        // uniform output + 3.76× slower than MHA (compile-time eager FA fired
-        // every plan.Step on every layer instance).
-        //
-        // savedState parity: softmaxStats from the compile-time eager call
-        // is stale once the lazy graph replays, exactly as LayerNorm's
-        // mean/variance (AiDotNet#1331). The execute callback below
-        // recomputes FA via the out-param overload and copies fresh stats
-        // into the same Tensor<T> instances the savedState slot holds, so
-        // FlashAttentionBackward reads up-to-date softmax statistics on
-        // every plan.Step.
-        // ────────────────────────────────────────────────────────────────────
-        if (GraphMode.IsActive)
+        // Training records the normalized output and its row-wise log-sum-exp together. Neither
+        // recording nor a closure probe evaluates current Q/K/V; the forward refreshes both buffers.
+        if (GraphMode.Current is { } scope)
         {
-            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
-            if (scope != null)
-            {
-                // Compute eager once OUTSIDE the graph scope so the lazy graph
-                // sees a registered node, not nested record calls.
-                var savedScope = GraphMode.Current;
-                GraphMode.SetCurrent(null);
-                var eagerOutput = FlashAttention(query, key, value, scale, isCausal, out var eagerStats, attentionBias);
-                GraphMode.SetCurrent(savedScope);
-
-                softmaxStats = eagerStats; // expose to caller (savedState references this object)
-                var capturedQuery = query;
-                var capturedKey = key;
-                var capturedValue = value;
-                var capturedBias = attentionBias;
-                var capturedScale = scale;
-                var capturedIsCausal = isCausal;
-                var capturedStats = eagerStats;
-
-                var inputs = attentionBias is null
-                    ? new[] { query, key, value }
-                    : new[] { query, key, value, attentionBias };
-
-                var lazyResult = scope.RecordVariadic(
-                    LazyNodeType.Custom, "FlashAttention",
-                    inputs, eagerOutput._shape,
-                    (eng, output) =>
+            scope.BindEngineIfUnset(this);
+            var capturedStats = new Tensor<T>(new[] { batch, heads, seqQ });
+            var recordedInputs = attentionBias is null
+                ? new[] { query, key, value }
+                : new[] { query, key, value, attentionBias };
+            var lazyResult = scope.RecordVariadic(
+                LazyNodeType.Custom, "FlashAttention", recordedInputs,
+                new[] { batch, heads, seqQ, headDim },
+                (eng, output) =>
+                {
+                    var freshOut = eng.FlashAttention(query, key, value, scale, isCausal,
+                        out var freshStats, attentionBias);
+                    try
                     {
-                        // Recompute FA with the latest Q/K/V coming through
-                        // the replayed graph. The out-param softmaxStats is
-                        // copied back into the SAME tensor instance the
-                        // savedState holds so the backward kernel reads fresh
-                        // log-sum-exp values.
-                        var freshOut = eng.FlashAttention(
-                            capturedQuery, capturedKey, capturedValue,
-                            capturedScale, capturedIsCausal, out var freshStats, capturedBias);
                         DirectGpuTensorEngine.CopyResultInto(eng, freshOut, output);
                         DirectGpuTensorEngine.CopyResultInto(eng, freshStats, capturedStats);
-                    },
-                    BackwardFunctions<T>.FlashAttentionBackward,
-                    capturedBias is null
-                        ? new object[] { capturedStats, capturedScale ?? 1.0 / Math.Sqrt(headDim), capturedIsCausal }
-                        : new object[] { capturedStats, capturedScale ?? 1.0 / Math.Sqrt(headDim), capturedIsCausal, capturedBias });
+                    }
+                    finally
+                    {
+                        Helpers.TensorAllocator.Return(freshOut);
+                        Helpers.TensorAllocator.Return(freshStats);
+                    }
+                },
+                BackwardFunctions<T>.FlashAttentionBackward,
+                attentionBias is null
+                    ? new object[] { capturedStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal }
+                    : new object[] { capturedStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal, attentionBias },
+                // Bias is forward data in the existing backward contract, which differentiates Q/K/V only.
+                differentiableInputIndices: attentionBias is null ? null : new[] { 0, 1, 2 });
+            // The saved statistic is this forward's auxiliary output, never an external leaf to rebind.
+            if (lazyResult.LazySource is LazyNode<T> attentionNode)
+                attentionNode.AuxiliaryOutput = capturedStats;
+            scope.RegisterAuxiliaryOutput(capturedStats, lazyResult);
 
-                // Mirror eager output bytes into the lazy result so any caller
-                // that uses the returned tensor's data BEFORE plan.Step() sees
-                // the eager values (matches LayerNorm's eagerResult.AsSpan
-                // copy-into-lazy pattern).
-                using var eagerOutputKeep1 = new KeepAliveScope(eagerOutput);
-                using var lazyResultKeep5 = new KeepAliveScope(lazyResult);
-                eagerOutput.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
-                return lazyResult;
-            }
+            using var resultKeep = new KeepAliveScope(lazyResult);
+            using var statsKeep = new KeepAliveScope(capturedStats);
+            // A consumer of the out statistic must run after the same forward that refreshes the
+            // backward's saved buffer. The statistic itself has no derivative.
+            softmaxStats = scope.RecordUnary(LazyNodeType.Custom, "FlashAttentionSoftmaxStats",
+                lazyResult, capturedStats._shape,
+                (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, capturedStats, output));
+            return lazyResult;
         }
 
-        // Validate bias shape *before* the float fast-path branch below. The
-        // fast path (FlashAttentionFloat) trusts its caller to hand it a
-        // correctly-shaped bias, so the rank/dimension check has to run here
-        // or we silently accept malformed bias tensors on the float path.
-        // (Regression exposed by FlashAttention_InvalidBiasRank_Throws +
-        // FlashAttention_Mismatched{3D,}BiasDimensions_Throws after the fast
-        // path was added.)
-        bool biasBroadcastBatch = false;
-        if (attentionBias is not null)
-        {
-            int biasRank = attentionBias._shape.Length;
-            if (biasRank == 4)
-            {
-                if (attentionBias._shape[0] != batch || attentionBias._shape[1] != heads ||
-                    attentionBias._shape[2] != seqQ || attentionBias._shape[3] != seqK)
-                    throw new ArgumentException(
-                        $"4D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [batch={batch}, heads={heads}, seqQ={seqQ}, seqK={seqK}].",
-                        nameof(attentionBias));
-                biasBroadcastBatch = false;
-            }
-            else if (biasRank == 3)
-            {
-                if (attentionBias._shape[0] != heads || attentionBias._shape[1] != seqQ || attentionBias._shape[2] != seqK)
-                    throw new ArgumentException(
-                        $"3D attention bias shape [{string.Join(",", attentionBias._shape)}] must match [heads={heads}, seqQ={seqQ}, seqK={seqK}].",
-                        nameof(attentionBias));
-                biasBroadcastBatch = true;
-            }
-            else
-            {
-                throw new ArgumentException(
-                    $"Attention bias must be rank 3 [heads, seqQ, seqK] or rank 4 [batch, heads, seqQ, seqK], got rank {biasRank}.",
-                    nameof(attentionBias));
-            }
-        }
+        var numOps = MathHelper.GetNumericOperations<T>();
+
 
         // ────────────────────────────────────────────────────────────────────
         // Fast path for float: materialized-softmax with SimdGemm, same pattern
