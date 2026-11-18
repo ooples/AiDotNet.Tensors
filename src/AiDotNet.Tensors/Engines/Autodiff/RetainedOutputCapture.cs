@@ -26,13 +26,20 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
     private bool _completed;
     private bool _disposed;
 
-    private RetainedOutputCapture()
+    private RetainedOutputCapture(RetainedOutputCapture<T>? parent) => _parent = parent;
+
+    internal static RetainedOutputCapture<T> Begin()
     {
-        _parent = _current;
-        _current = this;
+        var capture = new RetainedOutputCapture<T>(_current);
+        _current = capture;
+        return capture;
     }
 
-    internal static RetainedOutputCapture<T> Begin() => new();
+    // The per-thread stacks are written only by static members: instances name the parent to restore.
+    private static void RestoreCurrent(RetainedOutputCapture<T>? parent) => _current = parent;
+
+    private static bool IsCurrent(RetainedOutputCapture<T> capture) => ReferenceEquals(_current, capture);
+
     internal static bool IsActive => _current is not null;
 
     internal static void RequireReportingUpdater(bool reportsOutcome)
@@ -41,7 +48,20 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
             throw new NotSupportedException("A retained output handoff requires an updater that explicitly reports acceptance or rejection.");
     }
 
-    internal static EagerUpdateScope? BeginEagerUpdate() => _current is { } capture ? new EagerUpdateScope(capture) : null;
+    internal static EagerUpdateScope? BeginEagerUpdate()
+    {
+        if (_current is not { } capture) return null;
+        var scope = new EagerUpdateScope(capture, _activeUpdate);
+        _activeUpdate = scope;
+        return scope;
+    }
+
+    private static bool IsActiveUpdate(EagerUpdateScope scope) => ReferenceEquals(_activeUpdate, scope);
+
+    private static void RestoreActiveUpdate(EagerUpdateScope? parent) => _activeUpdate = parent;
+
+    private static bool HasPendingUpdate(RetainedOutputCapture<T> owner) => _activeUpdate?.BelongsTo(owner) == true;
+
     internal static void MarkUpdateAccepted()
     {
         if (_activeUpdate?.BelongsTo(_current) == true) _activeUpdate.Accept();
@@ -61,11 +81,10 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
         private bool _disposed;
         internal bool Accepted => _accepted && !_rejected;
         internal bool BelongsTo(RetainedOutputCapture<T>? owner) => ReferenceEquals(_owner, owner);
-        internal EagerUpdateScope(RetainedOutputCapture<T> owner)
+        internal EagerUpdateScope(RetainedOutputCapture<T> owner, EagerUpdateScope? parent)
         {
             _owner = owner;
-            _parent = _activeUpdate;
-            _activeUpdate = this;
+            _parent = parent;
             owner._published = null;
             owner._plan = null;
         }
@@ -74,7 +93,7 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
         public void Dispose()
         {
             if (_disposed) return;
-            if (!ReferenceEquals(_activeUpdate, this) || !ReferenceEquals(_current, _owner))
+            if (!IsActiveUpdate(this) || !IsCurrent(_owner))
                 throw new InvalidOperationException("Retained output update scopes must be disposed in nesting order on their creating thread.");
             _disposed = true;
             if (!Accepted)
@@ -82,7 +101,7 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
                 _owner._published = null;
                 _owner._plan = null;
             }
-            _activeUpdate = _parent;
+            RestoreActiveUpdate(_parent);
         }
     }
 
@@ -151,14 +170,14 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
     internal void Complete()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(RetainedOutputCapture<T>));
-        if (_completed || !ReferenceEquals(_current, this))
+        if (_completed || !IsCurrent(this))
             throw new InvalidOperationException("Retained output captures must complete once, in nesting order.");
-        if (_activeUpdate?.BelongsTo(this) == true)
+        if (HasPendingUpdate(this))
             throw new InvalidOperationException("The producer's update callback has not completed.");
         if (_published is null)
             throw new InvalidOperationException("No successful training step published retained outputs.");
         _completed = true;
-        _current = _parent;
+        RestoreCurrent(_parent);
         _eager.Clear();
     }
 
@@ -178,11 +197,11 @@ internal sealed class RetainedOutputCapture<T> : IDisposable
         if (_disposed) return;
         if (!_completed)
         {
-            if (!ReferenceEquals(_current, this))
+            if (!IsCurrent(this))
                 throw new InvalidOperationException("Retained output captures must be disposed in nesting order.");
-            if (_activeUpdate?.BelongsTo(this) == true)
+            if (HasPendingUpdate(this))
                 throw new InvalidOperationException("The producer's update callback has not completed.");
-            _current = _parent;
+            RestoreCurrent(_parent);
         }
         _disposed = true;
         _published = null;
