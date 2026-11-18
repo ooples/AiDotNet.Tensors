@@ -11,12 +11,12 @@ public partial class CpuEngine
 
     // A fixed channel-block/tap/channel reduction order exposes adjacent input channels to the
     // GEMM packer. Scratch is independent of waveform length and batch: one shared <=16MiB
-    // filter tile, and <=1MiB column/product panels per joined worker. No activation is retained.
+    // filter tile, and <=2MiB column/product panels per joined worker. No activation is retained.
     private static bool TryConv1DChannelBlocks(float[] input, int inputOffset, float[] kernel, int kernelOffset,
         float[] output, int outputOffset, int batch, int inChannels, int width, int outChannels,
         int kernelWidth, int stride, int padding, int dilation, int outputWidth)
     {
-        const int channelBlock = 16, aBudget = 4_194_304, workerBudget = 262_144;
+        const int channelBlock = 16, aBudget = 4_194_304, workerBudget = 524_288;
         if (inChannels < channelBlock || kernelWidth <= 1 || width <= 0 || outputWidth <= 0
             || batch <= 0 || outChannels <= 0 || stride <= 0 || dilation <= 0 || padding < 0)
             return false;
@@ -29,10 +29,12 @@ public partial class CpuEngine
         if ((ReferenceEquals(input, output) && input.AsSpan(inputOffset, inputCount).Overlaps(destination))
             || (ReferenceEquals(kernel, output) && kernel.AsSpan(kernelOffset, kernelCount).Overlaps(destination)))
             return false;
-        int columns = Math.Min(256, Math.Min(workerBudget / reduction, checked(batch * outputWidth)));
-        int rows = Math.Min(outChannels, Math.Min(256, Math.Max(1, (aBudget / reduction) / 16 * 16)));
-        columns = Math.Min(columns, workerBudget / rows);
-        int totalColumns = checked(batch * outputWidth), blocks = (totalColumns - 1) / columns + 1;
+        int rows = Math.Min(outChannels, Math.Max(1, (aBudget / reduction) / 16 * 16));
+        int totalColumns = checked(batch * outputWidth);
+        int columns = Math.Min(256, Math.Min(workerBudget / reduction, workerBudget / rows));
+        if (totalColumns > columns && columns >= 16) columns = columns / 16 * 16;
+        columns = Math.Min(columns, totalColumns);
+        int blocks = (totalColumns - 1) / columns + 1;
         int workers = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, blocks));
         var packedKernel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(rows * reduction), "workspace.conv1d_channel_block_filter");
         try
@@ -48,7 +50,14 @@ public partial class CpuEngine
                 int currentRowFrom = rowFrom;
                 CpuParallelSettings.ParallelForOrSerial(0, workers, (long)rowCount * reduction * totalColumns, worker =>
                 {
-                    var options = new BlasManaged.BlasOptions<float> { NumThreads = 1, BetaZero = true };
+                    // Match the regular deterministic TensorMatMul dispatch. A logical N-tail
+                    // keeps its packed reduction across every bounded panel, including aligned ones.
+                    var options = new BlasManaged.BlasOptions<float>
+                    {
+                        NumThreads = workers == 1 ? 0 : 1,
+                        PackingMode = totalColumns % 16 == 0 ? BlasManaged.PackingMode.DisableAutotune : BlasManaged.PackingMode.ForcePackBoth,
+                        BetaZero = true,
+                    };
                     var panel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(reduction * columns), "workspace.conv1d_channel_block_columns");
                     float[]? product = null;
                     try
