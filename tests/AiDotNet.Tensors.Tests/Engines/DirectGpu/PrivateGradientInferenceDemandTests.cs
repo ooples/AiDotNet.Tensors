@@ -112,10 +112,10 @@ public sealed class PrivateGradientInferenceDemandTests
         try
         {
             CompiledTrainingPlan<float>.CompiledInputGradientsForTests = inputGradients;
-            var baseline = Trajectory(gpu, false, inputGradients, forceFallback, out long baselineReleased);
-            var retired = Trajectory(gpu, true, inputGradients, forceFallback, out long released);
+            var baseline = Trajectory(gpu, false, inputGradients, forceFallback, out long baselineReleased, out _);
+            var retired = Trajectory(gpu, true, inputGradients, forceFallback, out long released, out string evidence);
             Assert.Equal(0, baselineReleased);
-            Assert.True(released > 0, "The fixture must actually retire private accumulator native buffers.");
+            Assert.True(released > 0, "The fixture must actually retire private accumulator native buffers.\n" + evidence);
             Assert.Equal(baseline.Count, retired.Count);
             for (int sample = 0; sample < baseline.Count; sample++)
                 Assert.Equal(baseline[sample].Select(BitConverter.SingleToInt32Bits),
@@ -129,7 +129,7 @@ public sealed class PrivateGradientInferenceDemandTests
         }
     }
 
-    private static List<float[]> Trajectory(DirectGpuTensorEngine engine, bool release, bool inputGradients, bool forceFallback, out long released)
+    private static List<float[]> Trajectory(DirectGpuTensorEngine engine, bool release, bool inputGradients, bool forceFallback, out long released, out string evidence)
     {
         AiDotNetEngine.Current = engine;
         Environment.SetEnvironmentVariable("AIDOTNET_INFERENCE_PRIVATE_GRADIENT_RETURN", release ? null : "0");
@@ -137,6 +137,7 @@ public sealed class PrivateGradientInferenceDemandTests
         plan.DisableGraphStep();
         plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: .001);
         var samples = new List<float[]>();
+        var eligibility = new List<string>();
         for (int iteration = 0; iteration < 5; iteration++)
         {
             input[0] = .1f + iteration * .01f;
@@ -151,6 +152,7 @@ public sealed class PrivateGradientInferenceDemandTests
             using (InferenceWorkspaceDemandScope.Enter(engine))
             using (var prediction = engine.TensorAdd(new Tensor<float>(new[] { 4096 }), new Tensor<float>(new[] { 4096 })))
                 Assert.Equal(4096, prediction.Length);
+            if (release && inputGradients && iteration < 2) eligibility.Add(DescribeRetirementEligibility(plan, iteration));
             GC.Collect();
             GC.WaitForPendingFinalizers();
             Assert.Same(publicBuffer, gradient._gpuBuffer);
@@ -161,7 +163,31 @@ public sealed class PrivateGradientInferenceDemandTests
             if (inputGradients) samples.Add(Assert.IsType<Tensor<float>>(inputGradient).ToArray());
         }
         released = plan.PrivateGradientNativeReleaseRequestedBytes;
+        evidence = string.Join("\n", eligibility);
         return samples;
+    }
+
+    private static string DescribeRetirementEligibility(CompiledTrainingPlan<float> plan, int iteration)
+    {
+        var facts = new List<string> { "iteration=" + iteration };
+        foreach (string name in new[] { "_privateGradientCompletedStep", "_privateGradientRegistered", "_residentBodyRanLast", "_residentStepFailed", "_graphStepEligible", "_workspaceExplicitGraphDisable", "_graphStepDisabled", "_graphPreparationStarted" })
+            facts.Add(name + "=" + Field(plan, name));
+        var tensors = Assert.IsType<HashSet<Tensor<float>>>(Field(plan, "_workspaceTensors"));
+        var protectedRoots = Assert.IsType<HashSet<IGpuBuffer>>(Field(plan, "_workspaceProtectedRoots"));
+        var protectedStorage = Assert.IsType<HashSet<object>>(Field(plan, "_workspaceProtectedStorage"));
+        var protectedVectors = Assert.IsType<HashSet<object>>(Field(plan, "_privateProtectedVectors"));
+        var protectedArrays = Assert.IsType<HashSet<object>>(Field(plan, "_privateProtectedArrays"));
+        var allocations = Assert.IsType<System.Runtime.CompilerServices.ConditionalWeakTable<IGpuBuffer, object>>(Field(plan, "_privateGradientAllocations"));
+        foreach (var gradient in Assert.IsType<Tensor<float>[]>(Field(plan, "_preAllocatedGrads")))
+        {
+            if (gradient._gpuBuffer is not { } buffer) continue;
+            var root = GpuBufferViewRoot.Of(buffer);
+            var vector = (Vector<float>)gradient.GraphVectorIdentity;
+            object? array = gradient.GraphBackingArrayIdentity;
+            int knownVectors = tensors.Where(t => ReferenceEquals(t.GraphBackingArrayIdentity, array)).Select(t => t.GraphVectorIdentity).Distinct().Count();
+            facts.Add($"gradient[{gradient.Length}] fresh={allocations.TryGetValue(root, out _)} protectedRoot={protectedRoots.Contains(root)} protectedStorage={protectedStorage.Contains(gradient.StorageIdentity)} protectedVector={protectedVectors.Contains(vector)} protectedArray={array is not null && protectedArrays.Contains(array)} wrappers={vector.ResultOwner?.State.Wrappers} knownVectors={knownVectors} escaped={vector.ResultOwner?.State.Escaped}");
+        }
+        return string.Join("; ", facts);
     }
 
     private static CompiledTrainingPlan<float> Compile(IEngine engine, out Tensor<float> input, out Tensor<float> weight)
