@@ -27,8 +27,12 @@ public sealed class PrivateGradientInferenceDemandTests
         var privateGradient = gradients.First(gradient => gradient.Length == 4 && !ReferenceEquals(gradient, publicGradient));
         var publicArray = new float[4];
         var privateArray = sameHostArray ? publicArray : new float[4];
-        using (var owner = new Tensor<float>(publicArray, new[] { 2, 2 })) publicGradient.RebindStorageFrom(owner);
-        using (var owner = new Tensor<float>(privateArray, new[] { 2, 2 })) privateGradient.RebindStorageFrom(owner);
+        var publicOwner = ResultBufferTracker.TrackFreshPrivateArray(publicArray, 0);
+        var privateOwner = sameHostArray ? publicOwner : ResultBufferTracker.TrackFreshPrivateArray(privateArray, 0);
+        using (var owner = Tensor<float>.FromMemory(publicArray, new[] { 2, 2 })) publicGradient.RebindStorageFrom(owner);
+        using (var owner = Tensor<float>.FromMemory(privateArray, new[] { 2, 2 })) privateGradient.RebindStorageFrom(owner);
+        Assert.Same(publicArray, publicGradient.GraphBackingArrayIdentity);
+        Assert.Same(privateArray, privateGradient.GraphBackingArrayIdentity);
         var publicBuffer = new NativeCell(4);
         var privateBuffer = new NativeCell(4);
         Bind(publicGradient, publicBuffer, backend);
@@ -52,12 +56,54 @@ public sealed class PrivateGradientInferenceDemandTests
         Assert.Equal(new[] { 37f, 37f, 37f, 37f }, publicView.ToArray());
         Assert.Equal(1, downloads);
         Assert.Equal(sameHostArray ? 0L : 16L, plan.PrivateGradientNativeReleaseRequestedBytes);
+        GC.KeepAlive(publicOwner);
+        GC.KeepAlive(privateOwner);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_host_wrapper_outside_the_plan_protects_the_global_download(bool registerFreshOwnership)
+    {
+        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var plan = Compile(engine, out _, out _);
+        PrepareCompletedMetadata(plan, engine);
+        var publicGradient = plan.Gradients[0];
+        var gradients = (Tensor<float>[])Field(plan, "_preAllocatedGrads")!;
+        var privateGradient = gradients.First(gradient => gradient.Length == 4 && !ReferenceEquals(gradient, publicGradient));
+        var array = new float[4];
+        var owner = registerFreshOwnership ? ResultBufferTracker.TrackFreshPrivateArray(array, 0) : null;
+        using (var initial = Tensor<float>.FromMemory(array, new[] { 2, 2 })) privateGradient.RebindStorageFrom(initial);
+        // Deliberately absent from the plan's known tensor census. It has its own Vector and TensorStorage.
+        using var foreignPublic = Tensor<float>.FromMemory(array, new[] { 2, 2 });
+        Assert.NotSame(foreignPublic.StorageIdentity, privateGradient.StorageIdentity);
+        Assert.NotSame(foreignPublic.GraphVectorIdentity, privateGradient.GraphVectorIdentity);
+        var privateBuffer = new NativeCell(4);
+        Bind(privateGradient, privateBuffer, backend);
+        plan.RecordPrivateGradientAllocation(privateBuffer);
+        int downloads = 0;
+        HostSync.Register(array, value => { downloads++; Array.Fill((float[])value, 53f); });
+        plan.RegisterPrivateGradientDemandOwner(engine, backend);
+        using (InferenceWorkspaceDemandScope.Enter(engine))
+            InferenceWorkspaceDemandScope.BeforeAllocation(backend, 5);
+        GC.Collect(); GC.WaitForPendingFinalizers();
+        Assert.Equal(0, privateBuffer.Releases);
+        Assert.Equal(0, downloads);
+        Assert.True(HostSync.IsPending(array));
+        Assert.Equal(new[] { 53f, 53f, 53f, 53f }, foreignPublic.ToArray());
+        Assert.Equal(1, downloads);
+        Assert.Equal(0, plan.PrivateGradientNativeReleaseRequestedBytes);
+        GC.KeepAlive(owner);
     }
 
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Cuda_TrainPredictTrain_preserves_unread_results_and_Adam_after_private_native_release(bool inputGradients)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void Cuda_TrainPredictTrain_preserves_unread_results_and_Adam_after_private_native_release(bool inputGradients, bool forceFallback)
     {
         using var gpu = CreateGpu();
         var previous = AiDotNetEngine.Current;
@@ -66,8 +112,8 @@ public sealed class PrivateGradientInferenceDemandTests
         try
         {
             CompiledTrainingPlan<float>.CompiledInputGradientsForTests = inputGradients;
-            var baseline = Trajectory(gpu, false, inputGradients, out long baselineReleased);
-            var retired = Trajectory(gpu, true, inputGradients, out long released);
+            var baseline = Trajectory(gpu, false, inputGradients, forceFallback, out long baselineReleased);
+            var retired = Trajectory(gpu, true, inputGradients, forceFallback, out long released);
             Assert.Equal(0, baselineReleased);
             Assert.True(released > 0, "The fixture must actually retire private accumulator native buffers.");
             Assert.Equal(baseline.Count, retired.Count);
@@ -83,7 +129,7 @@ public sealed class PrivateGradientInferenceDemandTests
         }
     }
 
-    private static List<float[]> Trajectory(DirectGpuTensorEngine engine, bool release, bool inputGradients, out long released)
+    private static List<float[]> Trajectory(DirectGpuTensorEngine engine, bool release, bool inputGradients, bool forceFallback, out long released)
     {
         AiDotNetEngine.Current = engine;
         Environment.SetEnvironmentVariable("AIDOTNET_INFERENCE_PRIVATE_GRADIENT_RETURN", release ? null : "0");
@@ -94,7 +140,9 @@ public sealed class PrivateGradientInferenceDemandTests
         for (int iteration = 0; iteration < 5; iteration++)
         {
             input[0] = .1f + iteration * .01f;
+            if (forceFallback && iteration == 2) plan.FailPrivateGradientResidencyAtForTesting = 1;
             var loss = plan.Step();
+            if (forceFallback && iteration >= 2) Assert.Equal(true, Field(plan, "_residentStepFailed"));
             var gradient = plan.Gradients[0];
             using var gradientView = gradient.Reshape(4);
             var inputGradient = input.Grad;
@@ -106,7 +154,7 @@ public sealed class PrivateGradientInferenceDemandTests
             GC.Collect();
             GC.WaitForPendingFinalizers();
             Assert.Same(publicBuffer, gradient._gpuBuffer);
-            Assert.NotEqual(IntPtr.Zero, gradient._gpuBuffer!.Handle);
+            if (publicBuffer is not null) Assert.NotEqual(IntPtr.Zero, gradient._gpuBuffer!.Handle);
             samples.Add(loss.ToArray());
             samples.Add(gradientView.ToArray());
             samples.Add(weight.ToArray());
