@@ -11,8 +11,8 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class CpuEngine
 {
-    // These math-only entry points are recorded once by GroupedConvolution. Views retain their source's
-    // Vector, storage, mutation epoch and physical offset; no independent FromMemory wrapper resets them.
+    // These math-only entry points are recorded once by GroupedConvolution. Direct array offsets and
+    // destination spans preserve parent ownership; no independent FromMemory wrapper resets its epoch.
     internal virtual void GroupedConv2DInto<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel,
         in GroupedConv2DGeometry geometry)
     {
@@ -30,22 +30,9 @@ public partial class CpuEngine
             var source = GroupedReadSource(input, output, null, owned);
             var weights = GroupedReadSource(kernel, output, null, owned);
             var destination = GroupedDestination(output, owned);
-            if (typeof(T) == typeof(float) && source.Layout == TensorLayout.Nchw)
-            {
-                var stride = geometry.Stride; var padding = geometry.Padding; var dilation = geometry.Dilation;
-                for (int group = 0; group < geometry.Groups; group++)
-                {
-                    using var weightView = GroupedKernelView(weights, group, geometry);
-                    for (int image = 0; image < geometry.Batch; image++)
-                    {
-                        using var inputView = GroupedImageView(source, image, group * geometry.InChannelsPerGroup,
-                            geometry.InChannelsPerGroup);
-                        using var outputView = GroupedImageView(destination, image, group * geometry.OutChannelsPerGroup,
-                            geometry.OutChannelsPerGroup);
-                        Conv2DInto(outputView, inputView, weightView, stride, padding, dilation);
-                    }
-                }
-            }
+            if (typeof(T) == typeof(float))
+                GroupedForwardFloat((Tensor<float>)(object)destination, (Tensor<float>)(object)source,
+                    (Tensor<float>)(object)weights, geometry);
             else GroupedForwardGeneric(destination, source, weights, geometry);
             if (!ReferenceEquals(destination, output)) CommitGroupedResult(output, destination);
             else output.IncrementVersion();
@@ -81,27 +68,13 @@ public partial class CpuEngine
             var source = gradKernel is null ? input : GroupedReadSource(input, gradInput, gradKernel, owned);
             var weights = gradInput is null ? kernel : GroupedReadSource(kernel, gradInput, gradKernel, owned);
             var upstream = GroupedReadSource(gradOutput, gradInput, gradKernel, owned);
-            var stride = geometry.Stride; var padding = geometry.Padding; var dilation = geometry.Dilation;
             if (gradInput is not null)
             {
                 var destination = GroupedDestination(gradInput, owned);
                 if (!ReferenceEquals(destination, gradInput) && addInput) CopyGroupedLogical(gradInput, destination);
                 if (typeof(T) == typeof(float))
-                {
-                    for (int group = 0; group < geometry.Groups; group++)
-                    {
-                        using var weightView = GroupedKernelView(weights, group, geometry);
-                        for (int image = 0; image < geometry.Batch; image++)
-                        {
-                            using var upstreamView = GroupedImageView(upstream, image, group * geometry.OutChannelsPerGroup,
-                                geometry.OutChannelsPerGroup);
-                            using var destinationView = GroupedImageView(destination, image, group * geometry.InChannelsPerGroup,
-                                geometry.InChannelsPerGroup);
-                            Conv2DBackwardInputInto(destinationView, upstreamView, weightView, destinationView._shape,
-                                stride, padding, dilation, addInput);
-                        }
-                    }
-                }
+                    GroupedInputGradientFloat((Tensor<float>)(object)destination, (Tensor<float>)(object)upstream,
+                        (Tensor<float>)(object)weights, geometry, addInput);
                 else GroupedInputGradientGeneric(destination, upstream, weights, geometry, addInput);
                 if (!ReferenceEquals(destination, gradInput)) CommitGroupedResult(gradInput, destination);
                 else gradInput.IncrementVersion();
@@ -192,6 +165,114 @@ public partial class CpuEngine
         int offset = checked(source._storageOffset + group * geometry.OutChannelsPerGroup * source._strides[0]);
         return new Tensor<T>((Vector<T>)source.GraphVectorIdentity, shape, (int[])source._strides.Clone(), offset, source._storage)
             { Layout = source.Layout };
+    }
+
+    // Ordinary Conv2D dispatch has array-only fallbacks which copy an offset destination. Stream bounded
+    // columns directly into the parent array instead; the large waveform route is independently offset-aware.
+    private static void GroupedForwardFloat(Tensor<float> destination, Tensor<float> input,
+        Tensor<float> kernel, in GroupedConv2DGeometry g)
+    {
+        if (g.Batch == 0) return;
+        var output = destination.GetCpuBackingForContiguousWrite(out int outputOffset);
+        var source = input.GetCpuBackingForStridedRead(out int inputOffset);
+        var weights = kernel.GetCpuBackingForStridedRead(out int kernelOffset);
+        if (output is null || source is null || weights is null)
+        {
+            GroupedForwardGeneric(destination, input, kernel, g);
+            return;
+        }
+        int k = checked(g.InChannelsPerGroup * g.KernelH * g.KernelW);
+        int spatial = checked(g.OutHeight * g.OutWidth), columns = Math.Min(256, spatial);
+        float[]? panel = null;
+        try
+        {
+            for (int group = 0; group < g.Groups; group++)
+                for (int image = 0; image < g.Batch; image++)
+                {
+                    int x = checked(inputOffset + (image * g.InChannels + group * g.InChannelsPerGroup) * g.InHeight * g.InWidth);
+                    int w = checked(kernelOffset + group * g.OutChannelsPerGroup * k);
+                    int y = checked(outputOffset + (image * g.OutChannels + group * g.OutChannelsPerGroup) * spatial);
+                    if (TryConv1DColumnPanels(source, weights, output, 1, g.InChannelsPerGroup, g.InHeight, g.InWidth,
+                        g.OutChannelsPerGroup, g.KernelH, g.KernelW, g.StrideH, g.StrideW, g.PadH, g.PadW,
+                        g.DilationH, g.DilationW, g.OutHeight, g.OutWidth, inputStorageOffset: x,
+                        outputStorageOffset: y, kernelStorageOffset: w)) continue;
+                    panel ??= CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(k * columns), "workspace.grouped_conv_forward_columns");
+                    for (int from = 0; from < spatial; from += columns)
+                    {
+                        int count = Math.Min(columns, spatial - from);
+                        FillGroupedColumnPanel(source, x, panel, from, count, g);
+                        BlasProvider.GemmEx(g.OutChannelsPerGroup, count, k, weights, w, k, false,
+                            panel, 0, count, false, output, y + from, spatial);
+                    }
+                }
+        }
+        finally { if (panel is not null) ArrayPool<float>.Shared.Return(panel); }
+    }
+
+    private static void GroupedInputGradientFloat(Tensor<float> destination, Tensor<float> upstream,
+        Tensor<float> kernel, in GroupedConv2DGeometry g, bool accumulate)
+    {
+        var target = destination.AsWritableSpanUnmarked();
+        if (!accumulate) target.Clear();
+        if (g.Batch == 0) return;
+        var weights = kernel.GetCpuBackingForStridedRead(out int kernelOffset);
+        var gradient = upstream.GetCpuBackingForStridedRead(out int gradientOffset);
+        if (weights is null || gradient is null)
+        {
+            GroupedInputGradientGeneric(destination, upstream, kernel, g, accumulate);
+            return;
+        }
+        int k = checked(g.InChannelsPerGroup * g.KernelH * g.KernelW);
+        int spatial = checked(g.OutHeight * g.OutWidth), columns = Math.Min(256, spatial);
+        bool waveform = g.InHeight == 1 && g.KernelH == 1 && g.OutHeight == 1 && g.StrideH == 1
+            && g.StrideW == 1 && g.PadH == 0 && g.KernelW > 1
+            && (long)g.OutChannelsPerGroup * g.KernelW * g.InWidth >= 1_048_576;
+        float[]? panel = null;
+        try
+        {
+            for (int group = 0; group < g.Groups; group++)
+                for (int image = 0; image < g.Batch; image++)
+                {
+                    if (waveform)
+                    {
+                        using var weightView = GroupedKernelView(kernel, group, g);
+                        using var upstreamView = GroupedImageView(upstream, image, group * g.OutChannelsPerGroup, g.OutChannelsPerGroup);
+                        using var destinationView = GroupedImageView(destination, image, group * g.InChannelsPerGroup, g.InChannelsPerGroup);
+                        if (TryConv1DBackwardInputColumnPanels(destinationView, upstreamView, weightView, 1,
+                            g.InChannelsPerGroup, g.InHeight, g.InWidth, g.OutChannelsPerGroup, g.KernelH, g.KernelW,
+                            g.StrideH, g.StrideW, g.PadH, g.PadW, g.DilationH, g.DilationW, g.OutHeight, g.OutWidth, accumulate)) continue;
+                    }
+                    panel ??= CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(k * columns), "workspace.grouped_conv_dx_columns");
+                    int w = checked(kernelOffset + group * g.OutChannelsPerGroup * k);
+                    int dy = checked(gradientOffset + (image * g.OutChannels + group * g.OutChannelsPerGroup) * spatial);
+                    int x = checked((image * g.InChannels + group * g.InChannelsPerGroup) * g.InHeight * g.InWidth);
+                    for (int from = 0; from < spatial; from += columns)
+                    {
+                        int count = Math.Min(columns, spatial - from);
+                        BlasProvider.GemmEx(k, count, g.OutChannelsPerGroup, weights, w, k, true,
+                            gradient, dy + from, spatial, false, panel, 0, count);
+                        AddGroupedColumnGradient(target, x, panel, from, count, g);
+                    }
+                }
+        }
+        finally { if (panel is not null) ArrayPool<float>.Shared.Return(panel); }
+    }
+
+    private static void AddGroupedColumnGradient(Span<float> destination, int offset, float[] panel,
+        int from, int count, in GroupedConv2DGeometry g)
+    {
+        int row = 0;
+        for (int channel = 0; channel < g.InChannelsPerGroup; channel++)
+            for (int kh = 0; kh < g.KernelH; kh++)
+                for (int kw = 0; kw < g.KernelW; kw++, row++)
+                    for (int column = 0; column < count; column++)
+                    {
+                        int position = from + column;
+                        int ih = position / g.OutWidth * g.StrideH - g.PadH + kh * g.DilationH;
+                        int iw = position % g.OutWidth * g.StrideW - g.PadW + kw * g.DilationW;
+                        if ((uint)ih < (uint)g.InHeight && (uint)iw < (uint)g.InWidth)
+                            destination[offset + (channel * g.InHeight + ih) * g.InWidth + iw] += panel[row * count + column];
+                    }
     }
 
     [ScalarKernel("Only exceptional strided destinations need logical tensor writes; contiguous grouped outputs are written in place.")]
@@ -288,7 +369,7 @@ public partial class CpuEngine
         for (; index < source.Length; index++) destination[index] += source[index];
     }
 
-    [ScalarKernel("Non-FP32 grouped convolution uses generic numeric operations over zero-copy spans; FP32 uses existing optimized convolution dispatch.")]
+    [ScalarKernel("Non-FP32 grouped convolution uses generic numeric operations over zero-copy spans; FP32 uses bounded offset-aware panels.")]
     private static void GroupedForwardGeneric<T>(Tensor<T> output, Tensor<T> input, Tensor<T> kernel, in GroupedConv2DGeometry g)
     {
         var x = input.AsSpanUnmarked(); var w = kernel.AsSpanUnmarked(); var y = output.AsWritableSpanUnmarked();
