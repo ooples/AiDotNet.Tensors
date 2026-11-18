@@ -27,6 +27,8 @@ internal sealed class TensorStorageLeaseSet : IDisposable
     private readonly Dictionary<object, TensorStorageLease> _leases = new(IdentityComparer.Instance);
     private bool _disposed;
 
+    internal bool ContainsStorage(object identity) => !_disposed && _leases.ContainsKey(identity);
+
     internal void Add(ITensorStorageLeaseSource tensor)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(TensorStorageLeaseSet));
