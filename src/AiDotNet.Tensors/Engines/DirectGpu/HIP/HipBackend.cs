@@ -9189,8 +9189,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
+    // Rows at least this wide reduce with one block per row (arg_extreme_axis_rows, the CUDA kernel); narrower rows
+    // keep one thread per row.
+    internal const int ArgExtremeRowKernelMinWidth = 512;
+
+    private unsafe bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
+    {
+        if (reduceSize < ArgExtremeRowKernelMinWidth || outerSize <= 0
+            || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var kernel))
+            return false;
+        IntPtr inputPtr = A.Handle;
+        IntPtr indicesPtr = indices.Handle;
+        int outerSizeVal = outerSize, reduceSizeVal = reduceSize, findMinVal = findMin;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPtr; args[1] = &indicesPtr; args[2] = &outerSizeVal; args[3] = &reduceSizeVal; args[4] = &findMinVal;
+        LaunchKernel(kernel, (uint)outerSize, DefaultBlockSize, args);
+        return true;
+    }
+
     public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) { Synchronize(); return; }
         if (!_kernelCache.TryGetValue("argmax_axis", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: argmax_axis");
 
@@ -9212,6 +9231,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 1)) { Synchronize(); return; }
         if (!_kernelCache.TryGetValue("argmin_axis", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: argmin_axis");
 
@@ -10579,6 +10599,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: argmax_axis");
 

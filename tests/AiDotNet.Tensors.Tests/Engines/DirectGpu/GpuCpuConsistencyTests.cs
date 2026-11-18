@@ -2108,6 +2108,47 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         Assert.Equal(expectedBuckets.GetDataArray(), actualBuckets.GetDataArray());
     }
 
+    [SkippableTheory]
+    [InlineData(1, 49152)]   // one vocabulary row: the B=1 decode argmax
+    [InlineData(5, 4097)]
+    [InlineData(3, 512)]     // the row-kernel threshold
+    [InlineData(4, 511)]     // just below it: the one-thread-per-row kernel
+    public void ArgMaxArgMin_WideRows_MatchCpuScanExactly(int rows, int width)
+    {
+        SkipIfNoDirectGpu();
+        var rng = new Random(rows * 7919 + width);
+        var data = new float[rows * width];
+        for (int i = 0; i < data.Length; i++) data[i] = (float)Math.Round(rng.NextDouble() * 8 - 4, 1); // many exact ties
+        for (int r = 0; r < rows; r++)
+        {
+            int o = r * width;
+            switch (r % 5)
+            {
+                case 0: // ties at the extreme: the first of them must win, from several threads' slices
+                    data[o + width - 1] = 100f; data[o + 3] = 100f; data[o + width / 2] = 100f;
+                    data[o + width - 2] = -100f; data[o + 5] = -100f;
+                    break;
+                case 1: // a later NaN is skipped; infinities are ordinary extremes
+                    data[o + 1] = float.NaN; data[o + width - 1] = float.PositiveInfinity; data[o + 2] = float.NegativeInfinity;
+                    break;
+                case 2: // a leading NaN wins both
+                    data[o] = float.NaN; data[o + 9] = 1e30f;
+                    break;
+                case 3: // signed zeros tie (same bit key 0): the first wins; subnormals still order exactly
+                    for (int i = 0; i < width; i++) data[o + i] = i % 2 == 0 ? -1e-40f : -0f;
+                    data[o + width - 1] = 0f; data[o + 6] = 1e-45f; data[o + width - 3] = 1e-45f;
+                    break;
+                default:
+                    break;
+            }
+        }
+        var values = new Tensor<float>(data, new[] { rows, width });
+        IEngine cpu = new CpuEngine();
+        IEngine gpu = Gpu;
+        Assert.Equal(cpu.TensorArgMax(values, 1).GetDataArray(), gpu.TensorArgMax(values, 1).GetDataArray());
+        Assert.Equal(cpu.TensorArgMin(values, 1).GetDataArray(), gpu.TensorArgMin(values, 1).GetDataArray());
+    }
+
     [SkippableFact]
     public void GenericEmbeddingForwardBackward_StayResidentAndMatchCpu()
     {

@@ -14530,8 +14530,32 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // Rows at least this wide reduce with one block per row (arg_extreme_axis_rows); narrower rows keep one thread per
+    // row, which is already coalesced across rows and pays no shared-memory reduction.
+    internal const int ArgExtremeRowKernelMinWidth = 512;
+
+    private unsafe bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
+    {
+        if (reduceSize < ArgExtremeRowKernelMinWidth || outerSize <= 0
+            || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var kernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr inputPtr = A.Handle;
+        IntPtr indicesPtr = indices.Handle;
+        int outerSizeVal = outerSize, reduceSizeVal = reduceSize, findMinVal = findMin;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPtr;
+        args[1] = &indicesPtr;
+        args[2] = &outerSizeVal;
+        args[3] = &reduceSizeVal;
+        args[4] = &findMinVal;
+        LaunchKernel(kernel, (uint)outerSize, DefaultBlockSize, args);
+        return true;
+    }
+
     public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
@@ -14549,6 +14573,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 1)) return;
         if (!_kernelCache.TryGetValue("argmin_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmin_axis");
 
@@ -17359,6 +17384,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if ((long)outerSize * reduceSize > A.Size)
             throw new ArgumentOutOfRangeException(nameof(outerSize), $"outerSize*reduceSize ({(long)outerSize * reduceSize}) exceeds buffer A length ({A.Size}).");
 
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
