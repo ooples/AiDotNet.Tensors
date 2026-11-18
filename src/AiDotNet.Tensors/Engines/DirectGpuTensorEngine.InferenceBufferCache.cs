@@ -11,7 +11,7 @@ public partial class DirectGpuTensorEngine
     // queue-affine free cache. Acquiring a plan lock here would invert the engine->backend allocation lock order.
     internal bool IsInferenceIdleCacheDemandEligible(IDirectGpuBackend backend)
     {
-        if (GetType() != typeof(DirectGpuTensorEngine) || ResidentStepActive || InferenceCaptureActive
+        if (this.Unwrap().GetType() != typeof(DirectGpuTensorEngine) || ResidentStepActive || InferenceCaptureActive
             || ScratchPoolingActive || TrainingStep.InStep || GradientRecording.IsRecording<float>()
             || GraphMode.IsActive || Gpu.DeferredScope.Current is not null || Gpu.GpuBufferReleaseDeferral.IsActive
             || Gpu.AutocastScope.IsEnabled) return false;
