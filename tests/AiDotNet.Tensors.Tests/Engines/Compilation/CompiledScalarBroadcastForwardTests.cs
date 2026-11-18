@@ -31,7 +31,7 @@ public sealed class CompiledScalarBroadcastForwardTests : IDisposable
     {
         var left = new Tensor<float>(Enumerable.Range(0, rows * columns).Select(i => (i % 127 - 63) * .03125f).ToArray(), new[] { rows, columns });
         var scalar = new Tensor<float>(new[] { .75f }, new[] { 1, 1 });
-        var output = new Tensor<float>(left.Shape);
+        var output = new Tensor<float>(left.Shape.ToArray());
         var replay = Replay(left, scalar, output);
         foreach (float scale in new[] { .75f, -.125f, 0f })
         {
@@ -49,7 +49,7 @@ public sealed class CompiledScalarBroadcastForwardTests : IDisposable
     {
         var left = new Tensor<double>(new[] { 2.5, -4.0, 1e-100, -7.25, 0.0, 9.0 }, new[] { 2, 3 });
         var scalar = new Tensor<double>(new[] { -1.125 }, new[] { 1, 1 });
-        var output = new Tensor<double>(left.Shape);
+        var output = new Tensor<double>(left.Shape.ToArray());
         var replay = Replay(left, scalar, output);
         foreach (double scale in new[] { -1.125, .375 })
         {
@@ -86,7 +86,7 @@ public sealed class CompiledScalarBroadcastForwardTests : IDisposable
         Assert.Equal(original.Take(12).Select(value => value * -.75f), target.ToArray());
 
         var strided = source.Transpose(new[] { 1, 0 });
-        var output = new Tensor<float>(strided.Shape);
+        var output = new Tensor<float>(strided.Shape.ToArray());
         output.Fill(777);
         Assert.Null(CompiledTrainingPlan<float>.TryBuildSpecializedForward(Step(strided, scalar, output)));
         Assert.All(output.ToArray(), value => Assert.Equal(777f, value));
@@ -98,7 +98,7 @@ public sealed class CompiledScalarBroadcastForwardTests : IDisposable
         var engine = new CountingMultiplyEngine();
         var left = new Tensor<float>(new[] { 1f, 2, 3, 4, 5, 6 }, new[] { 2, 3 });
         var scalar = new Tensor<float>(new[] { -.5f }, new[] { 1, 1 });
-        var output = new Tensor<float>(left.Shape);
+        var output = new Tensor<float>(left.Shape.ToArray());
         var replay = Replay(left, scalar, output);
         replay(engine);
         Assert.Equal(1, engine.MultiplyCalls);
@@ -146,7 +146,7 @@ public sealed class CompiledScalarBroadcastForwardTests : IDisposable
         var engine = new CpuEngine();
         var dense = new Tensor<float>(new[] { 3, 7 });
         var scalar = new Tensor<float>(new[] { 1, 1 });
-        var probe = new Tensor<float>(dense.Shape);
+        var probe = new Tensor<float>(dense.Shape.ToArray());
         ICompiledTrainingPlan<float> plan;
         using (var scope = GraphMode.EnableTraining(new[] { dense, scalar, probe }))
         {
@@ -178,7 +178,7 @@ public sealed class CompiledScalarBroadcastForwardTests : IDisposable
         {
             var source = new Tensor<float>(new[] { 32, columns });
             var scalar = new Tensor<float>(new[] { .75f }, new[] { 1, 1 });
-            var output = new Tensor<float>(source.Shape);
+            var output = new Tensor<float>(source.Shape.ToArray());
             var replay = Replay(source, scalar, output);
             var engine = new CpuEngine();
             for (int warm = 0; warm < 4; warm++) replay(engine);

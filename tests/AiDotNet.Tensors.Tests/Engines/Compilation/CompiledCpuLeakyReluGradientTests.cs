@@ -16,7 +16,7 @@ public sealed class CompiledCpuLeakyReluGradientTests : IDisposable
     private static Action<IEngine> Replay<T>(Tensor<T> input, Tensor<T> upstream, Tensor<T> destination,
         double slope, bool shared = false)
     {
-        var output = new Tensor<T>(input.Shape);
+        var output = new Tensor<T>(input.Shape.ToArray());
         var step = new CompiledStep<T>("LeakyReLU", (_, _) => { }, output, new[] { input },
             savedState: new object[] { slope });
         var gradients = new Dictionary<Tensor<T>, Tensor<T>> { [input] = destination, [output] = upstream };
@@ -34,7 +34,7 @@ public sealed class CompiledCpuLeakyReluGradientTests : IDisposable
             -1e-39f, 1e-39f, -4f, 5f }, new[] { 11 });
         var upstream = new Tensor<float>(new[] { 1f, -2f, 3f, -4f, 5f, -6f, 7f, 8f, -9f, float.NaN, -0f }, new[] { 11 });
         var expected = new CpuEngine().LeakyReluBackward(upstream, input, slope).ToArray();
-        var output = new Tensor<float>(input.Shape);
+        var output = new Tensor<float>(input.Shape.ToArray());
         output.Fill(777);
         Replay(input, upstream, output, slope)(new CpuEngine());
         for (int i = 0; i < expected.Length; i++)
@@ -53,7 +53,7 @@ public sealed class CompiledCpuLeakyReluGradientTests : IDisposable
             double.PositiveInfinity, -1e-310, 1e-310 }, new[] { 9 });
         var upstream = new Tensor<double>(new[] { 1.0, -2, 3, -4, 5, -6, 7, 8, -9 }, new[] { 9 });
         var expected = new CpuEngine().LeakyReluBackward(upstream, input, slope).ToArray();
-        var output = new Tensor<double>(input.Shape);
+        var output = new Tensor<double>(input.Shape.ToArray());
         Replay(input, upstream, output, slope)(new CpuEngine());
         for (int i = 0; i < expected.Length; i++)
         {
