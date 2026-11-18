@@ -14992,10 +14992,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // A multi-consumer operand's buffer is overwritten when this is its first write of the step (see
             // AccumulatesInto), so the plan does not zero it.
             if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            // Match the base-CPU alias pool switch: flag0 and custom engines retain their previous binding policy.
+            bool deferAddBacking = engine.Unwrap().GetType() == typeof(CpuEngine)
+                && Environment.GetEnvironmentVariable("AIDOTNET_CPU_POOL_ALIAS_GRADS") != "0";
             if (typeof(T) == typeof(float) && !engine.SupportsGpu
                 && gradA.Length == gradOut.Length && gradB.Length == gradOut.Length
-                && HasSpecializedBacking(gradOut) && HasSpecializedBacking(gradA)
-                && HasSpecializedBacking(gradB))
+                && (deferAddBacking
+                    ? HasSpecializedBacking(gradOut) && HasSpecializedBacking(gradA) && HasSpecializedBacking(gradB)
+                    : TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
+                        && TryGetLiveFloatBacking(gradB) is not null))
             {
                 int addLen = gradOut.Length;
                 return eng =>

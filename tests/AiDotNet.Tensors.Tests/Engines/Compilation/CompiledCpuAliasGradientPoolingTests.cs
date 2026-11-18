@@ -6,12 +6,17 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 [Collection("CompilationGlobalState")]
 public class CompiledCpuAliasGradientPoolingTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public CompiledCpuAliasGradientPoolingTests(ITestOutputHelper output) => _output = output;
+
     private sealed class CustomCpuEngine : CpuEngine { }
 
     private sealed class Result
@@ -145,6 +150,8 @@ public class CompiledCpuAliasGradientPoolingTests
     {
         Result baseline = Run(pooling: false, inputGradients);
         Result pooled = Run(pooling: true, inputGradients);
+        _output.WriteLine($"input_gradients={inputGradients}; baseline_gradient_backing_bytes={baseline.GradientBackingBytes}; "
+            + $"pooled_gradient_backing_bytes={pooled.GradientBackingBytes}; pooled_alias_targets={pooled.PooledAliasTargets}");
         Assert.True(pooled.PooledAliasTargets > 0, "No alias target was pooled; this does not exercise the candidate.");
         Assert.True(pooled.GradientBackingBytes * 2 < baseline.GradientBackingBytes,
             $"Expected substantial backing reduction, got {pooled.GradientBackingBytes} vs {baseline.GradientBackingBytes}.");
