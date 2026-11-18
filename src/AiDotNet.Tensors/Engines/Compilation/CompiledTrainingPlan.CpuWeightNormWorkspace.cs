@@ -90,6 +90,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     {
         if (!CpuWeightNormWorkspaceEnabled || !LazyTensorScope.DeferCpuTrainingOutputs || typeof(T) != typeof(float)
             || !engine.Is<CpuEngine>() || !ReferenceEquals(engine, engine.Unwrap())
+            || engine.Unwrap().GetType() != typeof(CpuEngine)
             || scope.HostReadOp is not null || ForwardStepObserver is not null || SanitizeForwardBuffers
             || coverage.Count != backward.Count || coverage.Any(row => row is null)) return null;
         var actionSteps = Enumerable.Range(0, forwardKinds.Length).Where(i => forwardKinds[i] != ForwardEmit.Skip).ToArray();
