@@ -56,6 +56,10 @@ internal static class WeightNormSharingTestGraph
         internal readonly List<float[]> Values = new();
         internal long DistinctForwardBackingBytes;
         internal int DistinctForwardArrays;
+        internal bool ObservedManagedBacking;
+        internal int DistinctForwardStorages;
+        internal int DistinctForwardVectors;
+        internal long DistinctForwardVectorCapacityBytes;
         internal int DifferentiableWeightNormNodes;
         internal int NoGradWeightNormNodes;
     }
@@ -147,29 +151,52 @@ internal static class WeightNormSharingTestGraph
                         first[0] += 7f;
                         Assert.Equal(peer, second[0]);
                     }
-                    var arrays = weightNorm.Select(step => step.OutputBuffer.GetBackingArrayForCacheLookupUnsafe()).ToArray();
-                    Assert.All(arrays, array => Assert.NotNull(array));
-                    var distinct = new HashSet<float[]>(ReferenceEqualityComparer.Instance);
+                    var storages = new HashSet<object>(ReferenceEqualityComparer.Instance);
+                    var vectors = new HashSet<object>(ReferenceEqualityComparer.Instance);
+                    long vectorCapacityBytes = 0;
+                    foreach (var step in weightNorm)
+                    {
+                        storages.Add(step.OutputBuffer._storage);
+                        var vector = (Vector<float>)step.OutputBuffer.GraphVectorIdentity;
+                        Assert.Equal(step.OutputBuffer.Length, vector.Length);
+                        if (vectors.Add(vector)) vectorCapacityBytes += (long)vector.Length * sizeof(float);
+                    }
                     long bytes = 0;
-                    foreach (float[] array in arrays.Cast<float[]>())
-                        if (distinct.Add(array)) bytes += (long)array.Length * sizeof(float);
+                    int arrayCount = 0;
+                    bool observeManagedBacking = engine is not DirectGpuTensorEngine;
+                    if (observeManagedBacking)
+                    {
+                        var arrays = weightNorm.Select(step => step.OutputBuffer.GetBackingArrayForCacheLookupUnsafe()).ToArray();
+                        Assert.All(arrays, array => Assert.NotNull(array));
+                        var distinct = new HashSet<float[]>(ReferenceEqualityComparer.Instance);
+                        foreach (float[] array in arrays.Cast<float[]>())
+                            if (distinct.Add(array)) bytes += (long)array.Length * sizeof(float);
+                        arrayCount = distinct.Count;
+                    }
                     if (engine is DirectGpuTensorEngine native)
                     {
                         Assert.Equal(SeedA, seedA.ToArray());
                         Assert.Equal(SeedB, seedB.ToArray());
-                        // Cached-buffer draining may release only unused storage; both shared logical outputs
-                        // and all read-only inputs must remain valid for the next actual training replay.
+                        // Deferred device storage need not have a managed array. The direct CUDA fixture
+                        // separately proves simultaneous native alias ownership and surviving-view lifetime.
                         native.ReleaseUnusedDeviceMemory();
                     }
                     if (iteration == 1)
                     {
+                        result.ObservedManagedBacking = observeManagedBacking;
                         result.DistinctForwardBackingBytes = bytes;
-                        result.DistinctForwardArrays = distinct.Count;
+                        result.DistinctForwardArrays = arrayCount;
+                        result.DistinctForwardStorages = storages.Count;
+                        result.DistinctForwardVectors = vectors.Count;
+                        result.DistinctForwardVectorCapacityBytes = vectorCapacityBytes;
                     }
                     else
                     {
                         Assert.Equal(result.DistinctForwardBackingBytes, bytes);
-                        Assert.Equal(result.DistinctForwardArrays, distinct.Count);
+                        Assert.Equal(result.DistinctForwardArrays, arrayCount);
+                        Assert.Equal(result.DistinctForwardStorages, storages.Count);
+                        Assert.Equal(result.DistinctForwardVectors, vectors.Count);
+                        Assert.Equal(result.DistinctForwardVectorCapacityBytes, vectorCapacityBytes);
                     }
                 }
                 Assert.Contains(result.Values[2], value => value != 0f);
@@ -185,10 +212,20 @@ internal static class WeightNormSharingTestGraph
 
     internal static void AssertEquivalent(Result baseline, Result candidate, bool expectSharing)
     {
-        Assert.Equal(2, baseline.DistinctForwardArrays);
-        Assert.Equal(expectSharing ? 1 : 2, candidate.DistinctForwardArrays);
-        Assert.Equal(baseline.DistinctForwardBackingBytes,
-            candidate.DistinctForwardBackingBytes * (expectSharing ? 2 : 1));
+        Assert.Equal(2, baseline.DistinctForwardStorages);
+        Assert.Equal(2, baseline.DistinctForwardVectors);
+        Assert.Equal(expectSharing ? 1 : 2, candidate.DistinctForwardStorages);
+        Assert.Equal(expectSharing ? 1 : 2, candidate.DistinctForwardVectors);
+        Assert.Equal(baseline.DistinctForwardVectorCapacityBytes,
+            candidate.DistinctForwardVectorCapacityBytes * (expectSharing ? 2 : 1));
+        Assert.Equal(baseline.ObservedManagedBacking, candidate.ObservedManagedBacking);
+        if (baseline.ObservedManagedBacking)
+        {
+            Assert.Equal(2, baseline.DistinctForwardArrays);
+            Assert.Equal(expectSharing ? 1 : 2, candidate.DistinctForwardArrays);
+            Assert.Equal(baseline.DistinctForwardBackingBytes,
+                candidate.DistinctForwardBackingBytes * (expectSharing ? 2 : 1));
+        }
         Assert.Equal(baseline.DifferentiableWeightNormNodes, candidate.DifferentiableWeightNormNodes);
         Assert.Equal(baseline.NoGradWeightNormNodes, candidate.NoGradWeightNormNodes);
         Assert.Equal(baseline.Values.Count, candidate.Values.Count);
