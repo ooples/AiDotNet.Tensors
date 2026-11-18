@@ -274,6 +274,8 @@ public sealed unsafe partial class VulkanBackend
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
         // Issue #285: per-allocation cap check before VkBuffer creation.
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, data.Length);
+
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Vulkan);
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId && data.Length > 0)
             return AllocateAndRecordBatchUpload(data);
@@ -344,6 +346,8 @@ public sealed unsafe partial class VulkanBackend
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         return VulkanGpuBuffer.Create(size);
     }
 

@@ -10,6 +10,28 @@ public partial class DirectGpuTensorEngine
     internal CompiledTransientWorkspaceBroker CompiledWorkspaceBroker =>
         _compiledWorkspaceBroker ??= new CompiledTransientWorkspaceBroker(this);
 
+    // An inference demand can exceed every idle compiled cell (e.g. a larger batch). Return only that broker's
+    // already-detached, permanently uncaptured backing so the native allocator can satisfy the new size regime.
+    // Parameter/result/optimizer/captured roots and other plans' outstanding loans never enter the broker's free list.
+    internal void ReturnIncompatibleInferenceWorkspace(IDirectGpuBackend backend, long requestedBytes)
+    {
+        if (_compiledWorkspaceBroker is not { RetainedBytes: > 0 } broker
+            || ResidentStepActive || InferenceCaptureActive || TrainingStep.InStep
+            || Autodiff.GradientRecording.IsRecording<float>()
+            || Compilation.GraphMode.IsActive || Gpu.DeferredScope.Current?.IsRecording == true
+            || Gpu.AutocastScope.IsEnabled)
+            return;
+        using var operation = EnterGpuOp();
+        if (!operation.Held) return;
+        lock (CompiledStepLock)
+        {
+            if (ResidentStepActive || InferenceCaptureActive || TrainingStep.InStep
+                || backend is IGpuGraphCapture { SupportsGraphCapture: true } capture && capture.IsStreamCapturing())
+                return;
+            broker.ReturnIncompatibleCellsToNativeAllocator(backend, requestedBytes);
+        }
+    }
+
     // Only called for private, dead compiled intermediates while their scratch owner still owns the native buffer.
     // Reuse never materializes host data; a stale internal read fails rather than reading another plan's new value.
     internal void DetachCompiledWorkspaceTensor<T>(Tensor<T> tensor)

@@ -1581,6 +1581,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var size = (UIntPtr)(data.Length * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, data.Length);
+
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Hip);
 
         DrainCollectedBuffers();
@@ -1666,6 +1668,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
 
         DrainCollectedBuffers();
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
@@ -1697,6 +1701,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IntPtr devicePtr = IntPtr.Zero;
         long sizeInBytes = (long)size * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("HIP", sizeInBytes, MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         var sizeBytes = (UIntPtr)sizeInBytes;
 
         DrainCollectedBuffers();
