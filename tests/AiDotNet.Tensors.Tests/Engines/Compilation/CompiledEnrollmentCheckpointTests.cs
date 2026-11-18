@@ -623,8 +623,8 @@ public sealed class CompiledEnrollmentCheckpointTests
         const int budgetBytes = 256 * 1024 * 1024;
         int boundaryLength = budgetBytes / bytesPerElement;
         int oversizedLength = boundaryLength + 1;
-        var method = typeof(FusedOptimizerCheckpointSerializer).GetMethod(
-            "ReadArrayLength", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var method = Assert.IsAssignableFrom<System.Reflection.MethodInfo>(typeof(FusedOptimizerCheckpointSerializer).GetMethod(
+            "ReadArrayLength", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static));
         var readLength = (Func<BinaryReader, string, int, int, bool, int>)method.CreateDelegate(
             typeof(Func<BinaryReader, string, int, int, bool, int>));
 
