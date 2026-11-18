@@ -1,0 +1,26 @@
+{
+  "schema": "residual-fusion-metal-source-binding-v1",
+  "source_commit": "2cf1781c4772a89981735af370dd5ec87b27720a",
+  "source_archive_pathspec": "src/AiDotNet.Tensors/Engines/DirectGpu",
+  "source_archive_sha256": "7ab20d37ed42201093e1c73512681d04b23de5ea38fb07c58856cdfbbffe394a",
+  "payload_manifest_sha256": "ecc373dc011de6ae3d278bd2a2eeae6f34fab18030345dafe6a85abe2c7117d4",
+  "assemblies_sha256": {
+    "AiDotNet.Evolution.dll": "e88331586027426352fc8e1f13efa5eb69d645c10e311c5e11fb4a5d6d4bc8e3",
+    "AiDotNet.Tensors.dll": "1e4aeb4dfaa75c19c4c2acd8e2e2965c1b8571e23950d75835f66090fb5b95d8"
+  },
+  "payloads": {
+    "batch.metal": {
+      "sha256": "7a90714c3497b87355a79a8f06e6a27fa6446a6b3acb5bc0267ea8aa84588cef",
+      "bytes": 102120,
+      "strict": true
+    },
+    "convt.metal": {
+      "sha256": "d7f05f4bb1091656e5da660ced9bd44be8683e816b9f51f1b676c831dc2dd0d0",
+      "bytes": 1928,
+      "strict": false
+    }
+  },
+  "origin": "C:/Users/FranklinMoormann/source/repos/perf2561/finish-hifi-residual-fusion-compilers-attempt1",
+  "preparer_sha256": "18d02d87fb07b1ea32898b0cd7ded60ffe0e10196294aed599d7b34feab895ca",
+  "claim": "Apple compiler proof of the complete actual production Metal modules including grouped convolution FWD/DX/DW and residual fusion. No runtime or performance claim."
+}

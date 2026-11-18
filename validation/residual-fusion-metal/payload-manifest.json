@@ -1,0 +1,493 @@
+{
+  "schema": 1,
+  "source_commit": "2cf1781c4772a89981735af370dd5ec87b27720a",
+  "assemblies_sha256": {
+    "AiDotNet.Evolution.dll": "e88331586027426352fc8e1f13efa5eb69d645c10e311c5e11fb4a5d6d4bc8e3",
+    "AiDotNet.Tensors.dll": "1e4aeb4dfaa75c19c4c2acd8e2e2965c1b8571e23950d75835f66090fb5b95d8"
+  },
+  "gpu_disabled": true,
+  "classification": "Actual complete production modules including separately rounded bias/residual additions and optional activated carry. Export only; no compiler success asserted.",
+  "source_archive_sha256": "7ab20d37ed42201093e1c73512681d04b23de5ea38fb07c58856cdfbbffe394a",
+  "payloads": {
+    "batch.cu": {
+      "backend": "CUDA",
+      "provider": "BatchExecutionCudaKernels.GetSource",
+      "sha256": "3d2d72d7577783ed113d93c47d47044c0d36457378835fcf07281f59246d049a",
+      "bytes": 76480,
+      "required_kernels": [
+        "bx_weight_norm",
+        "bx_weight_norm_stats",
+        "bx_weight_norm_dv",
+        "bx_weight_norm_dg",
+        "bx_rfft_magnitude",
+        "bx_rfft_magnitude_seed",
+        "bx_rfft_real_gradient",
+        "bx_channel_bias_leaky",
+        "bx_grouped_conv2d",
+        "bx_grouped_conv2d_dx",
+        "bx_grouped_conv2d_dw",
+        "bx_channel_bias_residual"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "batch.hip": {
+      "backend": "HIP",
+      "provider": "HipBackend compiles BatchExecutionCudaKernels.GetSource without translation",
+      "sha256": "3d2d72d7577783ed113d93c47d47044c0d36457378835fcf07281f59246d049a",
+      "bytes": 76480,
+      "required_kernels": [
+        "bx_weight_norm",
+        "bx_weight_norm_stats",
+        "bx_weight_norm_dv",
+        "bx_weight_norm_dg",
+        "bx_rfft_magnitude",
+        "bx_rfft_magnitude_seed",
+        "bx_rfft_real_gradient",
+        "bx_channel_bias_leaky",
+        "bx_grouped_conv2d",
+        "bx_grouped_conv2d_dx",
+        "bx_grouped_conv2d_dw",
+        "bx_channel_bias_residual"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "batch.cl": {
+      "backend": "OpenCL",
+      "provider": "OpenCL.Kernels.BatchExecutionKernels.GetSource",
+      "sha256": "5a9b653d5ca2456acfbf723a1fb2655c47244ebfcb2e51c6beef30478ac85c41",
+      "bytes": 64611,
+      "required_kernels": [
+        "bx_weight_norm",
+        "bx_weight_norm_stats",
+        "bx_weight_norm_dv",
+        "bx_weight_norm_dg",
+        "bx_rfft_magnitude",
+        "bx_rfft_magnitude_seed",
+        "bx_rfft_real_gradient",
+        "bx_channel_bias_leaky",
+        "bx_grouped_conv2d",
+        "bx_grouped_conv2d_dx",
+        "bx_grouped_conv2d_dw",
+        "bx_channel_bias_residual"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "batch.metal": {
+      "backend": "Metal",
+      "provider": "MetalBatchExecutionKernels.Source, actual full translated module",
+      "sha256": "7a90714c3497b87355a79a8f06e6a27fa6446a6b3acb5bc0267ea8aa84588cef",
+      "bytes": 102120,
+      "required_kernels": [
+        "bx_weight_norm",
+        "bx_weight_norm_stats",
+        "bx_weight_norm_dv",
+        "bx_weight_norm_dg",
+        "bx_rfft_magnitude",
+        "bx_rfft_magnitude_seed",
+        "bx_rfft_real_gradient",
+        "bx_channel_bias_leaky",
+        "bx_grouped_conv2d",
+        "bx_grouped_conv2d_dx",
+        "bx_grouped_conv2d_dw",
+        "bx_channel_bias_residual"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.WeightNormShaders.Forward",
+      "sha256": "b5546393c8a2a80a8e99f9e2147f9ea678cd8fbd49300e33abee48521aa30a86",
+      "bytes": 1296,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "391b2275300c9fc1f16a308f708fa1d990eff5ba8bfddd112df54b83eb25715e",
+      "bytes": 4565,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm_stats.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.WeightNormShaders.Stats",
+      "sha256": "1de2d7506a0534ec4c7eb748bab6a73839acccc6383f1e514a343fd7713cc9f5",
+      "bytes": 1415,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm_stats.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "10d35f63fc23a2ec430642cc0fbd21264cd526c58ee20592cb918e568b537e8b",
+      "bytes": 4580,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm_dv.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.WeightNormShaders.DirectionGrad",
+      "sha256": "416bb85c5d6d6ece24e312fab1b451ccbb50e1cf96271ccf88ff00a45ff90acd",
+      "bytes": 1117,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm_dv.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "00155b58cb988009bda03777b753f28c0189c502a76fb63ec12c687c685cce9b",
+      "bytes": 4264,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm_dg.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.WeightNormShaders.GainGrad",
+      "sha256": "63ac1c861a2664a04bfc2d27854fd430cdb2c249ede7e4a78d4136dfce049bcf",
+      "bytes": 819,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_weight_norm_dg.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "8b096a8a5828dc78488f4be77a37d837591fdb15b33d170c9e0368b5454d3610",
+      "bytes": 3978,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "hip-activation.hip": {
+      "backend": "HIP",
+      "provider": "HipActivationKernels.GetSource",
+      "sha256": "abf1604591e39dd2ecd0fb0bcb03e555e663b4cee332fa8eb3be678c6f689154",
+      "bytes": 56267,
+      "required_kernels": [
+        "leaky_relu_backward"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "hip-neural-net.hip": {
+      "backend": "HIP",
+      "provider": "HipNeuralNetKernels.GetSource",
+      "sha256": "26a8ef54d777ba68eba187ac36c89a9cb2ee6e1d04fd13d93a84f27512b481f7",
+      "bytes": 97581,
+      "required_kernels": [
+        "leaky_relu_backward"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "binary-elementwise.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanGlslKernels.BinaryElementwise",
+      "sha256": "6208cb2d811e49f4f7ae3b8341094d0cf5af241addd668c0a958b201d90ecd1c",
+      "bytes": 2355,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "activation-backward.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuKernels.ActivationBackwardSource + production Prelude.Prepare",
+      "sha256": "94a99f5eb43dd820d5b3e154de0a35ce6f13655dcea6d4a7ddaa2bcf8c7d2cff",
+      "bytes": 5436,
+      "required_kernels": [
+        "leaky_relu_backward"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "convt.hip": {
+      "backend": "HIP",
+      "provider": "ConvTransposeGemmKernelTemplate.GetModuleSource",
+      "sha256": "6519d59a9de9c0e294bd1750133883847518a54a3c84855a2e1aa67420621a57",
+      "bytes": 1458,
+      "required_kernels": [
+        "convt_gemm_regroup",
+        "convt_gemm_overlap_add"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "convt.cl": {
+      "backend": "OpenCL",
+      "provider": "ConvTransposeGemmKernelTemplate.GetModuleSource",
+      "sha256": "ce0249006a02bd99de24312868304cb2fec0474a5c7f5fe0ed70a64f0925aa9d",
+      "bytes": 1508,
+      "required_kernels": [
+        "convt_gemm_regroup",
+        "convt_gemm_overlap_add"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "convt.metal": {
+      "backend": "Metal",
+      "provider": "ConvTransposeGemmKernelTemplate.GetModuleSource",
+      "sha256": "d7f05f4bb1091656e5da660ced9bd44be8683e816b9f51f1b676c831dc2dd0d0",
+      "bytes": 1928,
+      "required_kernels": [
+        "convt_gemm_regroup",
+        "convt_gemm_overlap_add"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "convt_gemm_regroup.comp": {
+      "backend": "Vulkan",
+      "provider": "ConvTransposeGemmKernelTemplate.GetGlslSource",
+      "sha256": "7260b9a287e573de4a2dfdb8249c4db6a24bef2cb5846ca91262d4432c101872",
+      "bytes": 503,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "convt_gemm_regroup.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuConvTransposeGemmKernels.SourceFor + production Prelude.Prepare",
+      "sha256": "23696921e939483adf6c8a52fa20946c48bd797a2532a5d49af09f4331ae13a6",
+      "bytes": 606,
+      "required_kernels": [
+        "convt_gemm_regroup"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "convt_gemm_overlap_add.comp": {
+      "backend": "Vulkan",
+      "provider": "ConvTransposeGemmKernelTemplate.GetGlslSource",
+      "sha256": "5e4a63156cbebe803c93d1a6fbd72c00ed26b7882717983ead7891ff29fbb70f",
+      "bytes": 1113,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "convt_gemm_overlap_add.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuConvTransposeGemmKernels.SourceFor + production Prelude.Prepare",
+      "sha256": "35dbd06292bb817572de9453fb3d1cf65ce8452c11e01704a84b03c69545dc65",
+      "bytes": 1351,
+      "required_kernels": [
+        "convt_gemm_overlap_add"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "rfft-precise.cu": {
+      "backend": "CUDA",
+      "provider": "CudaBackend compiles BatchExecutionCudaKernels.RfftMagnitudeCudaSource with useFastMath:false",
+      "sha256": "20d59e0da38803befdf6016002d9511934570eb07de3fe8b11ed211c8e3ea197",
+      "bytes": 1555,
+      "required_kernels": [
+        "bx_rfft_magnitude",
+        "bx_rfft_magnitude_seed",
+        "bx_rfft_real_gradient"
+      ],
+      "status": "exported_not_compiled",
+      "compile_options": [
+        "useFastMath:false"
+      ]
+    },
+    "weightnorm-precise.cu": {
+      "backend": "CUDA",
+      "provider": "CudaBackend compiles BatchExecutionCudaKernels.WeightNormPreciseSource with useFastMath:false after the shared batch module",
+      "sha256": "16b009d43b60da05ebc36c10a0954eb921a70fb8c1b4cea431a63bbdc32874db",
+      "bytes": 3538,
+      "required_kernels": [
+        "bx_weight_norm"
+      ],
+      "status": "exported_not_compiled",
+      "compile_options": [
+        "useFastMath:false"
+      ]
+    },
+    "bx_rfft_magnitude.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.RfftMagnitudeShaders.Magnitude",
+      "sha256": "fadd82a73248563ac9a3717e2e8819d068d7a464783dabb89dd8793b7f055ee2",
+      "bytes": 1020,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_rfft_magnitude.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "b91a023a86faec7ec047bcea9ea0ce178ec0f0f463e1b690c864e9f60c53fca4",
+      "bytes": 4100,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_rfft_magnitude_seed.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.RfftMagnitudeShaders.Seed",
+      "sha256": "77379cc794a69b42bcd3741200c9208bb76d97870e773e9188286985bfeab0b9",
+      "bytes": 1270,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_rfft_magnitude_seed.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "9adf0d527893fe202a6bdeb8f0c92ab606b415011c1ac2082a1b9e6590db57a6",
+      "bytes": 4355,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_rfft_real_gradient.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.RfftMagnitudeShaders.Gradient",
+      "sha256": "d71214c47ccf14b2b26091434647a629de6687d0001a5aa52256bca6b3bb5fc3",
+      "bytes": 865,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_rfft_real_gradient.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "deed0f72f515f52dc95c46bf71ccc1c3ec6af3a94c762e81b30c15f3612cc209",
+      "bytes": 4018,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_channel_bias_leaky.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.ChannelBiasLeakyShader",
+      "sha256": "0cc6d3e45c746a045094e081e38683b73fd2f7d5e046f0a884cf9b0c42ed823c",
+      "bytes": 956,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_channel_bias_leaky.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "0a72041356b23d94307633854f430dec899f6e036260697dbf5695e411814bd4",
+      "bytes": 4096,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_grouped_conv2d.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.GroupedConv2DShaders.Forward",
+      "sha256": "8f057ba86592f204a4c6bd29ad055c1a09f9413ec9d4aeac17114f816e284705",
+      "bytes": 1867,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_grouped_conv2d.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "80fbd85038959009b910e085df639afb8de4cb0e3e73a6cebedb05c88d3483a3",
+      "bytes": 1827,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_grouped_conv2d_dx.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.GroupedConv2DShaders.InputGrad",
+      "sha256": "ca67975edbe67e3a09cc5aa70c301b3f5b9929c848339924b6f8eb93663257c9",
+      "bytes": 2093,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_grouped_conv2d_dx.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "7965083921018daaedd5d5b8fe6b1f1cdcb8f0c7ec8b5e95a6ebf66534d9d391",
+      "bytes": 2113,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_grouped_conv2d_dw.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.GroupedConv2DShaders.KernelGrad",
+      "sha256": "aafee40c43da441c5292448462a5b029ef03a64dd4937a3f466e8a85052ababf",
+      "bytes": 1919,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_grouped_conv2d_dw.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "c3afe5f646dc1e8883d2bce7adf0978069d10f85763027f3706f27a21933aa1f",
+      "bytes": 1890,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_channel_bias_residual.comp": {
+      "backend": "Vulkan",
+      "provider": "VulkanBatchExecutionKernels.ChannelBiasResidualShader",
+      "sha256": "79c504690990a471e86af87595f3fb93f884ef3a6efd28a2f1063a64438fae88",
+      "bytes": 1218,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    },
+    "bx_channel_bias_residual.wgsl": {
+      "backend": "WebGPU",
+      "provider": "WebGpuBatchExecutionKernels.ByKernelName + production Prelude.Prepare",
+      "sha256": "9fad5067e55b68337f82334e84a4ea948a4f81578ee6fef4f519b9b7f0078345",
+      "bytes": 4342,
+      "required_kernels": [
+        "main"
+      ],
+      "status": "exported_not_compiled"
+    }
+  },
+  "exporter_sha256": "cf7e9ad0b1684d271f96ce46d227fc035ae81c2f85b933183d87c5bb417c8b73",
+  "base_exporter_sha256": "c1091e957479cc23ee516cf5f58937a15ec982f5507a145e4f41ae8cf8859097",
+  "rfft_exporter_sha256": "51bc478d5b2120117bc338b8348aaa93f245c14ddae248d5c5bad57540355673",
+  "bias_leaky_exporter_sha256": "756e4898929ec1c276fc6c01ceaf4f0a7d5559b468b293ff7d6a95f29177cac7",
+  "grouped_scalar_abi": {
+    "buffers": 3,
+    "input_gradient": 17,
+    "kernel_gradient": 17,
+    "forward": 16
+  },
+  "grouped_exporter_sha256": "d2801ca355026906d95913e2b4b206ed3f0cbb3bcbbd0d12f419c4ad44dc1742",
+  "residual_scalar_abi": {
+    "scalars": 5,
+    "buffers": 5
+  }
+}

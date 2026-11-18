@@ -1,0 +1,3 @@
+*.metal -text
+*.json -text
+*.py -text

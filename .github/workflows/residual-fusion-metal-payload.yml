@@ -1,0 +1,29 @@
+name: Exact residual fusion and HiFi Metal payload compiler
+
+on:
+  push:
+    branches: [ validation/residual-fusion-metal-2cf1781c ]
+
+permissions:
+  contents: read
+
+jobs:
+  compile-exact-payloads:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - name: Compile the two complete hash-bound production libraries
+        env:
+          METAL_VALIDATION_OUTPUT: metal-payload-results
+        run: python3 validation/residual-fusion-metal/compile_payloads.py
+      - name: Preserve compiler evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: residual-fusion-metal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: metal-payload-results/**
+          if-no-files-found: error
+          retention-days: 30
