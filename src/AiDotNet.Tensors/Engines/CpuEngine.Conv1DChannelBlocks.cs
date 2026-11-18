@@ -1,0 +1,95 @@
+using System;
+using System.Buffers;
+using AiDotNet.Tensors.Helpers;
+
+namespace AiDotNet.Tensors.Engines;
+
+public partial class CpuEngine
+{
+    [ThreadStatic] private static int t_conv1DChannelBlockRuns;
+    internal static int Conv1DChannelBlockRunsOnThisThread => t_conv1DChannelBlockRuns;
+
+    // A fixed channel-block/tap/channel reduction order exposes adjacent input channels to the
+    // GEMM packer. Scratch is independent of waveform length and batch: one shared <=16MiB
+    // filter tile, and <=1MiB column/product panels per joined worker. No activation is retained.
+    private static bool TryConv1DChannelBlocks(float[] input, int inputOffset, float[] kernel, int kernelOffset,
+        float[] output, int outputOffset, int batch, int inChannels, int width, int outChannels,
+        int kernelWidth, int stride, int padding, int dilation, int outputWidth)
+    {
+        const int channelBlock = 16, aBudget = 4_194_304, workerBudget = 262_144;
+        if (inChannels < channelBlock || kernelWidth <= 1 || width <= 0 || outputWidth <= 0
+            || batch <= 0 || outChannels <= 0 || stride <= 0 || dilation <= 0 || padding < 0)
+            return false;
+        int reduction = checked(inChannels * kernelWidth);
+        if (reduction > workerBudget) return false;
+        int inputCount = checked(batch * inChannels * width);
+        int kernelCount = checked(outChannels * reduction);
+        int outputCount = checked(batch * outChannels * outputWidth);
+        var destination = output.AsSpan(outputOffset, outputCount);
+        if ((ReferenceEquals(input, output) && input.AsSpan(inputOffset, inputCount).Overlaps(destination))
+            || (ReferenceEquals(kernel, output) && kernel.AsSpan(kernelOffset, kernelCount).Overlaps(destination)))
+            return false;
+        int columns = Math.Min(256, Math.Min(workerBudget / reduction, checked(batch * outputWidth)));
+        int rows = Math.Min(outChannels, Math.Min(256, Math.Max(1, (aBudget / reduction) / 16 * 16)));
+        columns = Math.Min(columns, workerBudget / rows);
+        int totalColumns = checked(batch * outputWidth), blocks = (totalColumns - 1) / columns + 1;
+        int workers = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, blocks));
+        var packedKernel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(rows * reduction), "workspace.conv1d_channel_block_filter");
+        try
+        {
+            for (int rowFrom = 0; rowFrom < outChannels; rowFrom += rows)
+            {
+                int rowCount = Math.Min(rows, outChannels - rowFrom), packedRow = 0;
+                for (int block = 0; block < inChannels; block += channelBlock)
+                    for (int tap = 0; tap < kernelWidth; tap++)
+                        for (int channel = block; channel < Math.Min(inChannels, block + channelBlock); channel++, packedRow++)
+                            for (int oc = 0; oc < rowCount; oc++)
+                                packedKernel[oc * reduction + packedRow] = kernel[kernelOffset + ((rowFrom + oc) * inChannels + channel) * kernelWidth + tap];
+                int currentRowFrom = rowFrom;
+                CpuParallelSettings.ParallelForOrSerial(0, workers, (long)rowCount * reduction * totalColumns, worker =>
+                {
+                    var options = new BlasManaged.BlasOptions<float> { NumThreads = 1, BetaZero = true };
+                    var panel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(reduction * columns), "workspace.conv1d_channel_block_columns");
+                    float[]? product = null;
+                    try
+                    {
+                        product = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(rowCount * columns), "workspace.conv1d_channel_block_product");
+                        for (int tile = worker; tile < blocks; tile += workers)
+                        {
+                            int from = tile * columns, count = Math.Min(columns, totalColumns - from), row = 0;
+                            for (int block = 0; block < inChannels; block += channelBlock)
+                                for (int tap = 0; tap < kernelWidth; tap++)
+                                    for (int channel = block; channel < Math.Min(inChannels, block + channelBlock); channel++, row++)
+                                        for (int column = 0; column < count; column++)
+                                        {
+                                            int flat = from + column, image = flat / outputWidth;
+                                            int location = (flat % outputWidth) * stride - padding + tap * dilation;
+                                            panel[row * count + column] = (uint)location < (uint)width
+                                                ? input[inputOffset + (image * inChannels + channel) * width + location] : 0f;
+                                        }
+                            BlasManaged.BlasManaged.Gemm<float>(packedKernel.AsSpan(0, rowCount * reduction), reduction, false,
+                                panel.AsSpan(0, reduction * count), count, false, product.AsSpan(0, rowCount * count), count,
+                                rowCount, count, reduction, options);
+                            for (int oc = 0; oc < rowCount; oc++)
+                                for (int column = 0; column < count; column++)
+                                {
+                                    int flat = from + column, image = flat / outputWidth, time = flat % outputWidth;
+                                    output[outputOffset + (image * outChannels + currentRowFrom + oc) * outputWidth + time] = product[oc * count + column];
+                                }
+                        }
+                    }
+                    finally
+                    {
+                        if (product is not null) ArrayPool<float>.Shared.Return(product);
+                        ArrayPool<float>.Shared.Return(panel);
+                    }
+                }, deterministicSafe: true);
+            }
+            t_conv1DChannelBlockRuns++;
+            // The existing counter covers waveform column-panel executions, including this ordering.
+            t_conv1DColumnPanelRuns++;
+            return true;
+        }
+        finally { ArrayPool<float>.Shared.Return(packedKernel); }
+    }
+}
