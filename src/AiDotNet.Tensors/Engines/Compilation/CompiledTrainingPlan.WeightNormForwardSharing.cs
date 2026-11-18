@@ -142,9 +142,22 @@ internal sealed partial class CompiledTrainingPlan<T>
 
     private static void CollectWeightNormSavedArrays(object? saved, HashSet<object> arrays)
     {
-        if (saved is T[] values) arrays.Add(values);
-        else if (saved is object[] nested)
-            foreach (var value in nested) CollectWeightNormSavedArrays(value, arrays);
+        if (saved is null) return;
+        var pending = new Stack<object>();
+        var seen = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        pending.Push(saved);
+        while (pending.Count != 0)
+        {
+            var value = pending.Pop();
+            if (!seen.Add(value)) continue;
+            if (value is T[] values) arrays.Add(values);
+            else if (value is Array array && array.GetType().GetElementType() is { IsValueType: false })
+            {
+                foreach (var item in array) if (item is not null) pending.Push(item);
+            }
+            else if (value is ISavedStateTensorContainer container)
+                foreach (var item in container.SavedStateValues) if (item is not null) pending.Push(item);
+        }
     }
 
     private static bool SameWeightNormPhysicalStorage(Tensor<T> left, Tensor<T> right) =>
