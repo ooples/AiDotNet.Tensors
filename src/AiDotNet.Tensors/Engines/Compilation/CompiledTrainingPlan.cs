@@ -1974,6 +1974,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} parameters={_parameters.Length} {row.Key}: host={row.Value.Host / 1048576.0:F1}MB device={row.Value.Device / 1048576.0:F1}MB");
         }
         AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} observed unique host={hostBytes / 1048576.0:F1}MB device={deviceBytes / 1048576.0:F1}MB; pruned_gradients={PrunedGradientBufferCount}");
+        TraceCpuOutputCensus();
         if (_scratchPool is { } scratch)
             AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} scratch pool holds {scratch.BufferCount} buffers/{scratch.BufferBytes / 1048576.0:F1}MB (overlaps observed device handles)");
     }
