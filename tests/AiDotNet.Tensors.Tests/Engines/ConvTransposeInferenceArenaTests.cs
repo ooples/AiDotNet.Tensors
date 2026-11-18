@@ -89,6 +89,41 @@ public sealed class ConvTransposeInferenceArenaTests
     }
 
     [Fact]
+    public void IntoPrivatizesCopyOnWriteDestination()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 2f }, new[] { 1, 1, 1, 2 });
+        var kernel = new Tensor<float>(new[] { 2f, 3f }, new[] { 1, 1, 1, 2 });
+        var peer = new Tensor<float>(new[] { 91f, 91f, 91f }, new[] { 1, 1, 1, 3 });
+        var destination = (Tensor<float>)peer.CloneShared();
+        Assert.True(destination.IsCowShared);
+        using var noGrad = new NoGradScope<float>();
+        engine.ConvTranspose2DInto(destination, input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 0, 0 });
+        Assert.Equal(new[] { 2f, 7f, 6f }, destination.ToArray());
+        Assert.Equal(new[] { 91f, 91f, 91f }, peer.ToArray());
+    }
+
+    [Fact]
+    public void IntoConsumesDeferredDestinationDownloadBeforeWriting()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 2f }, new[] { 1, 1, 1, 2 });
+        var kernel = new Tensor<float>(new[] { 2f, 3f }, new[] { 1, 1, 1, 2 });
+        var backing = new float[32];
+        var destination = Tensor<float>.FromMemory(new Memory<float>(backing, 0, 3), new[] { 1, 1, 1, 3 });
+        int downloads = 0;
+        HostSync.Register(backing, value => { downloads++; Array.Fill((float[])value, 91f); });
+        Assert.True(HostSync.IsPending(backing));
+        using var noGrad = new NoGradScope<float>();
+        engine.ConvTranspose2DInto(destination, input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 0, 0 });
+        Assert.Equal(1, downloads);
+        Assert.False(HostSync.IsPending(backing));
+        Assert.Equal(new[] { 2f, 7f, 6f }, destination.ToArray());
+        Assert.Equal(1, downloads);
+        Assert.All(backing.Skip(3), value => Assert.Equal(91f, value));
+    }
+
+    [Fact]
     public void TapedForwardInsideArenaKeepsAnalyticInputAndKernelGradients()
     {
         var previous = AiDotNetEngine.Current;
