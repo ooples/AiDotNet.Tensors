@@ -10523,6 +10523,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
 
 
+        if (LazyTensorScope.DeferCpuTrainingOutputs && engine.Is<CpuEngine>()
+            && ReferenceEquals(engine, engine.Unwrap()))
+        {
+            // Share normalization storage before allocating primal arrays. CPU
+            // specializations bind those arrays during lowering, so deferred
+            // outputs must be ready before any action chooses its replay path.
+            // Read the storage vector directly: Tensor host access would realize
+            // the recorded node and execute a trace while it is being compiled.
+            foreach (var step in forwardSteps)
+                if (step.OutputBuffer.HasDeferredHostStorage)
+                    _ = step.OutputBuffer._storage.GetVector().AsSpanUnmarked().Length;
+        }
+
         // Map each tensor to its consumer count (how many backward steps write to it)
         var consumerCount = new Dictionary<Tensor<T>, int>();
         foreach (var step in forwardSteps)
