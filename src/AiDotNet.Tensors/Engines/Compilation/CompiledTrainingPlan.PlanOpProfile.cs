@@ -39,12 +39,13 @@ internal sealed partial class CompiledTrainingPlan<T>
             internal Counter(string name) => Name = name;
         }
         private readonly string _directory;
-        private readonly int _id, _parameters, _pid;
+        private readonly long _id;
+        private readonly int _parameters, _pid;
         private Counter[] _forward = Array.Empty<Counter>(), _backward = Array.Empty<Counter>();
         private long _wallTicks;
         private int _steps, _forwardGeneration;
 
-        internal PlanOperationProfile(string directory, int id, int parameters)
+        internal PlanOperationProfile(string directory, long id, int parameters)
         {
             _directory = Path.GetFullPath(directory); _id = id; _parameters = parameters;
             using var process = Process.GetCurrentProcess(); _pid = process.Id;
