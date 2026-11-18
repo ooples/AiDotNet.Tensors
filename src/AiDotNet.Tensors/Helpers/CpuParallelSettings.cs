@@ -677,6 +677,7 @@ public static class CpuParallelSettings
     {
         if (toExclusive <= fromInclusive) return;
         int maxDegree = MaxDegreeOfParallelism;
+        if (maxDegree <= 0) throw new ArgumentOutOfRangeException(nameof(MaxDegreeOfParallelism));
         if (maxDegree <= 1 || _inParallelRegion
             || (toExclusive - fromInclusive) <= 1
             || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
