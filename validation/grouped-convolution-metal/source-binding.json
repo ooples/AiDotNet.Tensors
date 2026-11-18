@@ -1,0 +1,26 @@
+{
+  "schema": "grouped-convolution-metal-source-binding-v1",
+  "source_commit": "d73036b60ed2658a512398da8761e4b4c5ad56d1",
+  "source_archive_pathspec": "src/AiDotNet.Tensors/Engines/DirectGpu",
+  "source_archive_sha256": "d7c576ccfbc3ac23a8433f05d11d1c718c5bae96707d2b64c571ead2e3fe31cf",
+  "payload_manifest_sha256": "aa661bf675c721dd5d23cb0f2e7e400fb70f136733025cdf0c58f182bb269aea",
+  "assemblies_sha256": {
+    "AiDotNet.Evolution.dll": "e88331586027426352fc8e1f13efa5eb69d645c10e311c5e11fb4a5d6d4bc8e3",
+    "AiDotNet.Tensors.dll": "07d7c6efd669f36be12018ff37509d4ed024460183bada3df0dff5b440178348"
+  },
+  "payloads": {
+    "batch.metal": {
+      "sha256": "176d636eb892865a94e86e8a464cd0ef367e06bd9ecfe2713dbe61166c55814c",
+      "bytes": 101005,
+      "strict": true
+    },
+    "convt.metal": {
+      "sha256": "d7f05f4bb1091656e5da660ced9bd44be8683e816b9f51f1b676c831dc2dd0d0",
+      "bytes": 1928,
+      "strict": false
+    }
+  },
+  "origin": "C:/Users/FranklinMoormann/source/repos/perf2561/finish-grouped-convolution-compilers-attempt4",
+  "preparer_sha256": "ea14ddbc4600212d03d2a5693825461e515f804055107154fb4d6eccf4bf9d0a",
+  "claim": "Apple compiler proof of the complete actual production Metal modules including grouped convolution FWD/DX/DW. No runtime or performance claim."
+}
