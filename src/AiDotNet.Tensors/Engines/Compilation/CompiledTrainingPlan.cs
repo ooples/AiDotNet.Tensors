@@ -4179,6 +4179,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         long operationProfileStart = _planOperationProfile is null ? 0 : Stopwatch.GetTimestamp();
+        long operationAllocationStart = _planOperationProfile is null ? 0 : PlanOperationProfile.Allocated();
         try
         {
             // Every compiled GPU step holds the engine lock, then its plan lock.
@@ -4188,7 +4189,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (gpuEngine is null) result = StepLocked();
             else lock (gpuEngine.CompiledStepLock) result = StepLocked();
             TraceRetainedStorageOnce();
-            _planOperationProfile?.CompleteStep(operationProfileStart);
+            _planOperationProfile?.CompleteStep(operationProfileStart, operationAllocationStart);
             return result;
         }
         catch
@@ -11378,7 +11379,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 forwardFixedActions,
                 storageLeases);
             plan._cpuWeightNormWorkspace = weightNormWorkspace;
-            plan.InstallPlanOperationProfile(backwardStepNames.ToArray());
+            plan.InstallPlanOperationProfile(backwardStepNames.ToArray(), actionCoverage);
             storageLeases = null;
             plan._dataForwardReplay = dataReplay;
             plan._graphGradientMembership = parameters.Select(gradientMembers.Contains).ToArray();
