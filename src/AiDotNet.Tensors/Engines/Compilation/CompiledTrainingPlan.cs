@@ -4386,6 +4386,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     return StepResidentOrEager();
                 }
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
+                gte.RefreshHostIndexDeviceCopiesNow();   // host id tensors the graph reads through their device copies
                 if (_stepIo is not null ? !StepIoInputsStillBound(cb) : !RefreshGraphInputInPlace(cb))
                 {
                     // An input the graph reads through a baked pointer was released: replaying would read freed

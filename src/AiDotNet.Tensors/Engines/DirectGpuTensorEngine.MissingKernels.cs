@@ -4689,7 +4689,14 @@ public partial class DirectGpuTensorEngine
         IDirectGpuBackend backend, Tensor<int> indices)
     {
         if (!HasResidentIndexStorage(indices))
+        {
+            // On the resident (compiled) step, host ids get a device copy kept across steps: a fresh allocation and
+            // upload per call is a cuMemAlloc and a synchronous copy inside the captured step, which aborts the capture
+            // and sent the op to the host path, whose read of its device-resident input aborted it again.
+            if (ResidentStepActive)
+                return new OwnedBuffer(GetHostIndexDeviceCopy(backend, indices), ownsBuffer: false);
             return new OwnedBuffer(backend.AllocateIntBuffer(indices.GetDataArray()), ownsBuffer: true);
+        }
 
         if (indices._gpuBufferContainsRawInt32)
             return GetOrAllocateBuffer(backend, indices);
@@ -4755,6 +4762,85 @@ public partial class DirectGpuTensorEngine
             numeric.DisposeAfterQueuedUse(backend);
             throw;
         }
+    }
+
+    /// <summary>A host <see cref="Tensor{T}"/> of ids and its device copy, re-uploaded when the host storage version
+    /// moves.</summary>
+    private sealed class HostIndexDeviceCopy
+    {
+        internal readonly WeakReference<Tensor<int>> Source;
+        internal IGpuBuffer? Buffer;
+        internal int Capacity;
+        internal int Version;
+        internal HostIndexDeviceCopy(Tensor<int> source) => Source = new WeakReference<Tensor<int>>(source);
+    }
+
+    // Keyed weakly by the host index tensor: a copy (and, through its buffer's finalizer, its device memory) lives
+    // as long as the tensor - the plan node that captured it.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<Tensor<int>, HostIndexDeviceCopy> _hostIndexCopies = new();
+    private readonly List<WeakReference<HostIndexDeviceCopy>> _hostIndexCopyList = new();
+    private readonly object _hostIndexLock = new();
+
+    /// <summary>
+    /// The device copy of host ids <paramref name="indices"/>, uploaded on first use and again only after the host
+    /// storage version changed (a constant id table uploads once). A captured step reads it through a stable pointer;
+    /// <see cref="RefreshHostIndexDeviceCopiesNow"/> brings every copy up to date before a replay.
+    /// </summary>
+    private IGpuBuffer GetHostIndexDeviceCopy(IDirectGpuBackend backend, Tensor<int> indices)
+    {
+        HostIndexDeviceCopy copy;
+        lock (_hostIndexLock)
+        {
+            if (!_hostIndexCopies.TryGetValue(indices, out copy!))
+            {
+                copy = new HostIndexDeviceCopy(indices);
+                _hostIndexCopies.Add(indices, copy);
+                _hostIndexCopyList.RemoveAll(w => !w.TryGetTarget(out var c) || !c.Source.TryGetTarget(out _));
+                _hostIndexCopyList.Add(new WeakReference<HostIndexDeviceCopy>(copy));
+            }
+        }
+        RefreshHostIndexDeviceCopy(backend, copy, indices);
+        return copy.Buffer!;
+    }
+
+    private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices)
+    {
+        int n = indices.Length;
+        int version = indices.GpuCacheVersion;
+        lock (copy)
+        {
+            if (copy.Buffer is not null && copy.Capacity == n && copy.Version == version) return;
+            var data = indices.ToArray();
+            if (copy.Buffer is null || copy.Capacity != n)
+            {
+                var buffer = backend.AllocateIntBuffer(n);
+                copy.Buffer?.Dispose();
+                copy.Buffer = buffer;
+                copy.Capacity = n;
+            }
+            if (n > 0) backend.UploadIntBufferInPlace(data, copy.Buffer);
+            copy.Version = version;
+        }
+    }
+
+    /// <summary>
+    /// Re-uploads every live host-id device copy whose host tensor changed since its last upload. A compiled plan
+    /// calls it before each captured replay, outside the capture: the graph reads the copies through baked pointers,
+    /// so ids the caller rewrote between steps would otherwise replay with their captured values.
+    /// </summary>
+    internal void RefreshHostIndexDeviceCopiesNow()
+    {
+        if (!TryGetBackend(out var backend)) return;
+        HostIndexDeviceCopy[] copies;
+        lock (_hostIndexLock)
+        {
+            var live = new List<HostIndexDeviceCopy>(_hostIndexCopyList.Count);
+            foreach (var w in _hostIndexCopyList)
+                if (w.TryGetTarget(out var c)) live.Add(c);
+            copies = live.ToArray();
+        }
+        foreach (var copy in copies)
+            if (copy.Source.TryGetTarget(out var source)) RefreshHostIndexDeviceCopy(backend, copy, source);
     }
 
     private static bool HasResidentIndexStorage(Tensor<int> indices)
