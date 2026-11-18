@@ -4,12 +4,15 @@ internal static partial class VulkanBatchExecutionKernels
 {
     internal static class GroupedConv2DShaders
     {
+        private static string ComputeBody(string body)
+            => "\nvoid main() {\n" + body.Replace("0.0f", "0.0") + "\n}\n";
+
         internal static readonly string Forward = Shader(new[] { "r:first", "r:second", "w:resultValues" },
-            GroupedConv2DShaderBodies.ScalarDeclarations(false), GroupedConv2DShaderBodies.Forward.Replace("0.0f", "0.0"));
+            GroupedConv2DShaderBodies.ScalarDeclarations(false), ComputeBody(GroupedConv2DShaderBodies.Forward));
         internal static readonly string InputGrad = Shader(new[] { "r:first", "r:second", "rw:resultValues" },
-            GroupedConv2DShaderBodies.ScalarDeclarations(true), GroupedConv2DShaderBodies.InputGrad.Replace("0.0f", "0.0"));
+            GroupedConv2DShaderBodies.ScalarDeclarations(true), ComputeBody(GroupedConv2DShaderBodies.InputGrad));
         internal static readonly string KernelGrad = Shader(new[] { "r:first", "r:second", "rw:resultValues" },
-            GroupedConv2DShaderBodies.ScalarDeclarations(true), GroupedConv2DShaderBodies.KernelGrad.Replace("0.0f", "0.0"));
+            GroupedConv2DShaderBodies.ScalarDeclarations(true), ComputeBody(GroupedConv2DShaderBodies.KernelGrad));
     }
 }
 
