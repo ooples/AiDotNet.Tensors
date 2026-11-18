@@ -19,6 +19,14 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
     private bool _privateGradientCompletedStep;
     internal long PrivateGradientNativeReleaseRequestedBytes { get; private set; }
     internal long PrivateGradientNativeReleaseRequestedBuffers { get; private set; }
+    internal int FailPrivateGradientResidencyAtForTesting { get; set; } = -1;
+    bool IInferencePrivateGradientWorkspaceOwner.PrivateGradientWorkspaceDemandPending => _privateGradientCompletedStep && !_disposed;
+
+    private static void TrackFreshPrivateGradientTensor(Tensor<T> tensor)
+    {
+        if (tensor.GraphBackingArrayIdentity is T[] array)
+            ((Vector<T>)tensor.GraphVectorIdentity).ResultOwner = ResultBufferTracker.TrackFreshPrivateArray(array, 1);
+    }
 
     internal void RecordPrivateGradientAllocation(IGpuBuffer buffer)
     {
@@ -28,10 +36,12 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
 
     internal void RegisterPrivateGradientDemandOwner(DirectGpuTensorEngine engine, IDirectGpuBackend backend)
     {
-        if (!CanReturnPrivateGradientWorkspace(engine)) return;
+        if (!CanReturnPrivateGradientWorkspace(engine)
+            || Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_PRIVATE_GRADIENT_RETURN") == "0") return;
         _privateGradientBackend = backend;
         _privateGradientThread = Environment.CurrentManagedThreadId;
         _privateGradientCompletedStep = true;
+        engine.MarkPrivateGradientWorkspaceReady();
         if (_privateGradientRegistered) return;
         engine.RegisterPrivateGradientWorkspace(this);
         _privateGradientRegistered = true;
@@ -132,6 +142,7 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
         foreach (var step in _forwardSteps!)
         {
             _workspaceTensors.Add(step.OutputBuffer);
+            ProtectBuffer(step.OutputBuffer._gpuBuffer); // Primal bindings have a separate replay/retirement lifecycle.
             foreach (var input in step.Inputs)
             {
                 _workspaceTensors.Add(input);
@@ -159,6 +170,7 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
 
         var knownOwners = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
         var knownVectorStorages = new Dictionary<object, HashSet<object>>(ReferenceEqualityComparer<object>.Instance);
+        var knownArrayVectors = new Dictionary<object, HashSet<object>>(ReferenceEqualityComparer<object>.Instance);
         foreach (var tensor in _workspaceTensors)
         {
             object storage = tensor.StorageIdentity;
@@ -166,6 +178,12 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
             if (!knownVectorStorages.TryGetValue(tensor.GraphVectorIdentity, out var storages))
                 knownVectorStorages[tensor.GraphVectorIdentity] = storages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
             storages.Add(storage);
+            if (tensor.GraphBackingArrayIdentity is { } array)
+            {
+                if (!knownArrayVectors.TryGetValue(array, out var vectors))
+                    knownArrayVectors[array] = vectors = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+                vectors.Add(tensor.GraphVectorIdentity);
+            }
         }
         foreach (var tensor in _workspaceTensors)
         {
@@ -174,7 +192,8 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
             var vector = (Vector<T>)tensor.GraphVectorIdentity;
             if (tensor._storage.RefCount != expected || vector.LiveStorages != knownVectorStorages[vector].Count
                 || tensor.HasPendingCopyOnWritePeer || tensor._ownsGpuBuffer || tensor._storage.HasGpuBufferOwner
-                || vector.ResultOwner is { } owner && (owner.State.Escaped || owner.State.Wrappers > 1))
+                || tensor.GraphBackingArrayIdentity is { } array && (vector.ResultOwner is not { } owner
+                    || owner.State.Escaped || System.Threading.Volatile.Read(ref owner.State.Wrappers) != knownArrayVectors[array].Count))
                 Protect(tensor);
         }
         foreach (var gradient in _preAllocatedGrads)

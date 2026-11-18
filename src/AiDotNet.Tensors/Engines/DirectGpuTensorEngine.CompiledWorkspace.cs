@@ -9,6 +9,9 @@ namespace AiDotNet.Tensors.Engines;
 public partial class DirectGpuTensorEngine
 {
     private readonly List<WeakReference<IInferencePrivateGradientWorkspaceOwner>> _privateGradientOwners = new();
+    private volatile bool _privateGradientDemandPending;
+
+    internal void MarkPrivateGradientWorkspaceReady() => _privateGradientDemandPending = true;
 
     internal void RegisterPrivateGradientWorkspace(IInferencePrivateGradientWorkspaceOwner owner)
     {
@@ -27,7 +30,7 @@ public partial class DirectGpuTensorEngine
     // Parameter/result/optimizer/captured roots and other plans' outstanding loans never enter the broker's free list.
     internal void ReturnIncompatibleInferenceWorkspace(IDirectGpuBackend backend, long requestedBytes)
     {
-        if ((_compiledWorkspaceBroker is not { RetainedBytes: > 0 } && _privateGradientOwners.Count == 0)
+        if ((_compiledWorkspaceBroker is not { RetainedBytes: > 0 } && !_privateGradientDemandPending)
             || ResidentStepActive || InferenceCaptureActive || TrainingStep.InStep
             || Autodiff.GradientRecording.IsRecording<float>()
             || Compilation.GraphMode.IsActive || Gpu.DeferredScope.Current?.IsRecording == true
@@ -41,11 +44,17 @@ public partial class DirectGpuTensorEngine
                 || backend is IGpuGraphCapture { SupportsGraphCapture: true } capture && capture.IsStreamCapturing())
                 return;
             _compiledWorkspaceBroker?.ReturnIncompatibleCellsToNativeAllocator(backend, requestedBytes);
+            bool pending = false;
             for (int i = _privateGradientOwners.Count - 1; i >= 0; i--)
             {
                 if (!_privateGradientOwners[i].TryGetTarget(out var owner)) _privateGradientOwners.RemoveAt(i);
-                else owner.ReturnPrivateGradientWorkspaceForInference(this, backend);
+                else
+                {
+                    owner.ReturnPrivateGradientWorkspaceForInference(this, backend);
+                    pending |= owner.PrivateGradientWorkspaceDemandPending;
+                }
             }
+            _privateGradientDemandPending = pending;
         }
     }
 
