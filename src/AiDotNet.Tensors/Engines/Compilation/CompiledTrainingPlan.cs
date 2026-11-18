@@ -2549,6 +2549,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _forwardActions = rebuiltForward.ToArray();
+        if (_cpuWeightNormWorkspace is { } weightNormWorkspace)
+            weightNormWorkspace.WrapForward(_forwardActions, ActionToStepIndex
+                ?? throw new InvalidOperationException("Weight-normalization workspace requires forward metadata."));
         // The span lease plan was made over the original actions; a specialized action may write elsewhere.
         _spanStepOfAction = null;
         _spanReleaseAfter = null;
@@ -10532,7 +10535,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // Read the storage vector directly: Tensor host access would realize
             // the recorded node and execute a trace while it is being compiled.
             foreach (var step in forwardSteps)
-                if (step.OutputBuffer.HasDeferredHostStorage)
+                if (step.OutputBuffer.HasDeferredHostStorage
+                    && (!CpuWeightNormWorkspaceEnabled || step.OpType != OpType.TensorWeightNorm))
                     _ = step.OutputBuffer._storage.GetVector().AsSpanUnmarked().Length;
         }
 
@@ -11445,6 +11449,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             outputBuffer.AsWritableSpan();
         }
 
+        var weightNormWorkspace = dataReplay is null && fp16HeteroOrder is null
+            ? PrepareCpuWeightNormWorkspace(forwardSteps, forwardActions, backwardActions, forwardEmitKinds,
+                actionCoverage, parameters, lossOutput, retainedOutputs, scope, engine)
+            : null;
+        if (CpuWeightNormWorkspaceEnabled && engine.Is<CpuEngine>() && ReferenceEquals(engine, engine.Unwrap()))
+            foreach (var step in forwardSteps)
+                if (step.OutputBuffer.HasDeferredHostStorage)
+                    _ = step.OutputBuffer._storage.GetVector().AsSpanUnmarked().Length;
+
         TensorStorageLeaseSet? storageLeases = new TensorStorageLeaseSet();
         try
         {
@@ -11454,6 +11467,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     fp16HeteroOrder[i].AddStorageLeases(storageLeases);
             dataReplay?.AcquireStorage(storageLeases);
             storageLeases.Add(lossOutput);
+            weightNormWorkspace?.CompleteSnapshot();
 
             var plan = new CompiledTrainingPlan<T>(
                 forwardActions,
@@ -11480,6 +11494,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 forwardEmitKinds,
                 forwardFixedActions,
                 storageLeases);
+            plan._cpuWeightNormWorkspace = weightNormWorkspace;
             storageLeases = null;
             plan._dataForwardReplay = dataReplay;
             plan._graphGradientMembership = parameters.Select(gradientMembers.Contains).ToArray();
@@ -11532,6 +11547,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         finally
         {
             storageLeases?.Dispose();
+            weightNormWorkspace?.CompleteSnapshot();
         }
     }
 
