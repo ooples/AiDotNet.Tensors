@@ -1,4 +1,4 @@
-// Copyright (c) CrowdTrainer LLC. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA kernels for the fused Gated Linear Attention (GLA) sequence scan (issue ooples/AiDotNet#1464).
 // Mirrors CpuEngine.GlaScan.cs exactly (see HipGlaKernels for the shared design notes):
 //   S_t[di,ki] = g_t * S_{t-1}[di,ki] + V_t[di] * K_t[ki]
@@ -140,6 +140,139 @@ extern ""C"" __global__ void gla_scan_backward_ckpt(
             atomicAdd(&dG[gOff], dg);
 
             for (int ki = 0; ki < headDim; ki++) dSrow[ki] *= g;
+        }
+    }
+}
+
+// Checkpointed BPTT backward, one 1024-thread block per (batch, head), each thread owning up to GLA_TILE_EPT elements of
+// the headDim x headDim state in registers (element e = di*headDim + ki, e = threadIdx.x + j*1024). Same recurrence,
+// checkpoints and chunk recompute as gla_scan_backward_ckpt, whose threads each walked a whole state row serially and
+// atomically added into the same dQ[ki] / dK[ki] in lockstep (14.5 ms per call at batch 16, seqLen 256, 4 heads of 65;
+// the forward is 0.9 ms). Here every state update is elementwise and parallel, and the per-position reductions run
+// through a padded shared [headDim][headDim|1] tile in a fixed order: dQ and dK are column sums, dV a row sum, dG a
+// warp-shuffle tree. All are plain stores, so the result is deterministic and needs no zero-fill. Checkpoint and
+// scratch states are stored element-contiguous, so their reads and writes are coalesced.
+// Dynamic shared memory: headDim*(headDim|1) + 4*headDim + 32 floats.
+#define GLA_TILE_THREADS 1024
+#define GLA_TILE_EPT 12
+// Sums the tile's columns (COLS=1: out[c] = sum_r tile[r][c]) or rows (COLS=0: out[r] = sum_c tile[r][c]) in index
+// order, one line per thread. Ends with every thread synced.
+#define GLA_TILE_SUM(COLS, OUT) { if (tid < headDim) { float acc = 0.0f; for (int r = 0; r < headDim; r++) acc += (COLS) ? tile[r * stride + tid] : tile[tid * stride + r]; OUT = acc; } __syncthreads(); }
+// Walks this thread's state elements e = tid + j*1024 with their (row d_, column k_) kept incrementally (no index arrays,
+// so S and dS stay in registers at 1024 threads per block).
+#define GLA_TILE_FOR(BODY) { int d_ = di0, k_ = ki0;     _Pragma(""unroll"") for (int j = 0; j < GLA_TILE_EPT; j++) { int e = tid + j * GLA_TILE_THREADS; if (e >= hh) break;     BODY; k_ += stepK; d_ += stepD; if (k_ >= headDim) { k_ -= headDim; d_++; } } }
+extern ""C"" __global__ __launch_bounds__(GLA_TILE_THREADS) void gla_scan_backward_tiled(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* G,
+    float* Ckpt, float* Scratch,
+    float* dQ, float* dK, float* dV, float* dG,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, int chunk)
+{
+    extern __shared__ float smem[];
+    int stride = headDim | 1;                 // odd row stride: row and column walks hit distinct banks
+    float* tile = smem;                       // [headDim][stride]
+    float* qs = tile + headDim * stride;
+    float* ks = qs + headDim;
+    float* vs = ks + headDim;
+    float* dos = vs + headDim;
+    float* warpPart = dos + headDim;          // [32]
+
+    long bh = blockIdx.x;
+    if (bh >= (long)batch * numHeads) return;
+    int b = (int)(bh / numHeads), h = (int)(bh % numHeads);
+    int tid = threadIdx.x;
+    int hOff = h * headDim;
+    int hh = headDim * headDim;
+    int nChunks = (seqLen + chunk - 1) / chunk;
+
+    float S[GLA_TILE_EPT], dS[GLA_TILE_EPT];
+#pragma unroll
+    for (int j = 0; j < GLA_TILE_EPT; j++) { S[j] = 0.0f; dS[j] = 0.0f; }
+    int di0 = tid / headDim, ki0 = tid % headDim;
+    int stepD = GLA_TILE_THREADS / headDim, stepK = GLA_TILE_THREADS % headDim;
+
+    // Pass 1: forward scan, saving S_{t0-1} at every chunk start.
+    for (int t = 0; t < seqLen; t++) {
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        __syncthreads();
+        if (tid < headDim) { ks[tid] = K[baseOff + tid]; vs[tid] = V[baseOff + tid]; }
+        __syncthreads();
+        float g = G[(b * seqLen + t) * numHeads + h];
+        long ck = (bh * nChunks + t / chunk) * hh;
+        GLA_TILE_FOR(
+            if (t % chunk == 0) Ckpt[ck + e] = S[j];
+            S[j] = g * S[j] + vs[d_] * ks[k_];
+        )
+    }
+
+    // Pass 2: chunks in reverse; recompute the chunk's states into Scratch, then BPTT over it.
+    for (int c = nChunks - 1; c >= 0; c--) {
+        int t0 = c * chunk;
+        int t1 = min(seqLen, t0 + chunk);
+        long ck = (bh * nChunks + c) * hh;
+#pragma unroll
+        for (int j = 0; j < GLA_TILE_EPT; j++) {
+            int e = tid + j * GLA_TILE_THREADS;
+            if (e < hh) S[j] = Ckpt[ck + e];
+        }
+        for (int t = t0; t < t1; t++) {
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            __syncthreads();
+            if (tid < headDim) { ks[tid] = K[baseOff + tid]; vs[tid] = V[baseOff + tid]; }
+            __syncthreads();
+            float g = G[(b * seqLen + t) * numHeads + h];
+            long sc = (bh * chunk + (t - t0)) * hh;
+            GLA_TILE_FOR(
+                S[j] = g * S[j] + vs[d_] * ks[k_];
+                Scratch[sc + e] = S[j];
+            )
+        }
+        for (int t = t1 - 1; t >= t0; t--) {
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gOff = (b * seqLen + t) * numHeads + h;
+            __syncthreads();
+            if (tid < headDim) {
+                qs[tid] = Q[baseOff + tid]; ks[tid] = K[baseOff + tid];
+                vs[tid] = V[baseOff + tid]; dos[tid] = dOut[baseOff + tid];
+            }
+            __syncthreads();
+            float g = G[gOff];
+            long sp = (t > t0) ? (bh * chunk + (t - 1 - t0)) * hh : ck;
+            const float* prev = (t > t0) ? Scratch : Ckpt;
+
+            // dQ[ki] = sum_di dOut[di] S_t[di][ki], then dS += dOut q^T. S holds S_t: after the recompute it is S_{t1-1},
+            // and each position below leaves S_{t-1} in it for the next (earlier) one, so Scratch is read once per state.
+            GLA_TILE_FOR(
+                tile[d_ * stride + k_] = dos[d_] * S[j];
+                dS[j] += dos[d_] * qs[k_];
+            )
+            __syncthreads();
+            GLA_TILE_SUM(1, dQ[baseOff + tid])
+
+            // dK[ki] = sum_di dS[di][ki] v[di];  dG = sum dS . S_{t-1}.
+            float pg = 0.0f;
+            GLA_TILE_FOR(
+                float sPrev = prev[sp + e];
+                pg += dS[j] * sPrev;
+                S[j] = sPrev;
+                tile[d_ * stride + k_] = dS[j] * vs[d_];
+            )
+            for (int off = 16; off > 0; off >>= 1) pg += __shfl_down_sync(0xffffffffu, pg, off);
+            if ((tid & 31) == 0) warpPart[tid >> 5] = pg;
+            __syncthreads();
+            if (tid == 0) {
+                float acc = 0.0f;
+                for (int w = 0; w < GLA_TILE_THREADS / 32; w++) acc += warpPart[w];
+                dG[gOff] = acc;
+            }
+            GLA_TILE_SUM(1, dK[baseOff + tid])
+
+            // dV[di] = sum_ki dS[di][ki] k[ki]; then carry dS back through the gate.
+            GLA_TILE_FOR(
+                tile[d_ * stride + k_] = dS[j] * ks[k_];
+                dS[j] *= g;
+            )
+            __syncthreads();
+            GLA_TILE_SUM(0, dV[baseOff + tid])
         }
     }
 }
@@ -482,6 +615,7 @@ extern ""C"" __global__ void minmax_reduce_int32(
         {
             "gla_scan_forward",
             "gla_scan_backward_ckpt",
+            "gla_scan_backward_tiled",
             "causal_dwconv1d_forward",
             "causal_dwconv1d_backward_input",
             "causal_dwconv1d_backward_kernel",
