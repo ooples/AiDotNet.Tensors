@@ -20412,7 +20412,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // allocating an activation-sized GC array and then copying it through TensorAllocator.Rent.
         // Keep traced/taped/custom-engine calls on their established recording and dispatch path.
         if (TensorArena.Current is not null && Autodiff.NoGradScope<T>.IsSuppressed
-            && !GraphMode.IsActive && !GraphCaptureCompatibility.IsActive
+            && !GraphMode.IsActive
             && this.Unwrap().GetType() == typeof(CpuEngine) && ReferenceEquals(this, this.Unwrap())
             && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
         {
