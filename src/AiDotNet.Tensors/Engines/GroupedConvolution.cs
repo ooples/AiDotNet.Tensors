@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using TensorLayout = AiDotNet.Tensors.LinearAlgebra.TensorLayout;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -15,9 +16,9 @@ internal static class GroupedConvolution
         if (Environment.GetEnvironmentVariable("AIDOTNET_GROUPED_CONV2D") == "0") return null;
         var unwrapped = engine.Unwrap();
         if (!ReferenceEquals(engine, unwrapped)) return null;
-        if (unwrapped is DirectGpuTensorEngine && Gpu.AutocastScope.IsEnabled) return null;
+        if (engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine) && Gpu.AutocastScope.IsEnabled) return null;
         return engine.Unwrap().GetType() == typeof(CpuEngine) || engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
-            ? (CpuEngine)unwrapped : null;
+            ? engine.Cast<CpuEngine>() : null;
     }
 
     internal static GroupedConv2DGeometry Validate<T>(Tensor<T> input, Tensor<T> kernel,

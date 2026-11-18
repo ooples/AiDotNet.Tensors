@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using TensorLayout = AiDotNet.Tensors.LinearAlgebra.TensorLayout;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -150,7 +151,9 @@ public partial class CpuEngine
     private static Tensor<T> GroupedReadSource<T>(Tensor<T> source, Tensor<T>? firstWrite, Tensor<T>? secondWrite,
         List<Tensor<T>> owned)
     {
-        source.EnsureMaterialized();
+        // This internal read accessor materializes deferred storage and synchronizes an existing
+        // CPU backing array without exposing a writable/escaped alias or recording another op.
+        _ = source.GetCpuBackingForStridedRead(out _);
         if (!source.IsContiguous)
         {
             var contiguous = source.Contiguous();
