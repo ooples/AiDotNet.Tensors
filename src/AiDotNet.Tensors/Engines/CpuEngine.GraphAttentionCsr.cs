@@ -83,11 +83,20 @@ public partial class CpuEngine
         double slope = (double)savedState[1];
         double rate = (double)savedState[2];
         var state = (GraphAttentionDropoutState)savedState[3];
+        if (BackwardFunctions<T>.CreatesGraph
+            && GraphAttentionCsrCreateGraph(gradOutput, inputs, engine, grads, graph, slope, rate, state.Seed))
+            return;
         var cpu = engine.As<CpuEngine>() ?? new CpuEngine();
         var (gWh, gAttn) = cpu.GraphAttentionCsrBackward(gradOutput, inputs[0], inputs[1], graph, slope, rate, state.Seed);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gWh, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gAttn, engine);
     }
+
+    // The fused kernels are first order: a create-graph backward differentiates the recorded composite instead.
+    private static bool GraphAttentionCsrCreateGraph<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads, CsrGraph graph, double slope, double rate, uint seed)
+        => BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
+            e => BackwardFunctions<T>.GraphAttentionCsrRecorded(e, inputs[0], inputs[1], graph, slope, rate, seed));
 
     /// <summary>The device-independent dropout draw both the CPU and the GPU kernels use: keep when u &gt;= rate.</summary>
     internal static float GraphAttentionUniform(uint seed, uint index)
