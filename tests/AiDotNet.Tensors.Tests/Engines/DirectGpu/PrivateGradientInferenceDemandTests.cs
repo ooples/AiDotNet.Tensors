@@ -108,11 +108,13 @@ public sealed class PrivateGradientInferenceDemandTests
         using var gpu = CreateGpu();
         var previous = AiDotNetEngine.Current;
         bool? priorInputGradients = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
+        bool priorTraceEscapes = ResultBufferTracker.TraceEscapes;
         string? priorPolicy = Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_PRIVATE_GRADIENT_RETURN");
         try
         {
             CompiledTrainingPlan<float>.CompiledInputGradientsForTests = inputGradients;
             var baseline = Trajectory(gpu, false, inputGradients, forceFallback, out long baselineReleased, out _);
+            if (inputGradients) ResultBufferTracker.TraceEscapes = true;
             var retired = Trajectory(gpu, true, inputGradients, forceFallback, out long released, out string evidence);
             Assert.Equal(0, baselineReleased);
             Assert.True(released > 0, "The fixture must actually retire private accumulator native buffers.\n" + evidence);
@@ -125,6 +127,7 @@ public sealed class PrivateGradientInferenceDemandTests
         {
             Environment.SetEnvironmentVariable("AIDOTNET_INFERENCE_PRIVATE_GRADIENT_RETURN", priorPolicy);
             CompiledTrainingPlan<float>.CompiledInputGradientsForTests = priorInputGradients;
+            ResultBufferTracker.TraceEscapes = priorTraceEscapes;
             AiDotNetEngine.Current = previous;
         }
     }
@@ -170,6 +173,7 @@ public sealed class PrivateGradientInferenceDemandTests
     private static string DescribeRetirementEligibility(CompiledTrainingPlan<float> plan, int iteration)
     {
         var facts = new List<string> { "iteration=" + iteration };
+        facts.Add("firstEscapeSites=" + string.Join(",", ResultBufferTracker.TopEscapeSites(12).Select(site => site.Key + ":" + site.Value)));
         foreach (string name in new[] { "_privateGradientCompletedStep", "_privateGradientRegistered", "_residentBodyRanLast", "_residentStepFailed", "_graphStepEligible", "_workspaceExplicitGraphDisable", "_graphStepDisabled", "_graphPreparationStarted" })
             facts.Add(name + "=" + Field(plan, name));
         var tensors = Assert.IsType<HashSet<Tensor<float>>>(Field(plan, "_workspaceTensors"));
