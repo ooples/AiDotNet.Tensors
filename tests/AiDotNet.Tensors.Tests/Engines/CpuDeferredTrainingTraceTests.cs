@@ -6,7 +6,7 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
-[Collection("BlasManaged-Perf-Serial")]
+[Collection("CompilationGlobalState")]
 public class CpuDeferredTrainingTraceTests
 {
     [Theory]
@@ -22,7 +22,6 @@ public class CpuDeferredTrainingTraceTests
             var cpu = new CpuEngine();
             AiDotNetEngine.Current = cpu;
             using var parameter = new Tensor<float>(new[] { 1f, 2f, -3f }, new[] { 1, 3 });
-            parameter.RequiresGrad = true;
             using var coefficients = new Tensor<float>(new[] { .5f, -1f, 2f }, new[] { 3, 1 });
             using var scope = GraphMode.EnableTraining(new[] { parameter });
             var scaled = cpu.TensorMultiplyScalar(parameter, 2f);
