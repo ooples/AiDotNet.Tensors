@@ -256,7 +256,7 @@ internal static class ResultBufferTracker
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static ResultBufferOwner? Find<T>(ReadOnlyMemory<T> memory)
     {
-        if (Volatile.Read(ref s_count) == 0) return null;
+        if (!s_privateOwnershipSeen && Volatile.Read(ref s_count) == 0) return null;
         return MemoryMarshal.TryGetArray(memory, out var segment) && segment.Array is { } array ? Find(array) : null;
     }
 
