@@ -1,11 +1,13 @@
 using System;
 using System.Linq;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
 using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -13,6 +15,20 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public sealed class ChannelBiasLeakyBackendParityTests
 {
+    [Fact]
+    public void Closing_engine_does_not_borrow_a_backend_or_launch()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        engine.StrictGpuLeases = true;
+        engine.Dispose();
+        using var input = new Tensor<float>(new[] { 1, 2, 1, 3 });
+        using var bias = new Tensor<float>(new[] { 2 });
+        long before = GpuLaunchProbe.Count;
+        Assert.False(engine.TryChannelBiasLeakyInference(input, bias, .1f, out var output));
+        Assert.Null(output);
+        Assert.Equal(before, GpuLaunchProbe.Count);
+    }
+
     private static void Verify(IDirectGpuBackend backend)
     {
         const int batch = 2, channels = 3, spatial = 259, count = batch * channels * spatial;
