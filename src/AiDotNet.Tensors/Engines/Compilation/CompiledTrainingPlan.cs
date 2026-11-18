@@ -14397,6 +14397,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return reducedBackward;
         }
 
+        var leakyBackward = BuildCpuLeakyReluBackward(step, gradMap, gradWriterCount ?? consumerCount, engine, requiresGrad);
+        if (leakyBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return leakyBackward;
+        }
+
 
         // Every unary specialization below WRITES its input's gradient (CopyTo, or Array.Clear then fill) rather
         // than accumulating into it. That is only correct when this step is the input's sole consumer. With more
