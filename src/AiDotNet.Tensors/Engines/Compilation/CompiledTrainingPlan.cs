@@ -5286,6 +5286,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var producers = new Dictionary<Tensor<T>, int>(comparer);
         var unsafeTensors = new HashSet<Tensor<T>>(parameters, comparer) { lossOutput };
         unsafeTensors.UnionWith(retainedOutputs);
+        // Pure normalizations may intentionally share their complete storage. A per-tensor forward release cannot
+        // prove the union of their lifetimes, so keep these roots until the storage-aware backward lender handles it.
+        var producedStorage = new Dictionary<object, Tensor<T>>(ReferenceEqualityComparer<object>.Instance);
+        foreach (var step in forwardSteps)
+        {
+            if (step.OpType != OpType.TensorWeightNorm) continue;
+            if (producedStorage.TryGetValue(step.OutputBuffer.StorageIdentity, out var sibling)
+                && !ReferenceEquals(sibling, step.OutputBuffer))
+            {
+                unsafeTensors.Add(sibling);
+                unsafeTensors.Add(step.OutputBuffer);
+            }
+            else producedStorage[step.OutputBuffer.StorageIdentity] = step.OutputBuffer;
+        }
         for (int i = 0; i < n; i++)
         {
             var step = forwardSteps[i];
@@ -10359,6 +10373,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (retainedOutputs.Count > 0 && fp16HeteroOrder is not null)
             throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
 
+        if (dataReplay is null && fp16HeteroOrder is null && forwardSteps.Count > 0)
+            ShareWeightNormForwardStorage(forwardSteps, parameters,
+                explicitLoss ?? recordedLastOutput ?? forwardSteps[forwardSteps.Count - 1].OutputBuffer,
+                retainedOutputs, engine, scope);
 
         // Map each tensor to its consumer count (how many backward steps write to it)
         var consumerCount = new Dictionary<Tensor<T>, int>();
