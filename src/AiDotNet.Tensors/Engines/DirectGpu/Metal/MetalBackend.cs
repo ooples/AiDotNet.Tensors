@@ -544,6 +544,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         }
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, data.Length);
+
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Metal);
 
         return MetalGpuBuffer.Create(_device, data);
@@ -567,6 +569,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         }
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("Metal", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
 
         return MetalGpuBuffer.Create(_device, size, zeroInitialize);
     }

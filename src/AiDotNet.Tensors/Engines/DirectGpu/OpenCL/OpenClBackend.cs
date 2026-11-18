@@ -1577,6 +1577,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
+            InferenceWorkspaceDemandScope.BeforeAllocation(this, data.Length);
+
             DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
@@ -1610,6 +1612,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     static state => state.Item1.AllocateBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
             DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
