@@ -145,6 +145,11 @@ internal sealed class LazyTensorScope : IDisposable
     internal static bool DeferGpuTrainingOutputs { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_GPU_DEFER_TRACE_OUTPUTS") != "0";
 
+    // CPU tracing can postpone primal allocation until a value is actually used.
+    // Kept opt-in while the complete training and lifetime controls are evaluated.
+    internal static bool DeferCpuTrainingOutputs { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_CPU_DEFER_TRACE_OUTPUTS") == "1";
+
     /// <summary>Number of lazy operations recorded.</summary>
     internal int NodeCount => _nodes.Count;
 
@@ -169,7 +174,10 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     private Tensor<TOut> RentOutput<TOut>(int[] outputShape)
         => _isProbe ? Tensor<TOut>.CreateDeferred(outputShape)
-            : DeferGpuTrainingOutputs && _traceKind == GraphTraceKind.Training && _engine.Is<DirectGpuTensorEngine>()
+            : _traceKind == GraphTraceKind.Training
+                && ((DeferGpuTrainingOutputs && _engine.Is<DirectGpuTensorEngine>())
+                    || (DeferCpuTrainingOutputs && _engine.Is<CpuEngine>()
+                        && ReferenceEquals(_engine, _engine.Unwrap())))
                 ? Tensor<TOut>.CreateHostDeferred(outputShape)
                 : TensorAllocator.RentUninitialized<TOut>(outputShape);
 
