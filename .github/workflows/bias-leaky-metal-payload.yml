@@ -1,0 +1,29 @@
+name: Exact channel bias Leaky RFFT and WeightNorm Metal payload compiler
+
+on:
+  push:
+    branches: [ validation/bias-leaky-metal-7f9cf37d ]
+
+permissions:
+  contents: read
+
+jobs:
+  compile-exact-payloads:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - name: Compile the two complete hash-bound production libraries
+        env:
+          METAL_VALIDATION_OUTPUT: metal-payload-results
+        run: python3 validation/bias-leaky-metal/compile_payloads.py
+      - name: Preserve compiler evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bias-leaky-metal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: metal-payload-results/**
+          if-no-files-found: error
+          retention-days: 30

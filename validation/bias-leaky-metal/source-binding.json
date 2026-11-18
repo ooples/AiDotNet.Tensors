@@ -1,0 +1,25 @@
+{
+  "schema": "bias-leaky-metal-source-binding-v1",
+  "source_commit": "7f9cf37da1a1428172e31c9c2f0144fcabb59ee6",
+  "source_archive_pathspec": "src/AiDotNet.Tensors/Engines/DirectGpu",
+  "source_archive_sha256": "9eabaf206b75c919d2723c7336a0a7c814ab15f9844a102f07df326c717a2778",
+  "payload_manifest_sha256": "65695ac85ca343d5d410581f6a095229cdfa49d5c0ef9d45412818e72f7963df",
+  "assemblies_sha256": {
+    "AiDotNet.Evolution.dll": "e88331586027426352fc8e1f13efa5eb69d645c10e311c5e11fb4a5d6d4bc8e3",
+    "AiDotNet.Tensors.dll": "203dab5f869ef964b2339e849da59e911263b18410f7910416e634c1f997f388"
+  },
+  "payloads": {
+    "batch.metal": {
+      "sha256": "03bc17fc080d7ae9383c13e67ff5c7175625e73777706332c2d9c1f8832d76f0",
+      "bytes": 95158,
+      "strict": true
+    },
+    "convt.metal": {
+      "sha256": "d7f05f4bb1091656e5da660ced9bd44be8683e816b9f51f1b676c831dc2dd0d0",
+      "bytes": 1928,
+      "strict": false
+    }
+  },
+  "origin": "C:\\Users\\FranklinMoormann\\source\\repos\\perf2561\\finish-bias-leaky-7f9-compilers-attempt1",
+  "claim": "Apple compiler proof of the complete actual production Metal libraries, including channel bias then LeakyReLU, WeightNorm and all three RFFT kernels. No runtime or performance claim."
+}
