@@ -125,6 +125,17 @@ jobs:
           --logger 'trx;LogFileName=flashattention-signature.trx'
           --results-directory artifacts/coordination/TestResults
 
+      - name: Verify NanToNum numeric and replay regressions (mandatory CPU)
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj
+          --configuration Release --framework net10.0 --no-build --no-restore
+          -p:GeneratePackageOnBuild=false -p:UseSharedCompilation=false -m:2
+          -p:ContinuousIntegrationBuild=true -p:PackageVersion="$PACKAGE_VERSION"
+          --filter 'FullyQualifiedName~AiDotNet.Tensors.Tests.Engines.Compilation.NanToNumReplayTests&Category!=GPU'
+          --logger 'trx;LogFileName=nantonum-signature.trx'
+          --results-directory artifacts/coordination/TestResults
+
+
 
       - name: Verify package contents and write provenance
         shell: python
@@ -337,9 +348,29 @@ jobs:
           assert not prior_cpu_names.intersection(flash_names), 'Overlapping FlashAttention CPU identities'
           all_cpu_names = prior_cpu_names | set(flash_names)
 
+          # Separate cohort: 16 actual local passing identities, with dtype/default/view/replay coverage.
+          assert len(all_cpu_names) == 319, 'Prior mandatory CPU identity union changed'
+          nan_trx = root / 'TestResults/nantonum-signature.trx'
+          nan_results = ET.parse(nan_trx).getroot()
+          nan_counters = nan_results.find('.//{*}Counters').attrib
+          assert nan_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', nan_counters
+          for key, value in nan_counters.items():
+              assert int(value) == (16 if key in ('total', 'executed', 'passed') else 0), nan_counters
+          assert all(key in nan_counters for key in ('total', 'executed', 'passed', 'failed', 'notExecuted')), nan_counters
+          nan_rows = nan_results.findall('.//{*}UnitTestResult')
+          nan_names = [row.attrib['testName'] for row in nan_rows]
+          assert len(nan_names) == len(set(nan_names)) == 16, 'Duplicate or missing NanToNum CPU identities'
+          assert all(row.attrib['outcome'] == 'Passed' for row in nan_rows), 'A mandatory NanToNum case failed or skipped'
+          nan_identity_sha256 = hashlib.sha256('\n'.join(sorted(nan_names)).encode('utf-8')).hexdigest()
+          assert nan_identity_sha256 == 'a06efe7174351d1f18d53539e20b564f2ae4fa76aa4e7db42360fd42a9fb77aa'
+          assert not all_cpu_names.intersection(nan_names), 'Overlapping NanToNum CPU identities'
+          all_cpu_names.update(nan_names)
+          assert len(all_cpu_names) == 335, 'Mandatory CPU identity union changed'
+
+
 
           checksums = {}
-          for path in [package, trx, retention_trx, enrollment_trx, replay_trx, flash_trx]:
+          for path in [package, trx, retention_trx, enrollment_trx, replay_trx, flash_trx, nan_trx]:
               checksums[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
           manifest = {
               'repository': os.environ['GITHUB_REPOSITORY'],
@@ -358,6 +389,9 @@ jobs:
               'normalizationSearchTestCases': sorted(replay_names),
               'flashAttentionTestCounters': flash_counters,
               'flashAttentionTestCases': sorted(flash_names),
+              'nanToNumTestCounters': nan_counters,
+              'nanToNumTestCases': sorted(nan_names),
+              'nanToNumTestCasesSha256': nan_identity_sha256,
               'mandatoryCpuTestCount': len(all_cpu_names),
               'separateGpuCoverage': 'CompiledRetainedOutputTests CUDA whole-step capture is not part of the mandatory CPU gate.',
               'sha256': checksums,

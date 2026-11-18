@@ -551,7 +551,8 @@ jobs:
             expected_groups = {'testCounters': 100, 'retainedOutputTestCounters': 46,
                 'heterogeneousReplayTestCounters': 15, 'noGradTestCounters': 9,
                 'optimizerEnrollmentTestCounters': 43, 'enrollmentCheckpointTestCounters': 45,
-                'normalizationSearchTestCounters': 20, 'flashAttentionTestCounters': 41}
+                'normalizationSearchTestCounters': 20, 'flashAttentionTestCounters': 41,
+                'nanToNumTestCounters': 16}
             assert all(n > 0 for n in expected_groups.values()), 'Invalid reviewed CPU group count'
             for key, expected in expected_groups.items():
                 counters = manifest[key]
@@ -633,7 +634,20 @@ jobs:
             prior_cpu_names = set(canonical_signature_names) | replay_names | retained | union
             assert len(prior_cpu_names) == 278, 'Prior mandatory CPU identity union changed'
             assert not prior_cpu_names.intersection(flash_names), 'Overlapping FlashAttention CPU identities'
-            assert manifest['mandatoryCpuTestCount'] == len(prior_cpu_names | flash_names)
+            previous_cpu_names = prior_cpu_names | flash_names
+            assert len(previous_cpu_names) == 319, 'Prior mandatory CPU identity union changed'
+            nan_names = passed_results('TestResults/nantonum-signature.trx', 16)
+            nan_results = ET.fromstring(archive.read('TestResults/nantonum-signature.trx'))
+            nan_counters = nan_results.find('.//{*}Counters').attrib
+            assert nan_results.find('.//{*}ResultSummary').attrib['outcome'] == 'Completed', nan_counters
+            assert all(key in nan_counters for key in ('total', 'executed', 'passed', 'failed', 'notExecuted')), nan_counters
+            for key, value in nan_counters.items():
+                assert int(value) == (16 if key in ('total', 'executed', 'passed') else 0), nan_counters
+            assert nan_names == set(manifest['nanToNumTestCases'])
+            nan_identity_sha256 = hashlib.sha256('\n'.join(sorted(nan_names)).encode('utf-8')).hexdigest()
+            assert nan_identity_sha256 == manifest['nanToNumTestCasesSha256'] == 'a06efe7174351d1f18d53539e20b564f2ae4fa76aa4e7db42360fd42a9fb77aa'
+            assert not previous_cpu_names.intersection(nan_names), 'Overlapping NanToNum CPU identities'
+            assert manifest['mandatoryCpuTestCount'] == len(previous_cpu_names | nan_names) == 335
 
             assert len(packages) == 1
             package_bytes = archive.read(packages[0])
