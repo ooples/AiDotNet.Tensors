@@ -41,12 +41,15 @@ public partial class CpuEngine
         {
             for (int rowFrom = 0; rowFrom < outChannels; rowFrom += rows)
             {
-                int rowCount = Math.Min(rows, outChannels - rowFrom), packedRow = 0;
-                for (int block = 0; block < inChannels; block += channelBlock)
-                    for (int tap = 0; tap < kernelWidth; tap++)
-                        for (int channel = block; channel < Math.Min(inChannels, block + channelBlock); channel++, packedRow++)
-                            for (int oc = 0; oc < rowCount; oc++)
+                int rowCount = Math.Min(rows, outChannels - rowFrom);
+                for (int oc = 0; oc < rowCount; oc++)
+                {
+                    int packedRow = 0;
+                    for (int block = 0; block < inChannels; block += channelBlock)
+                        for (int tap = 0; tap < kernelWidth; tap++)
+                            for (int channel = block; channel < Math.Min(inChannels, block + channelBlock); channel++, packedRow++)
                                 packedKernel[oc * reduction + packedRow] = kernel[kernelOffset + ((rowFrom + oc) * inChannels + channel) * kernelWidth + tap];
+                }
                 int currentRowFrom = rowFrom;
                 CpuParallelSettings.ParallelForOrSerial(0, workers, (long)rowCount * reduction * totalColumns, worker =>
                 {
@@ -69,21 +72,20 @@ public partial class CpuEngine
                             for (int block = 0; block < inChannels; block += channelBlock)
                                 for (int tap = 0; tap < kernelWidth; tap++)
                                     for (int channel = block; channel < Math.Min(inChannels, block + channelBlock); channel++, row++)
-                                        for (int column = 0; column < count; column++)
-                                        {
-                                            int flat = from + column, image = flat / outputWidth;
-                                            int location = (flat % outputWidth) * stride - padding + tap * dilation;
-                                            panel[row * count + column] = (uint)location < (uint)width
-                                                ? input[inputOffset + (image * inChannels + channel) * width + location] : 0f;
-                                        }
+                                        FillConv1DChannelBlockRow(input, inputOffset, panel.AsSpan(row * count, count),
+                                            from, outputWidth, inChannels, channel, width, tap, stride, padding, dilation);
                             BlasManaged.BlasManaged.Gemm<float>(packedKernel.AsSpan(0, rowCount * reduction), reduction, false,
                                 panel.AsSpan(0, reduction * count), count, false, product.AsSpan(0, rowCount * count), count,
                                 rowCount, count, reduction, options);
                             for (int oc = 0; oc < rowCount; oc++)
-                                for (int column = 0; column < count; column++)
+                                for (int column = 0; column < count;)
                                 {
-                                    int flat = from + column, image = flat / outputWidth, time = flat % outputWidth;
-                                    output[outputOffset + (image * outChannels + currentRowFrom + oc) * outputWidth + time] = product[oc * count + column];
+                                    int flat = from + column, image = flat / outputWidth;
+                                    int time = flat - image * outputWidth;
+                                    int take = Math.Min(count - column, outputWidth - time);
+                                    product.AsSpan(oc * count + column, take).CopyTo(output.AsSpan(
+                                        outputOffset + (image * outChannels + currentRowFrom + oc) * outputWidth + time, take));
+                                    column += take;
                                 }
                         }
                     }
@@ -100,5 +102,40 @@ public partial class CpuEngine
             return true;
         }
         finally { ArrayPool<float>.Shared.Return(packedKernel); }
+    }
+
+    // Each batch segment has a single contiguous valid interval. Divide only at batch/padding
+    // boundaries; the stride-one body copies the input plane without per-element index arithmetic.
+    private static void FillConv1DChannelBlockRow(float[] input, int inputOffset, Span<float> destination,
+        int from, int outputWidth, int inChannels, int channel, int width, int tap, int stride, int padding, int dilation)
+    {
+        for (int column = 0; column < destination.Length;)
+        {
+            int flat = from + column, image = flat / outputWidth;
+            int time = flat - image * outputWidth;
+            int take = Math.Min(destination.Length - column, outputWidth - time);
+            long first = (long)time * stride - padding + (long)tap * dilation;
+            int left = BoundConv1DCeiling(-first, stride, take);
+            int right = Math.Max(left, BoundConv1DCeiling(width - first, stride, take));
+            destination.Slice(column, left).Clear();
+            destination.Slice(column + right, take - right).Clear();
+            if (right > left)
+            {
+                int source = inputOffset + (image * inChannels + channel) * width + (int)(first + (long)left * stride);
+                var valid = destination.Slice(column + left, right - left);
+                if (stride == 1) input.AsSpan(source, valid.Length).CopyTo(valid);
+                else
+                    for (int index = 0; index < valid.Length; index++, source += stride)
+                        valid[index] = input[source];
+            }
+            column += take;
+        }
+    }
+
+    private static int BoundConv1DCeiling(long numerator, int denominator, int upper)
+    {
+        if (numerator <= 0) return 0;
+        long quotient = (numerator + denominator - 1) / denominator;
+        return quotient >= upper ? upper : (int)quotient;
     }
 }

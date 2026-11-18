@@ -13,6 +13,8 @@ public sealed class Conv1DChannelBlockTests
     [InlineData(7, 17, 37, 19, 5, 3, 2, 2)]
     [InlineData(2, 32, 277, 13, 3, 1, 1, 1)]
     [InlineData(7, 1024, 13, 257, 5, 1, 2, 1)]
+    [InlineData(3, 17, 3, 5, 9, 2, 17, 2)]
+    [InlineData(5, 19, 67, 23, 3, 2, 4, 3)]
     public void Panels_match_independent_double_convolution_with_channel_tail_batch_and_row_tiles(
         int batch, int channels, int time, int outputs, int taps, int stride, int padding, int dilation)
     {
