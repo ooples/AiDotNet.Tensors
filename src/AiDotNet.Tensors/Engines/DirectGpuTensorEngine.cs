@@ -6150,6 +6150,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         output.RelinquishOwnership();
     }
 
+    /// <summary>
+    /// Whether <paramref name="destination"/> is deferred host storage whose current value is its own device buffer on
+    /// <paramref name="backend"/> (bound by <see cref="BindDeferredHostResult"/> on an earlier run, never read back).
+    /// </summary>
+    private static bool IsBoundDeferredHostDestination<T>(Tensor<T> destination, int elementCount, IDirectGpuBackend backend)
+        => typeof(T) == typeof(float) && destination.HasDeferredHostStorage && !destination.IsSparse
+            && destination.IsContiguous && destination._storageOffset == 0 && destination.Length == elementCount
+            && destination._gpuBuffer is { } buffer && destination._ownsGpuBuffer
+            && ReferenceEquals(destination._gpuBackend, backend) && buffer.Size >= elementCount && IsLiveDeviceBuffer(buffer);
+
+    /// <summary>Marks a bound deferred destination (<see cref="IsBoundDeferredHostDestination"/>) rewritten on the device.</summary>
+    private static void RebindDeferredHostResult<T>(IDirectGpuBackend backend, Tensor<T> destination)
+    {
+        destination.IncrementVersion();
+        destination._gpuBufferVersion = destination.GpuCacheVersion;
+        RegisterHostDownload<T>(destination.DataVector, backend, destination._gpuBuffer!);
+    }
+
     private static bool TryGetSimpleCpuDestinationArray<T>(Tensor<T> destination, int elementCount, out T[] destinationArray)
     {
         destinationArray = null!;
@@ -7538,15 +7556,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         bool deferredDestination = IsUnboundDeferredHostDestination(destination, left.Length);
+        // A deferred destination an earlier run already bound to its own device buffer (a compiled step's node output
+        // whose host copy was never read) is written in place: a host array would be a download, which a step being
+        // captured as a CUDA graph cannot do, and the CPU fallback would read the inputs back the same way.
+        bool boundDeferredDestination = !deferredDestination && IsBoundDeferredHostDestination(destination, left.Length, backend);
         T[] destinationArray = null!;
-        if (!deferredDestination && !TryGetSimpleCpuDestinationArray(destination, left.Length, out destinationArray))
+        if (!deferredDestination && !boundDeferredDestination
+            && !TryGetSimpleCpuDestinationArray(destination, left.Length, out destinationArray))
             return false;
 
         try
         {
             using var bufferA = GetOrAllocateContiguousInputBuffer(backend, left);
             using var bufferB = GetOrAllocateContiguousInputBuffer(backend, right);
-            var output = AllocateOutputBuffer(backend, left.Length);
+            var output = boundDeferredDestination
+                ? new OwnedBuffer(destination._gpuBuffer!, ownsBuffer: false)
+                : AllocateOutputBuffer(backend, left.Length);
             try
             {
                 if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
@@ -7565,6 +7590,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
 
                 if (deferredDestination) BindDeferredHostResult(backend, output, destination);
+                else if (boundDeferredDestination) RebindDeferredHostResult(backend, destination);
                 else DownloadGpuBufferInto(backend, output, destination, destinationArray, left.Length);
                 Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
                 return true;
