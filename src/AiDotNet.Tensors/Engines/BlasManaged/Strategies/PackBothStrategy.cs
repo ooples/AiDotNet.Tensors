@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// in Phase G.
 /// </para>
 /// </summary>
-internal static class PackBothStrategy
+internal static partial class PackBothStrategy
 {
     // #653 diagnostic gate (env AIDOTNET_GEMM_TRACE=1): trace the chosen parallel path.
     private static readonly bool s_trace =
@@ -1092,7 +1092,7 @@ internal static class PackBothStrategy
     /// ic blocks own disjoint C rows so there is no cross-thread write contention.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void RunParallelSingleRegionUnsafe<T>(
+    internal static unsafe void RunParallelSingleRegionJoinedUnsafe<T>(
         T* aPtr, int aLen, int lda,
         T* bPtr, int bLen, int ldb,
         T* cPtr, int cLen, int ldc,

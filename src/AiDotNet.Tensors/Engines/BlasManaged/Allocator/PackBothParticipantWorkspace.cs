@@ -68,6 +68,40 @@ internal sealed class PackBothParticipantWorkspace : IDisposable
     // Opt-in diagnostics for focused allocation/rounding proofs, separate from storage-request counters.
     // These report this operator's successfully recorded participant leases, not process backing acquisitions.
     internal static bool DiagnosticsEnabled;
+
+    // A synchronous serial region needs the same joined lease lifetime without
+    // allocating a participant object. Its diagnostics retain the owner/rent contract.
+    internal ref struct SerialLease
+    {
+        private byte[]? _buffer;
+        private readonly int _requested;
+        private readonly bool _tracked, _ownerTracked;
+
+        internal SerialLease(int bytes, string tag)
+        {
+            _buffer = ArrayPool<byte>.Shared.Rent(bytes);
+            _requested = bytes;
+            _ownerTracked = DiagnosticsEnabled;
+            if (_ownerTracked) lock (DiagnosticGate) s_ownersCreated++;
+            _tracked = RecordRent(bytes, _buffer.Length);
+            CpuStorageAllocationDiagnostics.Record<byte>(tag, bytes);
+        }
+
+        internal Span<byte> Span => _buffer.AsSpan(0, _requested);
+
+        public void Dispose()
+        {
+            var buffer = _buffer;
+            if (buffer is null) return;
+            _buffer = null;
+            try { ArrayPool<byte>.Shared.Return(buffer); }
+            finally
+            {
+                if (_tracked) RecordReturn(_requested, buffer.Length);
+                if (_ownerTracked) lock (DiagnosticGate) s_ownersDisposed++;
+            }
+        }
+    }
     private static readonly object DiagnosticGate = new();
     private static long s_rents, s_returns, s_requested, s_lentBacking, s_liveRequested, s_liveBacking;
     private static long s_peakRequested, s_peakBacking;
