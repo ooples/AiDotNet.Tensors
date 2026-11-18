@@ -145,11 +145,11 @@ public partial class CpuEngine
     /// </remarks>
     private static float CascadeChannelSum(ReadOnlySpan<float> values)
     {
-        int width = Vector<float>.Count, vectors = values.Length / width, groups = vectors / 4;
+        int width = System.Numerics.Vector<float>.Count, vectors = values.Length / width, groups = vectors / 4;
         int log = 0;
         for (int remaining = Math.Max(0, groups - 1); remaining != 0; remaining >>= 1) log++;
         int power = Math.Max(4, log / 4), step = 1 << power, mask = step - 1;
-        Span<Vector<float>> accumulators = stackalloc Vector<float>[16];
+        Span<System.Numerics.Vector<float>> accumulators = stackalloc System.Numerics.Vector<float>[16];
         accumulators.Clear();
         int index = 0;
         while (index + step <= groups)
@@ -157,24 +157,24 @@ public partial class CpuEngine
             int stop = index + step;
             for (; index < stop; index++)
                 for (int stream = 0; stream < 4; stream++)
-                    accumulators[stream] += new Vector<float>(values.Slice((index * 4 + stream) * width, width));
+                    accumulators[stream] += new System.Numerics.Vector<float>(values.Slice((index * 4 + stream) * width, width));
             for (int level = 1; level < 4; level++)
             {
                 for (int stream = 0; stream < 4; stream++)
                 {
                     accumulators[level * 4 + stream] += accumulators[(level - 1) * 4 + stream];
-                    accumulators[(level - 1) * 4 + stream] = Vector<float>.Zero;
+                    accumulators[(level - 1) * 4 + stream] = System.Numerics.Vector<float>.Zero;
                 }
                 if ((index & ((long)mask << (level * power))) != 0) break;
             }
         }
         for (; index < groups; index++)
             for (int stream = 0; stream < 4; stream++)
-                accumulators[stream] += new Vector<float>(values.Slice((index * 4 + stream) * width, width));
+                accumulators[stream] += new System.Numerics.Vector<float>(values.Slice((index * 4 + stream) * width, width));
         for (int level = 1; level < 4; level++)
             for (int stream = 0; stream < 4; stream++) accumulators[stream] += accumulators[level * 4 + stream];
         for (int vector = groups * 4; vector < vectors; vector++)
-            accumulators[0] += new Vector<float>(values.Slice(vector * width, width));
+            accumulators[0] += new System.Numerics.Vector<float>(values.Slice(vector * width, width));
         for (int stream = 1; stream < 4; stream++) accumulators[0] += accumulators[stream];
         float sum = 0f;
         for (int tail = vectors * width; tail < values.Length; tail++) sum += values[tail];
