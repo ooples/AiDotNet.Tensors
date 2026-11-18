@@ -29,7 +29,8 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
 {
     Type ICrossTypeNodeMetadata.InputElementType => typeof(TIn);
     Type ICrossTypeNodeMetadata.OutputElementType => typeof(TOut);
-    bool ICrossTypeNodeMetadata.HasBackward => BackwardFn is not null;
+    bool ICrossTypeNodeMetadata.HasBackward => BackwardFn is not null && !RecordedUnderNoGrad;
+    object? ICrossTypeNodeMetadata.DifferentiableInputTensor => BackwardFn is not null && !RecordedUnderNoGrad ? Input : null;
     Action<IEngine> ICompiledForwardNode.CompileForwardAction() => engine =>
     {
         DirectGpuTensorEngine.s_currentForwardOp = OpName;
@@ -37,8 +38,6 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
         ForwardOnlyHeterogeneousReplay.CommitOutput(Output, OpName);
         IsRealized = true;
     };
-
-    void ICompiledForwardNode.ProtectDeviceState(HashSet<object> keys) { }
 
     void ICompiledForwardNode.DetachDeviceBindings(HashSet<DirectGpu.IGpuBuffer> released, HashSet<IntPtr> handles, HashSet<object> retained)
     {

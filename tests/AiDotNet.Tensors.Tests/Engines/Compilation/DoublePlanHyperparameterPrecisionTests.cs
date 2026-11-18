@@ -199,16 +199,80 @@ public class DoublePlanHyperparameterPrecisionTests
     private const int VelocityFlagOffset = 4 + 4 + 1 + 4 + 1 + 4 + (4 * 8) + 4 + 4 + 4 + 8
         + (17 * 4) + 1 + 4 + 4 + 4 + 4 + 4 + 3 + (2 * 9);
 
-    /// <summary>Drops the velocity flag from a version 5 export and stamps <paramref name="version"/>.</summary>
+    /// <summary>
+    /// Transcodes a current (version 6) export into pre-velocity-flag version <paramref name="version"/> (4),
+    /// removing the v6 enrollment fields (fixed-domain marker, per-parameter accepted-update ages, L-BFGS presence byte)
+    /// and the v5 velocity flag.
+    /// </summary>
     private static byte[] WithoutVelocityFlag(byte[] current, int version)
     {
-        Assert.Equal(5, BitConverter.ToInt32(current, 4));
+        Assert.Equal(6, BitConverter.ToInt32(current, 4));
         Assert.True(current[VelocityFlagOffset] <= 1, "the byte at the velocity-flag offset is not a bool");
-        var legacy = new System.Collections.Generic.List<byte>(current);
-        legacy.RemoveAt(VelocityFlagOffset);
-        byte[] v = BitConverter.GetBytes(version);
-        for (int b = 0; b < 4; b++) legacy[4 + b] = v[b];
-        return legacy.ToArray();
+
+        using var input = new System.IO.MemoryStream(current, writable: false);
+        using var reader = new System.IO.BinaryReader(input);
+        using var output = new System.IO.MemoryStream(current.Length);
+        using var writer = new System.IO.BinaryWriter(output);
+
+        // Copy everything before VelocityFlagOffset, stamping the requested legacy version at offset 4.
+        byte[] prefix = reader.ReadBytes(VelocityFlagOffset);
+        BitConverter.GetBytes(version).CopyTo(prefix, 4);
+        writer.Write(prefix);
+
+        // Consume and drop the VelocityIncludesLearningRate byte.
+        _ = reader.ReadByte();
+
+        static void CopyLengthPrefixedSection(System.IO.BinaryReader src, System.IO.BinaryWriter dst, int elemBytes)
+        {
+            int len = src.ReadInt32();
+            dst.Write(len);
+            if (len > 0) dst.Write(src.ReadBytes(checked(len * elemBytes)));
+        }
+
+        // Copy LR schedules.
+        int scheduleCount = reader.ReadInt32();
+        writer.Write(scheduleCount);
+        for (int i = 0; i < scheduleCount; i++)
+        {
+            writer.Write(reader.ReadInt32()); // Kind
+            CopyLengthPrefixedSection(reader, writer, sizeof(double));
+            CopyLengthPrefixedSection(reader, writer, sizeof(int));
+        }
+
+        // Copy ParamToGroup, GroupOptimizerTypes, GroupWeightDecays, and Scalars (5 floats).
+        CopyLengthPrefixedSection(reader, writer, sizeof(int));
+        CopyLengthPrefixedSection(reader, writer, sizeof(int));
+        CopyLengthPrefixedSection(reader, writer, sizeof(double));
+        writer.Write(reader.ReadBytes(5 * sizeof(float)));
+
+        // Consume and drop v6 FixedActiveDomain (-1 for uncoupled optimizers).
+        Assert.Equal(-1, reader.ReadInt32());
+
+        // Copy parameter states while stripping each parameter's v6 AcceptedUpdates int64.
+        int paramCount = reader.ReadInt32();
+        writer.Write(paramCount);
+        for (int p = 0; p < paramCount; p++)
+        {
+            _ = reader.ReadInt64(); // AcceptedUpdates
+            CopyLengthPrefixedSection(reader, writer, sizeof(float));  // MFloat
+            CopyLengthPrefixedSection(reader, writer, sizeof(float));  // VFloat
+            CopyLengthPrefixedSection(reader, writer, sizeof(float));  // VMaxFloat
+            CopyLengthPrefixedSection(reader, writer, sizeof(double)); // MDouble
+            CopyLengthPrefixedSection(reader, writer, sizeof(double)); // VDouble
+            CopyLengthPrefixedSection(reader, writer, sizeof(double)); // VMaxDouble
+            CopyLengthPrefixedSection(reader, writer, sizeof(ushort)); // MBFloat16
+            CopyLengthPrefixedSection(reader, writer, sizeof(ushort)); // VBFloat16
+            CopyLengthPrefixedSection(reader, writer, 1);              // MQuantized
+            CopyLengthPrefixedSection(reader, writer, 1);              // VQuantized
+            CopyLengthPrefixedSection(reader, writer, sizeof(double)); // MScales
+            CopyLengthPrefixedSection(reader, writer, sizeof(double)); // VScales
+        }
+
+        // Consume and drop v6 L-BFGS history presence byte (0 for non-LBFGS).
+        Assert.Equal(0, reader.ReadByte());
+        Assert.Equal(current.Length, input.Position);
+        writer.Flush();
+        return output.ToArray();
     }
 
     /// <summary>

@@ -53,14 +53,14 @@ public sealed class NamedRetainedOutputTests : IDisposable
                 RetainedOutputCapture<double>.PublishEager(tape);
             }
             Assert.True(((IBackingArraySource)retained).TryGetBackingArray(out var backing));
-            Assert.NotNull(backing);
-            arena.ReturnIssued(new TensorArena.IssuedBuffer(backing!, -1, 0));
+            var nonNullBacking = Assert.IsAssignableFrom<Array>(backing);
+            arena.ReturnIssued(new TensorArena.IssuedBuffer(nonNullBacking, -1, 0));
             for (int step = 0; step < 3; step++)
             {
                 arena.Reset();
                 for (int rent = 0; rent < 3; rent++)
                 {
-                    var scratch = arena.TryRentTensor<double>(count, new[] { count })!;
+                    var scratch = Assert.IsType<Tensor<double>>(arena.TryRentTensor<double>(count, new[] { count }));
                     scratch.AsWritableSpan().Fill(-9.0);
                     Assert.NotSame(detached, scratch);
                 }
@@ -74,7 +74,8 @@ public sealed class NamedRetainedOutputTests : IDisposable
         outputs.Complete();
         Assert.Same(retained, outputs.Get("generation"));
         using (var next = TensorArena.Create())
-            for (int i = 0; i < 8; i++) next.TryRentTensor<double>(count, new[] { count })!.AsWritableSpan().Fill(-77.0);
+            for (int i = 0; i < 8; i++)
+                Assert.IsType<Tensor<double>>(next.TryRentTensor<double>(count, new[] { count })).AsWritableSpan().Fill(-77.0);
         Assert.Equal(shape, retained.Shape.ToArray());
         Assert.Equal(expected, retained.ToArray());
     }
@@ -138,13 +139,14 @@ public sealed class NamedRetainedOutputTests : IDisposable
                 RetainedOutputCapture<double>.PublishEager(tape);
             }
             // A later last-use return must not put transferred storage back in a free queue.
-            arena.ReturnIssued(new TensorArena.IssuedBuffer(retained.GetLiveBackingArrayOrNull()!, -1, 0));
+            var liveBacking = Assert.IsType<double[]>(retained.GetLiveBackingArrayOrNull());
+            arena.ReturnIssued(new TensorArena.IssuedBuffer(liveBacking, -1, 0));
             for (int step = 0; step < 3; step++)
             {
                 arena.Reset();
                 for (int rent = 0; rent < 3; rent++)
                 {
-                    var scratch = arena.TryRentTensor<double>(count, new[] { count })!;
+                    var scratch = Assert.IsType<Tensor<double>>(arena.TryRentTensor<double>(count, new[] { count }));
                     scratch.AsWritableSpan().Fill(9.0);
                     Assert.NotSame(detached, scratch);
                 }
@@ -155,7 +157,7 @@ public sealed class NamedRetainedOutputTests : IDisposable
                 Assert.Equal(0, arena.PinnedArrayCount);
             }
             // Ordinary, unretained scratch still follows the arena's reuse contract.
-            var ordinary = arena.TryRentTensor<double>(17, new[] { 17 })!;
+            var ordinary = Assert.IsType<Tensor<double>>(arena.TryRentTensor<double>(17, new[] { 17 }));
             arena.Reset();
             Assert.Same(ordinary, arena.TryRentTensor<double>(17, new[] { 17 }));
         }
@@ -163,7 +165,7 @@ public sealed class NamedRetainedOutputTests : IDisposable
         Assert.Same(retained, outputs.Get("generation"));
         using (var next = TensorArena.Create())
             for (int i = 0; i < 8; i++)
-                next.TryRentTensor<double>(count, new[] { count })!.AsWritableSpan().Fill(-7.0);
+                Assert.IsType<Tensor<double>>(next.TryRentTensor<double>(count, new[] { count })).AsWritableSpan().Fill(-7.0);
         Assert.Equal(shape, retained.Shape.ToArray());
         Assert.Same(storage, retained._storage);
         Assert.All(retained.ToArray(), value => Assert.Equal(2.0, value));
@@ -217,11 +219,12 @@ public sealed class NamedRetainedOutputTests : IDisposable
             plan = trace.CompileTraining(parameters, Objective());
         using (plan)
         {
-            var guard = ClosureObjectiveGuard<double>.TakeRecorded(out var reason);
-            Assert.True(guard is not null, reason);
+            var recorded = ClosureObjectiveGuard<double>.TakeRecorded(out var reason);
+            Assert.True(recorded is not null, reason);
+            var guard = Assert.IsType<ClosureObjectiveGuard<double>>(recorded);
             mode = change;
             Assert.Equal(change == "duplicate" ? ClosureGuardResult.Aborted : ClosureGuardResult.Mismatched,
-                guard!.TryRebind(Objective, parameters, out _));
+                guard.TryRebind(Objective, parameters, out _));
         }
     }
 
@@ -346,4 +349,383 @@ public sealed class NamedRetainedOutputTests : IDisposable
         Assert.Equal(10.0, values[0]);
         Assert.Equal(14.0, values[1]);
     }
+
+    [Fact]
+    public void Tape_reset_clears_eager_key_registrations_while_preserving_same_forward_uniqueness()
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using (var tape = new GradientTape<double>(new GradientTapeOptions { Persistent = true }))
+        {
+            var first = engine.TensorMultiplyScalar(new Tensor<double>(new[] { 2.0 }, new[] { 1 }), 3.0);
+            var stale = engine.TensorMultiplyScalar(new Tensor<double>(new[] { 9.0 }, new[] { 1 }), 2.0);
+            GradientRecording.RetainOutput("generation", first);
+            GradientRecording.RetainOutput("stale", stale);
+            Assert.Throws<InvalidOperationException>(() => GradientRecording.RetainOutput("generation", first));
+
+            tape.Reset();
+
+            var second = engine.TensorMultiplyScalar(new Tensor<double>(new[] { 5.0 }, new[] { 1 }), 4.0);
+            GradientRecording.RetainOutput("generation", second);
+            Assert.Throws<InvalidOperationException>(() => GradientRecording.RetainOutput("generation", second));
+            RetainedOutputCapture<double>.PublishEager(tape);
+        }
+        outputs.Complete();
+        Assert.Equal(20.0, outputs.Get("generation").ToArray()[0]);
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() => outputs.Get("stale"));
+    }
+
+    [Fact]
+    public void Named_output_from_outer_arena_survives_when_detached_inner_arena_is_active()
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        const int length = 128;
+        var seed = new Tensor<double>(Enumerable.Range(0, length).Select(i => (double)(i + 1)).ToArray(), new[] { length });
+        var expected = seed.ToArray().Select(v => v * 3.0).ToArray();
+        Tensor<double> retained;
+
+        using var capture = RetainedOutputCapture<double>.Begin();
+        using var detached = TensorArena.CreateDetached();
+        using (var outer = TensorArena.Create())
+        {
+            using (var tape = new GradientTape<double>())
+            {
+                retained = engine.StopGradient(engine.TensorMultiplyScalar(seed, 3.0));
+                using (detached.Activate())
+                {
+                    var innerScratch = Assert.IsType<Tensor<double>>(detached.TryRentTensor<double>(length, new[] { length }));
+                    innerScratch.AsWritableSpan().Fill(-1.0);
+                    GradientRecording.RetainOutput("generation", retained);
+                }
+                RetainedOutputCapture<double>.PublishEager(tape);
+            }
+
+            // Force multiple outer-arena resets and rentals to prove the outer arena released both wrapper and array.
+            for (int step = 0; step < 4; step++)
+            {
+                outer.Reset();
+                for (int rent = 0; rent < 4; rent++)
+                {
+                    var scratch = Assert.IsType<Tensor<double>>(outer.TryRentTensor<double>(length, new[] { length }));
+                    scratch.AsWritableSpan().Fill(-42.0);
+                    Assert.NotSame(retained, scratch);
+                }
+                Assert.Equal(expected, retained.ToArray());
+            }
+        }
+        capture.Complete();
+        Assert.Equal(expected, capture.Get("generation").ToArray());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Streaming_reset_starts_a_fresh_named_output_recording_even_after_callback_failure(bool failCallback)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using (var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        }))
+        {
+            var first = engine.TensorMultiplyScalar(parameter, 2.0);
+            GradientRecording.RetainOutput("generation", first);
+            GradientRecording.RetainOutput("stale", first);
+            Assert.Throws<InvalidOperationException>(() => GradientRecording.RetainOutput("generation", first));
+            var firstLoss = engine.ReduceSum(first, null);
+            long firstEpoch = tape.RecordingEpoch;
+            int callbacks = 0;
+            void FirstGradient(Tensor<double> source, Tensor<double> gradient)
+            {
+                Assert.Same(parameter, source);
+                Assert.Equal(2.0, gradient.ToArray()[0]);
+                callbacks++;
+                if (failCallback) throw new ApplicationException("callback failed");
+            }
+            if (failCallback)
+                Assert.Throws<ApplicationException>(() => tape.ComputeGradientsStreaming(firstLoss, new[] { parameter }, FirstGradient));
+            else
+                tape.ComputeGradientsStreaming(firstLoss, new[] { parameter }, FirstGradient);
+            Assert.Equal(1, callbacks);
+            Assert.Equal(firstEpoch + 1, tape.RecordingEpoch);
+
+            var second = engine.TensorMultiplyScalar(parameter, 4.0);
+            GradientRecording.RetainOutput("generation", second);
+            Assert.Throws<InvalidOperationException>(() => GradientRecording.RetainOutput("generation", second));
+            int secondCallbacks = 0;
+            tape.ComputeGradientsStreaming(engine.ReduceSum(second, null), new[] { parameter }, (source, gradient) =>
+            {
+                Assert.Same(parameter, source);
+                Assert.Equal(4.0, gradient.ToArray()[0]);
+                secondCallbacks++;
+            });
+            Assert.Equal(1, secondCallbacks);
+            RetainedOutputCapture<double>.PublishEager(tape);
+        }
+        outputs.Complete();
+        Assert.Equal(20.0, outputs.Get("generation").ToArray()[0]);
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() => outputs.Get("stale"));
+    }
+
+    [Fact]
+    public void Rejected_out_of_order_update_disposal_preserves_the_live_scope_stack()
+    {
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var outer = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        using var inner = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        Assert.Throws<InvalidOperationException>(() => outer.Dispose());
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(inner.Accepted);
+        Assert.False(outer.Accepted);
+        inner.Dispose();
+        PublishNamedScalar(12.0);
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(outer.Accepted);
+        outer.Dispose();
+        outputs.Complete();
+        Assert.Equal(12.0, outputs.Get("generation").ToArray()[0]);
+        Assert.Null(RetainedOutputCapture<double>.BeginEagerUpdate());
+    }
+
+    [Fact]
+    public void Rejected_foreign_thread_update_disposal_does_not_dispose_or_clear_the_owner()
+    {
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        PublishNamedScalar(13.0);
+        // Keep this thread's lexical scope on its creating thread while the other thread attempts disposal.
+        Assert.IsType<InvalidOperationException>(OnOtherThread(update.Dispose));
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        update.Dispose();
+        outputs.Complete();
+        Assert.Equal(13.0, outputs.Get("generation").ToArray()[0]);
+    }
+
+    [Fact]
+    public void Parent_update_disposal_waits_for_the_nested_capture_to_finish()
+    {
+        using var parent = RetainedOutputCapture<double>.Begin();
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        using (var child = RetainedOutputCapture<double>.Begin())
+        {
+            PublishNamedScalar(3.0);
+            Assert.Throws<InvalidOperationException>(() => update.Dispose());
+            child.Complete();
+            Assert.Equal(3.0, child.Get("generation").ToArray()[0]);
+        }
+        PublishNamedScalar(7.0);
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        update.Dispose();
+        parent.Complete();
+        Assert.Equal(7.0, parent.Get("generation").ToArray()[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Foreign_thread_capture_completion_or_disposal_leaves_the_lexical_owner_active(bool complete)
+    {
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        PublishNamedScalar(17.0);
+        Assert.IsType<InvalidOperationException>(OnOtherThread(() =>
+        {
+            if (complete) outputs.Complete();
+            else outputs.Dispose();
+        }));
+        Assert.True(RetainedOutputCapture<double>.IsActive);
+        outputs.Complete();
+        Assert.Equal(17.0, outputs.Get("generation").ToArray()[0]);
+    }
+
+    private static void PublishNamedScalar(double value)
+    {
+        using var tape = new GradientTape<double>();
+        GradientRecording.RetainOutput("generation", new Tensor<double>(new[] { value }, new[] { 1 }));
+        RetainedOutputCapture<double>.PublishEager(tape);
+    }
+
+    private static Exception? OnOtherThread(Action action)
+    {
+        Exception? failure = null;
+        var thread = new System.Threading.Thread(() => failure = Record.Exception(action)) { IsBackground = true };
+        thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(10)), "The foreign-thread scope operation did not return.");
+        return failure;
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Unretained_second_forward_does_not_publish_an_earlier_recording(bool streaming, bool failFirstCallback)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        });
+        var first = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", first);
+        CompleteBackward(tape, engine.ReduceSum(first, null), parameter, 2.0, streaming, failFirstCallback);
+        Assert.Equal(1, tape.RecordingEpoch);
+        if (!failFirstCallback) PublishAccepted(tape);
+
+        // This is a real new forward and accepted update, but it deliberately registers no retained output.
+        var second = engine.TensorMultiplyScalar(parameter, 4.0);
+        CompleteBackward(tape, engine.ReduceSum(second, null), parameter, 4.0, streaming, failCallback: false);
+        Assert.Equal(2, tape.RecordingEpoch);
+        PublishAccepted(tape);
+        outputs.Complete();
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() => outputs.Get("generation"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Immediate_post_backward_publication_keeps_the_completed_nonpersistent_recording(bool streaming)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        });
+        var generated = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", generated);
+        CompleteBackward(tape, engine.ReduceSum(generated, null), parameter, 2.0, streaming, failCallback: false);
+        Assert.Equal(1, tape.RecordingEpoch);
+        PublishAccepted(tape);
+        outputs.Complete();
+        Assert.Equal(10.0, outputs.Get("generation").ToArray()[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Persistent_retained_graph_can_publish_the_same_recording_after_repeated_backwards(bool streaming)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions
+        {
+            Persistent = true,
+            StreamingGraphRetention = StreamingGraphRetentionMode.RetainUntilTapeDisposal,
+        });
+        var generated = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", generated);
+        var loss = engine.ReduceSum(generated, null);
+        for (int update = 0; update < 2; update++)
+        {
+            CompleteBackward(tape, loss, parameter, 2.0, streaming, failCallback: false);
+            Assert.Equal(0, tape.RecordingEpoch);
+            PublishAccepted(tape);
+        }
+        outputs.Complete();
+        Assert.Equal(10.0, outputs.Get("generation").ToArray()[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Reset_or_dispose_discards_even_an_immediately_completed_recording(bool dispose)
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var parameter = new Tensor<double>(new[] { 5.0 }, new[] { 1 });
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var tape = new GradientTape<double>(new GradientTapeOptions { Persistent = false });
+        var generated = engine.TensorMultiplyScalar(parameter, 2.0);
+        GradientRecording.RetainOutput("generation", generated);
+        CompleteBackward(tape, engine.ReduceSum(generated, null), parameter, 2.0, streaming: false, failCallback: false);
+        if (dispose) tape.Dispose();
+        else tape.Reset();
+        PublishAccepted(tape);
+        outputs.Complete();
+        Assert.Throws<System.Collections.Generic.KeyNotFoundException>(() => outputs.Get("generation"));
+    }
+
+    private static void PublishAccepted(GradientTape<double> tape)
+    {
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(update.Accepted);
+        RetainedOutputCapture<double>.PublishEager(tape);
+    }
+
+    private static void CompleteBackward(GradientTape<double> tape, Tensor<double> loss, Tensor<double> parameter,
+        double expectedGradient, bool streaming, bool failCallback)
+    {
+        if (!streaming)
+        {
+            Assert.False(failCallback);
+            Assert.Equal(expectedGradient, tape.ComputeGradients(loss, new[] { parameter })[parameter].ToArray()[0]);
+            return;
+        }
+        int callbacks = 0;
+        void Consume(Tensor<double> source, Tensor<double> gradient)
+        {
+            Assert.Same(parameter, source);
+            Assert.Equal(expectedGradient, gradient.ToArray()[0]);
+            callbacks++;
+            if (failCallback) throw new ApplicationException("callback failed");
+        }
+        if (failCallback)
+            Assert.Throws<ApplicationException>(() => tape.ComputeGradientsStreaming(loss, new[] { parameter }, Consume));
+        else
+            tape.ComputeGradientsStreaming(loss, new[] { parameter }, Consume);
+        Assert.Equal(1, callbacks);
+    }
+
+    [Fact]
+    public void Premature_capture_disposal_preserves_its_owned_update_and_publication_for_completion()
+    {
+        using var outputs = RetainedOutputCapture<double>.Begin();
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        PublishNamedScalar(23.0);
+        Assert.Throws<InvalidOperationException>(() => outputs.Dispose());
+        Assert.True(RetainedOutputCapture<double>.IsActive);
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(update.Accepted);
+        update.Dispose();
+        outputs.Complete();
+        Assert.Equal(23.0, outputs.Get("generation").ToArray()[0]);
+        Assert.Null(RetainedOutputCapture<double>.BeginEagerUpdate());
+    }
+
+    [Fact]
+    public void Child_capture_disposal_preserves_the_parent_owned_update_and_parent_publication()
+    {
+        using var parent = RetainedOutputCapture<double>.Begin();
+        using var update = Assert.IsType<RetainedOutputCapture<double>.EagerUpdateScope>(RetainedOutputCapture<double>.BeginEagerUpdate());
+        PublishNamedScalar(31.0);
+        using (var child = RetainedOutputCapture<double>.Begin())
+        {
+            PublishNamedScalar(37.0);
+            child.Dispose(); // The active update belongs to the parent, so aborting this child is valid.
+            Assert.Throws<ObjectDisposedException>(() => child.Get("generation"));
+        }
+        Assert.True(RetainedOutputCapture<double>.IsActive);
+        RetainedOutputCapture<double>.MarkUpdateAccepted();
+        Assert.True(update.Accepted);
+        update.Dispose();
+        parent.Complete();
+        Assert.Equal(31.0, parent.Get("generation").ToArray()[0]);
+        Assert.Null(RetainedOutputCapture<double>.BeginEagerUpdate());
+    }
+
 }

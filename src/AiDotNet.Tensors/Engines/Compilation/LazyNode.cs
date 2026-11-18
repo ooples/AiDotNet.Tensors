@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// operation later (during Realize) or to fuse it with adjacent operations.
 /// </summary>
 /// <typeparam name="T">The numeric element type.</typeparam>
-internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLazyNode, ICompiledForwardNode
+internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLazyNode, ICompiledForwardNode, IDeviceStateProtectionNode
 {
     Action<IEngine> ICompiledForwardNode.CompileForwardAction() => engine =>
     {
@@ -20,7 +20,7 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
         IsRealized = true;
     };
 
-    void ICompiledForwardNode.ProtectDeviceState(HashSet<object> keys)
+    void IDeviceStateProtectionNode.ProtectDeviceState(HashSet<object> keys)
     {
         if (WritesInPlace) ForwardOnlyHeterogeneousReplay.ProtectTensor(keys, Output);
     }

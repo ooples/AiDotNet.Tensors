@@ -375,7 +375,7 @@ public sealed partial class CudaBackend
             IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments, IReadOnlyList<int> sizes,
             float beta1, float beta2, float epsilon, float weightDecay)
         {
-            if (_gradientTable is null || _adamTable is null)
+            if (_gradientTable is null || _adamTable is null || _dynamicScalars is null || _state is null)
                 throw new InvalidOperationException("PrepareOptimizer was not called before the capture.");
             _backend.MultiTensorSumOfSquares(_gradientTable, _guard!, zeroFirst: false);   // the epilogue re-zeroes it
             // Learning rate remains global; each leaf's accepted age comes from integer state plus its offset.

@@ -42,6 +42,43 @@ internal sealed class LayerNormStateRef<T> : Compilation.ISignatureScratch
     public Tensor<T>? Variance;
 }
 
+// A lazy GroupNorm's per-(sample, group) statistics: the forward replaces them every replay, the backward and the
+// statistic consumers read them. Only the immutable statistic count belongs to the objective signature.
+internal sealed class GroupNormStateRef<T> : Compilation.ISignatureScratch
+{
+    private Tensor<T>? _mean;
+    private Tensor<T>? _variance;
+
+    internal GroupNormStateRef(int statistics) => SignatureLength = statistics;
+
+    public int SignatureLength { get; }
+
+    internal void Refresh(Tensor<T> mean, Tensor<T> variance)
+    {
+        if (mean.Length != SignatureLength || variance.Length != SignatureLength)
+            throw new InvalidOperationException(
+                $"GroupNorm replay produced {mean.Length} means and {variance.Length} variances; the recorded node holds {SignatureLength}.");
+        if (_mean is { } previousMean && !ReferenceEquals(previousMean, mean)
+            && previousMean._gpuBuffer is null && !previousMean.HasPendingGpuData)
+        {
+            TensorAllocator.Return(previousMean);
+        }
+        if (_variance is { } previousVariance && !ReferenceEquals(previousVariance, variance)
+            && previousVariance._gpuBuffer is null && !previousVariance.HasPendingGpuData)
+        {
+            TensorAllocator.Return(previousVariance);
+        }
+        _mean = mean;
+        _variance = variance;
+    }
+
+    internal Tensor<T> RequireMean() => _mean ?? throw new InvalidOperationException(
+        "GroupNorm statistics were read before the node's forward ran (lazy/compiled-path wiring bug).");
+
+    internal Tensor<T> RequireVariance() => _variance ?? throw new InvalidOperationException(
+        "GroupNorm statistics were read before the node's forward ran (lazy/compiled-path wiring bug).");
+}
+
 /// <summary>
 /// Contains backward function implementations for all differentiable engine operations.
 /// Each method is a <see cref="BackwardFunction{T}"/> that computes input gradients
@@ -2276,8 +2313,9 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var numGroups = (int)savedState[0];
-        var mean = (Tensor<T>)savedState[1];
-        var variance = (Tensor<T>)savedState[2];
+        // A lazy training node keeps one holder in both statistic slots; the eager tape keeps the tensors.
+        var mean = savedState[1] is GroupNormStateRef<T> meanRef ? meanRef.RequireMean() : (Tensor<T>)savedState[1];
+        var variance = savedState[2] is GroupNormStateRef<T> varianceRef ? varianceRef.RequireVariance() : (Tensor<T>)savedState[2];
         var epsilon = (double)savedState[3];
         if (TrySecondOrderGroupNorm(gradOutput, inputs, engine, grads, numGroups, epsilon)) return;
 
@@ -9915,28 +9953,38 @@ internal static partial class BackwardFunctions<T>
             AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorDigamma(inputs[0]), engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
+
         var x = inputs[0];
-        using var xSrcLease = x.Lease();
-        var xSrc = xSrcLease.Span;
-        using var dYLease = gradOutput.Lease();
-        var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
-        using var dXLease = gX.LeaseWritable();
-        var dX = dXLease.Span;
-        for (int i = 0; i < dX.Length; i++)
+        var xs = RoIAlignPlan.ToDoubles(x);
+        // Keep the derivative and its upstream product in double until the final conversion to T.
+        for (int i = 0; i < xs.Length; i++)
         {
-            double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
-            // Use the same asymptotic digamma formula as TensorDigamma.
+            double xd = xs[i];
+            // Reflection bounds recurrence work even for very large negative arguments.
+            // Nonpositive integer poles and negative infinity have no digamma derivative.
+            // Exact equality identifies integer poles; adjacent representable nonintegers are not poles.
+            if (double.IsNegativeInfinity(xd) || (xd < 0 && xd == System.Math.Floor(xd)))
+            {
+                xs[i] = double.NaN;
+                continue;
+            }
             double shift = 0;
+            if (xd < 0)
+            {
+                // Reduce to the nearest integer first, preserving relative distance to negative poles.
+                shift = -System.Math.PI / System.Math.Tan(System.Math.PI * (xd - System.Math.Round(xd)));
+                xd = 1.0 - xd;
+            }
             while (xd < 10.0) { shift -= 1.0 / xd; xd += 1.0; }
             double inv = 1.0 / xd; double inv2 = inv * inv;
             double series = System.Math.Log(xd) - 0.5 * inv
                 - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0
                     - inv2 * (1.0 / 132.0 - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))));
-            dX[i] = ops.Multiply(dY[i], ops.FromDouble(shift + series));
+            xs[i] = shift + series;
         }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        var upstream = RoIAlignPlan.ToDoubles(gradOutput);
+        for (int i = 0; i < xs.Length; i++) xs[i] *= upstream[i];
+        DifferentiableOps.AccumulateGrad(grads, x, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
     }
 
     /// <summary>Digamma backward: d/dx digamma(x) = trigamma(x).</summary>
@@ -9950,19 +9998,33 @@ internal static partial class BackwardFunctions<T>
             AccumulateScaled(grads, inputs[0], gradOutput, engine.TensorPolygamma(1, inputs[0]), engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
+
         var x = inputs[0];
-        using var xSrcLease = x.Lease();
-        var xSrc = xSrcLease.Span;
-        using var dYLease = gradOutput.Lease();
-        var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
-        using var dXLease = gX.LeaseWritable();
-        var dX = dXLease.Span;
-        for (int i = 0; i < dX.Length; i++)
+        var xs = RoIAlignPlan.ToDoubles(x);
+        // Keep the derivative and its upstream product in double until the final conversion to T.
+        for (int i = 0; i < xs.Length; i++)
         {
-            double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
-            // Trigamma asymptotic with recurrence shift — same as Polygamma(1, x).
+            double xd = xs[i];
+            if (double.IsNegativeInfinity(xd))
+            {
+                xs[i] = double.NaN;
+                continue;
+            }
+            // Exact equality identifies integer poles; adjacent representable nonintegers are not poles.
+            if (xd <= 0 && xd == System.Math.Floor(xd))
+            {
+                xs[i] = double.PositiveInfinity;
+                continue;
+            }
+            // psi'(x) = pi^2 / sin^2(pi*x) - psi'(1-x), with bounded positive recurrence.
+            double reflection = 0;
+            bool reflected = xd < 0;
+            if (reflected)
+            {
+                double sin = System.Math.Sin(System.Math.PI * (xd - System.Math.Round(xd)));
+                reflection = System.Math.PI * System.Math.PI / (sin * sin);
+                xd = 1.0 - xd;
+            }
             double shift = 0;
             while (xd < 6.0) { shift += 1.0 / (xd * xd); xd += 1.0; }
             double inv = 1.0 / xd; double inv2 = inv * inv;
@@ -9970,9 +10032,11 @@ internal static partial class BackwardFunctions<T>
                 + inv2 * inv * (1.0 / 6.0
                   - inv2 * (1.0 / 30.0
                     - inv2 * (1.0 / 42.0)));
-            dX[i] = ops.Multiply(dY[i], ops.FromDouble(shift + series));
+            xs[i] = reflected ? reflection - (shift + series) : shift + series;
         }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        var upstream = RoIAlignPlan.ToDoubles(gradOutput);
+        for (int i = 0; i < xs.Length; i++) xs[i] *= upstream[i];
+        DifferentiableOps.AccumulateGrad(grads, x, RoIAlignPlan.FromDoubles<T>(xs, x._shape), engine);
     }
 
     /// <summary>I0 backward: d/dx I₀(x) = I₁(x).</summary>
@@ -10702,18 +10766,16 @@ internal static partial class BackwardFunctions<T>
         }
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
+        var xs = RoIAlignPlan.ToDoubles(input);
         using var goLease = gradOutput.Lease();
         var go = goLease.Span;
         using var dstLease = grad.LeaseWritable();
         var dst = dstLease.Span;
         var zero = ops.Zero;
-        for (int i = 0; i < src.Length; i++)
+        for (int i = 0; i < xs.Length; i++)
         {
-            double d = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
             // net471 lacks double.IsFinite — check NaN/Infinity explicitly.
-            bool isFinite = !(double.IsNaN(d) || double.IsInfinity(d));
+            bool isFinite = !(double.IsNaN(xs[i]) || double.IsInfinity(xs[i]));
             dst[i] = isFinite ? go[i] : zero;
         }
         DifferentiableOps.AccumulateGrad(grads, input, grad, engine);

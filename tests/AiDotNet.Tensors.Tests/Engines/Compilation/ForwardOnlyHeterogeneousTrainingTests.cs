@@ -34,7 +34,7 @@ public sealed class ForwardOnlyHeterogeneousTrainingTests : IDisposable
         using (var scope = GraphMode.EnableTraining(new[] { parameter }))
         {
             area = engine.ReduceSum(DataCast<T, double>(engine,
-                engine.TensorGreaterThan(input, default(T)!)), null, false);
+                engine.TensorGreaterThan(input, MathHelper.GetNumericOperations<T>().Zero)), null, false);
             var ratio = DataCast<double, T>(engine, engine.TensorMultiplyScalar(area, 1.0 / 65536));
             var loss = engine.ReduceSum(engine.TensorMultiply(parameter, ratio), null, false);
             Assert.Null(scope.HostReadOp);
@@ -267,7 +267,8 @@ public sealed class ForwardOnlyHeterogeneousTrainingTests : IDisposable
         int heldReferences = storage.RefCount;
         Assert.True(heldReferences >= 2);
         using (var next = TensorArena.Create())
-            for (int i = 0; i < 4; i++) next.TryRentTensor<double>(65536, new[] { 256, 256 })!.AsWritableSpan().Fill(-99);
+            for (int i = 0; i < 4; i++)
+                Assert.IsType<Tensor<double>>(next.TryRentTensor<double>(65536, new[] { 256, 256 })).AsWritableSpan().Fill(-99);
         for (int step = 0; step < 3; step++)
         {
             Assert.Equal(2f, plan.Step().ToArray()[0]);
@@ -391,9 +392,10 @@ public sealed class ForwardOnlyHeterogeneousTrainingTests : IDisposable
             plan = scope.CompileTraining(parameters, loss);
             Assert.Null(scope.HostReadOp);
         }
-        var guard = ClosureObjectiveGuard<float>.TakeRecorded(out var reason);
-        Assert.True(guard is not null, reason);
-        guard!.AttachTo(plan);
+        var recorded = ClosureObjectiveGuard<float>.TakeRecorded(out var reason);
+        Assert.True(recorded is not null, reason);
+        var guard = Assert.IsType<ClosureObjectiveGuard<float>>(recorded);
+        guard.AttachTo(plan);
         return (plan, guard);
     }
 
@@ -440,7 +442,8 @@ public sealed class ForwardOnlyHeterogeneousGpuTrainingTests : IDisposable
                 Assert.True(available, "GPU tests were required but no direct GPU backend resolved.");
             Skip.If(!available, "No direct GPU backend available.");
             // Preserve default opportunistic graph/resident settings and the original GPU engine.
-            ForwardOnlyHeterogeneousTrainingTests.CheckGuardedReplay(device!);
+            var engine = Assert.IsType<DirectGpuTensorEngine>(device);
+            ForwardOnlyHeterogeneousTrainingTests.CheckGuardedReplay(engine);
         }
     }
 
@@ -456,9 +459,9 @@ public sealed class ForwardOnlyHeterogeneousGpuTrainingTests : IDisposable
             if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
                 Assert.True(available, "GPU tests were required but no direct GPU backend resolved.");
             Skip.If(!available, "No direct GPU backend available.");
-            var engine = device!;
+            var engine = Assert.IsType<DirectGpuTensorEngine>(device);
             AiDotNetEngine.Current = engine;
-            var backend = engine.GetBackend()!;
+            var backend = Assert.IsAssignableFrom<AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend>(engine.GetBackend());
             using var outputBinding = backend.AllocateBuffer(new[] { 0f });
             using var stateBinding = backend.AllocateBuffer(new[] { 0f });
             var parameter = new Tensor<float>(new[] { 2f }, new[] { 1 });

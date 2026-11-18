@@ -85,10 +85,10 @@ public sealed class LstmClosureReplayTests
             var coefficients = new Tensor<double>(Enumerable.Range(0, output.Length)
                 .Select(index => 0.2 + index * 0.13).ToArray(), output._shape);
             var loss = engine.ReduceSum(engine.TensorMultiply(output, coefficients), null);
-            if (optional == 2)
+            if (optional == 2 && finalHidden is not null && finalCell is not null)
                 loss = engine.TensorAdd(loss, engine.TensorAdd(
-                    engine.TensorMultiplyScalar(engine.ReduceSum(finalHidden!, null), 0.17),
-                    engine.TensorMultiplyScalar(engine.ReduceSum(finalCell!, null), 0.23)));
+                    engine.TensorMultiplyScalar(engine.ReduceSum(finalHidden, null), 0.17),
+                    engine.TensorMultiplyScalar(engine.ReduceSum(finalCell, null), 0.23)));
             return loss;
         }
 
@@ -98,9 +98,10 @@ public sealed class LstmClosureReplayTests
             plan = scope.CompileTraining(parameters, Objective());
         using (plan)
         {
-            var guard = ClosureObjectiveGuard<double>.TakeRecorded(out var reason);
-            Assert.True(guard is not null, reason);
-            guard!.AttachTo(plan);
+            var recorded = ClosureObjectiveGuard<double>.TakeRecorded(out var reason);
+            Assert.True(recorded is not null, reason);
+            var guard = Assert.IsType<ClosureObjectiveGuard<double>>(recorded);
+            guard.AttachTo(plan);
             for (int step = 0; step < 3; step++)
             {
                 var inputValues = new[] { 0.3 + step * 0.2, -0.7 + step * 0.3, 1.1 - step * 0.4 };

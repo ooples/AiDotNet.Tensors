@@ -1098,6 +1098,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public int SkipsRecorded { get; set; }
         public uint AgesApplied { get; set; }
         public bool[]? ParameterMembership { get; set; }
+        public int[]? ActiveIndices { get; set; }
 
         // ---- ping-pong (null PingPong: the update runs in place in one graph) ----
         /// <summary>Each parameter's second weight buffer; the parity-1 graph reads the weights from these.</summary>
@@ -3543,11 +3544,27 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var target = _optimizerRuntimeState!;
         source.ResolveDeferredFiniteness();
         ResolveDeferredFiniteness();   // this plan's in-flight replays land before its count is replaced
-        // Active membership and per-parameter ages determine captured device tables.
-        // Retire those tables before adopting another plan's optimizer timeline.
-        if (_capturedOptimizer is not null) InvalidateCapturedStepGraph();
+        // Active membership and per-parameter relative ages determine captured device tables; when they are
+        // unchanged across plans sharing the same moment group, the captured forward/backward/optimizer graph
+        // remains valid and only the dynamic global step needs to advance.
+        if (_capturedOptimizer is { } capturedOpt)
+        {
+            bool invalidate = capturedOpt.ParameterMembership is null
+                || !capturedOpt.ParameterMembership.SequenceEqual(_optimizerGradientMembership);
+            if (!invalidate)
+            {
+                for (int p = 0; p < _parameters.Length; p++)
+                {
+                    if (!IsOptimizerParameterActive(p)) continue;
+                    long currentOffset = _parameterAcceptedUpdates[p] - _optimizerStep;
+                    long nextOffset = source._parameterAcceptedUpdates[p] - source._optimizerStep;
+                    if (currentOffset != nextOffset) { invalidate = true; break; }
+                }
+            }
+            if (invalidate) InvalidateCapturedStepGraph();
+        }
         _optimizerStep = source._optimizerStep;
-        _parameterAcceptedUpdates = source._parameterAcceptedUpdates;
+        _parameterAcceptedUpdates = (long[])source._parameterAcceptedUpdates.Clone();
         SyncCapturedOptimizerStep();
         _maxGradNorm = source._maxGradNorm;
         _nonFiniteGradientPolicy = source._nonFiniteGradientPolicy;
@@ -4907,9 +4924,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool TryCaptureOddParityGraph(Engines.DirectGpuTensorEngine gte, Engines.DirectGpu.IGpuGraphCapture cb)
     {
         if (_capturedOptimizer is not { PingPong: { } second, BindParity: { } bind } optimizer || _stepIo is not { } io) return false;
-        var first = new Engines.DirectGpu.IGpuBuffer[_parameters.Length];
-        for (int p = 0; p < first.Length; p++)
-            if (_parameters[p]._gpuBuffer is { } bound) first[p] = bound; else return false;
+        int[] activeIndices = optimizer.ActiveIndices
+            ?? Enumerable.Range(0, _parameters.Length).Where(IsOptimizerParameterActive).ToArray();
+        if (activeIndices.Length != second.Length) return false;
+        var first = new Engines.DirectGpu.IGpuBuffer[activeIndices.Length];
+        for (int i = 0; i < activeIndices.Length; i++)
+            if (_parameters[activeIndices[i]]._gpuBuffer is { } bound) first[i] = bound; else return false;
         IntPtr odd = IntPtr.Zero;
         try
         {
@@ -7255,6 +7275,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             List<Engines.DirectGpu.IGpuBuffer>? mtParams = null, mtGrads = null, mtM = null, mtV = null;
             List<int>? mtSizes = null;
             var activeIndices = Enumerable.Range(0, paramCount).Where(IsOptimizerParameterActive).ToArray();
+            if (activeIndices.Length == 0) return;
             int firstActive = activeIndices[0];
             if ((optType == OptimizerType.Adam || optType == OptimizerType.AdamW)
                 && paramCount > 0
@@ -8181,7 +8202,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var capSizes = new List<int>(paramCount);
             var capIndices = Enumerable.Range(0, paramCount).Where(IsOptimizerParameterActive).ToArray();
             if (capIndices.Length == 0) return null;
-            var capOffsets = capIndices.Select(p => _parameterAcceptedUpdates[p] - _optimizerStep).ToArray();
             var owner = gpuBackends[capIndices[0]];
             if (owner is not Engines.DirectGpu.IGpuGraphCapture) return null;
             bool adam = optType != OptimizerType.SGD;
@@ -8203,6 +8223,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 else io.CaptureSgdUpdate(capParams, capGrads, capSizes, (float)wd);
             });
             captured.ParameterMembership = (bool[])_optimizerGradientMembership.Clone();
+            captured.ActiveIndices = capIndices;
             captured.Prepare = io =>
             {
                 if (pingPong is not null)
@@ -8226,7 +8247,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         RejectPingPong("its tables could not be built: " + prepareFailure.Message);
                     }
                 }
-                io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes, adam ? capOffsets : null);
+                var capOffsets = adam ? capIndices.Select(p => _parameterAcceptedUpdates[p] - _optimizerStep).ToArray() : null;
+                io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes, capOffsets);
             };
             // Binds every parameter to buffer set `set` (0: the plan's own, 1: the ping-pong second buffers) as the
             // authoritative copy everywhere it is looked up; `from` is the set the persistent weight cache names now.
@@ -8272,7 +8294,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         for (int position = 0; position < capIndices.Length; position++)
                         {
                             int p = capIndices[position];
-                            owner.Copy(pingPong[position], gpuParam[p]!, lengths[p]);
+                            if (gpuParam[p] is { } dstParam)
+                                owner.Copy(pingPong[position], dstParam, lengths[p]);
                         }
                         BindSet(0, 1);
                     }
@@ -9480,16 +9503,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 ScheduleFreeWeightSum = rt.Scalars.ScheduleFreeWeightSum,
                 ConjugateGradientPrevGradNorm2 = rt.Scalars.CgPrevGradNorm2,
             },
-            LbfgsHistory = rt.OptimizerType == OptimizerType.LBFGS ? new FusedLbfgsHistoryCheckpoint
-            {
-                S = rt.LbfgsS!.Select(row => (float[])row.Clone()).ToArray(),
-                Y = rt.LbfgsY!.Select(row => (float[])row.Clone()).ToArray(),
-                Rho = (float[])rt.LbfgsRho!.Clone(),
-                PrevParam = (float[])rt.LbfgsPrevParam!.Clone(),
-                PrevGrad = (float[])rt.LbfgsPrevGrad!.Clone(),
-                Count = rt.LbfgsCount, Head = rt.LbfgsHead, HasPrev = rt.LbfgsHasPrev,
-                GammaNum = rt.LbfgsGammaNum, GammaDen = rt.LbfgsGammaDen,
-            } : null,
+            LbfgsHistory = rt.OptimizerType == OptimizerType.LBFGS
+                && rt.LbfgsS is { } lbfgsS && rt.LbfgsY is { } lbfgsY
+                && rt.LbfgsRho is { } lbfgsRho && rt.LbfgsPrevParam is { } lbfgsPrevParam
+                && rt.LbfgsPrevGrad is { } lbfgsPrevGrad
+                ? new FusedLbfgsHistoryCheckpoint
+                {
+                    S = lbfgsS.Select(row => (float[])row.Clone()).ToArray(),
+                    Y = lbfgsY.Select(row => (float[])row.Clone()).ToArray(),
+                    Rho = (float[])lbfgsRho.Clone(),
+                    PrevParam = (float[])lbfgsPrevParam.Clone(),
+                    PrevGrad = (float[])lbfgsPrevGrad.Clone(),
+                    Count = rt.LbfgsCount, Head = rt.LbfgsHead, HasPrev = rt.LbfgsHasPrev,
+                    GammaNum = rt.LbfgsGammaNum, GammaDen = rt.LbfgsGammaDen,
+                }
+                : null,
             Parameters = new FusedOptimizerParameterCheckpoint[_parameters.Length],
         };
 
@@ -10046,17 +10074,29 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (!source.CanRead) throw new ArgumentException("The stream is not readable.", nameof(source));
 
+        var expectedLengths = new int[_parameters.Length];
+        for (int i = 0; i < _parameters.Length; i++) expectedLengths[i] = _parameters[i].Length;
+
+        int version;
         FusedOptimizerCheckpoint? checkpoint;
         try
         {
             using var reader = new BinaryReader(source, System.Text.Encoding.UTF8, leaveOpen: true);
             if (reader.ReadInt32() != OptimizerStateMagic)
                 throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
-            int version = reader.ReadInt32();
-            if (version != OptimizerStateVersion)
+            version = reader.ReadInt32();
+            if (version != OptimizerStateVersion
+                && version != PreEnrollmentOptimizerStateVersion
+                && version != NoVelocityFlagOptimizerStateVersion
+                && version != SingleHyperparameterOptimizerStateVersion)
                 throw new InvalidDataException(
                     $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
-            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader);
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(
+                reader,
+                doubleHyperparameters: version >= NoVelocityFlagOptimizerStateVersion,
+                hasVelocityIncludesLearningRate: version >= PreEnrollmentOptimizerStateVersion,
+                hasEnrollmentMetadata: version >= OptimizerStateVersion,
+                expectedParameterLengths: expectedLengths);
         }
         catch (EndOfStreamException ex)
         {
@@ -10065,6 +10105,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         if (checkpoint is null)
             throw new InvalidDataException("Compiled optimizer state payload contains no optimizer.");
+        if (version < OptimizerStateVersion)
+        {
+            if (RequiresFixedActiveDomain(checkpoint.OptimizerType) || !_graphGradientMembership.All(static active => active))
+                throw new InvalidDataException(
+                    "Legacy pre-version-6 optimizer state lacks per-parameter enrollment history required by this plan.");
+        }
         RestoreFusedOptimizerCheckpoint(checkpoint);
     }
 
@@ -10077,8 +10123,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // 4: beta1, beta2, epsilon and weight decay became double (format 11).
     // 5: the extras gained VelocityIncludesLearningRate (format 14).
     // 6: per-parameter accepted-update ages and fixed coupled-optimizer enrollment domain.
-    // Earlier payloads cannot identify absent-gradient history and are deliberately rejected.
+    // Versions 3-5 remain readable for uncoupled full-enrollment plans; coupled or partial-enrollment plans require v6.
     private const int OptimizerStateVersion = 6;
+    private const int PreEnrollmentOptimizerStateVersion = 5;
+    private const int NoVelocityFlagOptimizerStateVersion = 4;
+    private const int SingleHyperparameterOptimizerStateVersion = 3;
 
     /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)
@@ -10241,21 +10290,30 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // The loss is the LAST op the caller RECORDED. Take it before the optimization passes: they may reorder
         // nodes, and an unconsumed side branch (a tensor computed but not used by the loss) can then end up last.
-        Tensor<T>? recordedLastOutput = scope.Nodes.Count > 0 && scope.Nodes[scope.Nodes.Count - 1] is LazyNode<T> lastRecorded
-            ? lastRecorded.Output
+        Tensor<T>? recordedLastOutput = scope.Nodes.Count > 0
+            && scope.Nodes[scope.Nodes.Count - 1] is ISignableLazyNode { OutputTensor: Tensor<T> lastRecordedOut }
+            ? lastRecordedOut
             : null;
 
         var retainedOutputs = scope.RetainedOutputClosure<T>();
         var observableNodes = new HashSet<ILazyNode>(scope.Nodes.OfType<LazyNode<T>>()
             .Where(node => retainedOutputs.Contains(node.Output)));
+        if (explicitLoss is not null)
+            foreach (var node in scope.Nodes)
+                if (node is ISignableLazyNode signable && ReferenceEquals(signable.OutputTensor, explicitLoss))
+                    observableNodes.Add(node);
         var compiler = new LazyGraphCompiler(forTraining: true, observableOutputs: observableNodes);
         var optimized = compiler.Compile(scope.Nodes);
 
         // Observation keeps forward work alive, but only loss ancestors may contribute gradients.
         // Resolve producer edges before clearing LazySource; GetInputNodes preserves in-place read ordering.
-        var lossRoot = optimized.OfType<LazyNode<T>>()
-            .LastOrDefault(node => ReferenceEquals(node.Output, explicitLoss ?? recordedLastOutput))
-            ?? (explicitLoss is null ? optimized.OfType<LazyNode<T>>().LastOrDefault() : null);
+        var lossTarget = explicitLoss ?? recordedLastOutput;
+        ILazyNode? lossRoot = lossTarget is not null
+            ? optimized.LastOrDefault(node => node is ISignableLazyNode signable && ReferenceEquals(signable.OutputTensor, lossTarget))
+            : null;
+        lossRoot ??= explicitLoss is null ? optimized.OfType<LazyNode<T>>().LastOrDefault() : null;
+        if (explicitLoss is not null && lossRoot is null)
+            throw new ArgumentException("The explicit loss must be produced by an operation recorded in this training scope.", nameof(explicitLoss));
         var lossAncestors = new HashSet<ILazyNode>();
         var pendingLossNodes = new Stack<ILazyNode>();
         if (lossRoot is not null) pendingLossNodes.Push(lossRoot);
@@ -10264,6 +10322,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var ancestor = pendingLossNodes.Pop();
             if (!lossAncestors.Add(ancestor)) continue;
             if (ancestor is ICrossTypeNodeMetadata { HasBackward: false }) continue;
+            if (ancestor is not LazyNode<T> && ancestor.RecordedUnderNoGrad)
+            {
+                // An in-place NoGrad write preserves the target's earlier gradient history,
+                // but its other operands must not enroll in the optimizer.
+                if (ancestor.PriorWriter is { } prior && !ReferenceEquals(prior, ancestor))
+                    pendingLossNodes.Push(prior);
+                continue;
+            }
             var gradientInputs = ancestor is LazyNode<T> typedAncestor
                 ? typedAncestor.GetGradientInputNodes() : ancestor.GetInputNodes();
             foreach (var inputNode in gradientInputs) pendingLossNodes.Push(inputNode);
@@ -10271,9 +10337,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Membership means a derivative edge exists, not that its current numerical value is nonzero.
         var gradientMembers = new HashSet<Tensor<T>>();
-        if ((explicitLoss ?? recordedLastOutput) is { } directLoss) gradientMembers.Add(directLoss);
+        if (lossTarget is { } directLoss) gradientMembers.Add(directLoss);
         foreach (var node in lossAncestors.OfType<LazyNode<T>>())
             foreach (var input in node.GetDifferentiableInputs()) gradientMembers.Add(input);
+        foreach (var bridge in lossAncestors.OfType<ICrossTypeNodeMetadata>())
+            if (bridge.HasBackward && bridge.InputElementType == typeof(T) && bridge.DifferentiableInputTensor is Tensor<T> bridgeInput)
+                gradientMembers.Add(bridgeInput);
 
         // The complete foreign-data schedule is distinct from the typed backward projection.
         var dataReplay = ForwardOnlyHeterogeneousReplay.Create<T>(optimized);
@@ -11026,7 +11095,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Skipped under gradient pooling: pruning removes backward actions, which
         // would break the 1:1 position↔action-index mapping the re-zero schedule
         // depends on (the schedule was computed assuming every step's backward runs).
-        var paramSet = new HashSet<Tensor<T>>(parameters);
         if (!useGradPool)
             backwardActions = BackwardPruningPass.Prune(backwardActions, forwardSteps, parameters, gradMap);
 
@@ -12891,6 +12959,36 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Return, every training Step() would leak two pooled tensors.
                 TensorAllocator.Return(freshMean);
                 TensorAllocator.Return(freshVar);
+            };
+        }
+
+        // Lazy training GroupNorm (CpuEngine.RecordGroupNormTraining): the backward and the statistic consumers read
+        // a holder rather than trace-time tensors, so the replay hands the holder this step's statistics instead of
+        // copying into saved buffers. Float and double keep the write-into-output kernel; Half and BFloat16 take the
+        // engine op, whose float32 statistics GroupNormInto's generic path would not reproduce.
+        if (step.OpType == OpType.GroupNorm && step.Inputs.Length == 3 && step.Inputs[0].IsContiguous
+            && step.SavedState is { Length: >= 4 }
+            && step.SavedState[0] is int numGroupsRef
+            && step.SavedState[1] is GroupNormStateRef<T> gnStateRef
+            && ReferenceEquals(step.SavedState[2], gnStateRef)
+            && step.SavedState[3] is double epsilonRef)
+        {
+            var inp = step.Inputs[0];
+            var gamma = step.Inputs[1];
+            var beta = step.Inputs[2];
+            var o = step.OutputBuffer;
+            bool intoKernel = typeof(T) == typeof(float) || typeof(T) == typeof(double);
+            return eng =>
+            {
+                Tensor<T> freshMean, freshVar;
+                if (intoKernel && eng.TryGet<CpuEngine>(out var cpuEng) && !eng.SupportsGpu)
+                    cpuEng.GroupNormInto(o, inp, numGroupsRef, gamma, beta, epsilonRef, out freshMean, out freshVar);
+                else
+                {
+                    var result = eng.GroupNorm(inp, numGroupsRef, gamma, beta, epsilonRef, out freshMean, out freshVar);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, o);
+                }
+                gnStateRef.Refresh(freshMean, freshVar);
             };
         }
 

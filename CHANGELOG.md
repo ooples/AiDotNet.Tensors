@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.151.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.151.1...v0.151.2) (2026-11-17)
+
+
+### Bug Fixes
+
+* **compilation:** preserve gradient enrollment and training replay ([#1766](https://github.com/ooples/AiDotNet.Tensors/issues/1766)) ([dcfcf5a](https://github.com/ooples/AiDotNet.Tensors/commit/dcfcf5ad1fceddfddf7008c2590a30463c82e141))
+
+## [0.151.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.151.0...v0.151.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **autodiff:** sign generic LayerNorm replay scratch ([#1762](https://github.com/ooples/AiDotNet.Tensors/issues/1762)) ([cf8f863](https://github.com/ooples/AiDotNet.Tensors/commit/cf8f8639dae2c5defa92c4275007d22dd9c86a4d))
+* **compile:** no backward for ops traced under NoGradScope, plus the [#1744](https://github.com/ooples/AiDotNet.Tensors/issues/1744)/[#1760](https://github.com/ooples/AiDotNet.Tensors/issues/1760) review fixes ([#1764](https://github.com/ooples/AiDotNet.Tensors/issues/1764)) ([7fd8a02](https://github.com/ooples/AiDotNet.Tensors/commit/7fd8a02f75a6ca59fb652157df51a593fbac90ab))
+
 ## [0.151.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.150.0...v0.151.0) (2026-11-16)
 
 
