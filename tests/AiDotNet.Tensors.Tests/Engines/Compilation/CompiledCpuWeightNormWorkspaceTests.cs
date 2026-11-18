@@ -35,14 +35,27 @@ public sealed class CompiledCpuWeightNormWorkspaceTests
 
     private sealed record Result(bool WorkspaceActive, int KernelArrays, List<float[]> Values);
 
-    private static Result Run(bool enabled, bool retainFirst, bool rebuildForward)
+    private sealed class CustomCpuEngine : CpuEngine { }
+
+    [Fact]
+    public void Custom_cpu_engine_keeps_independent_kernel_storage()
+    {
+        var baseline = Run(false, false, false, true);
+        var guarded = Run(true, false, false, true);
+        Assert.False(guarded.WorkspaceActive);
+        Assert.Equal(2, guarded.KernelArrays);
+        Assert.Equal(baseline.Values.Count, guarded.Values.Count);
+        for (int i = 0; i < baseline.Values.Count; i++) Assert.Equal(baseline.Values[i], guarded.Values[i]);
+    }
+
+    private static Result Run(bool enabled, bool retainFirst, bool rebuildForward, bool customEngine = false)
     {
         var previousEngine = AiDotNetEngine.Current;
         bool previousDeferred = LazyTensorScope.DeferCpuTrainingOutputs;
         bool previousWorkspace = CompiledTrainingPlan<float>.CpuWeightNormWorkspaceEnabled;
         try
         {
-            AiDotNetEngine.Current = new CpuEngine();
+            AiDotNetEngine.Current = customEngine ? new CustomCpuEngine() : new CpuEngine();
             var engine = AiDotNetEngine.Current;
             LazyTensorScope.DeferCpuTrainingOutputs = true;
             CompiledTrainingPlan<float>.CpuWeightNormWorkspaceEnabled = enabled;
