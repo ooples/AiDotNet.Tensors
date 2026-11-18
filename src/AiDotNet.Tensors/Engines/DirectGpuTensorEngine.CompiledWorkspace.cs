@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -6,6 +8,16 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class DirectGpuTensorEngine
 {
+    private readonly List<WeakReference<IInferencePrivateGradientWorkspaceOwner>> _privateGradientOwners = new();
+
+    internal void RegisterPrivateGradientWorkspace(IInferencePrivateGradientWorkspaceOwner owner)
+    {
+        // Called only at a completed step while CompiledStepLock is held. The registry must not keep a model alive.
+        for (int i = _privateGradientOwners.Count - 1; i >= 0; i--)
+            if (!_privateGradientOwners[i].TryGetTarget(out _)) _privateGradientOwners.RemoveAt(i);
+        _privateGradientOwners.Add(new WeakReference<IInferencePrivateGradientWorkspaceOwner>(owner));
+    }
+
     private CompiledTransientWorkspaceBroker? _compiledWorkspaceBroker;
     internal CompiledTransientWorkspaceBroker CompiledWorkspaceBroker =>
         _compiledWorkspaceBroker ??= new CompiledTransientWorkspaceBroker(this);
@@ -15,7 +27,7 @@ public partial class DirectGpuTensorEngine
     // Parameter/result/optimizer/captured roots and other plans' outstanding loans never enter the broker's free list.
     internal void ReturnIncompatibleInferenceWorkspace(IDirectGpuBackend backend, long requestedBytes)
     {
-        if (_compiledWorkspaceBroker is not { RetainedBytes: > 0 } broker
+        if ((_compiledWorkspaceBroker is not { RetainedBytes: > 0 } && _privateGradientOwners.Count == 0)
             || ResidentStepActive || InferenceCaptureActive || TrainingStep.InStep
             || Autodiff.GradientRecording.IsRecording<float>()
             || Compilation.GraphMode.IsActive || Gpu.DeferredScope.Current?.IsRecording == true
@@ -28,7 +40,12 @@ public partial class DirectGpuTensorEngine
             if (ResidentStepActive || InferenceCaptureActive || TrainingStep.InStep
                 || backend is IGpuGraphCapture { SupportsGraphCapture: true } capture && capture.IsStreamCapturing())
                 return;
-            broker.ReturnIncompatibleCellsToNativeAllocator(backend, requestedBytes);
+            _compiledWorkspaceBroker?.ReturnIncompatibleCellsToNativeAllocator(backend, requestedBytes);
+            for (int i = _privateGradientOwners.Count - 1; i >= 0; i--)
+            {
+                if (!_privateGradientOwners[i].TryGetTarget(out var owner)) _privateGradientOwners.RemoveAt(i);
+                else owner.ReturnPrivateGradientWorkspaceForInference(this, backend);
+            }
         }
     }
 
