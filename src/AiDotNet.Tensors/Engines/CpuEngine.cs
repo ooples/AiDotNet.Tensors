@@ -20677,7 +20677,9 @@ public partial class CpuEngine : ITensorLevelEngine
         using var kernelDataLease = kernel.LeaseArray();
         var kernelData = kernelDataLease.Array;
         using var outputOwnerKeep = new KeepAliveScope(output);
+        output.EnsureOwnedForDeviceWrite(); // Same COW/streaming write guard as LeaseArray, without a padded copy.
         var liveOutputArray = output.GetLiveBackingArrayAllowingPaddingOrNull();
+        if (liveOutputArray is not null) HostSync.TryMaterialize(liveOutputArray);
         using var outputDataLease = liveOutputArray is null ? output.LeaseArray() : default;
         var outputData = liveOutputArray ?? outputDataLease.Array;
 
