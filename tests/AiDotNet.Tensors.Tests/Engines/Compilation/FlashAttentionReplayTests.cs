@@ -324,11 +324,12 @@ public sealed class FlashAttentionReplayTests : IDisposable
             {
                 var point = parameters.Select(p => p.ToArray().Select(x => (double)x).ToArray()).ToArray();
                 var expected = Reference(point, weights.ToArray().Select(x => (double)x).ToArray(), null, 0, false);
-                Near(expected.Loss, plan.Step().ToArray()[0], 7e-5);
-                Check(expected.Output, output.ToArray().Select(x => (double)x).ToArray(), 7e-5);
-                Check(expected.Stats, stats.ToArray().Select(x => (double)x).ToArray(), 7e-5);
+                Near(expected.Loss, plan.Step().ToArray()[0], 7e-5, $"capture={capture}, step={step}, loss: ");
+                Check(expected.Output, output.ToArray().Select(x => (double)x).ToArray(), 7e-5, $"capture={capture}, step={step}, output");
+                Check(expected.Stats, stats.ToArray().Select(x => (double)x).ToArray(), 7e-5, $"capture={capture}, step={step}, stats");
                 for (int p = 0; p < 3; p++)
-                    Check(expected.Gradients[p], plan.Gradients[p].ToArray().Select(x => (double)x).ToArray(), 7e-5);
+                    Check(expected.Gradients[p], plan.Gradients[p].ToArray().Select(x => (double)x).ToArray(), 7e-5,
+                        $"capture={capture}, step={step}, gradient={p}");
             }
             if (capture)
             {
@@ -456,13 +457,13 @@ public sealed class FlashAttentionReplayTests : IDisposable
         return (loss, output, stats, gradients);
     }
 
-    private static void Check(double[] expected, double[] actual, double tolerance)
+    private static void Check(double[] expected, double[] actual, double tolerance, string context = "")
     {
         Assert.Equal(expected.Length, actual.Length);
-        for (int i = 0; i < expected.Length; i++) Near(expected[i], actual[i], tolerance);
+        for (int i = 0; i < expected.Length; i++) Near(expected[i], actual[i], tolerance, $"{context}[{i}]: ");
     }
 
-    private static void Near(double expected, double actual, double tolerance) =>
+    private static void Near(double expected, double actual, double tolerance, string context = "") =>
         Assert.True(double.IsFinite(actual) && Math.Abs(expected - actual) <= tolerance,
-            $"Expected {expected:R}, got {actual:R}; tolerance {tolerance:R}.");
+            $"{context}Expected {expected:R}, got {actual:R}; tolerance {tolerance:R}.");
 }
