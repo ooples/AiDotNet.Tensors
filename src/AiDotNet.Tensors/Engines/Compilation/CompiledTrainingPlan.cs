@@ -4170,10 +4170,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             ClearPlanBufferReleaseMarks();
             UploadHostWrittenParameters();
             var loss = StepCore();
-            // Graph replay runs no host code: re-arm declared outputs without downloading any activations.
-            if (_retainedOutputs.Count > 0 && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var outputEngine))
+            // Graph replay runs no host bookkeeping: re-arm observable device results without downloading them.
+            if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var outputEngine))
+            {
                 foreach (var output in _retainedOutputs.Where(output => output._gpuBuffer is not null && output._gpuBackend is not null))
                     outputEngine.BindResidentBuffer(output, output._gpuBuffer!, output._gpuBackend!);
+                if (_stepGraphExec != IntPtr.Zero)
+                    foreach (var gradient in ResultGradients())
+                        if (gradient._gpuBuffer is not null && gradient._gpuBackend is not null)
+                            outputEngine.BindResidentBuffer(gradient, gradient._gpuBuffer, gradient._gpuBackend);
+            }
             if (_namedRetainedOutputs.Count > 0 || RetainedOutputCapture<T>.IsActive)
             {
                 // Device-guarded optimizers may return before their skip verdict is read back.
