@@ -28,6 +28,13 @@ public sealed partial class CudaBackend
     private TunedKernelSlot<CudaConv2DArgs>? _conv2DForwardVendorSlot;
     private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataVendorSlot, _conv2DBackwardFilterVendorSlot;
 
+    private static readonly bool s_cudnnExecutionDiagnosticsEnabled =
+        Environment.GetEnvironmentVariable("AIDOTNET_CUDNN_EXECUTION_DIAGNOSTICS") == "1";
+    private long _cudnnForwardExecutions, _cudnnBackwardDataExecutions, _cudnnBackwardFilterExecutions;
+    internal long CudnnForwardExecutions => System.Threading.Volatile.Read(ref _cudnnForwardExecutions);
+    internal long CudnnBackwardDataExecutions => System.Threading.Volatile.Read(ref _cudnnBackwardDataExecutions);
+    internal long CudnnBackwardFilterExecutions => System.Threading.Volatile.Read(ref _cudnnBackwardFilterExecutions);
+
     private CuDnnNative.CudnnMathType CudnnConvMath =>
         CudaDispatchPolicy.ConvReducedPrecisionTF32 && ConvTensorCoresAvailable
             ? CuDnnNative.CudnnMathType.TensorOp
@@ -76,6 +83,8 @@ public sealed partial class CudaBackend
                 a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
         }
         RunConvEpiloguePasses(a);
+        if (s_cudnnExecutionDiagnosticsEnabled)
+            System.Threading.Interlocked.Increment(ref _cudnnForwardExecutions);
     }
 
     private void RunCudnnBackward(in TunedConv2DBackwardArgs a, int algorithm)
@@ -96,6 +105,11 @@ public sealed partial class CudaBackend
                 conv.Conv2DBackwardDataGpu(a.Second.Handle, a.First.Handle, a.Output.Handle, a.Batch, a.InChannels,
                     a.InHeight, a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW,
                     a.StrideH, a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
+        }
+        if (s_cudnnExecutionDiagnosticsEnabled)
+        {
+            if (a.WeightGradient) System.Threading.Interlocked.Increment(ref _cudnnBackwardFilterExecutions);
+            else System.Threading.Interlocked.Increment(ref _cudnnBackwardDataExecutions);
         }
     }
 
