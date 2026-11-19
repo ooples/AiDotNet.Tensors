@@ -9918,7 +9918,6 @@ internal static partial class BackwardFunctions<T>
                 Scale(engine, engine.TensorExp(engine.TensorNegate(Squared(engine, x))), c), engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
         using var xSrcLease = x.Lease();
         var xSrc = xSrcLease.Span;
         using var dYLease = gradOutput.Lease();
@@ -9928,17 +9927,47 @@ internal static partial class BackwardFunctions<T>
         bool add = target is not null && !overwrite;
         using var dXLease = gX.LeaseWritable();
         var dX = dXLease.Span;
-        var cT = ops.FromDouble(c);
-        for (int i = 0; i < dX.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            var expTerm = ops.Exp(ops.Negate(ops.Multiply(xSrc[i], xSrc[i])));
-            var contribution = ops.Multiply(dY[i], ops.Multiply(cT, expTerm));
-            dX[i] = add ? ops.Add(dX[i], contribution) : contribution;
+            for (int i = 0; i < dX.Length; i++)
+            {
+                float value = (float)(object)xSrc[i]!;
+                float exp = (float)Math.Exp(-(value * value));
+                float contribution = (float)(object)dY[i]! * ((float)c * exp);
+                dX[i] = (T)(object)(add ? (float)(object)dX[i]! + contribution : contribution);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            for (int i = 0; i < dX.Length; i++)
+            {
+                double value = (double)(object)xSrc[i]!;
+                double contribution = (double)(object)dY[i]! * (c * Math.Exp(-(value * value)));
+                dX[i] = (T)(object)(add ? (double)(object)dX[i]! + contribution : contribution);
+            }
+        }
+        else
+        {
+            ErfcGradientGeneric(xSrc, dY, dX, c, add);
         }
         if (target is null)
             DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
         else
             target.IncrementVersion();
+    }
+
+    [ScalarKernel("The fallback for non-float and non-double element types preserves the numeric type's exponential and ordered gradient addition.")]
+    private static void ErfcGradientGeneric(ReadOnlySpan<T> x, ReadOnlySpan<T> upstream,
+        Span<T> gradient, double coefficient, bool add)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var c = ops.FromDouble(coefficient);
+        for (int i = 0; i < gradient.Length; i++)
+        {
+            var exp = ops.Exp(ops.Negate(ops.Multiply(x[i], x[i])));
+            var contribution = ops.Multiply(upstream[i], ops.Multiply(c, exp));
+            gradient[i] = add ? ops.Add(gradient[i], contribution) : contribution;
+        }
     }
 
     /// <summary>Erfinv backward: d/dy erfinv(y) = √π/2 · e^(erfinv(y)²).</summary>
