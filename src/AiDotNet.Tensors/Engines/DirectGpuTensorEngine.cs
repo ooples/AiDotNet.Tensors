@@ -735,6 +735,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || t is null) return;
         if (!TryGetBackend(out var cb)) return;
+        // Unless a device copy rewrote it in its bound buffer since (a dropout mask redrawn on the device): then the
+        // buffer holds the value and the host array only a pending download of it, so dropping that download and
+        // uploading the host would put the previous step's value back.
+        if (ReferenceEquals(t._gpuBackend, cb) && ResidentInputHoldsDeviceWrite(t))
+        {
+            t._gpuBufferVersion = t.GpuCacheVersion;
+            return;
+        }
         // The host is authoritative for an external input (callers write batches through a host span). A device op on
         // a view sharing its array (the backward's Reshape or Transpose of the batch) can have armed a download into
         // it; materializing that would read back data the host already holds.
@@ -746,6 +754,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             cb.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
+            NoteResidentInputBinding(t, existing);
             return;
         }
         // Release the previous allocation before overwriting it. The reuse branch above already returned for a
@@ -757,6 +766,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBuffer = buf;
         t._gpuBackend = cb;
         t._gpuBufferVersion = t.GpuCacheVersion;
+        NoteResidentInputBinding(t, buf);
     }
 
     /// <summary>Downloads <paramref name="t"/>'s resident GPU buffer (which a replayed graph just wrote) into a
@@ -4264,6 +4274,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // updated in place (CommitParameterUpdatedOnDevice) and the in-place state a compiled plan keeps on the device (a
     // BatchNorm running statistic). Keyed by tensor, with that buffer; weak, so an entry goes with its tensor.
     private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, IGpuBuffer> _deviceAuthoritativeParameters = new();
+
+    // The buffer EnsureResidentInput bound to a compiled plan's external leaf, and the leaf version a device copy last
+    // wrote into it (-1 after a host upload). A captured graph reads that buffer through a baked pointer, so a device
+    // write into the leaf (a dropout mask redrawn on the device between replays) must land in it rather than in a
+    // fresh buffer, which retired the graph: the plan saw its leaf rebound and trained eagerly from then on.
+    private sealed class ResidentInputBinding
+    {
+        internal IGpuBuffer? Buffer;
+        internal int DeviceWrittenVersion = -1;
+    }
+
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, ResidentInputBinding> _residentInputBindings = new();
+
+    private void NoteResidentInputBinding(object tensor, IGpuBuffer buffer)
+    {
+        var binding = _residentInputBindings.GetValue(tensor, static _ => new ResidentInputBinding());
+        binding.Buffer = buffer;
+        binding.DeviceWrittenVersion = -1;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="tensor"/>'s value is the one a device copy last wrote into the buffer
+    /// <see cref="EnsureResidentInput{T}"/> bound to it: no version change and no host write since (a host write
+    /// materializes the pending download first, which clears it). Uploading its host array into that buffer would then
+    /// download the device value only to write it back.
+    /// </summary>
+    internal bool ResidentInputHoldsDeviceWrite<T>(Tensor<T> tensor)
+    {
+        if (tensor is null || !_residentInputBindings.TryGetValue(tensor, out var binding)
+            || binding.Buffer is not { } buffer || !ReferenceEquals(buffer, tensor._gpuBuffer)
+            || buffer.Handle == IntPtr.Zero || binding.DeviceWrittenVersion != tensor.GpuCacheVersion)
+            return false;
+        var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
+        return Helpers.HostSync.IsPending(key);
+    }
 
     /// <summary>
     /// Whether <paramref name="tensor"/> is still bound to a device buffer its owner updates on the device (see
@@ -25235,7 +25280,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // A destination with no device buffer yet gets one: the copy overwrites every element, so it needs no
                 // upload of its stale host values. Falling back to the host copy here downloaded the source, which
                 // inside a captured training step is a host read that aborts CUDA graph capture.
-                var destinationBuffer = ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false);
+                // A compiled plan's input buffer is the destination's own (the copy overwrites every element, so its
+                // contents do not matter): a captured graph reads it through a baked pointer.
+                var destinationBuffer = _residentInputBindings.TryGetValue(destination, out var inputBinding)
+                    && inputBinding.Buffer is { } inputBuffer && ReferenceEquals(inputBuffer, destination._gpuBuffer)
+                    && ReferenceEquals(destination._gpuBackend, backend) && inputBuffer.Handle != IntPtr.Zero
+                    && inputBuffer.Size >= destination.Length
+                    ? inputBuffer
+                    : ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false);
                 if (destinationBuffer is null || destinationBuffer.Handle == IntPtr.Zero)
                     destinationBuffer = GetOrCreateResidentBuffer(backend, destination, destination.Length, fullyWritten: true);
                 using var sourceBuffer = GetOrAllocateBuffer(backend, source);
@@ -25248,6 +25300,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // Invalidate CPU-derived weight packs without invoking the host-write GPU re-upload path.
                 base.InvalidatePersistentTensor(destination);
                 MarkCallerOwnedDestination(destination);
+                if (inputBinding is not null && ReferenceEquals(inputBinding.Buffer, destinationBuffer))
+                    inputBinding.DeviceWrittenVersion = destination.GpuCacheVersion;
                 return;
             }
             catch (NotSupportedException ex) {
