@@ -133,7 +133,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (groups.Count < 2) return null;
         var tensors = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         var protectedStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
-        foreach (var tensor in parameters.Concat(retained).Append(loss))
+        foreach (var tensor in parameters.Concat(retained).Concat(new[] { loss }))
         { tensors.Add(tensor); protectedStorage.Add(tensor.StorageIdentity); }
         var visitor = new WeightNormSavedStorageVisitor(protectedStorage, tensors);
         var lastWrite = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
