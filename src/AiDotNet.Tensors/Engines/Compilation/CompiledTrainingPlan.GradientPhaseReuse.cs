@@ -29,7 +29,13 @@ internal sealed partial class CompiledTrainingPlan<T>
         bool Inspect(object? value)
         {
             if (value is null || !seen.Add(value)) return true;
-            if (value is Tensor<T> tensor) { primalStorage.Add(tensor.StorageIdentity); return true; }
+            if (value is Tensor<T> tensor)
+            {
+                primalStorage.Add(tensor.StorageIdentity);
+                if (tensor.GraphBackingArrayIdentity is { } array) primalStorage.Add(array);
+                return true;
+            }
+            if (value is Array savedArray) primalStorage.Add(savedArray);
             if (value is Tensor<int> || value is Tensor<long>) return true;
             if (value is object[] nested) { foreach (var item in nested) if (!Inspect(item)) return false; return true; }
             // Native and opaque owners require a separate alias proof; decline the entire delayed schedule.
@@ -49,10 +55,12 @@ internal sealed partial class CompiledTrainingPlan<T>
             storageCounts[gradient.StorageIdentity] = storageCounts.TryGetValue(gradient.StorageIdentity, out int n) ? n + 1 : 1;
         var first = new Dictionary<Tensor<T>, int>(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
         var firstAny = new Dictionary<Tensor<T>, int>(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var lastAny = new Dictionary<Tensor<T>, int>(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
         void Touch(Tensor<T> primal, int action)
         {
             if (!gradMap.TryGetValue(primal, out var gradient)) return;
             if (!firstAny.ContainsKey(gradient)) firstAny.Add(gradient, action);
+            lastAny[gradient] = action;
             if (!candidates.Contains(gradient)
                 || primalStorage.Contains(gradient.StorageIdentity)
                 || !storageCounts.TryGetValue(gradient.StorageIdentity, out int count) || count != 1) return;
@@ -71,6 +79,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             _shadowDelayEligible.Add(item.Key);
         }
         PrepareShadowBankFirstTouches(firstAny, primalStorage, coverage.Count);
+        PrepareShadowBankLastTouches(firstAny, lastAny, coverage.Count);
     }
 
     private void BeginShadowGradientPhase(DirectGpuTensorEngine engine)
@@ -80,7 +89,11 @@ internal sealed partial class CompiledTrainingPlan<T>
         _shadowForwardAliases.Clear();
         _shadowPhaseProtectedRoots.Clear();
         _shadowPhaseActive = false;
-        if (CanUseGradientShadows(engine)) _firstWriteRedirects.CaptureRemapSources();
+        if (CanUseGradientShadows(engine))
+        {
+            _firstWriteRedirects.CaptureRemapSources();
+            CaptureGradientBankRemapSources();
+        }
         if (!CanUseGradientShadows(engine) || _shadowFirstTouches is null) return;
         if (!ProtectShadowSavedRoots(_shadowPhaseProtectedRoots)) return;
         _shadowPhaseActive = true;

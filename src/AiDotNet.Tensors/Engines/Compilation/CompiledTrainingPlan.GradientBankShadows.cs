@@ -47,7 +47,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     }
 
     private long ShadowCompletedGradientBanks(DirectGpuTensorEngine engine, IDirectGpuBackend backend,
-        HashSet<IGpuBuffer> protectedRoots)
+        HashSet<IGpuBuffer> protectedRoots, Array? onlyBank = null)
     {
         if (!_gradientBankShadowsEnabled || _scratchPool is not { } pool) return 0;
         long bytes = 0;
@@ -57,6 +57,7 @@ internal sealed partial class CompiledTrainingPlan<T>
                 || gradient.GraphBackingArrayIdentity is not T[] array
                 || array is not float[] destination || !ResultBufferTracker.IsUnexposedPrivateArray(array)
                 || ((Vector<T>)gradient.GraphVectorIdentity).ResultOwner is not { } owner) continue;
+            if (onlyBank is not null && !ReferenceEquals(array, onlyBank)) continue;
             bool loan = _shadowBankLoans.TryGetValue(array, out var held) && ReferenceEquals(held.Buffer, root);
             if (!loan && (StepScratchPool.IsPooled(root) || !_privateGradientAllocations.TryGetValue(root, out _))) continue;
             if (!ResidentHostMirror.TryCollectGradientBankBindings(array, root, backend, owner,
@@ -86,7 +87,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (bytes != 0)
         {
             GradientBankShadowBytes += bytes;
-            GradientBankShadowCompletedSteps++;
+            if (onlyBank is null) GradientBankShadowCompletedSteps++;
         }
         return bytes;
     }

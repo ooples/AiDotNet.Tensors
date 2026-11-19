@@ -13,6 +13,33 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public sealed class GradientShadowReuseTests
 {
+    [Fact]
+    public void SharedPhysicalTargetsRemapIndependentlyAtTheirBackwardActions()
+    {
+        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        using var sourceA = backend.AllocateBuffer(16);
+        using var sourceB = backend.AllocateBuffer(16);
+        using var sharedOld = backend.AllocateBuffer(16);
+        using var nextA = backend.AllocateBuffer(16);
+        using var nextB = backend.AllocateBuffer(16);
+        long slotA = 11L << 32, slotB = 12L << 32;
+        var table = new FirstWriteRedirectTable();
+        table.BeginRun();
+        table.NoteContribution(sourceA, 11); table.Offer(slotA, sourceA, sharedOld);
+        table.NoteContribution(sourceB, 12); table.Offer(slotB, sourceB, sharedOld);
+        table.EndRun(true);
+        table.CaptureRemapSources();
+        table.RemapCapturedTargetsForAction(11, new Dictionary<IGpuBuffer, IGpuBuffer> { [sharedOld] = nextA });
+        Assert.True(table.TryGetTarget(slotA, out var actualA)); Assert.Same(nextA, actualA);
+        Assert.True(table.TryGetTarget(slotB, out var actualB)); Assert.Same(sharedOld, actualB);
+        table.RemapCapturedTargetsForAction(12, new Dictionary<IGpuBuffer, IGpuBuffer> { [sharedOld] = nextB });
+        Assert.True(table.TryGetTarget(slotA, out actualA)); Assert.Same(nextA, actualA);
+        Assert.True(table.TryGetTarget(slotB, out actualB)); Assert.Same(nextB, actualB);
+        table.RemapCapturedTargetsForAction(11, new Dictionary<IGpuBuffer, IGpuBuffer>(), new HashSet<IGpuBuffer> { sharedOld });
+        Assert.False(table.TryGetTarget(slotA, out _));
+        Assert.True(table.TryGetTarget(slotB, out actualB)); Assert.Same(nextB, actualB);
+    }
+
     [SkippableFact]
     public void FullBankShadowPreservesWholeAndPaddedVectorAliasesAndDeclinesForeignCopies()
     {

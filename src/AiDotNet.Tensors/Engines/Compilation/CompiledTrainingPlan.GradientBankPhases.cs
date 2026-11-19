@@ -28,7 +28,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         foreach (var gradient in _preAllocatedGrads)
         {
             if (gradient.GraphBackingArrayIdentity is not T[] array || !ResultBufferTracker.IsUnexposedPrivateArray(array)) continue;
-            if (primalStorage.Contains(gradient.StorageIdentity)) excluded.Add(array);
+            if (primalStorage.Contains(gradient.StorageIdentity) || primalStorage.Contains(array)) excluded.Add(array);
             if (!_shadowBankAliases.TryGetValue(array, out var aliases))
                 _shadowBankAliases[array] = aliases = new List<Tensor<T>>();
             aliases.Add(gradient);
@@ -54,7 +54,8 @@ internal sealed partial class CompiledTrainingPlan<T>
                 || !_shadowBankAliases.TryGetValue(array, out var aliases)) continue;
             bool eligible = true;
             foreach (var alias in aliases)
-                if (alias._gpuBuffer is { Handle: var handle } && handle != IntPtr.Zero
+                if (!ReferenceEquals(alias.GraphBackingArrayIdentity, array)
+                    || alias._gpuBuffer is { Handle: var handle } && handle != IntPtr.Zero
                     || !engine.CanUseCompiledGradientShadow(alias)) { eligible = false; break; }
             if (eligible) _shadowPendingBanks.Add(array);
         }

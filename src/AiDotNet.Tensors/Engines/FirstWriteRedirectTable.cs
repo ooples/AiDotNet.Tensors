@@ -92,6 +92,19 @@ internal sealed class FirstWriteRedirectTable
                 _redirects[pair.Key] = replacement;
     }
 
+    internal void RemapCapturedTargetsForAction(int action, IReadOnlyDictionary<IGpuBuffer, IGpuBuffer> replacements,
+        ISet<IGpuBuffer>? ambiguous = null)
+    {
+        foreach (var pair in _remapSources)
+        {
+            if (ActionOf(pair.Key) != action || !_redirects.ContainsKey(pair.Key)) continue;
+            // Multiple logical destinations can share an old native root. If liveness cannot identify one,
+            // compute the contribution normally and copy it; a stale in-place destination would corrupt a gradient.
+            if (ambiguous?.Contains(pair.Value) == true) _redirects.Remove(pair.Key);
+            else if (replacements.TryGetValue(pair.Value, out var replacement)) _redirects[pair.Key] = replacement;
+        }
+    }
+
     /// <summary>
     /// Ends a run of the body. After an executed (uncaptured) run, commits the offers whose contribution had no other
     /// consumer, and blocks every slot whose buffer had a second one. A captured run only recorded, so it changes nothing.

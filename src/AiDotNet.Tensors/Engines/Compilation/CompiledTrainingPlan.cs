@@ -5730,7 +5730,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int i = 0; i < bwd.Length; i++)
             {
                 if (residentEngine is not null && !capturingNow)
+                {
                     BindShadowGradientsStartingAt(i, residentEngine, backend, esz);
+                    RefreshShadowGradientRedirectsForAction(i);
+                }
                 if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 long rb = 0;
@@ -5739,6 +5742,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (resBwdUs is not null) { ProfSync(engine); resBwdUs[i] += ProfElapsedUs(rb); }
                 de?.EndScratchAction();
                 if (lendPool is not null && lend is not null && lend[i] is { } dead) lendPool.Lend(dead);
+                if (residentEngine is not null && !capturingNow)
+                    ShadowGradientBanksEndingAt(i, residentEngine, backend);
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
                     string nm = i < bwdNames.Length ? bwdNames[i] : "?";

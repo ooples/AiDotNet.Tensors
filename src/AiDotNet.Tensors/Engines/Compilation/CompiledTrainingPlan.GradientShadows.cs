@@ -48,6 +48,9 @@ internal sealed partial class CompiledTrainingPlan<T>
 
     private void RefreshShadowGradientRedirects()
     {
+        // Intra-step bank reuse makes one old physical buffer represent different logical banks at different
+        // actions. Those destinations are remapped by action below, rather than through one global buffer map.
+        if (_shadowBankLastTouches is not null) return;
         _shadowTargetReplacements.Clear();
         _shadowRefreshedGradients.Clear();
         foreach (var pair in _shadowPreviousBuffers)

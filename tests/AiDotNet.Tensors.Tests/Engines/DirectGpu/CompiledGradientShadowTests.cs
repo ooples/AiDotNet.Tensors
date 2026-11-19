@@ -33,7 +33,7 @@ public sealed class CompiledGradientShadowTests
         return plan;
     }
 
-    private static (List<float[]> Values, long Bytes, long Steps, long Reuses, long Delayed, long PhaseBytes, long CacheBytes) Run(DirectGpuTensorEngine gpu,
+    private static (List<float[]> Values, long Bytes, long Steps, long Reuses, long Delayed, long PhaseBytes, long CacheBytes, long EarlyBytes) Run(DirectGpuTensorEngine gpu,
         bool enabled, bool gradientView, bool inputGradients)
     {
         Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_SHADOWS", enabled ? "1" : "0");
@@ -65,6 +65,8 @@ public sealed class CompiledGradientShadowTests
         long bytes = a.GradientShadowBytes + b.GradientShadowBytes;
         long steps = a.GradientShadowCompletedSteps + b.GradientShadowCompletedSteps;
         long reuses = a.GradientShadowReuses + b.GradientShadowReuses;
+        if (enabled && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_BANK_LAST_USE") == "1")
+            Assert.True(a.GradientBankEarlyShadows + b.GradientBankEarlyShadows > 0, "Private banks must retire during backward.");
         var last = a.Gradients[0];
         var expected = last.ToArray();
         a.Dispose();
@@ -72,7 +74,8 @@ public sealed class CompiledGradientShadowTests
         return (values, bytes, steps, reuses,
             a.GradientPhaseDelayedBindings + b.GradientPhaseDelayedBindings,
             a.GradientPhaseReuseBytes + b.GradientPhaseReuseBytes,
-            a.GradientWorkspaceCacheReturnedBytes + b.GradientWorkspaceCacheReturnedBytes);
+            a.GradientWorkspaceCacheReturnedBytes + b.GradientWorkspaceCacheReturnedBytes,
+            a.GradientBankEarlyShadowBytes + b.GradientBankEarlyShadowBytes);
     }
 
     [SkippableTheory]
@@ -100,7 +103,8 @@ public sealed class CompiledGradientShadowTests
             if (Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_PHASE_REUSE") == "1")
             {
                 Assert.True(shadow.Delayed > 0, "The first-use path must actually execute.");
-                Assert.True(shadow.PhaseBytes > 0, "Dead forward or backward backing must actually serve public gradients.");
+                Assert.True(shadow.PhaseBytes > 0 || shadow.EarlyBytes > 0,
+                    "Dead forward/backward or retired private-bank backing must actually serve gradients.");
             }
             Assert.Equal(baseline.Values.Count, shadow.Values.Count);
             for (int i = 0; i < shadow.Values.Count; i++) Assert.Equal(baseline.Values[i], shadow.Values[i]);
@@ -131,6 +135,7 @@ public sealed class CompiledGradientShadowTests
             Assert.Equal(0, plan.GradientShadowCompletedSteps);
             Assert.Equal(0, plan.GradientPhaseDelayedBindings);
             Assert.Equal(0, plan.GradientPhaseReuseBytes);
+            Assert.Equal(0, plan.GradientBankEarlyShadows);
         }
         finally
         {
