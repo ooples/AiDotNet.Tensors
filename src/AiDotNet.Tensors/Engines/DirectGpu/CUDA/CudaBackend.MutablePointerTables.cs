@@ -56,12 +56,13 @@ public sealed partial class CudaBackend
         IReadOnlyList<IGpuBuffer>? second, IReadOnlyList<IGpuBuffer>? third, IReadOnlyList<IGpuBuffer>? fourth)
     {
         int count = first.Count;
-        bool changed = false;
+        bool changed = table.PointerUploadPending;
         for (int i = 0; i < table.Handles.Length; i++)
         {
             IntPtr address = i < count ? first[i].Handle : i < 2 * count ? second![i - count].Handle
                 : i < 3 * count ? third![i - 2 * count].Handle : fourth![i - 3 * count].Handle;
             if (table.Handles[i] == address) continue;
+            table.PointerUploadPending = true;
             table.Handles[i] = address;
             WriteAddress(table.StagingAddresses, i, address);
             changed = true;
@@ -76,6 +77,8 @@ public sealed partial class CudaBackend
                 (IntPtr)source, (ulong)table.StagingAddresses.Length, _stream), "cuMemcpyHtoDAsync(mutable table)");
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(mutable table)");
         }
+        // A failed copy or stream wait must force a full upload on the next call, even for the same handles.
+        table.PointerUploadPending = false;
         return true;
     }
 }

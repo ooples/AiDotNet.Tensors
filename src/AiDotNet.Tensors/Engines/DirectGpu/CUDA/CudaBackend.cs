@@ -15257,6 +15257,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         public IGpuBuffer? Pointers, SizesBuffer, ChunkTensor, ChunkStart;
         public int TotalChunks;
         public long MutableOwner;
+        public bool PointerUploadPending;
         public byte[] StagingAddresses = Array.Empty<byte>();
 
 
