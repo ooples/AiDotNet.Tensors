@@ -31236,9 +31236,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var gi = UploadTensorRaw(b, input);
-                var go = b.AllocateBuffer(input.Length);
-                b.PowScalar(gi, go, Convert.ToSingle(exponent), input.Length);
-                return DeferTensorResult<T>(b, go, input.Length, input.Shape.ToArray());
+                // Pow fully overwrites its output. Reuse the compiled action's scratch just like other unary ops.
+                var outputLease = AllocateFullyWrittenOutputBuffer(b, input.Length);
+                try
+                {
+                    b.PowScalar(gi, outputLease.Buffer, Convert.ToSingle(exponent), input.Length);
+                    var result = DeferTensorResult<T>(b, outputLease.Buffer, input.Length, input.Shape.ToArray());
+                    outputLease.RelinquishOwnership();
+                    return result;
+                }
+                finally
+                {
+                    outputLease.DisposeAfterQueuedUse(b);
+                }
             }
             catch { }
         }
