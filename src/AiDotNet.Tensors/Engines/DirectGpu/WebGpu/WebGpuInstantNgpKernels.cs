@@ -398,8 +398,10 @@ struct PositionsP { rows: i32, chunk: i32, vocab: i32, pad: i32 };
 @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
     let gid = i32(id.x);
     if (gid >= p.rows) { return; }
-    let tid = clamp(ids[gid], 0, p.vocab - 1);
+    let raw = ids[gid];
+    let tid = clamp(raw, 0, p.vocab - 1);
     positionBits[gid] = bitcast<f32>((gid % p.chunk) * p.vocab + tid);
+    positionBits[p.rows + gid] = select(bitcast<f32>(0x7fc00000u), 0.0, raw == tid);
 }
 ";
 

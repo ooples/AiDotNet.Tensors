@@ -4825,6 +4825,10 @@ public partial class DirectGpuTensorEngine
         lock (copy)
         {
             if (copy.Buffer is not null && copy.Capacity == n && copy.Version == version) return;
+            if (copy.Buffer is not null && copy.Capacity != n)
+                throw new InvalidOperationException(
+                    $"A host index tensor's device copy cannot be resized ({copy.Capacity} -> {n}): a captured graph " +
+                    "reads its buffer through a baked pointer.");
             var data = indices.ToArray();
             if (copy.UpperBound > 0)
                 for (int i = 0; i < n; i++)
@@ -6544,10 +6548,18 @@ public partial class DirectGpuTensorEngine
             if (targetIdTensor is not null && (ResidentStepActive
                     || (backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())))
             {
-                if (!TryFusedCeCapturedIds(backend, targetIdTensor, weight._shape[1], out var capturedIds)) return false;
-                using (capturedIds)
-                    return TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias, null,
-                        needHidden, needWeight, needBias, out gradHidden, out gradWeight, out gradBias, capturedIds.Buffer);
+                // Declining here would send the caller to the host backward, which a capture would bake in with the
+                // captured batch's labels: fail the capture instead, so the step runs uncaptured.
+                bool ran = false;
+                if (TryFusedCeCapturedIds(backend, targetIdTensor, weight._shape[1], out var capturedIds))
+                    using (capturedIds)
+                        ran = TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias, null,
+                            needHidden, needWeight, needBias, out gradHidden, out gradWeight, out gradBias, capturedIds.Buffer);
+                if (!ran && backend is DirectGpu.IGpuGraphCapture c2 && c2.IsStreamCapturing())
+                    throw new NotSupportedException(
+                        "The fused cross-entropy backward cannot run on the device inside this capture; the host " +
+                        "backward would replay the captured batch's labels.");
+                return ran;
             }
             if (targetIds is not null && TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias,
                     targetIds, needHidden, needWeight, needBias, out gradHidden, out gradWeight, out gradBias))
@@ -6594,7 +6606,8 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception)
         {
-            if (ThrowOnGpuKernelFallback) throw;
+            // Inside a capture a false would run the host backward, baked in with the captured labels: fail the capture.
+            if (ThrowOnGpuKernelFallback || (backend is DirectGpu.IGpuGraphCapture capturing && capturing.IsStreamCapturing())) throw;
             return false;
         }
     }
@@ -6642,6 +6655,7 @@ public partial class DirectGpuTensorEngine
         using var rowStat = AllocateStreamOrderedScratch(backend, chunk);
         using var onesV = AllocateStreamOrderedScratch(backend, vocab);
         using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
+        using var chunkFlags = deviceIds is not null ? AllocateStreamOrderedScratch(backend, chunk) : null;
         backend.Fill(ones, 1f, chunk);
         backend.Fill(onesV, 1f, vocab);
         for (int r0 = 0; r0 < n; r0 += chunk)
@@ -6660,6 +6674,11 @@ public partial class DirectGpuTensorEngine
             backend.Log(rowStat, rowStat, c);                              // shifted lse_r
             backend.Gemm(ones, rowStat, meanLoss, 1, 1, c, 1f, beta);      // sum += 1ᵀ·lse
             backend.Gemm(ones, picked, meanLoss, 1, 1, c, -1f, 1f);        // sum -= 1ᵀ·target
+            if (chunkFlags is not null)
+            {
+                backend.Copy(positions.Buffer, n + r0, chunkFlags, 0, c);
+                backend.Gemm(ones, chunkFlags, meanLoss, 1, 1, c, 1f, 1f); // NaN when a row's id was out of range
+            }
         }
         backend.Scale(meanLoss, meanLoss, 1f / n, 1);
         RecordFusedCeForwardChunks((n + chunk - 1) / chunk);
@@ -6718,8 +6737,11 @@ public partial class DirectGpuTensorEngine
         using var ones = needBias ? AllocateStreamOrderedScratch(backend, chunk) : default;
         using var minusOnes = AllocateStreamOrderedScratch(backend, chunk);
         using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
+        using var chunkFlags = deviceIds is not null ? AllocateStreamOrderedScratch(backend, chunk) : null;
+        using var onesV = deviceIds is not null ? AllocateStreamOrderedScratch(backend, vocab) : null;
         if (needBias) backend.Fill(ones!, 1f, chunk);
         backend.Fill(minusOnes, -1f, chunk);
+        if (onesV is not null) backend.Fill(onesV, 1f, vocab);
         for (int r0 = 0; r0 < n; r0 += chunk)
         {
             int c = Math.Min(chunk, n - r0), cv = c * vocab;
@@ -6732,6 +6754,12 @@ public partial class DirectGpuTensorEngine
             backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
             backend.Scale(logits, logits, 1f / n, cv);                           // / N
             backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
+            if (chunkFlags is not null)
+            {
+                // A row whose id was out of range gets NaN gradients, as its loss term is NaN.
+                backend.Copy(positions.Buffer, n + r0, chunkFlags, 0, c);
+                backend.Gemm(chunkFlags, onesV!, work, c, vocab, 1, 1f, 1f);
+            }
             if (needHidden)
             {
                 backend.MatMulTransposed(work, wB.Buffer, dhChunk!, c, d, vocab); // dHidden_c = dLogits_c·Wᵀ
@@ -6775,7 +6803,8 @@ public partial class DirectGpuTensorEngine
         if (deviceIds is not null)
         {
             if (backend is not DirectGpu.IFusedCrossEntropyPositionsBackend positionsBackend) return false;
-            var scratch = AllocateStreamOrderedScratch(backend, n);
+            // [0, n): positions; [n, 2n): row flags (0, or NaN for an out-of-range id).
+            var scratch = AllocateStreamOrderedScratch(backend, checked(2 * n));
             positionsBackend.FusedCrossEntropyTargetPositions(deviceIds, scratch, n, chunk, vocab);
             positions = new OwnedBuffer(scratch, ownsBuffer: true);
             return true;

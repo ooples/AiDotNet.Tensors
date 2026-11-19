@@ -372,8 +372,10 @@ layout(push_constant) uniform P { int rows; int chunk; int vocab; };
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= rows) return;
-    int id = clamp(ids[gid], 0, vocab - 1);
+    int raw = ids[gid];
+    int id = clamp(raw, 0, vocab - 1);
     positionBits[gid] = intBitsToFloat((gid % chunk) * vocab + id);
+    positionBits[rows + gid] = raw == id ? 0.0 : intBitsToFloat(0x7fc00000);
 }
 ";
 

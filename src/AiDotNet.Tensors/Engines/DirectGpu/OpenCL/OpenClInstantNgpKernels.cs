@@ -338,9 +338,10 @@ __kernel void fused_ce_target_positions(
 {
     int gid = get_global_id(0);
     if (gid >= rows) return;
-    int id = ids[gid];
-    id = id < 0 ? 0 : (id >= vocab ? vocab - 1 : id);
+    int raw = ids[gid];
+    int id = raw < 0 ? 0 : (raw >= vocab ? vocab - 1 : raw);
     positionBits[gid] = as_float((gid % chunk) * vocab + id);
+    positionBits[rows + gid] = raw == id ? 0.0f : as_float(0x7fc00000);
 }
 
 __kernel void resident_indices_to_int32(

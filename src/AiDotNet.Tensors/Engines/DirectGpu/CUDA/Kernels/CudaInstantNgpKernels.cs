@@ -364,9 +364,10 @@ extern ""C"" __global__ __launch_bounds__(256) void fused_ce_target_positions(
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= rows) return;
-    int id = ids[gid];
-    id = id < 0 ? 0 : (id >= vocab ? vocab - 1 : id);
+    int raw = ids[gid];
+    int id = raw < 0 ? 0 : (raw >= vocab ? vocab - 1 : raw);
     positionBits[gid] = __int_as_float((gid % chunk) * vocab + id);
+    positionBits[rows + gid] = raw == id ? 0.0f : __int_as_float(0x7fc00000);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void resident_one_hot_int32(

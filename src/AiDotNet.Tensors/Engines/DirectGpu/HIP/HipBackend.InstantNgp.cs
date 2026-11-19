@@ -216,7 +216,6 @@ public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRen
         void** args = stackalloc void*[5];
         args[0] = &i; args[1] = &o; args[2] = &r; args[3] = &c; args[4] = &v;
         LaunchKernel(kernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
-        Synchronize();
     }
 
     public unsafe void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
