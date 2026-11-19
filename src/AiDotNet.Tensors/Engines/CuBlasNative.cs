@@ -171,7 +171,7 @@ public static class CuBlasNative
 
 #endif
 
-    private static string[] GetCudaBinDirectories()
+    internal static string[] GetCudaBinDirectories()
     {
         var dirs = new System.Collections.Generic.List<string>();
 
