@@ -1242,7 +1242,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int k = 0; k < window; k++) rates[k] = (float)optimizer.Schedule.GetLr(first + k);
             io.WriteLearningRates(replay, first, rates);
         }
-        if ((replay & 1) == 1 && _stepGraphExecOdd != IntPtr.Zero) exec = _stepGraphExecOdd;
         LaunchStepGraph(cb, exec);
         io.Flush();
         _stepIoLaunched = replay + 1;
@@ -4104,23 +4103,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
             gpuEngine?.NoteCompiledStepThread(_planId);
             if (gpuEngine is null) return StepLocked();
-            lock (gpuEngine.CompiledStepLock)
-            {
-                // A device label this plan's previous step found out of range (read asynchronously: see the engine's
-                // label-error word) fails this step before it runs. The read consumes the copy, so a caller that
-                // catches and feeds a good batch steps on. The word is cleared before each step and copied into this
-                // plan's own readback after it, so a step only ever sees its own rows.
-                if (gpuEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback))
-                    throw new ArgumentOutOfRangeException("targetIds",
-                        "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). Where the " +
-                        "backend propagates NaN that step was discarded as non-finite; elsewhere its update may have been applied.");
-                _fusedCeLabelsValidated = false;
-                gpuEngine.ClearFusedCeLabelError();
-                var loss = StepLocked();
-                ThrowOnInvalidCurrentFusedCeLabels();
-                gpuEngine.QueueFusedCeLabelErrorCheck(ref _labelErrorReadback);
-                return loss;
-            }
+            lock (gpuEngine.CompiledStepLock) return StepLocked();
         }
         catch
         {
@@ -4215,7 +4198,31 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    private IntPtr NextStepGraph =>
+        _stepIo is not null && (_stepIoLaunched & 1) != 0 && _stepGraphExecOdd != IntPtr.Zero
+            ? _stepGraphExecOdd : _stepGraphExec;
+
     private Tensor<T> StepLocked()
+    {
+        var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
+        if (gpuEngine is null) return ExecuteStepLocked();
+        // A device label this plan's previous step found out of range (read asynchronously: see the engine's
+        // label-error word) fails this step before it runs. The read consumes the copy, so a caller that
+        // catches and feeds a good batch steps on. The word is cleared before each step and copied into this
+        // plan's own readback after it, so a step only ever sees its own rows.
+        if (gpuEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback))
+            throw new ArgumentOutOfRangeException("targetIds",
+                "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). Where the " +
+                "backend propagates NaN that step was discarded as non-finite; elsewhere its update may have been applied.");
+        _fusedCeLabelsValidated = false;
+        gpuEngine.ClearFusedCeLabelError();
+        var loss = ExecuteStepLocked();
+        ThrowOnInvalidCurrentFusedCeLabels();
+        gpuEngine.QueueFusedCeLabelErrorCheck(ref _labelErrorReadback);
+        return loss;
+    }
+
+    private Tensor<T> ExecuteStepLocked()
     {
         ResolvePingPongClaims(force: false);
         // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
@@ -4410,7 +4417,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     _scratchPinsAtCapture = _scratchPool?.PinnedCount ?? 0;
                     // Executes THIS step on the just-uploaded indices (through the step I/O's staging when it has one).
-                    if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, exec);
+                    if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, NextStepGraph);
                     else LaunchStepGraph(cb, exec);
                     RefreshLossFromCapturedGraph(gte);
                     if (_capturedOptimizer is { } capturedFirst)
@@ -4444,15 +4451,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     return StepResidentOrEager();
                 }
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
-                try
-                {
-                    gte.RefreshHostIndexDeviceCopiesNow(_stepGraphExec);
-                }
-                catch (InvalidOperationException)
-                {
-                    InvalidateCapturedStepGraph();
-                    return StepResidentOrEager();
-                }
                 if (_stepIo is not null ? !StepIoInputsStillBound(cb) : !RefreshGraphInputInPlace(cb))
                 {
                     // An input the graph reads through a baked pointer was released: replaying would read freed
@@ -4461,8 +4459,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _graphStepDisabled = true;
                     return StepEager();
                 }
-                if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, _stepGraphExec);
-                else LaunchStepGraph(cb, _stepGraphExec);
+                var replayGraph = NextStepGraph;
+                try
+                {
+                    gte.RefreshHostIndexDeviceCopiesNow(replayGraph);
+                }
+                catch (InvalidOperationException)
+                {
+                    InvalidateCapturedStepGraph();
+                    return StepResidentOrEager();
+                }
+                if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, replayGraph);
+                else LaunchStepGraph(cb, replayGraph);
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
                 RefreshLossFromCapturedGraph(gte);
                 if (_capturedOptimizer is { } capturedReplay)

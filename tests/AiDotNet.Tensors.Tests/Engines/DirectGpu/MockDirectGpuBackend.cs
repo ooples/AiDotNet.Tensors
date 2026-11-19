@@ -64,9 +64,6 @@ internal sealed class MockBackendState
     public string DeviceVendor { get; set; } = "Mock";
     public List<int> AllocationSizes { get; } = new();
     public List<MockGpuBuffer> AllocatedBuffers { get; } = new();
-    public bool Capturing { get; set; }
-    public long NextGraph { get; set; }
-    public int GraphLaunches { get; set; }
     public int DownloadBufferCalls { get; set; }
     public int ClassifyFloatCalls { get; set; }
     public int FillCalls { get; set; }
@@ -78,6 +75,9 @@ internal sealed class MockBackendState
     public int EqualsCalls { get; set; }
     public int NotEqualsCalls { get; set; }
     public int WhereCalls { get; set; }
+    public bool Capturing { get; set; }
+    public long NextGraph { get; set; }
+    public int GraphLaunches { get; set; }
     public List<string> OptimizerCalls { get; } = new();
 }
 
