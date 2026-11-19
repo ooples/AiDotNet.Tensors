@@ -100,7 +100,9 @@ public class ProgramOperationReplaySweepTests : IDisposable
                 // Check that these fail explicitly rather than silently freezing their values into a trace.
                 bool nonPortable = name is "MaxPool2DWithIndices" or "MaxPool3DWithIndices"
                     or "NativeSpectralFilter" or "NativeSpectralFilterBatch"
-                    || (name == "ReduceMax" && method.GetParameters().Any(p => p.ParameterType.IsByRef))
+                    // A CsrGraph (host adjacency) and a Random (attention-dropout source) are outside it too.
+                    or "GraphAttentionCsr"
+                    ||(name == "ReduceMax" && method.GetParameters().Any(p => p.ParameterType.IsByRef))
                     || args.Any(x => x is Tensor<Bit>);
                 if (nonPortable)
                 {

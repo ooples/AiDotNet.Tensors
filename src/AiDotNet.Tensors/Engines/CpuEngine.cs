@@ -6837,6 +6837,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // a snapshot and the write is recorded snapshot -> tensor (CpuEngine.InPlace). The kernels below record nothing.
         if (IsRecordingInPlace<T>()) { InPlaceEager(this, a, "TensorMultiplyScalarInPlace", (e, x) => e.TensorMultiplyScalar(x, scalar)); return; }
 
+        // The SIMD and generic kernels write unmarked storage. Notify views, saved tensors and derived-weight
+        // caches once before any of those paths mutates it, as the binary in-place operators do.
+        a.IncrementVersion();
+
         int length = a.Length;
 
         // Float fast path: SIMD MultiplyScalar with parallel chunking
@@ -11194,6 +11198,21 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 #endif
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && height == 1 && kernelHeight == 1 && outputHeight == 1
+            && (long)inChannels * kernelWidth * outputWidth >= 1_048_576)
+        {
+            int inOffP = 0, kOffP = 0, outOffP = 0;
+            var inArrP = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOffP) : null);
+            var kArrP = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOffP) : null);
+            var outArrP = outputData ?? output.GetCpuBackingForContiguousWrite(out outOffP);
+            if (inArrP is not null && kArrP is not null && outArrP is not null
+                && TryConv1DColumnPanels(inArrP, kArrP, outArrP,
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth,
+                    inputStorageOffset: inOffP, outputStorageOffset: outOffP, kernelStorageOffset: kOffP))
+                return;
+        }
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))
         {
@@ -15674,6 +15693,20 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = preAllocatedOutput ?? (fullyWrittenByRoute
             ? TensorAllocator.RentUninitialized<T>([batch, outChannels, outputHeight, outputWidth])
             : TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]));
+        // The NCHW dispatcher reads/writes raw storage with offsets. Materializing arrays before it would
+        // copy an arena/view destination and discard its writes; it also copies every offset-bearing input.
+        if (typeof(T) == typeof(float) && input.Layout == LinearAlgebra.TensorLayout.Nchw)
+        {
+            DispatchFloatConv2D((Tensor<float>)(object)input, (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result, null, null, null,
+                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+            DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel, BackwardFunctions<T>.Conv2DBackward,
+                new object[] { stride, padding, dilation });
+            if (AutoTracer.ShouldRecord) AutoTracer.RecordOp("Conv2D", result, eng => eng.Conv2D(inputOrig, kernel, stride, padding, dilation));
+            return result;
+        }
+
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
         using var outputDataLease = result.LeaseArray();
@@ -15924,7 +15957,7 @@ public partial class CpuEngine : ITensorLevelEngine
         void ProcessImage(int b)
         {
             // Rent a scratch col buffer of size [K, N] = K*N floats.
-            var col = System.Buffers.ArrayPool<float>.Shared.Rent(K * N);
+            var col = CpuStorageAllocationDiagnostics.RentWorkspace<float>(K * N, "workspace.conv");
             try
             {
                 // im2col: for each output position (oh, ow) and each kernel
@@ -16024,9 +16057,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (N <= 128 && outC >= 128)
                 {
                     // col stored [K, N] → colT [N, K]
-                    var colT = System.Buffers.ArrayPool<float>.Shared.Rent(N * K);
+                    var colT = CpuStorageAllocationDiagnostics.RentWorkspace<float>(N * K, "workspace.conv");
                     // output computed as [N, M], then transposed to [M, N]
-                    var outT = System.Buffers.ArrayPool<float>.Shared.Rent(N * outC);
+                    var outT = CpuStorageAllocationDiagnostics.RentWorkspace<float>(N * outC, "workspace.conv");
                     // Kernel pre-transpose cache: for a given input kernel
                     // float[] reference, keep a pre-transposed [K, M] copy.
                     // This is the "fast-forward transform" — moves the 2.4 MB
@@ -16264,7 +16297,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         void ProcessImage(int b)
         {
-            var col = System.Buffers.ArrayPool<double>.Shared.Rent(K * N);
+            var col = CpuStorageAllocationDiagnostics.RentWorkspace<double>(K * N, "workspace.conv");
             try
             {
                 Helpers.Im2ColHelper.Im2Col(
@@ -16310,7 +16343,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
             return TensorAllocator.Rent<T>(shape, (T[])(object)floatResult);
         var ops = MathHelper.GetNumericOperations<T>();
-        var arr = new T[floatResult.Length];
+        var arr = CpuStorageAllocationDiagnostics.NewNumericArray<T>(floatResult.Length, "numeric.conv_output_or_scratch");
         ops.FromFloatSpan(new ReadOnlySpan<float>(floatResult), new Span<T>(arr));
         return TensorAllocator.Rent<T>(shape, arr);
     }
@@ -16364,7 +16397,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var kW = kernel.GetCpuBackingForStridedRead(out int kOffW) as float[];
             if (gW is not null && kW is not null)
             {
-                var dXW = new float[batch * inChannels * height * width];
+                var dXW = CpuStorageAllocationDiagnostics.NewNumericArray<float>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
                 Simd.WinogradF43.BackwardInput(gW, gOffW, kW, kOffW, dXW, 0, accumulate: false,
                     batch, inChannels, height, width, outChannels);
                 return RentFloatResult<T>(inputShape, dXW);
@@ -16379,7 +16412,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // as one small GEMM per batch row instead of the im2col / col2im route.
             var dYF = (float[])(object)gradOutput.GetFlattenedData();
             var wF = (float[])(object)kernel.GetFlattenedData();
-            var dXF = new float[batch * inChannels * height * width];
+            var dXF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
             PointwiseInputGradFloat(dYF, wF, dXF, batch, outChannels, inChannels, height * width);
             return RentFloatResult<T>(inputShape, dXF);
         }
@@ -16389,7 +16422,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
-            var gradInputF = new float[batch * inChannels * height * width];
+            var gradInputF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
 
@@ -16523,7 +16556,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int gradSliceSize1x1 = outChannels * N1x1;
                 var gradOutputD1x1 = (double[])(object)gradOutput.GetFlattenedData();
                 var kernelD1x1 = (double[])(object)kernel.GetFlattenedData();
-                var gradInputD1x1 = new double[batch * inputSliceSize1x1];
+                var gradInputD1x1 = CpuStorageAllocationDiagnostics.NewNumericArray<double>(batch * inputSliceSize1x1, "numeric.conv_output_or_scratch");
 
                 CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N1x1, [MethodImpl(Hot)] (b) =>
                 {
@@ -16632,7 +16665,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // gradInput escapes via TensorAllocator.Rent — must be
                     // GC-owned, not pool-rented. The flip + col scratch are
                     // the only per-call transient allocations on this path.
-                    var gradInputDDirect = new double[batch * inChannels * height * width];
+                    var gradInputDDirect = CpuStorageAllocationDiagnostics.NewNumericArray<double>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
                     unsafe
                     {
                         fixed (double* pGradOut = gradOutputDDirect)
@@ -16666,7 +16699,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
-            var gradInputD = new double[batch * inChannels * height * width];
+            var gradInputD = CpuStorageAllocationDiagnostics.NewNumericArray<double>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var kernelD = (double[])(object)kernel.GetFlattenedData();
 
@@ -16770,7 +16803,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback for non-float, non-double types
-        var gradInput = new T[batch * inChannels * height * width];
+        var gradInput = CpuStorageAllocationDiagnostics.NewNumericArray<T>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
         using var gradOutputDataLease = gradOutput.LeaseArray();
         var gradOutputData = gradOutputDataLease.Array;
         using var kernelDataLease = kernel.LeaseArray();
@@ -16938,6 +16971,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
+            if (TryConv1DBackwardInputColumnPanels((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
+                (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
+                return;
             // FUSED FAST PATH (transposed-convolution identity). For stride=1,
             // dilation=1 and a non-negative symmetric transposed padding, the
             // input-gradient equals a FORWARD convolution of gradOutput with the
@@ -17154,7 +17191,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             destD, destSliceOff, N);
                         return;
                     }
-                    var product = System.Buffers.ArrayPool<double>.Shared.Rent(inputSliceSize);
+                    var product = CpuStorageAllocationDiagnostics.RentWorkspace<double>(inputSliceSize, "workspace.conv");
                     try
                     {
                         Helpers.BlasProvider.GemmEx(
@@ -17170,7 +17207,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            var kernelTD = new double[colH * outChannels];
+            var kernelTD = CpuStorageAllocationDiagnostics.NewNumericArray<double>(colH * outChannels, "numeric.conv_output_or_scratch");
             for (int r = 0; r < outChannels; r++)
                 for (int c = 0; c < colH; c++)
                     kernelTD[c * outChannels + r] = kernelD[r * colH + c];
@@ -17305,11 +17342,14 @@ public partial class CpuEngine : ITensorLevelEngine
         [MethodImpl(Hot)]
         public static float[] Rent(int minLen)
         {
+            if (CpuStorageAllocationDiagnostics.Enabled && !CpuStorageAllocationDiagnostics.IsInsideRequest)
+                return CpuStorageAllocationDiagnostics.Observe("workspace.ConvScratchPool", (long)minLen * sizeof(float),
+                    minLen, static length => Rent(length));
             if (minLen <= 0) return Array.Empty<float>();
             // Small buffers: Shared already pools them on a lock-free per-thread stack — going through our
             // locked pool would only add contention (regressed a small-shape perf test). Only the large
             // buffers Shared refuses to pool are worth the bounded large pool.
-            if (minLen <= SharedCap) return System.Buffers.ArrayPool<float>.Shared.Rent(minLen);
+            if (minLen <= SharedCap) return CpuStorageAllocationDiagnostics.RentWorkspace<float>(minLen, "workspace.conv");
             if (minLen > MaxPooledLen) return new float[minLen]; // too big to retain → fresh, dropped on Return
             lock (_lock)
             {
@@ -17602,7 +17642,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // route spent its time staging and transposing for a K = 1..16 product.
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
-            var gradKernelF = new float[outChannels * inChannels];
+            var gradKernelF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * inChannels, "numeric.conv_output_or_scratch");
             PointwiseWeightGradFloat(gradOutputF, inputF, gradKernelF, batch, outChannels, inChannels, height * width);
             return RentFloatResult<T>(kernelShape, gradKernelF);
         }
@@ -17620,7 +17660,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var gArrW = gradOutput.GetCpuBackingForStridedRead(out int gOffW) as float[];
             if (xArrW is not null && gArrW is not null)
             {
-                var dWW = new float[outChannels * inChannels * 9];
+                var dWW = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * inChannels * 9, "numeric.conv_output_or_scratch");
                 Simd.WinogradF43.BackwardKernel(xArrW, xOffW, gArrW, gOffW, dWW, 0, accumulate: false,
                     batch, inChannels, height, width, outChannels);
                 return RentFloatResult<T>(kernelShape, dWW);
@@ -17632,7 +17672,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
-            var gradKernelF = new float[outChannels * colH];
+            var gradKernelF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * colH, "numeric.conv_output_or_scratch");
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
@@ -17742,7 +17782,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         im2colBuf, 0, colW, true,
                         localGrad, 0, colH);
 
-                    var gradCopy = new float[outChannels * colH];
+                    var gradCopy = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * colH, "numeric.conv_output_or_scratch");
                     Array.Copy(localGrad, gradCopy, outChannels * colH);
                     perBatchGrads[b] = gradCopy;
                 }
@@ -17775,7 +17815,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
-            var gradKernelD = new double[outChannels * colH];
+            var gradKernelD = CpuStorageAllocationDiagnostics.NewNumericArray<double>(outChannels * colH, "numeric.conv_output_or_scratch");
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var inputD = (double[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
@@ -17795,7 +17835,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int totalLen1x1 = outChannels * inChannels;
                 // The managed GEMM overwrites its output, so batch 0 writes gradKernel directly and every later
                 // batch's product lands in a pooled buffer that is added in.
-                var product1x1 = batch > 1 ? System.Buffers.ArrayPool<double>.Shared.Rent(totalLen1x1) : null;
+                var product1x1 = batch > 1 ? CpuStorageAllocationDiagnostics.RentWorkspace<double>(totalLen1x1, "workspace.conv") : null;
                 try
                 {
                     for (int b = 0; b < batch; b++)
@@ -17971,7 +18011,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Generic fallback for non-float, non-double types
-        var gradKernel = new T[outChannels * inChannels * kernelHeight * kernelWidth];
+        var gradKernel = CpuStorageAllocationDiagnostics.NewNumericArray<T>(outChannels * inChannels * kernelHeight * kernelWidth, "numeric.conv_output_or_scratch");
         using var gradOutputDataLease = gradOutput.LeaseArray();
         var gradOutputData = gradOutputDataLease.Array;
         using var inputDataLease = input.LeaseArray();
@@ -18215,7 +18255,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     try
                     {
                         ComputeBatchGradF(b, im2colBuf, localGrad, channelParallel: false);
-                        var gradCopy = new float[totalLen];
+                        var gradCopy = CpuStorageAllocationDiagnostics.NewNumericArray<float>(totalLen, "numeric.conv_output_or_scratch");
                         Array.Copy(localGrad, gradCopy, totalLen);
                         perBatchGrads[b] = gradCopy;
                     }
@@ -18289,7 +18329,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // The managed GEMM overwrites its output: only a non-accumulating batch 0 writes destD directly;
                 // every other batch's product lands in a pooled buffer that is added in.
                 bool needsProduct = accumulate || batch > 1;
-                var product1x1 = needsProduct ? System.Buffers.ArrayPool<double>.Shared.Rent(totalLen) : null;
+                var product1x1 = needsProduct ? CpuStorageAllocationDiagnostics.RentWorkspace<double>(totalLen, "workspace.conv") : null;
                 try
                 {
                     for (int b = 0; b < batch; b++)
@@ -18369,7 +18409,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            var gradKernelD = new double[totalLen];
+            var gradKernelD = CpuStorageAllocationDiagnostics.NewNumericArray<double>(totalLen, "numeric.conv_output_or_scratch");
 
             // Per-image im2col + GEMM into localGrad (overwrite). See the float
             // counterpart ComputeBatchGradF for the channel-parallel rationale.
@@ -18415,7 +18455,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     try
                     {
                         ComputeBatchGradD(b, im2colBuf, localGrad, channelParallel: false);
-                        var gradCopy = new double[totalLen];
+                        var gradCopy = CpuStorageAllocationDiagnostics.NewNumericArray<double>(totalLen, "numeric.conv_output_or_scratch");
                         Array.Copy(localGrad, gradCopy, totalLen);
                         perBatchGradsD[b] = gradCopy;
                     }
@@ -19034,7 +19074,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int xBase = srcOff + plane * inPlane, gBase = goOff + plane * outPlane;
                 // Accumulating: scatter this plane into zeroed scratch, then add it to the destination once.
-                float[]? scratch = accumulate ? System.Buffers.ArrayPool<float>.Shared.Rent(inPlane) : null;
+                float[]? scratch = accumulate ? CpuStorageAllocationDiagnostics.RentWorkspace<float>(inPlane, "workspace.conv") : null;
                 float[] dst = scratch ?? d;
                 int dBase = scratch is null ? giOff + plane * inPlane : 0;
                 MaxPoolBackwardRecomputePlane(x, xBase, g, gBase, dst, dBase, height, width, outH, outW,
@@ -19195,7 +19235,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var inputData = input.GetFlattenedData();
-        var outputData = new T[batch * channels * outputHeight * outputWidth];
+        var outputData = CpuStorageAllocationDiagnostics.NewNumericArray<T>(batch * channels * outputHeight * outputWidth, "numeric.conv_output_or_scratch");
         T poolArea = numOps.FromDouble(poolH * poolW);
 
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
@@ -19493,7 +19533,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            var outputData = new T[batch0 * outChannels0 * outputHeight0 * outputWidth0];
+            var outputData = CpuStorageAllocationDiagnostics.NewNumericArray<T>(batch0 * outChannels0 * outputHeight0 * outputWidth0, "numeric.conv_output_or_scratch");
             DepthwiseConv2DComputeIntoOutput(input, kernel, stride, padding, outputData);
             dwConvResult = TensorAllocator.Rent<T>(outputShape0, outputData);
         }
@@ -19626,7 +19666,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int positions)
     {
         int rows = batch * positions;
-        var xT = System.Buffers.ArrayPool<float>.Shared.Rent(rows * inChannels);
+        var xT = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rows * inChannels, "workspace.conv");
         try
         {
             for (int b = 0; b < batch; b++)
@@ -20014,7 +20054,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     width, strideH);
                 return dx;
             }
-            var giF = new float[batch * inChannels * height * width];
+            var giF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
             for (int ic = 0; ic < inChannels; ic++)
             {
                 for (int b = 0; b < batch; b++)
@@ -20057,7 +20097,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var goD = (double[])(object)gradOutput.GetFlattenedData();
             var kD = (double[])(object)kernel.GetFlattenedData();
-            var giD = new double[batch * inChannels * height * width];
+            var giD = CpuStorageAllocationDiagnostics.NewNumericArray<double>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
             for (int ic = 0; ic < inChannels; ic++)
             {
                 for (int b = 0; b < batch; b++)
@@ -20097,7 +20137,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return TensorAllocator.Rent<T>(inputShape, (T[])(object)giD);
         }
 
-        var gradInput = new T[batch * inChannels * height * width];
+        var gradInput = CpuStorageAllocationDiagnostics.NewNumericArray<T>(batch * inChannels * height * width, "numeric.conv_output_or_scratch");
         var gradOutputData = gradOutput.GetFlattenedData();
         var kernelData = kernel.GetFlattenedData();
 
@@ -20184,7 +20224,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     width, strideH);
                 return dw;
             }
-            var gkF = new float[inChannels * multiplier * kernelHeight * kernelWidth];
+            var gkF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(inChannels * multiplier * kernelHeight * kernelWidth, "numeric.conv_output_or_scratch");
             for (int ic = 0; ic < inChannels; ic++)
             {
                 for (int m = 0; m < multiplier; m++)
@@ -20225,7 +20265,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var goD = (double[])(object)gradOutput.GetFlattenedData();
             var inD = (double[])(object)input.GetFlattenedData();
-            var gkD = new double[inChannels * multiplier * kernelHeight * kernelWidth];
+            var gkD = CpuStorageAllocationDiagnostics.NewNumericArray<double>(inChannels * multiplier * kernelHeight * kernelWidth, "numeric.conv_output_or_scratch");
             for (int ic = 0; ic < inChannels; ic++)
             {
                 for (int m = 0; m < multiplier; m++)
@@ -20263,7 +20303,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return TensorAllocator.Rent<T>(kernelShape, (T[])(object)gkD);
         }
 
-        var gradKernel = new T[inChannels * multiplier * kernelHeight * kernelWidth];
+        var gradKernel = CpuStorageAllocationDiagnostics.NewNumericArray<T>(inChannels * multiplier * kernelHeight * kernelWidth, "numeric.conv_output_or_scratch");
         var gradOutputData = gradOutput.GetFlattenedData();
         var inputData = input.GetFlattenedData();
 
@@ -20371,7 +20411,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
-        var outputData = new T[batch * outChannels * outputHeight * outputWidth];
+        var outputData = CpuStorageAllocationDiagnostics.NewNumericArray<T>(batch * outChannels * outputHeight * outputWidth, "numeric.conv_output_or_scratch");
 
         // ────────────────────────────────────────────────────────────────────
         // Primitive fast paths: direct float/double arithmetic, no virtual

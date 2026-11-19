@@ -20,14 +20,19 @@ public static class BatchExecutionKernels
     /// The IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C so OpenCL runs the same
     /// code HIP and Metal run: kernel qualifiers, global pointers, the thread index and the float builtins.
     /// </summary>
-    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.DecodeLinearSource + K.DirectConvSource);
+    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.DecodeLinearSource + K.DirectConvSource + K.WeightNormSource);
 
     private static string TranslateSolvers(string cuda)
     {
         string body = cuda.Replace("extern \"C\" __global__ __launch_bounds__(256) void", "__kernel void")
             .Replace("bx_gid()", "(int)get_global_id(0)")
             .Replace("__uint_as_float(", "as_float(")
-            .Replace("__int_as_float(", "as_float(");
+            .Replace("__int_as_float(", "as_float(")
+            .Replace("__shared__ float", "__local float")
+            .Replace("__syncthreads()", "barrier(CLK_LOCAL_MEM_FENCE)")
+            .Replace("blockIdx.x", "get_group_id(0)")
+            .Replace("threadIdx.x", "get_local_id(0)")
+            .Replace("blockDim.x", "get_local_size(0)");
         body = Regex.Replace(body, @"(?<![\w*])(const )?(float|int)\* ", "__global $1$2* ", RegexOptions.None, RegexTimeout);
         return Regex.Replace(body, @"\b(sqrt|fmax|fabs|exp|log|tanh)f\(", "$1(", RegexOptions.None, RegexTimeout);
     }
@@ -256,6 +261,7 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
     {
         return new[]
         {
+            K.WeightNorm, K.WeightNormStats, K.WeightNormDirectionGrad, K.WeightNormGainGrad,
             "bx_full_reduce", "bx_reduce_max_backward", "bx_reduce_variance_backward", "bx_reduce_log_variance",
             "bx_reduce_log_variance_backward", "bx_sincos", "bx_slice_axis", "bx_set_slice_axis",
             "bx_crop_2d_backward", "bx_sparsemax", "bx_mse_loss_rows", "bx_meshgrid2d",

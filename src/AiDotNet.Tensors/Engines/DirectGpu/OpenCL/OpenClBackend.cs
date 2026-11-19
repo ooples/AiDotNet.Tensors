@@ -1571,6 +1571,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateBuffer(float[] data)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+                return BufferAllocationDiagnostics.Observe("OpenCL", BufferAllocationDiagnostics.Primitive32Bytes(data), (this, data),
+                    static state => state.Item1.AllocateBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
@@ -1602,6 +1605,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateBuffer(int size)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+                return BufferAllocationDiagnostics.Observe("OpenCL", (long)size * sizeof(float), (this, size),
+                    static state => state.Item1.AllocateBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             DrainCollectedBuffers();
@@ -4609,6 +4615,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateByteBuffer(int size)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+                return BufferAllocationDiagnostics.Observe("OpenCL", (long)size * sizeof(byte), (this, size),
+                    static state => state.Item1.AllocateByteBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
@@ -9253,6 +9262,9 @@ KERNEL VARIANTS (A/B testing):
 
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
+            if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+                return BufferAllocationDiagnostics.Observe("OpenCL", (long)data.Length * sizeof(float), (this, data),
+                    static state => state.Item1.AllocateIntBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (data is null)
@@ -14791,9 +14803,11 @@ KERNEL VARIANTS (A/B testing):
     /// OpenCL GPU buffer wrapper implementing IGpuBuffer.
     /// Uses pure P/Invoke with no managed GPU runtime dependency.
     /// </summary>
-    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
     {
         internal readonly DirectOpenClBuffer Buffer;
+        private readonly IGpuBuffer? _viewParent;
+        IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
         private readonly Action<DirectOpenClGpuBuffer>? _returnToPool;
         private int _poolState;
         internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
@@ -14816,9 +14830,10 @@ KERNEL VARIANTS (A/B testing):
         /// <param name="account">The device's memory counters, for a fresh allocation; null for a view or a pool's new
         /// wrapper of memory already counted.</param>
         public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null,
-            DeviceMemoryAccount? account = null)
+            DeviceMemoryAccount? account = null, IGpuBuffer? viewParent = null)
         {
             Buffer = buffer;
+            _viewParent = viewParent;
             _returnToPool = returnToPool;
             _size = buffer.Length;
             _memory.OnAllocated(account, (long)buffer.Length * sizeof(float));

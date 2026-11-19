@@ -135,6 +135,15 @@ internal sealed class LazyTensorScope : IDisposable
         return retained;
     }
 
+    /// <summary>
+    /// Whether a GPU training trace records its node outputs with deferred host storage (no host array until a host
+    /// read or write). The compiled plan's device step binds each output to a device buffer (TryAliasResidentOutput),
+    /// so a host array per output was dead weight kept for the plan's lifetime: 2.9 GB of an Informer CUDA run's
+    /// 5.1 GB peak RSS. A host access still allocates the array, and a pending device result downloads into it.
+    /// AIDOTNET_GPU_DEFER_TRACE_OUTPUTS=0 turns it off.
+    /// </summary>
+    internal static bool DeferGpuTrainingOutputs { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_GPU_DEFER_TRACE_OUTPUTS") != "0";
 
     /// <summary>Number of lazy operations recorded.</summary>
     internal int NodeCount => _nodes.Count;
@@ -155,10 +164,14 @@ internal sealed class LazyTensorScope : IDisposable
     /// <summary>
     /// The output tensor for a recorded node. A probe gives a shape-only tensor whose storage is never created
     /// (reading it realizes the node, which a probe forbids); every other trace rents uninitialized storage the
-    /// node's Execute will overwrite.
+    /// node's Execute will overwrite. A GPU training trace gives deferred host storage instead
+    /// (<see cref="DeferGpuTrainingOutputs"/>).
     /// </summary>
     private Tensor<TOut> RentOutput<TOut>(int[] outputShape)
-        => _isProbe ? Tensor<TOut>.CreateDeferred(outputShape) : TensorAllocator.RentUninitialized<TOut>(outputShape);
+        => _isProbe ? Tensor<TOut>.CreateDeferred(outputShape)
+            : DeferGpuTrainingOutputs && _traceKind == GraphTraceKind.Training && _engine.Is<DirectGpuTensorEngine>()
+                ? Tensor<TOut>.CreateHostDeferred(outputShape)
+                : TensorAllocator.RentUninitialized<TOut>(outputShape);
 
     /// <summary>
     /// Whether an op of element type <typeparamref name="T"/> recorded now is inside a <see cref="NoGradScope{T}"/> of a
@@ -195,7 +208,6 @@ internal sealed class LazyTensorScope : IDisposable
         BackwardFunction<T>? backwardFn = null,
         object[]? savedState = null)
     {
-        // Allocate output tensor with correct shape but uninitialized data
         var output = RentOutput<T>(outputShape);
 
         backwardFn = GradientEdge(backwardFn, out bool noGrad);

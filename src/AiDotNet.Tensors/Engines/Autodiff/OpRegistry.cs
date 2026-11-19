@@ -25,6 +25,8 @@ internal static class OpRegistry
         "TensorTridiagonalSolve",
         // Fused GRU sequence: one node, fused BPTT on the host and the device (#1568)
         "GruSequenceForward",
+        // Weight normalization w = g * v / sqrt(sum(v^2) + eps): native VJP, composite under create-graph
+        "TensorWeightNorm",
 
         // Tensor-level unary maths with their own backward (CpuEngine.ElementwiseExtra)
         "TensorAcosh", "TensorAsinh", "TensorExp2", "TensorExpm1", "TensorLog10", "TensorLog1p", "TensorLog2",

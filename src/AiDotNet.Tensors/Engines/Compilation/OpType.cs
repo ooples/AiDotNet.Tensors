@@ -113,6 +113,7 @@ internal enum OpType : byte
     // Training-gradient boundaries and in-place history; appended without changing existing ordinals.
     StopGradient,
     TensorAddInPlace,
+    TensorWeightNorm,
 }
 
 internal static class OpTypeParser
@@ -123,6 +124,7 @@ internal static class OpTypeParser
     /// </summary>
     internal static OpType Parse(string opName) => opName switch
     {
+        "TensorWeightNorm" => OpType.TensorWeightNorm,
         "TensorAdd" => OpType.TensorAdd,
         "TensorSubtract" => OpType.TensorSubtract,
         "TensorMultiply" => OpType.TensorMultiply,

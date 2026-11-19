@@ -171,6 +171,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Internal accessor for the backing vector. Used by DirectGpuTensorEngine to check
     /// activation cache without triggering CPU materialization.
     /// </summary>
+    /// <summary>
+    /// True while this tensor's host array is not allocated yet (GPU-resident or deferred host storage): the first host
+    /// access allocates it. Reads no data and realizes nothing.
+    /// </summary>
+    internal bool HasDeferredHostStorage => _data.IsLazyAllocated;
+
     internal Vector<T> DataVector
     {
         get
