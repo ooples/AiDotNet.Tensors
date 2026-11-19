@@ -4773,6 +4773,7 @@ public partial class DirectGpuTensorEngine
         internal readonly WeakReference<Tensor<int>> Source;
         internal IGpuBuffer? Buffer;
         internal int Capacity;
+        internal object? Storage;
         internal int Version;
         internal HostIndexDeviceCopy(Tensor<int> source) => Source = new WeakReference<Tensor<int>>(source);
     }
@@ -4816,6 +4817,7 @@ public partial class DirectGpuTensorEngine
     private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices, int upperBound = 0)
     {
         int n = indices.Length;
+        object storage = indices.StorageIdentity;
         int version = indices.GpuCacheVersion;
         lock (copy)
         {
@@ -4828,7 +4830,8 @@ public partial class DirectGpuTensorEngine
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Target ID {data[i]} at position {i} is out of bounds for vocabulary size {upperBound}.");
             }
-            if (copy.Buffer is not null && copy.Capacity == n && copy.Version == version) return;
+            if (copy.Buffer is not null && copy.Capacity == n && ReferenceEquals(copy.Storage, storage)
+                && copy.Version == version) return;
             if (copy.Buffer is not null && copy.Capacity != n)
                 throw new InvalidOperationException("A captured host-index device copy cannot be resized.");
             data ??= indices.ToArray();
@@ -4848,6 +4851,7 @@ public partial class DirectGpuTensorEngine
                 copy.Capacity = n;
             }
             else if (n > 0) backend.UploadIntBufferInPlace(data, copy.Buffer);
+            copy.Storage = storage;
             copy.Version = version;
         }
     }

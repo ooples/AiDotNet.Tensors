@@ -56,6 +56,30 @@ public sealed class IndexGraphBindingTests
     }
 
     [Fact]
+    public void ReplayReadsReplacementStorageWithTheSameMutationVersion()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.CreateGraphCapture(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var scope = engine.EnterResidentCaptureScope();
+        using var ids = new Tensor<int>(new[] { 1 }, new[] { 1 });
+        using var replacement = new Tensor<int>(new[] { 3 }, new[] { 1 });
+        ids.SetFlat(0, 2);
+        int version = ids.GpuCacheVersion;
+        var buffer = Copy(engine, backend, ids);
+        IntPtr graph = engine.CaptureGpuGraph(() => Copy(engine, backend, ids));
+        try
+        {
+            new CpuEngine().TensorSetInPlace(ids, replacement);
+            Assert.Equal(version, ids.GpuCacheVersion);
+            engine.LaunchGpuGraph(graph);
+            Assert.Equal(3, First(buffer));
+        }
+        finally { engine.DestroyGpuGraph(graph); }
+    }
+
+    [Fact]
     public void EmbeddingLookup_ValidatesChangedHostIdsBeforeReplay()
     {
         var state = new MockBackendState();
