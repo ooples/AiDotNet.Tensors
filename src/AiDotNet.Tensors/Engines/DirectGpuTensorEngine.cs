@@ -31188,6 +31188,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_ownsDirectGpu) _ownedResults.EvacuateAll();
         _compiledWorkspaceBroker?.Release();
         _compiledWorkspaceBroker = null;
+        ReleaseGraphAttentionGraphs();
 
         // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these
         // buffers: their host arrays download before the buffers are freed.

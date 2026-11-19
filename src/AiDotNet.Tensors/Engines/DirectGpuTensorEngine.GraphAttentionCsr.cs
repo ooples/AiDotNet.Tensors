@@ -4,36 +4,64 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
 
-// GraphAttentionCsr on the CUDA graph-attention kernels: the inputs stay resident and the CSR/CSC pattern is uploaded
-// once per graph (cached on the CsrGraph). Other backends and element types run CpuEngine's implementation.
+// GraphAttentionCsr keeps one device pattern per graph and engine. An engine's captured programs can continue to
+// reference it while another engine uses the same graph.
 public partial class DirectGpuTensorEngine
 {
-    private sealed class GraphAttentionDeviceGraph
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<CsrGraph, GraphAttentionDeviceGraph> _graphAttentionGraphs = new();
+    private readonly System.Collections.Concurrent.ConcurrentBag<WeakReference<GraphAttentionDeviceGraph>> _graphAttentionGraphOwners = new();
+
+    private sealed class GraphAttentionDeviceGraph : IDisposable
     {
-        public IDirectGpuBackend Backend = null!;
-        public IGpuBuffer RowPointers = null!, Columns = null!, ColumnPointers = null!, TransposeRows = null!, TransposeEdges = null!;
+        private readonly IDirectGpuBackend _backend;
+        private readonly IGpuBuffer[] _buffers = new IGpuBuffer[5];
+        public IGpuBuffer RowPointers => _buffers[0];
+        public IGpuBuffer Columns => _buffers[1];
+        public IGpuBuffer ColumnPointers => _buffers[2];
+        public IGpuBuffer TransposeRows => _buffers[3];
+        public IGpuBuffer TransposeEdges => _buffers[4];
+
+        internal GraphAttentionDeviceGraph(IDirectGpuBackend backend, CsrGraph graph)
+        {
+            _backend = backend;
+            try
+            {
+                _buffers[0] = backend.AllocateIntBuffer(graph.RowPointers);
+                _buffers[1] = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.ColumnIndices : new int[1]);
+                _buffers[2] = backend.AllocateIntBuffer(graph.ColumnPointers);
+                _buffers[3] = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.TransposeRowIndices : new int[1]);
+                _buffers[4] = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.TransposeEdgeIndices : new int[1]);
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            foreach (var buffer in _buffers)
+                if (buffer is not null) DisposeBufferAfterQueuedUse(_backend, buffer);
+        }
     }
 
-    private static GraphAttentionDeviceGraph DeviceGraph(IDirectGpuBackend backend, CsrGraph graph)
+    private GraphAttentionDeviceGraph DeviceGraph(IDirectGpuBackend backend, CsrGraph graph)
     {
-        if (graph.DeviceCache is GraphAttentionDeviceGraph cached && ReferenceEquals(cached.Backend, backend))
-            return cached;
-        lock (graph)
+        lock (_graphAttentionGraphs)
         {
-            if (graph.DeviceCache is GraphAttentionDeviceGraph again && ReferenceEquals(again.Backend, backend))
-                return again;
-            var device = new GraphAttentionDeviceGraph
-            {
-                Backend = backend,
-                RowPointers = backend.AllocateIntBuffer(graph.RowPointers),
-                Columns = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.ColumnIndices : new int[1]),
-                ColumnPointers = backend.AllocateIntBuffer(graph.ColumnPointers),
-                TransposeRows = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.TransposeRowIndices : new int[1]),
-                TransposeEdges = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.TransposeEdgeIndices : new int[1]),
-            };
-            graph.DeviceCache = device;
+            if (_graphAttentionGraphs.TryGetValue(graph, out var cached)) return cached;
+            var device = new GraphAttentionDeviceGraph(backend, graph);
+            _graphAttentionGraphs.Add(graph, device);
+            _graphAttentionGraphOwners.Add(new WeakReference<GraphAttentionDeviceGraph>(device));
             return device;
         }
+    }
+
+    private void ReleaseGraphAttentionGraphs()
+    {
+        while (_graphAttentionGraphOwners.TryTake(out var weak))
+            if (weak.TryGetTarget(out var graph)) graph.Dispose();
     }
 
     /// <inheritdoc/>
@@ -51,8 +79,10 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float))
             return base.GraphAttentionCsrForward(transformed, attention, graph, slope, rate, seed);
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || backend is not IGraphAttentionBackend cuda)
+        if (!TryGetBackend(out var backend))
             return base.GraphAttentionCsrForward(transformed, attention, graph, slope, rate, seed);
+        if (backend is not IGraphAttentionBackend cuda)
+            throw new NotSupportedException($"{backend.BackendName} does not support GraphAttentionCsr. Use CpuEngine for sparse graph attention.");
         try
         {
             int heads = attention.Shape[0], features = attention.Shape[1] / 2;
@@ -86,8 +116,10 @@ public partial class DirectGpuTensorEngine
         if (typeof(T) != typeof(float))
             return base.GraphAttentionCsrBackward(gradOutput, transformed, attention, graph, slope, rate, seed);
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || backend is not IGraphAttentionBackend cuda)
+        if (!TryGetBackend(out var backend))
             return base.GraphAttentionCsrBackward(gradOutput, transformed, attention, graph, slope, rate, seed);
+        if (backend is not IGraphAttentionBackend cuda)
+            throw new NotSupportedException($"{backend.BackendName} does not support GraphAttentionCsr backward. Use CpuEngine for sparse graph attention.");
         try
         {
             int heads = attention.Shape[0], features = attention.Shape[1] / 2;
