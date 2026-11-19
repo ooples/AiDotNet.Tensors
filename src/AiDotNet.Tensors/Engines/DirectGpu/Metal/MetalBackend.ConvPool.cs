@@ -212,6 +212,11 @@ public sealed partial class MetalBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
+        // One GEMM per batch chunk and an overlap-add (PortableConvTransposeGemm) where the kernels built; the
+        // one-thread-per-output conv_transpose2d kernel below re-reads every input channel and tap per output.
+        if (TryConvTranspose2DGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW))
+            return;
         ThrowIfDisposed();
         TryDispatchConvPoolMetal(_convolutionLibrary, "Convolution", "conv_transpose2d",
             checked(batch * outChannels * outHeight * outWidth), new[] { input, kernel, output },

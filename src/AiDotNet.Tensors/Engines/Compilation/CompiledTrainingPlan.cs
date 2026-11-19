@@ -756,8 +756,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // not. Batches are fed through AsWritableSpan, which by contract does not bump the GPU-cache version, so after
         // a failed capture the eager step kept reading the pre-pass batch as current: every later step trained on a
         // stale target (measured: the loss matched MSE(pred(x_t), y_(t-1)) exactly).
-        foreach (var leaf in GraphExternalLeaves()) Unbind(leaf);
+        // Another plan's (or optimizer's) device-authoritative parameter read here as a leaf is that owner's binding,
+        // not this plan's: unbinding it dropped the owner's current weights.
+        foreach (var leaf in GraphExternalLeaves())
+            if (!_foreignParameterLeaves.ContainsKey(leaf)) Unbind(leaf);
         _ownedLeafBuffers.Clear();
+        _foreignParameterLeaves.Clear();
     }
 
     // The caller disposed the tensor, or released its device data (a host read of it then throws the release message):
@@ -1168,6 +1172,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>Whether every step-I/O input is still bound to the buffer the graph copies it into.</summary>
     private bool StepIoInputsStillBound(Engines.DirectGpu.IGpuGraphCapture cb)
     {
+        if (!ForeignParametersStillBound(cb)) return false;
         var leaves = _stepIoLeaves!; var buffers = _stepIoBuffers!;
         for (int i = 0; i < leaves.Length; i++)
             if (!ReferenceEquals(leaves[i]._gpuBuffer, buffers[i]) || !ReferenceEquals(leaves[i]._gpuBackend, cb)
@@ -4451,6 +4456,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     return StepResidentOrEager();
                 }
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
+                if (!ForeignParametersStillBound(cb)
+                    && ++_foreignParameterRecaptures <= MaxForeignParameterRecaptures)
+                {
+                    // A foreign parameter's owner moved its weights to another buffer: the graph's baked pointer reads
+                    // the old one. Re-capture against the new binding (the next step) rather than train eagerly.
+                    InvalidateCapturedStepGraph();
+                    return StepResidentOrEager();
+                }
                 if (_stepIo is not null ? !StepIoInputsStillBound(cb) : !RefreshGraphInputInPlace(cb))
                 {
                     // An input the graph reads through a baked pointer was released: replaying would read freed
@@ -4578,6 +4591,28 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Dictionary<Tensor<T>, Engines.DirectGpu.IGpuBuffer> _ownedLeafBuffers =
         new(ReferenceEqualityComparer<Tensor<T>>.Instance);
 
+    // External leaves another owner keeps current on the device (DirectGpuTensorEngine.IsBoundDeviceAuthoritative) -
+    // a GAN generator's plan reading the discriminator's weights and BatchNorm running statistics, which the
+    // discriminator's plan updates on the device. Each maps to the owner's buffer the capture bound. The plan reads that
+    // buffer and never takes the binding: taking it (and refreshing it from the host copy, which lags the device) fed
+    // the reader stale weights and, once it rebound the tensor, made the owner's next step roll its own update back.
+    private readonly Dictionary<Tensor<T>, Engines.DirectGpu.IGpuBuffer> _foreignParameterLeaves =
+        new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+    // Captured graphs dropped because a foreign parameter's owner moved it to another buffer. Each re-captures against
+    // the new buffer; past the cap (an owner that alternates buffers every step) the plan stops capturing.
+    private int _foreignParameterRecaptures;
+    private const int MaxForeignParameterRecaptures = 4;
+
+    private bool ForeignParametersStillBound(Engines.DirectGpu.IGpuGraphCapture cb)
+    {
+        foreach (var entry in _foreignParameterLeaves)
+            if (!ReferenceEquals(entry.Key._gpuBuffer, entry.Value) || !ReferenceEquals(entry.Key._gpuBackend, cb)
+                || entry.Value.Handle == IntPtr.Zero)
+                return false;
+        return true;
+    }
+
     private bool? _compiledInputIsParameter;
 
     private bool CompiledInputIsParameter => _compiledInputIsParameter ??=
@@ -4599,6 +4634,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         out Engines.DirectGpu.IGpuBuffer? buffer)
     {
         buffer = null;
+        // A foreign device parameter is read through its owner's buffer, which the graph baked in: nothing to refresh,
+        // as long as the owner still keeps its weights there.
+        if (_foreignParameterLeaves.TryGetValue(leaf, out var foreign))
+            return ReferenceEquals(leaf._gpuBuffer, foreign) && ReferenceEquals(leaf._gpuBackend, cb)
+                   && foreign.Handle != IntPtr.Zero;
         bool captured = _ownedLeafBuffers.TryGetValue(leaf, out var owned);
         if (leaf._gpuBuffer is not { } bound || !ReferenceEquals(leaf._gpuBackend, cb))
             return !captured;
@@ -5288,6 +5328,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (de is not null && !IsCapturing())
             foreach (var leaf in GraphExternalLeaves())
             {
+                // A device-authoritative parameter of another owner: read its buffer as it is (see
+                // _foreignParameterLeaves). Its host copy can lag the device, so uploading that would read stale weights.
+                if (!IsOwnedLeafBinding(leaf) && leaf._gpuBuffer is { } ownerBuffer
+                    && ReferenceEquals(leaf._gpuBackend, backend) && de.IsBoundDeviceAuthoritative(leaf))
+                {
+                    _ownedLeafBuffers.Remove(leaf);
+                    _foreignParameterLeaves[leaf] = ownerBuffer;
+                    continue;
+                }
+                _foreignParameterLeaves.Remove(leaf);
                 // EnsureResidentInput reuses any bound buffer with a live-looking handle. A binding this plan did not
                 // make is not ours to write: drop it (without disposing - its owner does that) so a fresh one is bound.
                 if (leaf._gpuBuffer is not null && !IsOwnedLeafBinding(leaf))
@@ -5307,8 +5357,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // update runs on the device and every replay reads and writes the one buffer the graph bakes in.
         if (de is not null && !IsCapturing())
             foreach (var state in InPlaceStateTensors())
-                if (state._gpuBuffer is null && !Array.Exists(_parameters, p => ReferenceEquals(p, state)))
-                    de.EnsureResidentInput(state);
+            {
+                if (Array.Exists(_parameters, p => ReferenceEquals(p, state))) continue;
+                if (state._gpuBuffer is null) de.EnsureResidentInput(state);
+                // From here the plan updates it on the device only: another plan reading it (a GAN generator's step
+                // reading the discriminator's running statistics in eval mode) must read this buffer, not the host
+                // copy, which no longer follows.
+                if (state._gpuBuffer is { } stateBuffer && ReferenceEquals(state._gpuBackend, backend))
+                    de.NoteBoundDeviceAuthoritative(state, stateBuffer);
+            }
         _preForwardParamTransform?.Invoke();
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
