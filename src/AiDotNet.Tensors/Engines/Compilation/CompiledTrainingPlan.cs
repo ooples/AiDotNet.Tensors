@@ -318,6 +318,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!pooled[i]) continue;
             var grad = _preAllocatedGrads[i];
             if (grad.GetBackingArrayForCacheLookupUnsafe() is not { } array) continue;
+            if (TryBindShadowGradientBank(engine, backend, grad, out var shadowBank))
+            {
+                buffers[array] = shadowBank;
+                continue;
+            }
             if (!buffers.TryGetValue(array, out var buffer) || buffer.Handle == IntPtr.Zero)
             {
                 buffer = backend.AllocateBuffer(array.Length);
@@ -634,6 +639,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _weightNormWorkspace = null;
         _shadowLoanOwner?.Release();
         _shadowLoans.Clear();
+        _shadowBankLoans.Clear();
 
     }
 
@@ -5580,7 +5586,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     FailPrivateGradientResidencyAtForTesting = -1;
                     throw new NotSupportedException("Injected private-gradient residency failure.");
                 }
-                if (DelayShadowGradient(residentEngine, _preAllocatedGrads[i])
+                if (TryBindShadowGradientBank(residentEngine, backend, _preAllocatedGrads[i], out _)
+                    || DelayShadowGradient(residentEngine, _preAllocatedGrads[i])
                     || TryBindShadowGradientLoan(residentEngine, backend, _preAllocatedGrads[i])) continue;
 
                 var buffer = residentEngine.EnsureResidentBufferWithAllocationInfo(_preAllocatedGrads[i], out bool allocated);

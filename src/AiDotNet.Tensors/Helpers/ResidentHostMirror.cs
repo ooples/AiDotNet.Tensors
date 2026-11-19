@@ -22,7 +22,7 @@ namespace AiDotNet.Tensors.Helpers;
 /// copy goes into the existing array (never a replacement), because other views and owners alias it.
 /// </para>
 /// </remarks>
-internal static class ResidentHostMirror
+internal static partial class ResidentHostMirror
 {
     private sealed class Group<T>
     {

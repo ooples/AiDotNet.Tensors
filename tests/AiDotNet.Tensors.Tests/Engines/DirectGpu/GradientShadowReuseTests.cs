@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Helpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -12,6 +13,45 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public sealed class GradientShadowReuseTests
 {
+    [SkippableFact]
+    public void FullBankShadowPreservesWholeAndPaddedVectorAliasesAndDeclinesForeignCopies()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "Actual CUDA required.");
+        var backend = gpu.GetBackend()!;
+        var array = new float[32];
+        var owner = ResultBufferTracker.TrackFreshPrivateArray(array, 0)!;
+        using var whole = Tensor<float>.FromMemory(array.AsMemory(), new[] { 4, 8 });
+        using var backing = backend.AllocateBuffer(32);
+        backend.Fill(backing, .375f, 32);
+        gpu.BindResidentBuffer(whole, backing, backend);
+        using var view = new CpuEngine().Reshape(whole, new[] { 32 });
+        var bindings = new List<Tensor<float>>();
+        var vectors = new HashSet<object>();
+        Assert.True(ResidentHostMirror.TryCollectGradientBankBindings(array, backing, backend, owner, bindings, vectors));
+        using var padded = Tensor<float>.FromMemory(array.AsMemory(0, 16), new[] { 16 });
+        Assert.False(ResidentHostMirror.TryCollectGradientBankBindings(array, backing, backend, owner, bindings, vectors));
+        gpu.BindResidentBuffer(padded, backing, backend);
+        Assert.True(ResidentHostMirror.TryCollectGradientBankBindings(array, backing, backend, owner, bindings, vectors));
+        using var foreign = backend.AllocateBuffer(16);
+        gpu.BindResidentBuffer(padded, foreign, backend);
+        Assert.False(ResidentHostMirror.TryCollectGradientBankBindings(array, backing, backend, owner, bindings, vectors));
+        gpu.BindResidentBuffer(padded, backing, backend);
+        Assert.True(ResidentHostMirror.TryCollectGradientBankBindings(array, backing, backend, owner, bindings, vectors));
+        backend.DownloadBuffer(backing, array);
+        var scratch = gpu.CreateScratchPool();
+        scratch.Track(backing);
+        foreach (var binding in bindings) gpu.DetachHostCurrentCompiledGradient(binding);
+        backend.Fill(backing, -2f, 32);
+        Assert.All(whole.ToArray(), value => Assert.Equal(.375f, value));
+        Assert.All(view.ToArray(), value => Assert.Equal(.375f, value));
+        Assert.All(padded.ToArray(), value => Assert.Equal(.375f, value));
+        Assert.Null(whole._gpuBuffer);
+        Assert.Null(view._gpuBuffer);
+        Assert.Null(padded._gpuBuffer);
+        StepScratchPool.Untrack(backing);
+    }
+
     private sealed class SavedOwner : ISavedStateTensorContainer
     {
         internal SavedOwner(params object[] values) => SavedStateValues = values;

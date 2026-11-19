@@ -122,6 +122,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             moved.Add(buffer);
             bytes += (long)gradient.Length * sizeof(float);
         }
+        bytes += ShadowCompletedGradientBanks(engine, backend, protectedRoots);
         if (bytes == 0) return;
         _gradHeldZero = null;
         _unwrittenGradIndices = null;
