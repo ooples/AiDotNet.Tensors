@@ -1612,6 +1612,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // IGpuBatchExecution kernels shared with HIP (#1142).
         CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+        CompileKernelModule(device, BatchExecutionCudaKernels.RfftMagnitudeCudaSource, "rfft_magnitude_precise_kernels",
+            BatchExecutionCudaKernels.RfftMagnitudeKernelNames, useFastMath: false);
         // The GRU kernels again, without --use_fast_math; compiled second, so they replace the fast-math entries above.
         CompileKernelModule(device, BatchExecutionCudaKernels.GruPreciseSource, "gru_precise_kernels",
             BatchExecutionCudaKernels.GruKernelNames, useFastMath: false);
@@ -19805,6 +19807,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Direct-PTX modules borrow this backend's context and stream. Unload
         // them while both handles are still alive, before pool/stream teardown.
         DisposeDirectPtxRuntime();
+        DisposeRealFftPlans();
 
         // In-flight staged uploads still own pinned slots; wait for them before the pool frees its memory.
         try { DrainStagedUploads(blockAll: true); } catch { }

@@ -666,6 +666,62 @@ public static class CpuParallelSettings
     }
 
     /// <summary>
+    /// The deterministic-safe Action loop's dispatch with one disposable local per joined
+    /// participant. Iterations must write disjoint destinations and perform no cross-iteration
+    /// reduction. The public reduction-local overload retains its existing deterministic gate.
+    /// </summary>
+    [MethodImpl(Hot)]
+    internal static void ParallelForIndependentWithLocal<TLocal>(
+        int fromInclusive, int toExclusive, long totalWork,
+        Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
+    {
+        if (toExclusive <= fromInclusive) return;
+        int maxDegree = MaxDegreeOfParallelism;
+        if (maxDegree <= 0) throw new ArgumentOutOfRangeException(nameof(MaxDegreeOfParallelism));
+        if (maxDegree <= 1 || _inParallelRegion
+            || (toExclusive - fromInclusive) <= 1
+            || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
+        {
+            TLocal local = localInit();
+            Exception? firstException = null;
+            try
+            {
+                for (int i = fromInclusive; i < toExclusive; i++)
+                {
+                    try { body(i, local); }
+                    catch (Exception ex) { firstException ??= ex; }
+                }
+            }
+            finally
+            {
+                try { localFinally(local); }
+                catch (Exception ex) { firstException ??= ex; }
+            }
+            if (firstException is not null) throw firstException;
+            return;
+        }
+
+        // Keep the deterministic-safe Action overload's grain size, participant cap and
+        // contiguous chunk boundaries. The executor owns each local across all that
+        // participant's chunks and returns it before the dispatch joins (also on failure).
+        int count = toExclusive - fromInclusive;
+        const long workPerChunk = 8 * 1024;
+        int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
+        int chunks = Math.Min(maxDegree, byWork);
+        if (s_capChunksAtParticipants)
+            chunks = Math.Min(chunks, PersistentParallelExecutor.Instance.WorkerCount + 1);
+        int from = fromInclusive;
+        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, localInit,
+            [MethodImpl(Hot)] (chunk, local) =>
+            {
+                using var _region = EnterParallelRegion();
+                int cs = from + (int)((long)chunk * count / chunks);
+                int ce = from + (int)((long)(chunk + 1) * count / chunks);
+                for (int i = cs; i < ce; i++) body(i, local);
+            }, localFinally);
+    }
+
+    /// <summary>
     /// Route <see cref="ParallelForOrSerial(int,int,long,Action{int},bool)"/>'s parallel
     /// path through the low-latency persistent worker pool (<see cref="PersistentParallelExecutor"/>)
     /// instead of <see cref="System.Threading.Tasks.Parallel.For(int,int,Action{int})"/>. Cheaper

@@ -114,6 +114,7 @@ internal enum OpType : byte
     StopGradient,
     TensorAddInPlace,
     TensorWeightNorm,
+    TensorRfftMagnitude,
 }
 
 internal static class OpTypeParser
@@ -125,6 +126,7 @@ internal static class OpTypeParser
     internal static OpType Parse(string opName) => opName switch
     {
         "TensorWeightNorm" => OpType.TensorWeightNorm,
+        "TensorRfftMagnitude" => OpType.TensorRfftMagnitude,
         "TensorAdd" => OpType.TensorAdd,
         "TensorSubtract" => OpType.TensorSubtract,
         "TensorMultiply" => OpType.TensorMultiply,
