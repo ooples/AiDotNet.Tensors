@@ -121,6 +121,32 @@ public sealed class CompiledStatefulInferenceTests
     }
 
     [Fact]
+    public void The_public_entry_point_compiles_a_stateful_plan()
+    {
+        var (refOut, refState) = Reference();
+        var cpu = new CpuEngine();
+        var s = new Tensor<float>([D, D]);
+        var x = new Tensor<float>([1, D], new Vector<float>(Input(0)));
+        using var cache = new CompiledModelCache<float>();
+        ICompiledPlan<float> plan;
+        using (new EngineScope(cpu))
+            plan = cache.CompileStatefulInference(new[] { x }, () =>
+            {
+                var (o, next) = Step(cpu, s, x);
+                return (o, new[] { (s, next) });
+            });
+        using (plan)
+            for (int t = 0; t < Steps; t++)
+            {
+                plan.SetInputs(new[] { new Tensor<float>([1, D], new Vector<float>(Input(t))) });
+                var output = plan.Execute().ToArray();
+                var state = s.ToArray();
+                Assert.True(Math.Abs(output[0] - refOut[t][0]) <= 1e-5f * (1 + Math.Abs(refOut[t][0])), $"step {t} output");
+                Assert.True(Math.Abs(state[D + 1] - refState[t][D + 1]) <= 1e-5f * (1 + Math.Abs(refState[t][D + 1])), $"step {t} state");
+            }
+    }
+
+    [Fact]
     public void A_state_must_be_a_leaf_the_graph_reads_and_its_next_value_must_be_computed()
     {
         var cpu = new CpuEngine();
