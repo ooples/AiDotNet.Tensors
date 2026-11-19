@@ -821,6 +821,114 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A fused linear cross-entropy whose host <c>Tensor&lt;int&gt;</c> labels the caller rewrites every step must train
+    /// like the CPU plan, eager and captured. The GPU op refused a capture with host-backed labels (the upload would
+    /// be replayed as the captured batch's labels), so a language-model step never replayed as one graph; it now reads
+    /// the labels' per-replay device copy in the forward and in the backward.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_fused_cross_entropy_over_fed_host_labels_trains_like_the_cpu_plan(bool capture)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            var run = TrainFusedCrossEntropy(gpu, capture, badLabelAtStep: -1);
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainFusedCrossEntropy(cpu, capture: false, badLabelAtStep: -1);
+            AiDotNetEngine.Current = prior;
+            _output.WriteLine("cpu " + string.Join(" ", truth.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("gpu " + string.Join(" ", run.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(truth.Losses.Distinct().Count() == Steps, "the losses repeat; the comparison would be vacuous");
+            if (capture) Assert.True(run.Replayed, "the captured plan is not replaying a graph after warm-up");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - run.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {run.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            for (int p = 0; p < truth.Weights.Length; p++)
+                for (int i = 0; i < truth.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(truth.Weights[p][i] - run.Weights[p][i]) <= 1e-4f,
+                        $"param {p}[{i}]: GPU {run.Weights[p][i]} != CPU {truth.Weights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A captured replay cannot check its labels on the device, so the labels' device copy checks them on the host
+    /// when it uploads them before the replay: an out-of-range label is rejected as an eager call rejects it, not
+    /// turned into a wrong loss.
+    /// </summary>
+    [SkippableFact]
+    public void A_captured_fused_cross_entropy_rejects_an_out_of_range_fed_label()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            Assert.ThrowsAny<ArgumentOutOfRangeException>(() => TrainFusedCrossEntropy(gpu, capture: true, badLabelAtStep: Steps - 1));
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainFusedCrossEntropy(IEngine engine, bool capture,
+        int badLabelAtStep)
+    {
+        const int vocab = 24;
+        var labels = new Tensor<int>([Batch]);
+        var x = Rand([Batch, Inputs], 1, 1f);
+        var w = Rand([Inputs, Inputs], 4, 0.3f);
+        var head = Rand([Inputs, vocab], 5, 0.3f);
+        var bias = Rand([vocab], 6, 0.1f);
+        var parameters = new[] { w, head, bias };
+        if (engine is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(900 + step);
+            for (int i = 0; i < Batch; i++) labels.SetFlat(i, step == badLabelAtStep && i == 0 ? vocab : rng.Next(vocab));
+            labels.MarkModified();
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var h = engine.TensorTanh(engine.TensorMatMul(x, w));
+            engine.FusedLinearCrossEntropyWithLogits(h, head, bias, labels);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            bool replayed = false;
+            if (plan is CompiledTrainingPlan<float> c)
+            {
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                replayed = execField.GetValue(c) is IntPtr handle && handle != IntPtr.Zero;
+            }
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), replayed);
+        }
+    }
+
     private static (double[] Losses, float[][] Weights, bool Replayed) TrainHostIdSelects(IEngine engine, bool capture)
     {
         const int rows = 40;

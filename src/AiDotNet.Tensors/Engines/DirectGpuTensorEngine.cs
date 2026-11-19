@@ -14414,7 +14414,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Recording under a tape reads the ids on the host too (they are the backward's saved state), and that read
         // would synchronize the capturing stream, so a taped call is refused the same way.
         bool capturing = backend is IGpuGraphCapture capture && capture.IsStreamCapturing();
-        if (capturing && !HasResidentIndexStorage(targetIds))
+        if (capturing && !HasResidentIndexStorage(targetIds) && !ResidentStepActive)
             throw new NotSupportedException(
                 "FusedLinearCrossEntropyWithLogits cannot be captured with host-backed target ids: replay would reuse " +
                 "the labels of the captured batch. Keep the ids resident on the device to capture this step.");
@@ -14442,10 +14442,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var wB = GetOrAllocateBuffer(backend, weight);
             using var bB = GetOrAllocateBuffer(backend, bias);
             using var loss = AllocateOutputBuffer(backend, 1);
-            // The chunked forward builds its gather positions on the host, so it never runs inside a capture (the upload
-            // would be baked into the graph). An eager call has already read the ids for validation above.
+            // An eager call builds the chunked forward's gather positions on the host (it has already read the ids for
+            // validation above). Inside a capture the positions come from device ids: host ids' per-replay device copy
+            // on a resident step (validated on every upload; RefreshHostIndexDeviceCopiesNow runs before each replay), or
+            // resident ids' own buffer, so a replay uses that step's labels.
             bool chunked = false;
-            if (!capturing)
+            if (capturing)
+            {
+                if (TryFusedCeCapturedIds(backend, targetIds, vocab, out var capturedIds))
+                    using (capturedIds)
+                        chunked = TryFusedLinearCrossEntropyIndexForwardChunked(backend, hB.Buffer, wB.Buffer, bB.Buffer,
+                            null, loss.Buffer, n, d, vocab, capturedIds.Buffer);
+            }
+            else
             {
                 try
                 {

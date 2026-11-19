@@ -4772,6 +4772,9 @@ public partial class DirectGpuTensorEngine
         internal IGpuBuffer? Buffer;
         internal int Capacity;
         internal int Version;
+        // Exclusive upper bound every id must respect (0 = none): a fused cross-entropy's vocabulary. Checked on the host
+        // at every upload, so a captured step rejects an out-of-range id before its replay, as an eager call does.
+        internal int UpperBound;
         internal HostIndexDeviceCopy(Tensor<int> source) => Source = new WeakReference<Tensor<int>>(source);
     }
 
@@ -4786,7 +4789,7 @@ public partial class DirectGpuTensorEngine
     /// storage version changed (a constant id table uploads once). A captured step reads it through a stable pointer;
     /// <see cref="RefreshHostIndexDeviceCopiesNow"/> brings every copy up to date before a replay.
     /// </summary>
-    private IGpuBuffer GetHostIndexDeviceCopy(IDirectGpuBackend backend, Tensor<int> indices)
+    private IGpuBuffer GetHostIndexDeviceCopy(IDirectGpuBackend backend, Tensor<int> indices, int upperBound = 0)
     {
         HostIndexDeviceCopy copy;
         lock (_hostIndexLock)
@@ -4797,6 +4800,11 @@ public partial class DirectGpuTensorEngine
                 _hostIndexCopies.Add(indices, copy);
                 _hostIndexCopyList.RemoveAll(w => !w.TryGetTarget(out var c) || !c.Source.TryGetTarget(out _));
                 _hostIndexCopyList.Add(new WeakReference<HostIndexDeviceCopy>(copy));
+            }
+            if (upperBound > 0 && (copy.UpperBound == 0 || upperBound < copy.UpperBound))
+            {
+                copy.UpperBound = upperBound;
+                copy.Version = int.MinValue;   // validate the current ids against the new bound
             }
         }
         RefreshHostIndexDeviceCopy(backend, copy, indices);
@@ -4811,6 +4819,11 @@ public partial class DirectGpuTensorEngine
         {
             if (copy.Buffer is not null && copy.Capacity == n && copy.Version == version) return;
             var data = indices.ToArray();
+            if (copy.UpperBound > 0)
+                for (int i = 0; i < n; i++)
+                    if (data[i] < 0 || data[i] >= copy.UpperBound)
+                        throw new ArgumentOutOfRangeException(nameof(indices),
+                            $"Target ID {data[i]} at position {i} is out of bounds for vocabulary size {copy.UpperBound}.");
             if (copy.Buffer is null || copy.Capacity != n)
             {
                 var buffer = backend.AllocateIntBuffer(n);
@@ -6507,7 +6520,7 @@ public partial class DirectGpuTensorEngine
     internal bool TryFusedLinearCrossEntropyBackwardOnDevice<T>(Tensor<T> gradOutput, Tensor<T> hidden,
         Tensor<T> weight, Tensor<T> bias, int[]? targetIds, Tensor<T>? denseTarget,
         bool needHidden, bool needWeight, bool needBias,
-        out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias)
+        out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias, Tensor<int>? targetIdTensor = null)
     {
         using var __gpuOp = EnterGpuOp();
         gradHidden = gradWeight = gradBias = hidden;
@@ -6518,6 +6531,15 @@ public partial class DirectGpuTensorEngine
             return false;
         try
         {
+            // Inside a capture the host ids cannot be uploaded (the copy would be baked into the graph as this batch's
+            // labels): the chunked backward reads the same per-replay device ids the captured forward used.
+            if (targetIdTensor is not null && backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())
+            {
+                if (!TryFusedCeCapturedIds(backend, targetIdTensor, weight._shape[1], out var capturedIds)) return false;
+                using (capturedIds)
+                    return TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias, null,
+                        needHidden, needWeight, needBias, out gradHidden, out gradWeight, out gradBias, capturedIds.Buffer);
+            }
             if (targetIds is not null && TryFusedLinearCrossEntropyIndexBackwardChunked(gradOutput, hidden, weight, bias,
                     targetIds, needHidden, needWeight, needBias, out gradHidden, out gradWeight, out gradBias))
                 return true;
@@ -6593,23 +6615,16 @@ public partial class DirectGpuTensorEngine
     /// sum of exponentials): 3.68 s per call at N=4096, d=256, V=49152 on an RTX 3080 (Nsight), 44% of a training step.
     /// </summary>
     private bool TryFusedLinearCrossEntropyIndexForwardChunked(IDirectGpuBackend backend, IGpuBuffer h, IGpuBuffer w,
-        IGpuBuffer b, int[] targetIds, IGpuBuffer meanLoss, int n, int d, int vocab)
+        IGpuBuffer b, int[]? targetIds, IGpuBuffer meanLoss, int n, int d, int vocab, IGpuBuffer? deviceIds = null)
     {
-        if (n <= 0 || d <= 0 || vocab <= 0 || targetIds.Length != n) return false;
+        if (n <= 0 || d <= 0 || vocab <= 0 || (deviceIds is null && targetIds?.Length != n)) return false;
         int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
         if (chunk >= 32) chunk &= ~31;
         checked { _ = chunk * vocab; _ = n * d; }
 
         // Each row's target position inside its chunk's [chunk, vocab] block, as int bits (the gather reads the bits).
-        var positionBits = new float[n];
-        for (int r = 0; r < n; r++)
-        {
-            int id = targetIds[r];
-            if (id < 0 || id >= vocab) return false;
-            positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
-        }
-
-        using var positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
+        if (!TryFusedCeTargetPositions(backend, targetIds, deviceIds, n, chunk, vocab, out var positions)) return false;
+        using var _positions = positions;
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
         using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
@@ -6651,9 +6666,9 @@ public partial class DirectGpuTensorEngine
     /// floats = 805 MB each), which filled a 12 GB device and made every training step wait on their frees.
     /// </summary>
     private bool TryFusedLinearCrossEntropyIndexBackwardChunked<T>(Tensor<T> gradOutput, Tensor<T> hidden,
-        Tensor<T> weight, Tensor<T> bias, int[] targetIds,
+        Tensor<T> weight, Tensor<T> bias, int[]? targetIds,
         bool needHidden, bool needWeight, bool needBias,
-        out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias)
+        out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias, IGpuBuffer? deviceIds = null)
     {
         gradHidden = gradWeight = gradBias = hidden;
         if (!TryGetBackend(out var backend) || gradOutput.Length != 1 || bias.Length != weight._shape[1])
@@ -6662,20 +6677,16 @@ public partial class DirectGpuTensorEngine
         if (needWeight && transposedA is null)
             return false;
         int n = hidden._shape[0], d = hidden._shape[1], vocab = weight._shape[1];
-        if (n <= 0 || d <= 0 || vocab <= 0 || weight._shape[0] != d || targetIds.Length != n) return false;
+        if (n <= 0 || d <= 0 || vocab <= 0 || weight._shape[0] != d || (deviceIds is null && targetIds?.Length != n))
+            return false;
         int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
         if (chunk >= 32) chunk &= ~31;
         checked { _ = chunk * vocab; _ = n * d; _ = d * vocab; }
 
         // Target positions inside a chunk's [chunk, vocab] block, as int bits in a float buffer (the scatter reads
-        // the bits; a pooled float buffer is returned to the pool instead of a blocking free).
-        var positionBits = new float[n];
-        for (int r = 0; r < n; r++)
-        {
-            int id = targetIds[r];
-            if (id < 0 || id >= vocab) return false;
-            positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
-        }
+        // the bits).
+        if (!TryFusedCeTargetPositions(backend, targetIds, deviceIds, n, chunk, vocab, out var positions)) return false;
+        using var _positions = positions;
 
         var h = hidden.IsContiguous ? hidden : hidden.Contiguous();
         var w = weight.IsContiguous ? weight : weight.Contiguous();
@@ -6685,7 +6696,6 @@ public partial class DirectGpuTensorEngine
         using var wB = GetOrAllocateBuffer(backend, w);
         using var bB = GetOrAllocateBuffer(backend, b);
         using var gB = GetOrAllocateBuffer(backend, g);
-        using var positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
         // Allocate only the gradient outputs actually requested on this tape pass: detached shared readouts skip both
         // the [d, vocab] dWeight buffer and its h_c^T * dL_c GEMM across all intermediate layers.
         using var dHidden = needHidden ? AllocateOutputBuffer(backend, n * d) : default;
@@ -6739,6 +6749,55 @@ public partial class DirectGpuTensorEngine
             gradBias = DeferTensorResult<T>(backend, dBias.Buffer, vocab, new[] { vocab });
             dBias.RelinquishOwnership();
         }
+        return true;
+    }
+
+    /// <summary>
+    /// The chunked fused CE's per-row target positions, <c>(r % chunk) * vocab + id_r</c> as int bits in a float buffer.
+    /// From host ids they are validated and uploaded (a pooled float buffer, returned to the pool instead of a blocking
+    /// free). From device ids (<paramref name="deviceIds"/>, int32) the backend computes them on the device into
+    /// stream-ordered scratch, with no host read or upload, so the call can run inside a captured step. Null when an id
+    /// is out of range or the backend cannot compute positions from device ids.
+    /// </summary>
+    private static bool TryFusedCeTargetPositions(IDirectGpuBackend backend, int[]? targetIds, IGpuBuffer? deviceIds,
+        int n, int chunk, int vocab, out OwnedBuffer positions)
+    {
+        positions = default;
+        if (deviceIds is not null)
+        {
+            if (backend is not DirectGpu.IFusedCrossEntropyPositionsBackend positionsBackend) return false;
+            var scratch = AllocateStreamOrderedScratch(backend, n);
+            positionsBackend.FusedCrossEntropyTargetPositions(deviceIds, scratch, n, chunk, vocab);
+            positions = new OwnedBuffer(scratch, ownsBuffer: true);
+            return true;
+        }
+        if (targetIds is null || targetIds.Length != n) return false;
+        var positionBits = new float[n];
+        for (int r = 0; r < n; r++)
+        {
+            int id = targetIds[r];
+            if (id < 0 || id >= vocab) return false;
+            positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
+        }
+        positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
+        return true;
+    }
+
+    /// <summary>
+    /// The device int32 ids of a fused CE's targets for a captured step: a host tensor's per-replay device copy (checked
+    /// against <paramref name="vocab"/> at every upload) or a resident tensor's own buffer. False outside a resident
+    /// step for host ids.
+    /// </summary>
+    private bool TryFusedCeCapturedIds(IDirectGpuBackend backend, Tensor<int> targetIds, int vocab, out OwnedBuffer ids)
+    {
+        ids = default;
+        if (!HasResidentIndexStorage(targetIds))
+        {
+            if (!ResidentStepActive) return false;
+            ids = new OwnedBuffer(GetHostIndexDeviceCopy(backend, targetIds, vocab), ownsBuffer: false);
+            return true;
+        }
+        ids = GetOrAllocateInt32IndexBuffer(backend, targetIds);
         return true;
     }
 

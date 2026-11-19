@@ -4,7 +4,7 @@ public static class CudaInstantNgpKernels
 {
     public static string[] GetKernelNames() =>
         ["instant_ngp_hash_encode_level", "instant_ngp_hash_encode_level_backward",
-            "frexp_decompose", "unique_consecutive_compact", "unique_consecutive_with_info", "unique_sorted_with_info", "project_gaussians_3d_to_2d", "sample_rays_with_occupancy", "resident_mode", "resident_indices_to_int32", "resident_one_hot_int32", "resident_index_add", "resident_index_select", "resident_scatter_max_argmax_rows", "resident_uniform_mesh_laplacian", "resident_scatter_add_rows", "resident_scatter_mean_rows_counts", "resident_scatter_softmax_rows", "resident_scatter_add_backward_rows", "resident_scatter_mean_backward_rows", "resident_scatter_max_backward_rows", "resident_scatter_softmax_backward_rows", "nonzero_compact", "ctc_loss_forward", "importance_sampling", "resident_nms",
+            "frexp_decompose", "unique_consecutive_compact", "unique_consecutive_with_info", "unique_sorted_with_info", "project_gaussians_3d_to_2d", "sample_rays_with_occupancy", "resident_mode", "resident_indices_to_int32", "fused_ce_target_positions", "resident_one_hot_int32", "resident_index_add", "resident_index_select", "resident_scatter_max_argmax_rows", "resident_uniform_mesh_laplacian", "resident_scatter_add_rows", "resident_scatter_mean_rows_counts", "resident_scatter_softmax_rows", "resident_scatter_add_backward_rows", "resident_scatter_mean_backward_rows", "resident_scatter_max_backward_rows", "resident_scatter_softmax_backward_rows", "nonzero_compact", "ctc_loss_forward", "importance_sampling", "resident_nms",
             "generate_spiral_indices"];
 
     public static string GetSource() => @"
@@ -355,6 +355,18 @@ extern ""C"" __global__ __launch_bounds__(256) void resident_indices_to_int32(
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid < length) output[gid] = (int)input[gid];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void fused_ce_target_positions(
+    const int* __restrict__ ids,
+    float* __restrict__ positionBits,
+    int rows, int chunk, int vocab)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= rows) return;
+    int id = ids[gid];
+    id = id < 0 ? 0 : (id >= vocab ? vocab - 1 : id);
+    positionBits[gid] = __int_as_float((gid % chunk) * vocab + id);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void resident_one_hot_int32(
