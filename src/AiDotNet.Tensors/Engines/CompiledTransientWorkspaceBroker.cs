@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines;
 /// private to each plan. A checked-out buffer is absent from this broker until its complete step returns it.
 /// All calls are serialized by the engine's CompiledStepLock; nested steps therefore have separate checkouts too.
 /// </summary>
-internal sealed class CompiledTransientWorkspaceBroker
+internal sealed partial class CompiledTransientWorkspaceBroker
 {
     private readonly StepScratchPool _owner;
     private readonly List<(long Key, IDirectGpuBackend Backend, int Thread, IGpuBuffer Buffer)> _free = new();

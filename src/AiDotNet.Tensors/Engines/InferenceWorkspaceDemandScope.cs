@@ -13,6 +13,8 @@ internal static class InferenceWorkspaceDemandScope
     [ThreadStatic] private static DirectGpuTensorEngine? t_engine;
     internal static bool BestFitIdleBuffersEnabled { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_BEST_FIT_IDLE_BUFFERS") == "1";
+    internal static bool HandoffIdleWorkspaceEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_WORKSPACE_HANDOFF") == "1";
 
     [ThreadStatic] private static long t_scope;
     [ThreadStatic] private static long t_nextScope;
@@ -51,6 +53,16 @@ internal static class InferenceWorkspaceDemandScope
         long next = ++t_nextScope;
         t_engine = GraphMode.IsActive ? null : engine?.As<DirectGpuTensorEngine>();
         t_scope = next;
+        try
+        {
+            if (HandoffIdleWorkspaceEnabled) t_engine?.ReturnIdleCompiledWorkspaceToAllocatorCache();
+        }
+        catch
+        {
+            t_engine = previous;
+            t_scope = previousScope;
+            throw;
+        }
         return new Scope(previous, previousScope, next);
     }
 
