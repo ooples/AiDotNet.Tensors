@@ -6845,7 +6845,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the compiled plan calls it from the not-capturing pre-pass so capture/replay only memset + accumulate in place.
     /// Returns null if no backend or non-float (the resident paths are float-only).</summary>
     internal IGpuBuffer? EnsureResidentBuffer<T>(Tensor<T> t)
+        => EnsureResidentBufferWithAllocationInfo(t, out _);
+
+    internal IGpuBuffer? EnsureResidentBufferWithAllocationInfo<T>(Tensor<T> t, out bool allocated)
     {
+        allocated = false;
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
         int need = t.Length;
@@ -6860,6 +6864,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var buf = backend.AllocateBuffer(need);
             if (buf is null || buf.Handle == System.IntPtr.Zero) return null;
             BindResidentBuffer(t, buf, backend);
+            allocated = true;
             return buf;
         }
         catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("EnsureResidentBuffer", ex); AliasDiag($"EnsureResidentBuffer FELLBACK len={need}: {ex.GetType().Name}: {ex.Message}"); return null; }
