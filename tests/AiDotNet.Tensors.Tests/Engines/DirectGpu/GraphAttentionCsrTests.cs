@@ -4,12 +4,13 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
-namespace AiDotNet.Tensors.Tests.Engines;
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// Correctness of <see cref="CpuEngine.GraphAttentionCsr{T}"/>: the forward against a direct per-row reference, the
 /// backward against central finite differences, and the GPU kernels against the CPU implementation (dropout included).
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class GraphAttentionCsrTests
 {
     private const int Batch = 2, Nodes = 5, Heads = 2, Features = 3;
