@@ -151,7 +151,9 @@ FN U64 dgn_roundshift(U64 m, int sh, int sticky)
     if (sh > 64) return 0;
     U64 q = sh == 64 ? (U64)0 : (m >> sh);
     int roundBit = (int)((m >> (sh - 1)) & DGN_ONE);
-    int rest = sticky || (sh > 1 && (m & (~(U64)0 >> (65 - sh))) != 0);
+    // The low sh - 1 bits (none when sh is 1). One mask, not a guarded shift: POCL 6's LLVM 18 aborts (Instruction
+    // Combining did not reach a fixpoint) on the guarded form when the program binary is requested.
+    int rest = sticky || (m & ((DGN_ONE << (sh - 1)) - DGN_ONE)) != 0;
     if (roundBit && (rest || (q & DGN_ONE) != 0)) q++;
     return q;
 }

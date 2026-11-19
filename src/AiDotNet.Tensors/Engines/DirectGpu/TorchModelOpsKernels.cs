@@ -639,8 +639,11 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_topk_select(const float* 
         if (mo_before(xj, j, xi, i)) { rank = rank + 1; }
         if (mo_before(xj, j, top, topIndex)) { top = xj; topIndex = j; }
     }
+    // exp outside the branch (the same values): POCL 6 / LLVM 18 aborts (Instruction Combining did not reach a
+    // fixpoint) on the conditional exp.
+    float ex = expf(xi - top);
     float r0 = -1.0f;
-    if (rank < k) { r0 = expf(xi - top); }
+    if (rank < k) { r0 = ex; }
     e[g] = r0;
 }
 
@@ -736,8 +739,11 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_topk_rank(const float* ca
         }
         rank = rank + lo;
     }
+    // exp outside the branch (the same values): POCL 6 / LLVM 18 aborts (Instruction Combining did not reach a
+    // fixpoint) on the conditional exp.
+    float ex = expf(v - top);
     float r0 = -1.0f;
-    if (rank < k) { r0 = expf(v - top); }
+    if (rank < k) { r0 = ex; }
     w[g] = r0;
 }
 
