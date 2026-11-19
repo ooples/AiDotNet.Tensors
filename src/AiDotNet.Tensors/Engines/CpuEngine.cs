@@ -16984,6 +16984,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
+            if (TryShortWaveInputGradient((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
+                (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
+                return;
+
             if (TryConv1DBackwardInputColumnPanels((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
                 (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
