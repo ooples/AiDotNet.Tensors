@@ -4879,6 +4879,19 @@ public partial class DirectGpuTensorEngine
     }
     private readonly List<CapturedResidentIndex> _capturedResidentIndices = new();
 
+    /// <summary>
+    /// On a compiled step, for a device-resident int tensor read through its own buffer: uploads a host write into that
+    /// buffer (outside a capture) and records the tensor so RefreshHostIndexDeviceCopiesNow repeats it before every
+    /// replay. Covers every int consumer (index select, gather, scatter, the fused cross-entropy's labels), since all of
+    /// them resolve a resident tensor through GetOrAllocateBuffer.
+    /// </summary>
+    internal void PrepareResidentIndexForCompiledStep(IDirectGpuBackend backend, Tensor<int> indices)
+    {
+        if (!(backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing()))
+            RefreshResidentIndexInPlace(backend, indices, IntPtr.Zero);
+        RecordCapturedResidentIndex(indices);
+    }
+
     private void RecordCapturedResidentIndex(Tensor<int> indices)
     {
         if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero) return;
@@ -6899,12 +6912,6 @@ public partial class DirectGpuTensorEngine
             ids = new OwnedBuffer(GetHostIndexDeviceCopy(backend, targetIds, vocab), ownsBuffer: false);
             return true;
         }
-        // The compiled step reads this tensor's own buffer without a version check, and a replay through a baked
-        // pointer: bring a host write into that buffer now (outside a capture), and record it so the plan does the same
-        // before each replay.
-        bool capturingIds = backend is DirectGpu.IGpuGraphCapture capturing && capturing.IsStreamCapturing();
-        if (!capturingIds) RefreshResidentIndexInPlace(backend, targetIds, IntPtr.Zero);
-        RecordCapturedResidentIndex(targetIds);
         ids = GetOrAllocateInt32IndexBuffer(backend, targetIds);
         return true;
     }

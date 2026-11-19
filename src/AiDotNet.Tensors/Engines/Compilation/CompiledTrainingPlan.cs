@@ -4105,8 +4105,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // plan's own readback after it, so a step only ever sees its own rows.
                 if (gpuEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback))
                     throw new ArgumentOutOfRangeException("targetIds",
-                        "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). A backend " +
-                        "that does not propagate NaN may have applied that step's update.");
+                        "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). Where the " +
+                        "backend propagates NaN that step was discarded as non-finite; elsewhere its update may have been applied.");
                 gpuEngine.ClearFusedCeLabelError();
                 var loss = StepLocked();
                 gpuEngine.QueueFusedCeLabelErrorCheck(ref _labelErrorReadback);

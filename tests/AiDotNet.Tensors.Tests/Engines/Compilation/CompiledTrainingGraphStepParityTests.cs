@@ -789,9 +789,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// read of its device-resident input aborted the capture.
     /// </summary>
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Index_selects_through_host_ids_train_like_the_cpu_plan(bool capture)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void Index_selects_through_host_ids_train_like_the_cpu_plan(bool capture, bool residentIds)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -801,7 +803,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 "Whole-step graph capture is CUDA-only.");
             Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
                 "Graph capture is disabled for this process.");
-            var run = TrainHostIdSelects(gpu, capture);
+            // residentIds: the ids live on the device (Gpu()) and each step's batch is written on the host.
+            var run = TrainHostIdSelects(gpu, capture, residentIds);
             var prior = AiDotNetEngine.Current;
             var cpu = new CpuEngine();
             AiDotNetEngine.Current = cpu;
@@ -1015,7 +1018,93 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         }
     }
 
-    private static (double[] Losses, float[][] Weights, bool Replayed) TrainHostIdSelects(IEngine engine, bool capture)
+    /// <summary>
+    /// Ids the step computes on the device (an argmax over a fed input) are read as they are: the resident int refresh
+    /// that brings a host write into a device-resident ids buffer must never upload stale host bytes over device-written
+    /// ids.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Device_computed_ids_train_like_the_cpu_plan(bool capture)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            var run = TrainDeviceComputedIds(gpu, capture);
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainDeviceComputedIds(cpu, capture: false);
+            AiDotNetEngine.Current = prior;
+            _output.WriteLine("cpu " + string.Join(" ", truth.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("gpu " + string.Join(" ", run.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(truth.Losses.Distinct().Count() == Steps, "the losses repeat; the comparison would be vacuous");
+            if (capture) Assert.True(run.Replayed, "the captured plan is not replaying a graph after warm-up");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - run.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {run.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainDeviceComputedIds(IEngine engine, bool capture)
+    {
+        const int rows = 40;
+        var scores = Rand([Batch, rows], 11, 1f);
+        var x = Rand([Batch, Inputs], 1, 1f);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var table = Rand([rows, Inputs], 5, 0.5f);
+        var w = Rand([Inputs, Outputs], 4, 0.3f);
+        var parameters = new[] { table, w };
+        if (engine is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(800 + step);
+            var span = scores.AsWritableSpan();
+            for (int i = 0; i < span.Length; i++) span[i] = (float)rng.NextDouble();
+            scores.IncrementVersion();
+            FeedTarget(y, step);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var ids = engine.TensorArgMax(scores, 1);   // computed on the device each step
+            var a = engine.TensorIndexSelect(table, ids, 0);
+            engine.TensorMSELoss(engine.TensorMatMul(engine.TensorMultiply(a, x), w), y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            bool replayed = false;
+            if (plan is CompiledTrainingPlan<float> c)
+            {
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                replayed = execField.GetValue(c) is IntPtr handle && handle != IntPtr.Zero;
+            }
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), replayed);
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainHostIdSelects(IEngine engine, bool capture,
+        bool residentIds = false)
     {
         const int rows = 40;
         var fed = new Tensor<int>([Batch]);
@@ -1040,6 +1129,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
         ICompiledTrainingPlan<float> plan;
         Feed(0);
+        if (residentIds && engine is DirectGpuTensorEngine) fed.Gpu();
         using (var scope = GraphMode.EnableTraining(parameters))
         {
             var a = engine.TensorIndexSelect(tableA, fed, 0);
