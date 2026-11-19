@@ -180,9 +180,10 @@ public static class AiDotNetEngine
             }
 
             // An engine the caller chose before anything asked for one stands; the owed detection must not replace it.
-            Volatile.Write(ref _deferredDetection, 0);
+            lock (_deferredLock)
             lock (_adoptionLock)
             {
+                Volatile.Write(ref _deferredDetection, 0);
                 Volatile.Write(ref _current, value);
                 // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
                 Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
@@ -536,10 +537,11 @@ public static class AiDotNetEngine
     private static void SwitchToCpuEngine()
     {
         // A caller that asked for the CPU engine before anything read Current must not get the GPU on that read.
-        if (!t_completingDeferred) Volatile.Write(ref _deferredDetection, 0);
         DirectGpuTensorEngine? parked = null;
+        lock (_deferredLock)
         lock (_adoptionLock)
         {
+            if (!t_completingDeferred) Volatile.Write(ref _deferredDetection, 0);
             var observed = Volatile.Read(ref _current);
             // A reset hands the choice back to the library either way, also when it keeps a plain CPU engine.
             Volatile.Write(ref _callerAssigned, false);

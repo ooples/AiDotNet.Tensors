@@ -11,9 +11,9 @@ internal sealed partial class CompiledTrainingPlan<T>
     private void ThrowOnInvalidCurrentFusedCeLabels()
     {
         if (!_usesFusedCe || _fusedCeLabelsValidated) return;
-        _fusedCeLabelsValidated = true;
         if (_engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TakeFusedCeLabelError())
             throw new ArgumentOutOfRangeException("targetIds",
                 "A fused cross-entropy target id on this compiled step was outside [0, vocab). The step was not applied.");
+        _fusedCeLabelsValidated = true;
     }
 }

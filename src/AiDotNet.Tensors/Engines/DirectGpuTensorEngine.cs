@@ -604,7 +604,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void BeginGraphLifetime()
     {
-        System.Threading.Interlocked.Increment(ref _liveCapturedGraphs);
+        lock (_graphLifetimeLock) System.Threading.Interlocked.Increment(ref _liveCapturedGraphs);
         _evictionSuspendDepth.Enter();
     }
 
@@ -614,12 +614,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _evictionSuspendDepth.Exit();
         int live = System.Threading.Interlocked.Decrement(ref _liveCapturedGraphs);
         if (live < 0) { System.Threading.Interlocked.Increment(ref _liveCapturedGraphs); live = 0; }
+        lock (_graphLifetimeLock)
+        {
+            if (_liveCapturedGraphs == 0 && _pendingActivationClear)
+                ClearActivationCache();
+        }
         if (live == 0 && System.Threading.Interlocked.Exchange(ref _pendingWeightCacheInvalidation, 0) == 1)
             InvalidateAllWeightCaches();
     }
 
     // Set when InvalidateAllWeightCaches is called while a captured graph is alive (see there).
     private int _pendingWeightCacheInvalidation;
+    private readonly object _graphLifetimeLock = new();
+    private bool _pendingActivationClear;
 
     // ───────────────────────────────────────────────────────────────────────────────────────────
     // #1650 PUBLIC inference CUDA-graph capture API. ForwardUNet (the diffusion eager GPU forward to
@@ -3383,6 +3390,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void ClearActivationCache()
     {
+        lock (_graphLifetimeLock)
+        {
+            if (_liveCapturedGraphs != 0 && !IsDisposed)
+            {
+                _pendingActivationClear = true;
+                return;
+            }
+            _pendingActivationClear = false;
+            ClearActivationCacheCore();
+        }
+    }
+
+    private void ClearActivationCacheCore()
+    {
         // Snapshot the (key, entry) pairs this cache owns, then clear.
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
@@ -3429,6 +3450,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// frees the GPU buffers and removes the (now-moot) materializers directly.
     /// </summary>
     public void DropActivationCache()
+    {
+        lock (_graphLifetimeLock)
+        {
+            if (_liveCapturedGraphs != 0)
+            {
+                // A live graph can still write these entries. Preserve its last writes on eventual release.
+                _pendingActivationClear = true;
+                return;
+            }
+            DropActivationCacheCore();
+        }
+    }
+
+    private void DropActivationCacheCore()
     {
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
@@ -6121,7 +6156,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // A view that does not cover its whole storage (a slice or strided view). Pooled tensors whose backing array is
     // longer than their length are not views and keep the resident fast paths.
-    private static bool IsPartialView<T>(Tensor<T> tensor)
+    internal static bool IsPartialView<T>(Tensor<T> tensor)
         => tensor.IsView && (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor._storage.Length != tensor.Length);
 
     private static bool IsCanonicalDenseAllocation<T>(Tensor<T> tensor)
@@ -6514,6 +6549,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void BindResidentBuffer<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend, bool isDeviceModified)
     {
         int hostVersion = t.GpuCacheVersion;
+        if (isDeviceModified && _residentInputBindings.TryGetValue(t, out var inputBinding)
+            && ReferenceEquals(inputBinding.Buffer, buf))
+            inputBinding.DeviceWrittenVersion = hostVersion;
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = hostVersion;
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null)
@@ -25300,8 +25338,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // Invalidate CPU-derived weight packs without invoking the host-write GPU re-upload path.
                 base.InvalidatePersistentTensor(destination);
                 MarkCallerOwnedDestination(destination);
-                if (inputBinding is not null && ReferenceEquals(inputBinding.Buffer, destinationBuffer))
-                    inputBinding.DeviceWrittenVersion = destination.GpuCacheVersion;
                 return;
             }
             catch (NotSupportedException ex) {

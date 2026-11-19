@@ -6,7 +6,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed partial class CudaBackend : IGraphAttentionBackend
 {
     private IntPtr _graphAttentionModule;
-    private string? _graphAttentionError;
     private readonly object _graphAttentionLock = new object();
 
     // Compiled on first use: only graph-attention layers dispatch here, so other models pay nothing for it.
@@ -14,7 +13,7 @@ public sealed partial class CudaBackend : IGraphAttentionBackend
     {
         lock (_graphAttentionLock)
         {
-            if (_graphAttentionModule == IntPtr.Zero && _graphAttentionError is null)
+            if (_graphAttentionModule == IntPtr.Zero)
             {
                 try
                 {
@@ -24,12 +23,12 @@ public sealed partial class CudaBackend : IGraphAttentionBackend
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
-                    _graphAttentionError = ex.Message;
+                    // Preserve the optional GPU fallback while allowing a later dispatch to retry the load.
+                    throw new NotSupportedException("CUDA graph-attention kernels could not be loaded.", ex);
                 }
             }
             if (_graphAttentionModule == IntPtr.Zero || !_kernelCache.TryGetValue(name, out var kernel))
-                throw new NotSupportedException("CUDA graph-attention kernels are unavailable"
-                    + (_graphAttentionError is null ? "." : ": " + _graphAttentionError));
+                throw new NotSupportedException($"CUDA graph-attention kernel {name} is unavailable.");
             return kernel;
         }
     }
@@ -53,7 +52,7 @@ public sealed partial class CudaBackend : IGraphAttentionBackend
 
     unsafe void IGraphAttentionBackend.GraphAttentionForward(IGpuBuffer wh, IGpuBuffer selfScore, IGpuBuffer neighScore,
         IGpuBuffer rowPtr, IGpuBuffer col, IGpuBuffer output,
-        int batch, int nodes, int heads, int features, int edges, float slope, float rate, float keep, uint seed)
+        int batch, int nodes, int heads, int features, int edges, double slope, uint cutoff, float keep, uint seed)
     {
         int total = batch * nodes * heads;
         if (total <= 0) return;
@@ -63,13 +62,13 @@ public sealed partial class CudaBackend : IGraphAttentionBackend
         void** args = stackalloc void*[15];
         args[0] = &pw; args[1] = &ps; args[2] = &pn; args[3] = &pr; args[4] = &pc; args[5] = &po;
         args[6] = &batch; args[7] = &nodes; args[8] = &heads; args[9] = &features; args[10] = &edges;
-        args[11] = &slope; args[12] = &rate; args[13] = &keep; args[14] = &seed;
+        args[11] = &slope; args[12] = &cutoff; args[13] = &keep; args[14] = &seed;
         LaunchKernel(kernel, GraphAttentionGrid(total), DefaultBlockSize, args);
     }
 
     unsafe void IGraphAttentionBackend.GraphAttentionBackwardRows(IGpuBuffer wh, IGpuBuffer gradOutput, IGpuBuffer selfScore,
         IGpuBuffer neighScore, IGpuBuffer rowPtr, IGpuBuffer col, IGpuBuffer gz, IGpuBuffer cp, IGpuBuffer gSelf,
-        int batch, int nodes, int heads, int features, int edges, float slope, float rate, float keep, uint seed)
+        int batch, int nodes, int heads, int features, int edges, double slope, uint cutoff, float keep, uint seed)
     {
         int total = batch * nodes * heads;
         if (total <= 0) return;
@@ -81,7 +80,7 @@ public sealed partial class CudaBackend : IGraphAttentionBackend
         args[0] = &pw; args[1] = &pg; args[2] = &ps; args[3] = &pn; args[4] = &pr; args[5] = &pc;
         args[6] = &pz; args[7] = &pp; args[8] = &pgs;
         args[9] = &batch; args[10] = &nodes; args[11] = &heads; args[12] = &features; args[13] = &edges;
-        args[14] = &slope; args[15] = &rate; args[16] = &keep; args[17] = &seed;
+        args[14] = &slope; args[15] = &cutoff; args[16] = &keep; args[17] = &seed;
         LaunchKernel(kernel, GraphAttentionGrid(total), DefaultBlockSize, args);
     }
 

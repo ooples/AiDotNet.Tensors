@@ -20,14 +20,18 @@ internal static class CuRandNative
 {
     private const string Lib = "curand64_10";
 
-#if NETCOREAPP
     static CuRandNative()
     {
+#if NETCOREAPP
         // CUDA 13 installs its DLLs in bin\x64, which its installer does not put on PATH (only bin), so the default
         // search found no curand64_10 on such a machine and every cuRAND path fell back to the CPU generator (the
         // CUDA lane's skip gate failed on it). Probe the CUDA install as cuBLAS does.
         NativeLibraryResolverRegistry.Register(ResolveCuRandLibrary);
+#endif
+        IsAvailable = Probe();
     }
+
+#if NETCOREAPP
 
     private static readonly string[] WindowsCandidates = ["curand64_10"];
     private static readonly string[] LinuxCandidates = ["libcurand.so.10", "libcurand.so"];
@@ -140,7 +144,7 @@ internal static class CuRandNative
     /// primary context, a device busy for a moment) was cached for the life of the process, and every cuRAND path
     /// then ran on the CPU - the CUDA lane saw all its cuRAND tests skip in one run and pass in the next. A device
     /// call that fails now falls back to the CPU generator for that call only.</remarks>
-    public static readonly bool IsAvailable = Probe();
+    public static readonly bool IsAvailable;
 
     private static bool Probe()
     {

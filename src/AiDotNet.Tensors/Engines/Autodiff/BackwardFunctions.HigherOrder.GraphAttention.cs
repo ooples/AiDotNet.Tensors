@@ -19,12 +19,13 @@ internal static partial class BackwardFunctions<T>
         int n = graph.NodeCount, edges = graph.EdgeCount;
         int rows = transformed.Length / (heads * features);
         int batch = rows / n;
-        var rowPtr = graph.RowPointers;
-        var col = graph.ColumnIndices;
-        var rowOf = new int[edges];
-        for (int i = 0; i < n; i++)
-            for (int k = rowPtr[i]; k < rowPtr[i + 1]; k++) rowOf[k] = i;
-        int be = batch * edges;
+        long edgeCount = (long)batch * edges;
+        if (edgeCount > int.MaxValue / heads / features)
+            throw new NotSupportedException("The recorded CSR edge-feature map exceeds the maximum array length.");
+        int be = (int)edgeCount;
+        var rowPtr = graph.RowOffsets;
+        var col = graph.Columns;
+        var rowOf = graph.EdgeRows;
 
         // Attention halves [1, H, F] gathered from attention [H, 2F].
         var selfFrom = new int[heads * features];
@@ -62,12 +63,16 @@ internal static partial class BackwardFunctions<T>
         var z = e.TensorAdd(SparseMap(sSelf, eh, edgeTo, rowFrom, null), SparseMap(sNeigh, eh, edgeTo, colFrom, null));
 
         // LeakyReLU, the row max shift and the dropout scale as constants of this forward.
-        var zv = RoIAlignPlan.ToDoubles(z);
-        var leak = new double[zv.Length];
-        var ev = new double[zv.Length];
-        for (int t = 0; t < zv.Length; t++) { leak[t] = zv[t] > 0 ? 1.0 : slope; ev[t] = zv[t] * leak[t]; }
-        var shift = new double[zv.Length];
-        var keep = new double[zv.Length];
+        var scores = CpuEngine.GraphAttentionScores(RoIAlignPlan.ToDoubles(transformed), RoIAlignPlan.ToDoubles(attention), rows, heads, features);
+        var leak = new double[rowFrom.Length];
+        var ev = new double[rowFrom.Length];
+        for (int t = 0; t < ev.Length; t++)
+        {
+            double logit = scores.Self[rowFrom[t]] + scores.Neigh[colFrom[t]];
+            leak[t] = logit > 0 ? 1.0 : slope;
+            ev[t] = logit * leak[t];
+        }
+        var keep = new double[ev.Length];
         double scale = rate > 0 ? 1.0 / (1.0 - rate) : 1.0;
         for (int b = 0; b < batch; b++)
             for (int i = 0; i < n; i++)
@@ -78,13 +83,16 @@ internal static partial class BackwardFunctions<T>
                     for (int k = rowPtr[i]; k < rowPtr[i + 1]; k++)
                     {
                         int t = (b * edges + k) * heads + h;
-                        shift[t] = max;
+                        ev[t] -= max;
                         keep[t] = rate > 0 && CpuEngine.GraphAttentionUniform(seed, (uint)(((long)b * edges + k) * heads + h)) < rate
                             ? 0.0 : scale;
                     }
                 }
         var leaky = e.TensorMultiply(z, RoIAlignPlan.FromDoubles<T>(leak, eh));
-        var ex = e.TensorExp(e.TensorSubtract(leaky, RoIAlignPlan.FromDoubles<T>(shift, eh)));
+        // Round after the max shift, as in the fused forward. The row shift cancels in softmax.
+        var centered = RoIAlignPlan.FromDoubles<T>(ev, eh);
+        DifferentiableOps.RecordUnary("GraphAttentionCenteredScores", centered, leaky, StraightThroughBackward);
+        var ex = e.TensorExp(centered);
         var rowSum = SparseMap(ex, new[] { rows, heads }, rowFrom, edgeTo, null);
         var alpha = e.TensorDivide(ex, SparseMap(rowSum, eh, edgeTo, rowFrom, null));
         var coef = e.TensorMultiply(alpha, RoIAlignPlan.FromDoubles<T>(keep, eh));

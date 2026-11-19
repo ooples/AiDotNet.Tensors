@@ -4171,6 +4171,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // copies the current weights back and lands the device count, so this update starts from both and the next
             // capture re-seeds from what it leaves.
             if (_capturedOptimizer is not null) InvalidateCapturedStepGraph();
+            _fusedCeLabelsValidated = false;
+            if (_engine.TryGet<DirectGpuTensorEngine>(out var labelEngine))
+                ThrowOnPreviousFusedCeLabelError(labelEngine);
+            ThrowOnInvalidCurrentFusedCeLabels();
             var previousMembership = _optimizerGradientMembership;
             _optimizerGradientMembership = membership;
             try
@@ -4215,10 +4219,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // label-error word) fails this step before it runs. The read consumes the copy, so a caller that
         // catches and feeds a good batch steps on. The word is cleared before each step and copied into this
         // plan's own readback after it, so a step only ever sees its own rows.
-        if (gpuEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback))
-            throw new ArgumentOutOfRangeException("targetIds",
-                "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). Where the " +
-                "backend propagates NaN that step was discarded as non-finite; elsewhere its update may have been applied.");
+        ThrowOnPreviousFusedCeLabelError(gpuEngine);
         _fusedCeLabelsValidated = false;
         gpuEngine.ClearFusedCeLabelError();
         var loss = ExecuteStepLocked();
@@ -4606,11 +4607,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private int _foreignParameterRecaptures;
     private const int MaxForeignParameterRecaptures = 4;
 
+    private void ThrowOnPreviousFusedCeLabelError(DirectGpuTensorEngine engine)
+    {
+        if (engine.ReadFusedCeLabelErrorCheck(_labelErrorReadback))
+            throw new ArgumentOutOfRangeException("targetIds", "A fused cross-entropy target id on the previous step was outside [0, vocab).");
+    }
+
     private bool ForeignParametersStillBound(Engines.DirectGpu.IGpuGraphCapture cb)
     {
         foreach (var entry in _foreignParameterLeaves)
             if (!ReferenceEquals(entry.Key._gpuBuffer, entry.Value) || !ReferenceEquals(entry.Key._gpuBackend, cb)
-                || entry.Value.Handle == IntPtr.Zero)
+                || entry.Value.Handle == IntPtr.Zero || entry.Key._gpuBufferVersion != entry.Key.GpuCacheVersion)
                 return false;
         return true;
     }
@@ -4640,7 +4647,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // as long as the owner still keeps its weights there.
         if (_foreignParameterLeaves.TryGetValue(leaf, out var foreign))
             return ReferenceEquals(leaf._gpuBuffer, foreign) && ReferenceEquals(leaf._gpuBackend, cb)
-                   && foreign.Handle != IntPtr.Zero;
+                   && foreign.Handle != IntPtr.Zero && leaf._gpuBufferVersion == leaf.GpuCacheVersion;
         bool captured = _ownedLeafBuffers.TryGetValue(leaf, out var owned);
         if (leaf._gpuBuffer is not { } bound || !ReferenceEquals(leaf._gpuBackend, cb))
             return !captured;

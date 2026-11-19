@@ -43,10 +43,13 @@ internal static class PortableConvTransposeGemm
             || outWidth <= 0 || kernelH <= 0 || kernelW <= 0 || strideH <= 0 || strideW <= 0 || padH < 0 || padW < 0)
             return 0;
         long L = (long)inHeight * inWidth;
-        long P = (long)outChannels * kernelH * kernelW;
-        long inSample = inChannels * L, outSample = (long)outChannels * outHeight * outWidth;
-        if ((long)batch * inSample > int.MaxValue || (long)batch * outSample > int.MaxValue) return 0;
-        long chunk = Math.Max(1, Math.Min(batch, ColCap / Math.Max(1, P * L)));
+        long outPlane = (long)outHeight * outWidth;
+        if (L > int.MaxValue / batch / inChannels || outPlane > int.MaxValue / batch / outChannels) return 0;
+        long taps = (long)kernelH * kernelW;
+        if (taps > ColCap / L / outChannels) return 0;
+        long P = taps * outChannels;
+        long inSample = inChannels * L, outSample = outChannels * outPlane;
+        long chunk = Math.Min(batch, ColCap / (P * L));
         // Each launch of a chunk stays within the grid.
         chunk = Math.Min(chunk, MaxGroups * G / Math.Max(1, Math.Max(inSample, outSample)));
         if (chunk < 1 || P * chunk * L > int.MaxValue) return 0;
@@ -70,6 +73,8 @@ internal static class PortableConvTransposeGemm
         int L = inHeight * inWidth;
         int P = outChannels * kernelH * kernelW;
         int inSample = inChannels * L, outSample = outChannels * outHeight * outWidth;
+        long limit = backend.MaxBufferAllocBytes;
+        if (limit > 0 && (long)chunk * L * Math.Max(inChannels, P) * sizeof(float) > limit) return false;
         using var xt = backend.AllocateBuffer(inChannels * chunk * L);
         using var col = backend.AllocateBuffer(P * chunk * L);
         for (int b0 = 0; b0 < batch; b0 += chunk)

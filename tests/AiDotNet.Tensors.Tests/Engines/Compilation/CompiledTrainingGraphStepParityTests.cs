@@ -1110,10 +1110,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
     /// <summary>
     /// A captured graph reads a device-resident ids tensor through the buffer it baked: if the tensor is given another
-    /// buffer (without its version moving), the next replay throws instead of reading the old one.
+    /// buffer (without its version moving), the plan retires the graph and computes the step from the new binding.
     /// </summary>
     [SkippableFact]
-    public void A_replay_rejects_resident_ids_moved_to_another_buffer()
+    public void A_replay_recovers_when_resident_ids_move_to_another_buffer()
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -1150,16 +1150,25 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     ?? throw new InvalidOperationException("_stepGraphExec field not found.");
                 Assert.True(execField.GetValue(plan) is IntPtr handle && handle != IntPtr.Zero,
                     "the captured plan is not replaying a graph after warm-up");
-                // Same values, same version, another buffer: as a re-placement would leave it.
+                // A replacement buffer with a different lookup, at the same version.
                 var backend = gpu.GetBackend()!;
-                var moved = backend.AllocateBuffer(AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine.ToFloatArray(ids.ToArray()));
+                var replacement = ids.ToArray().Select(id => (id + 1) % rows).ToArray();
+                var cpu = new CpuEngine();
+                var hostTable = new Tensor<float>(table.ToArray(), table.Shape.ToArray());
+                var hostWeight = new Tensor<float>(w.ToArray(), w.Shape.ToArray());
+                var selected = cpu.TensorIndexSelect(hostTable, new Tensor<int>(replacement, new[] { Batch }), 0);
+                var expected = cpu.TensorMSELoss(cpu.TensorMatMul(cpu.TensorMultiply(selected, x), hostWeight), y).ToArray()[0];
+                var moved = backend.AllocateBuffer(AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine.ToFloatArray(replacement));
                 var original = ids._gpuBuffer;
                 int version = ids._gpuBufferVersion;
                 ids._gpuBuffer = moved;
                 ids._gpuBufferVersion = version;
                 try
                 {
-                    Assert.Throws<InvalidOperationException>(() => plan.Step());
+                    var loss = plan.Step().ToArray();
+                    Assert.Single(loss);
+                    Assert.InRange(Math.Abs(loss[0] - expected), 0f, 1e-4f * (1f + Math.Abs(expected)));
+                    Assert.Equal(IntPtr.Zero, (IntPtr)execField.GetValue(plan)!);
                 }
                 finally
                 {
@@ -3408,4 +3417,3 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         finally { AiDotNetEngine.Current = prior; }
     }
 }
-

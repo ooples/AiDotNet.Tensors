@@ -4746,7 +4746,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // one-thread-per-output conv_transpose2d kernel below re-reads every input channel and tap per output.
         if (TryConvTranspose2DGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
                 outWidth, kernelH, kernelW, strideH, strideW, padH, padW))
+        {
+            Synchronize();
             return;
+        }
         if (!_kernelCache.TryGetValue("conv_transpose2d", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: conv_transpose2d");
 

@@ -27,6 +27,13 @@ public sealed class ConvTransposeGemmPortTests
     private readonly ITestOutputHelper _out;
     public ConvTransposeGemmPortTests(ITestOutputHelper output) => _out = output;
 
+    [Fact]
+    public void ColumnWorkspaceMustFitAtLeastOneSample()
+    {
+        Assert.Equal(0, PortableConvTransposeGemm.Chunk(1, 32, 512, 512, 32, 512, 512, 7, 7, 1, 1, 3, 3));
+        Assert.Equal(8, PortableConvTransposeGemm.Chunk(10, 4, 32, 32, 64, 64, 64, 4, 4, 2, 2, 1, 1));
+    }
+
     // batch, inC, inH, inW, outC, k, stride, pad, outputPad.
     public static IEnumerable<object[]> Cases() => new[]
     {
@@ -45,6 +52,8 @@ public sealed class ConvTransposeGemmPortTests
     {
         Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
         using var backend = new OpenClBackend(deviceIndex: 0);
+        if (backend.InitializationState == GpuBackendInitializationState.Failed)
+            throw new InvalidOperationException("OpenCL initialization failed.", backend.InitializationException);
         Skip.IfNot(backend.IsAvailable, "OpenCL backend did not initialize.");
         Check(backend, backend.TryConvTranspose2DGemm, batch, inC, inH, inW, outC, k, s, p, op);
     }
@@ -77,6 +86,8 @@ public sealed class ConvTransposeGemmPortTests
         int op)
     {
         using var backend = new HipBackend();
+        if (backend.InitializationState == GpuBackendInitializationState.Failed)
+            throw new InvalidOperationException("HIP initialization failed.", backend.InitializationException);
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
         Check(backend, backend.TryConvTranspose2DGemm, batch, inC, inH, inW, outC, k, s, p, op);
     }

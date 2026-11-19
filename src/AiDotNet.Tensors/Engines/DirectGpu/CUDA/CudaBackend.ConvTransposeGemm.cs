@@ -43,7 +43,8 @@ public sealed partial class CudaBackend
         // Between those the implicit-GEMM data-gradient engine is faster: on the 64x64 DCGAN generator at batch 16,
         // 8x8 -> 16x16 (256 -> 128) ran 211 us there vs 253 us here, and 16x16 -> 32x32 (128 -> 64) 257 vs 361 us.
         if (L > 16 && P > 64) return false;
-        int chunk = (int)Math.Max(1, Math.Min(batch, ConvTransposeColCap / Math.Max(1, P * L)));
+        int chunk = (int)Math.Min(batch, ConvTransposeColCap / (P * L));
+        if (chunk == 0) return false;
         long colFloats = P * chunk * L, xtFloats = (long)inChannels * chunk * L;
         if (colFloats > int.MaxValue || xtFloats > int.MaxValue) return false;
 

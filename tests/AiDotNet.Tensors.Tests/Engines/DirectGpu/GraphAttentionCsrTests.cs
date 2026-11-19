@@ -132,7 +132,10 @@ public class GraphAttentionCsrTests
     {
         DirectGpuTensorEngine? gpu = null;
         try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.IfNot(gpu is not null && gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using var engineLifetime = gpu;
+        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
+            Assert.True(gpu?.IsGpuAvailable == true, "Required GPU backend did not resolve.");
+        Skip.IfNot(gpu?.IsGpuAvailable == true, "GPU backend did not resolve.");
         bool savedFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
         try
         {
@@ -147,7 +150,7 @@ public class GraphAttentionCsrTests
 
             if (gpu!.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.IGraphAttentionBackend)
             {
-                var ex = Assert.Throws<NotSupportedException>(() => gpu.GraphAttentionCsrForward(wh, attn, g, 0.2, rate, seed));
+                var ex = Assert.Throws<NotSupportedException>(() => gpu.GraphAttentionCsr(wh, attn, g));
                 Assert.Contains(gpu.GetBackend()!.BackendName, ex.Message);
                 Assert.Contains("CpuEngine", ex.Message);
                 return;
@@ -159,11 +162,26 @@ public class GraphAttentionCsrTests
             var (gWh, gAttn) = gpu.GraphAttentionCsrBackward(gradOut, wh, attn, g, 0.2, rate, seed);
             Close(cWh.ToArray(), gWh.ToArray(), "dWh");
             Close(cAttn.ToArray(), gAttn.ToArray(), "dAttn");
+            if (rate == 0)
+            {
+                using var scope = AiDotNetEngine.PushThreadEngine(gpu);
+                using var tape = new GradientTape<float>();
+                var output = gpu.GraphAttentionCsr(wh, attn, g);
+                var loss = gpu.ReduceSum(gpu.TensorMultiply(output, gradOut), new[] { 0, 1 }, false);
+                var gradients = tape.ComputeGradients(loss, new[] { wh, attn });
+                Close(cWh.ToArray(), gradients[wh].ToArray(), "public dWh");
+                Close(cAttn.ToArray(), gradients[attn].ToArray(), "public dAttn");
+
+                var one = new CsrGraph(1, new[] { 0, 1 }, new[] { 0 });
+                var feature = new Tensor<float>(new[] { 1e20f }, new[] { 1, 1 });
+                var weight = new Tensor<float>(new[] { 1e20f, 0f }, new[] { 1, 2 });
+                Assert.Equal(1e20f, gpu.GraphAttentionCsrForward(feature, weight, one, 0.2, 0, 0).ToArray()[0]);
+                Assert.Equal(0f, gpu.GraphAttentionCsrForward(feature, weight, one, 0.2, 1e-50, 0).ToArray()[0]);
+            }
         }
         finally
         {
             DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedFallback;
-            gpu?.Dispose();
         }
     }
 
@@ -182,6 +200,45 @@ public class GraphAttentionCsrTests
     [InlineData(1, 0, 1, 1)]
     public void DuplicateNeighbors_AreRejected(int a, int b, int c, int d)
         => Assert.Throws<ArgumentException>(() => new CsrGraph(2, new[] { 0, 3, 4 }, new[] { a, b, c, d }));
+
+    [Fact]
+    public void EmptyBatchIsAllowedButZeroHeadsAreRejected()
+    {
+        var engine = new CpuEngine();
+        var graph = new CsrGraph(1, new[] { 0, 1 }, new[] { 0 });
+        var empty = new Tensor<float>(new[] { 0, 1 });
+        Assert.Equal("attention", Assert.Throws<ArgumentException>(() =>
+            engine.GraphAttentionCsr(empty, new Tensor<float>(new[] { 0, 2 }), graph)).ParamName);
+        Assert.Empty(engine.GraphAttentionCsr(empty, new Tensor<float>(new[] { 1, 2 }), graph).ToArray());
+    }
+
+    [Fact]
+    public void GraphTopologyIsIndependentOfConstructorArraysAndPublicCopies()
+    {
+        int[] rows = { 0, 2, 3 }, columns = { 0, 1, 1 };
+        var graph = new CsrGraph(2, rows, columns);
+        rows[1] = columns[0] = graph.RowPointers[1] = graph.ColumnIndices[0] = 1;
+        Assert.Equal(new[] { 0, 2, 3 }, graph.RowPointers);
+        Assert.Equal(new[] { 0, 1, 1 }, graph.ColumnIndices);
+    }
+
+    [Fact]
+    public void CreateGraphUsesTheFusedScorePrecision()
+    {
+        var cpu = new CpuEngine();
+        using var scope = AiDotNetEngine.PushThreadEngine(cpu);
+        var graph = new CsrGraph(2, new[] { 0, 2, 3 }, new[] { 0, 1, 1 });
+        var wh = new Tensor<float>(new[] { 16777216f, 0f, 0f, 1f }, new[] { 2, 2 });
+        var attention = new Tensor<float>(new[] { 1f, 0f, 0f, 1f }, new[] { 1, 4 });
+        var upstream = new Tensor<float>(new[] { 0f, 1f, 0f, 0f }, new[] { 2, 2 });
+        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = true });
+        var output = cpu.GraphAttentionCsr(wh, attention, graph);
+        var loss = cpu.ReduceSum(cpu.TensorMultiply(output, upstream), new[] { 0, 1 }, false);
+        float fused = tape.ComputeGradients(loss, new[] { attention })[attention].ToArray()[3];
+        float recorded = tape.ComputeGradients(loss, new[] { attention }, createGraph: true)[attention].ToArray()[3];
+        Assert.InRange(fused, 0.19660f, 0.19663f);
+        Assert.InRange(Math.Abs(fused - recorded), 0f, 1e-6f);
+    }
 
     [Fact]
     public void CreateGraphBackward_PreservesSecondDerivative()

@@ -11,35 +11,35 @@ internal static class CudaGraphAttentionKernels
         ["gat_csr_scores", "gat_csr_forward", "gat_csr_backward_rows", "gat_csr_backward_cols", "gat_csr_attention_grad"];
 
     public static string GetSource() => @"
-__device__ __forceinline__ float gat_uniform(unsigned int seed, unsigned int index)
+__device__ __forceinline__ unsigned int gat_draw(unsigned int seed, unsigned int index)
 {
     unsigned int x = index * 0x9E3779B1u + seed;
     x ^= x >> 16; x *= 0x7FEB352Du;
     x ^= x >> 15; x *= 0x846CA68Bu;
     x ^= x >> 16;
-    return (float)(x >> 8) * (1.0f / 16777216.0f);
+    return x >> 8;
 }
 
 // selfScore[r, h] = Wh[r, h, :] . a[h, :F]; neighScore[r, h] = Wh[r, h, :] . a[h, F:]  (r over batch * nodes)
 extern ""C"" __global__ __launch_bounds__(256) void gat_csr_scores(
     const float* __restrict__ wh, const float* __restrict__ attn,
-    float* __restrict__ selfScore, float* __restrict__ neighScore, int rows, int heads, int features)
+    double* __restrict__ selfScore, double* __restrict__ neighScore, int rows, int heads, int features)
 {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= rows * heads) return;
     int h = t % heads;
     const float* w = wh + (long long)t * features;
     const float* as = attn + h * 2 * features;
-    float s = 0.0f, q = 0.0f;
-    for (int f = 0; f < features; f++) { float v = w[f]; s += v * as[f]; q += v * as[features + f]; }
+    double s = 0.0, q = 0.0;
+    for (int f = 0; f < features; f++) { double v = w[f]; s += v * as[f]; q += v * as[features + f]; }
     selfScore[t] = s;
     neighScore[t] = q;
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void gat_csr_forward(
-    const float* __restrict__ wh, const float* __restrict__ selfScore, const float* __restrict__ neighScore,
+    const float* __restrict__ wh, const double* __restrict__ selfScore, const double* __restrict__ neighScore,
     const int* __restrict__ rowPtr, const int* __restrict__ col, float* __restrict__ out,
-    int batch, int nodes, int heads, int features, int edges, float slope, float rate, float keep, unsigned int seed)
+    int batch, int nodes, int heads, int features, int edges, double slope, unsigned int cutoff, float keep, unsigned int seed)
 {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= batch * nodes * heads) return;
@@ -47,23 +47,23 @@ extern ""C"" __global__ __launch_bounds__(256) void gat_csr_forward(
     int bi = t / heads;
     int b = bi / nodes, i = bi % nodes;
     int r0 = rowPtr[i], r1 = rowPtr[i + 1];
-    float self = selfScore[t];
+    double self = selfScore[t];
     int nb = b * nodes;
-    float mx = -3.402823466e38f;
+    double mx = -1.7976931348623157e308;
     for (int e = r0; e < r1; e++)
     {
-        float z = self + neighScore[(nb + col[e]) * heads + h];
-        float ev = z > 0.0f ? z : slope * z;
-        mx = fmaxf(mx, ev);
+        double z = self + neighScore[(nb + col[e]) * heads + h];
+        double ev = z > 0.0f ? z : slope * z;
+        mx = fmax(mx, ev);
     }
-    float sum = 0.0f;
+    double sum = 0.0;
     for (int e = r0; e < r1; e++)
     {
-        float z = self + neighScore[(nb + col[e]) * heads + h];
-        float ev = z > 0.0f ? z : slope * z;
-        sum += expf(ev - mx);
+        double z = self + neighScore[(nb + col[e]) * heads + h];
+        double ev = z > 0.0f ? z : slope * z;
+        sum += exp(ev - mx);
     }
-    float inv = 1.0f / sum;
+    double inv = 1.0 / sum;
     float acc[32];
     float* o = out + (long long)t * features;
     for (int f0 = 0; f0 < features; f0 += 32)
@@ -72,11 +72,11 @@ extern ""C"" __global__ __launch_bounds__(256) void gat_csr_forward(
         for (int f = 0; f < fc; f++) acc[f] = 0.0f;
         for (int e = r0; e < r1; e++)
         {
-            float z = self + neighScore[(nb + col[e]) * heads + h];
-            float ev = z > 0.0f ? z : slope * z;
-            float c = expf(ev - mx) * inv;
-            if (rate > 0.0f)
-                c = gat_uniform(seed, (unsigned int)(((long long)b * edges + e) * heads + h)) < rate ? 0.0f : c * keep;
+            double z = self + neighScore[(nb + col[e]) * heads + h];
+            double ev = z > 0.0f ? z : slope * z;
+            float c = exp(ev - mx) * inv;
+            if (cutoff != 0)
+                c = gat_draw(seed, (unsigned int)(((long long)b * edges + e) * heads + h)) < cutoff ? 0.0f : c * keep;
             if (c == 0.0f) continue;
             const float* w = wh + ((long long)(nb + col[e]) * heads + h) * features + f0;
             for (int f = 0; f < fc; f++) acc[f] += c * w[f];
@@ -89,10 +89,10 @@ extern ""C"" __global__ __launch_bounds__(256) void gat_csr_forward(
 // cp[e] = c m; gSelf[row] = sum_e gz[e].
 extern ""C"" __global__ __launch_bounds__(256) void gat_csr_backward_rows(
     const float* __restrict__ wh, const float* __restrict__ gout,
-    const float* __restrict__ selfScore, const float* __restrict__ neighScore,
+    const double* __restrict__ selfScore, const double* __restrict__ neighScore,
     const int* __restrict__ rowPtr, const int* __restrict__ col,
     float* __restrict__ gz, float* __restrict__ cp, float* __restrict__ gSelf,
-    int batch, int nodes, int heads, int features, int edges, float slope, float rate, float keep, unsigned int seed)
+    int batch, int nodes, int heads, int features, int edges, double slope, unsigned int cutoff, float keep, unsigned int seed)
 {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= batch * nodes * heads) return;
@@ -100,30 +100,30 @@ extern ""C"" __global__ __launch_bounds__(256) void gat_csr_backward_rows(
     int bi = t / heads;
     int b = bi / nodes, i = bi % nodes;
     int r0 = rowPtr[i], r1 = rowPtr[i + 1];
-    float self = selfScore[t];
+    double self = selfScore[t];
     int nb = b * nodes;
-    float mx = -3.402823466e38f;
+    double mx = -1.7976931348623157e308;
     for (int e = r0; e < r1; e++)
     {
-        float z = self + neighScore[(nb + col[e]) * heads + h];
-        mx = fmaxf(mx, z > 0.0f ? z : slope * z);
+        double z = self + neighScore[(nb + col[e]) * heads + h];
+        mx = fmax(mx, z > 0.0f ? z : slope * z);
     }
-    float sum = 0.0f;
+    double sum = 0.0;
     for (int e = r0; e < r1; e++)
     {
-        float z = self + neighScore[(nb + col[e]) * heads + h];
-        sum += expf((z > 0.0f ? z : slope * z) - mx);
+        double z = self + neighScore[(nb + col[e]) * heads + h];
+        sum += exp((z > 0.0f ? z : slope * z) - mx);
     }
-    float inv = 1.0f / sum;
+    double inv = 1.0 / sum;
     const float* g = gout + (long long)t * features;
     float dot = 0.0f;
     for (int e = r0; e < r1; e++)
     {
-        float z = self + neighScore[(nb + col[e]) * heads + h];
-        float c = expf((z > 0.0f ? z : slope * z) - mx) * inv;
+        double z = self + neighScore[(nb + col[e]) * heads + h];
+        float c = exp((z > 0.0f ? z : slope * z) - mx) * inv;
         float m = 1.0f;
         long long slot = ((long long)b * edges + e) * heads + h;
-        if (rate > 0.0f) m = gat_uniform(seed, (unsigned int)slot) < rate ? 0.0f : keep;
+        if (cutoff != 0) m = gat_draw(seed, (unsigned int)slot) < cutoff ? 0.0f : keep;
         float gv = 0.0f;
         if (m != 0.0f)
         {
@@ -138,8 +138,8 @@ extern ""C"" __global__ __launch_bounds__(256) void gat_csr_backward_rows(
     float gs = 0.0f;
     for (int e = r0; e < r1; e++)
     {
-        float z = self + neighScore[(nb + col[e]) * heads + h];
-        float c = expf((z > 0.0f ? z : slope * z) - mx) * inv;
+        double z = self + neighScore[(nb + col[e]) * heads + h];
+        float c = exp((z > 0.0f ? z : slope * z) - mx) * inv;
         long long slot = ((long long)b * edges + e) * heads + h;
         float ge = c * (gz[slot] - dot) * (z > 0.0f ? 1.0f : slope);
         gz[slot] = ge;

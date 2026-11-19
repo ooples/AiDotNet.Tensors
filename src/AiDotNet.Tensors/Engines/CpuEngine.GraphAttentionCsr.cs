@@ -36,7 +36,7 @@ public partial class CpuEngine
         if (transformed is null) throw new ArgumentNullException(nameof(transformed));
         if (attention is null) throw new ArgumentNullException(nameof(attention));
         if (graph is null) throw new ArgumentNullException(nameof(graph));
-        if (attention.Rank != 2 || attention.Shape[1] % 2 != 0 || attention.Shape[1] == 0)
+        if (attention.Rank != 2 || attention.Shape[0] == 0 || attention.Shape[1] % 2 != 0 || attention.Shape[1] == 0)
             throw new ArgumentException($"attention must be [heads, 2 * features]; got [{string.Join(", ", attention._shape)}].", nameof(attention));
         if (double.IsNaN(dropoutRate) || dropoutRate < 0.0 || dropoutRate >= 1.0)
             throw new ArgumentOutOfRangeException(nameof(dropoutRate), "dropoutRate must be in [0, 1).");
@@ -123,7 +123,7 @@ public partial class CpuEngine
         var (sSelf, sNeigh) = GraphAttentionScores(wh, a, batch * n, heads, features);
         var outD = new double[wh.Length];
         int edges = graph.EdgeCount;
-        var rowPtr = graph.RowPointers; var col = graph.ColumnIndices;
+        var rowPtr = graph.RowOffsets; var col = graph.Columns;
         double keep = rate > 0 ? 1.0 / (1.0 - rate) : 1.0;
         int maxDegree = MaxDegree(graph);
 
@@ -174,7 +174,7 @@ public partial class CpuEngine
         var go = GatToDoubles(gradOutput);
         var (sSelf, sNeigh) = GraphAttentionScores(wh, a, batch * n, heads, features);
         int edges = graph.EdgeCount;
-        var rowPtr = graph.RowPointers; var col = graph.ColumnIndices;
+        var rowPtr = graph.RowOffsets; var col = graph.Columns;
         double keep = rate > 0 ? 1.0 / (1.0 - rate) : 1.0;
         int maxDegree = MaxDegree(graph);
         var gz = new double[(long)batch * edges * heads];
@@ -282,7 +282,7 @@ public partial class CpuEngine
         return (GatFromDoubles<T>(gWh, transformed._shape), GatFromDoubles<T>(gA, attention._shape));
     }
 
-    private static (double[] Self, double[] Neigh) GraphAttentionScores(double[] wh, double[] a, int rows, int heads, int features)
+    internal static (double[] Self, double[] Neigh) GraphAttentionScores(double[] wh, double[] a, int rows, int heads, int features)
     {
         var self = new double[(long)rows * heads];
         var neigh = new double[self.Length];
@@ -308,7 +308,7 @@ public partial class CpuEngine
     private static int MaxDegree(CsrGraph graph)
     {
         int max = 1;
-        var p = graph.RowPointers;
+        var p = graph.RowOffsets;
         for (int i = 0; i < graph.NodeCount; i++) max = Math.Max(max, p[i + 1] - p[i]);
         return max;
     }

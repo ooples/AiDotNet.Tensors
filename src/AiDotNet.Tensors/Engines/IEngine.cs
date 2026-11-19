@@ -5074,7 +5074,8 @@ public partial interface IEngine
     /// <returns>
     /// <c>out[b, i, h, :] = sum over neighbours j of alpha_ijh * Wh[b, j, h, :]</c> with
     /// <c>alpha_ijh = softmax_j(LeakyReLU(a_self_h . Wh_ih + a_neigh_h . Wh_jh))</c>, in <paramref name="transformed"/>'s shape.
-    /// It equals the dense formulation with an additive -1e9 mask off the graph whenever every row has an edge.
+    /// For finite logits and nonempty rows, this equals dense attention with non-neighbors masked to negative infinity.
+    /// A finite mask such as -1e9 only approximates exclusion and depends on the logit range.
     /// </returns>
     Tensor<T> GraphAttentionCsr<T>(
         Tensor<T> transformed,

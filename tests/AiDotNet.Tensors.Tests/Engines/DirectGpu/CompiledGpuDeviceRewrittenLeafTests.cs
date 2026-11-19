@@ -79,6 +79,7 @@ public class CompiledGpuDeviceRewrittenLeafTests
             Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
             Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true },
                 "The backend does not capture step graphs.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0", "Graph steps are disabled.");
             var expected = Train(new CpuEngine()).Parameters;
             var (actual, failure, replays) = Train(gpu);
 

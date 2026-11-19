@@ -26,8 +26,8 @@ public partial class DirectGpuTensorEngine
             _backend = backend;
             try
             {
-                _buffers[0] = backend.AllocateIntBuffer(graph.RowPointers);
-                _buffers[1] = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.ColumnIndices : new int[1]);
+                _buffers[0] = backend.AllocateIntBuffer(graph.RowOffsets);
+                _buffers[1] = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.Columns : new int[1]);
                 _buffers[2] = backend.AllocateIntBuffer(graph.ColumnPointers);
                 _buffers[3] = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.TransposeRowIndices : new int[1]);
                 _buffers[4] = backend.AllocateIntBuffer(graph.EdgeCount > 0 ? graph.TransposeEdgeIndices : new int[1]);
@@ -76,11 +76,13 @@ public partial class DirectGpuTensorEngine
     internal override Tensor<T> GraphAttentionCsrForward<T>(
         Tensor<T> transformed, Tensor<T> attention, CsrGraph graph, double slope, double rate, uint seed)
     {
-        if (typeof(T) != typeof(float))
-            return base.GraphAttentionCsrForward(transformed, attention, graph, slope, rate, seed);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return base.GraphAttentionCsrForward(transformed, attention, graph, slope, rate, seed);
+        if (typeof(T) != typeof(float))
+            throw new NotSupportedException($"{backend.BackendName} supports GraphAttentionCsr only for Single. Use CpuEngine for {typeof(T).Name}.");
+        if (rate > 0 && backend is IGpuGraphCapture capture && capture.IsStreamCapturing())
+            throw new NotSupportedException("GraphAttentionCsr dropout requires a fresh seed on each execution.");
         if (backend is not IGraphAttentionBackend cuda)
             throw new NotSupportedException($"{backend.BackendName} does not support GraphAttentionCsr. Use CpuEngine for sparse graph attention.");
         try
@@ -92,14 +94,14 @@ public partial class DirectGpuTensorEngine
             var dg = DeviceGraph(backend, graph);
             using var whBuf = GetOrAllocateBuffer(backend, transformed);
             using var aBuf = GetOrAllocateBuffer(backend, attention);
-            using var selfBuf = AllocateTransientScratch(backend, rows * heads, fullyWritten: true);
-            using var neighBuf = AllocateTransientScratch(backend, rows * heads, fullyWritten: true);
+            using var selfBuf = AllocateTransientScratch(backend, checked(rows * heads * 2), fullyWritten: true);
+            using var neighBuf = AllocateTransientScratch(backend, checked(rows * heads * 2), fullyWritten: true);
             float keep = rate > 0 ? (float)(1.0 / (1.0 - rate)) : 1f;
             return DispatchDeferredGpuOp<T>(backend, transformed.Length, (int[])transformed._shape.Clone(), output =>
             {
                 cuda.GraphAttentionScores(whBuf.Buffer, aBuf.Buffer, selfBuf.Buffer, neighBuf.Buffer, rows, heads, features);
                 cuda.GraphAttentionForward(whBuf.Buffer, selfBuf.Buffer, neighBuf.Buffer, dg.RowPointers, dg.Columns, output,
-                    batch, nodes, heads, features, graph.EdgeCount, (float)slope, (float)rate, keep, seed);
+                    batch, nodes, heads, features, graph.EdgeCount, slope, (uint)Math.Ceiling(rate * 16777216.0), keep, seed);
             }, fullyWritten: true);
         }
         catch (NotSupportedException ex)
@@ -113,11 +115,13 @@ public partial class DirectGpuTensorEngine
     internal override (Tensor<T> GradTransformed, Tensor<T> GradAttention) GraphAttentionCsrBackward<T>(
         Tensor<T> gradOutput, Tensor<T> transformed, Tensor<T> attention, CsrGraph graph, double slope, double rate, uint seed)
     {
-        if (typeof(T) != typeof(float))
-            return base.GraphAttentionCsrBackward(gradOutput, transformed, attention, graph, slope, rate, seed);
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return base.GraphAttentionCsrBackward(gradOutput, transformed, attention, graph, slope, rate, seed);
+        if (typeof(T) != typeof(float))
+            throw new NotSupportedException($"{backend.BackendName} supports GraphAttentionCsr only for Single. Use CpuEngine for {typeof(T).Name}.");
+        if (rate > 0 && backend is IGpuGraphCapture capture && capture.IsStreamCapturing())
+            throw new NotSupportedException("GraphAttentionCsr dropout requires a fresh seed on each execution.");
         if (backend is not IGraphAttentionBackend cuda)
             throw new NotSupportedException($"{backend.BackendName} does not support GraphAttentionCsr backward. Use CpuEngine for sparse graph attention.");
         try
@@ -131,8 +135,8 @@ public partial class DirectGpuTensorEngine
             using var whBuf = GetOrAllocateBuffer(backend, transformed);
             using var aBuf = GetOrAllocateBuffer(backend, attention);
             using var goBuf = GetOrAllocateBuffer(backend, gradOutput);
-            using var selfBuf = AllocateTransientScratch(backend, rows * heads, fullyWritten: true);
-            using var neighBuf = AllocateTransientScratch(backend, rows * heads, fullyWritten: true);
+            using var selfBuf = AllocateTransientScratch(backend, checked(rows * heads * 2), fullyWritten: true);
+            using var neighBuf = AllocateTransientScratch(backend, checked(rows * heads * 2), fullyWritten: true);
             using var gSelfBuf = AllocateTransientScratch(backend, rows * heads, fullyWritten: true);
             using var gNeighBuf = AllocateTransientScratch(backend, rows * heads, fullyWritten: true);
             using var gzBuf = AllocateTransientScratch(backend, edgeSlots, fullyWritten: true);
@@ -143,7 +147,7 @@ public partial class DirectGpuTensorEngine
                 cuda.GraphAttentionScores(whBuf.Buffer, aBuf.Buffer, selfBuf.Buffer, neighBuf.Buffer, rows, heads, features);
                 cuda.GraphAttentionBackwardRows(whBuf.Buffer, goBuf.Buffer, selfBuf.Buffer, neighBuf.Buffer,
                     dg.RowPointers, dg.Columns, gzBuf.Buffer, cpBuf.Buffer, gSelfBuf.Buffer,
-                    batch, nodes, heads, features, edges, (float)slope, (float)rate, keep, seed);
+                    batch, nodes, heads, features, edges, slope, (uint)Math.Ceiling(rate * 16777216.0), keep, seed);
                 cuda.GraphAttentionBackwardCols(goBuf.Buffer, aBuf.Buffer, gzBuf.Buffer, cpBuf.Buffer, gSelfBuf.Buffer,
                     dg.ColumnPointers, dg.TransposeRows, dg.TransposeEdges, gNeighBuf.Buffer, output,
                     batch, nodes, heads, features, edges);

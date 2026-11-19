@@ -3,6 +3,7 @@ using System;
 // Issue #301 — sparse-linear chain detection for graph-mode auto-fusion.
 
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -260,7 +261,8 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
     /// </summary>
     [ThreadStatic] internal static HashSet<object>? t_dynamicLeaves;
 
-    private static bool IsDeclaredDynamic(Tensor<float>? t) => t is not null && t_dynamicLeaves is { } d && d.Contains(t);
+    private static bool IsDeclaredDynamic(Tensor<float>? t) => t is not null && t_dynamicLeaves is { } leaves
+        && (leaves.Contains(t) || leaves.Any(leaf => leaf is Tensor<float> state && ReferenceEquals(state.StorageIdentity, t.StorageIdentity)));
 
     private static bool TryBuildCsrFromStaticWeight(LazyNode<float> matmul, out CsrWeights? weights)
     {

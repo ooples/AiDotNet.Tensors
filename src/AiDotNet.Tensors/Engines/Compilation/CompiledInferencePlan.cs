@@ -82,6 +82,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // CPU/other-backend steps once at capture and skip them on replay, leaving stale downstream outputs.
     // So graph capture is refused for such plans (TryGetGraphBackend returns false).
     private readonly bool _containsCrossEngineSteps;
+    private bool _containsStitchedState;
     private static readonly bool s_inferenceCudaGraph =
         System.Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_CUDA_GRAPH") == "1";
     /// <summary>Tests: overrides AIDOTNET_INFERENCE_CUDA_GRAPH for this process (null = the environment).</summary>
@@ -793,7 +794,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             sourcePlans: stitchedSources,
             // A stitched plan contains cross-engine steps if THIS stitch crosses engines or either operand
             // already did — so graph capture stays disabled for the whole chain, not just the first hop.
-            containsCrossEngineSteps: crossEngine || _containsCrossEngineSteps || nextPlan._containsCrossEngineSteps);
+            containsCrossEngineSteps: crossEngine || _containsCrossEngineSteps || nextPlan._containsCrossEngineSteps)
+        {
+            _containsStitchedState = _containsStitchedState || nextPlan._containsStitchedState
+                || _stateTensors.Length != 0 || nextPlan._stateTensors.Length != 0
+        };
     }
 
     private static bool ShapesEqual(int[] a, int[] b)
@@ -1045,6 +1050,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             var (state, next) = updates[i];
             if (state is null || next is null) throw new ArgumentNullException(nameof(updates), $"State update {i} is null.");
+            if (!state.IsContiguous || DirectGpuTensorEngine.IsPartialView(state))
+                throw new ArgumentException($"State {i} must be a whole contiguous tensor.", nameof(updates));
             if (!seen.Add(state)) throw new ArgumentException($"State {i} is declared twice.", nameof(updates));
             if (produced.Contains(state))
                 throw new ArgumentException($"State {i} is computed by the graph; a state must be a traced leaf.", nameof(updates));
@@ -1095,7 +1102,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         cb = null!;
         // A cross-engine stitched plan runs some steps on a non-_engine backend; capturing only _engine's
         // CUDA work would skip those steps on replay and serve stale downstream outputs. Refuse capture.
-        if (_containsCrossEngineSteps) return false;
+        if (_containsCrossEngineSteps || _containsStitchedState) return false;
         if (typeof(T) != typeof(float)) return false;
         if (!_engine.TryGet<DirectGpuTensorEngine>(out var gte)) return false;
         if (gte.GetBackend() is not Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } backend) return false;
@@ -1735,7 +1742,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
 
         // Run CPU-level optimization passes (spectral decomposition, dataflow fusion)
-        var optimizedSteps = RunCpuOptimizationPasses(specializedSteps, engine);
+        var optimizedSteps = hostSpecialize ? RunCpuOptimizationPasses(specializedSteps, engine) : specializedSteps;
 
         // Clear LazySource on all compiled output tensors to prevent auto-materialization
         // from re-triggering lazy graph execution after compilation
@@ -2034,7 +2041,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // faster than eager. Passes add compile-time overhead that doesn't pay off at runtime.
         //
         // Only run passes for large plans (20+ steps) where fusion can amortize the overhead,
-        // or when the plan contains specific patterns that passes target (Conv+BN, attention).
+        // or for plans of at least eight steps with a convolution, batch normalization, or matrix multiply.
         const int MinStepsForPasses = 20;
         bool hasConvOrAttention = false;
         for (int i = 0; i < steps.Length && !hasConvOrAttention; i++)

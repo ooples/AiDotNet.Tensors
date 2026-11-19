@@ -3,7 +3,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <summary>
 /// Sparse (CSR) multi-head graph attention kernels behind <see cref="IEngine.GraphAttentionCsr{T}"/>: one thread per
 /// (graph, node, head) row over its neighbourhood, and a backward that gathers through the transposed pattern. A
-/// backend without it runs CpuEngine's implementation.
+/// backend without it reports the unsupported operation.
 /// </summary>
 internal interface IGraphAttentionBackend
 {
@@ -14,12 +14,12 @@ internal interface IGraphAttentionBackend
     /// <summary>The softmax-weighted (and dropped-out) aggregation over each row's neighbours.</summary>
     void GraphAttentionForward(IGpuBuffer wh, IGpuBuffer selfScore, IGpuBuffer neighScore, IGpuBuffer rowPtr,
         IGpuBuffer col, IGpuBuffer output, int batch, int nodes, int heads, int features, int edges,
-        float slope, float rate, float keep, uint seed);
+        double slope, uint cutoff, float keep, uint seed);
 
     /// <summary>Per-edge score gradients, the dropped coefficients, and the self-score gradient per row.</summary>
     void GraphAttentionBackwardRows(IGpuBuffer wh, IGpuBuffer gradOutput, IGpuBuffer selfScore, IGpuBuffer neighScore,
         IGpuBuffer rowPtr, IGpuBuffer col, IGpuBuffer gz, IGpuBuffer cp, IGpuBuffer gSelf,
-        int batch, int nodes, int heads, int features, int edges, float slope, float rate, float keep, uint seed);
+        int batch, int nodes, int heads, int features, int edges, double slope, uint cutoff, float keep, uint seed);
 
     /// <summary>The transformed-feature gradient, gathered per node through the transposed pattern.</summary>
     void GraphAttentionBackwardCols(IGpuBuffer gradOutput, IGpuBuffer attention, IGpuBuffer gz, IGpuBuffer cp,

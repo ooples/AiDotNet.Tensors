@@ -15,6 +15,28 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 [Collection("DirectGpuSerial")]
 public sealed class CompiledStatefulInferenceTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ActivationClearWaitsForTheLastLiveGraph(bool discard)
+    {
+        var backend = DirectGpu.MockDirectGpuBackend.Create(new DirectGpu.MockBackendState());
+        using var direct = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        var state = new Tensor<float>(new[] { 3f }, new[] { 1 });
+        engine.BeginGraphLifetime();
+        engine.BeginGraphLifetime();
+        var buffer = Assert.IsType<DirectGpu.MockGpuBuffer>(engine.PinInputResident(state));
+        if (discard) engine.DropActivationCache();
+        else engine.ClearActivationCache();
+        Assert.Equal(0, buffer.DisposeCount);
+        engine.EndGraphLifetime();
+        Assert.Equal(0, buffer.DisposeCount);
+        engine.EndGraphLifetime();
+        Assert.Equal(1, buffer.DisposeCount);
+        Assert.Equal(3f, state.ToArray()[0]);
+    }
+
     private const int D = 64;
     private const int Steps = 12;
 
@@ -79,6 +101,7 @@ public sealed class CompiledStatefulInferenceTests
             for (int t = 0; t < Steps; t++)
             {
                 plan.SetInputs(new[] { new Tensor<float>([1, D], new Vector<float>(Input(t))), new Tensor<float>([D, 1], new Vector<float>(Input(t))) });
+                if (expectGraph && t == Steps - 1) ((DirectGpuTensorEngine)engine).ClearActivationCache();
                 int previousVersion = s.Version;
                 var output = plan.Execute().ToArray();
                 if (engine is CpuEngine && engine is not DirectGpuTensorEngine) Assert.NotEqual(previousVersion, s.Version);

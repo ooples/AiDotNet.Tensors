@@ -2227,7 +2227,13 @@ public static class OpParityRegistry
         var csrWh = OpInput.Rand(5014, new[] { 8, 6 });
         var csrAttn = OpInput.Rand(5015, new[] { 2, 6 });
         yield return new OpCase("GraphAttentionCsr[2x4,h2f3]", "attention",
-            e => e.GraphAttentionCsr(csrWh.F(), csrAttn.F(), csrGraph, 0.2),
+            e =>
+            {
+                if (e.TryGet<DirectGpuTensorEngine>(out var gpu))
+                    Xunit.Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IGraphAttentionBackend,
+                        "The selected backend does not implement CSR graph attention.");
+                return e.GraphAttentionCsr(csrWh.F(), csrAttn.F(), csrGraph, 0.2);
+            },
             e => e.GraphAttentionCsr(csrWh.D(), csrAttn.D(), csrGraph, 0.2),
             ParityTol.Accum(1e-3), opMethod: "GraphAttentionCsr");
 

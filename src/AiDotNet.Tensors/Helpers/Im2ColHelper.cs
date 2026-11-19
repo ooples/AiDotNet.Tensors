@@ -1787,10 +1787,10 @@ internal static class Im2ColHelper
         int hw = inputHeight * inputWidth;
         int kmkn = outChannels * kernelH * kernelW;
         int outPlane = outputHeight * outputWidth;
-        int chunk = (int)Math.Max(1, Math.Min(batch, ConvTransposeColCap / Math.Max(1L, (long)kmkn * hw)));
+        int chunk = (int)Math.Max(1, Math.Min(batch, Math.Min(ConvTransposeColCap, int.MaxValue) / Math.Max(1L, (long)kmkn * hw)));
         var pool = ArrayPool<float>.Shared;
-        float[] xt = pool.Rent(inChannels * chunk * hw);
-        float[] col = pool.Rent(kmkn * chunk * hw);
+        float[] xt = pool.Rent(checked(inChannels * chunk * hw));
+        float[] col = pool.Rent(checked(kmkn * chunk * hw));
         try
         {
             for (int b0 = 0; b0 < batch; b0 += chunk)

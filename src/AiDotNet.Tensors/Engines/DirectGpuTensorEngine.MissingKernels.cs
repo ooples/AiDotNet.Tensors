@@ -2359,7 +2359,7 @@ public partial class DirectGpuTensorEngine
 
         using var destinationBuffer = GetOrAllocateBuffer(backend, destination);
         using var sourceBuffer = GetOrAllocateBuffer(backend, source);
-        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
+        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: destinationAxis);
         return DispatchDeferredGpuOp<T>(backend, destination.Length,
             (int[])destination._shape.Clone(), output =>
                 indexBackend.IndexAdd(destinationBuffer.Buffer, indexBuffer.Buffer,
@@ -2404,7 +2404,7 @@ public partial class DirectGpuTensorEngine
         }
 
         using var sourceBuffer = GetOrAllocateBuffer(backend, source);
-        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
+        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: destinationAxis);
         if (outerSize == 1)
         {
             return DispatchDeferredGpuOp<T>(backend, total, (int[])inShape.Clone(), output =>
@@ -5772,7 +5772,7 @@ public partial class DirectGpuTensorEngine
             }
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: n);
             var putResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -5956,7 +5956,7 @@ public partial class DirectGpuTensorEngine
             var ci = indices.IsContiguous ? indices : indices.Contiguous();
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
             var scatterResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -6262,7 +6262,7 @@ public partial class DirectGpuTensorEngine
             var upstream = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             var ci = indices.IsContiguous ? indices : indices.Contiguous();
             using var bufG = GetOrAllocateBuffer(backend, upstream);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: axisSize);
             return DispatchDeferredGpuOp<T>(backend, n, (int[])gradOutput._shape.Clone(), output =>
             {
                 backend.Copy(bufG.Buffer, output, n);
@@ -6298,7 +6298,7 @@ public partial class DirectGpuTensorEngine
             var shape = (int[])gradOutput._shape.Clone();
             shape[ax] = indices.Length;
             using var bufG = GetOrAllocateBuffer(backend, upstream);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: axisSize);
             using var bufOverwritten = overwritten.Length == 0
                 ? default
                 : new OwnedBuffer(backend.AllocateIntBuffer(overwritten), ownsBuffer: true);
@@ -7250,7 +7250,7 @@ public partial class DirectGpuTensorEngine
                 return base.TensorIndexCopy(tensor, axis, indices, source);
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstAxis);
             var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -7301,7 +7301,7 @@ public partial class DirectGpuTensorEngine
                             $"indices[{i}]={indexData[i]} out of range for axis size {dstAxis}");
             }
             using var bufIn = GetOrAllocateBuffer(backend, ct);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstAxis);
             var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -10032,7 +10032,7 @@ public partial class DirectGpuTensorEngine
             outShape[normalizedAxis] = indices.Length;
             int outputLength = outerSize * indices.Length * innerSize;
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousInput);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: axisSize);
             return DispatchDeferredGpuOp<T>(backend, outputLength, outShape, output =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, output,
                     outerSize, axisSize, indices.Length, innerSize));
@@ -10088,7 +10088,7 @@ public partial class DirectGpuTensorEngine
             var contiguousValues = values.IsContiguous ? values : values.Contiguous();
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
             using var valuesBuffer = GetOrAllocateBuffer(backend, contiguousValues);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: axisSize);
             var scatterResult = DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), output =>
             {
                 backend.Copy(inputBuffer.Buffer, output, input.Length);
@@ -10174,7 +10174,7 @@ public partial class DirectGpuTensorEngine
             var cs = source.IsContiguous ? source : source.Contiguous();
             using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
-            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
             using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
             IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
             var claims = Scratch(n);
@@ -10281,7 +10281,7 @@ public partial class DirectGpuTensorEngine
         var leases = new List<OwnedBuffer>();
         try
         {
-            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
             using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
             var claims = RentOpScratch(backend, n, leases);
             var positions = RentOpScratch(backend, m, leases);
@@ -10342,7 +10342,7 @@ public partial class DirectGpuTensorEngine
             outputShape[normalizedAxis] = indices.Length;
             int outputLength = checked(outerSize * indices.Length * innerSize);
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousPacked);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: sourceAxis);
             return DispatchDeferredGpuOp<byte>(backend, outputLength, outputShape, output =>
                 indexBackend.IndexSelect(inputBuffer.Buffer, indexBuffer.Buffer, output,
                     outerSize, sourceAxis, indices.Length, innerSize));
@@ -10403,7 +10403,7 @@ public partial class DirectGpuTensorEngine
             for (int i = normalizedAxis + 1; i < packed.Rank; i++) innerSize *= packed.Shape._dims[i];
             using var destinationBuffer = GetOrAllocateBuffer(backend, contiguousPacked);
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousSource);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: destinationAxis);
             return DispatchDeferredGpuOp<byte>(backend, packed.Length, packed.Shape.ToArray(), output =>
             {
                 backend.Copy(destinationBuffer.Buffer, output, packed.Length);

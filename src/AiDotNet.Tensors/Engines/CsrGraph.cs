@@ -11,12 +11,12 @@ namespace AiDotNet.Tensors.Engines;
 /// <remarks>
 /// <para>
 /// Row <c>i</c> lists the nodes <c>j</c> that node <c>i</c> attends to: <c>ColumnIndices[RowPointers[i] ..
-/// RowPointers[i + 1])</c>, ascending. The column form lists, for each node <c>j</c>, the edges that read it, so a
+/// RowPointers[i + 1])</c>, in the order supplied. The column form lists, for each node <c>j</c>, the edges that read it, so a
 /// backward pass can gather into <c>j</c> without atomics. Only the pattern is kept; edge values are not.
 /// </para>
 /// <para>
-/// The arrays are owned by the graph and must not be modified after construction. An engine may cache device copies
-/// of them on the graph, keyed by the graph instance.
+/// The constructor copies the topology. The public array properties return copies, so an engine can cache
+/// device buffers for the lifetime of the graph.
 /// </para>
 /// </remarks>
 public sealed class CsrGraph
@@ -30,6 +30,8 @@ public sealed class CsrGraph
         if (nodeCount <= 0) throw new ArgumentOutOfRangeException(nameof(nodeCount), "A graph needs at least one node.");
         if (rowPointers is null) throw new ArgumentNullException(nameof(rowPointers));
         if (columnIndices is null) throw new ArgumentNullException(nameof(columnIndices));
+        rowPointers = (int[])rowPointers.Clone();
+        columnIndices = (int[])columnIndices.Clone();
         if (rowPointers.Length != nodeCount + 1)
             throw new ArgumentException($"rowPointers must have nodeCount + 1 = {nodeCount + 1} entries; got {rowPointers.Length}.", nameof(rowPointers));
         if (rowPointers[0] != 0 || rowPointers[nodeCount] != columnIndices.Length)
@@ -40,18 +42,20 @@ public sealed class CsrGraph
         for (int e = 0; e < columnIndices.Length; e++)
             if ((uint)columnIndices[e] >= (uint)nodeCount)
                 throw new ArgumentException($"Column index {columnIndices[e]} at edge {e} is outside [0, {nodeCount}).", nameof(columnIndices));
-        var seen = new HashSet<int>();
+        var seen = new int[nodeCount];
         for (int row = 0; row < nodeCount; row++)
         {
-            seen.Clear();
             for (int e = rowPointers[row]; e < rowPointers[row + 1]; e++)
-                if (!seen.Add(columnIndices[e]))
+            {
+                if (seen[columnIndices[e]] == row + 1)
                     throw new ArgumentException($"Duplicate column {columnIndices[e]} in row {row}.", nameof(columnIndices));
+                seen[columnIndices[e]] = row + 1;
+            }
         }
 
         NodeCount = nodeCount;
-        RowPointers = rowPointers;
-        ColumnIndices = columnIndices;
+        RowOffsets = rowPointers;
+        Columns = columnIndices;
 
         // Transpose: for every column j, the (row, edge) pairs that read it, in ascending row order.
         int edges = columnIndices.Length;
@@ -87,13 +91,15 @@ public sealed class CsrGraph
     public int NodeCount { get; }
 
     /// <summary>The number of edges (stored entries).</summary>
-    public int EdgeCount => ColumnIndices.Length;
+    public int EdgeCount => Columns.Length;
 
     /// <summary>The <see cref="NodeCount"/> + 1 row offsets into <see cref="ColumnIndices"/>.</summary>
-    public int[] RowPointers { get; }
+    public int[] RowPointers => (int[])RowOffsets.Clone();
+    internal int[] RowOffsets { get; }
 
     /// <summary>The neighbour (column) of every edge, row by row.</summary>
-    public int[] ColumnIndices { get; }
+    public int[] ColumnIndices => (int[])Columns.Clone();
+    internal int[] Columns { get; }
 
     /// <summary>Whether every node has at least one edge (an empty row has no softmax to normalize over).</summary>
     public bool EveryRowHasEdge { get; }
