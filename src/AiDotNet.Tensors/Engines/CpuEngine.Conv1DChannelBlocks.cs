@@ -36,6 +36,15 @@ public partial class CpuEngine
         columns = Math.Min(columns, totalColumns);
         int blocks = (totalColumns - 1) / columns + 1;
         int workerBudgetCount = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
+        // The default dispatcher can select either packed strategy. Align to both
+        // row tiles so a partition cannot turn an interior row into a different tail kernel.
+        int bothMr = BlasManaged.BlasManaged.GetEvolutionTuningTile<float>(
+            BlasManaged.PackingMode.ForcePackBoth, BlasProvider.IsDeterministicMode).Mr;
+        int onlyMr = BlasManaged.BlasManaged.GetEvolutionTuningTile<float>(
+            BlasManaged.PackingMode.ForcePackAOnly, BlasProvider.IsDeterministicMode).Mr;
+        int divisor = bothMr, remainder = onlyMr;
+        while (remainder != 0) { int next = divisor % remainder; divisor = remainder; remainder = next; }
+        int rowAlignment = checked(bothMr / divisor * onlyMr);
         var packedKernel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(rows * reduction), "workspace.conv1d_channel_block_filter");
         try
         {
@@ -52,7 +61,7 @@ public partial class CpuEngine
                 }
                 int currentRowFrom = rowFrom;
                 // Short time axes expose too few spatial tasks. Partition independent output
-                // rows too; six-row boundaries preserve the GEMM microkernel's row grouping.
+                // rows too; aligned boundaries preserve the GEMM microkernels' row grouping.
                 // The reduction axis and the pre-existing channel/tap order remain unchanged.
                 int taskRows = rowCount;
                 // A single spatial task already delegates the full worker budget to GEMM.
@@ -60,7 +69,7 @@ public partial class CpuEngine
                 if (splitChannels && blocks > 1 && blocks < workerBudgetCount && rowCount >= 192)
                 {
                     int partitions = Math.Min((workerBudgetCount + blocks - 1) / blocks, rowCount / 96);
-                    taskRows = Math.Min(rowCount, ((rowCount + partitions * 6 - 1) / (partitions * 6)) * 6);
+                    taskRows = Math.Min(rowCount, ((rowCount + partitions * rowAlignment - 1) / (partitions * rowAlignment)) * rowAlignment);
                 }
                 int rowTasks = (rowCount + taskRows - 1) / taskRows;
                 int tasks = checked(blocks * rowTasks);
