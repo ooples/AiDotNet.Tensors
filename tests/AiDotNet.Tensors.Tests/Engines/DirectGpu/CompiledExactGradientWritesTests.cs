@@ -65,13 +65,14 @@ public sealed class CompiledExactGradientWritesTests
         try
         {
             using var input = new Tensor<float>(Enumerable.Range(0, 64).Select(i => (i - 32) * .01f).ToArray(), new[] { 1, 4, 4, 4 });
-            using var kernel = new Tensor<float>(Enumerable.Range(0, 144).Select(i => (i % 11 - 5) * .02f).ToArray(), new[] { 4, 4, 3, 3 });
+            using var kernel = new Tensor<float>(Enumerable.Range(0, 144).Select(i => (i % 11 - 5) * .02f).ToArray(), new[] { 4, 36 });
             using var bias = new Tensor<float>(new[] { .1f, -.2f, .3f, -.4f }, new[] { 4 });
             var parameters = frozenKernel ? new[] { input } : new[] { kernel };
             CompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.EnableTraining(parameters))
             {
-                var conv = engine.Conv2D(input, kernel, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
+                var kernelView = engine.Reshape(kernel, new[] { 4, 4, 3, 3 });
+                var conv = engine.Conv2D(input, kernelView, new[] { 1, 1 }, new[] { 1, 1 }, new[] { 1, 1 });
                 var output = engine.TensorChannelBiasAdd(conv, bias);
                 var loss = engine.ReduceSum(engine.TensorMultiply(output, output), null, false);
                 plan = scope.CompileTraining(parameters, loss);

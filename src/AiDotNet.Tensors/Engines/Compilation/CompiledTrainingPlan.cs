@@ -11283,6 +11283,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         && fp16HeteroOrder is null
                         && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_EXACT_GRAD_WRITES") == "1"
                         ? gradRequired : null);
+                if (aliasedGradViews is not null && t_gradAliasTargets is not null)
+                    aliasedGradViews.RemoveAll(alias => !t_gradAliasTargets.ContainsKey(alias.View));
                 if (gradientIndexRemap is not null)
                 {
                     prunedGradientBufferCount = gradientIndexRemap.Count(index => index < 0);
@@ -11679,11 +11681,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var tenants = new List<int>();
             var unused = new HashSet<Tensor<T>>();
             var aliasRoots = aliasTargets is null ? new HashSet<Tensor<T>>() : new HashSet<Tensor<T>>(aliasTargets.Values);
+            // GradIndex resolves these flat views to their physical roots. Complete action coverage and no
+            // public/requested result prove that an untouched root AND its views need only deferred zeros.
+            // Keep the old protection for unknown alias chains or conservative write contracts.
+            bool pruneUnobservedAliasRoots = requiredGradients is not null && aliasTargets is not null
+                && aliasTargets.Values.All(indexOf.ContainsKey);
             for (int g = 0; g < count; g++)
             {
                 var gradient = allGrads[g];
                 if (!placeholders.Contains(gradient) || excluded.Contains(gradient)) continue;
-                if (firstWrite[g] == None && lastUse[g] < 0 && !aliasRoots.Contains(gradient))
+                if (firstWrite[g] == None && lastUse[g] < 0
+                    && (pruneUnobservedAliasRoots || !aliasRoots.Contains(gradient)))
                     unused.Add(gradient);
                 else if (firstWrite[g] != None && !readBeforeWrite[g] && gradient.Length > 0)
                     tenants.Add(g);
@@ -11722,6 +11730,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // and device. Preserve a lazily materialized exact zero in the map, outside residency and clear loops.
                 var zeros = unused.ToDictionary(gradient => gradient,
                     gradient => Tensor<T>.CreateDeferred((int[])gradient._shape.Clone()));
+                if (pruneUnobservedAliasRoots && aliasTargets is not null)
+                    foreach (var alias in aliasTargets.Where(pair => unused.Contains(pair.Value)).ToArray())
+                    {
+                        // An unobserved alias still has a zero gradient in the map, but no resident target to bind.
+                        zeros[alias.Key] = Tensor<T>.CreateDeferred((int[])alias.Key._shape.Clone());
+                        aliasTargets.Remove(alias.Key);
+                    }
                 foreach (var tensor in gradMap.Keys.ToArray())
                     if (zeros.TryGetValue(gradMap[tensor], out var zero)) gradMap[tensor] = zero;
                 indexRemap = new int[count];
