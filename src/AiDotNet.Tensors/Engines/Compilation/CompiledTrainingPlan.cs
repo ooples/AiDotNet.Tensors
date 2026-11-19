@@ -614,6 +614,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             lossReadback.Dispose();
             _lossReadback = null;
         }
+        DisposeLabelErrorReadback();
 
         _fp16PagedPlan?.Dispose();
         _fp16PagedPlan = null;
@@ -1363,6 +1364,34 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // Page-locked slot the captured step's loss is copied into after each launch (CUDA).
     private Engines.DirectGpu.IDeviceReadback? _lossReadback;
+
+    // This plan's copy of the engine's fused cross-entropy label-error word, queued after each Step() and read before
+    // the next (see Step).
+    private Engines.DirectGpu.IDeviceReadback? _labelErrorReadback;
+
+    /// <summary>
+    /// Disposes the label-error readback. A step after the plan's last Step() never reads its copy, so a final step
+    /// with an out-of-range device label is reported here (Dispose cannot throw): traced as an error.
+    /// </summary>
+    private void DisposeLabelErrorReadback()
+    {
+        if (_labelErrorReadback is not { } readback) return;
+        _labelErrorReadback = null;
+        try
+        {
+            if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte) && gte.ReadFusedCeLabelErrorCheck(readback))
+                System.Diagnostics.Trace.TraceError(
+                    "CompiledTrainingPlan: a fused cross-entropy target id on the plan's last step was outside [0, vocab).");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            System.Diagnostics.Trace.TraceWarning("CompiledTrainingPlan: the last step's label check could not be read: " + ex.Message);
+        }
+        finally
+        {
+            readback.Dispose();
+        }
+    }
 
     /// <summary>
     /// Queues the loss's device-to-host copy behind the step instead of waiting for it, and makes the copy the loss
@@ -4070,11 +4099,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (gpuEngine is null) return StepLocked();
             lock (gpuEngine.CompiledStepLock)
             {
-                // A device label the previous step found out of range (read asynchronously: see the engine's
-                // label-error word) fails this step before it runs; this step's own check is queued behind it.
-                gpuEngine.ThrowIfFusedCeLabelError();
+                // A device label this plan's previous step found out of range (read asynchronously: see the engine's
+                // label-error word) fails this step before it runs. The read consumes the copy, so a caller that
+                // catches and feeds a good batch steps on. The word is cleared before each step and copied into this
+                // plan's own readback after it, so a step only ever sees its own rows.
+                if (gpuEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback))
+                    throw new ArgumentOutOfRangeException("targetIds",
+                        "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). A backend " +
+                        "that does not propagate NaN may have applied that step's update.");
+                gpuEngine.ClearFusedCeLabelError();
                 var loss = StepLocked();
-                gpuEngine.QueueFusedCeLabelErrorCheck();
+                gpuEngine.QueueFusedCeLabelErrorCheck(ref _labelErrorReadback);
                 return loss;
             }
         }

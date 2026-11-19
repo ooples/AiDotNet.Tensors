@@ -880,6 +880,87 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         }
     }
 
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void A_resident_out_of_range_label_is_caught_on_the_device_and_the_plan_recovers(bool capture)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            if (capture)
+            {
+                Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                    "Whole-step graph capture is CUDA-only.");
+                Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                    "Graph capture is disabled for this process.");
+            }
+            const int vocab = 24;
+            var labels = new Tensor<int>([Batch]);
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var w = Rand([Inputs, Inputs], 4, 0.3f);
+            var head = Rand([Inputs, vocab], 5, 0.3f);
+            var bias = Rand([vocab], 6, 0.1f);
+            var parameters = new[] { w, head, bias };
+            foreach (var t in parameters) t.Gpu();
+            void Feed(int step, bool bad)
+            {
+                var rng = new Random(900 + step);
+                for (int i = 0; i < Batch; i++) labels.SetFlat(i, bad && i == 0 ? vocab : rng.Next(vocab));
+                labels.MarkModified();
+            }
+            Feed(0, bad: false);
+            labels.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                var h = gpu.TensorTanh(gpu.TensorMatMul(x, w));
+                gpu.FusedLinearCrossEntropyWithLogits(h, head, bias, labels);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                for (int s = 0; s < Steps; s++)
+                {
+                    if (s > 0) Feed(s, bad: false);
+                    plan.Step();
+                }
+                if (capture)
+                {
+                    // The bad batch must reach the captured device path, not the eager pre-pass.
+                    var execField = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                        ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                    Assert.True(execField.GetValue(plan) is IntPtr handle && handle != IntPtr.Zero,
+                        "the captured plan is not replaying a graph after warm-up");
+                }
+                // The bad batch: it is reported on its own step (a discarded NaN step) or, on a backend that does not
+                // propagate NaN, on the next one.
+                Feed(Steps, bad: true);
+                ArgumentOutOfRangeException? caught = null;
+                for (int s = Steps; s <= Steps + 1 && caught is null; s++)
+                {
+                    try { plan.Step(); }
+                    catch (ArgumentOutOfRangeException ex) { caught = ex; }
+                    if (caught is null) Feed(s + 1, bad: false);
+                }
+                Assert.NotNull(caught);
+                // Detected on the device, not by a host-side check of the uploaded ids.
+                Assert.DoesNotContain("out of bounds for vocabulary", caught!.Message);
+                // Recovery: good batches step without rethrowing the old count.
+                for (int s = Steps + 2; s < Steps + 5; s++)
+                {
+                    Feed(s, bad: false);
+                    var loss = plan.Step().ToArray()[0];
+                    Assert.True(!float.IsNaN(loss) && !float.IsInfinity(loss), $"step {s} loss {loss}");
+                }
+            }
+        }
+    }
+
     private static (double[] Losses, float[][] Weights, bool Replayed) TrainFusedCrossEntropy(IEngine engine, bool capture,
         int badLabelAtStep)
     {

@@ -6843,13 +6843,14 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
-    // One float: the count of device-id fused cross-entropy rows whose id was outside [0, vocab), summed from finite
-    // 0/1 flags (no NaN semantics needed, so it holds on fast-math and WGSL backends). Allocated with its readback on
-    // the first (uncaptured) resident step. A compiled Step() queues its readback after the step and reads it before
-    // the next (QueueFusedCeLabelErrorCheck / ThrowIfFusedCeLabelError); a step discarded as non-finite reads it at
-    // once (TakeFusedCeLabelError), so where the NaN row flags do propagate the bad step itself throws.
+    // One float: the number of device-id fused cross-entropy rows whose id was outside [0, vocab), summed from finite
+    // 0/1 flags (no NaN semantics needed, so it holds on fast-math and WGSL backends; exact below 2^24, and only ever
+    // tested against zero). Allocated on the first (uncaptured) resident step. A compiled Step() clears it before the
+    // step, so after the step it holds only that step's rows, and copies it into the plan's own readback
+    // (ClearFusedCeLabelError / QueueFusedCeLabelErrorCheck): one plan never sees another's labels. A step discarded
+    // as non-finite reads it at once (TakeFusedCeLabelError), so where the NaN row flags do propagate the bad step
+    // itself throws.
     private IGpuBuffer? _fusedCeLabelError;
-    private DirectGpu.IDeviceReadback? _fusedCeLabelErrorReadback;
     private readonly object _fusedCeLabelErrorLock = new();
 
     private IGpuBuffer FusedCeLabelErrorWord(IDirectGpuBackend backend)
@@ -6863,9 +6864,6 @@ public partial class DirectGpuTensorEngine
                     "uncaptured first.");
             var buffer = backend.AllocateBuffer(1);
             backend.Fill(buffer, 0f, 1);
-            _fusedCeLabelErrorReadback = backend is DirectGpu.IDeviceReadbackFactory factory
-                ? factory.CreateReadback(sizeof(float))
-                : new DirectGpu.SynchronousDeviceReadback(backend, sizeof(float));
             return _fusedCeLabelError = buffer;
         }
     }
@@ -6885,38 +6883,41 @@ public partial class DirectGpuTensorEngine
         return true;
     }
 
-    /// <summary>
-    /// Queues the label-error word's copy behind the work submitted so far (after a compiled step), without waiting.
-    /// No-op until a device-id fused cross-entropy has run.
-    /// </summary>
-    internal void QueueFusedCeLabelErrorCheck()
+    /// <summary>Zeroes the label-error word, stream-ordered, before a compiled step. No-op until it exists.</summary>
+    internal void ClearFusedCeLabelError()
     {
         IGpuBuffer? word;
-        DirectGpu.IDeviceReadback? readback;
-        lock (_fusedCeLabelErrorLock) { word = _fusedCeLabelError; readback = _fusedCeLabelErrorReadback; }
-        if (word is null || readback is null) return;
+        lock (_fusedCeLabelErrorLock) word = _fusedCeLabelError;
+        if (word is null || !TryGetBackend(out var backend)) return;
         using var __gpuOp = EnterGpuOp();
+        backend.Fill(word, 0f, 1);
+    }
+
+    /// <summary>
+    /// Queues the label-error word's copy into <paramref name="readback"/> (created on first use) behind the work
+    /// submitted so far, without waiting. No-op until a device-id fused cross-entropy has run.
+    /// </summary>
+    internal void QueueFusedCeLabelErrorCheck(ref DirectGpu.IDeviceReadback? readback)
+    {
+        IGpuBuffer? word;
+        lock (_fusedCeLabelErrorLock) word = _fusedCeLabelError;
+        if (word is null || !TryGetBackend(out var backend)) return;
+        using var __gpuOp = EnterGpuOp();
+        readback ??= backend is DirectGpu.IDeviceReadbackFactory factory
+            ? factory.CreateReadback(sizeof(float))
+            : new DirectGpu.SynchronousDeviceReadback(backend, sizeof(float));
         readback.Enqueue(word, sizeof(float));
     }
 
     /// <summary>
-    /// Throws <see cref="ArgumentOutOfRangeException"/> when the copy queued by <see cref="QueueFusedCeLabelErrorCheck"/>
-    /// shows an out-of-range fused cross-entropy target id, and clears the word. Waits only for that copy, which the
-    /// device has normally finished by the next step.
+    /// Reads a copy queued by <see cref="QueueFusedCeLabelErrorCheck"/>, consuming it: true when the step it followed
+    /// saw an out-of-range id. Waits only for that copy, which the device has normally finished by the next step.
     /// </summary>
-    internal void ThrowIfFusedCeLabelError()
+    internal bool ReadFusedCeLabelErrorCheck(DirectGpu.IDeviceReadback? readback)
     {
-        IGpuBuffer? word;
-        DirectGpu.IDeviceReadback? readback;
-        lock (_fusedCeLabelErrorLock) { word = _fusedCeLabelError; readback = _fusedCeLabelErrorReadback; }
-        if (word is null || readback is not { HasUnreadValue: true }) return;
+        if (readback is not { HasUnreadValue: true }) return false;
         using var __gpuOp = EnterGpuOp();
-        float count = System.Runtime.InteropServices.MemoryMarshal.Read<float>(readback.Read());
-        if (count == 0f) return;
-        if (TryGetBackend(out var backend)) backend.Fill(word, 0f, 1);
-        throw new ArgumentOutOfRangeException("targetIds",
-            $"{count} fused cross-entropy target id(s) on the previous compiled step were outside [0, vocab). A backend " +
-            "that does not propagate NaN may have applied that step's update.");
+        return System.Runtime.InteropServices.MemoryMarshal.Read<float>(readback.Read()) != 0f;
     }
 
     private static void RecordFusedCeBackwardChunks(int chunks) => LastFusedCeBackwardChunks = chunks;
