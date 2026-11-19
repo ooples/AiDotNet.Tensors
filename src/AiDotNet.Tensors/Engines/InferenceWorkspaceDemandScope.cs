@@ -13,6 +13,8 @@ internal static class InferenceWorkspaceDemandScope
     [ThreadStatic] private static DirectGpuTensorEngine? t_engine;
     internal static bool BestFitIdleBuffersEnabled { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_BEST_FIT_IDLE_BUFFERS") == "1";
+    internal static bool TransitionOnlyIdleCacheReturnEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_INFERENCE_IDLE_CACHE_TRANSITION_ONLY") == "1";
 
     [ThreadStatic] private static long t_scope;
     [ThreadStatic] private static long t_nextScope;
@@ -78,7 +80,8 @@ internal static class InferenceWorkspaceDemandScope
             t_returning = true;
             if (!engine.IsInferenceIdleCacheDemandEligible(backend)
                 || t_scope != scope || !ReferenceEquals(t_engine, engine)) return false;
-            return pool.ReturnIncompatibleIdleForLargerRequest(elements, affinity) > 0;
+            return pool.ReturnIncompatibleIdleForLargerRequest(elements, affinity,
+                TransitionOnlyIdleCacheReturnEnabled) > 0;
         }
         finally { t_returning = false; }
     }
