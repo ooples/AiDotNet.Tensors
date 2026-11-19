@@ -401,7 +401,8 @@ struct PositionsP { rows: i32, chunk: i32, vocab: i32, pad: i32 };
     let raw = ids[gid];
     let tid = clamp(raw, 0, p.vocab - 1);
     positionBits[gid] = bitcast<f32>((gid % p.chunk) * p.vocab + tid);
-    positionBits[p.rows + gid] = select(bitcast<f32>(0x7fc00000u), 0.0, raw == tid);
+    // Select the bits, then bitcast: a constant NaN (bitcast<f32>(0x7fc00000u)) is a shader-creation error in Tint.
+    positionBits[p.rows + gid] = bitcast<f32>(select(0x7fc00000u, 0u, raw == tid));
 }
 ";
 
