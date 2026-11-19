@@ -39,7 +39,7 @@ internal readonly struct GpuBufferPoolAffinity : IEquatable<GpuBufferPoolAffinit
     public override int GetHashCode() => _value.GetHashCode();
 }
 
-internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
+internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
 {
     private sealed class Bucket
     {

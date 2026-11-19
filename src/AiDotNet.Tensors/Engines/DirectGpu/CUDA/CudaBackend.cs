@@ -475,7 +475,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
     {
         if (_backendStreamCaptureActive || _mainStream == IntPtr.Zero) return null;
-        return _bufferPool.TryRent(size, AsyncPoolAffinity, out var pooled) ? pooled : null;
+        return _bufferPool.TryRentForBackend(size, AsyncPoolAffinity, this, out var pooled) ? pooled : null;
     }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
     // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
@@ -1612,6 +1612,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // IGpuBatchExecution kernels shared with HIP (#1142).
         CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+        // WeightNorm's row scale and reduction use explicit FP32 arithmetic; keep subnormals and sqrt/div semantics.
+        CompileKernelModule(device, BatchExecutionCudaKernels.WeightNormPreciseSource, "weight_norm_precise_kernels",
+            new[] { BatchExecutionCudaKernels.WeightNorm }, useFastMath: false);
+
         CompileKernelModule(device, BatchExecutionCudaKernels.RfftMagnitudeCudaSource, "rfft_magnitude_precise_kernels",
             BatchExecutionCudaKernels.RfftMagnitudeKernelNames, useFastMath: false);
         // The GRU kernels again, without --use_fast_math; compiled second, so they replace the fast-math entries above.
@@ -1952,6 +1956,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ulong byteSize = (ulong)size * sizeof(float);
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
         DrainFinalizedFreesBeforeAllocation();
 
@@ -2007,7 +2013,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             catch { target.Dispose(); throw; }
             return target;
         }
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             unsafe
             {
@@ -2308,6 +2314,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
         DrainFinalizedFreesBeforeAllocation();
 
@@ -2352,7 +2360,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "cuMemsetD8Async");
             return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
         }
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
@@ -2379,6 +2387,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
         DrainFinalizedFreesBeforeAllocation();
         // Only the stream-ordered allocator skips the fill: the legacy path's pooled buffers are recycled across
@@ -10272,7 +10282,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return target;
         }
 
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null)
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null)
         {
             unsafe
             {
