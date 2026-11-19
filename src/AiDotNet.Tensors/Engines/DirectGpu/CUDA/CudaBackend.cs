@@ -14530,39 +14530,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+    // Rows at least this long take the block-per-row kernel (argmax_axis_rows / argmin_axis_rows): 256 threads read a
+    // row coalesced. Shorter rows (top-k over a few experts, a small class count) keep one thread per row, which fills
+    // the device from the outer extent instead.
+    internal const int ArgReduceRowKernelMinLength = 128;
+
+    private unsafe void LaunchArgReduce(string name, IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
+        bool rows = reduceSize >= ArgReduceRowKernelMinLength;
+        string kernelName = rows ? name + "_rows" : name;
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: " + kernelName);
 
         using var _ = PushContext();
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = rows ? (uint)outerSize : (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr aPtr = A.Handle;
         IntPtr idxPtr = indices.Handle;
+        int outer = outerSize, reduce = reduceSize;
         void** args = stackalloc void*[4];
         args[0] = &aPtr;
         args[1] = &idxPtr;
-        args[2] = &outerSize;
-        args[3] = &reduceSize;
+        args[2] = &outer;
+        args[3] = &reduce;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
-    {
-        if (!_kernelCache.TryGetValue("argmin_axis", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmin_axis");
+    public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+        => LaunchArgReduce("argmax_axis", A, indices, outerSize, reduceSize);
 
-        using var _ = PushContext();
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr aPtr = A.Handle;
-        IntPtr idxPtr = indices.Handle;
-        void** args = stackalloc void*[4];
-        args[0] = &aPtr;
-        args[1] = &idxPtr;
-        args[2] = &outerSize;
-        args[3] = &reduceSize;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
-    }
+    public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+        => LaunchArgReduce("argmin_axis", A, indices, outerSize, reduceSize);
 
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
@@ -17352,28 +17349,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// <inheritdoc/>
     public bool ArgMaxIndicesAreBitReinterpreted => false; // CUDA kernel uses (float)cast
 
-    public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+    public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
         if (outerSize <= 0 || reduceSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(outerSize), "outerSize and reduceSize must be positive.");
         if ((long)outerSize * reduceSize > A.Size)
             throw new ArgumentOutOfRangeException(nameof(outerSize), $"outerSize*reduceSize ({(long)outerSize * reduceSize}) exceeds buffer A length ({A.Size}).");
 
-        if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
-
-        using var _ = PushContext();
-        IntPtr inputPtr = A.Handle;
-        IntPtr indicesPtr = indices.Handle;
-        int outerSizeVal = outerSize;
-        int reduceSizeVal = reduceSize;
-        void** args = stackalloc void*[4];
-        args[0] = &inputPtr;
-        args[1] = &indicesPtr;
-        args[2] = &outerSizeVal;
-        args[3] = &reduceSizeVal;
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+        LaunchArgReduce("argmax_axis", A, indices, outerSize, reduceSize);
     }
 
     public unsafe void GenerateRandomUniform(IGpuBuffer output, int size, float min, float max, ulong seed)

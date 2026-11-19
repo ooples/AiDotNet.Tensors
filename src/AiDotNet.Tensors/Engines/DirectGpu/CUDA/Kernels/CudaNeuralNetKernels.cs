@@ -964,6 +964,78 @@ extern ""C"" __global__ __launch_bounds__(256) void argmax_axis(
     indices[outer] = (float)maxIdx;
 }
 
+// One block (256 threads) per row, for long rows: the per-thread kernel above scans a row serially, so a single
+// [1, 49152] row (a decode step's vocabulary argmax) ran its whole scan on ONE thread. Same result bit for bit as that
+// scan: it keeps element 0 when that is NaN (a NaN start is never replaced); otherwise it returns the first index of
+// the largest non-NaN value. Every thread starts from element 0 (a valid candidate) and scans a strided
+// subset in increasing order, keeping the first strictly better value; the tree then prefers a strictly better value,
+// and on a tie the smaller index.
+extern ""C"" __global__ __launch_bounds__(256) void argmax_axis_rows(
+    const float* input, float* indices, int outerSize, int axisSize)
+{
+    __shared__ unsigned int sBest[256];
+    __shared__ int sIdx[256];
+    int outer = blockIdx.x;
+    if (outer >= outerSize) return;
+    if (axisSize <= 0) { if (threadIdx.x == 0) indices[outer] = 0.0f; return; }
+    const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
+    unsigned int best = row[0];
+    if (xf_isnan(best)) { if (threadIdx.x == 0) indices[outer] = 0.0f; return; }
+    int bestIdx = 0;
+    for (int i = threadIdx.x; i < axisSize; i += blockDim.x) {
+        unsigned int val = row[i];
+        if (xf_gt(val, best)) { best = val; bestIdx = i; }
+    }
+    sBest[threadIdx.x] = best;
+    sIdx[threadIdx.x] = bestIdx;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            unsigned int ob = sBest[threadIdx.x + s], mb = sBest[threadIdx.x];
+            int oi = sIdx[threadIdx.x + s], mi = sIdx[threadIdx.x];
+            if (xf_gt(ob, mb) || (!xf_gt(mb, ob) && oi < mi)) { sBest[threadIdx.x] = ob; sIdx[threadIdx.x] = oi; }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) indices[outer] = (float)sIdx[0];
+}
+
+// One block (256 threads) per row, for long rows: the per-thread kernel above scans a row serially, so a single
+// [1, 49152] row (a decode step's vocabulary argmax) ran its whole scan on ONE thread. Same result bit for bit as that
+// scan: it keeps element 0 when that is NaN (a NaN start is never replaced); otherwise it returns the first index of
+// the smallest non-NaN value. Every thread starts from element 0 (a valid candidate) and scans a strided
+// subset in increasing order, keeping the first strictly better value; the tree then prefers a strictly better value,
+// and on a tie the smaller index.
+extern ""C"" __global__ __launch_bounds__(256) void argmin_axis_rows(
+    const float* input, float* indices, int outerSize, int axisSize)
+{
+    __shared__ unsigned int sBest[256];
+    __shared__ int sIdx[256];
+    int outer = blockIdx.x;
+    if (outer >= outerSize) return;
+    if (axisSize <= 0) { if (threadIdx.x == 0) indices[outer] = 0.0f; return; }
+    const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
+    unsigned int best = row[0];
+    if (xf_isnan(best)) { if (threadIdx.x == 0) indices[outer] = 0.0f; return; }
+    int bestIdx = 0;
+    for (int i = threadIdx.x; i < axisSize; i += blockDim.x) {
+        unsigned int val = row[i];
+        if (xf_lt(val, best)) { best = val; bestIdx = i; }
+    }
+    sBest[threadIdx.x] = best;
+    sIdx[threadIdx.x] = bestIdx;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            unsigned int ob = sBest[threadIdx.x + s], mb = sBest[threadIdx.x];
+            int oi = sIdx[threadIdx.x + s], mi = sIdx[threadIdx.x];
+            if (xf_lt(ob, mb) || (!xf_lt(mb, ob) && oi < mi)) { sBest[threadIdx.x] = ob; sIdx[threadIdx.x] = oi; }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) indices[outer] = (float)sIdx[0];
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void argmin_axis(
     const float* input, float* indices, int outerSize, int axisSize)
 {
@@ -2982,6 +3054,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "compute_mean_var",
                 "argmax_axis",
                 "argmin_axis",
+                "argmax_axis_rows",
+                "argmin_axis_rows",
                 "max_axis",
                 "max_axis_rows",
                 // Optimizers

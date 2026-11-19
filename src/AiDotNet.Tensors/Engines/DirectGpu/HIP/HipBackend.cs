@@ -9189,47 +9189,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             }
     }
 
-    public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
-    {
-        if (!_kernelCache.TryGetValue("argmax_axis", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: argmax_axis");
+    public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+        => LaunchArgReduce("argmax_axis", A, indices, outerSize, reduceSize);
 
-            {
-            IntPtr _p0 = A.Handle;
-            IntPtr _p1 = indices.Handle;
-            void** args = stackalloc void*[4];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &outerSize;
-            args[3] = &reduceSize;
-
-
-            uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
-    }
-
-    public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
-    {
-        if (!_kernelCache.TryGetValue("argmin_axis", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: argmin_axis");
-
-            {
-            IntPtr _p0 = A.Handle;
-            IntPtr _p1 = indices.Handle;
-            void** args = stackalloc void*[4];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &outerSize;
-            args[3] = &reduceSize;
-
-
-            uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
-    }
+    public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+        => LaunchArgReduce("argmin_axis", A, indices, outerSize, reduceSize);
 
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
@@ -10577,16 +10541,28 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public bool ArgMaxIndicesAreBitReinterpreted => false; // HIP kernel uses (float)cast
 
-    public unsafe void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+    public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
-        if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: argmax_axis");
+        LaunchArgReduce("argmax_axis", A, indices, outerSize, reduceSize);
+    }
 
-        IntPtr inputPtr = A.Handle;
-        IntPtr indicesPtr = indices.Handle;
+    // Rows at least this long take the block-per-row kernel (argmax_axis_rows / argmin_axis_rows): 256 threads read a
+    // row coalesced. Shorter rows (top-k over a few experts, a small class count) keep one thread per row, which fills
+    // the device from the outer extent instead.
+    internal const int ArgReduceRowKernelMinLength = 128;
+
+    private unsafe void LaunchArgReduce(string name, IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
+    {
+        bool rows = reduceSize >= ArgReduceRowKernelMinLength;
+        string kernelName = rows ? name + "_rows" : name;
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: " + kernelName);
+        IntPtr aPtr = A.Handle;
+        IntPtr idxPtr = indices.Handle;
+        int outer = outerSize, reduce = reduceSize;
         void** args = stackalloc void*[4];
-        args[0] = &inputPtr; args[1] = &indicesPtr; args[2] = &outerSize; args[3] = &reduceSize;
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        args[0] = &aPtr; args[1] = &idxPtr; args[2] = &outer; args[3] = &reduce;
+        uint grid = rows ? (uint)outerSize : (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

@@ -231,6 +231,35 @@ public sealed class GpuCpuEdgeValueComparisonTests
             yield return (name + "Triples", (e, make) => f(e, make(triples, tripleShape)), true);
         }
 
+        // Long rows (the block-per-row arg-reduce path, rows >= 128): each pair in a 300-wide row of filler, with the
+        // second value repeated 129 elements later (another thread's stride) so the first of equal extremes must win
+        // across threads. "Lead" puts the first value at index 0 (a leading NaN or infinity); "Mid" puts it mid-row.
+        const int longWidth = 300;
+        float[] LongRows(bool lead)
+        {
+            var r = new float[N * N * longWidth];
+            for (int i = 0; i < N * N; i++)
+            {
+                int o = i * longWidth, k1 = 1 + (i * 37) % 150, k2 = k1 + 129;
+                for (int j = 0; j < longWidth; j++) r[o + j] = -2f;
+                r[o + (lead ? 0 : k1 + 7)] = pa[i];
+                r[o + k1] = pb[i];
+                r[o + k2] = pb[i];
+            }
+            return r;
+        }
+        int[] longShape = { N * N, longWidth };
+        (string, Func<IEngine, Tensor<float>, Func<float[]>>)[] longOps =
+        {
+            ("ArgMax", (e, t) => F(e.TensorArgMax(t, 1))),
+            ("ArgMin", (e, t) => F(e.TensorArgMin(t, 1))),
+        };
+        foreach (var (name, f) in longOps)
+        {
+            yield return (name + "LongLead", (e, make) => f(e, make(LongRows(lead: true), longShape)), true);
+            yield return (name + "LongMid", (e, make) => f(e, make(LongRows(lead: false), longShape)), true);
+        }
+
         // Running max / min along the last axis (pairs and triples) and along a leading axis.
         var columns = pa.Concat(pb).ToArray();
         int[] columnShape = { 2, N * N };
