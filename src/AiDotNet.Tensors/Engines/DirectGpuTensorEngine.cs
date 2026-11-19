@@ -2768,7 +2768,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int hostVersion = 0)
         => CacheActivation((object)resultData, buffer, shape, backend, hostVersion: hostVersion);
 
-    private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
+    private bool CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
         bool isFp16 = false, int elementCount = 0, int hostVersion = 0)
     {
         // Approximate managed footprint of the key array (product(shape) * 4 bytes).
@@ -2784,7 +2784,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // vector over it share one -- or an earlier result). That entry keeps its buffer; this buffer stays owned by
         // whoever holds it (the result tensor, its pending download) and is freed with them. Disposing it here, as the
         // old cache did, could free a buffer a pending download still reads.
-        if (_activationCache.TryAdd(cacheKey, entry)) LogRecentActivationKey(cacheKey);
+        if (!_activationCache.TryAdd(cacheKey, entry)) return false;
+        LogRecentActivationKey(cacheKey);
+        return true;
     }
 
     /// <summary>

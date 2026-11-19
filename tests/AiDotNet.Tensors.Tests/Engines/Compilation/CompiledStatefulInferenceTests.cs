@@ -79,7 +79,9 @@ public sealed class CompiledStatefulInferenceTests
             for (int t = 0; t < Steps; t++)
             {
                 plan.SetInputs(new[] { new Tensor<float>([1, D], new Vector<float>(Input(t))), new Tensor<float>([D, 1], new Vector<float>(Input(t))) });
+                int previousVersion = s.Version;
                 var output = plan.Execute().ToArray();
+                if (engine is CpuEngine && engine is not DirectGpuTensorEngine) Assert.NotEqual(previousVersion, s.Version);
                 var state = s.ToArray();
                 for (int i = 0; i < D * D; i++)
                     Assert.True(Math.Abs(state[i] - refState[t][i]) <= 1e-5f * (1 + Math.Abs(refState[t][i])),

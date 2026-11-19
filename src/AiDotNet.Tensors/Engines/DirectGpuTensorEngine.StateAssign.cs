@@ -19,22 +19,24 @@ public partial class DirectGpuTensorEngine
     /// </remarks>
     internal void AssignStateInPlace<T>(Tensor<T> state, Tensor<T> next)
     {
+        using var lease = EnterGpuOp();
         if (state is null) throw new ArgumentNullException(nameof(state));
         if (next is null) throw new ArgumentNullException(nameof(next));
         if (next.Length != state.Length)
             throw new ArgumentException(
                 $"A state of {state.Length} elements cannot be assigned a value of {next.Length}.", nameof(next));
-        if (!state.IsContiguous || state._storageOffset != 0)
+        if (!state.IsContiguous || IsPartialView(state))
             throw new ArgumentException("A plan state must be a whole contiguous tensor, not a view.", nameof(state));
-        if (!TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
         {
-            next.AsSpan().CopyTo(state.AsWritableSpan());
+            ((Compilation.ISignatureTensor)state).CopyLeafFrom(next);
             return;
         }
 
         var destination = PersistentBufferFor(backend, state);
         using (var source = GetOrAllocateBuffer(backend, next))
             backend.Copy(source.Buffer, destination, state.Length);
+        state.IncrementVersion();
         BindResidentBuffer(state, destination, backend);
     }
 
@@ -45,8 +47,9 @@ public partial class DirectGpuTensorEngine
     internal IGpuBuffer? PinInputResident<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        if (!input.IsContiguous || input._storageOffset != 0 || !TryGetBackend(out var backend)) return null;
-        if (input._gpuBuffer is { } bound && ReferenceEquals(input._gpuBackend, backend)) return bound;
+        if (!input.IsContiguous || IsPartialView(input) || !TryGetBackend(out var backend)) return null;
+        if (input._gpuBuffer is { } bound && bound.Handle != IntPtr.Zero && bound.Size >= input.Length
+            && ReferenceEquals(input._gpuBackend, backend) && input._gpuBufferVersion == input.GpuCacheVersion) return bound;
         var buffer = PersistentBufferFor(backend, input);
         BindResidentBuffer(input, buffer, backend);
         return buffer;
@@ -56,16 +59,18 @@ public partial class DirectGpuTensorEngine
     // adopted into the activation cache under that array, so it lives as long as the tensor's storage.
     private IGpuBuffer PersistentBufferFor<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
-        if (tensor._gpuBuffer is { } bound && ReferenceEquals(tensor._gpuBackend, backend) && bound.Size >= tensor.Length)
+        if (tensor._gpuBuffer is { } bound && ReferenceEquals(tensor._gpuBackend, backend) && bound.Handle != IntPtr.Zero
+            && bound.Size >= tensor.Length && tensor._gpuBufferVersion == tensor.GpuCacheVersion)
             return bound;
-        var owned = GetOrAllocateBuffer(backend, tensor);
+        using var owned = GetOrAllocateBuffer(backend, tensor);
         var buffer = owned.Buffer;
         if (owned.OwnsBuffer)
         {
             var key = tensor.GetBackingArrayForCacheLookupUnsafe()
                 ?? throw new InvalidOperationException("The tensor has no host storage to own its device buffer.");
+            if (!CacheActivation(cacheKey: key, buffer, tensor._shape, backend, hostVersion: tensor.GpuCacheVersion))
+                throw new InvalidOperationException("The stateful plan could not retain its device buffer.");
             owned.RelinquishOwnership();
-            CacheActivation(key, buffer, tensor._shape, backend, hostVersion: tensor.GpuCacheVersion);
         }
         return buffer;
     }
@@ -77,6 +82,10 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal void RearmStateAfterReplay<T>(Tensor<T> state, IGpuBuffer capturedBuffer)
     {
-        if (TryGetBackend(out var backend)) BindResidentBuffer(state, capturedBuffer, backend);
+        if (TryGetBackend(out var backend))
+        {
+            state.IncrementVersion();
+            BindResidentBuffer(state, capturedBuffer, backend);
+        }
     }
 }
