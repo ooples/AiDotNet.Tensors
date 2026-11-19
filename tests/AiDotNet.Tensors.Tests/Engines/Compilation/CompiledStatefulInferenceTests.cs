@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
@@ -200,6 +201,210 @@ public sealed class CompiledStatefulInferenceTests
             var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
             CompiledInferencePlan<float>.InferenceCudaGraphOverride = capture;
             try { RunOneHotPosition(gpu!, expectGraph: capture); }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+        }
+    }
+
+    // Two stacked recurrent layers (batched like a multi-head scan, with a per-row decay): the second layer's
+    // intermediates have the first's shapes, and its input is a unary chain the first layer's output also feeds.
+    private static (Tensor<float> Output, Tensor<float> Next1, Tensor<float> Next2) TwoLayers(IEngine e,
+        Tensor<float> s1, Tensor<float> s2, Tensor<float> x, Tensor<float> gate)
+    {
+        Tensor<float> Layer(Tensor<float> s, Tensor<float> h, out Tensor<float> next)
+        {
+            // h [R, D]: outer = h tanh(h)ᵀ per row as [R, D, D]; next = gate ⊙ s + outer; out = σ(next · h)
+            var v = e.Reshape(h, [R, D, 1]);
+            var k = e.Reshape(e.Tanh(h), [R, 1, D]);
+            var outer = e.BatchMatMul(v, k);
+            next = e.TensorAdd(e.TensorMultiply(s, gate), outer);
+            return e.Sigmoid(e.Reshape(e.BatchMatMul(next, e.Reshape(h, [R, D, 1])), [R, D]));
+        }
+        var y1 = Layer(s1, x, out var n1);
+        var y2 = Layer(s2, y1, out var n2);
+        return (y2, n1, n2);
+    }
+
+    private const int R = 4;
+
+    // abandonCapture: the capture throws partway (as a non-capturable op does), so the plan must carry on eagerly, every
+    // later call reading that call's input and advancing the states from correct values.
+    private static void RunTwoLayers(IEngine engine, bool capture, bool abandonCapture)
+    {
+        var gate = new Tensor<float>([R, 1, 1]);
+        for (int i = 0; i < R; i++) gate[i, 0, 0] = 0.5f + 0.1f * i;
+        float[] In(int t)
+        {
+            var rng = new Random(900 + t);
+            var a = new float[R * D];
+            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+            return a;
+        }
+
+        var cpu = new CpuEngine();
+        var r1 = new Tensor<float>([R, D, D]);
+        var r2 = new Tensor<float>([R, D, D]);
+        var refOut = new List<float[]>();
+        var refS1 = new List<float[]>();
+        var refS2 = new List<float[]>();
+        for (int t = 0; t < 6; t++)
+        {
+            var (o, n1, n2) = TwoLayers(cpu, r1, r2, new Tensor<float>([R, D], new Vector<float>(In(t))), gate);
+            refOut.Add(o.ToArray());
+            r1 = n1;
+            r2 = n2;
+            refS1.Add(r1.ToArray());
+            refS2.Add(r2.ToArray());
+        }
+
+        var s1 = new Tensor<float>([R, D, D]);
+        var s2 = new Tensor<float>([R, D, D]);
+        var x = new Tensor<float>([R, D], new Vector<float>(In(0)));
+        CompiledInferencePlan<float> plan;
+        using (new EngineScope(engine))
+        using (var scope = GraphMode.EnableInference())
+        {
+            var (o, n1, n2) = TwoLayers(engine, s1, s2, x, gate);
+            plan = scope.CompileInference(o, new[] { x }, new[] { (s1, n1), (s2, n2) });
+        }
+        var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+        CompiledInferencePlan<float>.InferenceCudaGraphOverride = capture;
+        if (abandonCapture)
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookInsideCapture =
+                () => throw new InvalidOperationException("injected: a non-capturable step");
+        try
+        {
+            using (plan)
+            {
+                for (int t = 0; t < 6; t++)
+                {
+                    plan.SetInputs(new[] { new Tensor<float>([R, D], new Vector<float>(In(t))) });
+                    var got = plan.Execute().ToArray();
+                    AssertClose(refS1[t], s1.ToArray(), $"step {t} layer-1 state");
+                    AssertClose(refS2[t], s2.ToArray(), $"step {t} layer-2 state");
+                    AssertClose(refOut[t], got, $"step {t} output");
+                }
+                if (capture)
+                {
+                    var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                    Assert.Equal(!abandonCapture, (IntPtr)exec.GetValue(plan)! != IntPtr.Zero);
+                }
+            }
+        }
+        finally
+        {
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior;
+            if (abandonCapture) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.TestHookInsideCapture = null;
+        }
+    }
+
+    private static void AssertClose(float[] expected, float[] actual, string what)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-4f * (1 + Math.Abs(expected[i])),
+                $"{what}[{i}]: {actual[i]} vs {expected[i]}");
+    }
+
+    [Fact]
+    public void Two_stacked_recurrent_layers_advance_both_states_on_the_cpu_engine()
+        => RunTwoLayers(new CpuEngine(), capture: false, abandonCapture: false);
+
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Two_stacked_recurrent_layers_advance_both_states_on_the_gpu(bool capture, bool abandonCapture)
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            if (capture) Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            RunTwoLayers(gpu!, capture, abandonCapture);
+        }
+    }
+
+    // A deeper stack (six recurrent layers, each with its own state): later layers' same-shaped intermediates are
+    // candidates for the storage of earlier layers' dead ones.
+    private static (Tensor<float> Output, Tensor<float>[] Nexts) DeepStack(IEngine e, Tensor<float>[] states,
+        Tensor<float> x, Tensor<float> gate)
+    {
+        var nexts = new Tensor<float>[states.Length];
+        var h = x;
+        for (int l = 0; l < states.Length; l++)
+        {
+            var v = e.Reshape(h, [R, D, 1]);
+            var k = e.Reshape(e.Tanh(h), [R, 1, D]);
+            nexts[l] = e.TensorAdd(e.TensorMultiply(states[l], gate), e.BatchMatMul(v, k));
+            var read = e.Reshape(e.BatchMatMul(nexts[l], e.Reshape(h, [R, D, 1])), [R, D]);
+            h = e.TensorAdd(h, e.Sigmoid(read));
+        }
+        return (h, nexts);
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_deep_recurrent_stack_advances_every_state_on_the_gpu(bool capture)
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            if (capture) Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            const int layers = 6, steps = 6;
+            var gate = new Tensor<float>([R, 1, 1]);
+            for (int i = 0; i < R; i++) gate[i, 0, 0] = 0.6f + 0.05f * i;
+            float[] In(int t)
+            {
+                var rng = new Random(1700 + t);
+                var a = new float[R * D];
+                for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+                return a;
+            }
+
+            var cpu = new CpuEngine();
+            var refStates = new Tensor<float>[layers];
+            for (int l = 0; l < layers; l++) refStates[l] = new Tensor<float>([R, D, D]);
+            var refOut = new List<float[]>();
+            var refLast = new List<float[]>();
+            for (int t = 0; t < steps; t++)
+            {
+                var (o, n) = DeepStack(cpu, refStates, new Tensor<float>([R, D], new Vector<float>(In(t))), gate);
+                refStates = n;
+                refOut.Add(o.ToArray());
+                refLast.Add(n[layers - 1].ToArray());
+            }
+
+            var states = new Tensor<float>[layers];
+            for (int l = 0; l < layers; l++) states[l] = new Tensor<float>([R, D, D]);
+            var x = new Tensor<float>([R, D], new Vector<float>(In(0)));
+            CompiledInferencePlan<float> plan;
+            using (new EngineScope(gpu!))
+            using (var scope = GraphMode.EnableInference())
+            {
+                var (o, n) = DeepStack(gpu!, states, x, gate);
+                var pairs = new (Tensor<float>, Tensor<float>)[layers];
+                for (int l = 0; l < layers; l++) pairs[l] = (states[l], n[l]);
+                plan = scope.CompileInference(o, new[] { x }, pairs);
+            }
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = capture;
+            try
+            {
+                using (plan)
+                    for (int t = 0; t < steps; t++)
+                    {
+                        plan.SetInputs(new[] { new Tensor<float>([R, D], new Vector<float>(In(t))) });
+                        var got = plan.Execute().ToArray();
+                        AssertClose(refLast[t], states[layers - 1].ToArray(), $"step {t} last-layer state");
+                        AssertClose(refOut[t], got, $"step {t} output");
+                    }
+            }
             finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
         }
     }

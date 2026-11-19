@@ -41,6 +41,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // The device buffers a capture recorded the states at (the replays write there).
     private Engines.DirectGpu.IGpuBuffer[] _capturedStateBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
     private int[] _capturedStateVersions = Array.Empty<int>();
+    // The stable buffers the pre-residency pass and the capture draw each step's outputs and temporaries from, keyed by
+    // step (see Engines.StepScratchPool): a capture may not allocate, so an op needing scratch (a two-sided broadcast,
+    // say) otherwise declined to the CPU engine and abandoned the capture. Lives as long as the captured graph.
+    private Engines.StepScratchPool? _captureScratchPool;
     private readonly List<GCHandle> _pinnedHandles = new();
     private TensorStorageLeaseSet? _storageLeases;
 
@@ -946,18 +950,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // A stateful plan's trailing state writes are left out: the launch below performs
                             // this call's one state advance, and the state buffers already exist (the eager
                             // warmup calls wrote them).
-                            for (int i = 0; i < steps.Length - _stateTensors.Length; i++)
-                                steps[i].Execute(engine, steps[i].OutputBuffer);
+                            RunStepsPooled(gte, engine, steps, steps.Length - _stateTensors.Length);
 
                             // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
                             // capture is non-capturable), then record the step launches. Capture RECORDS
                             // but does not execute, so launch once afterwards to produce this call's output.
                             RefreshInferenceInputsInPlace(cb);
-                            var exec = cb.CaptureGraph(() =>
-                            {
-                                for (int i = 0; i < steps.Length; i++)
-                                    steps[i].Execute(engine, steps[i].OutputBuffer);
-                            });
+                            var exec = cb.CaptureGraph(() => RunStepsPooled(gte, engine, steps, steps.Length));
                             if (exec != IntPtr.Zero)
                             {
                                 _graphExec = exec;
@@ -977,6 +976,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         }
                         // Capture failed (a non-capturable op remains) — disable + resume eviction.
                         _graphCaptureDisabled = true;
+                        UnpinInputs(gte);
                         if (_graphEvictionSuspended)
                         {
                             // Best-effort, so the eager fallback below still runs this call.
@@ -993,6 +993,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 {
                     TraceGraphTeardownFailure("capture the inference graph; this plan now runs eagerly", ex);
                     _graphCaptureDisabled = true;
+                    UnpinInputs(gte);
                     // A throw after _graphExec was assigned (the first LaunchCapturedGraph or the output
                     // download above) leaves the graph executable allocated — destroy it so it isn't leaked
                     // until Dispose, and HasGraph-style state reflects that capture was abandoned.
@@ -1024,6 +1025,35 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             steps[i].Execute(engine, steps[i].OutputBuffer);
         }
         return _finalOutput;
+    }
+
+    // An abandoned capture leaves the plan eager: its input slots, pinned to buffers only a graph replay refreshes,
+    // must go back to the engine's ordinary upload path (SetInputs writes the host copy only).
+    private void UnpinInputs(DirectGpuTensorEngine gte)
+    {
+        foreach (var input in _compiledInputTensors)
+            if (input is not null) gte.UnpinInput(input);
+    }
+
+    // Runs the first count steps with this plan's scratch pool current, each step its own pool action, so a step's
+    // outputs and temporaries come back at the same addresses on every pooled run (the capture records the
+    // pre-residency pass's buffers).
+    private void RunStepsPooled(DirectGpuTensorEngine gte, IEngine engine, CompiledStep<T>[] steps, int count)
+    {
+        var outer = DirectGpuTensorEngine.EnterScratchPool(_captureScratchPool ??= gte.CreateScratchPool());
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                gte.SetCurrentScratchAction(i);
+                steps[i].Execute(engine, steps[i].OutputBuffer);
+            }
+        }
+        finally
+        {
+            gte.SetCurrentScratchAction(-1);
+            DirectGpuTensorEngine.RestoreScratchPool(outer);
+        }
     }
 
     // A replayed graph wrote the states on the device without host bookkeeping: re-mark each device-resident so a
@@ -1340,6 +1370,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             var disposedEngine = _graphEngine; BestEffortTeardown(() => disposedEngine.EndGraphLifetime(), "end the graph lifetime on dispose");
             _graphEvictionSuspended = false;
+        }
+        if (_captureScratchPool is { } capturePool)
+        {
+            BestEffortTeardown(capturePool.Release, "free the capture scratch pool on dispose");
+            _captureScratchPool = null;
         }
 
         // Tear down the cached execution stream BEFORE freeing pinned
@@ -2039,8 +2074,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (reordering.IsEnabled && reordering.TryOptimize(arr, engine) is { } reordered)
             arr = reordered;
 
+        // Memory planning shares host storage between tensors whose lifetimes do not overlap. That saves host memory
+        // only, and on the GPU engine it aliases device state: device buffers are cached and re-keyed by host backing
+        // array, so binding the second tenant's result displaced (and released) the first tenant's buffer while that
+        // tensor still held it (measured: a stacked recurrent model's later layers read an earlier layer's values).
         var memoryPlanning = new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass();
-        if (memoryPlanning.IsEnabled &&
+        if (memoryPlanning.IsEnabled && !engine.TryGet<DirectGpuTensorEngine>(out _) &&
             memoryPlanning.TryOptimize(arr, engine, protectedOutputs) is { } memoryPlanned)
             arr = memoryPlanned;
 

@@ -63,6 +63,25 @@ public partial class DirectGpuTensorEngine
         return buffer;
     }
 
+    /// <summary>
+    /// Undoes <see cref="PinInputResident{T}"/> when a plan goes back to eager execution: SetInputs writes only the host
+    /// copy, and a pinned binding would keep serving the call that pinned it (measured: every eager call after an
+    /// abandoned capture read that call's input).
+    /// </summary>
+    internal void UnpinInput<T>(Tensor<T> input)
+    {
+        if (input is not null && input._gpuBuffer is not null) InvalidateStaleBinding(input);
+    }
+
+    private void InvalidateStaleBinding<T>(Tensor<T> tensor)
+    {
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (array is not null) InvalidateActivationCacheEntry(array);
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
+    }
+
     // The tensor's own device buffer: the bound one, else the cached copy of its host array, else a fresh upload
     // adopted into the activation cache under that array, so it lives as long as the tensor's storage.
     private IGpuBuffer PersistentBufferFor<T>(IDirectGpuBackend backend, Tensor<T> tensor)
