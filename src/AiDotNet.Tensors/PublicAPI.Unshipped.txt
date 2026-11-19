@@ -57,6 +57,7 @@ AiDotNet.Tensors.Engines.DirectGpu.IOneHotIndexBackend.OneHotInt32(AiDotNet.Tens
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.OneHotInt32(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! int32Indices, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int rows, int depth) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanInstantNgpKernels.FusedCeTargetPositions.get -> string!
 static AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanInstantNgpKernels.OneHotInt32.get -> string!
 AiDotNet.Tensors.Engines.DirectGpu.IOneHotIndexBackend
 AiDotNet.Tensors.Engines.DirectGpu.IAdam8BitWeightDecayBackend

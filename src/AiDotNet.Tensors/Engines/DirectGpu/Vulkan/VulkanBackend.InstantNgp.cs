@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     public void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
@@ -124,6 +124,14 @@ public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBac
         if (length <= 0) return;
         GlslDispatchN(VulkanInstantNgpKernels.ConvertIndicesToInt32, length,
             [numericIndices, int32Indices], [(uint)length]);
+    }
+
+    void IFusedCrossEntropyPositionsBackend.FusedCrossEntropyTargetPositions(
+        IGpuBuffer int32Ids, IGpuBuffer positionBits, int rows, int chunk, int vocab)
+    {
+        if (rows <= 0) return;
+        GlslDispatchN(VulkanInstantNgpKernels.FusedCeTargetPositions, rows,
+            [int32Ids, positionBits], [(uint)rows, (uint)chunk, (uint)vocab]);
     }
 
     public void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)

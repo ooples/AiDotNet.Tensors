@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private void DispatchInstantNgp(
         string kernelName,
@@ -225,6 +225,23 @@ public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IR
         encoder.SetBuffer((MetalGpuBuffer)numericIndices, 0);
         encoder.SetBuffer((MetalGpuBuffer)int32Indices, 1);
         encoder.SetBytes(length, 2);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    void IFusedCrossEntropyPositionsBackend.FusedCrossEntropyTargetPositions(
+        IGpuBuffer int32Ids, IGpuBuffer positionBits, int rows, int chunk, int vocab)
+    {
+        if (rows <= 0) return;
+        ThrowIfDisposed();
+        var pipeline = GetPipeline(AudioLibName, _audioLibrary, "fused_ce_target_positions");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(rows);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)int32Ids, 0);
+        encoder.SetBuffer((MetalGpuBuffer)positionBits, 1);
+        encoder.SetBytes(rows, 2);
+        encoder.SetBytes(chunk, 3);
+        encoder.SetBytes(vocab, 4);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 

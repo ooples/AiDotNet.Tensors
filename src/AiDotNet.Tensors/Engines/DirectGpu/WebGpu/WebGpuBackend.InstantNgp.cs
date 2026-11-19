@@ -1,7 +1,7 @@
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     // Matches struct P in WebGpuInstantNgpKernels: eight 4-byte fields, 32 bytes.
     private static float[] InstantNgpUniforms(
@@ -168,6 +168,17 @@ public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, I
             WebGpuInstantNgpKernels.ConvertIndicesToInt32, "main",
             numericIndices, int32Indices,
             [BitConverter.Int32BitsToSingle(length), 0f, 0f, 0f], length)
+            .GetAwaiter().GetResult();
+    }
+
+    void IFusedCrossEntropyPositionsBackend.FusedCrossEntropyTargetPositions(
+        IGpuBuffer int32Ids, IGpuBuffer positionBits, int rows, int chunk, int vocab)
+    {
+        if (rows <= 0) return;
+        Dispatch2BufferAsync("FusedCeTargetPositions", WebGpuInstantNgpKernels.FusedCeTargetPositions, "main",
+            int32Ids, positionBits,
+            [BitConverter.Int32BitsToSingle(rows), BitConverter.Int32BitsToSingle(chunk),
+                BitConverter.Int32BitsToSingle(vocab), 0f], rows)
             .GetAwaiter().GetResult();
     }
 

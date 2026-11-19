@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private IntPtr ResolveInstantNgpKernel(string name)
     {
@@ -204,6 +204,18 @@ public sealed partial class HipBackend : IInstantNgpBackend, IFrexpBackend, IRen
         LaunchKernel(kernel, (uint)((length + DefaultBlockSize - 1) / DefaultBlockSize),
             DefaultBlockSize, args);
         Synchronize();
+    }
+
+    unsafe void IFusedCrossEntropyPositionsBackend.FusedCrossEntropyTargetPositions(
+        IGpuBuffer int32Ids, IGpuBuffer positionBits, int rows, int chunk, int vocab)
+    {
+        if (rows <= 0) return;
+        var kernel = ResolveInstantNgpKernel("fused_ce_target_positions");
+        IntPtr i = int32Ids.Handle, o = positionBits.Handle;
+        int r = rows, c = chunk, v = vocab;
+        void** args = stackalloc void*[5];
+        args[0] = &i; args[1] = &o; args[2] = &r; args[3] = &c; args[4] = &v;
+        LaunchKernel(kernel, (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, args);
     }
 
     public unsafe void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)

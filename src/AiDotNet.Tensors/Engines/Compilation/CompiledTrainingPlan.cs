@@ -142,6 +142,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static readonly bool s_graphStepDiagnosticsEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPHSTEP_DIAG") == "1";
     private IntPtr _stepGraphExec;
+    private DirectGpuTensorEngine? _stepGraphOwner;
     // The step graph for odd replays, when the plan alternates two (NeedsParityGraphs): replay r runs
     // _stepGraphExec when r is even, this one when r is odd. Zero: every replay runs _stepGraphExec.
     private IntPtr _stepGraphExecOdd;
@@ -480,6 +481,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // needs to write. Storing both costs ~N*sizeof(ref) extra per plan,
     // which is negligible relative to the pre-allocated tensor buffers.
     private readonly CompiledStep<T>[]? _forwardSteps;
+    private readonly bool _usesFusedCe;
     private readonly int[]? _compiledInputShape;
     private readonly Tensor<T>? _compiledInputTensor;
     // Per-step buffer the CUDA-graph replay refreshes in place. Equals _compiledInputTensor for ordinary
@@ -529,6 +531,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
         _forwardSteps = forwardSteps;
+        _usesFusedCe = forwardSteps?.Any(step => step.OpName.StartsWith("FusedLinearCrossEntropy", StringComparison.Ordinal)) ?? false;
         MaybeDumpOpHistogram(); // #639 diagnostic: AIDOTNET_PLAN_HISTOGRAM=1 dumps the replayed op profile
         // A leading "Embedding" step is an int→float gather. Capture it INSIDE the graph as a pure on-device gather
         // over a STABLE index buffer, and refresh just the small index vector before each launch (via the engine's
@@ -554,6 +557,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // A plan dropped without Dispose still releases its captured graph and the memory the graph pins.
     ~CompiledTrainingPlan()
     {
+        _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExec);
+        _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExecOdd);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExec);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExecOdd);
     }
@@ -614,6 +619,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             lossReadback.Dispose();
             _lossReadback = null;
         }
+        DisposeLabelErrorReadback();
 
         _fp16PagedPlan?.Dispose();
         _fp16PagedPlan = null;
@@ -1236,7 +1242,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int k = 0; k < window; k++) rates[k] = (float)optimizer.Schedule.GetLr(first + k);
             io.WriteLearningRates(replay, first, rates);
         }
-        if ((replay & 1) == 1 && _stepGraphExecOdd != IntPtr.Zero) exec = _stepGraphExecOdd;
         LaunchStepGraph(cb, exec);
         io.Flush();
         _stepIoLaunched = replay + 1;
@@ -1363,6 +1368,34 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // Page-locked slot the captured step's loss is copied into after each launch (CUDA).
     private Engines.DirectGpu.IDeviceReadback? _lossReadback;
+
+    // This plan's copy of the engine's fused cross-entropy label-error word, queued after each Step() and read before
+    // the next (see Step).
+    private Engines.DirectGpu.IDeviceReadback? _labelErrorReadback;
+
+    /// <summary>
+    /// Disposes the label-error readback. A step after the plan's last Step() never reads its copy, so a final step
+    /// with an out-of-range device label is reported here (Dispose cannot throw): traced as an error.
+    /// </summary>
+    private void DisposeLabelErrorReadback()
+    {
+        if (_labelErrorReadback is not { } readback) return;
+        _labelErrorReadback = null;
+        try
+        {
+            if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte) && gte.ReadFusedCeLabelErrorCheck(readback))
+                System.Diagnostics.Trace.TraceError(
+                    "CompiledTrainingPlan: a fused cross-entropy target id on the plan's last step was outside [0, vocab).");
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            System.Diagnostics.Trace.TraceWarning("CompiledTrainingPlan: the last step's label check could not be read: " + ex.Message);
+        }
+        finally
+        {
+            readback.Dispose();
+        }
+    }
 
     /// <summary>
     /// Queues the loss's device-to-host copy behind the step instead of waiting for it, and makes the copy the loss
@@ -1504,10 +1537,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
         {
-            if (_stepGraphExec != IntPtr.Zero) cb.DestroyCapturedGraph(_stepGraphExec);
-            if (_stepGraphExecOdd != IntPtr.Zero) cb.DestroyCapturedGraph(_stepGraphExecOdd);
+            if (_stepGraphExec != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExec);
+            if (_stepGraphExecOdd != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExecOdd);
         }
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
+        _stepGraphOwner = null;
         _stepGraphExec = IntPtr.Zero;
         StepGraphNodeCounts = null;
         _stepGraphExecOdd = IntPtr.Zero;
@@ -2858,6 +2892,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (IsOptimizerParameterActive(p) && (_parameterAcceptedUpdates[p] < 0 || _parameterAcceptedUpdates[p] > _optimizerStep))
                     throw new InvalidOperationException("A parameter's accepted-update age is inconsistent with the optimizer's global step.");
             int previousStep = _optimizerStep;
+            ThrowOnInvalidCurrentFusedCeLabels();
             _optimizerUpdate?.Invoke();
             if (_optimizerStep > previousStep)
             {
@@ -2894,7 +2929,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_finitenessReadback is not { } readback) return;
         double sumSquares = System.Runtime.InteropServices.MemoryMarshal.Read<double>(readback.Read());
         if (double.IsNaN(sumSquares) || double.IsInfinity(sumSquares))
-            MarkOptimizerStepDiscarded();
+            MarkOptimizerStepDiscarded(deferredVerdict: true);
         else if (_pendingParameterAgeMembership is { } membership)
             AdvanceParameterAges(membership);
         _pendingParameterAgeMembership = null;
@@ -3025,13 +3060,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void MarkOptimizerStepDiscarded()
+    private void MarkOptimizerStepDiscarded(bool deferredVerdict = false)
     {
         // The step counter drives schedules and bias correction. A discarded update must be
         // invisible to both, matching GradScaler's contract.
         _optimizerStep--;
         _nonFiniteStepsSkipped++;
         LastStepSkippedNonFiniteGradients = true;
+        // A captured or resident fused cross-entropy cannot check its device labels on the host, so an out-of-range id
+        // makes the loss and gradients NaN. Tell that apart from an overflow: the label error throws, it is not skipped.
+        if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var labelEngine) && (deferredVerdict ? labelEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback) : labelEngine.TakeFusedCeLabelError()))
+            throw new ArgumentOutOfRangeException("targetIds",
+                "A fused cross-entropy target id on this compiled step was outside [0, vocab). The step was not applied.");
     }
 
     private sealed class FusedOptimizerRuntimeScalars
@@ -4158,7 +4198,31 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    private IntPtr NextStepGraph =>
+        _stepIo is not null && (_stepIoLaunched & 1) != 0 && _stepGraphExecOdd != IntPtr.Zero
+            ? _stepGraphExecOdd : _stepGraphExec;
+
     private Tensor<T> StepLocked()
+    {
+        var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
+        if (gpuEngine is null) return ExecuteStepLocked();
+        // A device label this plan's previous step found out of range (read asynchronously: see the engine's
+        // label-error word) fails this step before it runs. The read consumes the copy, so a caller that
+        // catches and feeds a good batch steps on. The word is cleared before each step and copied into this
+        // plan's own readback after it, so a step only ever sees its own rows.
+        if (gpuEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback))
+            throw new ArgumentOutOfRangeException("targetIds",
+                "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). Where the " +
+                "backend propagates NaN that step was discarded as non-finite; elsewhere its update may have been applied.");
+        _fusedCeLabelsValidated = false;
+        gpuEngine.ClearFusedCeLabelError();
+        var loss = ExecuteStepLocked();
+        ThrowOnInvalidCurrentFusedCeLabels();
+        gpuEngine.QueueFusedCeLabelErrorCheck(ref _labelErrorReadback);
+        return loss;
+    }
+
+    private Tensor<T> ExecuteStepLocked()
     {
         ResolvePingPongClaims(force: false);
         // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
@@ -4292,7 +4356,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // those are the graph-purity violations that abort/spoil whole-step capture and keep the
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
-                            exec = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 0));
+                            exec = gte.CaptureGraphWithIndexBindings(cb, () => CaptureStepGraphBody(cb, parity: 0));
                         StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;
                     }
                     catch (Exception captureFailure)
@@ -4341,6 +4405,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         RollBackCaptureResidency(gte);
                         return StepResidentOrEager();
                     }
+                    _stepGraphOwner = gte;
                     _stepGraphExec = exec;
                     if (NeedsParityGraphs && !TryCaptureOddParityGraph(gte, cb))
                     {
@@ -4352,7 +4417,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     _scratchPinsAtCapture = _scratchPool?.PinnedCount ?? 0;
                     // Executes THIS step on the just-uploaded indices (through the step I/O's staging when it has one).
-                    if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, exec);
+                    if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, NextStepGraph);
                     else LaunchStepGraph(cb, exec);
                     RefreshLossFromCapturedGraph(gte);
                     if (_capturedOptimizer is { } capturedFirst)
@@ -4394,8 +4459,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _graphStepDisabled = true;
                     return StepEager();
                 }
-                if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, _stepGraphExec);
-                else LaunchStepGraph(cb, _stepGraphExec);
+                var replayGraph = NextStepGraph;
+                try
+                {
+                    gte.RefreshHostIndexDeviceCopiesNow(replayGraph);
+                }
+                catch (InvalidOperationException)
+                {
+                    InvalidateCapturedStepGraph();
+                    return StepResidentOrEager();
+                }
+                if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, replayGraph);
+                else LaunchStepGraph(cb, replayGraph);
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
                 RefreshLossFromCapturedGraph(gte);
                 if (_capturedOptimizer is { } capturedReplay)
@@ -4768,14 +4843,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
                 using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCaptureOdd"))
-                    odd = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 1));
+                    odd = gte.CaptureGraphWithIndexBindings(cb, () => CaptureStepGraphBody(cb, parity: 1));
             }
             finally { bind(0); }
         }
         catch (Exception oddFailure)
         {
             RejectPingPong("the odd-replay step graph did not capture: " + oddFailure.GetType().Name + ": " + oddFailure.Message);
-            if (odd != IntPtr.Zero) cb.DestroyCapturedGraph(odd);
+            if (odd != IntPtr.Zero) gte.DestroyGpuGraph(odd);
             return false;
         }
         if (odd == IntPtr.Zero) { RejectPingPong("the odd-replay step graph produced no graph"); return false; }
@@ -7936,7 +8011,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             ResolveDeferredFiniteness();
             if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
-                || paramCount == 0 || _l2Regularization != 0f || _maxGradNorm > 0.0)
+                || _usesFusedCe || paramCount == 0 || !_l2Regularization.Equals(0f) || _maxGradNorm > 0.0)
                 return null;
             ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
