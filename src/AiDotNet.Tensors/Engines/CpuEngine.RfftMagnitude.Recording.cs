@@ -5,7 +5,7 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
 
-public partial class CpuEngine
+public partial class CpuEngine : IRfftMagnitudeEngine
 {
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRfftMagnitude<T>(Tensor<T> input, double epsilon = 1e-9)
