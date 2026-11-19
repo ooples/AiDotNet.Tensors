@@ -56,7 +56,7 @@ public sealed partial class CudaBackend : IGroupedConv2DBackend
                 1 => convolution.TryGroupedConv2DBackwardDataGpu(first.Handle, second.Handle, destination.Handle, geometry, accumulate, CudnnConvMath),
                 _ => convolution.TryGroupedConv2DBackwardFilterGpu(first.Handle, second.Handle, destination.Handle, geometry, accumulate, CudnnConvMath),
             };
-            if (success && s_cudnnExecutionDiagnosticsEnabled)
+            if (success && CudnnExecutionDiagnosticsEnabled)
             {
                 if (pass == 0) System.Threading.Interlocked.Increment(ref _cudnnForwardExecutions);
                 else if (pass == 1) System.Threading.Interlocked.Increment(ref _cudnnBackwardDataExecutions);
