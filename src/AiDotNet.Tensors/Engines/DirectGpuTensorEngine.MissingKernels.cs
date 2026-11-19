@@ -4887,19 +4887,42 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal void PrepareResidentIndexForCompiledStep(IDirectGpuBackend backend, Tensor<int> indices)
     {
-        if (!(backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing()))
-            RefreshResidentIndexInPlace(backend, indices, IntPtr.Zero);
-        RecordCapturedResidentIndex(indices);
+        // Whole-vector tensors only (the caller checks): a view's device data is a slice of its base's buffer, which
+        // the view paths resolve from the base, and its version is not the shared device state's.
+        bool capturing = backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing();
+        if (!capturing) RefreshResidentIndexInPlace(backend, indices, IntPtr.Zero);
+        RecordCapturedResidentIndex(indices, capturing);
     }
 
-    private void RecordCapturedResidentIndex(Tensor<int> indices)
+    /// <summary>Number of live device-resident index tensors recorded for the pre-replay refresh (tests).</summary>
+    internal int CapturedResidentIndexCount
+    {
+        get
+        {
+            lock (_hostIndexLock)
+            {
+                int live = 0;
+                foreach (var r in _capturedResidentIndices) if (r.Tensor.TryGetTarget(out _)) live++;
+                return live;
+            }
+        }
+    }
+
+    // One entry per tensor. The handle is the one a capture read (set while capturing, or on the first record): a
+    // later uncaptured step that sees a different buffer must not overwrite it, or the pre-replay handle check could
+    // not catch the graph reading the old buffer.
+    private void RecordCapturedResidentIndex(Tensor<int> indices, bool capturing)
     {
         if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero) return;
         lock (_hostIndexLock)
         {
             _capturedResidentIndices.RemoveAll(r => !r.Tensor.TryGetTarget(out _));
             foreach (var r in _capturedResidentIndices)
-                if (r.Tensor.TryGetTarget(out var t) && ReferenceEquals(t, indices)) { r.Handle = buffer.Handle; return; }
+                if (r.Tensor.TryGetTarget(out var t) && ReferenceEquals(t, indices))
+                {
+                    if (capturing) r.Handle = buffer.Handle;
+                    return;
+                }
             _capturedResidentIndices.Add(new CapturedResidentIndex
             {
                 Tensor = new WeakReference<Tensor<int>>(indices),

@@ -789,11 +789,13 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// read of its device-resident input aborted the capture.
     /// </summary>
     [SkippableTheory]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    [InlineData(true, true)]
-    public void Index_selects_through_host_ids_train_like_the_cpu_plan(bool capture, bool residentIds)
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, true, true)]
+    [InlineData(true, true, true)]
+    public void Index_selects_through_host_ids_train_like_the_cpu_plan(bool capture, bool residentIds, bool viewIds)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -804,11 +806,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
                 "Graph capture is disabled for this process.");
             // residentIds: the ids live on the device (Gpu()) and each step's batch is written on the host.
-            var run = TrainHostIdSelects(gpu, capture, residentIds);
+            // viewIds: the fed ids are an offset view of a larger tensor, written through its base.
+            var run = TrainHostIdSelects(gpu, capture, residentIds, viewIds);
             var prior = AiDotNetEngine.Current;
             var cpu = new CpuEngine();
             AiDotNetEngine.Current = cpu;
-            var truth = TrainHostIdSelects(cpu, capture: false);
+            var truth = TrainHostIdSelects(cpu, capture: false, residentIds: false, viewIds);
             AiDotNetEngine.Current = prior;
             _output.WriteLine("cpu " + string.Join(" ", truth.Losses.Select(l => l.ToString("G6"))));
             _output.WriteLine("gpu " + string.Join(" ", run.Losses.Select(l => l.ToString("G6"))));
@@ -1104,10 +1107,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     private static (double[] Losses, float[][] Weights, bool Replayed) TrainHostIdSelects(IEngine engine, bool capture,
-        bool residentIds = false)
+        bool residentIds = false, bool viewIds = false)
     {
         const int rows = 40;
-        var fed = new Tensor<int>([Batch]);
+        var fedBase = new Tensor<int>([Batch + 3]);
+        var fed = viewIds ? fedBase.Slice(0, 2, 2 + Batch) : new Tensor<int>([Batch]);
         var constant = new Tensor<int>([Batch]);
         for (int i = 0; i < Batch; i++) constant.AsWritableSpan()[i] = (7 * i + 3) % rows;
         var x = Rand([Batch, Inputs], 1, 1f);
@@ -1121,15 +1125,18 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         void Feed(int step)
         {
             var rng = new Random(700 + step);
-            var span = fed.AsWritableSpan();
-            for (int i = 0; i < Batch; i++) span[i] = rng.Next(rows);
-            fed.IncrementVersion();
+            var written = viewIds ? fedBase : fed;
+            var span = written.AsWritableSpan();
+            int offset = viewIds ? 2 : 0;
+            for (int i = 0; i < span.Length; i++) span[i] = 0;
+            for (int i = 0; i < Batch; i++) span[offset + i] = rng.Next(rows);
+            written.IncrementVersion();
             FeedTarget(y, step);
         }
 
         ICompiledTrainingPlan<float> plan;
         Feed(0);
-        if (residentIds && engine is DirectGpuTensorEngine) fed.Gpu();
+        if (residentIds && engine is DirectGpuTensorEngine) (viewIds ? fedBase : fed).Gpu();
         using (var scope = GraphMode.EnableTraining(parameters))
         {
             var a = engine.TensorIndexSelect(tableA, fed, 0);
@@ -1143,11 +1150,16 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
             var losses = new double[Steps];
+            int recordedAtStep3 = -1;
             for (int s = 0; s < Steps; s++)
             {
                 if (s > 0) Feed(s);
                 losses[s] = plan.Step().ToArray()[0];
+                if (engine is DirectGpuTensorEngine g && s == 3) recordedAtStep3 = g.CapturedResidentIndexCount;
             }
+            // One record per tensor: the pre-replay refresh list does not grow with the steps.
+            if (engine is DirectGpuTensorEngine ge && recordedAtStep3 >= 0)
+                Assert.Equal(recordedAtStep3, ge.CapturedResidentIndexCount);
             bool replayed = false;
             if (plan is CompiledTrainingPlan<float> c)
             {

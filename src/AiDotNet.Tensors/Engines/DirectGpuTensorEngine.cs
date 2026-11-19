@@ -2137,7 +2137,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
             // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
             // get the same from the plan's input refresh (RefreshGraphInputInPlace).
-            if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts)
+            if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts
+                && residentInts.CoversWholeVector)
                 PrepareResidentIndexForCompiledStep(backend, residentInts);
             if (tensor._gpuBuffer.Handle != IntPtr.Zero
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
@@ -2601,7 +2602,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
             // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
             // get the same from the plan's input refresh (RefreshGraphInputInPlace).
-            if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts)
+            if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts
+                && residentInts.CoversWholeVector)
                 PrepareResidentIndexForCompiledStep(backend, residentInts);
             if (tensor._gpuBuffer.Handle != IntPtr.Zero
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
