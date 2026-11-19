@@ -774,6 +774,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var leaf in GraphExternalLeaves())
             if (!_foreignParameterLeaves.ContainsKey(leaf)) Unbind(leaf);
         _ownedLeafBuffers.Clear();
+        _ownedLeafInputBackends?.Clear();
         _foreignParameterLeaves.Clear();
     }
 
@@ -5586,6 +5587,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     && ReferenceEquals(leaf._gpuBackend, backend) && de.IsBoundDeviceAuthoritative(leaf))
                 {
                     _ownedLeafBuffers.Remove(leaf);
+                    _ownedLeafInputBackends?.Remove(leaf);
                     _foreignParameterLeaves[leaf] = ownerBuffer;
                     continue;
                 }
@@ -5599,8 +5601,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     leaf._gpuBackend = null;
                     leaf._gpuBufferVersion = -1;
                 }
-                de.EnsureResidentInput(leaf);
-                if (leaf._gpuBuffer is { } bound) _ownedLeafBuffers[leaf] = bound;
+                if (!TryRefreshOwnedLeafInput(de, leaf, backend)) de.EnsureResidentInput(leaf);
+                if (leaf._gpuBuffer is { } bound)
+                {
+                    _ownedLeafBuffers[leaf] = bound;
+                    RememberOwnedLeafInputBackend(leaf, backend);
+                }
             }
         // The same for state the forward updates in place (a router's selection bias nudged from its loads, a running
         // statistic). It is its own node's output, so it is not an external leaf, and nothing else gives it a buffer:
