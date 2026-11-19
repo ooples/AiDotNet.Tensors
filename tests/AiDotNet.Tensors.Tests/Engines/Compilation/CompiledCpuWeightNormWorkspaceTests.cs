@@ -80,7 +80,7 @@ public sealed class CompiledCpuWeightNormWorkspaceTests
             }
             using (plan)
             {
-                bool active = typeof(CompiledTrainingPlan<float>).GetField("_cpuWeightNormWorkspace", BindingFlags.NonPublic | BindingFlags.Instance)!
+                bool active = typeof(CompiledTrainingPlan<float>).GetField("_weightNormWorkspace", BindingFlags.NonPublic | BindingFlags.Instance)!
                     .GetValue(plan) is not null;
                 var steps = (CompiledStep<float>[])typeof(CompiledTrainingPlan<float>)
                     .GetField("_forwardSteps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan)!;

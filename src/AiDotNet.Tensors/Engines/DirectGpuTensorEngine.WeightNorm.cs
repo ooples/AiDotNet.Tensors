@@ -8,6 +8,10 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class DirectGpuTensorEngine
 {
+    // FP16 weight caches identify the underlying allocation, which a workspace
+    // intentionally reuses for different kernels. Those plans keep private weights.
+    internal bool SupportsWeightNormWorkspace => !Fp16ActEnabled && !Gpu.AutocastScope.IsEnabled;
+
     public override Tensor<T> TensorWeightNorm<T>(Tensor<T> direction, Tensor<T> gain, double epsilon = 1e-24)
     {
         var (rows, columns) = ValidateWeightNorm(direction, gain, epsilon);
