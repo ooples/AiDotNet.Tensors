@@ -4307,8 +4307,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // Tensors whose bound device buffer holds their current value while the host copy may lag: parameters an optimizer
     // updated in place (CommitParameterUpdatedOnDevice) and the in-place state a compiled plan keeps on the device (a
-    // BatchNorm running statistic). Keyed by tensor, with that buffer; weak, so an entry goes with its tensor.
-    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, IGpuBuffer> _deviceAuthoritativeParameters = new();
+    // BatchNorm running statistic). Keyed by tensor, with that buffer; weak, so an entry goes with its tensor. The value
+    // is a box updated in place: a compiled step commits every parameter on every replay, and replacing the entry
+    // allocated each time.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, System.Runtime.CompilerServices.StrongBox<IGpuBuffer?>> _deviceAuthoritativeParameters = new();
 
     // The buffer EnsureResidentInput bound to a compiled plan's external leaf, and the leaf version a device copy last
     // wrote into it (-1 after a host upload). A captured graph reads that buffer through a baked pointer, so a device
@@ -4358,7 +4360,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // pointer in, re-checks the handle before each replay (CompiledTrainingPlan.ForeignParametersStillBound).
         if (tensor._gpuBuffer is not { } bound) return false;
         lock (_deviceAuthoritativeParameters)
-            return _deviceAuthoritativeParameters.TryGetValue(tensor, out var committed) && ReferenceEquals(committed, bound);
+            return _deviceAuthoritativeParameters.TryGetValue(tensor, out var committed) && ReferenceEquals(committed.Value, bound);
     }
 
     /// <summary>Records that <paramref name="tensor"/>'s current value lives in <paramref name="buffer"/>, its binding,
@@ -4367,8 +4369,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         lock (_deviceAuthoritativeParameters)
         {
-            _deviceAuthoritativeParameters.Remove(tensor);
-            _deviceAuthoritativeParameters.Add(tensor, buffer);
+            _deviceAuthoritativeParameters.GetValue(tensor, static _ => new System.Runtime.CompilerServices.StrongBox<IGpuBuffer?>()).Value = buffer;
         }
     }
 
