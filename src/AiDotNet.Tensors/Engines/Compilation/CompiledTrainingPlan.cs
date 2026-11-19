@@ -12331,8 +12331,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Sub-E (#373): pre-pack B at plan-compile time so the replay
                 // closure routes through BlasManaged.Gemm with the cached handle.
                 // B is constant across inference calls (allowCachedB=true).
-                // Prefer the caller's FrozenWeightRegistry handle so we don't
-                // double-allocate; otherwise pre-pack here.
+                // Prefer a handle the caller registered in FrozenWeightRegistry so
+                // we don't double-allocate; otherwise pre-pack into a handle this
+                // plan owns. Compiling never registers B itself: a registered
+                // weight moves every later EAGER TensorMatMul on it onto this
+                // packed kernel, whose summation order differs, so eager results
+                // would depend on whether some plan had ever been compiled.
                 var capturedB = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB)
                     ?? Engines.BlasManaged.BlasManaged.PrePackB<float>(
                         new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);
