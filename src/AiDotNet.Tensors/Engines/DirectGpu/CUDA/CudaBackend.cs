@@ -18820,7 +18820,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // gla_scan_backward_tiled: one 1024-thread block per (batch, head), up to 12 state elements per thread (headDim*headDim <= 12,288),
     // reductions through a shared [headDim][headDim|1] tile (deterministic, no atomics). Used while the tile fits the
     // default 48 KB per block (headDim <= 108); wider heads keep gla_scan_backward_ckpt.
-    internal static int GlaTiledSharedBytes(int headDim) => (headDim * (headDim | 1) + 4 * headDim + 32) * sizeof(float);
+    internal static int GlaTiledSharedBytes(int headDim) => (headDim * (headDim | 1) + 4 * headDim + Kernels.CudaGlaKernels.TileWarpPartials) * sizeof(float);
 
     private unsafe bool TryGlaScanBackwardTiled(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
@@ -18828,7 +18828,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
     {
         int shared = GlaTiledSharedBytes(headDim);
-        if (headDim * headDim > 12 * 1024 || shared > 48 * 1024
+        if (headDim * headDim > Kernels.CudaGlaKernels.TileElementsPerThread * Kernels.CudaGlaKernels.TileThreads
+            || shared > Kernels.CudaGlaKernels.TileSharedMemoryLimitBytes
             || !_kernelCache.TryGetValue("gla_scan_backward_tiled", out var kernel))
             return false;
         var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
@@ -18842,7 +18843,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pdg;
         ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
         ba[16] = &chunk;
-        LaunchKernelWithSharedMem(kernel, (uint)(batch * numHeads), 1024u, (uint)shared, ba);
+        LaunchKernelWithSharedMem(kernel, (uint)(batch * numHeads), (uint)Kernels.CudaGlaKernels.TileThreads, (uint)shared, ba);
         return true;
     }
 

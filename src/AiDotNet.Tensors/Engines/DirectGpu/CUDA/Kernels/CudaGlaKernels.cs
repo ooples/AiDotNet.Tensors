@@ -13,10 +13,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 internal static class CudaGlaKernels
 {
     public const int MaxHeadDim = 256;
+    internal const int TileThreads = 1024;
+    internal const int TileElementsPerThread = 12;
+    internal const int TileWarpSize = 32;
+    internal const int TileWarpPartials = TileThreads / TileWarpSize;
+    internal const int TileSharedMemoryLimitBytes = 48 * 1024;
 
     public static string GetSource()
     {
-        return @"
+        return "#define GLA_TILE_THREADS " + TileThreads + "\n"
+            + "#define GLA_TILE_EPT " + TileElementsPerThread + "\n"
+            + "#define GLA_TILE_WARP_SIZE " + TileWarpSize + "\n"
+            + @"
 #include <math.h>
 
 #define GLA_MAX_HEADDIM 256
@@ -153,8 +161,6 @@ extern ""C"" __global__ void gla_scan_backward_ckpt(
 // warp-shuffle tree. All are plain stores, so the result is deterministic and needs no zero-fill. Checkpoint and
 // scratch states are stored element-contiguous, so their reads and writes are coalesced.
 // Dynamic shared memory: headDim*(headDim|1) + 4*headDim + 32 floats.
-#define GLA_TILE_THREADS 1024
-#define GLA_TILE_EPT 12
 // Sums the tile's columns (COLS=1: out[c] = sum_r tile[r][c]) or rows (COLS=0: out[r] = sum_c tile[r][c]) in index
 // order, one line per thread. Ends with every thread synced.
 #define GLA_TILE_SUM(COLS, OUT) { if (tid < headDim) { float acc = 0.0f; for (int r = 0; r < headDim; r++) acc += (COLS) ? tile[r * stride + tid] : tile[tid * stride + r]; OUT = acc; } __syncthreads(); }
@@ -261,7 +267,7 @@ extern ""C"" __global__ __launch_bounds__(GLA_TILE_THREADS) void gla_scan_backwa
             __syncthreads();
             if (tid == 0) {
                 float acc = 0.0f;
-                for (int w = 0; w < GLA_TILE_THREADS / 32; w++) acc += warpPart[w];
+                for (int w = 0; w < GLA_TILE_THREADS / GLA_TILE_WARP_SIZE; w++) acc += warpPart[w];
                 dG[gOff] = acc;
             }
             GLA_TILE_SUM(1, dK[baseOff + tid])
