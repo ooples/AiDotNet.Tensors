@@ -10142,12 +10142,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         args[0] = &gradOutPtr;
         args[1] = &idxPtr;
         args[2] = &gradEmbPtr;
         args[3] = &numIndices;
         args[4] = &embeddingDim;
+        args[5] = &vocabSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -13848,12 +13849,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         args[0] = &srcPtr;
         args[1] = &idxPtr;
         args[2] = &dstPtr;
         args[3] = &sourceSize;
         args[4] = &embDim;
+        args[5] = &destSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 

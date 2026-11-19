@@ -7169,7 +7169,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             if (s_residentSyncDebug) AliasDiag($"EMB-BUFS n={numIndices} dim={embeddingDim} needOut={(long)numIndices*embeddingDim} "
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={idxBuf.Size} impliedV={tableBuf.Size/embeddingDim}");
-            backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
+            if (backend is IResidentIndexBackend bounded)
+                bounded.IndexSelect(tableBuf, idxBuf, outBuf, 1, embeddings.Shape._dims[0], numIndices, embeddingDim);
+            else
+                backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
             // A device write must re-arm host synchronization as well as publishing its resident buffer.
             BindResidentBuffer(output, outBuf, backend);

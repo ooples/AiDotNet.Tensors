@@ -1537,12 +1537,13 @@ extern ""C"" __global__ __launch_bounds__(256) void embedding_forward(
 // PR #390 review (issue #382).
 extern ""C"" __global__ __launch_bounds__(256) void embedding_backward(
     const float* gradOutput, const int* indices, float* gradEmbedding,
-    int numIndices, int embeddingDim)
+    int numIndices, int embeddingDim, int vocabSize)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numIndices) return;
 
     int idx = indices[i];
+    if (idx < 0 || idx >= vocabSize) return;
     for (int d = 0; d < embeddingDim; d++) {
         // NON-DETERMINISTIC (issue #382); see embedding_backward_deterministic below.
         atomicAdd(&gradEmbedding[idx * embeddingDim + d], gradOutput[i * embeddingDim + d]);

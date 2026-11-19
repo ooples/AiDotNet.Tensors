@@ -5903,12 +5903,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("embedding_backward", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: embedding_backward");
 
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         args[0] = &_p0;
         args[1] = &_p1;
         args[2] = &_p2;
         args[3] = &numIndices;
         args[4] = &embeddingDim;
+        args[5] = &vocabSize;
 
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
         LaunchKernel(krnl, grid, DefaultBlockSize, args);
