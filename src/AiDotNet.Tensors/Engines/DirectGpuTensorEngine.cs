@@ -21509,6 +21509,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// continue to own the common last-axis cases. This deliberately materializes only the operands
     /// that need expansion; it never downloads either operand to perform index mapping on the CPU.
     /// </remarks>
+    // True when small, right-aligned against full, equals it on a trailing suffix and is 1 (or absent) on every axis
+    // before it, with full's rank at least small's: small repeats in tiles of the suffix's size (one element: a scalar).
+    private static bool IsTrailingTileBroadcast<T>(Tensor<T> full, Tensor<T> small, out int tile)
+    {
+        tile = 0;
+        var f = full.Shape._dims; var s = small.Shape._dims;
+        if (s.Length > f.Length || s.Length == 0) return false;
+        int offset = f.Length - s.Length, k = s.Length - 1, size = 1;
+        while (k >= 0 && s[k] == f[k + offset]) { size *= s[k]; k--; }
+        for (int i = k; i >= 0; i--) if (s[i] != 1) return false;
+        if (size == full.Length || small.Length != size) return false;   // size 1: a one-element operand, a scalar scale
+        tile = size;
+        return true;
+    }
+
+    // True when small has full's rank, equals it on a leading prefix of at least one axis and is 1 on every axis after
+    // (with at least one such axis): then small holds one value per prefix row, outer = the prefix's element count.
+    private static bool IsLeadingPrefixBroadcast<T>(Tensor<T> full, Tensor<T> small, out int outer)
+    {
+        outer = 0;
+        int rank = full.Rank;
+        if (small.Rank != rank || rank < 2) return false;
+        var f = full.Shape._dims; var s = small.Shape._dims;
+        int k = 0, prefix = 1;
+        while (k < rank && s[k] == f[k] && !(s[k] == 1 && AllOnesFrom(s, k))) { prefix *= f[k]; k++; }
+        if (k == 0 || k == rank) return false;
+        for (int i = k; i < rank; i++) if (s[i] != 1) return false;
+        if (prefix == full.Length) return false;
+        outer = prefix;
+        return true;
+
+        static bool AllOnesFrom(int[] dims, int from)
+        {
+            for (int i = from; i < dims.Length; i++) if (dims[i] != 1) return false;
+            return true;
+        }
+    }
+
     private Tensor<T>? TryRunGeneralBroadcastBinary<T>(
         Tensor<T> a,
         Tensor<T> b,
@@ -21698,11 +21736,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         bufferA.Buffer, bufferB.Buffer, output, outerSize, innerSize)));
             }
 
-            // Pattern 2: (outer, inner) * (outer, 1) -> broadcast along first axis (column broadcast)
-            if (a.Rank == 2 && b.Rank == 2 && b.Shape._dims[0] == a.Shape._dims[0] && b.Shape._dims[1] == 1)
+            // Pattern 2: (outer..., inner...) * (outer..., 1...) -> one scale per leading-prefix row, any rank (a [N, M]
+            // column scale; a per-head decay [B, H, dk, dv] * [B, H, 1, 1]). One kernel and no temporaries, so it records
+            // into a CUDA graph; the general path below tiles through scratch it may not allocate while capturing.
+            if (IsLeadingPrefixBroadcast(a, b, out int prefixOuter))
             {
-                int outerSize = a.Shape._dims[0];
-                int innerSize = a.Shape._dims[1];
+                int outerSize = prefixOuter;
+                int innerSize = a.Length / prefixOuter;
 
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
@@ -21739,10 +21779,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Reversed column broadcast: (outer, 1) * (outer, inner).
-            if (a.Rank == 2 && b.Rank == 2 && a.Shape._dims[0] == b.Shape._dims[0]
-                && a.Shape._dims[1] == 1)
+            if (IsLeadingPrefixBroadcast(b, a, out int prefixOuterA))
             {
-                int outerSize = b.Shape._dims[0], innerSize = b.Shape._dims[1];
+                int outerSize = prefixOuterA, innerSize = b.Length / prefixOuterA;
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
                 var firstAxis = backend as IGpuBatchExecution ?? throw new NotSupportedException("first-axis broadcast");
@@ -21753,6 +21792,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Rank-generic path: expand only the stretched axes with backend.TileAxis, then multiply.
             // TileAxis + Multiply are part of IDirectGpuBackend, so this remains native on all six
             // direct GPU backends instead of silently downloading complex broadcast shapes to CPU.
+            // Pattern 3: one operand repeats along the other's leading axes in tiles of its trailing suffix ([B, S, M] *
+            // [1, M], [B, H, D] * [H, D], either side): one row-scale kernel, no temporaries, so it records into a graph.
+            if (IsTrailingTileBroadcast(a, b, out int tileB))
+            {
+                using var bufferA = GetOrAllocateBuffer(backend, a);
+                using var bufferB = GetOrAllocateBuffer(backend, b);
+                return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
+                    backend.BroadcastMultiplyLastAxis(bufferA.Buffer, bufferB.Buffer, output, a.Length / tileB, tileB)));
+            }
+            if (IsTrailingTileBroadcast(b, a, out int tileA))
+            {
+                using var bufferA = GetOrAllocateBuffer(backend, a);
+                using var bufferB = GetOrAllocateBuffer(backend, b);
+                return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, b.Length, b.Shape.ToArray(), output =>
+                    backend.BroadcastMultiplyLastAxis(bufferB.Buffer, bufferA.Buffer, output, b.Length / tileA, tileA)));
+            }
+
             if (TryRunGeneralBroadcastBinary(a, b,
                     static (be, left, right, output, size) => be.Multiply(left, right, output, size), BroadcastBinaryOp.Multiply) is { } general)
                 return RecordGpuResult(general);
