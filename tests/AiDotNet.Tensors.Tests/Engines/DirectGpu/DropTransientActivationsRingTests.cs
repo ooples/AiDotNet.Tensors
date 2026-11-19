@@ -72,12 +72,16 @@ public class DropTransientActivationsRingTests
         using var engine = new DirectGpuTensorEngine();
         Assert.NotNull(CacheActivationMethod);
 
+        // The cache holds its keys weakly (DeviceEntryRegistry): an unreferenced key's entry leaves the cache, and its
+        // buffer is freed by its finalizer, not by the drop. Keep every key alive to the end, or a GC during the 6,000
+        // inserts collects some keys and the drop never sees their entries (3,465 of 5,999 undisposed on CI).
+        var keys = new List<object>();
         var older = new List<TrackingGpuBuffer>();
-        for (int i = 0; i < before; i++) older.Add(Cache(engine).Buffer);
+        for (int i = 0; i < before; i++) { var (key, buffer) = Cache(engine); keys.Add(key); older.Add(buffer); }
 
         long snapshot = engine.ActivationCacheTimestampSnapshot();
         var newer = new List<TrackingGpuBuffer>();
-        for (int i = 0; i < after - 1; i++) newer.Add(Cache(engine).Buffer);
+        for (int i = 0; i < after - 1; i++) { var (key, buffer) = Cache(engine); keys.Add(key); newer.Add(buffer); }
         var kept = Cache(engine);
 
         engine.DropTransientActivationsCreatedAfter(snapshot, kept.Key);
@@ -85,5 +89,6 @@ public class DropTransientActivationsRingTests
         Assert.All(older, b => Assert.Equal(0, b.DisposeCount));
         Assert.All(newer, b => Assert.Equal(1, b.DisposeCount));
         Assert.Equal(0, kept.Buffer.DisposeCount);
+        GC.KeepAlive(keys);
     }
 }
