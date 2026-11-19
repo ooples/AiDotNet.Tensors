@@ -55,7 +55,9 @@ public partial class CpuEngine
                 // rows too; six-row boundaries preserve the GEMM microkernel's row grouping.
                 // The reduction axis and the pre-existing channel/tap order remain unchanged.
                 int taskRows = rowCount;
-                if (splitChannels && blocks < workerBudgetCount && rowCount >= 192)
+                // A single spatial task already delegates the full worker budget to GEMM.
+                // Preserve that dispatch; only the multi-task/serial-inner gap needs this grid.
+                if (splitChannels && blocks > 1 && blocks < workerBudgetCount && rowCount >= 192)
                 {
                     int partitions = Math.Min((workerBudgetCount + blocks - 1) / blocks, rowCount / 96);
                     taskRows = Math.Min(rowCount, ((rowCount + partitions * 6 - 1) / (partitions * 6)) * 6);
