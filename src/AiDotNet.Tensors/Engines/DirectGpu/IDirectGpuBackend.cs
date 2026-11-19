@@ -3747,6 +3747,14 @@ public interface IGpuBatchExecution : IDirectGpuBackend
     void CumSumAxis(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize);
     void ScalarMinusTensor(IGpuBuffer input, IGpuBuffer output, float scalar, int size);
     void NormalizeL2(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize);
+    /// <summary>Row-wise v*g/sqrt(sum(v*v)+epsilon), with gain indexed by the first dimension.</summary>
+    void WeightNorm(IGpuBuffer direction, IGpuBuffer gain, IGpuBuffer output, int rows, int columns, float epsilon);
+    /// <summary>Writes [rows,2] inverse-norm/dot(upstream,v) scratch for the direct weight-norm VJP.</summary>
+    void WeightNormStats(IGpuBuffer gradOutput, IGpuBuffer direction, IGpuBuffer stats, int rows, int columns, float epsilon);
+    void WeightNormDirectionGradient(IGpuBuffer gradOutput, IGpuBuffer direction, IGpuBuffer gain, IGpuBuffer stats,
+        IGpuBuffer gradDirection, int rows, int columns, bool accumulate);
+    void WeightNormGainGradient(IGpuBuffer stats, IGpuBuffer gradGain, int rows, bool accumulate);
+
     void ReduceSumBackward(IGpuBuffer gradOutput, IGpuBuffer gradInput, int outerSize, int reduceSize);
     void ReduceMaxBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer maxValues, IGpuBuffer gradInput, int outerSize, int reduceSize);
     void ReduceVarianceBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer means, IGpuBuffer gradInput, int outerSize, int reduceSize);

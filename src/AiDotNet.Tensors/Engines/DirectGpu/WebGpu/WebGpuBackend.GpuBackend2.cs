@@ -156,6 +156,11 @@ public sealed partial class WebGpuBackend
         int strideH, int strideW, int padH, int padW,
         int outputPadH, int outputPadW)
     {
+        // One GEMM per batch chunk and an overlap-add (PortableConvTransposeGemm) where the kernels built; the
+        // one-thread-per-output conv_transpose2d kernel below re-reads every input channel and tap per output.
+        if (TryConvTranspose2DGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW))
+            return;
         // outHeight/outWidth already INCLUDE the output padding: every caller computes them as
         // (in - 1) * stride - 2 * pad + kernel + outputPad and sizes the buffer to match
         // (DirectGpuTensorEngine.cs, ConvTranspose2D/BackwardInput/BackwardKernel), so adding outputPad here counted it

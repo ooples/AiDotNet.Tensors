@@ -198,6 +198,13 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     private Tensor(int[] shape, TensorDevice gpuDevice) : base(shape, gpuDevice) { }
 
     /// <summary>
+    /// Creates a host tensor whose backing array is not allocated until something reads or writes it on the host.
+    /// A GPU training trace records its node outputs this way: the compiled plan binds them to device buffers, so
+    /// most of them never need a host copy at all.
+    /// </summary>
+    internal static Tensor<T> CreateHostDeferred(int[] shape) => new Tensor<T>(shape, TensorDevice.CPU);
+
+    /// <summary>
     /// Private constructor for zero-copy tensor creation from a Vector.
     /// </summary>
     private Tensor(Vector<T> data, int[] dimensions) : base(data, dimensions)
@@ -343,6 +350,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ShareGpuStateWith(view);
         // Same storage => same GpuCacheVersion; carry "current" only if the source's buffer was current.
         view._gpuBufferVersion = _gpuBufferVersion == GpuCacheVersion ? view.GpuCacheVersion : -1;
+        Helpers.ResidentHostMirror.AttachShapeAlias(this, view);
     }
 
     /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>

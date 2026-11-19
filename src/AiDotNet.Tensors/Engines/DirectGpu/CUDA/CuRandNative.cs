@@ -20,6 +20,36 @@ internal static class CuRandNative
 {
     private const string Lib = "curand64_10";
 
+#if NETCOREAPP
+    static CuRandNative()
+    {
+        // CUDA 13 installs its DLLs in bin\x64, which its installer does not put on PATH (only bin), so the default
+        // search found no curand64_10 on such a machine and every cuRAND path fell back to the CPU generator (the
+        // CUDA lane's skip gate failed on it). Probe the CUDA install as cuBLAS does.
+        NativeLibraryResolverRegistry.Register(ResolveCuRandLibrary);
+    }
+
+    private static readonly string[] WindowsCandidates = ["curand64_10"];
+    private static readonly string[] LinuxCandidates = ["libcurand.so.10", "libcurand.so"];
+
+    private static IntPtr ResolveCuRandLibrary(string libraryName, System.Reflection.Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        if (!libraryName.StartsWith("curand64_", StringComparison.Ordinal) &&
+            !libraryName.StartsWith("libcurand", StringComparison.Ordinal))
+            return IntPtr.Zero;
+        bool windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        var candidates = windows ? WindowsCandidates : LinuxCandidates;
+        foreach (var candidate in candidates)
+            if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out var handle))
+                return handle;
+        foreach (var dir in CuBlasNative.GetCudaBinDirectories())
+            foreach (var candidate in candidates)
+                if (NativeLibrary.TryLoad(System.IO.Path.Combine(dir, windows ? candidate + ".dll" : candidate), out var handle))
+                    return handle;
+        return IntPtr.Zero;
+    }
+#endif
+
     /// <summary>cuRAND status codes — only the success and "unavailable"
     /// codes are checked at this level; the wrapper turns the rest into
     /// exceptions.</summary>
@@ -100,22 +130,25 @@ internal static class CuRandNative
     [DllImport(Lib)]
     public static extern Status curandGenerateNormalDouble(IntPtr generator, IntPtr outputPtr, ulong num, double mean, double stddev);
 
-    /// <summary>Probes whether the cuRAND lib is loadable + the create
-    /// entry point works. Cached at module init so the hot path is a
-    /// single static-bool read.</summary>
+    [DllImport(Lib)]
+    public static extern Status curandGetVersion(out int version);
+
+    /// <summary>Whether the cuRAND library loads and the driver reports a CUDA device. Cached at module init so the
+    /// hot path is a single static-bool read.</summary>
+    /// <remarks>Both checks are permanent facts about the host. The probe used to create a generator instead, which
+    /// starts the CUDA runtime on the device: a transient failure there (another thread's stream capture open on the
+    /// primary context, a device busy for a moment) was cached for the life of the process, and every cuRAND path
+    /// then ran on the CPU - the CUDA lane saw all its cuRAND tests skip in one run and pass in the next. A device
+    /// call that fails now falls back to the CPU generator for that call only.</remarks>
     public static readonly bool IsAvailable = Probe();
 
     private static bool Probe()
     {
         try
         {
-            var status = curandCreateGenerator(out var gen, GeneratorType.PseudoPhilox4_32_10);
-            if (status == Status.Success)
-            {
-                curandDestroyGenerator(gen);
-                return true;
-            }
-            return false;
+            if (curandGetVersion(out _) != Status.Success) return false;
+            return CuBlasNative.cuInit(0) == CudaResult.Success
+                && CuBlasNative.cuDeviceGetCount(out int devices) == CudaResult.Success && devices > 0;
         }
         catch (DllNotFoundException) { return false; }
         catch (EntryPointNotFoundException) { return false; }

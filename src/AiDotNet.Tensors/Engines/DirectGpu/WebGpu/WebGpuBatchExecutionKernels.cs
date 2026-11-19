@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// the parameter struct at binding n, with every field 4 bytes in declaration order. WGSL has no 64-bit integers,
 /// so the hash builds its 32x32-bit product from 16-bit halves and the seed arrives as two words.
 /// </summary>
-internal static class WebGpuBatchExecutionKernels
+internal static partial class WebGpuBatchExecutionKernels
 {
     private const string Common = @"
 fn bx_mul_wide(a: u32, b: u32) -> vec2<u32> {
@@ -1517,6 +1517,10 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
+        [BatchExecutionCudaKernels.WeightNorm] = WeightNormShaders.Forward,
+        [BatchExecutionCudaKernels.WeightNormStats] = WeightNormShaders.Stats,
+        [BatchExecutionCudaKernels.WeightNormDirectionGrad] = WeightNormShaders.DirectionGrad,
+        [BatchExecutionCudaKernels.WeightNormGainGrad] = WeightNormShaders.GainGrad,
         ["bx_full_reduce"] = FullReduce, ["bx_row_reduce"] = RowReduce, ["bx_row_map"] = RowMap,
         ["bx_scalar"] = Scalar, ["bx_unary"] = Unary, ["bx_sincos"] = SinCos,
         ["bx_reduce_backward"] = ReduceBackward, ["bx_broadcast_first"] = BroadcastFirst,

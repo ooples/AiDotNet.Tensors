@@ -54,6 +54,14 @@ internal sealed class ClosureObjectiveGuard<T>
     internal int LeafCount => _leaves.Length;
 
     /// <summary>
+    /// Probes a later objective using this trace's audited output shapes. The caller must still compare the complete
+    /// returned signature before rebinding leaves or replaying a plan; this method never copies leaves or executes it.
+    /// </summary>
+    internal ClosureGuardResult ProbeWithRecordedShapes(Func<Tensor<T>> objective, Tensor<T>[] parameters,
+        out ObjectiveSignature? signature, out object[] leaves, out string? reason)
+        => Probe(objective, parameters, out signature, out leaves, out reason, _shapes);
+
+    /// <summary>
     /// Starts recording the next training-plan compilation on this thread. Dispose to stop; recordings nest (the
     /// inner one wins while open).
     /// </summary>

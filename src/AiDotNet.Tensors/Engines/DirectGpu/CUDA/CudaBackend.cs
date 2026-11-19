@@ -1110,9 +1110,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         try
         {
-            string cacheDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "AiDotNet", "Tensors", "kernel_cache");
+            string? root = Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_CACHE_DIR");
+            string cacheDir = string.IsNullOrWhiteSpace(root)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "AiDotNet", "Tensors", "kernel_cache")
+                : Path.Combine(root, "CUDA", "Nvrtc");
             Directory.CreateDirectory(cacheDir);
             return cacheDir;
         }
@@ -1932,8 +1934,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", BufferAllocationDiagnostics.Primitive32Bytes(data), (this, data),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        if (Volatile.Read(ref _cublasWarmStarted) == 0) StartCublasWarmup();
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Cuda);
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
         LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
@@ -2290,6 +2296,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
@@ -2360,6 +2369,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// <inheritdoc/>
     public IGpuBuffer AllocateBufferUninitialized(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBufferUninitialized(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (size <= 0)
@@ -2408,6 +2420,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)size * sizeof(byte), (this, size),
+                static state => state.Item1.AllocateByteBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
@@ -6801,6 +6816,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // the GC has finalized that ThreadLocal (its Values then throws), and its handles still have to be destroyed.
     private readonly ConcurrentQueue<ThreadCublas> _allThreadCublas = new();
 
+    // The first cuBLAS handle loads cublas64/cublasLt64 (hundreds of MB, ~50 ms) and initializes the library; done
+    // lazily, that lands inside the first training step's graph capture. The first host upload of an adopted GPU
+    // engine (weights, the first batch) starts a throwaway handle on a pool thread so the load overlaps model setup;
+    // the per-thread handle created later then only pays cublasCreate. Gated on the engine being current so a process
+    // that auto-detected the GPU but runs on the CPU engine never maps cuBLAS. AIDOTNET_CUBLAS_PREWARM=0 disables it.
+    private int _cublasWarmStarted;
+    private System.Threading.Tasks.Task? _cublasWarmup;
+
+    private void StartCublasWarmup()
+    {
+        if (!AiDotNetEngine.Current.Is<DirectGpuTensorEngine>()) return;
+        if (Interlocked.Exchange(ref _cublasWarmStarted, 1) != 0) return;
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_PREWARM") == "0") return;
+        _cublasWarmup = System.Threading.Tasks.Task.Run(() =>
+        {
+            try
+            {
+                // Under the capture gate: cublasCreate initializes the library and allocates on the device, which
+                // invalidates a stream capture another thread has open on this context (CUDA 901) - the first upload
+                // that starts this warmup is often followed at once by a capture. A capture opened meanwhile waits.
+                lock (CaptureGateFor(_cudaContext))
+                {
+                    using var _ = PushContext();
+                    if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                }
+            }
+            catch (Exception) { /* best effort: the real handle reports any failure on first use */ }
+        });
+    }
+
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
     // cuMemFree) from the GC finalizer thread races with op threads' driver entry and faults with an
     // uncatchable 0xC0000005 under the heavy GC the full test suite produces (DirectGpu-only, with low
@@ -10155,6 +10200,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (data is null)
@@ -14269,7 +14317,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     private static bool IsReleased(IGpuBuffer buffer)
     {
-        while (buffer is IGpuBufferViewSource view) buffer = view.ViewParent;
+        buffer = GpuBufferViewRoot.Of(buffer);
         return buffer.Handle == IntPtr.Zero || (buffer is CudaGpuBuffer cuda && cuda.IsReleased);
     }
 
@@ -19591,6 +19639,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Dispose()
     {
+        try { _cublasWarmup?.Wait(); } catch (Exception) { }
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
     }
