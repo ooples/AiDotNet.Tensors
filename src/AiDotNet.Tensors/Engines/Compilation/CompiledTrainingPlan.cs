@@ -318,10 +318,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!pooled[i]) continue;
             var grad = _preAllocatedGrads[i];
             if (grad.GetBackingArrayForCacheLookupUnsafe() is not { } array) continue;
+            if (DelayShadowGradientBank(grad)) continue;
+            if (TryBindShadowGradientBank(engine, backend, grad, out var shadowBank))
+            {
+                buffers[array] = shadowBank;
+                continue;
+            }
             if (!buffers.TryGetValue(array, out var buffer) || buffer.Handle == IntPtr.Zero)
             {
                 buffer = backend.AllocateBuffer(array.Length);
                 buffers[array] = buffer;
+                RecordPrivateGradientAllocation(buffer);
             }
             if (!ReferenceEquals(grad._gpuBuffer, buffer)) engine.BindResidentBuffer(grad, buffer, backend);
         }
@@ -362,7 +369,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var grad = _preAllocatedGrads[i];
             DetachDeviceBinding(grad);
             using (var own = new Tensor<T>((int[])grad._shape.Clone()))
+            {
+                if (typeof(T) == typeof(float) && _engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine))
+                    TrackFreshPrivateGradientTensor(own);
                 grad.RebindStorageFrom(own);
+            }
             if (_aliasedGradViews is not null)
                 foreach (var alias in _aliasedGradViews)
                     if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
@@ -383,7 +394,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var grad = _preAllocatedGrads[index];
         DetachDeviceBinding(grad);
         using (var own = new Tensor<T>((int[])grad._shape.Clone()))
+        {
+            if (typeof(T) == typeof(float) && _engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine))
+                TrackFreshPrivateGradientTensor(own);
             grad.RebindStorageFrom(own);
+        }
         if (_aliasedGradViews is not null)
             foreach (var alias in _aliasedGradViews)
                 if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
@@ -621,6 +636,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _fp16PagedPlan = null;
         _storageLeases?.Dispose();
         _storageLeases = null;
+        _weightNormWorkspace?.Dispose();
+        _weightNormWorkspace = null;
+        _shadowLoanOwner?.Release();
+        _shadowLoans.Clear();
+        _shadowBankLoans.Clear();
+
     }
 
     /// <summary>
@@ -757,6 +778,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var leaf in GraphExternalLeaves())
             if (!_foreignParameterLeaves.ContainsKey(leaf)) Unbind(leaf);
         _ownedLeafBuffers.Clear();
+        _ownedLeafInputBackends?.Clear();
         _foreignParameterLeaves.Clear();
     }
 
@@ -1940,6 +1962,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} parameters={_parameters.Length} {row.Key}: host={row.Value.Host / 1048576.0:F1}MB device={row.Value.Device / 1048576.0:F1}MB");
         }
         AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} observed unique host={hostBytes / 1048576.0:F1}MB device={deviceBytes / 1048576.0:F1}MB; pruned_gradients={PrunedGradientBufferCount}");
+        TraceCpuOutputCensus();
         if (_scratchPool is { } scratch)
             AiDotNetEngine.LogDiagnostic($"[PLAN-STORAGE] plan={_planId} scratch pool holds {scratch.BufferCount} buffers/{scratch.BufferBytes / 1048576.0:F1}MB (overlaps observed device handles)");
     }
@@ -2016,6 +2039,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The buffer each aliased gradient is ultimately a view of.
         var rootOf = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         bool device = engine.SupportsGpu || engine.Is<Engines.DirectGpuTensorEngine>();
+        // CPU aliases can follow the same final liveness assignment as device aliases. Keep custom engines on
+        // their existing ownership path; raw-array specializations still materialize and exclude their targets.
+        bool poolHostAliasTargets = !device && remainingGradient is not null
+            && engine.Unwrap().GetType() == typeof(CpuEngine)
+            && Environment.GetEnvironmentVariable("AIDOTNET_CPU_POOL_ALIAS_GRADS") != "0";
         HashSet<CompiledStep<T>>? aliased = null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
         // With AIDOTNET_COMPILED_INPUT_GRADS the external leaves publish .Grad from the backward that writes them. An
@@ -2048,10 +2076,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             if (!gradMap.TryGetValue(output, out var outputGrad))
             {
-                // On a device engine an alias target is a placeholder too, so gradient pooling can share its buffer: the
-                // views follow it (PoolGradientBuffers re-points them, MaterializeIfGradPlaceholder materializes them
-                // together). A residual network's add and channel-bias gradients were 0.9 GB of a GPU DDPM step.
-                outputGrad = device && remainingGradient is not null && PoolAliasTargetGradients
+                // Alias views follow their physical target when pooling settles its backing, and materialize
+                // together when a specialization captures a raw array. Both bindings must register the views.
+                outputGrad = remainingGradient is not null && ((device && PoolAliasTargetGradients) || poolHostAliasTargets)
                     ? remainingGradient(output)
                     : TensorAllocator.RentUninitialized<T>(output._shape);
                 gradMap[output] = outputGrad;
@@ -2081,7 +2108,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 rootOf[view] = rootOf.TryGetValue(outputGrad, out var outputRoot) ? outputRoot : outputGrad;
                 if (ownGrad is not null) dropped.Add(ownGrad);
                 aliasedInputs++;
-                if (device)
+                if (device || poolHostAliasTargets)
                 {
                     // A chain of views collapses onto the last one's buffer: bind to the gradient the output's own
                     // gradient views, if it is itself a view, so every view resolves to one physical buffer.
@@ -2510,6 +2537,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _forwardActions = rebuiltForward.ToArray();
+        if (_weightNormWorkspace is { } weightNormWorkspace)
+            weightNormWorkspace.WrapForward(_forwardActions, ActionToStepIndex
+                ?? throw new InvalidOperationException("Weight-normalization workspace requires forward metadata."));
         // The span lease plan was made over the original actions; a specialized action may write elsewhere.
         _spanStepOfAction = null;
         _spanReleaseAfter = null;
@@ -4592,6 +4622,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (s_stepProf && _profFwdUs is not null && ++s_residentProfSteps % StepProfDumpInterval == 0)
                         DumpPerOpProfile(s_residentProfSteps);
                     RefreshLossFromCapturedGraph(gte);
+                    using var pointerTables = EnterShadowPointerTableScope(gte, cb);
+
                     RegularizeAndClipGradients();   // in the order the eager and graph steps use
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
@@ -4613,6 +4645,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     DetachReleasedBindings(released);
                     gte.ReclaimGpuMemoryUnderPressure();
                     RearmUnreadLossReadback();
+                    if (completedWorkspaceStep) ShadowCompletedParameterGradients(gte, cb);
+
+                    if (completedWorkspaceStep) RegisterPrivateGradientDemandOwner(gte, cb);
                 }
             }
         }
@@ -5252,6 +5287,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ((BackwardFunction<T>)BackwardFunctions<T>.MatMulBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.Conv2DBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.WeightNormBackward).Method,
+        ((BackwardFunction<T>)BackwardFunctions<T>.RfftMagnitudeBackward).Method,
     };
 
     private static readonly HashSet<System.Reflection.MethodInfo> s_backwardIgnoresInputs = new()
@@ -5312,6 +5348,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var producers = new Dictionary<Tensor<T>, int>(comparer);
         var unsafeTensors = new HashSet<Tensor<T>>(parameters, comparer) { lossOutput };
         unsafeTensors.UnionWith(retainedOutputs);
+        // Pure normalizations may intentionally share their complete storage. A per-tensor forward release cannot
+        // prove the union of their lifetimes, so keep these roots until the storage-aware backward lender handles it.
+        var producedStorage = new Dictionary<object, Tensor<T>>(ReferenceEqualityComparer<object>.Instance);
+        foreach (var step in forwardSteps)
+        {
+            if (step.OpType != OpType.TensorWeightNorm) continue;
+            if (producedStorage.TryGetValue(step.OutputBuffer.StorageIdentity, out var sibling)
+                && !ReferenceEquals(sibling, step.OutputBuffer))
+            {
+                unsafeTensors.Add(sibling);
+                unsafeTensors.Add(step.OutputBuffer);
+            }
+            else producedStorage[step.OutputBuffer.StorageIdentity] = step.OutputBuffer;
+        }
         for (int i = 0; i < n; i++)
         {
             var step = forwardSteps[i];
@@ -5394,6 +5444,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _workspaceSharingBodyAllowed = redirectEngine is not null && CanShareTransientWorkspace(redirectEngine);
             leasingPool.WorkspaceBroker = _workspaceSharingBodyAllowed
                 ? redirectEngine!.CompiledWorkspaceBroker : null;
+            leasingPool.ShareBackwardScratch = _shadowShareBackwardScratch && _workspaceSharingBodyAllowed;
         }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
@@ -5410,7 +5461,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
                 redirectEngine.FirstWriteRedirects = null;
-                if (_scratchPool is { } finishedPool) finishedPool.WorkspaceBroker = null;
+                if (_scratchPool is { } finishedPool)
+                {
+                    finishedPool.WorkspaceBroker = null;
+                    finishedPool.ShareBackwardScratch = false;
+                }
 
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
@@ -5424,6 +5479,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the dropped buffers, and a live graph's buffers are never dropped.
             if (executed && completed && _scratchPool is { } scratchPool && !HasLiveStepGraph)
             {
+                // Free action leases are already proven unused by every later backward action. Transfer their
+                // ownership before TrimUnleased forgets older cells and leaves their native frees to a later GC.
+                if (_shadowShareBackwardScratch && redirectEngine is not null && CanUseGradientShadows(redirectEngine)
+                    && scratchPool.ReturnIdleBackwardScratch(backend, redirectEngine.CompiledWorkspaceBroker) > 0)
+                    _lendSchedule = null;
                 long dropped = scratchPool.TrimUnleased();
                 foreach (long slot in _firstWriteRedirects.RedirectedSlots) dropped += scratchPool.Forget(slot);
                 // The dropped buffers are long-lived (allocated on the plan's first runs), so only a full collection
@@ -5469,6 +5529,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     && ReferenceEquals(leaf._gpuBackend, backend) && de.IsBoundDeviceAuthoritative(leaf))
                 {
                     _ownedLeafBuffers.Remove(leaf);
+                    _ownedLeafInputBackends?.Remove(leaf);
                     _foreignParameterLeaves[leaf] = ownerBuffer;
                     continue;
                 }
@@ -5482,8 +5543,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     leaf._gpuBackend = null;
                     leaf._gpuBufferVersion = -1;
                 }
-                de.EnsureResidentInput(leaf);
-                if (leaf._gpuBuffer is { } bound) _ownedLeafBuffers[leaf] = bound;
+                if (!TryRefreshOwnedLeafInput(de, leaf, backend)) de.EnsureResidentInput(leaf);
+                if (leaf._gpuBuffer is { } bound)
+                {
+                    _ownedLeafBuffers[leaf] = bound;
+                    RememberOwnedLeafInputBackend(leaf, backend);
+                }
             }
         // The same for state the forward updates in place (a router's selection bias nudged from its loads, a running
         // statistic). It is its own node's output, so it is not an external leaf, and nothing else gives it a buffer:
@@ -5554,9 +5619,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool capturingNow = IsCapturing();
         if (residentEngine is not null && !capturingNow)
         {
+            BeginShadowGradientPhase(residentEngine);
             BindPooledGradientsResident(residentEngine, backend);
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
-                residentEngine.EnsureResidentBuffer(_preAllocatedGrads[i]);
+            {
+                if (FailPrivateGradientResidencyAtForTesting == i)
+                {
+                    FailPrivateGradientResidencyAtForTesting = -1;
+                    throw new NotSupportedException("Injected private-gradient residency failure.");
+                }
+                if (DelayShadowGradientBank(_preAllocatedGrads[i])
+                    || TryBindShadowGradientBank(residentEngine, backend, _preAllocatedGrads[i], out _)
+                    || DelayShadowGradient(residentEngine, _preAllocatedGrads[i])
+                    || TryBindShadowGradientLoan(residentEngine, backend, _preAllocatedGrads[i])) continue;
+
+                var buffer = residentEngine.EnsureResidentBufferWithAllocationInfo(_preAllocatedGrads[i], out bool allocated);
+                if (allocated && buffer is not null) RecordPrivateGradientAllocation(buffer);
+            }
+            if (CanUseGradientShadows(residentEngine)) RefreshShadowGradientRedirects();
+
             if (_aliasedGradViews is { } views)
                 foreach (var (view, target) in views)
                     if (target._gpuBuffer is { } targetBuffer && target._gpuBackend is { } targetBackend)
@@ -5648,6 +5729,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             for (int i = 0; i < bwd.Length; i++)
             {
+                if (residentEngine is not null && !capturingNow)
+                    BindShadowGradientsStartingAt(i, residentEngine, backend, esz);
                 if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 long rb = 0;
@@ -10262,6 +10345,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             t_gradPlaceholders = null;
             t_gradAliasTargets = null;
+            t_privateGradientHostOwnership = false;
             t_requestedInputGradientLeaves = null;
             t_requestedInputGradientSteps = null;
         }
@@ -10434,6 +10518,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (retainedOutputs.Count > 0 && fp16HeteroOrder is not null)
             throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
 
+        if (dataReplay is null && fp16HeteroOrder is null && forwardSteps.Count > 0)
+            ShareWeightNormForwardStorage(forwardSteps, parameters,
+                explicitLoss ?? recordedLastOutput ?? forwardSteps[forwardSteps.Count - 1].OutputBuffer,
+                retainedOutputs, engine, scope);
+
+        if (LazyTensorScope.DeferCpuTrainingOutputs && engine.Is<CpuEngine>() && !engine.SupportsGpu
+            && ReferenceEquals(engine, engine.Unwrap()))
+        {
+            // Share normalization storage before allocating primal arrays. CPU
+            // specializations bind those arrays during lowering, so deferred
+            // outputs must be ready before any action chooses its replay path.
+            // Read the storage vector directly: Tensor host access would realize
+            // the recorded node and execute a trace while it is being compiled.
+            foreach (var step in forwardSteps)
+                if (step.OutputBuffer.HasDeferredHostStorage
+                    && (!CpuWeightNormWorkspaceEnabled || engine.Unwrap().GetType() != typeof(CpuEngine)
+                        || step.OpType != OpType.TensorWeightNorm))
+                    _ = step.OutputBuffer._storage.GetVector().AsSpanUnmarked().Length;
+        }
 
         // Map each tensor to its consumer count (how many backward steps write to it)
         var consumerCount = new Dictionary<Tensor<T>, int>();
@@ -10495,9 +10598,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Gradient pooling: every gradient starts as a placeholder view of one shared scratch array, so building
         // the backward does not materialize a buffer per traced tensor (the gradients were the largest part of a CPU
         // training plan's footprint). Once the backward is built, PoolGradientBuffers gives gradients with disjoint
-        // lifetimes shared arrays and every other gradient an array of its own. On the host, reshape-aliased gradients
-        // keep real buffers and are never pooled; on a device engine their targets are pooled and the views re-pointed
-        // with them (see AliasReshapeViewGradients). On a GPU engine the
+        // lifetimes shared arrays and every other gradient an array of its own. Base CPU and device alias targets
+        // also participate: their views follow the final storage, while compile-time raw-array captures retain an
+        // own target buffer (see AliasReshapeViewGradients). On a GPU engine the
         // tenants of one array share one device buffer too (BindPooledGradientsResident): a GPU DenseNet-121 step held
         // 3.7 GB of per-tensor gradient buffers on the device, past the card, so the driver paged to host memory.
         // AIDOTNET_COMPILED_GRAD_VIEWS=0 turns it off.
@@ -10539,6 +10642,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 t_gradPlaceholders = gradPlaceholders;
                 t_gradAliasTargets = AliasTargetsByView(aliasedGradViews);
+                t_privateGradientHostOwnership = engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
+                    && ReferenceEquals(engine, engine.Unwrap());
             }
         }
 
@@ -11289,7 +11394,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 int[]? gradientIndexRemap;
                 (deferredZeroByAction, pooledGradients, gradientIndexRemap) = PoolGradientBuffers(backwardActions, actionCoverage, forwardSteps,
-                    gradMap, allGrads, parameters, lossOutput, gradPlaceholders, t_gradAliasTargets);
+                    gradMap, allGrads, parameters, lossOutput, gradPlaceholders, t_gradAliasTargets,
+                    // Refine writes without removing/reordering actions or changing any backward mathematics.
+                    // Unknown delegates and heterogeneous/custom engines keep the conservative plan.
+                    typeof(T) == typeof(float) && preferGenericForGpu
+                        && engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
+                        && fp16HeteroOrder is null
+                        && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_EXACT_GRAD_WRITES") == "1"
+                        ? gradRequired : null);
+                if (aliasedGradViews is not null && t_gradAliasTargets is not null)
+                    aliasedGradViews.RemoveAll(alias => !t_gradAliasTargets.ContainsKey(alias.View));
                 if (gradientIndexRemap is not null)
                 {
                     prunedGradientBufferCount = gradientIndexRemap.Count(index => index < 0);
@@ -11308,6 +11422,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 t_gradPlaceholders = null;   // pooling settled every placeholder; Compile clears it again on a throw
                 t_gradAliasTargets = null;
+                t_privateGradientHostOwnership = false;
             }
         }
         // BIND EVERY FORWARD OUTPUT'S LIVE BACKING BEFORE THE PLAN RUNS.
@@ -11344,6 +11459,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             outputBuffer.AsWritableSpan();
         }
 
+        var weightNormWorkspace = dataReplay is null && fp16HeteroOrder is null
+            ? PrepareWeightNormWorkspace(forwardSteps, forwardActions, backwardActions, forwardEmitKinds,
+                actionCoverage, parameters, lossOutput, retainedOutputs, scope, engine)
+            : null;
+        if (CpuWeightNormWorkspaceEnabled && engine.Is<CpuEngine>() && !engine.SupportsGpu && ReferenceEquals(engine, engine.Unwrap()))
+            foreach (var step in forwardSteps)
+                if (step.OutputBuffer.HasDeferredHostStorage)
+                    _ = step.OutputBuffer._storage.GetVector().AsSpanUnmarked().Length;
+
+        bool weightNormWorkspaceOwned = true;
         TensorStorageLeaseSet? storageLeases = new TensorStorageLeaseSet();
         try
         {
@@ -11353,6 +11478,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     fp16HeteroOrder[i].AddStorageLeases(storageLeases);
             dataReplay?.AcquireStorage(storageLeases);
             storageLeases.Add(lossOutput);
+            weightNormWorkspace?.CompleteSnapshot();
 
             var plan = new CompiledTrainingPlan<T>(
                 forwardActions,
@@ -11379,11 +11505,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 forwardEmitKinds,
                 forwardFixedActions,
                 storageLeases);
+            plan._weightNormWorkspace = weightNormWorkspace;
             storageLeases = null;
             plan._dataForwardReplay = dataReplay;
             plan._graphGradientMembership = parameters.Select(gradientMembers.Contains).ToArray();
             plan._optimizerGradientMembership = plan._graphGradientMembership;
             plan._liveGradientMap = gradMap;
+            plan.PrepareShadowFirstTouches(actionCoverage, forwardSteps, gradMap);
             if (fp16HeteroOrder is null)
                 plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
                     parameters, lossOutput);
@@ -11394,6 +11522,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (plan._lastBackwardReads is { } lastReads)
                 foreach (var output in retainedOutputs) lastReads.Remove(output);
             plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
+            if (plan._lastBackwardReads is { } workspaceLastReads && weightNormWorkspace is not null)
+                weightNormWorkspace.ProtectDeviceOutputs(workspaceLastReads);
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan.PrunedGradientBufferCount = prunedGradientBufferCount;
@@ -11426,11 +11556,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 plan._spanStepOfAction = spans.StepOfAction;
                 plan._spanReleaseAfter = spans.ReleaseAfter;
             }
+            weightNormWorkspaceOwned = false;
             return plan;
         }
         finally
         {
             storageLeases?.Dispose();
+            weightNormWorkspace?.CompleteSnapshot();
+            if (weightNormWorkspaceOwned) weightNormWorkspace?.Dispose();
         }
     }
 
@@ -11580,21 +11713,30 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 output.TryDropStorageForStreaming();
         }
     }
+    // Only these exact built-in delegates test relevance before every accumulator write.
+    // Operation names are not contracts: a custom backward with the same name must remain conservative.
+    private static bool HasExactGradientRelevanceContract(CompiledStep<T> step)
+    {
+        var backward = step.BackwardFn;
+        if (backward is null || backward.Target is not null || backward.GetInvocationList().Length != 1) return false;
+        var method = backward.Method;
+        return method == ((BackwardFunction<T>)BackwardFunctions<T>.Conv2DBackward).Method
+            || method == ((BackwardFunction<T>)BackwardFunctions<T>.FusedConv2DBiasActivationBackward).Method
+            || method == ((BackwardFunction<T>)BackwardFunctions<T>.GroupedConv2DBackward).Method
+            || method == ((BackwardFunction<T>)BackwardFunctions<T>.ChannelBiasAddBackward).Method;
+    }
+
+
     /// <summary>
-    /// Gradient pooling. Every gradient was built as a placeholder (a view of a shared scratch array; one fetched at build
-    /// time already got its own array). This gives the gradients of non-parameter tensors whose lifetimes in the backward
-    /// do not overlap shared arrays, sized to their largest tenant, and every remaining placeholder an array of its own.
-    /// A gradient lives from the first backward action that writes it to the last one that touches it, over the actual
-    /// action stream (<paramref name="coverage"/>); a gradient read before anything writes it, a parameter's (the
-    /// optimizer reads it after the backward) and the loss's (seeded at step start) are never pooled. Returns, per
-    /// action, the pooled gradients whose lifetime starts there (zeroed just before it when the step decides they need
-    /// zeroing, since an earlier tenant used the array), and which gradients are pooled. On DenseNet-121 the per-tensor
-    /// gradients were 3.1 GB while at most ~0.2 GB is ever live at once.
+    /// Gives disjoint-lifetime gradient placeholders shared arrays over the actual backward action stream.
+    /// Parameter, loss, requested-input and read-before-write gradients keep independent storage.
+    /// Unknown action coverage prevents pooling or pruning.
     /// </summary>
     private static (int[][]? Schedule, bool[]? Pooled, int[]? IndexRemap) PoolGradientBuffers(
         List<Action<IEngine>> backwardActions, List<int[]?> coverage, List<CompiledStep<T>> forwardSteps,
         Dictionary<Tensor<T>, Tensor<T>> gradMap, List<Tensor<T>> allGrads, Tensor<T>[] parameters, Tensor<T> lossOutput,
-        HashSet<Tensor<T>> placeholders, Dictionary<Tensor<T>, Tensor<T>>? aliasTargets = null)
+        HashSet<Tensor<T>> placeholders, Dictionary<Tensor<T>, Tensor<T>>? aliasTargets = null,
+        HashSet<Tensor<T>>? requiredGradients = null)
     {
         int count = allGrads.Count, actions = backwardActions.Count;
         var pooled = new bool[count];
@@ -11628,7 +11770,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 foreach (int s in covered[a])
                 {
                     int passthrough = GradIndex(forwardSteps[s].OutputBuffer);
-                    foreach (int w in forwardSteps[s].Inputs.Select(GradIndex).Where(i => i != None))
+                    foreach (int w in forwardSteps[s].Inputs
+                        .Where(input => requiredGradients is null || covered[a].Length != 1
+                            || requiredGradients.Contains(input)
+                            || !HasExactGradientRelevanceContract(forwardSteps[s]))
+                        .Select(GradIndex).Where(i => i != None))
                     {
                         lastUse[w] = Math.Max(lastUse[w], a);
                         if (w == passthrough) continue;
@@ -11656,11 +11802,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var tenants = new List<int>();
             var unused = new HashSet<Tensor<T>>();
             var aliasRoots = aliasTargets is null ? new HashSet<Tensor<T>>() : new HashSet<Tensor<T>>(aliasTargets.Values);
+            // GradIndex resolves these flat views to their physical roots. Complete action coverage and no
+            // public/requested result prove that an untouched root AND its views need only deferred zeros.
+            // Keep the old protection for unknown alias chains or conservative write contracts.
+            bool pruneUnobservedAliasRoots = requiredGradients is not null && aliasTargets is not null
+                && aliasTargets.Values.All(indexOf.ContainsKey);
             for (int g = 0; g < count; g++)
             {
                 var gradient = allGrads[g];
                 if (!placeholders.Contains(gradient) || excluded.Contains(gradient)) continue;
-                if (firstWrite[g] == None && lastUse[g] < 0 && !aliasRoots.Contains(gradient))
+                if (firstWrite[g] == None && lastUse[g] < 0
+                    && (pruneUnobservedAliasRoots || !aliasRoots.Contains(gradient)))
                     unused.Add(gradient);
                 else if (firstWrite[g] != None && !readBeforeWrite[g] && gradient.Length > 0)
                     tenants.Add(g);
@@ -11671,7 +11823,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 TraceGradientPooling(tenants, capacity, allGrads, placeholders, excluded, firstWrite, readBeforeWrite, unused);
 
             var arrays = new T[capacity.Count][];
-            for (int b = 0; b < arrays.Length; b++) arrays[b] = new T[capacity[b]];
+            var privateOwners = t_privateGradientHostOwnership ? new ResultBufferOwner?[arrays.Length] : null;
+            for (int b = 0; b < arrays.Length; b++)
+            {
+                arrays[b] = new T[capacity[b]];
+                if (privateOwners is not null) privateOwners[b] = ResultBufferTracker.TrackFreshPrivateArray(arrays[b], 0);
+            }
             foreach (int g in tenants)
             {
                 var grad = allGrads[g];
@@ -11682,6 +11839,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 anyPooled = true;
                 (schedule[firstWrite[g]] ??= new List<int>()).Add(g);
             }
+            GC.KeepAlive(privateOwners); // Owners must survive until every fresh array has its first vector wrapper.
             if (aliasTargets is not null)
                 foreach (var alias in aliasTargets)
                     if (indexOf.TryGetValue(alias.Value, out int t) && pooled[t]) RepointAliasView(alias.Key, alias.Value);
@@ -11693,6 +11851,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // and device. Preserve a lazily materialized exact zero in the map, outside residency and clear loops.
                 var zeros = unused.ToDictionary(gradient => gradient,
                     gradient => Tensor<T>.CreateDeferred((int[])gradient._shape.Clone()));
+                if (pruneUnobservedAliasRoots && aliasTargets is not null)
+                    foreach (var alias in aliasTargets.Where(pair => unused.Contains(pair.Value)).ToArray())
+                    {
+                        // An unobserved alias still has a zero gradient in the map, but no resident target to bind.
+                        zeros[alias.Key] = Tensor<T>.CreateDeferred((int[])alias.Key._shape.Clone());
+                        aliasTargets.Remove(alias.Key);
+                    }
                 foreach (var tensor in gradMap.Keys.ToArray())
                     if (zeros.TryGetValue(gradMap[tensor], out var zero)) gradMap[tensor] = zero;
                 indexRemap = new int[count];
@@ -11910,6 +12075,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Gradient buffers still backed by the shared compile-time placeholder (gradient pooling, PoolGradientBuffers).
     // Set only while a plan's backward is being built on this thread.
     [ThreadStatic] private static HashSet<Tensor<T>>? t_gradPlaceholders;
+    [ThreadStatic] private static bool t_privateGradientHostOwnership;
 
 
     // The alias views among the gradients (AliasReshapeViewGradients' device aliases) and the gradient each views, while
@@ -11948,6 +12114,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return aliases is not null && aliases.TryGetValue(tensor, out var viewed) ? MaterializeIfGradPlaceholder(viewed) : 0;
         placeholders.Remove(tensor);
         using var own = new Tensor<T>((int[])tensor._shape.Clone());
+        if (t_privateGradientHostOwnership) TrackFreshPrivateGradientTensor(own);
         tensor.RebindStorageFrom(own);
         if (aliases is not null)
             foreach (var alias in aliases)
@@ -14040,6 +14207,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // computes it correctly.
         if (!leftSpansOutput && !rightSpansOutput) return null;
 
+        // Spectral normalization multiplies its dense weight matrix by a [1,1] inverse sigma.
+        // The generic broadcast replay allocated that entire matrix before copying it into output.
+        // Read the scalar before writing: it may itself be a view into the destination's storage.
+        if (isMultiply && leftSpansOutput && !rightSpansOutput && right.Length == 1)
+        {
+            return engine =>
+            {
+                if (engine.Unwrap().GetType() != typeof(CpuEngine) || !ReferenceEquals(engine, engine.Unwrap()))
+                {
+                    ReplayBroadcastBinaryEagerly(engine, step.OpType, left, right, output);
+                    return;
+                }
+
+                using var scalarKeep = new KeepAliveScope(right);
+                var scalar = right.AsSpanUnmarked()[0];
+                engine.Cast<CpuEngine>().TensorMultiplyScalarInto(output, left, scalar);
+            };
+        }
+
         // Dense float [N,M] op [M] (row-vector / bias shape): a tight indexed loop, kept as a fast
         // sub-case of the one path rather than as a branch that re-decides orientation.
         if (typeof(T) == typeof(float) && leftSpansOutput && !rightSpansOutput
@@ -14460,12 +14646,33 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+        var rfftMagnitudeBackward = BuildRfftMagnitudeBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
+        if (rfftMagnitudeBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return rfftMagnitudeBackward;
+        }
         var weightNormBackward = BuildWeightNormBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
         if (weightNormBackward is not null)
         {
             if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return weightNormBackward;
         }
+        var groupedBackward = BuildGroupedConv2DBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
+        if (groupedBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return groupedBackward;
+        }
+
+        var scalarBackward = BuildCpuScalarMultiplyBackward(step, gradMap, gradWriterCount ?? consumerCount, engine, requiresGrad)
+            ?? BuildCpuFullMeanBackward(step, gradMap, gradWriterCount ?? consumerCount, engine, requiresGrad);
+        if (scalarBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return scalarBackward;
+        }
+
 
         // Partial reductions broadcast their upstream gradient directly into the existing accumulator. Resolve this
         // before the sole-writer/zero-offset guards: the writer handles accumulation and actual storage offsets.
@@ -14474,6 +14681,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
             return reducedBackward;
+        }
+
+        var leakyBackward = BuildCpuLeakyReluBackward(step, gradMap, gradWriterCount ?? consumerCount, engine, requiresGrad);
+        if (leakyBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return leakyBackward;
         }
 
 
@@ -15097,10 +15311,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // A multi-consumer operand's buffer is overwritten when this is its first write of the step (see
             // AccumulatesInto), so the plan does not zero it.
             if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            // Match the base-CPU alias pool switch: flag0 and custom engines retain their previous binding policy.
+            bool deferAddBacking = engine.Unwrap().GetType() == typeof(CpuEngine)
+                && Environment.GetEnvironmentVariable("AIDOTNET_CPU_POOL_ALIAS_GRADS") != "0";
             if (typeof(T) == typeof(float) && !engine.SupportsGpu
                 && gradA.Length == gradOut.Length && gradB.Length == gradOut.Length
-                && TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
-                && TryGetLiveFloatBacking(gradB) is not null)
+                && (deferAddBacking
+                    ? HasSpecializedBacking(gradOut) && HasSpecializedBacking(gradA) && HasSpecializedBacking(gradB)
+                    : TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
+                        && TryGetLiveFloatBacking(gradB) is not null))
             {
                 int addLen = gradOut.Length;
                 return eng =>

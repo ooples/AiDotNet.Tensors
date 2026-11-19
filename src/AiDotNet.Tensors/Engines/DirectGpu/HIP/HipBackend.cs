@@ -1581,10 +1581,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var size = (UIntPtr)(data.Length * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, data.Length);
+
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Hip);
 
         DrainCollectedBuffers();
-        if (_bufferPool.TryRent(data.Length, out var pooled) && pooled != null)
+        if (_bufferPool.TryRentForBackend(data.Length, this, out var pooled) && pooled != null)
         {
             pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
             fixed (float* dataPtr = data)
@@ -1666,9 +1668,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
 
         DrainCollectedBuffers();
-        if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+        if (_bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null)
         {
             pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
             var zeroResult = HipNativeBindings.hipMemset(pooled.Handle, 0, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
@@ -1697,10 +1701,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IntPtr devicePtr = IntPtr.Zero;
         long sizeInBytes = (long)size * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("HIP", sizeInBytes, MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         var sizeBytes = (UIntPtr)sizeInBytes;
 
         DrainCollectedBuffers();
-        if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+        if (_bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null)
         {
             pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(sizeInBytes);
             return pooled;
@@ -6000,7 +6006,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Hip);
 
         DrainCollectedBuffers();
-        if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+        if (_bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null)
         {
             pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(sizeInBytes);
             fixed (int* dataPtr = data)

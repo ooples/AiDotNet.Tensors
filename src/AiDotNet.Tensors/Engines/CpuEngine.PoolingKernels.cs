@@ -431,6 +431,8 @@ public partial class CpuEngine
                     ReluBiasBackwardPlane(pz, py0 + yOff + (long)plane * inPlane, pz, inPlane, relu: true, ref acc);
                 }
             }
+            acc = FinishFusedChannelBiasSum(dz, dzOff, c, channels, batch, inPlane, acc);
+
             db[dbOff + c] = accumulateBias ? db[dbOff + c] + acc : acc;
         });
     }
