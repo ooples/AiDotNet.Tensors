@@ -6849,7 +6849,9 @@ public partial class DirectGpuTensorEngine
     // step, so after the step it holds only that step's rows, and copies it into the plan's own readback
     // (ClearFusedCeLabelError / QueueFusedCeLabelErrorCheck): one plan never sees another's labels. A step discarded
     // as non-finite reads it at once (TakeFusedCeLabelError), so where the NaN row flags do propagate the bad step
-    // itself throws.
+    // itself throws. Only a compiled step reaches the device-id path (it needs ResidentStepActive or a capture), and
+    // every compiled step goes through Step(); a forward outside the plan (the one TryApplyGradients takes gradients
+    // from) runs eagerly, where the ids are checked on the host.
     private IGpuBuffer? _fusedCeLabelError;
     private readonly object _fusedCeLabelErrorLock = new();
 
