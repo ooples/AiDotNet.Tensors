@@ -4,10 +4,12 @@ using System.Runtime.CompilerServices;
 namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
-/// Module-load-time GPU auto-detection. On .NET 6+ this fires the moment
-/// the AiDotNet.Tensors assembly is loaded — before any model construction
-/// or tensor op — so consumers get GPU acceleration without an explicit
-/// <see cref="AiDotNetEngine.AutoDetectAndConfigureGpu"/> call.
+/// Module-load-time request for GPU auto-detection. On .NET 6+ this fires the moment
+/// the AiDotNet.Tensors assembly is loaded and records that detection is owed; the
+/// detection runs on the first read of <see cref="AiDotNetEngine.Current"/> — before any
+/// model construction or tensor op uses an engine — so consumers get GPU acceleration
+/// without an explicit <see cref="AiDotNetEngine.AutoDetectAndConfigureGpu"/> call, and a
+/// process that never asks for an engine never probes for a GPU.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -88,9 +90,12 @@ internal static class GpuAutoDetectModuleInit
             // overrides AIDOTNET_VERBOSE_INIT for callers who want zero noise.
             var verboseInit = !string.IsNullOrEmpty(
                 Environment.GetEnvironmentVariable("AIDOTNET_VERBOSE_INIT"));
-            // Before the engine loads the OpenCL runtime, which reads these once.
-            DirectGpu.OpenCL.OpenClRuntimeDefaults.Apply();
-            AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: verboseInit);
+            // The detection itself is owed, not run here: it happens on the first read of
+            // AiDotNetEngine.Current. Probing at assembly load made every consumer pay for it -- about two
+            // seconds and a page of driver log -- including the ones that call only the SIMD kernels or the
+            // helpers and never ask for an engine. Anything that does ask for one still gets the GPU without
+            // an explicit AutoDetectAndConfigureGpu call, which is what this initializer exists to guarantee.
+            AiDotNetEngine.DeferGpuAutoDetection(verbose: verboseInit);
         }
         catch
         {
