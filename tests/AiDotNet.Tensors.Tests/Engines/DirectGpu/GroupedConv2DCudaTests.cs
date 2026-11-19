@@ -76,8 +76,8 @@ public sealed class GroupedConv2DCudaTests
     [SkippableTheory] [InlineData(false)] [InlineData(true)]
     public void Portable_and_cudnn_fwd_dx_dw_overwrite_add_and_readonly_inputs(bool vendor)
     {
-        Assert.Equal("1", Environment.GetEnvironmentVariable("AIDOTNET_CUDNN_EXECUTION_DIAGNOSTICS"));
-        using var backend = new CudaBackend(); Skip.IfNot(backend.IsAvailable, "CUDA unavailable.");
+        using var backend = new CudaBackend { CudnnExecutionDiagnosticsEnabled = true };
+        CudaTestDevice.Require(backend);
         Skip.If(vendor && !CuDnnConvolution.IsAvailable, "cuDNN unavailable.");
         bool previous = TensorCodecOptions.Current.UseCudnn;
         try
@@ -92,8 +92,9 @@ public sealed class GroupedConv2DCudaTests
     [SkippableFact]
     public void Cudnn_cache_distinguishes_same_full_shape_with_different_group_counts()
     {
-        Assert.Equal("1", Environment.GetEnvironmentVariable("AIDOTNET_CUDNN_EXECUTION_DIAGNOSTICS"));
-        using var backend = new CudaBackend(); Skip.IfNot(backend.IsAvailable && CuDnnConvolution.IsAvailable, "CUDA/cuDNN unavailable.");
+        using var backend = new CudaBackend { CudnnExecutionDiagnosticsEnabled = true };
+        CudaTestDevice.Require(backend);
+        Skip.IfNot(CuDnnConvolution.IsAvailable, "cuDNN unavailable.");
         bool previous = TensorCodecOptions.Current.UseCudnn, previousHeuristic = CuDnnConvolution.HeuristicForwardEnabled;
         try
         {

@@ -28,7 +28,7 @@ public sealed partial class CudaBackend
     private TunedKernelSlot<CudaConv2DArgs>? _conv2DForwardVendorSlot;
     private TunedKernelSlot<TunedConv2DBackwardArgs>? _conv2DBackwardDataVendorSlot, _conv2DBackwardFilterVendorSlot;
 
-    private static readonly bool s_cudnnExecutionDiagnosticsEnabled =
+    internal bool CudnnExecutionDiagnosticsEnabled { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_CUDNN_EXECUTION_DIAGNOSTICS") == "1";
     private long _cudnnForwardExecutions, _cudnnBackwardDataExecutions, _cudnnBackwardFilterExecutions;
     internal long CudnnForwardExecutions => System.Threading.Volatile.Read(ref _cudnnForwardExecutions);
@@ -83,7 +83,7 @@ public sealed partial class CudaBackend
                 a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
         }
         RunConvEpiloguePasses(a);
-        if (s_cudnnExecutionDiagnosticsEnabled)
+        if (CudnnExecutionDiagnosticsEnabled)
             System.Threading.Interlocked.Increment(ref _cudnnForwardExecutions);
     }
 
@@ -106,7 +106,7 @@ public sealed partial class CudaBackend
                     a.InHeight, a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW,
                     a.StrideH, a.StrideW, a.DilationH, a.DilationW, algorithm: algorithm, mathType: CudnnConvMath);
         }
-        if (s_cudnnExecutionDiagnosticsEnabled)
+        if (CudnnExecutionDiagnosticsEnabled)
         {
             if (a.WeightGradient) System.Threading.Interlocked.Increment(ref _cudnnBackwardFilterExecutions);
             else System.Threading.Interlocked.Increment(ref _cudnnBackwardDataExecutions);

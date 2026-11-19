@@ -11,13 +11,13 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public sealed class ChannelBiasResidualBackendTests
 {
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void Cuda_preserves_each_rounding_boundary_and_all_inputs_in_one_launch(bool writeActivation)
     {
         using var backend = new CudaBackend();
-        Assert.True(backend.IsAvailable, "This validation requires actual CUDA.");
+        CudaTestDevice.Require(backend);
         const int batch = 2, channels = 3, spatial = 259, count = batch * channels * spatial;
         const float alpha = .1f, sentinel = 123.75f;
         float[] pattern = { 0f, BitConverter.Int32BitsToSingle(unchecked((int)0x80000000)), 1f, -1f,
@@ -53,11 +53,11 @@ public sealed class ChannelBiasResidualBackendTests
         Same(residuals, backend.DownloadBuffer(residual));
     }
 
-    [Fact]
+    [SkippableFact]
     public void Cuda_rejects_output_aliases_and_undersized_buffers_before_launch_or_write()
     {
         using var backend = new CudaBackend();
-        Assert.True(backend.IsAvailable);
+        CudaTestDevice.Require(backend);
         using var input = backend.AllocateBuffer(new[] { 1f, -2f, 3f, -4f });
         using var bias = backend.AllocateBuffer(new[] { .5f });
         using var residual = backend.AllocateBuffer(new[] { -1f, 2f, -3f, 4f });
