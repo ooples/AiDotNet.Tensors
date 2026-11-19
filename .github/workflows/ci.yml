@@ -113,6 +113,11 @@ jobs:
     needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.cuda == 'true'
     uses: ./.github/workflows/gpu-cuda-selfhosted.yml
+    # The called workflow reads a producer run's artifacts (actions: read); a reusable workflow may not request more
+    # than its caller grants, and the run fails to start (startup_failure) when it does.
+    permissions:
+      contents: read
+      actions: read
     secrets: inherit
 
   evolution-lifecycle:

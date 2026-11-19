@@ -94,6 +94,14 @@
     <Compile Remove="Engines\BlasManaged\MachineKernelGemmTests.cs" />
     <!-- System.Runtime.Intrinsics.X86 and SgemmWithInt8CachedB are .NET 5+; the fallbacks it covers are .NET 5+ too. -->
     <Compile Remove="Engines\Simd\InstructionSetFallbackTests.cs" />
+    <!-- GC.GetAllocatedBytesForCurrentThread and float.IsFinite are .NET Core 3+ APIs; these run on net10.0. -->
+    <Compile Remove="Engines\CompiledReductionBroadcastTests.cs" />
+    <Compile Remove="Engines\WeightNormCpuTests.cs" />
+    <Compile Remove="Engines\DirectGpu\CompiledGpuSharedWorkspaceTests.cs" />
+    <Compile Remove="Engines\DirectGpu\ComposedWeightNormGradientLifetimeTests.cs" />
+    <Compile Remove="Engines\DirectGpu\LeakyReluSemanticReplayTests.cs" />
+    <Compile Remove="Engines\DirectGpu\ResidentOutputDeferredHostTests.cs" />
+    <Compile Remove="Engines\DirectGpu\WeightNormResidentAllocationTests.cs" />
   </ItemGroup>
 
   <!-- Deploy BlasManaged baseline JSON alongside the test assembly so the

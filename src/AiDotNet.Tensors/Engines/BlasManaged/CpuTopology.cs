@@ -25,6 +25,8 @@ internal static class CpuTopology
     private static extern IntPtr GetCurrentThread();
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetThreadGroupAffinity(IntPtr hThread, ref GROUP_AFFINITY ga, IntPtr prev);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nuint SetThreadAffinityMask(IntPtr hThread, nuint mask);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct PROCESSOR_NUMBER { public ushort Group; public byte Number; public byte Reserved; }
@@ -253,8 +255,23 @@ internal static class CpuTopology
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
         try
         {
+            var thread = GetCurrentThread();
+            if (!GetThreadGroupAffinity(thread, out var current)) return false;
+            if (current.Group == d.Group)
+            {
+                if (!GetProcessAffinityMask(GetCurrentProcess(), out var allowed, out var system)) return false;
+                nuint mask = (nuint)d.Mask;
+                if (allowed != 0) mask &= allowed;
+                else if (system != 0) return false;
+                if (mask == 0) return false;
+                // A group's affinity can include SMT siblings excluded by the caller's process mask.
+                // SetThreadGroupAffinity can lift that restriction on Windows; the same-group API
+                // preserves it and rejects any processor outside the allowed process allocation.
+                return SetThreadAffinityMask(thread, mask) != 0;
+            }
+            if (!ComputeAffinityAllowsOtherGroups()) return false;
             var ga = new GROUP_AFFINITY { Mask = (nuint)d.Mask, Group = d.Group };
-            return SetThreadGroupAffinity(GetCurrentThread(), ref ga, IntPtr.Zero);
+            return SetThreadGroupAffinity(thread, ref ga, IntPtr.Zero);
         }
         catch { return false; }
     }

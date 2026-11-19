@@ -1,8 +1,11 @@
 ﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System;
+using System.IO;
+using System.Security.Cryptography;
 using AiDotNet.Tensors.Engines;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
@@ -15,12 +18,27 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class GpuLaneBackendTests
 {
     public const string ExpectedBackendVariable = "AIDOTNET_EXPECT_GPU_BACKEND";
+    private readonly ITestOutputHelper _output;
+
+    public GpuLaneBackendTests(ITestOutputHelper output) => _output = output;
 
     [SkippableFact]
     public void TheEngine_ResolvesTheBackendTheLaneRequires()
     {
         string? expected = Environment.GetEnvironmentVariable(ExpectedBackendVariable);
         Skip.If(string.IsNullOrWhiteSpace(expected), $"{ExpectedBackendVariable} is not set: this run names no required backend.");
+
+        string? expectedHash = Environment.GetEnvironmentVariable("AIDOTNET_EXPECT_TENSORS_DLL_SHA256");
+        if (!string.IsNullOrWhiteSpace(expectedHash))
+        {
+            string path = typeof(DirectGpuTensorEngine).Assembly.Location;
+            Assert.False(string.IsNullOrWhiteSpace(path), "The loaded tensor assembly has no verifiable file location.");
+            using var stream = File.OpenRead(path);
+            using var sha = SHA256.Create();
+            string actualHash = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            _output.WriteLine($"Loaded tensor assembly: {path}; SHA256: {actualHash}");
+            Assert.Equal(expectedHash.ToLowerInvariant(), actualHash);
+        }
 
         using var gpu = new DirectGpuTensorEngine();
         Assert.True(gpu.IsGpuAvailable, $"The lane requires {expected}, but no DirectGpu backend initialized.");

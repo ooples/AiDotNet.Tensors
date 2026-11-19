@@ -4482,6 +4482,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static (float[] Flat, int Offset)? TryGetFlatParameterView(Tensor<float> t)
     {
         if (!t.IsContiguous) return null;
+        // A compiler-owned gradient bank is workspace, even when a smaller tenant looks like a flat parameter view.
+        // Classify it by identity before the raw-array accessor would mark that private bank escaped.
+        if (CompiledGradientBankIdentityEnabled && !t._storage.IsParameterBuffer
+            && t._storage.TryGetBackingArrayIdentity(out var privateArray, out _) && privateArray is not null
+            && Helpers.ResultBufferTracker.IsUnexposedPrivateArray(privateArray)) return null;
+
         _ = t.DataVector.TryGetBackingArraySegmentForReadOnlyAccess(out var arr, out int segment);
         if (arr is null) return null;
         int offset = segment + t._storageOffset;
@@ -6924,7 +6930,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the compiled plan calls it from the not-capturing pre-pass so capture/replay only memset + accumulate in place.
     /// Returns null if no backend or non-float (the resident paths are float-only).</summary>
     internal IGpuBuffer? EnsureResidentBuffer<T>(Tensor<T> t)
+        => EnsureResidentBufferWithAllocationInfo(t, out _);
+
+    internal IGpuBuffer? EnsureResidentBufferWithAllocationInfo<T>(Tensor<T> t, out bool allocated)
     {
+        allocated = false;
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
         int need = t.Length;
@@ -6939,6 +6949,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var buf = backend.AllocateBuffer(need);
             if (buf is null || buf.Handle == System.IntPtr.Zero) return null;
             BindResidentBuffer(t, buf, backend);
+            allocated = true;
             return buf;
         }
         catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("EnsureResidentBuffer", ex); AliasDiag($"EnsureResidentBuffer FELLBACK len={need}: {ex.GetType().Name}: {ex.Message}"); return null; }
@@ -30318,17 +30329,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         OwnedBuffer inputLease = default;
         IGpuBuffer? output = null;
+        OwnedBuffer outputLease = default;
+        bool outputLeaseActive = false;
         bool handedOff = false;
         try
         {
             inputLease = GetOrAllocateBuffer(backend, tensor);
             var input = inputLease.Buffer;
-            output = AllocateDeviceBufferUninitialized(backend, total);   // every route below writes all of it
+            // Compiled forward/backward actions reuse their declared scratch lifetime, as the other device outputs do.
+            // Ordinary slicing retains its existing allocation/reclamation behavior.
+            if (ScratchPoolingActive)
+            {
+                outputLease = AllocateFullyWrittenOutputBuffer(backend, total);
+                outputLeaseActive = true;
+                output = outputLease.Buffer;
+            }
+            else output = AllocateDeviceBufferUninitialized(backend, total); // All routes write the whole output.
             int segment = length[tensor.Rank - 1];
             int rows = total / segment;
             if (TryLastAxisOnlySlice(backend, input, output, tensor, start, length, rows, segment))
             {
                 var fast = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                if (outputLeaseActive) outputLease.RelinquishOwnership();
                 handedOff = true;
                 return fast;
             }
@@ -30339,6 +30361,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 rect.RectSlice(input, output, tensor.Shape._dims, start, length, scatter: false);
                 var single = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                if (outputLeaseActive) outputLease.RelinquishOwnership();
                 handedOff = true;
                 return single;
             }
@@ -30361,6 +30384,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             var result = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+            if (outputLeaseActive) outputLease.RelinquishOwnership();
             handedOff = true;
             return result;
         }
@@ -30373,7 +30397,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         finally
         {
             inputLease.DisposeAfterQueuedUse(backend);
-            if (!handedOff && output is not null) DisposeBufferAfterQueuedUse(backend, output);
+            if (!handedOff)
+            {
+                if (outputLeaseActive) outputLease.DisposeAfterQueuedUse(backend);
+                else if (output is not null) DisposeBufferAfterQueuedUse(backend, output);
+            }
         }
     }
 
@@ -31160,6 +31188,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_ownsDirectGpu) _ownedResults.EvacuateAll();
         _compiledWorkspaceBroker?.Release();
         _compiledWorkspaceBroker = null;
+        ReleaseGraphAttentionGraphs();
 
         // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these
         // buffers: their host arrays download before the buffers are freed.
@@ -31299,9 +31328,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var gi = UploadTensorRaw(b, input);
-                var go = b.AllocateBuffer(input.Length);
-                b.PowScalar(gi, go, Convert.ToSingle(exponent), input.Length);
-                return DeferTensorResult<T>(b, go, input.Length, input.Shape.ToArray());
+                // Pow fully overwrites its output. Reuse the compiled action's scratch just like other unary ops.
+                var outputLease = AllocateFullyWrittenOutputBuffer(b, input.Length);
+                try
+                {
+                    b.PowScalar(gi, outputLease.Buffer, Convert.ToSingle(exponent), input.Length);
+                    var result = DeferTensorResult<T>(b, outputLease.Buffer, input.Length, input.Shape.ToArray());
+                    outputLease.RelinquishOwnership();
+                    return result;
+                }
+                finally
+                {
+                    outputLease.DisposeAfterQueuedUse(b);
+                }
             }
             catch { }
         }

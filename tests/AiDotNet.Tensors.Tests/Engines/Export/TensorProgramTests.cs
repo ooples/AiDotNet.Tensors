@@ -52,6 +52,16 @@ public class TensorProgramTests : IDisposable
     }
 
     [Fact]
+    public void RealFftMagnitudeCapabilityTracesAndReplaysOnChangedInput()
+    {
+        Tensor<float> Magnitude(Tensor<float> x) => AiDotNetEngine.Current.TensorRfftMagnitude(x, .125);
+        var program = TensorProgram.Trace(Magnitude, Random(5, 2, 8));
+        Assert.Equal("TensorRfftMagnitude", Assert.Single(program.Nodes).Op.Name);
+        var input = Random(6, 2, 8);
+        AssertClose(Magnitude(input), program.Run(input));
+    }
+
+    [Fact]
     public void Trace_InfersSymbolicBatch_FromShapeDependentArguments()
     {
         Tensor<float> Flatten(Tensor<float> x)

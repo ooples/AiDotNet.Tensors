@@ -9160,6 +9160,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Validate and normalize axes consistently with other reducers
         var normalizedAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
+        if (TryChannelCascadeSum(tensor, normalizedAxes, keepDims, out var channelSum))
+        {
+            DifferentiableOps.RecordUnary("ReduceSum", channelSum, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
+                new object[] { (int[])normalizedAxes.Clone(), keepDims });
+            return channelSum;
+        }
 
         // Fast path: single-axis sum on 2D contiguous float tensor
         if (normalizedAxes.Length == 1 && tensor.Rank == 2 && tensor.IsContiguous && typeof(T) == typeof(float))
@@ -11125,6 +11131,19 @@ public partial class CpuEngine : ITensorLevelEngine
         // A test scope that pins the full-im2col or implicit-GEMM route must reach it: the direct and batched routes
         // below are chosen first, so a pinned comparison would otherwise compare one of them with itself.
         bool routePinned = t_forceFullIm2Col || t_forceImplicitGemmForTest || t_forceRowBlockForTest;
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && height == 1 && kernelHeight == 1 && outputHeight == 1 && padH == 0 && strideH == 1
+            && inChannels >= 16 && kernelWidth > 1)
+        {
+            int inputOffset = 0, kernelOffset = 0, outputOffset = 0;
+            var source = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inputOffset) : null);
+            var weights = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kernelOffset) : null);
+            var destination = outputData ?? output.GetCpuBackingForContiguousWrite(out outputOffset);
+            if (source is not null && weights is not null && destination is not null
+                && TryConv1DChannelBlocks(source, inputOffset, weights, kernelOffset, destination, outputOffset,
+                    batch, inChannels, width, outChannels, kernelWidth, strideW, padW, dilationW, outputWidth))
+                return;
+        }
 #if NET5_0_OR_GREATER
         if (!routePinned && (strideH > 1 || strideW > 1) && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
@@ -16971,6 +16990,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
+            if (TryShortWaveInputGradient((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
+                (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
+                return;
+
             if (TryConv1DBackwardInputColumnPanels((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
                 (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
@@ -20408,6 +20432,23 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int outputHeight = (height - 1) * strideH - 2 * padH + kernelHeight + outPadH;
         int outputWidth = (width - 1) * strideW - 2 * padW + kernelWidth + outPadW;
+        // An inference arena already owns the output lifetime. Compute into its buffer instead of
+        // allocating an activation-sized GC array and then copying it through TensorAllocator.Rent.
+        // Keep traced/taped/custom-engine calls on their established recording and dispatch path.
+        if (TensorArena.Current is not null && Autodiff.NoGradScope<T>.IsSuppressed
+            && !GraphMode.IsActive
+            && this.Unwrap().GetType() == typeof(CpuEngine) && ReferenceEquals(this, this.Unwrap())
+            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            var pooledOutput = TensorAllocator.RentUninitialized<T>(new[] { batch, outChannels, outputHeight, outputWidth });
+            ConvTranspose2DInto(pooledOutput, input, kernel, stride, padding, outputPadding);
+            DifferentiableOps.RecordBinary("ConvTranspose2D", pooledOutput, inputOrig, kernelOrig,
+                BackwardFunctions<T>.ConvTranspose2DBackward,
+                savedState: new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
+            AutoTracer.RecordOp("ConvTranspose2D", pooledOutput, eng => pooledOutput);
+            return pooledOutput;
+        }
+
 
         var inputData = input.GetReadOnlyDataArray();
         var kernelData = kernel.GetReadOnlyDataArray();
@@ -20659,8 +20700,12 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = inputDataLease.Array;
         using var kernelDataLease = kernel.LeaseArray();
         var kernelData = kernelDataLease.Array;
-        using var outputDataLease = output.LeaseArray();
-        var outputData = outputDataLease.Array;
+        using var outputOwnerKeep = new KeepAliveScope(output);
+        output.EnsureOwnedForDeviceWrite(); // Same COW/streaming write guard as LeaseArray, without a padded copy.
+        var liveOutputArray = output.GetLiveBackingArrayAllowingPaddingOrNull();
+        if (liveOutputArray is not null) HostSync.TryMaterialize(liveOutputArray);
+        using var outputDataLease = liveOutputArray is null ? output.LeaseArray() : default;
+        var outputData = liveOutputArray ?? outputDataLease.Array;
 
         // BLAS GEMM + Col2Im fast path — TryConvTranspose2DWithGemm zeros its
         // output slice via Array.Clear (Im2ColHelper.cs:1185) before accumulating,
@@ -39749,7 +39794,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capStart = (int[])start.Clone();
                 var capLength = (int[])length.Clone();
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSlice", tensor, capLength,
-                    (eng, output) => { var r = eng.TensorSlice(captured, capStart, capLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        // Replay can write the planned CPU destination directly. Custom engines retain their
+                        // virtual TensorSlice implementation, and device engines retain their resident route.
+                        if (eng.Unwrap().GetType() == typeof(CpuEngine)
+                            && TryCopyCompiledSliceInto(captured, capStart, capLength, output)) return;
+                        var r = eng.TensorSlice(captured, capStart, capLength);
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                    },
                     BackwardFunctions<T>.SliceBackward, new object[] { capStart });
             }
         }
@@ -46239,12 +46292,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // SetParameters produced different output than the source even though its
         // GetParameters() was byte-identical (a diffusion Clone-determinism bug class).
         // Mark the backing array dirty so the next consume rebuilds from live bytes.
-        // GetLiveBackingArrayOrNull returns the backing array only for a simple
+        // GetLiveBackingArrayIdentityOrNull returns the backing array only for a simple
         // contiguous-at-offset-0 layout — exactly the array the conv/GEMM fast paths
         // key their caches on (they consume kernel.Contiguous().GetDataArray()); it
         // returns null for view/lazy/GPU layouts, which never own a persistent
         // per-array cache entry, so skipping them is correct.
-        var backing = tensor.GetLiveBackingArrayOrNull();
+        // Cache versioning consumes identity only; it neither reads nor exposes the array payload.
+        // Marking this lookup escaped prevented private compiled gradients copied on-device from retiring.
+        var backing = tensor.GetLiveBackingArrayIdentityOrNull();
         if (backing is not null)
             AiDotNet.Tensors.Engines.Simd.SimdGemm.MarkWeightDirty(backing);
     }
