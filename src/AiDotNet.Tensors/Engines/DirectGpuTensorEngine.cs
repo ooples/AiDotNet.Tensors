@@ -14443,11 +14443,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bB = GetOrAllocateBuffer(backend, bias);
             using var loss = AllocateOutputBuffer(backend, 1);
             // An eager call builds the chunked forward's gather positions on the host (it has already read the ids for
-            // validation above). Inside a capture the positions come from device ids: host ids' per-replay device copy
-            // on a resident step (validated on every upload; RefreshHostIndexDeviceCopiesNow runs before each replay), or
-            // resident ids' own buffer, so a replay uses that step's labels.
+            // validation above). On a resident (compiled) step, captured or not, the positions come from device ids:
+            // host ids' per-step device copy (validated on every upload; RefreshHostIndexDeviceCopiesNow runs before each
+            // replay), or resident ids' own buffer, so a replay uses that step's labels. The uncaptured resident steps
+            // before the capture create the copy: one first created inside the capture was not the buffer the replayed
+            // graph read, so every replay kept the captured batch's labels (losses stale at lr 1e-12 with fed labels).
             bool chunked = false;
-            if (capturing)
+            if (capturing || ResidentStepActive)
             {
                 if (TryFusedCeCapturedIds(backend, targetIds, vocab, out var capturedIds))
                     using (capturedIds)

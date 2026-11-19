@@ -4796,6 +4796,13 @@ public partial class DirectGpuTensorEngine
         {
             if (!_hostIndexCopies.TryGetValue(indices, out copy!))
             {
+                // A copy first created inside a capture is not what the replayed graph reads (measured: every replay of
+                // a captured fused cross-entropy kept the captured batch's labels). Refuse, so the capture fails and the
+                // step runs uncaptured; the resident steps before a capture create the copies it needs.
+                if (backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())
+                    throw new NotSupportedException(
+                        "A host index tensor's device copy cannot be created inside a graph capture: run the step " +
+                        "uncaptured first so the copy exists before the capture.");
                 copy = new HostIndexDeviceCopy(indices);
                 _hostIndexCopies.Add(indices, copy);
                 _hostIndexCopyList.RemoveAll(w => !w.TryGetTarget(out var c) || !c.Source.TryGetTarget(out _));
@@ -6531,9 +6538,11 @@ public partial class DirectGpuTensorEngine
             return false;
         try
         {
-            // Inside a capture the host ids cannot be uploaded (the copy would be baked into the graph as this batch's
-            // labels): the chunked backward reads the same per-replay device ids the captured forward used.
-            if (targetIdTensor is not null && backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())
+            // On a resident step (captured or not) the chunked backward reads the same per-step device ids as the
+            // forward: inside a capture the host ids cannot be uploaded (the copy would be baked into the graph as this
+            // batch's labels), and the uncaptured resident steps must create that device copy before the capture.
+            if (targetIdTensor is not null && (ResidentStepActive
+                    || (backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())))
             {
                 if (!TryFusedCeCapturedIds(backend, targetIdTensor, weight._shape[1], out var capturedIds)) return false;
                 using (capturedIds)
