@@ -30,6 +30,14 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
         var result = new List<CompiledStep<T>>(steps.Length);
         bool anyFused = false;
 
+        // Readers per tensor: a chain may only swallow an intermediate the next link is the sole reader of. Fusing
+        // through one that another step also reads left that step reading a tensor nothing writes any more (measured:
+        // Sigmoid -> Tanh fused while a reshape of the Sigmoid output fed the next layer, which then read zeros).
+        var readers = new Dictionary<Tensor<T>, int>(ReaderKeyComparer<Tensor<T>>.Instance);
+        foreach (var step in steps)
+            foreach (var input in step.Inputs)
+                readers[input] = readers.TryGetValue(input, out var r) ? r + 1 : 1;
+
         int i = 0;
         while (i < steps.Length)
         {
@@ -43,7 +51,9 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
                 while (chainEnd + 1 < steps.Length
                     && IsPointwiseUnary(steps[chainEnd + 1].OpName)
                     && steps[chainEnd + 1].Inputs.Length == 1
-                    && ReferenceEquals(steps[chainEnd].OutputBuffer, steps[chainEnd + 1].Inputs[0]))
+                    && ReferenceEquals(steps[chainEnd].OutputBuffer, steps[chainEnd + 1].Inputs[0])
+                    && readers.TryGetValue(steps[chainEnd].OutputBuffer, out var intermediateReaders)
+                    && intermediateReaders == 1)
                 {
                     chainEnd++;
                 }
@@ -178,5 +188,12 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
             or OpType.Softplus or OpType.HardSwish or OpType.HardSigmoid or OpType.ELU
             or OpType.SELU or OpType.LeakyReLU or OpType.Reciprocal or OpType.Floor
             or OpType.Ceiling or OpType.Round or OpType.Clamp;
+    }
+
+    private sealed class ReaderKeyComparer<TItem> : IEqualityComparer<TItem> where TItem : class
+    {
+        public static readonly ReaderKeyComparer<TItem> Instance = new();
+        public bool Equals(TItem? x, TItem? y) => ReferenceEquals(x, y);
+        public int GetHashCode(TItem obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
     }
 }
