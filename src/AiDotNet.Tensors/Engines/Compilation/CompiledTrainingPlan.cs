@@ -14664,6 +14664,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return groupedBackward;
         }
 
+        var scalarBackward = BuildCpuScalarMultiplyBackward(step, gradMap, gradWriterCount ?? consumerCount, engine, requiresGrad)
+            ?? BuildCpuFullMeanBackward(step, gradMap, gradWriterCount ?? consumerCount, engine, requiresGrad);
+        if (scalarBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return scalarBackward;
+        }
+
+
         // Partial reductions broadcast their upstream gradient directly into the existing accumulator. Resolve this
         // before the sole-writer/zero-offset guards: the writer handles accumulation and actual storage offsets.
         var reducedBackward = BuildCpuReducedGradientBackward(step, gradMap, gradWriterCount ?? consumerCount, engine);
