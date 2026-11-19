@@ -985,6 +985,46 @@ extern ""C"" __global__ __launch_bounds__(256) void argmin_axis(
     indices[outer] = (float)minIdx;
 }
 
+// argmax_axis / argmin_axis on wide rows: one 256-thread block per row instead of one thread per row. A single thread
+// scanning a 49,152-wide vocabulary row took ~3 ms (the whole B=1 decode step's budget); the block reduces it in a few
+// microseconds. Same answer as the scan, bit-exact: a leading NaN wins (nothing compares greater than it); otherwise
+// the first index of the extreme over the non-NaN values, compared as exact bit keys (xf_key), so ties go to the
+// smaller index and later NaNs are skipped. Each thread keeps the first extreme of its strided slice; merging two
+// candidates takes the strictly better key, else the smaller index - associative, so the tree gives the scan's result.
+extern ""C"" __global__ __launch_bounds__(256) void arg_extreme_axis_rows(
+    const float* input, float* indices, int outerSize, int axisSize, int findMin)
+{
+    __shared__ int sKey[256];
+    __shared__ int sIdx[256];
+    int outer = blockIdx.x;
+    if (outer >= outerSize) return;
+    int tid = threadIdx.x;
+    if (axisSize <= 0) { if (tid == 0) indices[outer] = 0.0f; return; }
+    const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
+    if (xf_isnan(row[0])) { if (tid == 0) indices[outer] = 0.0f; return; }
+
+    // The max of key' = findMin ? -key : key. |xf_key| <= 0x7F800000, so the negation cannot overflow.
+    bool have = false;
+    int bestKey = 0, bestIdx = 0;
+    for (long long i = tid; i < axisSize; i += blockDim.x) {
+        unsigned int v = row[i];
+        if (xf_isnan(v)) continue;
+        int key = findMin ? -xf_key(v) : xf_key(v);
+        if (!have || key > bestKey) { have = true; bestKey = key; bestIdx = (int)i; }
+    }
+    sKey[tid] = have ? bestKey : (int)0x80000000;   // INT_MIN: below every finite or infinite key
+    sIdx[tid] = have ? bestIdx : 0x7FFFFFFF;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            int k2 = sKey[tid + stride], i2 = sIdx[tid + stride];
+            if (k2 > sKey[tid] || (k2 == sKey[tid] && i2 < sIdx[tid])) { sKey[tid] = k2; sIdx[tid] = i2; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) indices[outer] = (float)sIdx[0];
+}
+
 // Reduce-max along the innermost (contiguous) axis: output[outer] = max over the axisSize block.
 // Mirrors argmax_axis but emits the max VALUE (not its index). Consumers: GumbelSoftmax / softmax-max
 // subtraction, MelSpectrogram log-floor normalization, BinCount range sizing.
@@ -2982,6 +3022,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "compute_mean_var",
                 "argmax_axis",
                 "argmin_axis",
+                "arg_extreme_axis_rows",
                 "max_axis",
                 "max_axis_rows",
                 // Optimizers
