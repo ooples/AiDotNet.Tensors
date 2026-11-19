@@ -54,10 +54,10 @@ public sealed class InferenceWorkspaceHandoffTests
         pool.Release();
     }
 
-    [Fact]
+    [SkippableFact]
     public void Cuda_prediction_reuses_handed_off_native_backing_without_allocating_again()
     {
-        using var backend = new CudaBackend(); Assert.True(backend.IsAvailable);
+        using var backend = new CudaBackend(); CudaTestDevice.Require(backend);
         using var direct = new DirectGpuEngine(backend);
         using var engine = new DirectGpuTensorEngine(direct);
         var broker = engine.CompiledWorkspaceBroker;
@@ -67,14 +67,12 @@ public sealed class InferenceWorkspaceHandoffTests
         try
         {
             InferenceWorkspaceDemandScope.HandoffIdleWorkspaceEnabled = true;
-            Assert.True(GpuMemoryTracker.Enabled);
-            var sequence = typeof(GpuMemoryTracker).GetField("s_seq", BindingFlags.Static | BindingFlags.NonPublic)!;
-            long before = (long)sequence.GetValue(null)!;
+            using var allocations = new BufferAllocationDiagnostics.NativeAllocationMeasurement();
             using var inference = InferenceWorkspaceDemandScope.Enter(engine);
             Assert.Equal(0, broker.RetainedBytes); Assert.Equal(128, broker.CacheReturnedForInferenceBytes);
             Assert.Equal(IntPtr.Zero, buffer.Handle);
             using var next = backend.AllocateBufferUninitialized(32);
-            Assert.Equal(address, next.Handle); Assert.Equal(before, (long)sequence.GetValue(null)!);
+            Assert.Equal(address, next.Handle); Assert.Equal(0L, allocations.Count);
         }
         finally { InferenceWorkspaceDemandScope.HandoffIdleWorkspaceEnabled = previous; }
     }

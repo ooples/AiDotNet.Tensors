@@ -30,7 +30,29 @@ internal static class BufferAllocationDiagnostics
 
     internal static void RecordCudaNativeApiRequest(long bytes)
     {
-        if (Enabled && bytes > 0) CudaNativeApiRequests.Add(bytes);
+        if ((Enabled || Volatile.Read(ref s_nativeObservers) != 0) && bytes > 0) CudaNativeApiRequests.Add(bytes);
+    }
+
+    private static int s_nativeObservers;
+
+    // Count the same successful native allocations as the full tracker without collecting allocation stacks.
+    internal sealed class NativeAllocationMeasurement : IDisposable
+    {
+        private readonly long _start;
+        private int _disposed;
+
+        internal NativeAllocationMeasurement()
+        {
+            Interlocked.Increment(ref s_nativeObservers);
+            _start = CudaNativeApiRequests.Count;
+        }
+
+        internal long Count => CudaNativeApiRequests.Count - _start;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0) Interlocked.Decrement(ref s_nativeObservers);
+        }
     }
 
     internal static void RecordCompiledWorkspaceLoan(int requestedFloat32Length)
