@@ -480,6 +480,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // needs to write. Storing both costs ~N*sizeof(ref) extra per plan,
     // which is negligible relative to the pre-allocated tensor buffers.
     private readonly CompiledStep<T>[]? _forwardSteps;
+    private readonly bool _usesFusedCe;
     private readonly int[]? _compiledInputShape;
     private readonly Tensor<T>? _compiledInputTensor;
     // Per-step buffer the CUDA-graph replay refreshes in place. Equals _compiledInputTensor for ordinary
@@ -529,6 +530,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _lossGradSeed = lossGradSeed;
         _genericGradIndices = genericGradIndices;
         _forwardSteps = forwardSteps;
+        _usesFusedCe = forwardSteps?.Any(step => step.OpName.StartsWith("FusedLinearCrossEntropy", StringComparison.Ordinal)) ?? false;
         MaybeDumpOpHistogram(); // #639 diagnostic: AIDOTNET_PLAN_HISTOGRAM=1 dumps the replayed op profile
         // A leading "Embedding" step is an int→float gather. Capture it INSIDE the graph as a pure on-device gather
         // over a STABLE index buffer, and refresh just the small index vector before each launch (via the engine's
@@ -1533,8 +1535,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
         {
-            if (_stepGraphExec != IntPtr.Zero) cb.DestroyCapturedGraph(_stepGraphExec);
-            if (_stepGraphExecOdd != IntPtr.Zero) cb.DestroyCapturedGraph(_stepGraphExecOdd);
+            if (_stepGraphExec != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExec);
+            if (_stepGraphExecOdd != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExecOdd);
         }
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
@@ -2887,6 +2889,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (IsOptimizerParameterActive(p) && (_parameterAcceptedUpdates[p] < 0 || _parameterAcceptedUpdates[p] > _optimizerStep))
                     throw new InvalidOperationException("A parameter's accepted-update age is inconsistent with the optimizer's global step.");
             int previousStep = _optimizerStep;
+            ThrowOnInvalidCurrentFusedCeLabels();
             _optimizerUpdate?.Invoke();
             if (_optimizerStep > previousStep)
             {
@@ -2923,7 +2926,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_finitenessReadback is not { } readback) return;
         double sumSquares = System.Runtime.InteropServices.MemoryMarshal.Read<double>(readback.Read());
         if (double.IsNaN(sumSquares) || double.IsInfinity(sumSquares))
-            MarkOptimizerStepDiscarded();
+            MarkOptimizerStepDiscarded(deferredVerdict: true);
         else if (_pendingParameterAgeMembership is { } membership)
             AdvanceParameterAges(membership);
         _pendingParameterAgeMembership = null;
@@ -3054,7 +3057,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void MarkOptimizerStepDiscarded()
+    private void MarkOptimizerStepDiscarded(bool deferredVerdict = false)
     {
         // The step counter drives schedules and bias correction. A discarded update must be
         // invisible to both, matching GradScaler's contract.
@@ -3063,7 +3066,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         LastStepSkippedNonFiniteGradients = true;
         // A captured or resident fused cross-entropy cannot check its device labels on the host, so an out-of-range id
         // makes the loss and gradients NaN. Tell that apart from an overflow: the label error throws, it is not skipped.
-        if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var labelEngine) && labelEngine.TakeFusedCeLabelError())
+        if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var labelEngine) && (deferredVerdict ? labelEngine.ReadFusedCeLabelErrorCheck(_labelErrorReadback) : labelEngine.TakeFusedCeLabelError()))
             throw new ArgumentOutOfRangeException("targetIds",
                 "A fused cross-entropy target id on this compiled step was outside [0, vocab). The step was not applied.");
     }
@@ -4107,8 +4110,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     throw new ArgumentOutOfRangeException("targetIds",
                         "A fused cross-entropy target id on this plan's previous step was outside [0, vocab). Where the " +
                         "backend propagates NaN that step was discarded as non-finite; elsewhere its update may have been applied.");
+                _fusedCeLabelsValidated = false;
                 gpuEngine.ClearFusedCeLabelError();
                 var loss = StepLocked();
+                ThrowOnInvalidCurrentFusedCeLabels();
                 gpuEngine.QueueFusedCeLabelErrorCheck(ref _labelErrorReadback);
                 return loss;
             }
@@ -4340,7 +4345,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // those are the graph-purity violations that abort/spoil whole-step capture and keep the
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
-                            exec = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 0));
+                            exec = gte.CaptureGraphWithIndexBindings(cb, () => CaptureStepGraphBody(cb, parity: 0));
                         StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;
                     }
                     catch (Exception captureFailure)
@@ -4434,7 +4439,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     return StepResidentOrEager();
                 }
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
-                gte.RefreshHostIndexDeviceCopiesNow();   // host id tensors the graph reads through their device copies
+                try
+                {
+                    gte.RefreshHostIndexDeviceCopiesNow(_stepGraphExec);
+                }
+                catch (InvalidOperationException)
+                {
+                    InvalidateCapturedStepGraph();
+                    return StepResidentOrEager();
+                }
                 if (_stepIo is not null ? !StepIoInputsStillBound(cb) : !RefreshGraphInputInPlace(cb))
                 {
                     // An input the graph reads through a baked pointer was released: replaying would read freed
@@ -4817,14 +4830,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             try
             {
                 using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCaptureOdd"))
-                    odd = cb.CaptureGraph(() => CaptureStepGraphBody(cb, parity: 1));
+                    odd = gte.CaptureGraphWithIndexBindings(cb, () => CaptureStepGraphBody(cb, parity: 1));
             }
             finally { bind(0); }
         }
         catch (Exception oddFailure)
         {
             RejectPingPong("the odd-replay step graph did not capture: " + oddFailure.GetType().Name + ": " + oddFailure.Message);
-            if (odd != IntPtr.Zero) cb.DestroyCapturedGraph(odd);
+            if (odd != IntPtr.Zero) gte.DestroyGpuGraph(odd);
             return false;
         }
         if (odd == IntPtr.Zero) { RejectPingPong("the odd-replay step graph produced no graph"); return false; }
@@ -7985,7 +7998,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             ResolveDeferredFiniteness();
             if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
-                || paramCount == 0 || _l2Regularization != 0f || _maxGradNorm > 0.0)
+                || _usesFusedCe || paramCount == 0 || _l2Regularization != 0f || _maxGradNorm > 0.0)
                 return null;
             ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);

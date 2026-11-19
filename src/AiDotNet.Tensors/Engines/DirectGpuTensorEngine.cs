@@ -647,7 +647,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         // Reject API misuse here rather than letting a null delegate surface as a backend-side failure.
         if (forward is null) throw new System.ArgumentNullException(nameof(forward));
-        return GetBackend() is IGpuGraphCapture capture ? capture.CaptureGraph(forward) : System.IntPtr.Zero;
+        return GetBackend() is IGpuGraphCapture capture ? CaptureGraphWithIndexBindings(capture, forward) : System.IntPtr.Zero;
     }
 
     /// <summary>Replays a graph captured by <see cref="CaptureGpuGraph"/> as a single cuGraphLaunch. Refresh
@@ -656,7 +656,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         if (graphExec != System.IntPtr.Zero && GetBackend() is IGpuGraphCapture capture)
+        {
+            RefreshHostIndexDeviceCopiesNow(graphExec);
             capture.LaunchCapturedGraph(graphExec);
+        }
     }
 
     /// <summary>Blocks until all work on the backend's compute stream completes. Used to separate GPU-compute
@@ -671,6 +674,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public void DestroyGpuGraph(System.IntPtr graphExec)
     {
         using var __gpuOp = EnterGpuOp();
+        RetireIndexGraphBindings(graphExec);
         if (graphExec != System.IntPtr.Zero && GetBackend() is IGpuGraphCapture capture)
             capture.DestroyCapturedGraph(graphExec);
     }
@@ -14516,7 +14520,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
-            if (ThrowOnGpuKernelFallback) throw;
+            if (capturing || ThrowOnGpuKernelFallback) throw;
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads);
         }
     }
@@ -30923,6 +30927,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Results callers still hold keep their values: each live one downloads (if its host copy is stale) and lets
         // go of its device buffer while the backend can still do both. Only when this engine frees the backend; a
         // shared backend keeps serving them.
+        ReleaseIndexReplayBindings();
         if (_ownsDirectGpu) _ownedResults.EvacuateAll();
 
         // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these

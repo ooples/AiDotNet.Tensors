@@ -2359,7 +2359,7 @@ public partial class DirectGpuTensorEngine
 
         using var destinationBuffer = GetOrAllocateBuffer(backend, destination);
         using var sourceBuffer = GetOrAllocateBuffer(backend, source);
-        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
         return DispatchDeferredGpuOp<T>(backend, destination.Length,
             (int[])destination._shape.Clone(), output =>
                 indexBackend.IndexAdd(destinationBuffer.Buffer, indexBuffer.Buffer,
@@ -2404,7 +2404,7 @@ public partial class DirectGpuTensorEngine
         }
 
         using var sourceBuffer = GetOrAllocateBuffer(backend, source);
-        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+        using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
         if (outerSize == 1)
         {
             return DispatchDeferredGpuOp<T>(backend, total, (int[])inShape.Clone(), output =>
@@ -4686,8 +4686,10 @@ public partial class DirectGpuTensorEngine
     }
 
     private OwnedBuffer GetOrAllocateInt32IndexBuffer(
-        IDirectGpuBackend backend, Tensor<int> indices)
+        IDirectGpuBackend backend, Tensor<int> indices, Tensor<int>? originalIndices = null)
     {
+        if (ResidentStepActive && originalIndices is not null && !HasResidentIndexStorage(originalIndices))
+            indices = originalIndices;
         if (!HasResidentIndexStorage(indices))
         {
             // On the resident (compiled) step, host ids get a device copy kept across steps: a fresh allocation and
@@ -4772,9 +4774,6 @@ public partial class DirectGpuTensorEngine
         internal IGpuBuffer? Buffer;
         internal int Capacity;
         internal int Version;
-        // Exclusive upper bound every id must respect (0 = none): a fused cross-entropy's vocabulary. Checked on the host
-        // at every upload, so a captured step rejects an out-of-range id before its replay, as an eager call does.
-        internal int UpperBound;
         internal HostIndexDeviceCopy(Tensor<int> source) => Source = new WeakReference<Tensor<int>>(source);
     }
 
@@ -4808,41 +4807,47 @@ public partial class DirectGpuTensorEngine
                 _hostIndexCopyList.RemoveAll(w => !w.TryGetTarget(out var c) || !c.Source.TryGetTarget(out _));
                 _hostIndexCopyList.Add(new WeakReference<HostIndexDeviceCopy>(copy));
             }
-            if (upperBound > 0 && (copy.UpperBound == 0 || upperBound < copy.UpperBound))
-            {
-                copy.UpperBound = upperBound;
-                copy.Version = int.MinValue;   // validate the current ids against the new bound
-            }
         }
-        RefreshHostIndexDeviceCopy(backend, copy, indices);
+        RefreshHostIndexDeviceCopy(backend, copy, indices, upperBound);
+        RecordHostIndexBinding(copy, indices, upperBound);
         return copy.Buffer!;
     }
 
-    private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices)
+    private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices, int upperBound = 0)
     {
         int n = indices.Length;
         int version = indices.GpuCacheVersion;
         lock (copy)
         {
+            int[]? data = null;
+            if (upperBound > 0)
+            {
+                data = indices.ToArray();
+                for (int i = 0; i < n; i++)
+                    if (data[i] < 0 || data[i] >= upperBound)
+                        throw new ArgumentOutOfRangeException(nameof(indices),
+                            $"Target ID {data[i]} at position {i} is out of bounds for vocabulary size {upperBound}.");
+            }
             if (copy.Buffer is not null && copy.Capacity == n && copy.Version == version) return;
             if (copy.Buffer is not null && copy.Capacity != n)
-                throw new InvalidOperationException(
-                    $"A host index tensor's device copy cannot be resized ({copy.Capacity} -> {n}): a captured graph " +
-                    "reads its buffer through a baked pointer.");
-            var data = indices.ToArray();
-            if (copy.UpperBound > 0)
-                for (int i = 0; i < n; i++)
-                    if (data[i] < 0 || data[i] >= copy.UpperBound)
-                        throw new ArgumentOutOfRangeException(nameof(indices),
-                            $"Target ID {data[i]} at position {i} is out of bounds for vocabulary size {copy.UpperBound}.");
-            if (copy.Buffer is null || copy.Capacity != n)
+                throw new InvalidOperationException("A captured host-index device copy cannot be resized.");
+            data ??= indices.ToArray();
+            if (copy.Buffer is null)
             {
-                var buffer = backend.AllocateIntBuffer(n);
-                copy.Buffer?.Dispose();
+                var buffer = backend.AllocateIntBuffer(Math.Max(n, 1));
+                try
+                {
+                    if (n > 0) backend.UploadIntBufferInPlace(data, buffer);
+                }
+                catch
+                {
+                    DisposeBufferAfterQueuedUse(backend, buffer);
+                    throw;
+                }
                 copy.Buffer = buffer;
                 copy.Capacity = n;
             }
-            if (n > 0) backend.UploadIntBufferInPlace(data, copy.Buffer);
+            else if (n > 0) backend.UploadIntBufferInPlace(data, copy.Buffer);
             copy.Version = version;
         }
     }
@@ -4852,9 +4857,15 @@ public partial class DirectGpuTensorEngine
     /// calls it before each captured replay, outside the capture: the graph reads the copies through baked pointers,
     /// so ids the caller rewrote between steps would otherwise replay with their captured values.
     /// </summary>
-    internal void RefreshHostIndexDeviceCopiesNow()
+    internal void RefreshHostIndexDeviceCopiesNow(IntPtr graphExec = default)
     {
+        using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend)) return;
+        if (graphExec != IntPtr.Zero)
+        {
+            RefreshIndexGraphBindings(backend, graphExec);
+            return;
+        }
         HostIndexDeviceCopy[] copies;
         lock (_hostIndexLock)
         {
@@ -4914,6 +4925,7 @@ public partial class DirectGpuTensorEngine
     private void RecordCapturedResidentIndex(Tensor<int> indices, bool capturing)
     {
         if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero) return;
+        RecordResidentIndexBinding(indices, buffer.Handle);
         lock (_hostIndexLock)
         {
             _capturedResidentIndices.RemoveAll(r => !r.Tensor.TryGetTarget(out _));
@@ -5756,7 +5768,7 @@ public partial class DirectGpuTensorEngine
             }
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             var putResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -5940,7 +5952,7 @@ public partial class DirectGpuTensorEngine
             var ci = indices.IsContiguous ? indices : indices.Contiguous();
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             var scatterResult = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -6246,7 +6258,7 @@ public partial class DirectGpuTensorEngine
             var upstream = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             var ci = indices.IsContiguous ? indices : indices.Contiguous();
             using var bufG = GetOrAllocateBuffer(backend, upstream);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             return DispatchDeferredGpuOp<T>(backend, n, (int[])gradOutput._shape.Clone(), output =>
             {
                 backend.Copy(bufG.Buffer, output, n);
@@ -6282,7 +6294,7 @@ public partial class DirectGpuTensorEngine
             var shape = (int[])gradOutput._shape.Clone();
             shape[ax] = indices.Length;
             using var bufG = GetOrAllocateBuffer(backend, upstream);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             using var bufOverwritten = overwritten.Length == 0
                 ? default
                 : new OwnedBuffer(backend.AllocateIntBuffer(overwritten), ownsBuffer: true);
@@ -6908,9 +6920,18 @@ public partial class DirectGpuTensorEngine
             if (backend is not DirectGpu.IFusedCrossEntropyPositionsBackend positionsBackend) return false;
             // [0, n): positions; [n, 2n): row flags (0, or NaN for an out-of-range id); [2n, 3n): count flags (0 or 1).
             var scratch = AllocateStreamOrderedScratch(backend, checked(3 * n));
-            positionsBackend.FusedCrossEntropyTargetPositions(deviceIds, scratch, n, chunk, vocab);
-            positions = new OwnedBuffer(scratch, ownsBuffer: true);
-            return true;
+            var owner = new OwnedBuffer(scratch, ownsBuffer: true);
+            try
+            {
+                positionsBackend.FusedCrossEntropyTargetPositions(deviceIds, scratch, n, chunk, vocab);
+                positions = owner;
+                return true;
+            }
+            catch
+            {
+                owner.DisposeAfterQueuedUse(backend);
+                throw;
+            }
         }
         if (targetIds is null || targetIds.Length != n) return false;
         var positionBits = new float[n];
@@ -6964,8 +6985,16 @@ public partial class DirectGpuTensorEngine
                     "The fused cross-entropy label-error word cannot be created inside a graph capture: run the step " +
                     "uncaptured first.");
             var buffer = backend.AllocateBuffer(1);
-            backend.Fill(buffer, 0f, 1);
-            return _fusedCeLabelError = buffer;
+            try
+            {
+                backend.Fill(buffer, 0f, 1);
+                return _fusedCeLabelError = buffer;
+            }
+            catch
+            {
+                DisposeBufferAfterQueuedUse(backend, buffer);
+                throw;
+            }
         }
     }
 
@@ -6975,10 +7004,10 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal bool TakeFusedCeLabelError()
     {
+        using var __gpuOp = EnterGpuOp();
         IGpuBuffer? word;
         lock (_fusedCeLabelErrorLock) word = _fusedCeLabelError;
         if (word is null || !TryGetBackend(out var backend)) return false;
-        using var __gpuOp = EnterGpuOp();
         if (backend.DownloadBuffer(word)[0] == 0f) return false;
         backend.Fill(word, 0f, 1);
         return true;
@@ -6987,10 +7016,10 @@ public partial class DirectGpuTensorEngine
     /// <summary>Zeroes the label-error word, stream-ordered, before a compiled step. No-op until it exists.</summary>
     internal void ClearFusedCeLabelError()
     {
+        using var __gpuOp = EnterGpuOp();
         IGpuBuffer? word;
         lock (_fusedCeLabelErrorLock) word = _fusedCeLabelError;
         if (word is null || !TryGetBackend(out var backend)) return;
-        using var __gpuOp = EnterGpuOp();
         backend.Fill(word, 0f, 1);
     }
 
@@ -7000,10 +7029,10 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal void QueueFusedCeLabelErrorCheck(ref DirectGpu.IDeviceReadback? readback)
     {
+        using var __gpuOp = EnterGpuOp();
         IGpuBuffer? word;
         lock (_fusedCeLabelErrorLock) word = _fusedCeLabelError;
         if (word is null || !TryGetBackend(out var backend)) return;
-        using var __gpuOp = EnterGpuOp();
         readback ??= backend is DirectGpu.IDeviceReadbackFactory factory
             ? factory.CreateReadback(sizeof(float))
             : new DirectGpu.SynchronousDeviceReadback(backend, sizeof(float));
@@ -7217,7 +7246,7 @@ public partial class DirectGpuTensorEngine
                 return base.TensorIndexCopy(tensor, axis, indices, source);
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -7268,7 +7297,7 @@ public partial class DirectGpuTensorEngine
                             $"indices[{i}]={indexData[i]} out of range for axis size {dstAxis}");
             }
             using var bufIn = GetOrAllocateBuffer(backend, ct);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -9999,7 +10028,7 @@ public partial class DirectGpuTensorEngine
             outShape[normalizedAxis] = indices.Length;
             int outputLength = outerSize * indices.Length * innerSize;
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousInput);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
             return DispatchDeferredGpuOp<T>(backend, outputLength, outShape, output =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, output,
                     outerSize, axisSize, indices.Length, innerSize));
@@ -10055,7 +10084,7 @@ public partial class DirectGpuTensorEngine
             var contiguousValues = values.IsContiguous ? values : values.Contiguous();
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
             using var valuesBuffer = GetOrAllocateBuffer(backend, contiguousValues);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
             var scatterResult = DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(), output =>
             {
                 backend.Copy(inputBuffer.Buffer, output, input.Length);
@@ -10141,7 +10170,7 @@ public partial class DirectGpuTensorEngine
             var cs = source.IsContiguous ? source : source.Contiguous();
             using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
-            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
             IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
             var claims = Scratch(n);
@@ -10248,7 +10277,7 @@ public partial class DirectGpuTensorEngine
         var leases = new List<OwnedBuffer>();
         try
         {
-            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices);
             using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
             var claims = RentOpScratch(backend, n, leases);
             var positions = RentOpScratch(backend, m, leases);
@@ -10309,7 +10338,7 @@ public partial class DirectGpuTensorEngine
             outputShape[normalizedAxis] = indices.Length;
             int outputLength = checked(outerSize * indices.Length * innerSize);
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousPacked);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
             return DispatchDeferredGpuOp<byte>(backend, outputLength, outputShape, output =>
                 indexBackend.IndexSelect(inputBuffer.Buffer, indexBuffer.Buffer, output,
                     outerSize, sourceAxis, indices.Length, innerSize));
@@ -10370,7 +10399,7 @@ public partial class DirectGpuTensorEngine
             for (int i = normalizedAxis + 1; i < packed.Rank; i++) innerSize *= packed.Shape._dims[i];
             using var destinationBuffer = GetOrAllocateBuffer(backend, contiguousPacked);
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousSource);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices);
             return DispatchDeferredGpuOp<byte>(backend, packed.Length, packed.Shape.ToArray(), output =>
             {
                 backend.Copy(destinationBuffer.Buffer, output, packed.Length);
@@ -10520,7 +10549,7 @@ public partial class DirectGpuTensorEngine
                     var indexValues = indexValuesLease.Array;
                     ValidateEmbeddingIndices(indexValues, vocabSize, nameof(indices));
                 }
-                indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+                indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: (object)indices as Tensor<int>);
             }
             else
             {
@@ -10643,7 +10672,7 @@ public partial class DirectGpuTensorEngine
             }
 
             using var gradientBuffer = GetOrAllocateBuffer(backend, gradOutput);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: (object)indices as Tensor<int>);
             return DispatchDeferredGpuOp<TValue>(backend, checked(vocabSize * embeddingDim),
                 new[] { vocabSize, embeddingDim }, output =>
                 {

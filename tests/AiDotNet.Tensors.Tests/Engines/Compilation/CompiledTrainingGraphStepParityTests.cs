@@ -891,9 +891,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     [SkippableTheory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void A_resident_out_of_range_label_is_caught_on_the_device_and_the_plan_recovers(bool capture)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public void A_resident_out_of_range_label_is_caught_on_the_device_and_the_plan_recovers(bool capture, bool repairGradients)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -932,31 +934,26 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             using (plan)
             {
                 if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
-                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 1e-2f, weightDecay: 0.1f);
+                if (repairGradients)
+                {
+                    var configured = (CompiledTrainingPlan<float>)plan;
+                    configured.SetMaxGradNorm(1.0);
+                    configured.SetNonFiniteGradientPolicy(AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.ZeroNonFinite);
+                }
                 for (int s = 0; s < Steps; s++)
                 {
                     if (s > 0) Feed(s, bad: false);
                     plan.Step();
                 }
-                if (capture)
-                {
-                    // The bad batch must reach the captured device path, not the eager pre-pass.
-                    var execField = typeof(CompiledTrainingPlan<float>)
-                        .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
-                        ?? throw new InvalidOperationException("_stepGraphExec field not found.");
-                    Assert.True(execField.GetValue(plan) is IntPtr handle && handle != IntPtr.Zero,
-                        "the captured plan is not replaying a graph after warm-up");
-                }
-                // The bad batch: it is reported on its own step (a discarded NaN step) or, on a backend that does not
-                // propagate NaN, on the next one.
+                if (capture) AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
+                var beforeBad = parameters.Select(p => p.ToArray()).ToArray();
+                int acceptedBefore = ((CompiledTrainingPlan<float>)plan).OptimizerStep;
                 Feed(Steps, bad: true);
-                ArgumentOutOfRangeException? caught = null;
-                for (int s = Steps; s <= Steps + 1 && caught is null; s++)
-                {
-                    try { plan.Step(); }
-                    catch (ArgumentOutOfRangeException ex) { caught = ex; }
-                    if (caught is null) Feed(s + 1, bad: false);
-                }
+                var caught = Assert.ThrowsAny<ArgumentOutOfRangeException>(() => plan.Step());
+                Assert.Equal(acceptedBefore, ((CompiledTrainingPlan<float>)plan).OptimizerStep);
+                for (int p = 0; p < parameters.Length; p++)
+                    Assert.Equal(beforeBad[p], parameters[p].ToArray());
                 Assert.NotNull(caught);
                 // Detected on the device, not by a host-side check of the uploaded ids.
                 Assert.DoesNotContain("out of bounds for vocabulary", caught!.Message);
@@ -1006,6 +1003,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             var losses = new double[Steps];
             for (int s = 0; s < Steps; s++)
             {
+                if (capture && s == badLabelAtStep) AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
                 if (s > 0) Feed(s);
                 losses[s] = plan.Step().ToArray()[0];
             }
@@ -1052,6 +1050,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(truth.Losses[s] - run.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(truth.Losses[s])),
                     $"step {s}: GPU plan loss {run.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            for (int p = 0; p < truth.Weights.Length; p++)
+                for (int i = 0; i < truth.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(truth.Weights[p][i] - run.Weights[p][i]) <= 1e-4f,
+                        $"param {p}[{i}]: GPU {run.Weights[p][i]} != CPU {truth.Weights[p][i]}");
         }
     }
 
