@@ -85,10 +85,17 @@ public sealed partial class CudaBackend
         lock (_realFftLock)
         {
             foreach (IntPtr stream in _realFftPlans.Values.Select(plan => plan.Stream).Distinct())
-                CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream), "cuStreamSynchronize(real FFT teardown)");
+            {
+                var status = CudaNativeBindings.cuStreamSynchronize(stream);
+                if (status != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning($"CUDA stream synchronization during FFT teardown returned {status}.");
+            }
             foreach (var plan in _realFftPlans.Values)
             {
-                if (plan.Handle != 0) CuFftNative.Check(CuFftNative.Destroy(plan.Handle), "cufftDestroy");
+                if (plan.Handle == 0) continue;
+                int status = CuFftNative.Destroy(plan.Handle);
+                if (status != 0)
+                    System.Diagnostics.Trace.TraceWarning($"cufftDestroy({plan.Handle}) returned {status} during teardown.");
                 plan.Handle = 0;
             }
             _realFftPlans.Clear();
