@@ -378,6 +378,33 @@ extern ""C"" __global__ __launch_bounds__(256) void resident_index_add(
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = outerSize * destinationAxis * innerSize;
+    // Scan each index once per workgroup. A single source can be read directly, while
+    // duplicates use the ordered loop below, including when the index buffer changes on replay.
+    __shared__ int owners[256];
+    int lane = (int)threadIdx.x;
+    int width = (int)blockDim.x;
+    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= 512) {
+        owners[lane] = -1;
+        __syncthreads();
+        int first = (gid - lane) % destinationAxis;
+        for (unsigned int j = (unsigned int)lane; j < (unsigned int)sourceAxis; j += (unsigned int)width) {
+            int index = indices[j];
+            if (index < 0 || index >= destinationAxis) continue;
+            int slot = index - first;
+            if (slot < 0) slot += destinationAxis;
+            if (slot < width && atomicExch(&owners[slot], (int)j) != -1)
+                atomicExch(&owners[slot], -2);
+        }
+        __syncthreads();
+        if (gid >= total) return;
+        int owner = owners[lane];
+        if (owner != -2) {
+            float value = destination[gid];
+            if (owner >= 0) value += source[(gid / destinationAxis) * sourceAxis + owner];
+            output[gid] = value;
+            return;
+        }
+    }
     if (gid >= total) return;
     int inner = gid % innerSize;
     int dst = (gid / innerSize) % destinationAxis;
