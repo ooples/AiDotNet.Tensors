@@ -215,6 +215,14 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var scalar = (T)savedState[0];
+        // A compiled first write already has a destination for the entire scaled gradient.
+        if (!gradOutput.IsSparse && engine.Unwrap().GetType() == typeof(CpuEngine) &&
+            DifferentiableOps.TryGetDirectGradTarget(grads, inputs[0], engine, out _, gradOutput, firstWriteOnly: true) is { } target)
+        {
+            engine.TensorMultiplyScalarInto(target, gradOutput, scalar);
+            target.IncrementVersion();
+            return;
+        }
         var grad = engine.TensorMultiplyScalar(gradOutput, scalar);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -9843,29 +9851,37 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
+        const double c = -1.1283791670955126; // -2/sqrt(pi)
+        // Create-graph, and any GPU engine: compose device element-wise ops (a host loop would download x and dY,
+        // which inside a compiled GPU step is a stream sync per call and blocks graph capture).
+        if (CreatesGraph || engine.TryGet<DirectGpuTensorEngine>(out _))
+        {
+            AccumulateScaled(grads, x, gradOutput,
+                Scale(engine, engine.TensorExp(engine.TensorNegate(Squared(engine, x))), c), engine);
+            return;
+        }
+        var ops = MathHelper.GetNumericOperations<T>();
         using var xSrcLease = x.Lease();
         var xSrc = xSrcLease.Span;
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
+        var target = DifferentiableOps.TryGetDirectGradTarget(grads, x, engine, out bool overwrite, gradOutput);
+        var gX = target ?? new Tensor<T>(x._shape);
+        bool add = target is not null && !overwrite;
         using var dXLease = gX.LeaseWritable();
         var dX = dXLease.Span;
-        // -2/√π
-        var c = ops.FromDouble(-2.0 / System.Math.Sqrt(System.Math.PI));
-        if (CreatesGraph)
-        {
-            AccumulateScaled(grads, x, gradOutput,
-                Scale(engine, engine.TensorExp(engine.TensorNegate(Squared(engine, x))), -2.0 / System.Math.Sqrt(System.Math.PI)), engine);
-            return;
-        }
+        var cT = ops.FromDouble(c);
         for (int i = 0; i < dX.Length; i++)
         {
             var expTerm = ops.Exp(ops.Negate(ops.Multiply(xSrc[i], xSrc[i])));
-            dX[i] = ops.Multiply(dY[i], ops.Multiply(c, expTerm));
+            var contribution = ops.Multiply(dY[i], ops.Multiply(cT, expTerm));
+            dX[i] = add ? ops.Add(dX[i], contribution) : contribution;
         }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        if (target is null)
+            DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        else
+            target.IncrementVersion();
     }
 
     /// <summary>Erfinv backward: d/dy erfinv(y) = √π/2 · e^(erfinv(y)²).</summary>
