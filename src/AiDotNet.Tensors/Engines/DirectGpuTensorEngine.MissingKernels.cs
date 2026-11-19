@@ -4865,6 +4865,66 @@ public partial class DirectGpuTensorEngine
         }
         foreach (var copy in copies)
             if (copy.Source.TryGetTarget(out var source)) RefreshHostIndexDeviceCopy(backend, copy, source);
+        RefreshCapturedResidentIndicesNow(backend);
+    }
+
+    // Device-resident index tensors a capture read through their own buffer (a captured fused cross-entropy's target
+    // ids), with the buffer handle the graph baked. A host write to such a tensor bumps its version; eager steps then
+    // re-upload it, but a replay reads the baked buffer, so RefreshCapturedResidentIndicesNow uploads a host-newer
+    // tensor into that buffer in place before each replay, as RefreshGraphInputInPlace does for float leaves.
+    private sealed class CapturedResidentIndex
+    {
+        public WeakReference<Tensor<int>> Tensor = null!;
+        public IntPtr Handle;
+    }
+    private readonly List<CapturedResidentIndex> _capturedResidentIndices = new();
+
+    private void RecordCapturedResidentIndex(Tensor<int> indices)
+    {
+        if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero) return;
+        lock (_hostIndexLock)
+        {
+            _capturedResidentIndices.RemoveAll(r => !r.Tensor.TryGetTarget(out _));
+            foreach (var r in _capturedResidentIndices)
+                if (r.Tensor.TryGetTarget(out var t) && ReferenceEquals(t, indices)) { r.Handle = buffer.Handle; return; }
+            _capturedResidentIndices.Add(new CapturedResidentIndex
+            {
+                Tensor = new WeakReference<Tensor<int>>(indices),
+                Handle = buffer.Handle,
+            });
+        }
+    }
+
+    private void RefreshCapturedResidentIndicesNow(IDirectGpuBackend backend)
+    {
+        CapturedResidentIndex[] entries;
+        lock (_hostIndexLock) entries = _capturedResidentIndices.ToArray();
+        foreach (var entry in entries)
+            if (entry.Tensor.TryGetTarget(out var indices)) RefreshResidentIndexInPlace(backend, indices, entry.Handle);
+    }
+
+    /// <summary>
+    /// Uploads a device-resident index tensor's host contents into its own device buffer, in place, when a host write
+    /// left that buffer stale (its version moved and the host holds the newer values). A compiled resident step reads
+    /// the buffer without the eager path's version check, and a replay reads it through a baked pointer: both need it
+    /// current before they run. Never inside a capture (a synchronous upload). <paramref name="expectedHandle"/>, when
+    /// set, is the buffer a captured graph baked.
+    /// </summary>
+    private static void RefreshResidentIndexInPlace(IDirectGpuBackend backend, Tensor<int> indices, IntPtr expectedHandle)
+    {
+        int version = indices.GpuCacheVersion;
+        if (indices._gpuBufferVersion == version) return;   // the device buffer is current (or newer)
+        var host = indices.GetBackingArrayForCacheLookupUnsafe();
+        if (host is null || Helpers.HostSync.IsPending(host)) return;   // the device holds the newer values
+        if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero
+            || (expectedHandle != IntPtr.Zero && buffer.Handle != expectedHandle))
+            throw new InvalidOperationException(
+                "A device-resident index tensor read by a captured graph was given a new device buffer: the graph " +
+                "reads the old one through a baked pointer.");
+        var data = indices.GetDataArray();
+        if (indices._gpuBufferContainsRawInt32) backend.UploadIntBufferInPlace(data, buffer);
+        else backend.UploadBufferInPlace(global::AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine.ToFloatArray(data), buffer);
+        indices._gpuBufferVersion = version;
     }
 
     private static bool HasResidentIndexStorage(Tensor<int> indices)
@@ -6839,6 +6899,12 @@ public partial class DirectGpuTensorEngine
             ids = new OwnedBuffer(GetHostIndexDeviceCopy(backend, targetIds, vocab), ownsBuffer: false);
             return true;
         }
+        // The compiled step reads this tensor's own buffer without a version check, and a replay through a baked
+        // pointer: bring a host write into that buffer now (outside a capture), and record it so the plan does the same
+        // before each replay.
+        bool capturingIds = backend is DirectGpu.IGpuGraphCapture capturing && capturing.IsStreamCapturing();
+        if (!capturingIds) RefreshResidentIndexInPlace(backend, targetIds, IntPtr.Zero);
+        RecordCapturedResidentIndex(targetIds);
         ids = GetOrAllocateInt32IndexBuffer(backend, targetIds);
         return true;
     }

@@ -828,9 +828,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// the labels' per-replay device copy in the forward and in the backward.
     /// </summary>
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void A_fused_cross_entropy_over_fed_host_labels_trains_like_the_cpu_plan(bool capture)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void A_fused_cross_entropy_over_fed_labels_trains_like_the_cpu_plan(bool capture, bool residentLabels)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -840,7 +842,9 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 "Whole-step graph capture is CUDA-only.");
             Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
                 "Graph capture is disabled for this process.");
-            var run = TrainFusedCrossEntropy(gpu, capture, badLabelAtStep: -1);
+            // residentLabels: the labels live on the device and each step's batch is written on the host; a replay reads
+            // their own buffer, so a stale buffer would train on the first batch's labels.
+            var run = TrainFusedCrossEntropy(gpu, capture, badLabelAtStep: -1, residentLabels);
             var prior = AiDotNetEngine.Current;
             var cpu = new CpuEngine();
             AiDotNetEngine.Current = cpu;
@@ -962,7 +966,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     private static (double[] Losses, float[][] Weights, bool Replayed) TrainFusedCrossEntropy(IEngine engine, bool capture,
-        int badLabelAtStep)
+        int badLabelAtStep, bool residentLabels = false)
     {
         const int vocab = 24;
         var labels = new Tensor<int>([Batch]);
@@ -982,6 +986,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
 
         ICompiledTrainingPlan<float> plan;
         Feed(0);
+        if (residentLabels && engine is DirectGpuTensorEngine) labels.Gpu();
         using (var scope = GraphMode.EnableTraining(parameters))
         {
             var h = engine.TensorTanh(engine.TensorMatMul(x, w));
