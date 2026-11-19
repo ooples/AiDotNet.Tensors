@@ -9,6 +9,8 @@ public sealed class Conv1DTaskGridTests
 {
     [Theory]
     [InlineData(1, 1024, 1024, 128, 5)]
+    [InlineData(1, 1024, 512, 128, 5)]
+    [InlineData(1, 256, 256, 256, 11)]
     [InlineData(1, 1024, 1024, 65, 5)]
     [InlineData(1, 1024, 1024, 33, 5)]
     [InlineData(7, 1024, 1024, 15, 5)]
