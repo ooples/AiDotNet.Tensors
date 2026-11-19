@@ -1320,17 +1320,6 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     internal Array? GraphBackingArrayIdentity => _data.TryGetBackingArrayIdentity(out var array, out _) ? array : null;
 
-    // Planner identity probes must not use DataVector: its getter realizes lazy nodes. An output can be rebound
-    // only before residency is established and while the tensor and the known trace lease are its sole owners.
-    internal object GraphVectorIdentity => _data;
-    internal bool CanShareUnboundGraphStorage(bool hasTraceLease) => !IsView && CoversWholeVector
-        && _gpuBuffer is null && _data.LiveStorages == 1
-        && _storage.RefCount == (_disposed ? 0 : 1) + (hasTraceLease ? 1 : 0)
-        && (!_data.TryGetBackingArrayIdentity(out var array, out int offset) || offset == 0 && array!.Length == Length)
-        && (_data.ResultOwner is null || (!_data.ResultOwner.State.Escaped && _data.ResultOwner.State.Wrappers == 1));
-
-    internal Array? GraphBackingArrayIdentity => _data.TryGetBackingArrayIdentity(out var array, out _) ? array : null;
-
     /// <summary>
     /// True when <see cref="_gpuBuffer"/> stores a logical <c>Tensor&lt;Complex&lt;T&gt;&gt;</c>
     /// as two contiguous float32 planes: all real values followed by all imaginary
