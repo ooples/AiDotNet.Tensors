@@ -678,7 +678,7 @@ public sealed class DirectPtxVisionBoxIouTests
                 }
                 Launch();
                 IntPtr graph = backend.CaptureGraph(Launch);
-                Assert.NotEqual(IntPtr.Zero, graph);
+                Assert.True(graph != IntPtr.Zero, "capture produced no graph: " + ((AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture)backend).LastCaptureFailure);
                 try
                 {
                     backend.EnqueueCapturedGraph(graph);
@@ -805,10 +805,10 @@ public sealed class DirectPtxVisionBoxIouTests
             using var output = backend.AllocateBuffer(checked(n * m));
             void Launch() => backend.BoxIou(aBuffer, bBuffer, output, n, m);
             IntPtr graph = backend.CaptureGraph(Launch);
-            Assert.NotEqual(IntPtr.Zero, graph);
+            Assert.True(graph != IntPtr.Zero, "capture produced no graph: " + ((AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture)backend).LastCaptureFailure);
             Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
             IntPtr secondGraph = backend.CaptureGraph(Launch);
-            Assert.NotEqual(IntPtr.Zero, secondGraph);
+            Assert.True(secondGraph != IntPtr.Zero, "capture produced no graph: " + ((AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture)backend).LastCaptureFailure);
             Assert.Equal(1, backend.DirectPtxVisionBoxIouPinnedKernelCount);
             try
             {

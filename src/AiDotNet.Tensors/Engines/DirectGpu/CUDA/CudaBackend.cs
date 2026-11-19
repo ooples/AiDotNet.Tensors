@@ -6819,8 +6819,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             try
             {
-                using var _ = PushContext();
-                if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                // Under the capture gate: cublasCreate initializes the library and allocates on the device, which
+                // invalidates a stream capture another thread has open on this context (CUDA 901) - the first upload
+                // that starts this warmup is often followed at once by a capture. A capture opened meanwhile waits.
+                lock (CaptureGateFor(_cudaContext))
+                {
+                    using var _ = PushContext();
+                    if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                }
             }
             catch (Exception) { /* best effort: the real handle reports any failure on first use */ }
         });
