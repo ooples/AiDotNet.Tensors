@@ -369,6 +369,7 @@ kernel void fused_ce_target_positions(
     int id = clamp(raw, 0, vocab - 1);
     positionBits[r] = as_type<float>((r % chunk) * vocab + id);
     positionBits[rows + r] = raw == id ? 0.0f : as_type<float>(0x7fc00000);
+    positionBits[2 * rows + r] = raw == id ? 0.0f : 1.0f;
 }
 
 kernel void resident_indices_to_int32(

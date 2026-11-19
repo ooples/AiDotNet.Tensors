@@ -376,6 +376,7 @@ void main() {
     int id = clamp(raw, 0, vocab - 1);
     positionBits[gid] = intBitsToFloat((gid % chunk) * vocab + id);
     positionBits[rows + gid] = raw == id ? 0.0 : intBitsToFloat(0x7fc00000);
+    positionBits[2 * rows + gid] = raw == id ? 0.0 : 1.0;
 }
 ";
 

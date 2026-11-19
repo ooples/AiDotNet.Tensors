@@ -4068,7 +4068,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
             gpuEngine?.NoteCompiledStepThread(_planId);
             if (gpuEngine is null) return StepLocked();
-            lock (gpuEngine.CompiledStepLock) return StepLocked();
+            lock (gpuEngine.CompiledStepLock)
+            {
+                // A device label the previous step found out of range (read asynchronously: see the engine's
+                // label-error word) fails this step before it runs; this step's own check is queued behind it.
+                gpuEngine.ThrowIfFusedCeLabelError();
+                var loss = StepLocked();
+                gpuEngine.QueueFusedCeLabelErrorCheck();
+                return loss;
+            }
         }
         catch
         {

@@ -342,6 +342,7 @@ __kernel void fused_ce_target_positions(
     int id = raw < 0 ? 0 : (raw >= vocab ? vocab - 1 : raw);
     positionBits[gid] = as_float((gid % chunk) * vocab + id);
     positionBits[rows + gid] = raw == id ? 0.0f : as_float(0x7fc00000);
+    positionBits[2 * rows + gid] = raw == id ? 0.0f : 1.0f;
 }
 
 __kernel void resident_indices_to_int32(
