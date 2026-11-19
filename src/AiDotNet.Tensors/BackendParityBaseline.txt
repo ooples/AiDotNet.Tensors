@@ -14,8 +14,3 @@ capability IRowConcatBackend MetalBackend #1749
 capability IRowConcatBackend OpenClBackend #1749
 capability IRowConcatBackend VulkanBackend #1749
 capability IRowConcatBackend WebGpuBackend #1749
-capability IGraphAttentionBackend HipBackend #1787
-capability IGraphAttentionBackend MetalBackend #1788
-capability IGraphAttentionBackend OpenClBackend #1789
-capability IGraphAttentionBackend VulkanBackend #1790
-capability IGraphAttentionBackend WebGpuBackend #1791

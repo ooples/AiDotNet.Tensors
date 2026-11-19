@@ -38,6 +38,8 @@ internal static class TorchModelOpsKernels
         "mo_time_embedding", "mo_time_embedding_backward",
         "mo_crf_forward", "mo_crf_backward",
         "mo_crf_boundary_grad", "mo_crf_transition_grad",
+        "gat_scores", "gat_forward", "gat_coefficients", "gat_row_grad",
+        "gat_column_grad", "gat_feature_grad", "gat_attention_grad",
     };
 
     /// <summary>The grid-index helper for CUDA and HIP, which compile the dialect directly.</summary>
@@ -1236,5 +1238,5 @@ extern ""C"" __global__ __launch_bounds__(256) void mo_crf_transition_grad(const
     dtrans[g] = s;
 }
 
-";
+" + PortableGraphAttentionKernels.Source;
 }

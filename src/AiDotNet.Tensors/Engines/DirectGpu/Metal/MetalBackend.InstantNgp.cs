@@ -1,7 +1,10 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend, IGraphAttentionBackend
 {
+    private PortableGraphAttention? _graphAttention;
+    private PortableGraphAttention GraphAttention => _graphAttention ??= new(LaunchTorchParity);
+
     private void DispatchInstantNgp(
         string kernelName,
         IGpuBuffer first,
@@ -504,4 +507,32 @@ public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IR
         encoder.SetBytes(spiralLength, 8);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
+
+    void IGraphAttentionBackend.GraphAttentionScores(IGpuBuffer wh, IGpuBuffer attention, IGpuBuffer selfScore, IGpuBuffer neighScore,
+        int rows, int heads, int features)
+        => GraphAttention.Scores(wh, attention, selfScore, neighScore,
+            rows, heads, features);
+
+    void IGraphAttentionBackend.GraphAttentionForward(IGpuBuffer wh, IGpuBuffer selfScore, IGpuBuffer neighScore, IGpuBuffer rowPtr,
+        IGpuBuffer col, IGpuBuffer output, int batch, int nodes, int heads, int features, int edges,
+        double slope, uint cutoff, float keep, uint seed)
+        => GraphAttention.Forward(wh, selfScore, neighScore, rowPtr, col, output,
+            batch, nodes, heads, features, edges, slope, cutoff, keep, seed);
+
+    void IGraphAttentionBackend.GraphAttentionBackwardRows(IGpuBuffer wh, IGpuBuffer gradOutput, IGpuBuffer selfScore, IGpuBuffer neighScore,
+        IGpuBuffer rowPtr, IGpuBuffer col, IGpuBuffer gz, IGpuBuffer cp, IGpuBuffer gSelf,
+        int batch, int nodes, int heads, int features, int edges, double slope, uint cutoff, float keep, uint seed)
+        => GraphAttention.BackwardRows(wh, gradOutput, selfScore, neighScore, rowPtr, col, gz, cp, gSelf,
+            batch, nodes, heads, features, edges, slope, cutoff, keep, seed);
+
+    void IGraphAttentionBackend.GraphAttentionBackwardCols(IGpuBuffer gradOutput, IGpuBuffer attention, IGpuBuffer gz, IGpuBuffer cp,
+        IGpuBuffer gSelf, IGpuBuffer colPtr, IGpuBuffer tRow, IGpuBuffer tEdge, IGpuBuffer gNeigh, IGpuBuffer gradWh,
+        int batch, int nodes, int heads, int features, int edges)
+        => GraphAttention.BackwardCols(gradOutput, attention, gz, cp, gSelf, colPtr, tRow, tEdge, gNeigh, gradWh,
+            batch, nodes, heads, features, edges);
+
+    void IGraphAttentionBackend.GraphAttentionAttentionGrad(IGpuBuffer wh, IGpuBuffer gSelf, IGpuBuffer gNeigh, IGpuBuffer gradAttention,
+        int rows, int heads, int features)
+        => GraphAttention.AttentionGrad(wh, gSelf, gNeigh, gradAttention,
+            rows, heads, features);
 }

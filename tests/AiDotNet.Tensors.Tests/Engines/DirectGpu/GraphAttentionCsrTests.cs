@@ -2,6 +2,11 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.Metal;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
+using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -136,6 +141,20 @@ public class GraphAttentionCsrTests
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
             Assert.True(gpu?.IsGpuAvailable == true, "Required GPU backend did not resolve.");
         Skip.IfNot(gpu?.IsGpuAvailable == true, "GPU backend did not resolve.");
+        Check(gpu!, rate);
+    }
+
+    internal static void CheckBackend(IDirectGpuBackend backend)
+    {
+        using var direct = new DirectGpuEngine(backend, borrowsBackend: true);
+        using var engine = new DirectGpuTensorEngine(direct);
+        Assert.True(engine.IsGpuAvailable);
+        Check(engine, 0);
+        Check(engine, 0.4);
+    }
+
+    private static void Check(DirectGpuTensorEngine gpu, double rate)
+    {
         bool savedFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
         try
         {
@@ -148,13 +167,7 @@ public class GraphAttentionCsrTests
             var gradOut = new Tensor<float>(Array.ConvertAll(Gen(wh.Length, 8), x => (float)x), shape);
             const uint seed = 12345u;
 
-            if (gpu!.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.IGraphAttentionBackend)
-            {
-                var ex = Assert.Throws<NotSupportedException>(() => gpu.GraphAttentionCsr(wh, attn, g));
-                Assert.Contains(gpu.GetBackend()!.BackendName, ex.Message);
-                Assert.Contains("CpuEngine", ex.Message);
-                return;
-            }
+            Assert.IsAssignableFrom<IGraphAttentionBackend>(gpu.GetBackend());
 
             Close(cpu.GraphAttentionCsrForward(wh, attn, g, 0.2, rate, seed).ToArray(),
                 gpu!.GraphAttentionCsrForward(wh, attn, g, 0.2, rate, seed).ToArray(), "forward");
@@ -172,9 +185,26 @@ public class GraphAttentionCsrTests
                 Close(cWh.ToArray(), gradients[wh].ToArray(), "public dWh");
                 Close(cAttn.ToArray(), gradients[attn].ToArray(), "public dAttn");
 
+                var emptyGraph = new CsrGraph(Nodes, new int[Nodes + 1], Array.Empty<int>());
+                Assert.All(gpu.GraphAttentionCsrForward(wh, attn, emptyGraph, 0.2, 0, 0).ToArray(), x => Assert.Equal(0f, x));
+                var emptyGrad = gpu.GraphAttentionCsrBackward(gradOut, wh, attn, emptyGraph, 0.2, 0, 0);
+                Assert.All(emptyGrad.GradTransformed.ToArray(), x => Assert.Equal(0f, x));
+                Assert.All(emptyGrad.GradAttention.ToArray(), x => Assert.Equal(0f, x));
+
+                var boundary = new CsrGraph(2, new[] { 0, 2, 2 }, new[] { 0, 1 });
+                var values = new Tensor<float>(new[] { 16777216f, 0f, 0f, 1f }, new[] { 2, 2 });
+                var weights = new Tensor<float>(new[] { 1f, 0f, 0f, 1f }, new[] { 1, 4 });
+                Close(cpu.GraphAttentionCsrForward(values, weights, boundary, 0.2, 0, 0).ToArray(),
+                    gpu.GraphAttentionCsrForward(values, weights, boundary, 0.2, 0, 0).ToArray(), "score precision");
+
                 var one = new CsrGraph(1, new[] { 0, 1 }, new[] { 0 });
                 var feature = new Tensor<float>(new[] { 1e20f }, new[] { 1, 1 });
                 var weight = new Tensor<float>(new[] { 1e20f, 0f }, new[] { 1, 2 });
+                var negativeFeature = new Tensor<float>(new[] { -1f }, new[] { 1, 1 });
+                var unitWeight = new Tensor<float>(new[] { 1f, 0f }, new[] { 1, 2 });
+                var wideSlope = gpu.GraphAttentionCsrBackward(negativeFeature, negativeFeature, unitWeight, one, 1e100, 0, 0);
+                Assert.Equal(-1f, wideSlope.GradTransformed.ToArray()[0]);
+                Assert.Equal(new[] { 0f, 0f }, wideSlope.GradAttention.ToArray());
                 Assert.Equal(1e20f, gpu.GraphAttentionCsrForward(feature, weight, one, 0.2, 0, 0).ToArray()[0]);
                 Assert.Equal(0f, gpu.GraphAttentionCsrForward(feature, weight, one, 0.2, 1e-50, 0).ToArray()[0]);
             }
@@ -264,3 +294,71 @@ public class GraphAttentionCsrTests
                 $"{what}[{i}] cpu={expected[i]} gpu={actual[i]}");
     }
 }
+
+[Collection("DirectGpuSerial")]
+public sealed class HipGraphAttentionCsrTests
+{
+    [SkippableFact]
+    public void ForwardAndBackwardMatchCpu()
+    {
+        using var backend = new HipBackend();
+        if (backend.InitializationState == GpuBackendInitializationState.Failed)
+            throw new InvalidOperationException("HIP initialization failed.", backend.InitializationException);
+        Skip.IfNot(backend.IsAvailable, "HIP is not available.");
+        GraphAttentionCsrTests.CheckBackend(backend);
+    }
+}
+
+[Collection("DirectGpuSerial")]
+public sealed class OpenClGraphAttentionCsrTests
+{
+    [SkippableFact]
+    public void ForwardAndBackwardMatchCpu()
+    {
+        Skip.IfNot(DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0, "No OpenCL device.");
+        using var backend = new OpenClBackend(deviceIndex: 0);
+        if (backend.InitializationState == GpuBackendInitializationState.Failed)
+            throw new InvalidOperationException("OpenCL initialization failed.", backend.InitializationException);
+        Skip.IfNot(backend.IsAvailable, "OpenCL backend did not initialize.");
+        GraphAttentionCsrTests.CheckBackend(backend);
+    }
+}
+
+[Collection("DirectGpuSerial")]
+public sealed class VulkanGraphAttentionCsrTests
+{
+    [SkippableFact]
+    public void ForwardAndBackwardMatchCpu()
+    {
+        var backend = VulkanBackend.Instance;
+        Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan with a GLSL compiler is not available.");
+        GraphAttentionCsrTests.CheckBackend(backend);
+    }
+}
+
+[Collection("DirectGpuSerial")]
+public sealed class MetalGraphAttentionCsrTests
+{
+    [SkippableFact]
+    public void ForwardAndBackwardMatchCpu()
+    {
+        Skip.IfNot(System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX),
+            "Metal is only available on macOS.");
+        using var backend = new MetalBackend();
+        Skip.IfNot(backend.IsAvailable, "Metal is not available.");
+        GraphAttentionCsrTests.CheckBackend(backend);
+    }
+}
+
+#if NET7_0_OR_GREATER
+[Collection("DirectGpuSerial")]
+public sealed class WebGpuGraphAttentionCsrTests
+{
+    [SkippableFact]
+    public void ForwardAndBackwardMatchCpu()
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        GraphAttentionCsrTests.CheckBackend(backend);
+    }
+}
+#endif
