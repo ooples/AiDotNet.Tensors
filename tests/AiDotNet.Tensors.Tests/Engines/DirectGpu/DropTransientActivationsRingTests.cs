@@ -72,12 +72,14 @@ public class DropTransientActivationsRingTests
         using var engine = new DirectGpuTensorEngine();
         Assert.NotNull(CacheActivationMethod);
 
+        // The cache's keys are weak: hold every key, or a GC mid-test drops entries before the walk sees them.
+        var keys = new List<object>();
         var older = new List<TrackingGpuBuffer>();
-        for (int i = 0; i < before; i++) older.Add(Cache(engine).Buffer);
+        for (int i = 0; i < before; i++) { var c = Cache(engine); keys.Add(c.Key); older.Add(c.Buffer); }
 
         long snapshot = engine.ActivationCacheTimestampSnapshot();
         var newer = new List<TrackingGpuBuffer>();
-        for (int i = 0; i < after - 1; i++) newer.Add(Cache(engine).Buffer);
+        for (int i = 0; i < after - 1; i++) { var c = Cache(engine); keys.Add(c.Key); newer.Add(c.Buffer); }
         var kept = Cache(engine);
 
         engine.DropTransientActivationsCreatedAfter(snapshot, kept.Key);
@@ -85,5 +87,6 @@ public class DropTransientActivationsRingTests
         Assert.All(older, b => Assert.Equal(0, b.DisposeCount));
         Assert.All(newer, b => Assert.Equal(1, b.DisposeCount));
         Assert.Equal(0, kept.Buffer.DisposeCount);
+        GC.KeepAlive(keys);
     }
 }
