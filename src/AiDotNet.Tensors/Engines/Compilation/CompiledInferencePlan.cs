@@ -2084,10 +2084,15 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             new TileSchedulingPass(),     // L1/L2 tile sizing for GEMM/Conv (#182)
         };
 
+        // The fusion passes build host kernels over the steps' host arrays: in a GPU engine's plan those arrays are not
+        // authoritative (a device-resident value, a state the plan writes on the device), so only the device-agnostic
+        // passes, which keep the engine's own steps, run there.
+        bool gpuPlan = engine.TryGet<DirectGpuTensorEngine>(out _);
         var current = steps;
         foreach (var pass in passes)
         {
             if (!pass.IsEnabled) continue;
+            if (gpuPlan && pass is not (ConstantFoldingPass or ForwardCSEPass)) continue;
             var optimized = pass.TryOptimize(current, engine);
             if (optimized != null)
                 current = optimized;
