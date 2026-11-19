@@ -3372,9 +3372,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try { Helpers.HostSync.TryMaterialize(kv.Key); }
                 catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ClearActivationCache", capabilityGap); Helpers.HostSync.Remove(kv.Key); }
                 catch (Exception released) when (released is ObjectDisposedException
-                                                 || released.InnerException is ObjectDisposedException)
+                                                 || released.InnerException is ObjectDisposedException
+                                                 || Helpers.ResidentHostMirror.IsNoLiveReader(released))
                 {
-                    // The entry's device buffer was already released (issue #226), so its host copy cannot be
+                    // The entry's device buffer was already released (issue #226), or no enrolled reader holds its
+                    // pending value any more (ResidentHostMirror), so its host copy cannot be
                     // recovered here either. Throwing would abort the clear -- and Dispose with it, leaking every
                     // other entry's buffer. The materializer is kept, not removed: a later host read of that tensor
                     // still fails loudly instead of silently returning a stale array.
@@ -4242,8 +4244,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // Tensors whose bound device buffer holds their current value while the host copy may lag: parameters an optimizer
     // updated in place (CommitParameterUpdatedOnDevice) and the in-place state a compiled plan keeps on the device (a
-    // BatchNorm running statistic). Keyed by tensor, with that buffer; weak, so an entry goes with its tensor.
-    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, IGpuBuffer> _deviceAuthoritativeParameters = new();
+    // BatchNorm running statistic). Keyed by tensor, with that buffer; weak, so an entry goes with its tensor. The buffer
+    // sits in a box updated in place, so recommitting a tracked tensor every optimizer step allocates nothing.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, System.Runtime.CompilerServices.StrongBox<IGpuBuffer>> _deviceAuthoritativeParameters = new();
 
     /// <summary>
     /// Whether <paramref name="tensor"/> is still bound to a device buffer its owner updates on the device (see
@@ -4258,7 +4261,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // pointer in, re-checks the handle before each replay (CompiledTrainingPlan.ForeignParametersStillBound).
         if (tensor._gpuBuffer is not { } bound) return false;
         lock (_deviceAuthoritativeParameters)
-            return _deviceAuthoritativeParameters.TryGetValue(tensor, out var committed) && ReferenceEquals(committed, bound);
+            return _deviceAuthoritativeParameters.TryGetValue(tensor, out var committed) && ReferenceEquals(committed.Value, bound);
     }
 
     /// <summary>Records that <paramref name="tensor"/>'s current value lives in <paramref name="buffer"/>, its binding,
@@ -4267,8 +4270,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         lock (_deviceAuthoritativeParameters)
         {
-            _deviceAuthoritativeParameters.Remove(tensor);
-            _deviceAuthoritativeParameters.Add(tensor, buffer);
+            if (_deviceAuthoritativeParameters.TryGetValue(tensor, out var committed)) committed.Value = buffer;
+            else _deviceAuthoritativeParameters.Add(tensor, new System.Runtime.CompilerServices.StrongBox<IGpuBuffer>(buffer));
         }
     }
 

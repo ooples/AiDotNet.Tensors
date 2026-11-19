@@ -24,6 +24,13 @@ namespace AiDotNet.Tensors.Helpers;
 /// </remarks>
 internal static class ResidentHostMirror
 {
+    private const string NoLiveReaderMessage = "The resident host mirror has no live reader for its pending device value.";
+
+    /// <summary>Whether <paramref name="error"/> is a host read that failed because no enrolled reader holds the
+    /// pending device value (the value is unrecoverable, as for a released buffer).</summary>
+    internal static bool IsNoLiveReader(Exception error)
+        => error is InvalidOperationException && error.Message == NoLiveReaderMessage;
+
     private sealed class Group<T>
     {
         public readonly List<WeakReference<Tensor<T>>> Members = new();
@@ -36,12 +43,13 @@ internal static class ResidentHostMirror
             var array = vector is null ? (T[])key : vector.GetBackingArrayUnsafe() ?? new T[vector.Length];
             WeakReference<Tensor<T>>[] members;
             lock (Members) members = Members.ToArray();
-            bool downloaded = false;
+            bool downloaded = false, liveReader = false;
             foreach (var weak in members)
             {
                 if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
                 if (!ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)
                     && (vector is null || !ReferenceEquals(t.DataVector, vector))) continue; // re-homed since
+                liveReader = true;
                 // A member bound to a pooled scratch buffer that was since released (ClearActionScratchPool) has
                 // nothing to contribute; its host slice is already the value. One such member must not abort the
                 // host read for every other view on the array.
@@ -60,10 +68,11 @@ internal static class ResidentHostMirror
                 Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
                 downloaded = true;
             }
-            // A pending device write has no proven current host copy. Do not turn
-            // an empty weak-reader list into a successfully materialized zero array.
-            if (!downloaded)
-                throw new InvalidOperationException("The resident host mirror has no live reader for its pending device value.");
+            // A pending device write has no proven current host copy. Do not turn an empty weak-reader list into a
+            // successfully materialized zero array. A live reader whose buffer was released or disposed leaves its
+            // host slice as the value (see above), so only the absence of any reader fails the read.
+            if (!downloaded && !liveReader)
+                throw new InvalidOperationException(NoLiveReaderMessage);
             if (vector is not null)
             {
                 // Publish only after every slice downloaded successfully. Subsequent array-backed binds
