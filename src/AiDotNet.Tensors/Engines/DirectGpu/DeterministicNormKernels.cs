@@ -238,7 +238,7 @@ FN void dgn_to_double(U64 alo, U64 ahi, int v, PPTR(U32) wlo, PPTR(U32) whi)
             dgn_shr128(alo, ahi, sh, &top, &h);
             int roundBit = dgn_bitat(alo, ahi, sh - 1);
             // Sticky bit: any of the low sh - 1 bits set. Written with masks rather than dgn_lowbits: POCL 6's
-            // LLVM 18 aborts with "Instruction Combining did not reach a fixpoint" on the dgn_lowbits form here.
+            // LLVM 18 aborts (Instruction Combining did not reach a fixpoint) on the dgn_lowbits form here.
             int rb = sh - 1;
             U64 mlo = rb >= 64 ? ~(U64)0 : ((DGN_ONE << rb) - DGN_ONE);
             U64 mhi = rb > 64 ? ((DGN_ONE << (rb - 64)) - DGN_ONE) : (U64)0;
