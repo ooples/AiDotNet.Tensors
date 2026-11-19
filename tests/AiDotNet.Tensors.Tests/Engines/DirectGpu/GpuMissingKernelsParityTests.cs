@@ -496,6 +496,48 @@ public sealed class GpuMissingKernelsParityTests : IClassFixture<GpuMissingKerne
         AssertMatch(gpu, cpu, $"TensorIndexAdd_1D[n={n};m={idxArr.Length}]");
     }
 
+    [SkippableTheory]
+    [InlineData(512)]
+    [InlineData(531)] // a workgroup spans two outer rows
+    public void ResidentIndexAddReadsChangedIndicesAndPreservesDuplicateOrder(int size)
+    {
+        if (!EnsureGpuReady()) return;
+        var backend = _gpu.GetBackend();
+        var indexBackend = Assert.IsAssignableFrom<AiDotNet.Tensors.Engines.DirectGpu.IResidentIndexBackend>(backend);
+        const int outer = 3;
+        var indices = new int[size];
+        var seed = new float[outer * size];
+        var values = new float[seed.Length];
+        for (int j = 0; j < size; j++) indices[j] = size - 1 - j;
+        for (int i = 0; i < values.Length; i++)
+        {
+            seed[i] = i % 7;
+            values[i] = (i % size) switch { 0 => 1e20f, 1 => -1e20f, _ => i % 13 - 6 };
+        }
+
+        using var keys = backend.AllocateIntBuffer(indices);
+        using var input = backend.AllocateBuffer(values);
+        for (int pass = 0; pass < 2; pass++)
+        {
+            if (pass == 1)
+            {
+                indices[0] = indices[1] = indices[2] = 3;
+                indices[3] = -1;
+                indices[4] = size;
+                backend.UploadIntBufferInPlace(indices, keys);
+            }
+            var expected = (float[])seed.Clone();
+            for (int b = 0; b < outer; b++)
+                for (int j = 0; j < size; j++)
+                    if ((uint)indices[j] < (uint)size)
+                        expected[b * size + indices[j]] += values[b * size + j];
+            using var target = backend.AllocateBuffer(seed);
+            indexBackend.IndexAdd(target, keys, input, target, outer, size, size, 1);
+            Assert.Equal(expected, backend.DownloadBuffer(target));
+        }
+    }
+
+
     // repeat_interleave along the LAST axis (the case the backend kernel covers).
     public static IEnumerable<object[]> RepeatInterleaveCases() => new List<object[]>
     {

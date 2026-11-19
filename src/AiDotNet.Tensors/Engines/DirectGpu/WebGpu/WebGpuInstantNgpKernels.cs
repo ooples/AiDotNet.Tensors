@@ -439,9 +439,38 @@ struct OneHotP { rows: i32, depth: i32 };
 @group(0) @binding(3) var<storage, read_write> output_ : array<f32>;
 struct IndexAddP { outerSize: i32, sourceAxis: i32, destinationAxis: i32, innerSize: i32 };
 @group(0) @binding(4) var<uniform> p : IndexAddP;
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+var<workgroup> owners: array<atomic<i32>, 256>;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>, @builtin(local_invocation_index) lane: u32) {
     let gid = i32(id.x);
     let total = p.outerSize * p.destinationAxis * p.innerSize;
+    // Scan each index once per workgroup. Duplicates retain the original summation order.
+    if (p.innerSize == 1 && p.sourceAxis == p.destinationAxis && p.sourceAxis >= 512) {
+        atomicStore(&owners[lane], -1);
+        workgroupBarrier();
+        let first = (gid - i32(lane)) % p.destinationAxis;
+        for (var j = lane; j < u32(p.sourceAxis); j += 256u) {
+            let index = indices[j];
+            if (index < 0 || index >= p.destinationAxis) { continue; }
+            var slot = index - first;
+            if (slot < 0) { slot += p.destinationAxis; }
+            if (slot < 256) {
+                if (atomicExchange(&owners[slot], i32(j)) != -1) {
+                    atomicStore(&owners[slot], -2);
+                }
+            }
+        }
+        workgroupBarrier();
+        if (gid >= total) { return; }
+        let owner = atomicLoad(&owners[lane]);
+        if (owner != -2) {
+            var uniqueValue = destination[gid];
+            if (owner >= 0) {
+                uniqueValue += source[(gid / p.destinationAxis) * p.sourceAxis + owner];
+            }
+            output_[gid] = uniqueValue;
+            return;
+        }
+    }
     if (gid >= total) { return; }
     let inner = gid % p.innerSize;
     let dst = (gid / p.innerSize) % p.destinationAxis;

@@ -414,9 +414,36 @@ layout(set = 0, binding = 3) writeonly buffer Output { float output_[]; };
 layout(push_constant) uniform P {
     int outerSize; int sourceAxis; int destinationAxis; int innerSize;
 };
+shared int owners[256];
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     int total = outerSize * destinationAxis * innerSize;
+    // Scan each index once per workgroup. A single source can be read directly, while
+    // duplicates use the ordered loop below, including when the index buffer changes on replay.
+    int lane = int(gl_LocalInvocationIndex);
+    int width = 256;
+    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= 512) {
+        owners[lane] = -1;
+        barrier();
+        int first = (gid - lane) % destinationAxis;
+        for (uint j = uint(lane); j < uint(sourceAxis); j += uint(width)) {
+            int index = indices[j];
+            if (index < 0 || index >= destinationAxis) continue;
+            int slot = index - first;
+            if (slot < 0) slot += destinationAxis;
+            if (slot < width && atomicExchange(owners[slot], int(j)) != -1)
+                atomicExchange(owners[slot], -2);
+        }
+        barrier();
+        if (gid >= total) return;
+        int owner = owners[lane];
+        if (owner != -2) {
+            float value = destination[gid];
+            if (owner >= 0) value += source[(gid / destinationAxis) * sourceAxis + owner];
+            output_[gid] = value;
+            return;
+        }
+    }
     if (gid >= total) return;
     int inner = gid % innerSize;
     int dst = (gid / innerSize) % destinationAxis;
