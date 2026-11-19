@@ -132,7 +132,11 @@ public partial class DirectGpuTensorEngine
             }
             else
             {
-                using var complex = AllocateTransientScratch(backend, checked(rows * n * 2));
+                int complexLength = checked(rows * n * 2);
+                using var complex = AllocateTransientScratch(backend, complexLength, fullyWritten: true);
+                // StridedScatter fills only the real lanes. Reused native storage can hold a prior spectrum.
+                if (backend is IDeviceZeroFill zero) zero.ZeroBuffer(complex.Buffer, complexLength);
+                else backend.Fill(complex.Buffer, 0f, complexLength);
                 backend.StridedScatter(input, complex.Buffer, 0, 2, checked(rows * n));
                 PortableRfftTransform(backend, complex.Buffer, spectrum.Buffer, rows, n, inverse: false);
             }
