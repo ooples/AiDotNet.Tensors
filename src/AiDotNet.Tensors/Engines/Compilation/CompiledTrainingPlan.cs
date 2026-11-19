@@ -11745,6 +11745,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var method = backward.Method;
         return method == ((BackwardFunction<T>)BackwardFunctions<T>.Conv2DBackward).Method
             || method == ((BackwardFunction<T>)BackwardFunctions<T>.FusedConv2DBiasActivationBackward).Method
+            || method == ((BackwardFunction<T>)BackwardFunctions<T>.GroupedConv2DBackward).Method
             || method == ((BackwardFunction<T>)BackwardFunctions<T>.ChannelBiasAddBackward).Method;
     }
 
