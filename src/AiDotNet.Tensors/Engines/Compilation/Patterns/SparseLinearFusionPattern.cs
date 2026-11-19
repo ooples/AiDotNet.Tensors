@@ -253,11 +253,20 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
         }
     }
 
+    /// <summary>
+    /// Leaves the compile being run declares as changing on every execution (a stateful plan's states): never a
+    /// sparse weight, however sparse their traced value (a recurrent state starts at zero). Set only for the duration
+    /// of one compile on this thread.
+    /// </summary>
+    [ThreadStatic] internal static HashSet<object>? t_dynamicLeaves;
+
+    private static bool IsDeclaredDynamic(Tensor<float>? t) => t is not null && t_dynamicLeaves is { } d && d.Contains(t);
+
     private static bool TryBuildCsrFromStaticWeight(LazyNode<float> matmul, out CsrWeights? weights)
     {
         weights = null;
         var weight = matmul.Input1;
-        if (weight is null || weight.LazySource is not null)
+        if (weight is null || weight.LazySource is not null || IsDeclaredDynamic(weight))
             return false;
         if (matmul.Input0.Rank != 2 || weight.Rank != 2)
             return false;
@@ -273,7 +282,8 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
         out CsrWeights? weights)
     {
         weights = null;
-        if (maskNode.Input1 is null || maskNode.Input0.LazySource is not null || maskNode.Input1.LazySource is not null)
+        if (maskNode.Input1 is null || maskNode.Input0.LazySource is not null || maskNode.Input1.LazySource is not null
+            || IsDeclaredDynamic(maskNode.Input0) || IsDeclaredDynamic(maskNode.Input1))
             return false;
         if (matmul.Input0.Rank != 2 || maskNode.Input0.Rank != 2 || maskNode.Input1.Rank != 2)
             return false;

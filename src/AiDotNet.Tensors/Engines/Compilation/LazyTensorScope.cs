@@ -670,6 +670,19 @@ internal sealed class LazyTensorScope : IDisposable
     }
 
     /// <summary>
+    /// Compiles a stateful inference plan: as the multi-input compile, plus <paramref name="stateUpdates"/>, pairs of
+    /// a traced leaf and the value the graph computes to replace it. Each execution ends by writing every next value
+    /// into its state's storage, so a recurrent or KV-cached decode step advances its state on every replay
+    /// (CompiledInferencePlan's CUDA graph included) without host work.
+    /// </summary>
+    internal CompiledInferencePlan<T> CompileInference<T>(Tensor<T> explicitOutput, Tensor<T>[] inputs,
+        IReadOnlyList<(Tensor<T> State, Tensor<T> Next)> stateUpdates)
+    {
+        return CompilePlan(
+            () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputs, stateUpdates));
+    }
+
+    /// <summary>
     /// Compiles the lazy graph into a training plan with forward + backward steps.
     /// The plan can be replayed for zero-overhead training iterations.
     /// </summary>
