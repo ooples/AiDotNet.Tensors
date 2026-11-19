@@ -799,7 +799,14 @@ public class CompilationComponentTests : IDisposable
             // The plan returned must execute this batch, not the first one's.
             Assert.True(plan.IsValid(x._shape));
             plan.SetInputs(new[] { x });
-            Assert.Equal(engine.TensorMatMul(x, weights).AsSpan().ToArray(), plan.Execute().AsSpan().ToArray());
+            // The plan runs a pre-packed GEMM whose summation order differs from eager's, so it matches eager to
+            // float rounding, not bit for bit (eager itself never adopts the plan's kernel: CompiledPlanEagerIsolationTests).
+            var expected = engine.TensorMatMul(x, weights).AsSpan().ToArray();
+            var actual = plan.Execute().AsSpan().ToArray();
+            Assert.Equal(expected.Length, actual.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-6f + 1e-5f * Math.Abs(expected[i]),
+                    $"batch {batch} [{i}]: plan {actual[i]:R} vs eager {expected[i]:R}");
         }
 
         RunBatch(4, 42, expectedTraces: 1);
