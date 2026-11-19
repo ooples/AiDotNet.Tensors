@@ -11,28 +11,6 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class InferenceBufferBestFitTests
 {
     [Fact]
-    public void TransitionReclamationPreservesRepeatedSizesAndSeparatesQueueHistory()
-    {
-        using var pool = new GpuBufferPool<Cell>(8, 1024);
-        var a = GpuBufferPoolAffinity.ForNativeQueue((IntPtr)21);
-        var b = GpuBufferPoolAffinity.ForNativeQueue((IntPtr)22);
-        var initial = new Cell(64); pool.Return(initial, a);
-        Assert.Equal(1, pool.ReturnIncompatibleIdleForLargerRequest(128, a, transitionOnly: true));
-        Assert.Equal(1, initial.Releases);
-        var repeat = new Cell(64); pool.Return(repeat, a);
-        Assert.Equal(0, pool.ReturnIncompatibleIdleForLargerRequest(128, a, transitionOnly: true));
-        Assert.Equal(0, pool.ReturnIncompatibleIdleForLargerRequest(96, a, transitionOnly: true));
-        Assert.Equal(0, repeat.Releases);
-        var foreign = new Cell(64); pool.Return(foreign, b);
-        Assert.Equal(1, pool.ReturnIncompatibleIdleForLargerRequest(128, b, transitionOnly: true));
-        Assert.Equal(1, foreign.Releases); Assert.Equal(0, repeat.Releases);
-        Assert.Equal(1, pool.ReturnIncompatibleIdleForLargerRequest(256, a, transitionOnly: true));
-        Assert.Equal(1, repeat.Releases);
-        pool.Return(new Cell(64), a);
-        Assert.Equal(1, pool.ReturnIncompatibleIdleForLargerRequest(128, a)); // Existing policy remains available.
-    }
-
-    [Fact]
     public void SmallestLargerClassPreservesCapacityAndReturnsUnderItsPhysicalClass()
     {
         using var pool = new GpuBufferPool<Cell>(4, 1024) { MaxPooledElements = 448 };

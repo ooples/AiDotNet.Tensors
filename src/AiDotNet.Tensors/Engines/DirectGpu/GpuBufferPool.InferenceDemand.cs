@@ -7,7 +7,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
 {
     private long _inferenceRegimeReleasedBuffers, _inferenceRegimeReleasedCapacityBytes;
-    private readonly Dictionary<GpuBufferPoolAffinity, int> _largestInferenceReclaimedSize = new();
     internal long InferenceRegimeNativeReleaseRequestedBuffers => Interlocked.Read(ref _inferenceRegimeReleasedBuffers);
     internal long InferenceRegimeNativeReleaseRequestedCapacityBytes => Interlocked.Read(ref _inferenceRegimeReleasedCapacityBytes);
 
@@ -41,18 +40,13 @@ internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpu
         return false;
     }
 
-    internal int ReturnIncompatibleIdleForLargerRequest(int requested, GpuBufferPoolAffinity affinity,
-        bool transitionOnly = false)
+    internal int ReturnIncompatibleIdleForLargerRequest(int requested, GpuBufferPoolAffinity affinity)
     {
         if (requested <= 0 || requested > _maxSize || Volatile.Read(ref _disposed) != 0) return 0;
         List<TBuffer>? detached = null;
         lock (_lifecycleGate)
         {
             if (Volatile.Read(ref _disposed) != 0) return 0;
-            // A pool miss inside a repeated forward is not a new working-size regime. Reclaim once when a larger
-            // size actually retires idle cells, then retain smaller reusable cells through repeats of that regime.
-            if (transitionOnly && _largestInferenceReclaimedSize.TryGetValue(affinity, out int largest)
-                && requested <= largest) return 0;
             bool any = false;
             // Return is serialized by this gate. Rent may remove a cell concurrently; removed cells are never freed
             // here. A same/larger idle cell means this is not a proven transition to a larger working size class.
@@ -73,8 +67,6 @@ internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpu
                         UnmarkMeasurementParked(candidate);
                         (detached ??= new List<TBuffer>()).Add(candidate);
                     }
-            if (transitionOnly && detached is not null)
-                _largestInferenceReclaimedSize[affinity] = requested;
         }
         // Native release can enter the driver's/context's own locks or callbacks. Never hold the pool gate across it.
         // A nested/closing inference scope cannot lend these detached private cells; every cell still gets released.
