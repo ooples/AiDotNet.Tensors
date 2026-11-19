@@ -3032,6 +3032,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _optimizerStep--;
         _nonFiniteStepsSkipped++;
         LastStepSkippedNonFiniteGradients = true;
+        // A captured or resident fused cross-entropy cannot check its device labels on the host, so an out-of-range id
+        // makes the loss and gradients NaN. Tell that apart from an overflow: the label error throws, it is not skipped.
+        if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var labelEngine) && labelEngine.TakeFusedCeLabelError())
+            throw new ArgumentOutOfRangeException("targetIds",
+                "A fused cross-entropy target id on this compiled step was outside [0, vocab). The step was not applied.");
     }
 
     private sealed class FusedOptimizerRuntimeScalars

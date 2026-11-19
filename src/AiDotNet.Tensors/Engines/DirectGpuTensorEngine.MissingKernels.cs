@@ -6656,6 +6656,7 @@ public partial class DirectGpuTensorEngine
         using var onesV = AllocateStreamOrderedScratch(backend, vocab);
         using var chunkPositions = AllocateStreamOrderedScratch(backend, chunk);
         using var chunkFlags = deviceIds is not null ? AllocateStreamOrderedScratch(backend, chunk) : null;
+        var labelError = deviceIds is not null ? FusedCeLabelErrorWord(backend) : null;
         backend.Fill(ones, 1f, chunk);
         backend.Fill(onesV, 1f, vocab);
         for (int r0 = 0; r0 < n; r0 += chunk)
@@ -6678,6 +6679,7 @@ public partial class DirectGpuTensorEngine
             {
                 backend.Copy(positions.Buffer, n + r0, chunkFlags, 0, c);
                 backend.Gemm(ones, chunkFlags, meanLoss, 1, 1, c, 1f, 1f); // NaN when a row's id was out of range
+                backend.Gemm(ones, chunkFlags, labelError!, 1, 1, c, 1f, 1f); // sticky until TakeFusedCeLabelError
             }
         }
         backend.Scale(meanLoss, meanLoss, 1f / n, 1);
@@ -6836,6 +6838,43 @@ public partial class DirectGpuTensorEngine
             return true;
         }
         ids = GetOrAllocateInt32IndexBuffer(backend, targetIds);
+        return true;
+    }
+
+    // One float, NaN once a device-id fused cross-entropy saw an id outside [0, vocab): the NaN it puts in the loss
+    // would otherwise read as an ordinary non-finite step and be skipped. Allocated on the first (uncaptured)
+    // resident step; read only when a step is being discarded as non-finite (TakeFusedCeLabelError).
+    private IGpuBuffer? _fusedCeLabelError;
+    private readonly object _fusedCeLabelErrorLock = new();
+
+    private IGpuBuffer FusedCeLabelErrorWord(IDirectGpuBackend backend)
+    {
+        lock (_fusedCeLabelErrorLock)
+        {
+            if (_fusedCeLabelError is { } word) return word;
+            if (backend is DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())
+                throw new NotSupportedException(
+                    "The fused cross-entropy label-error word cannot be created inside a graph capture: run the step " +
+                    "uncaptured first.");
+            var buffer = backend.AllocateBuffer(1);
+            backend.Fill(buffer, 0f, 1);
+            return _fusedCeLabelError = buffer;
+        }
+    }
+
+    /// <summary>
+    /// True (and the word cleared) when a device-id fused cross-entropy saw an out-of-range id since the last call.
+    /// One 4-byte read; a compiled plan calls it only when it discards a step as non-finite, so a bad label throws
+    /// instead of being skipped as an overflow.
+    /// </summary>
+    internal bool TakeFusedCeLabelError()
+    {
+        IGpuBuffer? word;
+        lock (_fusedCeLabelErrorLock) word = _fusedCeLabelError;
+        if (word is null || !TryGetBackend(out var backend)) return false;
+        float value = backend.DownloadBuffer(word)[0];
+        if (!float.IsNaN(value)) return false;
+        backend.Fill(word, 0f, 1);
         return true;
     }
 
