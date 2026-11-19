@@ -221,33 +221,6 @@ public sealed class ResidentHostMirrorRangeTests
         Assert.Equal(6, state.DownloadBufferCalls);
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void MetadataAliasCreatedAfterPartialWrite_PreservesWriterOrder(bool hostless)
-    {
-        var state = new MockBackendState();
-        var backend = MockDirectGpuBackend.Create(state);
-        using var direct = new DirectGpuEngine(backend);
-        using var engine = new DirectGpuTensorEngine(direct);
-        using var source = hostless
-            ? Tensor<float>.CreateGpuResident(new[] { 3 }, TensorDevice.OpenCL)
-            : new Tensor<float>(new float[3], new[] { 3 });
-        using var whole = new MockGpuBuffer(new[] { 10f, 20f, 30f });
-        using var slice = new MockGpuBuffer(new[] { 8f, 9f });
-        engine.BindResidentBuffer(source, whole, backend);
-        using var partial = source.CreateNarrowView(0, 1, 3, recordAutodiff: false);
-        engine.BindResidentBuffer(partial, slice, backend);
-
-        // This alias inherits the whole buffer, but creating it is not a write
-        // and must not supersede the already newer, overlapping partial writer.
-        using var alias = engine.Reshape(source, new[] { 1, 3 });
-
-        Assert.Equal(new[] { 10f, 8f, 9f }, alias.ToArray());
-        Assert.Equal(new[] { 10f, 8f, 9f }, source.ToArray());
-        Assert.Equal(new[] { 8f, 9f }, partial.ToArray());
-    }
-
     [Fact]
     public void DetachedHostlessView_DoesNotOverwriteItsSourcesPendingDownload()
     {

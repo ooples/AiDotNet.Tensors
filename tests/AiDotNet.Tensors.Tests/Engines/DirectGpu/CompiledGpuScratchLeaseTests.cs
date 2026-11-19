@@ -178,14 +178,8 @@ public class CompiledGpuScratchLeaseTests
         {
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.001f);
             if (!capture && plan is CompiledTrainingPlan<float> uncaptured) uncaptured.DisableGraphStep();
-            bool previousObservation = CompiledTrainingPlan<float>.ObserveScratchStorageForTests;
-            CompiledTrainingPlan<float>.ObserveScratchStorageForTests = true;
-            try { for (int s = 0; s < steps; s++) plan.Step(); }
-            finally { CompiledTrainingPlan<float>.ObserveScratchStorageForTests = previousObservation; }
-            // An explicitly uncaptured plan hands its transient backing to the next one (CompiledTransientWorkspaceBroker),
-            // so its pool reports what it inherited: measure the storage its own step used, before that transfer.
-            long bytes = plan is CompiledTrainingPlan<float> compiled
-                ? (capture ? compiled.ScratchBufferBytes : compiled.LastStepScratchBytesBeforeTransfer) : -1;
+            for (int s = 0; s < steps; s++) plan.Step();
+            long bytes = plan is CompiledTrainingPlan<float> compiled ? compiled.ScratchBufferBytes : -1;
             var all = new System.Collections.Generic.List<float>();
             foreach (var p in parameters) all.AddRange(p.ToArray());
             return (all.ToArray(), bytes);

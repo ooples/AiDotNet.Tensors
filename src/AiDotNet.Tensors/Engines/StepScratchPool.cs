@@ -24,7 +24,7 @@ namespace AiDotNet.Tensors.Engines;
 /// still be bound to its buffers, so each buffer is released by its finalizer once nothing references it.
 /// </para>
 /// </remarks>
-internal sealed class StepScratchPool
+internal sealed partial class StepScratchPool
 {
     // Every pooled buffer, whichever pool holds it: a tensor wrapping one does not own it (ReleaseDeadDeviceStorage).
     private static readonly ConditionalWeakTable<IGpuBuffer, object> s_pooled = new();
@@ -235,6 +235,7 @@ internal sealed class StepScratchPool
         buffer = _free[pick];
         _free[pick] = _free[_free.Count - 1];
         _free.RemoveAt(_free.Count - 1);
+        BufferAllocationDiagnostics.RecordStepScratchReuse(length);
         return true;
     }
 
@@ -271,6 +272,7 @@ internal sealed class StepScratchPool
         else _leases.Add((key, buffer));
         _leasedThisRun.Add(buffer);
         Keys[buffer] = key;
+        if (pick >= 0) BufferAllocationDiagnostics.RecordStepScratchReuse(length);
         return buffer;
     }
 

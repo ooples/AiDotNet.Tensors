@@ -114,6 +114,9 @@ internal enum OpType : byte
     StopGradient,
     TensorAddInPlace,
     TensorWeightNorm,
+    TensorRfftMagnitude,
+    // Append only: every existing serialized ordinal remains unchanged.
+    GroupedConv2D,
 }
 
 internal static class OpTypeParser
@@ -125,6 +128,8 @@ internal static class OpTypeParser
     internal static OpType Parse(string opName) => opName switch
     {
         "TensorWeightNorm" => OpType.TensorWeightNorm,
+        "TensorRfftMagnitude" => OpType.TensorRfftMagnitude,
+        "GroupedConv2D" => OpType.GroupedConv2D,
         "TensorAdd" => OpType.TensorAdd,
         "TensorSubtract" => OpType.TensorSubtract,
         "TensorMultiply" => OpType.TensorMultiply,

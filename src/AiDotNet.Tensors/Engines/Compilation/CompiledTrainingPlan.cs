@@ -2011,6 +2011,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The buffer each aliased gradient is ultimately a view of.
         var rootOf = new Dictionary<Tensor<T>, Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         bool device = engine.SupportsGpu || engine.Is<Engines.DirectGpuTensorEngine>();
+        // CPU aliases can follow the same final liveness assignment as device aliases. Keep custom engines on
+        // their existing ownership path; raw-array specializations still materialize and exclude their targets.
+        bool poolHostAliasTargets = !device && remainingGradient is not null
+            && engine.Unwrap().GetType() == typeof(CpuEngine)
+            && Environment.GetEnvironmentVariable("AIDOTNET_CPU_POOL_ALIAS_GRADS") != "0";
         HashSet<CompiledStep<T>>? aliased = null;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
         // With AIDOTNET_COMPILED_INPUT_GRADS the external leaves publish .Grad from the backward that writes them. An
@@ -2043,10 +2048,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var output = step.OutputBuffer;
             if (!gradMap.TryGetValue(output, out var outputGrad))
             {
-                // On a device engine an alias target is a placeholder too, so gradient pooling can share its buffer: the
-                // views follow it (PoolGradientBuffers re-points them, MaterializeIfGradPlaceholder materializes them
-                // together). A residual network's add and channel-bias gradients were 0.9 GB of a GPU DDPM step.
-                outputGrad = device && remainingGradient is not null && PoolAliasTargetGradients
+                // Alias views follow their physical target when pooling settles its backing, and materialize
+                // together when a specialization captures a raw array. Both bindings must register the views.
+                outputGrad = remainingGradient is not null && ((device && PoolAliasTargetGradients) || poolHostAliasTargets)
                     ? remainingGradient(output)
                     : TensorAllocator.RentUninitialized<T>(output._shape);
                 gradMap[output] = outputGrad;
@@ -2076,7 +2080,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 rootOf[view] = rootOf.TryGetValue(outputGrad, out var outputRoot) ? outputRoot : outputGrad;
                 if (ownGrad is not null) dropped.Add(ownGrad);
                 aliasedInputs++;
-                if (device)
+                if (device || poolHostAliasTargets)
                 {
                     // A chain of views collapses onto the last one's buffer: bind to the gradient the output's own
                     // gradient views, if it is itself a view, so every view resolves to one physical buffer.
@@ -5201,6 +5205,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ((BackwardFunction<T>)BackwardFunctions<T>.MatMulBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.Conv2DBackward).Method,
         ((BackwardFunction<T>)BackwardFunctions<T>.WeightNormBackward).Method,
+        ((BackwardFunction<T>)BackwardFunctions<T>.RfftMagnitudeBackward).Method,
     };
 
     private static readonly HashSet<System.Reflection.MethodInfo> s_backwardIgnoresInputs = new()
@@ -10427,9 +10432,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Gradient pooling: every gradient starts as a placeholder view of one shared scratch array, so building
         // the backward does not materialize a buffer per traced tensor (the gradients were the largest part of a CPU
         // training plan's footprint). Once the backward is built, PoolGradientBuffers gives gradients with disjoint
-        // lifetimes shared arrays and every other gradient an array of its own. On the host, reshape-aliased gradients
-        // keep real buffers and are never pooled; on a device engine their targets are pooled and the views re-pointed
-        // with them (see AliasReshapeViewGradients). On a GPU engine the
+        // lifetimes shared arrays and every other gradient an array of its own. Base CPU and device alias targets
+        // also participate: their views follow the final storage, while compile-time raw-array captures retain an
+        // own target buffer (see AliasReshapeViewGradients). On a GPU engine the
         // tenants of one array share one device buffer too (BindPooledGradientsResident): a GPU DenseNet-121 step held
         // 3.7 GB of per-tensor gradient buffers on the device, past the card, so the driver paged to host memory.
         // AIDOTNET_COMPILED_GRAD_VIEWS=0 turns it off.
@@ -14392,6 +14397,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+        var rfftMagnitudeBackward = BuildRfftMagnitudeBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
+        if (rfftMagnitudeBackward is not null)
+        {
+            if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            return rfftMagnitudeBackward;
+        }
         var weightNormBackward = BuildWeightNormBackward(step, gradMap, gradWriterCount ?? consumerCount, requiresGrad);
         if (weightNormBackward is not null)
         {
@@ -15029,10 +15040,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // A multi-consumer operand's buffer is overwritten when this is its first write of the step (see
             // AccumulatesInto), so the plan does not zero it.
             if (claimsFirstWrite is not null) claimsFirstWrite.Value = true;
+            // Match the base-CPU alias pool switch: flag0 and custom engines retain their previous binding policy.
+            bool deferAddBacking = engine.Unwrap().GetType() == typeof(CpuEngine)
+                && Environment.GetEnvironmentVariable("AIDOTNET_CPU_POOL_ALIAS_GRADS") != "0";
             if (typeof(T) == typeof(float) && !engine.SupportsGpu
                 && gradA.Length == gradOut.Length && gradB.Length == gradOut.Length
-                && TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
-                && TryGetLiveFloatBacking(gradB) is not null)
+                && (deferAddBacking
+                    ? HasSpecializedBacking(gradOut) && HasSpecializedBacking(gradA) && HasSpecializedBacking(gradB)
+                    : TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
+                        && TryGetLiveFloatBacking(gradB) is not null))
             {
                 int addLen = gradOut.Length;
                 return eng =>

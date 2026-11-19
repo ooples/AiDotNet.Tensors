@@ -39,6 +39,7 @@ internal sealed class CompiledTransientWorkspaceBroker
         RetainedBytes -= chosen.Buffer.SizeInBytes;
         ReuseCount++;
         ReuseBytes += chosen.Buffer.SizeInBytes;
+        BufferAllocationDiagnostics.RecordCompiledWorkspaceLoan(length);
         // Keep the pooled marker until the receiving plan replaces its owner. No tensor may dispose this backing.
         return chosen.Buffer;
     }
