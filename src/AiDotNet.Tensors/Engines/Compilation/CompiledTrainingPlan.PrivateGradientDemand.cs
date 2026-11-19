@@ -75,6 +75,11 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
         // One inspection per completed step, including a step whose buffers all escaped. Repeated inference allocations
         // must not rebuild this metadata, and another successful training step publishes a fresh opportunity.
         _privateGradientCompletedStep = false;
+        if (InferenceWorkspaceDemandScope.HandoffIdleWorkspaceEnabled)
+        {
+            _scratchPool!.ReturnIdleLeasesToBackendCache(backend);
+            _firstWriteRedirects.Clear();
+        }
         _workspaceProtectedRoots.Clear();
         _workspaceProtectedHandles.Clear();
         _workspaceProtectedStorage.Clear();
