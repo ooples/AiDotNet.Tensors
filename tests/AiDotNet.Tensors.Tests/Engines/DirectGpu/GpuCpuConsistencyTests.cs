@@ -468,6 +468,57 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             Assert.True(Math.Abs(cpuB[i] - gpuB[i]) <= 1e-3f * (1 + Math.Abs(cpuB[i])), $"dB[{i}] cpu={cpuB[i]} gpu={gpuB[i]}");
     }
 
+    [SkippableTheory]
+    [InlineData(16, 256, 4, 65)]  // a HarmonicEngine v2 training step (batch 16, seq 256, 4 heads of 64 + normaliser)
+    [InlineData(3, 37, 2, 65)]    // the Born scan width (64 + normaliser), seqLen not a multiple of the chunk
+    [InlineData(2, 20, 3, 8)]
+    [InlineData(2, 33, 2, 64)]    // even head dim: the odd tile stride keeps banks distinct
+    [InlineData(1, 17, 2, 100)]   // 10,000 state elements: 10 per thread
+    [InlineData(1, 17, 1, 108)]   // the widest head the tiled kernel takes (shared 47.8 KB)
+    [InlineData(1, 17, 1, 109)]   // one wider: the atomic checkpoint kernel
+    [InlineData(1, 17, 1, 128)]
+    public void GlaScanBackward_MatchesHostBptt(int batch, int seqLen, int numHeads, int headDim)
+    {
+        SkipIfNoDirectGpu();
+        int modelDim = numHeads * headDim;
+        var shape = new[] { batch, seqLen, modelDim };
+        float[] Wave(int n, double phase, double scale) =>
+            Enumerable.Range(0, n).Select(i => (float)(Math.Sin(0.37 * (i + 1) + phase) * scale)).ToArray();
+        var qd = Wave(batch * seqLen * modelDim, 0.1, 0.4);
+        var kd = Wave(batch * seqLen * modelDim, 0.7, 0.4);
+        var vd = Wave(batch * seqLen * modelDim, 1.3, 0.5);
+        var gd = Wave(batch * seqLen * numHeads, 2.1, 1.0).Select(x => 1f / (1f + MathF.Exp(-2f * x))).ToArray();
+        var wd = Wave(batch * seqLen * modelDim, 2.9, 1.0);   // dOut: the gradient of sum(output * w)
+
+        var dq = new float[qd.Length]; var dk = new float[kd.Length]; var dv = new float[vd.Length]; var dg = new float[gd.Length];
+        AiDotNet.Tensors.Engines.DirectGpu.Cpu.RecurrenceCpuKernels.GlaBackward(
+            wd, qd, kd, vd, gd, dq, dk, dv, dg, batch, seqLen, modelDim, numHeads, headDim);
+
+        IEngine gpu = Gpu;
+        var q = new Tensor<float>(qd, shape); var k = new Tensor<float>(kd, shape); var v = new Tensor<float>(vd, shape);
+        var g = new Tensor<float>(gd, new[] { batch, seqLen, numHeads });
+        var w = new Tensor<float>(wd, shape);
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads;
+        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+        {
+            var o = gpu.GlaScanForward(q, k, v, g, numHeads);
+            var loss = gpu.ReduceSum(gpu.TensorMultiply(o, w), null);
+            grads = tape.ComputeGradients(loss, new[] { q, k, v, g });
+        }
+
+        void Match(float[] expected, Tensor<float> actual, string name)
+        {
+            var a = actual.GetDataArray();
+            double scale = expected.Max(x => Math.Abs((double)x)), worst = 0;
+            for (int i = 0; i < expected.Length; i++) worst = Math.Max(worst, Math.Abs(expected[i] - a[i]));
+            Assert.True(worst <= 1e-4 * Math.Max(scale, 1.0), $"{name}: max |host - gpu| {worst} (scale {scale})");
+        }
+        Match(dq, grads[q], "dQ");
+        Match(dk, grads[k], "dK");
+        Match(dv, grads[v], "dV");
+        Match(dg, grads[g], "dG");
+    }
+
     [SkippableFact]
     public void FusedLstmSequenceTrain_ForwardAndGradients_MatchDecomposedCpu()
     {
@@ -2106,57 +2157,6 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         Assert.Equal(expectedMax.GetDataArray(), actualMax.GetDataArray());
         Assert.Equal(expectedMin.GetDataArray(), actualMin.GetDataArray());
         Assert.Equal(expectedBuckets.GetDataArray(), actualBuckets.GetDataArray());
-    }
-
-    [SkippableTheory]
-    [InlineData(16, 256, 4, 65)]  // a HarmonicEngine v2 training step (batch 16, seq 256, 4 heads of 64 + normaliser)
-    [InlineData(3, 37, 2, 65)]    // the Born scan width (64 + normaliser), seqLen not a multiple of the chunk
-    [InlineData(2, 20, 3, 8)]
-    [InlineData(2, 33, 2, 64)]    // even head dim: the odd tile stride keeps banks distinct
-    [InlineData(1, 17, 2, 100)]   // 10,000 state elements: 10 per thread
-    [InlineData(1, 17, 1, 108)]   // the widest head the tiled kernel takes (shared 47.8 KB)
-    [InlineData(1, 17, 1, 109)]   // one wider: the atomic checkpoint kernel
-    [InlineData(1, 17, 1, 128)]
-    public void GlaScanBackward_MatchesHostBptt(int batch, int seqLen, int numHeads, int headDim)
-    {
-        SkipIfNoDirectGpu();
-        int modelDim = numHeads * headDim;
-        var shape = new[] { batch, seqLen, modelDim };
-        float[] Wave(int n, double phase, double scale) =>
-            Enumerable.Range(0, n).Select(i => (float)(Math.Sin(0.37 * (i + 1) + phase) * scale)).ToArray();
-        var qd = Wave(batch * seqLen * modelDim, 0.1, 0.4);
-        var kd = Wave(batch * seqLen * modelDim, 0.7, 0.4);
-        var vd = Wave(batch * seqLen * modelDim, 1.3, 0.5);
-        var gd = Wave(batch * seqLen * numHeads, 2.1, 1.0).Select(x => 1f / (1f + MathF.Exp(-2f * x))).ToArray();
-        var wd = Wave(batch * seqLen * modelDim, 2.9, 1.0);   // dOut: the gradient of sum(output * w)
-
-        var dq = new float[qd.Length]; var dk = new float[kd.Length]; var dv = new float[vd.Length]; var dg = new float[gd.Length];
-        AiDotNet.Tensors.Engines.DirectGpu.Cpu.RecurrenceCpuKernels.GlaBackward(
-            wd, qd, kd, vd, gd, dq, dk, dv, dg, batch, seqLen, modelDim, numHeads, headDim);
-
-        IEngine gpu = Gpu;
-        var q = new Tensor<float>(qd, shape); var k = new Tensor<float>(kd, shape); var v = new Tensor<float>(vd, shape);
-        var g = new Tensor<float>(gd, new[] { batch, seqLen, numHeads });
-        var w = new Tensor<float>(wd, shape);
-        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads;
-        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
-        {
-            var o = gpu.GlaScanForward(q, k, v, g, numHeads);
-            var loss = gpu.ReduceSum(gpu.TensorMultiply(o, w), null);
-            grads = tape.ComputeGradients(loss, new[] { q, k, v, g });
-        }
-
-        void Match(float[] expected, Tensor<float> actual, string name)
-        {
-            var a = actual.GetDataArray();
-            double scale = expected.Max(x => Math.Abs((double)x)), worst = 0;
-            for (int i = 0; i < expected.Length; i++) worst = Math.Max(worst, Math.Abs(expected[i] - a[i]));
-            Assert.True(worst <= 1e-4 * Math.Max(scale, 1.0), $"{name}: max |host - gpu| {worst} (scale {scale})");
-        }
-        Match(dq, grads[q], "dQ");
-        Match(dk, grads[k], "dK");
-        Match(dv, grads[v], "dV");
-        Match(dg, grads[g], "dG");
     }
 
     [SkippableFact]
