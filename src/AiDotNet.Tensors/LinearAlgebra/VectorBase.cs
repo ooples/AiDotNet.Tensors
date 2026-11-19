@@ -289,6 +289,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
 #else
         arr = new T[length];
 #endif
+        Helpers.CpuStorageAllocationDiagnostics.Record<T>("tensor.vector_new", length);
         _memory = arr;
         _cachedArray = arr;
         _logicalLength = length;
@@ -343,6 +344,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     protected VectorBase(IEnumerable<T> values)
     {
         var arr = values.ToArray();
+        Helpers.CpuStorageAllocationDiagnostics.Record<T>("tensor.vector_copy", arr.Length);
         _memory = arr;
         _cachedArray = arr;
         _logicalLength = arr.Length;
@@ -585,6 +587,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
             // allocated (zero) array behind and every later read silently returns it.
             Helpers.HostSync.ThrowIfReleased(this);
             MaterializeBacking(new T[_logicalLength]);
+            Helpers.CpuStorageAllocationDiagnostics.Record<T>("tensor.host_materialization", _logicalLength);
         }
         SyncHostFromDevice();
     }

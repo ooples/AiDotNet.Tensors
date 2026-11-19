@@ -120,6 +120,67 @@ public sealed class CompiledModelCache<T> : IDisposable
     }
 
     /// <summary>
+    /// Returns the plan compiled for <paramref name="input"/>'s shape, fed with <paramref name="input"/>'s data, tracing
+    /// <paramref name="forward"/> on a plan-owned copy of the input the first time the shape is seen.
+    /// </summary>
+    /// <remarks>
+    /// The overloads taking a <c>Func&lt;Tensor&lt;T&gt;&gt;</c> trace on the caller's own tensor, so that tensor becomes the
+    /// plan's input slot: every later call with a different tensor copies its data INTO the caller's first tensor,
+    /// and passing that first tensor again then replays whatever was copied in last. Here the forward receives the
+    /// tensor to read, and the plan owns it, so the caller's tensors are only ever read.
+    /// </remarks>
+    /// <param name="input">This call's input. Read, never written.</param>
+    /// <param name="forward">The forward pass, applied to the tensor it is given. It must read its input from that
+    /// argument; a forward that reads anything else as its input fails to compile (the plan would replay stale data).</param>
+    public ICompiledPlan<T> GetOrCompileInference(Tensor<T> input, Func<Tensor<T>, Tensor<T>> forward)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (forward is null) throw new ArgumentNullException(nameof(forward));
+        return GetOrCompileInference(new[] { input }, inputs => forward(inputs[0]));
+    }
+
+    /// <summary>
+    /// Multi-input form of <see cref="GetOrCompileInference(Tensor{T}, Func{Tensor{T}, Tensor{T}})"/>: traces
+    /// <paramref name="forward"/> on plan-owned copies of <paramref name="inputs"/>, so the caller's tensors are only
+    /// ever read.
+    /// </summary>
+    /// <param name="inputs">This call's inputs, in the order <paramref name="forward"/> takes them. Read, never written.</param>
+    /// <param name="forward">The forward pass, applied to the tensors it is given.</param>
+    public ICompiledPlan<T> GetOrCompileInference(Tensor<T>[] inputs, Func<Tensor<T>[], Tensor<T>> forward)
+    {
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (forward is null) throw new ArgumentNullException(nameof(forward));
+        if (inputs.Length == 0)
+            throw new ArgumentException("At least one input is required.", nameof(inputs));
+
+        long key = ComputeShapeKey(inputs);
+        var primaryShape = inputs[0]._shape;
+        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
+            return cached;
+
+        lock (_compileLock)
+        {
+            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
+                return cached;
+
+            // The slots are copies of this call's data, so the new plan already reflects this call.
+            var slots = new Tensor<T>[inputs.Length];
+            for (int i = 0; i < inputs.Length; i++)
+                slots[i] = (Tensor<T>)(inputs[i] ?? throw new ArgumentException($"inputs[{i}] is null.", nameof(inputs))).CloneDeepCopy();
+            using var scope = GraphMode.EnableInference();
+            var explicitOutput = forward(slots);
+            ThrowIfForwardRecordedNothing(scope, explicitOutput);
+            var plan = scope.CompileInference<T>(explicitOutput, slots);
+
+            if (_inferencePlans.TryGetValue(key, out var old))
+                old.Dispose();
+
+            _inferencePlans[key] = plan;
+            return plan;
+        }
+    }
+
+    /// <summary>
     /// Multi-input variant: traces the forward once and marks EVERY tensor in
     /// <paramref name="inputs"/> as a mutable input slot the plan re-binds on each replay.
     /// On cache hit, every input's data is copied into the plan's captured buffers, so a forward
@@ -271,6 +332,37 @@ public sealed class CompiledModelCache<T> : IDisposable
     /// <returns>Compiled inference plan.</returns>
     public ICompiledPlan<T> GetOrCompileInference(int[] inputShape, Func<Tensor<T>> forward, SymbolicShape symbolicShape)
     {
+        if (forward is null) throw new ArgumentNullException(nameof(forward));
+        return GetOrCompileInferenceSymbolic(inputShape, () => (forward(), null), symbolicShape);
+    }
+
+    /// <summary>
+    /// <see cref="GetOrCompileInference(int[], Func{Tensor{T}}, SymbolicShape)"/> for a forward that takes its input:
+    /// a trace runs on a plan-owned copy of <paramref name="input"/>, so the caller's tensors are only ever read (see
+    /// <see cref="GetOrCompileInference(Tensor{T}, Func{Tensor{T}, Tensor{T}})"/>). The returned plan has not been fed
+    /// <paramref name="input"/> unless it was traced on it; call <c>SetInputs</c> before executing it.
+    /// </summary>
+    /// <param name="input">This call's input. Read, never written.</param>
+    /// <param name="forward">The forward pass, applied to the tensor it is given.</param>
+    /// <param name="symbolicShape">Symbolic shape with dynamic dimensions marked.</param>
+    /// <returns>Compiled inference plan.</returns>
+    public ICompiledPlan<T> GetOrCompileInference(Tensor<T> input, Func<Tensor<T>, Tensor<T>> forward, SymbolicShape symbolicShape)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (forward is null) throw new ArgumentNullException(nameof(forward));
+        return GetOrCompileInferenceSymbolic(input._shape, () =>
+        {
+            var slot = (Tensor<T>)input.CloneDeepCopy();
+            return (forward(slot), slot);
+        }, symbolicShape);
+    }
+
+    // trace runs the forward under the caller's GraphMode scope and returns its output and, when the forward was
+    // traced on a plan-owned input, that input (the plan's slot); null means the input is whichever traced leaf has
+    // the input's shape.
+    private ICompiledPlan<T> GetOrCompileInferenceSymbolic(
+        int[] inputShape, Func<(Tensor<T> Output, Tensor<T>? Slot)> trace, SymbolicShape symbolicShape)
+    {
         if (symbolicShape is null) throw new ArgumentNullException(nameof(symbolicShape));
         // A plan executes exactly the shape it was built for, so plans stay keyed by the concrete shape;
         // the symbolic key names the family whose batch-polymorphic template builds the others.
@@ -306,14 +398,16 @@ public sealed class CompiledModelCache<T> : IDisposable
             if (plan is null)
             {
                 using var scope = GraphMode.EnableInference();
-                var explicitOutput = forward();
+                var (explicitOutput, slot) = trace();
                 ThrowIfForwardRecordedNothing(scope, explicitOutput);
                 // Recorded before compiling: compilation clears the lazy links the recipe numbers.
                 // A size-1 symbolic dim is specialized: that trace teaches the template nothing.
                 var recipe = symbolDims.Length > 0 && ShapePolymorphicTemplate<T>.IsGeneric(inputShape, symbolDims)
                     ? InferenceTraceRecipe<T>.Capture(scope, explicitOutput, inputShape)
                     : null;
-                plan = scope.CompileInference<T>(explicitOutput, inputShape);
+                plan = slot is null
+                    ? scope.CompileInference<T>(explicitOutput, inputShape)
+                    : scope.CompileInference<T>(explicitOutput, new[] { slot });
                 if (recipe is not null)
                 {
                     if (template is null) _templates[familyKey] = new ShapePolymorphicTemplate<T>(recipe, symbolDims);

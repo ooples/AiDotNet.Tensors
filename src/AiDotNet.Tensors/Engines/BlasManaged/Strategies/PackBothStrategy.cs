@@ -33,7 +33,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// in Phase G.
 /// </para>
 /// </summary>
-internal static class PackBothStrategy
+internal static partial class PackBothStrategy
 {
     // #653 diagnostic gate (env AIDOTNET_GEMM_TRACE=1): trace the chosen parallel path.
     private static readonly bool s_trace =
@@ -564,7 +564,7 @@ internal static class PackBothStrategy
         // fast path. Without alignment the NT path silently falls back to
         // regular cached stores (still correct, just no perf win).
         const int PackBAlignment = 32;
-        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(packBBytes + PackBAlignment - 1);
+        byte[] packBArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<byte>(packBBytes + PackBAlignment - 1, "workspace.blas_parallel_packB");
         int packBAlignedOffset;
         unsafe
         {
@@ -930,7 +930,7 @@ internal static class PackBothStrategy
         // the sole dispatch path now (PR #762 removed the #85 L3-domain-PINNED experimental pool),
         // so there is no per-CCX pinning to replicate for — every participant reads the one copy.
         int nCopies = 1;
-        var packAArr = System.Buffers.ArrayPool<float>.Shared.Rent((int)(packAElemsPerCopy * nCopies));
+        var packAArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<float>((int)(packAElemsPerCopy * nCopies), "workspace.blas_naxis_packA");
         try
         {
             for (int pIdx = 0; pIdx < numKPanels; pIdx++)
@@ -955,7 +955,7 @@ internal static class PackBothStrategy
                 int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
                 long totalWork = (long)m * n * k * 2;
 
-                Action<int> nAxisBody = [MethodImpl(Hot)] (jcIdx) =>
+                Action<int, PackBothParticipantWorkspace> nAxisBody = [MethodImpl(Hot)] (jcIdx, workspace) =>
                 {
                     int jc = jcIdx * ncL;
                     int effNc = Math.Min(ncL, nL - jc);
@@ -963,16 +963,15 @@ internal static class PackBothStrategy
                     int nrTail = effNc - njrFull * nrL;
                     int packedNc = ((effNc + nrL - 1) / nrL) * nrL;
 
-                    // Private per-thread packed-B for this N-block: [K-panel][Kc × packedNc].
+                    // Participant-owned packed-B for this N-block: [K-panel][Kc × packedNc].
                     int bPanelStride = kcL * packedNc;
-                    byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
-                    try
+                    var ownedB = workspace.ForPanel(checked(numKPanelsL * bPanelStride * sizeof(float)));
                     {
                         // Single shared packed-A copy (PR #762 removed per-CCX pinning/replication).
                         float* pa = (float*)aPackAddr;
                         float* bb = (float*)bAddr;
                         float* cc = (float*)cAddr;
-                        var packBSpan = MemoryMarshal.Cast<byte, float>(packBArr.AsSpan());
+                        var packBSpan = MemoryMarshal.Cast<byte, float>(ownedB);
                         int numStripes = (effNc + nrL - 1) / nrL;
 
                         for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
@@ -1072,12 +1071,13 @@ internal static class PackBothStrategy
                             }
                         }
                     }
-                    finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
                 }; // N-axis body: disjoint C columns, fixed-order K reduction (bit-exact regardless of dispatch)
                    // Dispatch the N-block parallel-for through the persistent worker pool (PR #762 made this the
                    // sole path, removing the #85 L3-domain-PINNED experiment). Disjoint C columns ⇒ bit-exact.
-                CpuParallelSettings.ParallelForOrSerial(
-                    0, numNBlocks, totalWork, nAxisBody, maximumDop, deterministicSafe: true);
+                CpuParallelSettings.ParallelForIndependentWithLocal(
+                    0, numNBlocks, totalWork,
+                    () => new PackBothParticipantWorkspace("workspace.blas_naxis_packB"),
+                    nAxisBody, static workspace => workspace.Dispose(), maximumDop);
             }
         }
         finally { System.Buffers.ArrayPool<float>.Shared.Return(packAArr); }
@@ -1092,7 +1092,7 @@ internal static class PackBothStrategy
     /// ic blocks own disjoint C rows so there is no cross-thread write contention.
     /// </summary>
     [MethodImpl(Hot)]
-    private static unsafe void RunParallelSingleRegionUnsafe<T>(
+    internal static unsafe void RunParallelSingleRegionJoinedUnsafe<T>(
         T* aPtr, int aLen, int lda,
         T* bPtr, int bLen, int ldb,
         T* cPtr, int cLen, int ldc,
@@ -1108,7 +1108,7 @@ internal static class PackBothStrategy
         long packBAllElems = (long)numKPanels * kc * packedNc;
 
         const int PackBAlignment = 32;
-        byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent((int)(packBAllElems * elemSize) + PackBAlignment - 1);
+        byte[] packBArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<byte>((int)(packBAllElems * elemSize) + PackBAlignment - 1, "workspace.blas_single_region_packB");
         int packBAlignedOffset;
         fixed (byte* pbPtr = packBArr)
         {
@@ -1155,18 +1155,23 @@ internal static class PackBothStrategy
             int numIcBlocks = (m + mc - 1) / mc;
             long totalWork = (long)m * n * k;
             int mcCap = mc, mCap = m, ldaCap = lda, aLenCap = aLen, ldcCap = ldc, cLenCap = cLen, mrCap = mr;
-            CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, [MethodImpl(Hot)] (icIdx) =>
+            CpuParallelSettings.ParallelForIndependentWithLocal(0, numIcBlocks, totalWork,
+                () => new PackBothParticipantWorkspace("workspace.blas_private_packA"),
+                [MethodImpl(Hot)] (icIdx, workspace) =>
             {
                 int ic = icIdx * mcCap;
                 int effMc = Math.Min(mcCap, mCap - ic);
+                // Keep one participant-owned A pack across this IC block's entire K loop and subsequent IC blocks.
+                // A tail-only participant borrows only its actual row count; it grows later only if needed.
+                var ownedA = workspace.ForPanel(checked(effMc * Math.Min(kcCap, kCap) * elemSize));
                 for (int panel = 0; panel < numKPanelsCap; panel++)
                 {
                     int pc = panel * kcCap;
                     int effKc = Math.Min(kcCap, kCap - pc);
                     int panelOffElems = panel * kcCap * packedNcCap;
 
-                    // Pack A[ic, pc] into this thread's [ThreadStatic] pool (consumed below).
-                    Span<byte> packAByteSpan = PerThreadPool.Current.RentPackA(effMc * effKc * elemSize);
+                    // Pack A[ic, pc] into the current participant's held workspace (consumed below).
+                    Span<byte> packAByteSpan = ownedA.Slice(0, effMc * effKc * elemSize);
                     Span<T> packA = MemoryMarshal.Cast<byte, T>(packAByteSpan).Slice(0, effMc * effKc);
                     int aSliceOffset = ic * ldaCap + pc;
                     ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLenCap - aSliceOffset);
@@ -1194,7 +1199,7 @@ internal static class PackBothStrategy
                         }
                     }
                 }
-            }, maximumDop, deterministicSafe: true);
+            }, static workspace => workspace.Dispose(), maximumDop);
         }
         finally
         {

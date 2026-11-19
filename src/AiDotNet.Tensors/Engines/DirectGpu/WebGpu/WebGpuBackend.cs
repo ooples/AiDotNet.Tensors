@@ -202,6 +202,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
     internal IGpuBuffer AllocateBufferCore(int elementCount, bool zeroInitialize)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("WebGPU", (long)elementCount * sizeof(float), (this, elementCount, zeroInitialize),
+                static state => state.Item1.AllocateBufferCore(state.Item2, state.Item3));
         ThrowIfNotInitialized();
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)elementCount * sizeof(float), MaxBufferAllocBytes, DeviceName);
@@ -222,6 +225,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <returns>A new GPU buffer containing the data.</returns>
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("WebGPU", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         ThrowIfNotInitialized();
         if (data is null) throw new ArgumentNullException(nameof(data));
         // Issue #285: per-allocation cap check.
