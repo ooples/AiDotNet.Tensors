@@ -265,7 +265,8 @@ internal sealed partial class StepScratchPool
         }
         else
         {
-            buffer = backend.AllocateBuffer(length);
+            buffer = (ShareBackwardScratch ? WorkspaceBroker?.TryRent(backend, length) : null)
+                ?? backend.AllocateBuffer(length);
             Track(buffer);
         }
         if (_spanKeys.Contains(key)) _spanning[buffer] = key;   // a forward output: held until its last reader

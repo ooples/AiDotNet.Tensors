@@ -10,6 +10,10 @@ internal sealed partial class CompiledTrainingPlan<T>
 {
     private readonly bool _gradientShadowsEnabled =
         Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_SHADOWS") == "1";
+    private readonly bool _shadowBackendHandoffEnabled =
+        Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_BACKEND_SCRATCH_HANDOFF") == "1";
+    private readonly bool _shadowShareBackwardScratch =
+        Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_SHARED_BACKWARD_SCRATCH") == "1";
     private HashSet<Tensor<T>>? _shadowGradientSet;
     private readonly HashSet<IGpuBuffer> _shadowProtectedRoots = new(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
     private readonly HashSet<IGpuBuffer> _shadowMoved = new(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
@@ -25,6 +29,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     internal long GradientShadowBytes { get; private set; }
     internal long GradientShadowCompletedSteps { get; private set; }
     internal long GradientShadowReuses { get; private set; }
+    internal long GradientWorkspaceCacheReturnedBytes { get; private set; }
 
     private bool ProtectShadowSavedRoots(HashSet<IGpuBuffer> roots)
     {
@@ -129,6 +134,11 @@ internal sealed partial class CompiledTrainingPlan<T>
         _lendSchedule = null;
         GradientShadowBytes += bytes;
         GradientShadowCompletedSteps++;
+        // Detached no-grad forwards run between compiled GAN steps. They use the ordinary backend allocator, so
+        // a training-only free list otherwise hoards their available backing. Every returned root is already fully
+        // detached, and all public values have landed exactly before this existing cache ownership transfer.
+        if (_shadowBackendHandoffEnabled)
+            GradientWorkspaceCacheReturnedBytes += engine.CompiledWorkspaceBroker.ReturnIdleCellsToBackendCache(backend);
         if (Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
             Console.Error.WriteLine($"[GRADIENT-SHADOW] plan={_planId} steps={GradientShadowCompletedSteps} bytes={bytes} total_bytes={GradientShadowBytes} reuses={GradientShadowReuses}");
     }

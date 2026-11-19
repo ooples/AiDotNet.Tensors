@@ -48,9 +48,12 @@ internal sealed partial class CompiledTrainingPlan<T>
         foreach (var gradient in _preAllocatedGrads)
             storageCounts[gradient.StorageIdentity] = storageCounts.TryGetValue(gradient.StorageIdentity, out int n) ? n + 1 : 1;
         var first = new Dictionary<Tensor<T>, int>(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var firstAny = new Dictionary<Tensor<T>, int>(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
         void Touch(Tensor<T> primal, int action)
         {
-            if (!gradMap.TryGetValue(primal, out var gradient) || !candidates.Contains(gradient)
+            if (!gradMap.TryGetValue(primal, out var gradient)) return;
+            if (!firstAny.ContainsKey(gradient)) firstAny.Add(gradient, action);
+            if (!candidates.Contains(gradient)
                 || primalStorage.Contains(gradient.StorageIdentity)
                 || !storageCounts.TryGetValue(gradient.StorageIdentity, out int count) || count != 1) return;
             if (!first.ContainsKey(gradient)) first.Add(gradient, action);
@@ -67,11 +70,13 @@ internal sealed partial class CompiledTrainingPlan<T>
             (_shadowFirstTouches[item.Value] ??= new List<Tensor<T>>()).Add(item.Key);
             _shadowDelayEligible.Add(item.Key);
         }
+        PrepareShadowBankFirstTouches(firstAny, primalStorage, coverage.Count);
     }
 
     private void BeginShadowGradientPhase(DirectGpuTensorEngine engine)
     {
         _shadowPending.Clear();
+        _shadowPendingBanks.Clear();
         _shadowForwardAliases.Clear();
         _shadowPhaseProtectedRoots.Clear();
         _shadowPhaseActive = false;
@@ -79,6 +84,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (!CanUseGradientShadows(engine) || _shadowFirstTouches is null) return;
         if (!ProtectShadowSavedRoots(_shadowPhaseProtectedRoots)) return;
         _shadowPhaseActive = true;
+        BeginShadowBankPhase(engine);
         void Add(Tensor<T> tensor)
         {
             if (tensor._gpuBuffer is not { } buffer) return;
@@ -106,6 +112,7 @@ internal sealed partial class CompiledTrainingPlan<T>
 
     private void BindShadowGradientsStartingAt(int action, DirectGpuTensorEngine engine, IDirectGpuBackend backend, int elementSize)
     {
+        BindShadowGradientBanksStartingAt(action, engine, backend, elementSize);
         if (_shadowFirstTouches?[action] is not { } gradients) return;
         foreach (var gradient in gradients)
         {
@@ -124,10 +131,11 @@ internal sealed partial class CompiledTrainingPlan<T>
         RefreshShadowGradientRedirects();
     }
 
-    private IGpuBuffer? TryTakePhaseGradientBacking(DirectGpuTensorEngine engine, Tensor<T> gradient)
+    private IGpuBuffer? TryTakePhaseGradientBacking(DirectGpuTensorEngine engine, Tensor<T> gradient, int length = 0)
     {
-        if (!_shadowPhaseActive || !_shadowPending.Contains(gradient) || _scratchPool is not { } pool
-            || !pool.TryTakeGradientBacking(gradient.Length, out var buffer, _shadowPhaseProtectedRoots)) return null;
+        if (!_shadowPhaseActive || !(_shadowPending.Contains(gradient) || DelayShadowGradientBank(gradient))
+            || _scratchPool is not { } pool
+            || !pool.TryTakeGradientBacking(length == 0 ? gradient.Length : length, out var buffer, _shadowPhaseProtectedRoots)) return null;
         if (_shadowForwardAliases.TryGetValue(buffer, out var aliases))
             foreach (var alias in aliases)
                 if (alias._gpuBuffer is { } current && ReferenceEquals(GpuBufferViewRoot.Of(current), buffer))

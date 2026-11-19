@@ -34,6 +34,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         else
         {
             buffer = engine.CompiledWorkspaceBroker.TryRent(backend, array.Length, exactSize: true)
+                ?? TryTakePhaseGradientBacking(engine, gradient, array.Length)
                 ?? backend.AllocateBuffer(array.Length);
             var owner = _shadowLoanOwner ??= engine.CreateScratchPool();
             long key = ++_nextShadowLoan;

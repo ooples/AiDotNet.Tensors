@@ -33,7 +33,7 @@ public sealed class CompiledGradientShadowTests
         return plan;
     }
 
-    private static (List<float[]> Values, long Bytes, long Steps, long Reuses, long Delayed, long PhaseBytes) Run(DirectGpuTensorEngine gpu,
+    private static (List<float[]> Values, long Bytes, long Steps, long Reuses, long Delayed, long PhaseBytes, long CacheBytes) Run(DirectGpuTensorEngine gpu,
         bool enabled, bool gradientView, bool inputGradients)
     {
         Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_SHADOWS", enabled ? "1" : "0");
@@ -71,7 +71,8 @@ public sealed class CompiledGradientShadowTests
         Assert.Equal(expected, last.ToArray());
         return (values, bytes, steps, reuses,
             a.GradientPhaseDelayedBindings + b.GradientPhaseDelayedBindings,
-            a.GradientPhaseReuseBytes + b.GradientPhaseReuseBytes);
+            a.GradientPhaseReuseBytes + b.GradientPhaseReuseBytes,
+            a.GradientWorkspaceCacheReturnedBytes + b.GradientWorkspaceCacheReturnedBytes);
     }
 
     [SkippableTheory]
@@ -90,9 +91,12 @@ public sealed class CompiledGradientShadowTests
             var baseline = Run(gpu, false, gradientView, inputGradients);
             var shadow = Run(gpu, true, gradientView, inputGradients);
             Assert.Equal(0, baseline.Bytes);
+            Assert.Equal(0, baseline.CacheBytes);
             Assert.Equal(8, shadow.Steps);
             Assert.True(shadow.Bytes > 0);
             Assert.True(shadow.Reuses > 0, "Native backing must actually move between completed plans.");
+            if (Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_BACKEND_SCRATCH_HANDOFF") == "1")
+                Assert.True(shadow.CacheBytes > 0, "The completed-step native cache handoff must actually execute.");
             if (Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_PHASE_REUSE") == "1")
             {
                 Assert.True(shadow.Delayed > 0, "The first-use path must actually execute.");

@@ -318,6 +318,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!pooled[i]) continue;
             var grad = _preAllocatedGrads[i];
             if (grad.GetBackingArrayForCacheLookupUnsafe() is not { } array) continue;
+            if (DelayShadowGradientBank(grad)) continue;
             if (TryBindShadowGradientBank(engine, backend, grad, out var shadowBank))
             {
                 buffers[array] = shadowBank;
@@ -5412,6 +5413,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _workspaceSharingBodyAllowed = redirectEngine is not null && CanShareTransientWorkspace(redirectEngine);
             leasingPool.WorkspaceBroker = _workspaceSharingBodyAllowed
                 ? redirectEngine!.CompiledWorkspaceBroker : null;
+            leasingPool.ShareBackwardScratch = _shadowShareBackwardScratch && _workspaceSharingBodyAllowed;
         }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
@@ -5428,7 +5430,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
                 redirectEngine.FirstWriteRedirects = null;
-                if (_scratchPool is { } finishedPool) finishedPool.WorkspaceBroker = null;
+                if (_scratchPool is { } finishedPool)
+                {
+                    finishedPool.WorkspaceBroker = null;
+                    finishedPool.ShareBackwardScratch = false;
+                }
 
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
@@ -5442,6 +5448,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the dropped buffers, and a live graph's buffers are never dropped.
             if (executed && completed && _scratchPool is { } scratchPool && !HasLiveStepGraph)
             {
+                // Free action leases are already proven unused by every later backward action. Transfer their
+                // ownership before TrimUnleased forgets older cells and leaves their native frees to a later GC.
+                if (_shadowShareBackwardScratch && redirectEngine is not null && CanUseGradientShadows(redirectEngine)
+                    && scratchPool.ReturnIdleBackwardScratch(backend, redirectEngine.CompiledWorkspaceBroker) > 0)
+                    _lendSchedule = null;
                 long dropped = scratchPool.TrimUnleased();
                 foreach (long slot in _firstWriteRedirects.RedirectedSlots) dropped += scratchPool.Forget(slot);
                 // The dropped buffers are long-lived (allocated on the plan's first runs), so only a full collection
@@ -5586,7 +5597,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     FailPrivateGradientResidencyAtForTesting = -1;
                     throw new NotSupportedException("Injected private-gradient residency failure.");
                 }
-                if (TryBindShadowGradientBank(residentEngine, backend, _preAllocatedGrads[i], out _)
+                if (DelayShadowGradientBank(_preAllocatedGrads[i])
+                    || TryBindShadowGradientBank(residentEngine, backend, _preAllocatedGrads[i], out _)
                     || DelayShadowGradient(residentEngine, _preAllocatedGrads[i])
                     || TryBindShadowGradientLoan(residentEngine, backend, _preAllocatedGrads[i])) continue;
 
