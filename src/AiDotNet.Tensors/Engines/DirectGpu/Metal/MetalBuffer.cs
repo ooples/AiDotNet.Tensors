@@ -216,6 +216,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     /// Rents a pooled StorageModeShared Metal buffer when available, or allocates a new one.
     /// </summary>
     internal static MetalGpuBuffer Create(MetalDevice device, int elementCount, bool zeroInitialize = true)
+        => Create(device, elementCount, zeroInitialize, owner: null);
+
+    internal static MetalGpuBuffer Create(MetalDevice device, int elementCount, bool zeroInitialize, IDirectGpuBackend? owner)
     {
         if (device is null || !device.IsAvailable)
             throw new ArgumentException("Invalid Metal device", nameof(device));
@@ -227,13 +230,13 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(charge);
 
         MetalGpuBuffer buffer;
-        if (PoolingEnabled && device.BufferPool.TryRent(elementCount, out var parked) && parked is not null)
+        if (PoolingEnabled && device.BufferPool.TryRentForBackend(elementCount, owner, out var parked) && parked is not null)
         {
             buffer = FromParked(device, parked, elementCount);
             if (zeroInitialize) buffer.Clear();
         }
         else if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss() &&
-                 PendingFreesDrainAndTryRent(device, elementCount, out parked) && parked is not null)
+                 PendingFreesDrainAndTryRent(device, elementCount, owner, out parked) && parked is not null)
         {
             buffer = FromParked(device, parked, elementCount);
             if (zeroInitialize) buffer.Clear();
@@ -254,6 +257,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     /// or allocates a new buffer initialized with <paramref name="data"/>.
     /// </summary>
     internal static MetalGpuBuffer Create(MetalDevice device, float[] data)
+        => Create(device, data, owner: null);
+
+    internal static MetalGpuBuffer Create(MetalDevice device, float[] data, IDirectGpuBackend? owner)
     {
         if (device is null || !device.IsAvailable)
             throw new ArgumentException("Invalid Metal device", nameof(device));
@@ -265,13 +271,13 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(charge);
 
         MetalGpuBuffer buffer;
-        if (PoolingEnabled && device.BufferPool.TryRent(data.Length, out var parked) && parked is not null)
+        if (PoolingEnabled && device.BufferPool.TryRentForBackend(data.Length, owner, out var parked) && parked is not null)
         {
             buffer = FromParked(device, parked, data.Length);
             buffer.CopyFrom(data);
         }
         else if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss() &&
-                 PendingFreesDrainAndTryRent(device, data.Length, out parked) && parked is not null)
+                 PendingFreesDrainAndTryRent(device, data.Length, owner, out parked) && parked is not null)
         {
             buffer = FromParked(device, parked, data.Length);
             buffer.CopyFrom(data);
@@ -286,10 +292,10 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         return buffer;
     }
 
-    private static bool PendingFreesDrainAndTryRent(MetalDevice device, int elementCount, out MetalGpuBuffer? parked)
+    private static bool PendingFreesDrainAndTryRent(MetalDevice device, int elementCount, IDirectGpuBackend? owner, out MetalGpuBuffer? parked)
     {
         PendingFrees.Drain();
-        return device.BufferPool.TryRent(elementCount, out parked);
+        return device.BufferPool.TryRentForBackend(elementCount, owner, out parked);
     }
 
     private static MetalGpuBuffer FromParked(MetalDevice device, MetalGpuBuffer parked, int size)

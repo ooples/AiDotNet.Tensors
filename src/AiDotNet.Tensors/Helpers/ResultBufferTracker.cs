@@ -76,6 +76,26 @@ internal sealed class ResultBufferState
 /// </remarks>
 internal static class ResultBufferTracker
 {
+    // Ownership metadata for fresh compiled-gradient arrays. These entries never retain an array for recycling:
+    // the key is weak, the owner is weak, and vectors keep the owner alive only while they use that array.
+    private static readonly ConditionalWeakTable<Array, WeakReference<ResultBufferOwner>> s_privateOwners = new();
+    private static volatile bool s_privateOwnershipSeen;
+
+    /// <summary>
+    /// Registers a genuinely fresh, unexposed array. Zero wrappers means registration precedes its first Memory
+    /// wrapper; one means its sole creator vector already exists and will immediately receive the returned owner.
+    /// This is independent of result recycling budgets and never makes this array available to a rent.
+    /// </summary>
+    internal static ResultBufferOwner? TrackFreshPrivateArray<T>(T[] array, int existingWrappers)
+    {
+        if (array.Length == 0) return null;
+        if (existingWrappers != 0 && existingWrappers != 1) throw new ArgumentOutOfRangeException(nameof(existingWrappers));
+        var owner = new ResultBufferOwner(new ResultBufferState { Wrappers = existingWrappers });
+        s_privateOwners.Add(array, new WeakReference<ResultBufferOwner>(owner));
+        s_privateOwnershipSeen = true;
+        return owner;
+    }
+
     private sealed class Entry
     {
         internal GCHandle Owner;
@@ -236,13 +256,19 @@ internal static class ResultBufferTracker
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static ResultBufferOwner? Find<T>(ReadOnlyMemory<T> memory)
     {
-        if (Volatile.Read(ref s_count) == 0) return null;
+        if (!s_privateOwnershipSeen && Volatile.Read(ref s_count) == 0) return null;
         return MemoryMarshal.TryGetArray(memory, out var segment) && segment.Array is { } array ? Find(array) : null;
     }
 
     /// <summary>The owner of a tracked <paramref name="array"/>; null when untracked.</summary>
     internal static ResultBufferOwner? Find(Array array)
     {
+        if (s_privateOwnershipSeen && s_privateOwners.TryGetValue(array, out var privateEntry)
+            && privateEntry.TryGetTarget(out var privateOwner))
+        {
+            Interlocked.Increment(ref privateOwner.State.Wrappers);
+            return privateOwner;
+        }
         if (Volatile.Read(ref s_count) == 0) return null;
         lock (s_lock)
         {
