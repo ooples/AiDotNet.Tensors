@@ -4908,9 +4908,9 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    // One entry per tensor. The handle is the one a capture read (set while capturing, or on the first record): a
-    // later uncaptured step that sees a different buffer must not overwrite it, or the pre-replay handle check could
-    // not catch the graph reading the old buffer.
+    // One entry per tensor. The handle is the one a capture read (set only while capturing): a later uncaptured step
+    // that sees a different buffer must not overwrite it, or the pre-replay handle check could not catch the graph
+    // reading the old buffer. A tensor no capture read keeps a zero handle and is only refreshed, never checked.
     private void RecordCapturedResidentIndex(Tensor<int> indices, bool capturing)
     {
         if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero) return;
@@ -4923,10 +4923,11 @@ public partial class DirectGpuTensorEngine
                     if (capturing) r.Handle = buffer.Handle;
                     return;
                 }
+            // Zero until a capture reads it: only a handle a graph baked is checked before a replay.
             _capturedResidentIndices.Add(new CapturedResidentIndex
             {
                 Tensor = new WeakReference<Tensor<int>>(indices),
-                Handle = buffer.Handle,
+                Handle = capturing ? buffer.Handle : IntPtr.Zero,
             });
         }
     }
@@ -4948,15 +4949,17 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private static void RefreshResidentIndexInPlace(IDirectGpuBackend backend, Tensor<int> indices, IntPtr expectedHandle)
     {
+        // A graph that read this tensor reads the buffer it baked whether or not the version moved (a re-placement or a
+        // pool reassignment need not bump it): check that first.
+        if (expectedHandle != IntPtr.Zero && indices._gpuBuffer?.Handle != expectedHandle)
+            throw new InvalidOperationException(
+                "A device-resident index tensor read by a captured graph was given a new device buffer: the graph " +
+                "reads the old one through a baked pointer.");
         int version = indices.GpuCacheVersion;
         if (indices._gpuBufferVersion == version) return;   // the device buffer is current (or newer)
         var host = indices.GetBackingArrayForCacheLookupUnsafe();
         if (host is null || Helpers.HostSync.IsPending(host)) return;   // the device holds the newer values
-        if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero
-            || (expectedHandle != IntPtr.Zero && buffer.Handle != expectedHandle))
-            throw new InvalidOperationException(
-                "A device-resident index tensor read by a captured graph was given a new device buffer: the graph " +
-                "reads the old one through a baked pointer.");
+        if (indices._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero) return;
         var data = indices.GetDataArray();
         if (indices._gpuBufferContainsRawInt32) backend.UploadIntBufferInPlace(data, buffer);
         else backend.UploadBufferInPlace(global::AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine.ToFloatArray(data), buffer);

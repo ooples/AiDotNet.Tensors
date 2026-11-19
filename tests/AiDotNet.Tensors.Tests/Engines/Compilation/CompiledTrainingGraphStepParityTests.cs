@@ -1106,6 +1106,69 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A captured graph reads a device-resident ids tensor through the buffer it baked: if the tensor is given another
+    /// buffer (without its version moving), the next replay throws instead of reading the old one.
+    /// </summary>
+    [SkippableFact]
+    public void A_replay_rejects_resident_ids_moved_to_another_buffer()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            const int rows = 40;
+            var ids = new Tensor<int>([Batch]);
+            for (int i = 0; i < Batch; i++) ids.AsWritableSpan()[i] = (5 * i + 1) % rows;
+            ids.IncrementVersion();
+            ids.Gpu();
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var table = Rand([rows, Inputs], 5, 0.5f);
+            var w = Rand([Inputs, Outputs], 4, 0.3f);
+            var parameters = new[] { table, w };
+            foreach (var p in parameters) p.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                var a = gpu.TensorIndexSelect(table, ids, 0);
+                gpu.TensorMSELoss(gpu.TensorMatMul(gpu.TensorMultiply(a, x), w), y);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                for (int s = 0; s < Steps; s++) plan.Step();
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                Assert.True(execField.GetValue(plan) is IntPtr handle && handle != IntPtr.Zero,
+                    "the captured plan is not replaying a graph after warm-up");
+                // Same values, same version, another buffer: as a re-placement would leave it.
+                var backend = gpu.GetBackend()!;
+                var moved = backend.AllocateBuffer(AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine.ToFloatArray(ids.ToArray()));
+                var original = ids._gpuBuffer;
+                int version = ids._gpuBufferVersion;
+                ids._gpuBuffer = moved;
+                ids._gpuBufferVersion = version;
+                try
+                {
+                    Assert.Throws<InvalidOperationException>(() => plan.Step());
+                }
+                finally
+                {
+                    ids._gpuBuffer = original;
+                    ids._gpuBufferVersion = version;
+                    moved.Dispose();
+                }
+            }
+        }
+    }
+
     private static (double[] Losses, float[][] Weights, bool Replayed) TrainHostIdSelects(IEngine engine, bool capture,
         bool residentIds = false, bool viewIds = false)
     {
