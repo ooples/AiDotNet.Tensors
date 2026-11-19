@@ -43301,8 +43301,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
-
+        // Recorded as a compiled op whose replay refreshes the traced indices tensor in place, so its readers (index
+        // selects, gathers) see each execution's indices; inference plans included.
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
 
@@ -43467,7 +43467,6 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         if (axis < 0) axis = tensor.Rank + axis;
 
@@ -43476,6 +43475,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null && tensor.Rank >= 1 && axis >= 0 && axis < tensor.Rank)
             {
+                // The indices are a concrete Tensor<int> the replay reads live (a frozen index table, or the indices
+                // a compiled TopK refreshes in place each execution), so an inference plan can record this too.
                 RequireConcreteIndices(indices, "TensorIndexSelect");
                 var captured = tensor;
                 var capIndices = indices;
