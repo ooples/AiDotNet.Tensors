@@ -48,9 +48,35 @@ public sealed class IndexGraphBindingTests
         IntPtr graph = engine.CaptureGpuGraph(() => Copy(engine, backend, ids));
         storage.SetFlat(0, 6);
         engine.LaunchGpuGraph(graph);
-        Assert.Equal(6, First(buffer));
+        var uploaded = new int[4];
+        Buffer.BlockCopy(((MockGpuBuffer)buffer).Data, 0, uploaded, 0, uploaded.Length * sizeof(int));
+        Assert.Equal(new[] { 6, 3, 2, 4 }, uploaded);
         Assert.Equal(1, state.GraphLaunches);
         engine.DestroyGpuGraph(graph);
+    }
+
+    [Fact]
+    public void EmbeddingLookup_ValidatesChangedHostIdsBeforeReplay()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.CreateGraphCapture(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var scope = engine.EnterResidentCaptureScope();
+        var table = new Tensor<float>(new[] { 2, 1 });
+        var ids = new Tensor<int>(new[] { 0 }, new[] { 1 });
+        void Lookup() => ((IEngine)engine).TensorEmbeddingLookup(table, ids);
+        Lookup();
+        IntPtr graph = engine.CaptureGpuGraph(Lookup);
+        try
+        {
+            ids.SetFlat(0, 1);
+            engine.LaunchGpuGraph(graph);
+            ids.SetFlat(0, 2);
+            Assert.Throws<ArgumentOutOfRangeException>(() => engine.LaunchGpuGraph(graph));
+            Assert.Equal(1, state.GraphLaunches);
+        }
+        finally { engine.DestroyGpuGraph(graph); }
     }
 
     [Fact]

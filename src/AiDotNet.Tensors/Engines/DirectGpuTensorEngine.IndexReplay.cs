@@ -39,15 +39,20 @@ public partial class DirectGpuTensorEngine
     // each consumer graph, while device copies remain reusable by subsequent graphs with different vocabularies.
     internal IntPtr CaptureGraphWithIndexBindings(IGpuGraphCapture capture, Action forward)
     {
-        var previous = t_indexReplayCapture;
         var bindings = new IndexReplayBindings(this);
+        IntPtr exec = CaptureIndexBindings(capture, forward, bindings);
+        if (exec != IntPtr.Zero)
+            lock (_indexReplayGraphLock) _indexReplayGraphs[exec] = bindings;
+        return exec;
+    }
+
+    private static IntPtr CaptureIndexBindings(IGpuGraphCapture capture, Action forward, IndexReplayBindings bindings)
+    {
+        var previous = t_indexReplayCapture;
         t_indexReplayCapture = bindings;
         try
         {
-            IntPtr exec = capture.CaptureGraph(forward);
-            if (exec != IntPtr.Zero)
-                lock (_indexReplayGraphLock) _indexReplayGraphs[exec] = bindings;
-            return exec;
+            return capture.CaptureGraph(forward);
         }
         finally
         {
@@ -94,7 +99,7 @@ public partial class DirectGpuTensorEngine
             RefreshResidentIndexInPlace(backend, binding.Source, binding.Handle);
     }
 
-    private void RetireIndexGraphBindings(IntPtr graphExec)
+    internal void RetireIndexGraphBindings(IntPtr graphExec)
     {
         lock (_indexReplayGraphLock) _indexReplayGraphs.Remove(graphExec);
     }

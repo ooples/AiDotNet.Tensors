@@ -4686,7 +4686,7 @@ public partial class DirectGpuTensorEngine
     }
 
     private OwnedBuffer GetOrAllocateInt32IndexBuffer(
-        IDirectGpuBackend backend, Tensor<int> indices, Tensor<int>? originalIndices = null)
+        IDirectGpuBackend backend, Tensor<int> indices, Tensor<int>? originalIndices = null, int upperBound = 0)
     {
         if (ResidentStepActive && originalIndices is not null && !HasResidentIndexStorage(originalIndices))
             indices = originalIndices;
@@ -4696,7 +4696,7 @@ public partial class DirectGpuTensorEngine
             // upload per call is a cuMemAlloc and a synchronous copy inside the captured step, which aborts the capture
             // and sent the op to the host path, whose read of its device-resident input aborted it again.
             if (ResidentStepActive)
-                return new OwnedBuffer(GetHostIndexDeviceCopy(backend, indices), ownsBuffer: false);
+                return new OwnedBuffer(GetHostIndexDeviceCopy(backend, indices, upperBound), ownsBuffer: false);
             return new OwnedBuffer(backend.AllocateIntBuffer(indices.GetDataArray()), ownsBuffer: true);
         }
 
@@ -10549,7 +10549,7 @@ public partial class DirectGpuTensorEngine
                     var indexValues = indexValuesLease.Array;
                     ValidateEmbeddingIndices(indexValues, vocabSize, nameof(indices));
                 }
-                indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: (object)indices as Tensor<int>);
+                indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: intIndices, upperBound: vocabSize);
             }
             else
             {
@@ -10672,7 +10672,7 @@ public partial class DirectGpuTensorEngine
             }
 
             using var gradientBuffer = GetOrAllocateBuffer(backend, gradOutput);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: (object)indices as Tensor<int>);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: intIndices, upperBound: vocabSize);
             return DispatchDeferredGpuOp<TValue>(backend, checked(vocabSize * embeddingDim),
                 new[] { vocabSize, embeddingDim }, output =>
                 {

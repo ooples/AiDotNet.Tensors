@@ -142,6 +142,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static readonly bool s_graphStepDiagnosticsEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPHSTEP_DIAG") == "1";
     private IntPtr _stepGraphExec;
+    private DirectGpuTensorEngine? _stepGraphOwner;
     // The step graph for odd replays, when the plan alternates two (NeedsParityGraphs): replay r runs
     // _stepGraphExec when r is even, this one when r is odd. Zero: every replay runs _stepGraphExec.
     private IntPtr _stepGraphExecOdd;
@@ -556,6 +557,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // A plan dropped without Dispose still releases its captured graph and the memory the graph pins.
     ~CompiledTrainingPlan()
     {
+        _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExec);
+        _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExecOdd);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExec);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExecOdd);
     }
@@ -1539,6 +1542,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (_stepGraphExecOdd != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExecOdd);
         }
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
+        _stepGraphOwner = null;
         _stepGraphExec = IntPtr.Zero;
         StepGraphNodeCounts = null;
         _stepGraphExecOdd = IntPtr.Zero;
@@ -4394,6 +4398,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         RollBackCaptureResidency(gte);
                         return StepResidentOrEager();
                     }
+                    _stepGraphOwner = gte;
                     _stepGraphExec = exec;
                     if (NeedsParityGraphs && !TryCaptureOddParityGraph(gte, cb))
                     {
@@ -7998,7 +8003,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             ResolveDeferredFiniteness();
             if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
-                || _usesFusedCe || paramCount == 0 || _l2Regularization != 0f || _maxGradNorm > 0.0)
+                || _usesFusedCe || paramCount == 0 || !_l2Regularization.Equals(0f) || _maxGradNorm > 0.0)
                 return null;
             ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
