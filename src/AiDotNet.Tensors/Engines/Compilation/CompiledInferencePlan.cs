@@ -2081,10 +2081,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (reordering.IsEnabled && reordering.TryOptimize(arr, engine) is { } reordered)
             arr = reordered;
 
-        // Memory planning shares host storage between tensors whose lifetimes do not overlap. That saves host memory
-        // only, and on the GPU engine it aliases device state: device buffers are cached and re-keyed by host backing
-        // array, so binding the second tenant's result displaced (and released) the first tenant's buffer while that
-        // tensor still held it (measured: a stacked recurrent model's later layers read an earlier layer's values).
+        // Memory planning shares host storage between tensors whose lifetimes do not overlap. On the GPU engine that
+        // saves host memory only, and the engine caches device buffers per host backing array, so tenants of one array
+        // can share device state. Measured: with it, a stacked recurrent decode's later layers read an earlier layer's
+        // values (wrong next states); without it, they match the CPU engine. GPU plans skip it.
         var memoryPlanning = new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass();
         if (memoryPlanning.IsEnabled && !engine.TryGet<DirectGpuTensorEngine>(out _) &&
             memoryPlanning.TryOptimize(arr, engine, protectedOutputs) is { } memoryPlanned)
