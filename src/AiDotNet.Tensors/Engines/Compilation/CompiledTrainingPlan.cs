@@ -4525,6 +4525,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // memory. Drop the graph and train this plan eagerly from here on.
                     InvalidateCapturedStepGraph();
                     _graphStepDisabled = true;
+                    RecordGraphCaptureFailure("an input the captured graph reads through a baked pointer was released or "
+                        + "rebound to another buffer after the capture; this plan trains eagerly from now on");
                     return StepEager();
                 }
                 if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, _stepGraphExec);
@@ -4734,12 +4736,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool RefreshGraphInputInPlace(Engines.DirectGpu.IGpuGraphCapture cb)
     {
         bool allLive = true;
+        var de = _engine.As<Engines.DirectGpuTensorEngine>();
         // Every caller-fed leaf, embedding-first plans included (their indices refresh separately; the target does not).
         foreach (var leaf in GraphExternalLeaves())
         {
             if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
             if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
             if (leafBuffer is null) continue;
+            // A leaf the device rewrote in place since (a dropout mask redrawn between replays) already holds its value
+            // in this buffer, and its host copy is a pending download of it: leasing that array downloaded the value and
+            // the upload wrote it straight back, two transfers of every mask per step.
+            if (de is not null && de.ResidentInputHoldsDeviceWrite(leaf))
+            {
+                leaf._gpuBufferVersion = leaf.GpuCacheVersion;
+                continue;
+            }
             using var leafDataLease = leaf.LeaseArray();
             var leafData = leafDataLease.Array;
             if (leafBuffer.Size < leaf.Length) continue;
