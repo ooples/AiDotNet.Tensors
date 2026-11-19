@@ -11394,7 +11394,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 int[]? gradientIndexRemap;
                 (deferredZeroByAction, pooledGradients, gradientIndexRemap) = PoolGradientBuffers(backwardActions, actionCoverage, forwardSteps,
-                    gradMap, allGrads, parameters, lossOutput, gradPlaceholders, t_gradAliasTargets);
+                    gradMap, allGrads, parameters, lossOutput, gradPlaceholders, t_gradAliasTargets,
+                    // Refine writes without removing/reordering actions or changing any backward mathematics.
+                    // Unknown delegates and heterogeneous/custom engines keep the conservative plan.
+                    typeof(T) == typeof(float) && preferGenericForGpu
+                        && engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
+                        && fp16HeteroOrder is null
+                        && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_EXACT_GRAD_WRITES") == "1"
+                        ? gradRequired : null);
                 if (gradientIndexRemap is not null)
                 {
                     prunedGradientBufferCount = gradientIndexRemap.Count(index => index < 0);
@@ -11685,21 +11692,29 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 output.TryDropStorageForStreaming();
         }
     }
+    // Only these exact built-in delegates test relevance before every accumulator write.
+    // Operation names are not contracts: a custom backward with the same name must remain conservative.
+    private static bool HasExactGradientRelevanceContract(CompiledStep<T> step)
+    {
+        var backward = step.BackwardFn;
+        if (backward is null || backward.Target is not null || backward.GetInvocationList().Length != 1) return false;
+        var method = backward.Method;
+        return method == ((BackwardFunction<T>)BackwardFunctions<T>.Conv2DBackward).Method
+            || method == ((BackwardFunction<T>)BackwardFunctions<T>.FusedConv2DBiasActivationBackward).Method
+            || method == ((BackwardFunction<T>)BackwardFunctions<T>.ChannelBiasAddBackward).Method;
+    }
+
+
     /// <summary>
-    /// Gradient pooling. Every gradient was built as a placeholder (a view of a shared scratch array; one fetched at build
-    /// time already got its own array). This gives the gradients of non-parameter tensors whose lifetimes in the backward
-    /// do not overlap shared arrays, sized to their largest tenant, and every remaining placeholder an array of its own.
-    /// A gradient lives from the first backward action that writes it to the last one that touches it, over the actual
-    /// action stream (<paramref name="coverage"/>); a gradient read before anything writes it, a parameter's (the
-    /// optimizer reads it after the backward) and the loss's (seeded at step start) are never pooled. Returns, per
-    /// action, the pooled gradients whose lifetime starts there (zeroed just before it when the step decides they need
-    /// zeroing, since an earlier tenant used the array), and which gradients are pooled. On DenseNet-121 the per-tensor
-    /// gradients were 3.1 GB while at most ~0.2 GB is ever live at once.
+    /// Gives disjoint-lifetime gradient placeholders shared arrays over the actual backward action stream.
+    /// Parameter, loss, requested-input and read-before-write gradients keep independent storage.
+    /// Unknown action coverage prevents pooling or pruning.
     /// </summary>
     private static (int[][]? Schedule, bool[]? Pooled, int[]? IndexRemap) PoolGradientBuffers(
         List<Action<IEngine>> backwardActions, List<int[]?> coverage, List<CompiledStep<T>> forwardSteps,
         Dictionary<Tensor<T>, Tensor<T>> gradMap, List<Tensor<T>> allGrads, Tensor<T>[] parameters, Tensor<T> lossOutput,
-        HashSet<Tensor<T>> placeholders, Dictionary<Tensor<T>, Tensor<T>>? aliasTargets = null)
+        HashSet<Tensor<T>> placeholders, Dictionary<Tensor<T>, Tensor<T>>? aliasTargets = null,
+        HashSet<Tensor<T>>? requiredGradients = null)
     {
         int count = allGrads.Count, actions = backwardActions.Count;
         var pooled = new bool[count];
@@ -11733,7 +11748,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 foreach (int s in covered[a])
                 {
                     int passthrough = GradIndex(forwardSteps[s].OutputBuffer);
-                    foreach (int w in forwardSteps[s].Inputs.Select(GradIndex).Where(i => i != None))
+                    foreach (int w in forwardSteps[s].Inputs
+                        .Where(input => requiredGradients is null || covered[a].Length != 1
+                            || requiredGradients.Contains(input)
+                            || !HasExactGradientRelevanceContract(forwardSteps[s]))
+                        .Select(GradIndex).Where(i => i != None))
                     {
                         lastUse[w] = Math.Max(lastUse[w], a);
                         if (w == passthrough) continue;
