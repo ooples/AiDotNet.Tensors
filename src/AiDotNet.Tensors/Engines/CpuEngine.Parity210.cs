@@ -4528,9 +4528,21 @@ public partial class CpuEngine
 
     private static void ErfcRange<T>(ReadOnlySpan<T> src, Span<T> dst)
     {
-        var ops = MathHelper.GetNumericOperations<T>();
-        for (int i = 0; i < src.Length; i++)
-            dst[i] = ops.FromDouble(ErrorFunction.Erfc(ops.ToDouble(src[i])));
+        if (typeof(T) == typeof(float))
+        {
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = (T)(object)(float)ErrorFunction.Erfc((float)(object)src[i]!);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = (T)(object)ErrorFunction.Erfc((double)(object)src[i]!);
+        }
+        else
+        {
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = MathHelper.Erfc(src[i]);
+        }
     }
 
     /// <inheritdoc/>
