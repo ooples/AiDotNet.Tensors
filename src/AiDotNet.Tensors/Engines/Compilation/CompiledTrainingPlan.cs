@@ -636,6 +636,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _fp16PagedPlan = null;
         _storageLeases?.Dispose();
         _storageLeases = null;
+        _weightNormWorkspace?.Dispose();
+        _weightNormWorkspace = null;
     }
 
     /// <summary>
@@ -2558,7 +2560,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         _forwardActions = rebuiltForward.ToArray();
-        if (_cpuWeightNormWorkspace is { } weightNormWorkspace)
+        if (_weightNormWorkspace is { } weightNormWorkspace)
             weightNormWorkspace.WrapForward(_forwardActions, ActionToStepIndex
                 ?? throw new InvalidOperationException("Weight-normalization workspace requires forward metadata."));
         // The span lease plan was made over the original actions; a specialized action may write elsewhere.
@@ -10545,7 +10547,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
 
 
-        if (LazyTensorScope.DeferCpuTrainingOutputs && engine.Is<CpuEngine>()
+        if (LazyTensorScope.DeferCpuTrainingOutputs && engine.Is<CpuEngine>() && !engine.SupportsGpu
             && ReferenceEquals(engine, engine.Unwrap()))
         {
             // Share normalization storage before allocating primal arrays. CPU
@@ -11473,14 +11475,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
 
         var weightNormWorkspace = dataReplay is null && fp16HeteroOrder is null
-            ? PrepareCpuWeightNormWorkspace(forwardSteps, forwardActions, backwardActions, forwardEmitKinds,
+            ? PrepareWeightNormWorkspace(forwardSteps, forwardActions, backwardActions, forwardEmitKinds,
                 actionCoverage, parameters, lossOutput, retainedOutputs, scope, engine)
             : null;
-        if (CpuWeightNormWorkspaceEnabled && engine.Is<CpuEngine>() && ReferenceEquals(engine, engine.Unwrap()))
+        if (CpuWeightNormWorkspaceEnabled && engine.Is<CpuEngine>() && !engine.SupportsGpu && ReferenceEquals(engine, engine.Unwrap()))
             foreach (var step in forwardSteps)
                 if (step.OutputBuffer.HasDeferredHostStorage)
                     _ = step.OutputBuffer._storage.GetVector().AsSpanUnmarked().Length;
 
+        bool weightNormWorkspaceOwned = true;
         TensorStorageLeaseSet? storageLeases = new TensorStorageLeaseSet();
         try
         {
@@ -11517,7 +11520,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 forwardEmitKinds,
                 forwardFixedActions,
                 storageLeases);
-            plan._cpuWeightNormWorkspace = weightNormWorkspace;
+            plan._weightNormWorkspace = weightNormWorkspace;
             storageLeases = null;
             plan._dataForwardReplay = dataReplay;
             plan._graphGradientMembership = parameters.Select(gradientMembers.Contains).ToArray();
@@ -11533,6 +11536,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (plan._lastBackwardReads is { } lastReads)
                 foreach (var output in retainedOutputs) lastReads.Remove(output);
             plan._requestedInputGradientLeaves = RequestedInputGradientLeaves(forwardSteps).ToArray();
+            if (plan._lastBackwardReads is { } workspaceLastReads && weightNormWorkspace is not null)
+                weightNormWorkspace.ProtectDeviceOutputs(workspaceLastReads);
             plan._aliasedGradViews = aliasedGradViews?.ToArray();
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             plan.PrunedGradientBufferCount = prunedGradientBufferCount;
@@ -11565,12 +11570,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 plan._spanStepOfAction = spans.StepOfAction;
                 plan._spanReleaseAfter = spans.ReleaseAfter;
             }
+            weightNormWorkspaceOwned = false;
             return plan;
         }
         finally
         {
             storageLeases?.Dispose();
             weightNormWorkspace?.CompleteSnapshot();
+            if (weightNormWorkspaceOwned) weightNormWorkspace?.Dispose();
         }
     }
 

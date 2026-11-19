@@ -9,7 +9,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     internal static bool CpuWeightNormWorkspaceEnabled { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_CPU_WEIGHTNORM_WORKSPACE") == "1";
 
-    private CpuWeightNormWorkspace? _cpuWeightNormWorkspace;
+    private WeightNormWorkspaceLayout? _weightNormWorkspace;
 
     private sealed class WeightNormWorkspaceGroup
     {
@@ -25,17 +25,27 @@ internal sealed partial class CompiledTrainingPlan<T>
         { Normalization = step; FirstStep = index; Outputs.Add(step.OutputBuffer); }
     }
 
-    private sealed class CpuWeightNormWorkspace
+    private sealed class WeightNormWorkspaceLayout
     {
         private readonly Dictionary<int, WeightNormWorkspaceGroup> _consumers;
         private readonly IReadOnlyList<CompiledStep<T>> _steps;
         private readonly List<Tensor<T>> _temporaryViews = new();
+        private DeviceWeightNormWorkspace? _deviceWorkspace;
         internal readonly long OriginalBytes;
         internal readonly long WorkspaceBytes;
 
-        internal CpuWeightNormWorkspace(Dictionary<int, WeightNormWorkspaceGroup> consumers,
+        internal WeightNormWorkspaceLayout(Dictionary<int, WeightNormWorkspaceGroup> consumers,
             IReadOnlyList<CompiledStep<T>> steps, long originalBytes, long workspaceBytes)
         { _consumers = consumers; _steps = steps; OriginalBytes = originalBytes; WorkspaceBytes = workspaceBytes; }
+
+        internal void ProtectDeviceOutputs(Dictionary<Tensor<T>, int> lastReads)
+        {
+            if (_deviceWorkspace is not null)
+                foreach (var output in _deviceWorkspace.Outputs) lastReads.Remove(output);
+        }
+
+        internal void Dispose() => _deviceWorkspace?.Dispose();
+        internal void UseDeviceWorkspace(DeviceWeightNormWorkspace workspace) => _deviceWorkspace = workspace;
 
         internal void KeepUntilSnapshot(Tensor<T> view) => _temporaryViews.Add(view);
         internal void CompleteSnapshot()
@@ -48,11 +58,13 @@ internal sealed partial class CompiledTrainingPlan<T>
         {
             var group = _consumers[consumer];
             var normalization = group.Normalization;
+            _deviceWorkspace?.PrepareDestination(group, _steps[consumer].Inputs[1]);
             engine.TensorWeightNormInto(_steps[consumer].Inputs[1], normalization.Inputs[0],
                 normalization.Inputs[1], (double)normalization.SavedState![0]);
             // Independent tensor views intentionally share this private array. A
             // per-tensor version cannot describe which layer last wrote it.
-            Engines.Simd.SimdGemm.MarkWeightDirty(group.Bank);
+            if (_deviceWorkspace is null) Engines.Simd.SimdGemm.MarkWeightDirty(group.Bank);
+            else _deviceWorkspace.RefreshAliases(group, _steps[consumer].Inputs[1]);
         }
 
         internal void WrapForward(Action<IEngine>[] actions, int[] actionSteps)
@@ -61,6 +73,8 @@ internal sealed partial class CompiledTrainingPlan<T>
             for (int i = 0; i < actions.Length; i++)
             {
                 int step = actionSteps[i];
+                if (_deviceWorkspace?.Normalizations.Contains(step) == true)
+                { actions[i] = _ => { }; continue; }
                 if (!_consumers.ContainsKey(step)) continue;
                 var action = actions[i];
                 actions[i] = engine => { Refresh(engine, step); action(engine); };
@@ -83,14 +97,19 @@ internal sealed partial class CompiledTrainingPlan<T>
         }
     }
 
-    private static CpuWeightNormWorkspace? PrepareCpuWeightNormWorkspace(
+    private static WeightNormWorkspaceLayout? PrepareWeightNormWorkspace(
         IReadOnlyList<CompiledStep<T>> steps, Action<IEngine>[] forward, List<Action<IEngine>> backward,
         ForwardEmit[] forwardKinds, List<int[]?> coverage, Tensor<T>[] parameters, Tensor<T> loss,
         HashSet<Tensor<T>> retained, LazyTensorScope scope, IEngine engine)
     {
-        if (!CpuWeightNormWorkspaceEnabled || !LazyTensorScope.DeferCpuTrainingOutputs || typeof(T) != typeof(float)
-            || !engine.Is<CpuEngine>() || !ReferenceEquals(engine, engine.Unwrap())
-            || engine.Unwrap().GetType() != typeof(CpuEngine)
+        bool cpu = CpuWeightNormWorkspaceEnabled && LazyTensorScope.DeferCpuTrainingOutputs
+            && engine.Unwrap().GetType() == typeof(CpuEngine);
+        bool gpu = GpuWeightNormWorkspaceEnabled && engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
+            && engine.Cast<DirectGpuTensorEngine>().SupportsWeightNormWorkspace
+            && engine.Cast<DirectGpuTensorEngine>().QueryBackend is DirectGpu.IGpuBatchExecution
+            && engine.Cast<DirectGpuTensorEngine>().QueryBackend is DirectGpu.IGpuBufferViews;
+        if ((!cpu && !gpu) || typeof(T) != typeof(float)
+            || !ReferenceEquals(engine, engine.Unwrap())
             || scope.HostReadOp is not null || ForwardStepObserver is not null || SanitizeForwardBuffers
             || coverage.Count != backward.Count || coverage.Any(row => row is null)) return null;
         var actionSteps = Enumerable.Range(0, forwardKinds.Length).Where(i => forwardKinds[i] != ForwardEmit.Skip).ToArray();
@@ -127,7 +146,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             {
                 var tensor = step.Inputs[input]; tensors.Add(tensor);
                 if (!groups.TryGetValue(tensor.StorageIdentity, out var group)) continue;
-                bool convolution = step.OpType is OpType.Conv2D or OpType.GroupedConv2D;
+                bool convolution = IsWeightNormWorkspaceConvolution(step);
                 if (input != 1 || !convolution || step.DifferentiableInputIndices is not null || !emitted.Contains(i))
                     group.Safe = false;
                 else group.Consumers.Add(i);
@@ -137,9 +156,27 @@ internal sealed partial class CompiledTrainingPlan<T>
             if (groups.TryGetValue(tensor.StorageIdentity, out var group) && !group.Outputs.Contains(tensor)) group.Safe = false;
         var eligible = groups.Where(pair => pair.Value.Safe && !protectedStorage.Contains(pair.Key))
             .Select(pair => pair.Value).Where(group => group.Consumers.Count > 0
-                && group.Outputs.All(output => output.HasDeferredHostStorage && !output.IsView && output._storageOffset == 0)
+                && group.Outputs.All(output => output.HasDeferredHostStorage && !output.IsView && output._storageOffset == 0
+                    && (!gpu || output._gpuBuffer is null))
                 && group.Normalization.Inputs.All(input => !lastWrite.TryGetValue(input.StorageIdentity, out int writer)
                     || writer < group.FirstStep)).ToArray();
+        if (gpu && Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
+        {
+            AiDotNetEngine.LogDiagnostic($"[WN-WORKSPACE-ELIGIBILITY] groups={groups.Count} safe={groups.Values.Count(group => group.Safe)} protected={groups.Count(pair => protectedStorage.Contains(pair.Key))} deferred={groups.Values.Count(group => group.Outputs.All(output => output.HasDeferredHostStorage))} bound={groups.Values.Count(group => group.Outputs.Any(output => output._gpuBuffer is not null))} eligible={eligible.Length}");
+            var rejected = new Dictionary<string, int>();
+            for (int i = 0; i < steps.Count; i++)
+                for (int slot = 0; slot < steps[i].Inputs.Length; slot++)
+                    if (groups.ContainsKey(steps[i].Inputs[slot].StorageIdentity)
+                        && (slot != 1 || !IsWeightNormWorkspaceConvolution(steps[i])
+                            || steps[i].DifferentiableInputIndices is not null || !emitted.Contains(i)))
+                    {
+                        string reason = $"{steps[i].OpName}:{steps[i].OpType}:slot{slot}:custom{steps[i].DifferentiableInputIndices is not null}:emitted{emitted.Contains(i)}";
+                        rejected.TryGetValue(reason, out int count);
+                        rejected[reason] = count + 1;
+                    }
+            AiDotNetEngine.LogDiagnostic("[WN-WORKSPACE-CONSUMERS] " + string.Join(";", rejected.Select(pair => $"{pair.Key}={pair.Value}")));
+        }
+
         if (eligible.Length < 2) return null;
         var byConsumer = new Dictionary<int, WeightNormWorkspaceGroup>();
         var groupIndex = new Dictionary<WeightNormWorkspaceGroup, int>();
@@ -167,9 +204,15 @@ internal sealed partial class CompiledTrainingPlan<T>
         long originalBytes = eligible.Sum(group => (long)group.Normalization.OutputBuffer.Length * elementBytes);
         long workspaceBytes = capacities.Sum(length => (long)length * elementBytes);
         if (workspaceBytes >= originalBytes) return null;
-        var banks = capacities.Select(length => new T[length]).ToArray();
-        var layout = new CpuWeightNormWorkspace(byConsumer, steps, originalBytes, workspaceBytes);
-        foreach (var group in eligible)
+        var banks = gpu ? Array.Empty<T[]>() : capacities.Select(length => new T[length]).ToArray();
+        var layout = new WeightNormWorkspaceLayout(byConsumer, steps, originalBytes, workspaceBytes);
+        if (gpu)
+        {
+            var device = DeviceWeightNormWorkspace.TryCreate(engine.Cast<DirectGpuTensorEngine>(), eligible, capacities, steps);
+            if (device is null) return null;
+            layout.UseDeviceWorkspace(device);
+        }
+        else foreach (var group in eligible)
         {
             group.Bank = banks[group.Color];
             foreach (var output in group.Outputs)
@@ -182,7 +225,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         layout.WrapForward(forward, actionSteps);
         layout.WrapBackward(backward, coverage);
         if (Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
-            AiDotNetEngine.LogDiagnostic($"[WN-WORKSPACE] groups={eligible.Length} banks={banks.Length} original_bytes={originalBytes} workspace_bytes={workspaceBytes}");
+            AiDotNetEngine.LogDiagnostic($"[WN-WORKSPACE] device={(gpu ? "gpu" : "cpu")} groups={eligible.Length} banks={capacities.Count} original_bytes={originalBytes} workspace_bytes={workspaceBytes}");
         return layout;
     }
 }
