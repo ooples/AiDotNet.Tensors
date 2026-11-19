@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
-public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private DirectOpenClKernel GetInstantNgpKernel(string name)
     {
@@ -182,6 +182,19 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
         kernel.SetArg(1, InstantNgpHandle(int32Indices));
         kernel.SetArg(2, length);
         kernel.Execute1D(length, CalculateOptimalWorkGroupSize1D(length));
+    }
+
+    void IFusedCrossEntropyPositionsBackend.FusedCrossEntropyTargetPositions(
+        IGpuBuffer int32Ids, IGpuBuffer positionBits, int rows, int chunk, int vocab)
+    {
+        if (rows <= 0) return;
+        var kernel = GetInstantNgpKernel("fused_ce_target_positions");
+        kernel.SetArg(0, InstantNgpHandle(int32Ids));
+        kernel.SetArg(1, InstantNgpHandle(positionBits));
+        kernel.SetArg(2, rows);
+        kernel.SetArg(3, chunk);
+        kernel.SetArg(4, vocab);
+        kernel.Execute1D(rows, CalculateOptimalWorkGroupSize1D(rows));
     }
 
     public void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
