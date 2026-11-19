@@ -12,9 +12,9 @@ public partial class CpuEngine
     // A fixed channel-block/tap/channel reduction order exposes adjacent input channels to the
     // GEMM packer. Scratch is independent of waveform length and batch: one shared <=16MiB
     // filter tile, and <=2MiB column/product panels per joined worker. No activation is retained.
-    private static bool TryConv1DChannelBlocks(float[] input, int inputOffset, float[] kernel, int kernelOffset,
+    internal static bool TryConv1DChannelBlocks(float[] input, int inputOffset, float[] kernel, int kernelOffset,
         float[] output, int outputOffset, int batch, int inChannels, int width, int outChannels,
-        int kernelWidth, int stride, int padding, int dilation, int outputWidth)
+        int kernelWidth, int stride, int padding, int dilation, int outputWidth, bool splitChannels = true)
     {
         const int channelBlock = 16, aBudget = 4_194_304, workerBudget = 524_288;
         if (inChannels < channelBlock || kernelWidth <= 1 || width <= 0 || outputWidth <= 0
@@ -35,7 +35,7 @@ public partial class CpuEngine
         if (totalColumns > columns && columns >= 16) columns = columns / 16 * 16;
         columns = Math.Min(columns, totalColumns);
         int blocks = (totalColumns - 1) / columns + 1;
-        int workers = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, blocks));
+        int workerBudgetCount = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
         var packedKernel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(rows * reduction), "workspace.conv1d_channel_block_filter");
         try
         {
@@ -51,6 +51,18 @@ public partial class CpuEngine
                                 packedKernel[oc * reduction + packedRow] = kernel[kernelOffset + ((rowFrom + oc) * inChannels + channel) * kernelWidth + tap];
                 }
                 int currentRowFrom = rowFrom;
+                // Short time axes expose too few spatial tasks. Partition independent output
+                // rows too; six-row boundaries preserve the GEMM microkernel's row grouping.
+                // The reduction axis and the pre-existing channel/tap order remain unchanged.
+                int taskRows = rowCount;
+                if (splitChannels && blocks < workerBudgetCount && rowCount >= 192)
+                {
+                    int partitions = Math.Min((workerBudgetCount + blocks - 1) / blocks, rowCount / 96);
+                    taskRows = Math.Min(rowCount, ((rowCount + partitions * 6 - 1) / (partitions * 6)) * 6);
+                }
+                int rowTasks = (rowCount + taskRows - 1) / taskRows;
+                int tasks = checked(blocks * rowTasks);
+                int workers = Math.Min(workerBudgetCount, tasks);
                 CpuParallelSettings.ParallelForOrSerial(0, workers, (long)rowCount * reduction * totalColumns, worker =>
                 {
                     // Match the regular deterministic TensorMatMul dispatch. A logical N-tail
@@ -65,26 +77,29 @@ public partial class CpuEngine
                     float[]? product = null;
                     try
                     {
-                        product = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(rowCount * columns), "workspace.conv1d_channel_block_product");
-                        for (int tile = worker; tile < blocks; tile += workers)
+                        product = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(taskRows * columns), "workspace.conv1d_channel_block_product");
+                        for (int task = worker; task < tasks; task += workers)
                         {
+                            int rowStart = task / blocks * taskRows;
+                            int countRows = Math.Min(taskRows, rowCount - rowStart);
+                            int tile = task % blocks;
                             int from = tile * columns, count = Math.Min(columns, totalColumns - from), row = 0;
                             for (int block = 0; block < inChannels; block += channelBlock)
                                 for (int tap = 0; tap < kernelWidth; tap++)
                                     for (int channel = block; channel < Math.Min(inChannels, block + channelBlock); channel++, row++)
                                         FillConv1DChannelBlockRow(input, inputOffset, panel.AsSpan(row * count, count),
                                             from, outputWidth, inChannels, channel, width, tap, stride, padding, dilation);
-                            BlasManaged.BlasManaged.Gemm<float>(packedKernel.AsSpan(0, rowCount * reduction), reduction, false,
-                                panel.AsSpan(0, reduction * count), count, false, product.AsSpan(0, rowCount * count), count,
-                                rowCount, count, reduction, options);
-                            for (int oc = 0; oc < rowCount; oc++)
+                            BlasManaged.BlasManaged.Gemm<float>(packedKernel.AsSpan(rowStart * reduction, countRows * reduction), reduction, false,
+                                panel.AsSpan(0, reduction * count), count, false, product.AsSpan(0, countRows * count), count,
+                                countRows, count, reduction, options);
+                            for (int oc = 0; oc < countRows; oc++)
                                 for (int column = 0; column < count;)
                                 {
                                     int flat = from + column, image = flat / outputWidth;
                                     int time = flat - image * outputWidth;
                                     int take = Math.Min(count - column, outputWidth - time);
                                     product.AsSpan(oc * count + column, take).CopyTo(output.AsSpan(
-                                        outputOffset + (image * outChannels + currentRowFrom + oc) * outputWidth + time, take));
+                                        outputOffset + (image * outChannels + currentRowFrom + rowStart + oc) * outputWidth + time, take));
                                     column += take;
                                 }
                         }
