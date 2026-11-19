@@ -30,6 +30,7 @@ internal sealed class FirstWriteRedirectTable
     // overlap, so one buffer is the accumulator of several redirected slots in different actions. Counted per buffer alone,
     // every such slot looked consumed twice and was blocked. A contribution is consumed in the action that produced it.
     private readonly Dictionary<(IGpuBuffer Buffer, int Action), int> _uses = new();
+    private readonly List<long> _remapSlots = new();
 
     /// <summary>Number of redirected slots (diagnostics and tests).</summary>
     internal int Count => _redirects.Count;
@@ -64,6 +65,16 @@ internal sealed class FirstWriteRedirectTable
     internal bool TryGetTarget(long slot, out IGpuBuffer target) => _redirects.TryGetValue(slot, out target!);
 
     internal void Drop(long slot) => _redirects.Remove(slot);
+
+    // A completed uncaptured step may preserve a public gradient in its host shadow and subsequently rebind its
+    // device backing. The proven first-writer pairing stays valid; update only those physical destinations.
+    internal void RemapTargets(IReadOnlyDictionary<IGpuBuffer, IGpuBuffer> replacements)
+    {
+        _remapSlots.Clear();
+        foreach (var pair in _redirects)
+            if (replacements.ContainsKey(pair.Value)) _remapSlots.Add(pair.Key);
+        foreach (long slot in _remapSlots) _redirects[slot] = replacements[_redirects[slot]];
+    }
 
     /// <summary>
     /// Ends a run of the body. After an executed (uncaptured) run, commits the offers whose contribution had no other

@@ -4434,6 +4434,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static (float[] Flat, int Offset)? TryGetFlatParameterView(Tensor<float> t)
     {
         if (!t.IsContiguous) return null;
+        // A compiler-owned gradient bank is workspace, even when a smaller tenant looks like a flat parameter view.
+        // Classify it by identity before the raw-array accessor would mark that private bank escaped.
+        if (CompiledGradientBankIdentityEnabled && !t._storage.IsParameterBuffer
+            && t._storage.TryGetBackingArrayIdentity(out var privateArray, out _) && privateArray is not null
+            && Helpers.ResultBufferTracker.IsUnexposedPrivateArray(privateArray)) return null;
+
         _ = t.DataVector.TryGetBackingArraySegmentForReadOnlyAccess(out var arr, out int segment);
         if (arr is null) return null;
         int offset = segment + t._storageOffset;

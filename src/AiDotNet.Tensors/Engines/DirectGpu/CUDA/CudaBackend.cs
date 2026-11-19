@@ -15051,12 +15051,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes)
     {
-        if (_adamTable is { } cached && AdamTableMatches(cached, parameters, gradients, firstMoments, secondMoments, sizes))
+        if (CompiledPointerTableScope.Current is var owner && owner != 0 && !IsStreamCapturing())
+            return GetMutableAdamTable(owner, parameters, gradients, firstMoments, secondMoments, sizes);
+
+        if (_adamTable is { MutableOwner: 0 } cached && AdamTableMatches(cached, parameters, gradients, firstMoments, secondMoments, sizes))
             return cached;
         for (int i = 0; i < _retainedAdamTables.Count; i++)
         {
             var retained = _retainedAdamTables[i];
-            if (!AdamTableMatches(retained, parameters, gradients, firstMoments, secondMoments, sizes)) continue;
+            if (retained.MutableOwner != 0 || !AdamTableMatches(retained, parameters, gradients, firstMoments, secondMoments, sizes)) continue;
             _retainedAdamTables.RemoveAt(i);
             _retainedAdamTables.Add(retained);
             _adamTable = retained;
@@ -15089,7 +15092,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private MultiTensorTable BuildAdamTable(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
-        IReadOnlyList<int> sizes)
+        IReadOnlyList<int> sizes, bool retainAddresses = false)
     {
         int n = parameters.Count;
         var handles = new IntPtr[4 * n];
@@ -15119,7 +15122,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         // Build the replacement completely before retiring the cached table, as GetGradientTable does.
-        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
+        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks,
+            StagingAddresses = retainAddresses ? addresses : Array.Empty<byte>() };
         try
         {
             table.Pointers = AllocateByteBuffer(addresses.Length);
@@ -15246,6 +15250,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         public int[] Sizes = Array.Empty<int>();
         public IGpuBuffer? Pointers, SizesBuffer, ChunkTensor, ChunkStart;
         public int TotalChunks;
+        public long MutableOwner;
+        public byte[] StagingAddresses = Array.Empty<byte>();
+
 
         public bool Matches(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
         {
@@ -15284,12 +15291,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (sizes is null) throw new ArgumentNullException(nameof(sizes));
         if (sizes.Count != tensors.Count)
             throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
-        if (_gradientTable is { } cached && cached.Matches(tensors, sizes))
+        if (CompiledPointerTableScope.Current is var owner && owner != 0 && !IsStreamCapturing())
+            return GetMutableGradientTable(owner, tensors, sizes);
+
+        if (_gradientTable is { MutableOwner: 0 } cached && cached.Matches(tensors, sizes))
             return cached;
         for (int i = 0; i < _retainedGradientTables.Count; i++)
         {
             var retained = _retainedGradientTables[i];
-            if (!retained.Matches(tensors, sizes)) continue;
+            if (retained.MutableOwner != 0 || !retained.Matches(tensors, sizes)) continue;
             _retainedGradientTables.RemoveAt(i);
             _retainedGradientTables.Add(retained);
             _gradientTable = retained;
@@ -15309,7 +15319,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// A new gradient table (address, size and chunk arrays on the device) the caller owns. A captured graph that keeps
     /// its own table is unaffected when another tensor list replaces the shared cached one.
     /// </summary>
-    private MultiTensorTable BuildGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
+    private MultiTensorTable BuildGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, bool retainAddresses = false)
     {
         int n = tensors.Count;
         var addresses = new byte[n * sizeof(ulong)];
@@ -15337,7 +15347,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // Build the replacement completely before retiring the cached table: a failed allocation or upload disposes
         // the partial replacement and leaves the previous table intact.
-        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
+        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks,
+            StagingAddresses = retainAddresses ? addresses : Array.Empty<byte>() };
         try
         {
             using (PushContext())

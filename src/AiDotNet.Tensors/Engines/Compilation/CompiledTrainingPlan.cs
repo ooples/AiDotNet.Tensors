@@ -632,6 +632,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _storageLeases = null;
         _weightNormWorkspace?.Dispose();
         _weightNormWorkspace = null;
+        _shadowLoanOwner?.Release();
+        _shadowLoans.Clear();
+
     }
 
     /// <summary>
@@ -4593,6 +4596,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (s_stepProf && _profFwdUs is not null && ++s_residentProfSteps % StepProfDumpInterval == 0)
                         DumpPerOpProfile(s_residentProfSteps);
                     RefreshLossFromCapturedGraph(gte);
+                    using var pointerTables = EnterShadowPointerTableScope(gte, cb);
+
                     RegularizeAndClipGradients();   // in the order the eager and graph steps use
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
@@ -4614,6 +4619,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     DetachReleasedBindings(released);
                     gte.ReclaimGpuMemoryUnderPressure();
                     RearmUnreadLossReadback();
+                    if (completedWorkspaceStep) ShadowCompletedParameterGradients(gte, cb);
+
                     if (completedWorkspaceStep) RegisterPrivateGradientDemandOwner(gte, cb);
                 }
             }
@@ -5572,9 +5579,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     FailPrivateGradientResidencyAtForTesting = -1;
                     throw new NotSupportedException("Injected private-gradient residency failure.");
                 }
+                if (TryBindShadowGradientLoan(residentEngine, backend, _preAllocatedGrads[i])) continue;
+
                 var buffer = residentEngine.EnsureResidentBufferWithAllocationInfo(_preAllocatedGrads[i], out bool allocated);
                 if (allocated && buffer is not null) RecordPrivateGradientAllocation(buffer);
             }
+            if (CanUseGradientShadows(residentEngine)) RefreshShadowGradientRedirects();
+
             if (_aliasedGradViews is { } views)
                 foreach (var (view, target) in views)
                     if (target._gpuBuffer is { } targetBuffer && target._gpuBackend is { } targetBackend)
