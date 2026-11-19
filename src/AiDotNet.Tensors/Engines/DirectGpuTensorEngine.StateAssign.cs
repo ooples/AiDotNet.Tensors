@@ -64,6 +64,20 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// Downloads the first <paramref name="length"/> elements of a buffer a captured graph writes (a replayed plan's
+    /// output), independent of any tensor's binding to it. Null when the buffer is gone.
+    /// </summary>
+    internal float[]? DownloadCapturedBuffer(IGpuBuffer buffer, int length)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (buffer is null || buffer.Handle == IntPtr.Zero || buffer.Size < length || !TryGetBackend(out var backend)) return null;
+        if (buffer.Size == length) return backend.DownloadBuffer(buffer);
+        using var exact = backend.AllocateBuffer(length);
+        backend.Copy(buffer, 0, exact, 0, length);
+        return backend.DownloadBuffer(exact);
+    }
+
+    /// <summary>
     /// Undoes <see cref="PinInputResident{T}"/> when a plan goes back to eager execution: SetInputs writes only the host
     /// copy, and a pinned binding would keep serving the call that pinned it (measured: every eager call after an
     /// abandoned capture read that call's input).

@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Collections.Generic;
 using System;
 using System.Reflection;
@@ -264,7 +265,8 @@ public sealed class CompiledStatefulInferenceTests
         using (var scope = GraphMode.EnableInference())
         {
             var (o, n1, n2) = TwoLayers(engine, s1, s2, x, gate);
-            plan = scope.CompileInference(o, new[] { x }, new[] { (s1, n1), (s2, n2) });
+            // The output ends in a reshape (as a language model's logits do): its step re-binds the plan's output.
+            plan = scope.CompileInference(engine.Reshape(o, [1, R * D]), new[] { x }, new[] { (s1, n1), (s2, n2) });
         }
         var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
         CompiledInferencePlan<float>.InferenceCudaGraphOverride = capture;
@@ -278,7 +280,11 @@ public sealed class CompiledStatefulInferenceTests
                 for (int t = 0; t < 6; t++)
                 {
                     plan.SetInputs(new[] { new Tensor<float>([R, D], new Vector<float>(In(t))) });
-                    var got = plan.Execute().ToArray();
+                    var output = plan.Execute();
+                    var got = output.ToArray();
+                    // A decode loop reads the output through the engine (a greedy argmax over a reshaped view of it).
+                    var argmax = engine.TensorArgMax(output, 1).ToArray()[0];
+                    Assert.Equal(Array.IndexOf(refOut[t], refOut[t].Max()), argmax);
                     AssertClose(refS1[t], s1.ToArray(), $"step {t} layer-1 state");
                     AssertClose(refS2[t], s2.ToArray(), $"step {t} layer-2 state");
                     AssertClose(refOut[t], got, $"step {t} output");

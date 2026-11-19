@@ -45,6 +45,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // step (see Engines.StepScratchPool): a capture may not allocate, so an op needing scratch (a two-sided broadcast,
     // say) otherwise declined to the CPU engine and abandoned the capture. Lives as long as the captured graph.
     private Engines.StepScratchPool? _captureScratchPool;
+    // The buffer the captured graph writes the output into, recorded at capture: every replay downloads from it. The
+    // output tensor's own binding does not survive the call (its host refresh makes it stale, and a host read or an
+    // engine op over it can drop it), which failed the next replay's download.
+    private Engines.DirectGpu.IGpuBuffer? _capturedOutputBuffer;
     private readonly List<GCHandle> _pinnedHandles = new();
     private TensorStorageLeaseSet? _storageLeases;
 
@@ -962,6 +966,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 _graphExec = exec;
                                 _graphBackend = cb;
                                 _graphEngine = gte;
+                                _capturedOutputBuffer = _finalOutput._gpuBuffer;
                                 stateLaunchAttempted = _stateTensors.Length != 0;
                                 cb.LaunchCapturedGraph(exec);
                                 RearmStates();
@@ -1189,7 +1194,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     {
         var eng = _graphEngine ?? _engine.As<DirectGpuTensorEngine>();
         if (eng is null) return false;
-        var data = eng.DownloadResidentBuffer(_finalOutput);
+        var data = _capturedOutputBuffer is { } captured
+            ? eng.DownloadCapturedBuffer(captured, _finalOutput.Length)
+            : eng.DownloadResidentBuffer(_finalOutput);
         if (data is null) return false;
         var src = (T[])(object)data;
         using var dstLease = _finalOutput.LeaseWritable();
