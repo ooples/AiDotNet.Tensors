@@ -31062,6 +31062,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         ReleaseIndexReplayBindings();
         if (_ownsDirectGpu) _ownedResults.EvacuateAll();
 
+        ReleaseGraphAttentionGraphs();
+
         // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these
         // buffers: their host arrays download before the buffers are freed.
         foreach (var key in _persistentBufferCache.Keys)
