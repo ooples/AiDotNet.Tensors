@@ -4,6 +4,7 @@ using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -11,6 +12,73 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public sealed class GradientShadowReuseTests
 {
+    private sealed class SavedOwner : ISavedStateTensorContainer
+    {
+        internal SavedOwner(params object[] values) => SavedStateValues = values;
+        public IReadOnlyList<object> SavedStateValues { get; }
+    }
+
+    [Fact]
+    public void SavedNativeOwnersBlockGradientReuseAndOpaqueOwnersDecline()
+    {
+        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        using var direct = new DirectGpuEngine(backend);
+        using var gpu = new DirectGpuTensorEngine(direct);
+        using var retained = backend.AllocateBuffer(32);
+        var saved = new object[2];
+        saved[0] = saved;
+        saved[1] = new SavedOwner(retained);
+        var roots = new HashSet<IGpuBuffer>();
+        var pending = new Stack<object>();
+        var seen = new HashSet<object>();
+        Assert.True(GradientShadowSavedState.TryProtect<float>(saved, roots, pending, seen));
+        Assert.Contains(retained, roots);
+        var pool = gpu.CreateScratchPool();
+        pool.Slots[0] = retained;
+        pool.Keys[retained] = 0;
+        pool.Lend(new List<(long, IGpuBuffer)> { (0, retained) });
+        Assert.False(pool.TryTakeGradientBacking(32, out _, roots));
+        Assert.False(GradientShadowSavedState.TryProtect<float>(new object[] { new object() }, roots, pending, seen));
+        Assert.Same(retained, pool.Slots[0]);
+        pool.WithdrawLent();
+    }
+
+    [Fact]
+    public void GradientCheckoutExcludesLiveLeasesAndWithdrawsDeadForwardOwnership()
+    {
+        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        using var direct = new DirectGpuEngine(backend);
+        using var gpu = new DirectGpuTensorEngine(direct);
+        var pool = gpu.CreateScratchPool();
+        pool.FirstLeasedAction = 1;
+        pool.Begin(1);
+        var live = pool.Lease(1L << 32, backend, 32);
+        Assert.False(pool.TryTakeGradientBacking(32, out _));
+        pool.EndLeases(null);
+        Assert.False(pool.TryTakeGradientBacking(31, out _));
+        Assert.True(pool.TryTakeGradientBacking(32, out var taken));
+        Assert.Same(live, taken);
+        Assert.False(pool.TryTakeGradientBacking(32, out _));
+
+        var forward = backend.AllocateBuffer(64);
+        pool.Track(forward);
+        pool.Slots[0] = forward;
+        pool.Keys[forward] = 0;
+        pool.Lend(new List<(long, IGpuBuffer)> { (0, forward) });
+        pool.Slots[99] = forward; // A second owner must prevent the transfer.
+        Assert.False(pool.TryTakeGradientBacking(64, out _));
+        pool.Slots.Remove(99);
+        Assert.True(pool.TryTakeGradientBacking(64, out var gradient));
+        Assert.Same(forward, gradient);
+        Assert.Empty(pool.Slots);
+        Assert.False(pool.Keys.ContainsKey(forward));
+        pool.WithdrawLent();
+        Assert.False(pool.TryTakeGradientBacking(64, out _));
+        Assert.NotEqual(IntPtr.Zero, gradient.Handle);
+        taken.Dispose();
+        gradient.Dispose();
+    }
+
     [Fact]
     public void RedirectRemappingPreservesSwappedTargetsAndSecondConsumerProtection()
     {
@@ -26,7 +94,9 @@ public sealed class GradientShadowReuseTests
         table.NoteContribution(sourceA, 11); table.Offer(slotA, sourceA, targetA);
         table.NoteContribution(sourceB, 12); table.Offer(slotB, sourceB, targetB);
         table.EndRun(true);
-        table.RemapTargets(new Dictionary<IGpuBuffer, IGpuBuffer> { [targetA] = targetB, [targetB] = targetA });
+        table.CaptureRemapSources();
+        table.RemapCapturedTargets(new Dictionary<IGpuBuffer, IGpuBuffer> { [targetA] = targetB });
+        table.RemapCapturedTargets(new Dictionary<IGpuBuffer, IGpuBuffer> { [targetB] = targetA });
         Assert.True(table.TryGetTarget(slotA, out var actualA)); Assert.Same(targetB, actualA);
         Assert.True(table.TryGetTarget(slotB, out var actualB)); Assert.Same(targetA, actualB);
         table.BeginRun();

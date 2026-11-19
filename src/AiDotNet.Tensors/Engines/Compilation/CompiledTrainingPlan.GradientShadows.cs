@@ -15,6 +15,9 @@ internal sealed partial class CompiledTrainingPlan<T>
     private readonly HashSet<IGpuBuffer> _shadowMoved = new(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
     private readonly Dictionary<Tensor<T>, IGpuBuffer> _shadowPreviousBuffers = new(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
     private readonly Dictionary<IGpuBuffer, IGpuBuffer> _shadowTargetReplacements = new(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
+    private readonly List<Tensor<T>> _shadowRefreshedGradients = new();
+    private readonly Stack<object> _shadowSavedPending = new();
+    private readonly HashSet<object> _shadowSavedSeen = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
     private readonly Dictionary<Tensor<T>, (IGpuBuffer Buffer, IDirectGpuBackend Backend, int Thread, long Key)> _shadowLoans =
         new(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
     private StepScratchPool? _shadowLoanOwner;
@@ -22,6 +25,13 @@ internal sealed partial class CompiledTrainingPlan<T>
     internal long GradientShadowBytes { get; private set; }
     internal long GradientShadowCompletedSteps { get; private set; }
     internal long GradientShadowReuses { get; private set; }
+
+    private bool ProtectShadowSavedRoots(HashSet<IGpuBuffer> roots)
+    {
+        foreach (var step in _forwardSteps!)
+            if (!GradientShadowSavedState.TryProtect<T>(step.SavedState, roots, _shadowSavedPending, _shadowSavedSeen)) return false;
+        return true;
+    }
 
     private bool CanUseGradientShadows(DirectGpuTensorEngine engine) => _gradientShadowsEnabled
         && _workspaceSharingBodyAllowed && CanShareTransientWorkspace(engine);
@@ -34,11 +44,15 @@ internal sealed partial class CompiledTrainingPlan<T>
     private void RefreshShadowGradientRedirects()
     {
         _shadowTargetReplacements.Clear();
+        _shadowRefreshedGradients.Clear();
         foreach (var pair in _shadowPreviousBuffers)
-            if (pair.Key._gpuBuffer is { } current && current.Handle != IntPtr.Zero)
+            if (!_shadowPending.Contains(pair.Key) && pair.Key._gpuBuffer is { } current && current.Handle != IntPtr.Zero)
+            {
                 _shadowTargetReplacements[pair.Value] = current;
-        _firstWriteRedirects.RemapTargets(_shadowTargetReplacements);
-        _shadowPreviousBuffers.Clear();
+                _shadowRefreshedGradients.Add(pair.Key);
+            }
+        _firstWriteRedirects.RemapCapturedTargets(_shadowTargetReplacements);
+        foreach (var gradient in _shadowRefreshedGradients) _shadowPreviousBuffers.Remove(gradient);
     }
 
     private bool TryBindShadowGradientLoan(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<T> gradient)
@@ -55,7 +69,8 @@ internal sealed partial class CompiledTrainingPlan<T>
             engine.BindResidentBuffer(gradient, held.Buffer, backend);
             return true;
         }
-        var buffer = engine.CompiledWorkspaceBroker.TryRent(backend, gradient.Length, exactSize: true);
+        var buffer = engine.CompiledWorkspaceBroker.TryRent(backend, gradient.Length, exactSize: true)
+            ?? TryTakePhaseGradientBacking(engine, gradient);
         if (buffer is null) return false;
         var owner = _shadowLoanOwner ??= engine.CreateScratchPool();
         long key = ++_nextShadowLoan;
@@ -73,6 +88,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             || backend is IGpuGraphCapture { SupportsGraphCapture: true } graph && graph.IsStreamCapturing()) return;
         var protectedRoots = _shadowProtectedRoots;
         protectedRoots.Clear();
+        if (!ProtectShadowSavedRoots(protectedRoots)) return;
         void Protect(IGpuBuffer? buffer) { if (buffer is not null) protectedRoots.Add(GpuBufferViewRoot.Of(buffer)); }
         foreach (var parameter in _parameters) Protect(parameter._gpuBuffer);
         foreach (var buffer in _gpuOptimizerBuffers) Protect(buffer);

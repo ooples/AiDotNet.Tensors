@@ -33,7 +33,7 @@ public sealed class CompiledGradientShadowTests
         return plan;
     }
 
-    private static (List<float[]> Values, long Bytes, long Steps, long Reuses) Run(DirectGpuTensorEngine gpu,
+    private static (List<float[]> Values, long Bytes, long Steps, long Reuses, long Delayed, long PhaseBytes) Run(DirectGpuTensorEngine gpu,
         bool enabled, bool gradientView, bool inputGradients)
     {
         Environment.SetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_SHADOWS", enabled ? "1" : "0");
@@ -69,7 +69,9 @@ public sealed class CompiledGradientShadowTests
         var expected = last.ToArray();
         a.Dispose();
         Assert.Equal(expected, last.ToArray());
-        return (values, bytes, steps, reuses);
+        return (values, bytes, steps, reuses,
+            a.GradientPhaseDelayedBindings + b.GradientPhaseDelayedBindings,
+            a.GradientPhaseReuseBytes + b.GradientPhaseReuseBytes);
     }
 
     [SkippableTheory]
@@ -91,6 +93,11 @@ public sealed class CompiledGradientShadowTests
             Assert.Equal(8, shadow.Steps);
             Assert.True(shadow.Bytes > 0);
             Assert.True(shadow.Reuses > 0, "Native backing must actually move between completed plans.");
+            if (Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRADIENT_PHASE_REUSE") == "1")
+            {
+                Assert.True(shadow.Delayed > 0, "The first-use path must actually execute.");
+                Assert.True(shadow.PhaseBytes > 0, "Dead forward or backward backing must actually serve public gradients.");
+            }
             Assert.Equal(baseline.Values.Count, shadow.Values.Count);
             for (int i = 0; i < shadow.Values.Count; i++) Assert.Equal(baseline.Values[i], shadow.Values[i]);
         }
@@ -118,6 +125,8 @@ public sealed class CompiledGradientShadowTests
             for (int i = 0; i < 4; i++) Assert.True(float.IsFinite(plan.Step().ToArray()[0]));
             Assert.Equal(0, plan.GradientShadowBytes);
             Assert.Equal(0, plan.GradientShadowCompletedSteps);
+            Assert.Equal(0, plan.GradientPhaseDelayedBindings);
+            Assert.Equal(0, plan.GradientPhaseReuseBytes);
         }
         finally
         {

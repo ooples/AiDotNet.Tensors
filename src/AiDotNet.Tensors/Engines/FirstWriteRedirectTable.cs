@@ -31,6 +31,7 @@ internal sealed class FirstWriteRedirectTable
     // every such slot looked consumed twice and was blocked. A contribution is consumed in the action that produced it.
     private readonly Dictionary<(IGpuBuffer Buffer, int Action), int> _uses = new();
     private readonly List<long> _remapSlots = new();
+    private readonly Dictionary<long, IGpuBuffer> _remapSources = new();
 
     /// <summary>Number of redirected slots (diagnostics and tests).</summary>
     internal int Count => _redirects.Count;
@@ -76,6 +77,21 @@ internal sealed class FirstWriteRedirectTable
         foreach (long slot in _remapSlots) _redirects[slot] = replacements[_redirects[slot]];
     }
 
+    // Delayed gradients can swap destinations at different backward actions. Always resolve each slot against its
+    // original destination, so remapping B's old buffer cannot accidentally move A again after A took that buffer.
+    internal void CaptureRemapSources()
+    {
+        _remapSources.Clear();
+        foreach (var pair in _redirects) _remapSources.Add(pair.Key, pair.Value);
+    }
+
+    internal void RemapCapturedTargets(IReadOnlyDictionary<IGpuBuffer, IGpuBuffer> replacements)
+    {
+        foreach (var pair in _remapSources)
+            if (_redirects.ContainsKey(pair.Key) && replacements.TryGetValue(pair.Value, out var replacement))
+                _redirects[pair.Key] = replacement;
+    }
+
     /// <summary>
     /// Ends a run of the body. After an executed (uncaptured) run, commits the offers whose contribution had no other
     /// consumer, and blocks every slot whose buffer had a second one. A captured run only recorded, so it changes nothing.
@@ -101,5 +117,6 @@ internal sealed class FirstWriteRedirectTable
         _redirects.Clear();
         _offers.Clear();
         _uses.Clear();
+        _remapSources.Clear();
     }
 }

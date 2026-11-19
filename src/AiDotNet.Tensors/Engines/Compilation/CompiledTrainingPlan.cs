@@ -5571,6 +5571,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool capturingNow = IsCapturing();
         if (residentEngine is not null && !capturingNow)
         {
+            BeginShadowGradientPhase(residentEngine);
             BindPooledGradientsResident(residentEngine, backend);
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
             {
@@ -5579,7 +5580,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     FailPrivateGradientResidencyAtForTesting = -1;
                     throw new NotSupportedException("Injected private-gradient residency failure.");
                 }
-                if (TryBindShadowGradientLoan(residentEngine, backend, _preAllocatedGrads[i])) continue;
+                if (DelayShadowGradient(residentEngine, _preAllocatedGrads[i])
+                    || TryBindShadowGradientLoan(residentEngine, backend, _preAllocatedGrads[i])) continue;
 
                 var buffer = residentEngine.EnsureResidentBufferWithAllocationInfo(_preAllocatedGrads[i], out bool allocated);
                 if (allocated && buffer is not null) RecordPrivateGradientAllocation(buffer);
@@ -5677,6 +5679,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             for (int i = 0; i < bwd.Length; i++)
             {
+                if (residentEngine is not null && !capturingNow)
+                    BindShadowGradientsStartingAt(i, residentEngine, backend, esz);
                 if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 long rb = 0;
@@ -11409,6 +11413,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             plan._graphGradientMembership = parameters.Select(gradientMembers.Contains).ToArray();
             plan._optimizerGradientMembership = plan._graphGradientMembership;
             plan._liveGradientMap = gradMap;
+            plan.PrepareShadowFirstTouches(actionCoverage, forwardSteps, gradMap);
             if (fp16HeteroOrder is null)
                 plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
                     parameters, lossOutput);
