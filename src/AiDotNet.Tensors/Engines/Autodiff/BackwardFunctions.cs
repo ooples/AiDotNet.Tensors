@@ -4202,6 +4202,26 @@ internal static partial class BackwardFunctions<T>
         }
 
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
+        if (engine.Unwrap().GetType() == typeof(CpuEngine) && gradOutput.IsContiguous && !gradOutput.IsSparse
+            && CpuEngine.TryGetTileSlab(inShape, outShape, out int width, out int repeats))
+        {
+            // Add each repeated slab in forward order, preserving the per-element sum order.
+            using (var src = gradOutput.Lease())
+            using (var dst = inputGrad.LeaseWritable())
+            {
+                int read = 0;
+                for (int offset = 0; offset < inputGrad.Length; offset += width)
+                {
+                    var sum = dst.Span.Slice(offset, width);
+                    for (int repeat = 0; repeat < repeats; repeat++, read += width)
+                        numOps.Add(sum, src.Span.Slice(read, width), sum);
+                }
+            }
+            inputGrad.IncrementVersion();
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+            return;
+        }
+
         for (int flat = 0; flat < totalOut; flat++)
         {
             int remaining = flat;

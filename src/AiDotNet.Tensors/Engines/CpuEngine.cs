@@ -39709,7 +39709,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor._shape.Length; i++)
                     outShape[i] = tensor._shape[i] * multiples[i];
                 return scope.RecordUnary(LazyNodeType.Custom, "Tile", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorTile(captured, capMultiples); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        if (eng.Unwrap().GetType() == typeof(CpuEngine) && TryCopyTileInto(captured, output, outShape)) return;
+                        var tiled = eng.TensorTile(captured, capMultiples);
+                        DirectGpuTensorEngine.CopyResultInto(eng, tiled, output);
+                    },
                     BackwardFunctions<T>.TileBackward);
             }
         }
@@ -39726,25 +39731,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
-        using var tensorDataLease = tensor.LeaseArray();
-        var tensorData = tensorDataLease.Array;
-        using var resultDataLease = result.LeaseArray();
-        var resultData = resultDataLease.Array;
-        int srcLen = tensor.Length;
-
-        // Fast path: only tiling along axis 0 (other axes multiply=1)
-        bool onlyAxis0 = true;
-        for (int i = 1; i < multiples.Length; i++)
-            if (multiples[i] != 1) { onlyAxis0 = false; break; }
-
-        if (onlyAxis0)
+        if (!TryCopyTileInto(tensor, result, outputShape))
         {
-            // Just copy the source data `multiples[0]` times
-            for (int m = 0; m < multiples[0]; m++)
-                Array.Copy(tensorData, 0, resultData, m * srcLen, srcLen);
-        }
-        else
-        {
+            using var tensorDataLease = tensor.LeaseArray();
+            var tensorData = tensorDataLease.Array;
+            using var resultDataLease = result.LeaseArray();
+            var resultData = resultDataLease.Array;
             // General tiling via per-element index mapping
             int totalElements = result.Length;
             CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, [MethodImpl(Hot)] (flatIdx) =>
