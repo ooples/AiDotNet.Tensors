@@ -213,6 +213,9 @@ public partial class CpuEngine
     private static void GroupedInputGradientFloat(Tensor<float> destination, Tensor<float> upstream,
         Tensor<float> kernel, in GroupedConv2DGeometry g, bool accumulate)
     {
+        using var cpuPass = CpuConvolutionPassProfile.Enabled
+            ? CpuConvolutionPassProfile.Start("grouped-dx", g.InputShape, g.KernelShape) : default;
+
         var target = destination.AsWritableSpanUnmarked();
         if (!accumulate) target.Clear();
         if (g.Batch == 0) return;
@@ -296,6 +299,9 @@ public partial class CpuEngine
     private static void GroupedKernelGradientFloat(Tensor<float> destination, Tensor<float> input,
         Tensor<float> upstream, in GroupedConv2DGeometry geometry, bool accumulate)
     {
+        using var cpuPass = CpuConvolutionPassProfile.Enabled
+            ? CpuConvolutionPassProfile.Start("grouped-dw", geometry.InputShape, geometry.KernelShape) : default;
+
         var target = destination.AsWritableSpanUnmarked();
         if (geometry.Batch == 0)
         {

@@ -16916,6 +16916,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (dest == null) throw new ArgumentNullException(nameof(dest));
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        using var cpuPass = CpuConvolutionPassProfile.Enabled
+            ? CpuConvolutionPassProfile.Start("regular-dx", inputShape, kernel._shape) : default;
+
         if (!dest.IsContiguous) throw new InvalidOperationException("dest must be contiguous.");
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!kernel.IsContiguous) kernel = kernel.Contiguous();
@@ -18097,6 +18100,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (dest == null) throw new ArgumentNullException(nameof(dest));
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        using var cpuPass = CpuConvolutionPassProfile.Enabled
+            ? CpuConvolutionPassProfile.Start("regular-dw", input._shape, kernelShape) : default;
+
         if (!dest.IsContiguous) throw new InvalidOperationException("dest must be contiguous.");
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         if (!input.IsContiguous) input = input.Contiguous();
