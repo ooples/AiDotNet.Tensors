@@ -31,7 +31,10 @@ public class CpuUnaryGradientReplayTests
             for (int step = 0; step < 3; step++)
             {
                 for (int i = 0; i < input.Length; i++) input[i] = i * 0.5 - step;
-                plan.Step();
+                double expectedValue = 0;
+                for (int i = 0; i < input.Length; i++)
+                    expectedValue += AiDotNet.Tensors.Helpers.MathHelper.Erfc(input[i]) + 3 * input[i];
+                Assert.Equal(expectedValue, plan.Step()[0], 12);
                 for (int i = 0; i < input.Length; i++)
                 {
                     double x = input[i];
