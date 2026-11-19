@@ -181,6 +181,7 @@ public partial class CpuEngine
             GroupedForwardGeneric(destination, input, kernel, g);
             return;
         }
+        if (TryGroupedParallelForward(source, inputOffset, weights, kernelOffset, output, outputOffset, g)) return;
         int k = checked(g.InChannelsPerGroup * g.KernelH * g.KernelW);
         int spatial = checked(g.OutHeight * g.OutWidth), columns = Math.Min(256, spatial);
         float[]? panel = null;
@@ -227,6 +228,7 @@ public partial class CpuEngine
         bool waveform = g.InHeight == 1 && g.KernelH == 1 && g.OutHeight == 1 && g.StrideH == 1
             && g.StrideW == 1 && g.PadH == 0 && g.KernelW > 1
             && (long)g.OutChannelsPerGroup * g.KernelW * g.InWidth >= 1_048_576;
+        if (TryGroupedParallelInputGradient(destination, weights, kernelOffset, gradient, gradientOffset, g, waveform)) return;
         float[]? panel = null;
         try
         {
@@ -308,6 +310,7 @@ public partial class CpuEngine
             ?? throw new InvalidOperationException("Contiguous grouped input needs managed backing.");
         var gradient = upstream.GetCpuBackingForStridedRead(out int gradientOffset)
             ?? throw new InvalidOperationException("Contiguous grouped gradient needs managed backing.");
+        if (TryGroupedParallelKernelGradient(destination, source, inputOffset, gradient, gradientOffset, geometry, accumulate)) return;
         var panel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(k * columns), "workspace.grouped_conv_columns");
         float[]? partial = null, sum = null;
         try

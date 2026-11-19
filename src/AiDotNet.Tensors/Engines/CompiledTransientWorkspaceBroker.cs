@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines;
 /// private to each plan. A checked-out buffer is absent from this broker until its complete step returns it.
 /// All calls are serialized by the engine's CompiledStepLock; nested steps therefore have separate checkouts too.
 /// </summary>
-internal sealed class CompiledTransientWorkspaceBroker
+internal sealed partial class CompiledTransientWorkspaceBroker
 {
     private readonly StepScratchPool _owner;
     private readonly List<(long Key, IDirectGpuBackend Backend, int Thread, IGpuBuffer Buffer)> _free = new();
@@ -23,14 +23,14 @@ internal sealed class CompiledTransientWorkspaceBroker
 
     internal CompiledTransientWorkspaceBroker(DirectGpuTensorEngine engine) => _owner = engine.CreateScratchPool();
 
-    internal IGpuBuffer? TryRent(IDirectGpuBackend backend, int length)
+    internal IGpuBuffer? TryRent(IDirectGpuBackend backend, int length, bool exactSize = false)
     {
         int pick = -1;
         for (int i = 0; i < _free.Count; i++)
         {
             var item = _free[i];
             if (!ReferenceEquals(item.Backend, backend) || item.Thread != Environment.CurrentManagedThreadId || item.Buffer.Handle == IntPtr.Zero
-                || item.Buffer.Size < length || item.Buffer.Size > 2L * length) continue;
+                || item.Buffer.Size < length || item.Buffer.Size > (exactSize ? length : 2L * length)) continue;
             if (pick < 0 || item.Buffer.Size < _free[pick].Buffer.Size) pick = i;
         }
         if (pick < 0) return null;

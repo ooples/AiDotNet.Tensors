@@ -91,6 +91,10 @@ public partial class CpuEngine
             || kernel._shape[1] != input._shape[1] || bias._shape[0] != kernel._shape[0]
             || output._shape[0] != input._shape[0] || output._shape[1] != kernel._shape[0])
             throw new ArgumentException("Conv2DBiasActivationInto needs input [N, C, H, W], kernel [O, C, kH, kW], bias [O] and output [N, O, oH, oW].");
+        if (!relu && SingleOutputConvBiasEnabled
+            && TrySingleOutputConvBiasInto(output, input, kernel, bias, stride, padding, dilation))
+            return;
+
 
 #if NETCOREAPP
         int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1];
@@ -225,14 +229,16 @@ public partial class CpuEngine
                     ReluBiasBackwardPlane(pg, py, pz, spatial, relu, ref acc);
                 }
             }
+            acc = FinishFusedChannelBiasSum(dz, dzOff, c, channels, batch, spatial, acc);
             db[dbOff + c] = accumulateBias ? db[dbOff + c] + acc : acc;
         });
     }
 
     /// <summary>
     /// One plane of <see cref="ChannelBiasActivationBackwardInto"/>: <c>pz[i] = 0 + (relu ? (py[i] &gt; 0 ? pg[i] : 0)
-    /// : pg[i])</c>, each value added to <paramref name="acc"/> in index order. <paramref name="pz"/> may alias
-    /// <paramref name="pg"/> (each element is read before it is written).
+    /// : pg[i])</c>. Modern targets finish the channel reduction after all planes have been written;
+    /// legacy targets accumulate into <paramref name="acc"/> in index order. <paramref name="pz"/> may alias
+    /// <paramref name="pg"/> because each element is read before it is written.
     /// </summary>
     [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     private static unsafe void ReluBiasBackwardPlane(float* pg, float* py, float* pz, int spatial, bool relu, ref float acc)
@@ -251,8 +257,6 @@ public partial class CpuEngine
                         FloatComparisonMode.OrderedGreaterThanSignaling));
                 v = Avx.Add(zero, v);
                 Avx.Store(pz + i, v);
-                sum += v.GetElement(0); sum += v.GetElement(1); sum += v.GetElement(2); sum += v.GetElement(3);
-                sum += v.GetElement(4); sum += v.GetElement(5); sum += v.GetElement(6); sum += v.GetElement(7);
             }
         }
 #endif
@@ -260,9 +264,28 @@ public partial class CpuEngine
         {
             float v = 0f + (relu ? (py[i] > 0 ? pg[i] : 0f) : pg[i]);
             pz[i] = v;
+#if !NET5_0_OR_GREATER
             sum += v;
+#endif
         }
         acc = sum;
+    }
+
+    // Match ReduceSum's channel cascade without allocating an intermediate
+    // activation-gradient tensor. A sole channel reduces the entire batch as
+    // one contiguous stream; multiple channels combine one cascade per image.
+    private static float FinishFusedChannelBiasSum(float[] gradient, int offset, int channel,
+        int channels, int batch, int spatial, float legacySum)
+    {
+#if NET5_0_OR_GREATER
+        if (channels == 1) return CascadeChannelSum(gradient.AsSpan(offset, batch * spatial));
+        float sum = 0f;
+        for (int image = 0; image < batch; image++)
+            sum += CascadeChannelSum(gradient.AsSpan(offset + (image * channels + channel) * spatial, spatial));
+        return sum;
+#else
+        return legacySum;
+#endif
     }
 
     /// <summary>
@@ -275,8 +298,8 @@ public partial class CpuEngine
     /// <remarks>
     /// Bit-identical to <see cref="MaxPool2DBackwardRecomputeInto{T}"/> into a separate activation-gradient buffer
     /// followed by <see cref="ChannelBiasActivationBackwardInto"/> with ReLU: both stages are the same per-plane code
-    /// (<see cref="MaxPoolBackwardRecomputePlane"/>, <see cref="ReluBiasBackwardPlane"/>), and each channel's bias
-    /// sum runs over its planes in batch order, as there.
+    /// (<see cref="MaxPoolBackwardRecomputePlane"/>, <see cref="ReluBiasBackwardPlane"/>), followed by the same
+    /// channel reduction as the separate bias backward.
     /// </remarks>
     internal unsafe void MaxPoolReluBiasBackwardInto(
         Tensor<float> gradInput, Tensor<float> gradBias, Tensor<float> gradPoolOutput, Tensor<float> activation,
@@ -319,6 +342,7 @@ public partial class CpuEngine
                     ReluBiasBackwardPlane(pz, py, pz, inPlane, relu: true, ref acc);
                 }
             }
+            acc = FinishFusedChannelBiasSum(dz, dzOff, c, channels, batch, inPlane, acc);
             db[dbOff + c] = accumulateBias ? db[dbOff + c] + acc : acc;
         });
     }

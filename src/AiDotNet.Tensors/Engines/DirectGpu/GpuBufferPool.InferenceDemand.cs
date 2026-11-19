@@ -18,8 +18,25 @@ internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpu
     {
         if (TryRent(size, affinity, out buffer)) return true;
         if (Volatile.Read(ref _disposed) != 0 || size <= 0 || size > _maxSize) return false;
+        if (backend is not null && InferenceWorkspaceDemandScope.TryRentLargerIdleBuffer(
+                backend, this, size, affinity, out buffer)) return true;
         if (backend is not null && InferenceWorkspaceDemandScope.TryReturnIncompatibleIdleCache(backend, this, size, affinity))
             return TryRent(size, affinity, out buffer); // A concurrent return may have supplied the new size class.
+        return false;
+    }
+
+    // Only called after the ordinary size-class rent missed. Increasing bucket order chooses the smallest
+    // reusable class without enumerating the pool or allocating a search list. Physical capacity never exceeds
+    // four times the logical request, and the existing parked-element budget remains unchanged.
+    internal bool TryRentLargerIdleBuffer(int size, GpuBufferPoolAffinity affinity, out TBuffer? buffer)
+    {
+        buffer = null;
+        if (_exactSizes || size <= 0 || size > _maxSize || Volatile.Read(ref _disposed) != 0) return false;
+        int requestedBucket = BucketKey(size);
+        if (requestedBucket <= 0) return false; // Power-of-two rounding overflow: preserve the native fallback.
+        long limit = Math.Min((long)size * 4, int.MaxValue);
+        for (long bucket = (long)requestedBucket * 2; bucket <= limit; bucket *= 2)
+            if (TryRentFromBucket(size, (int)bucket, affinity, out buffer)) return true;
         return false;
     }
 

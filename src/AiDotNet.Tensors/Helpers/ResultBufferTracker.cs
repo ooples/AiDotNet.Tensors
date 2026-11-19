@@ -96,6 +96,12 @@ internal static class ResultBufferTracker
         return owner;
     }
 
+    // Identity query only: it neither hands out array contents nor attaches another wrapper.
+    internal static bool IsUnexposedPrivateArray(Array array) => s_privateOwnershipSeen
+        && s_privateOwners.TryGetValue(array, out var weak) && weak.TryGetTarget(out var owner)
+        && !owner.State.Escaped;
+
+
     private sealed class Entry
     {
         internal GCHandle Owner;

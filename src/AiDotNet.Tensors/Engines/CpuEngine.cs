@@ -9160,6 +9160,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Validate and normalize axes consistently with other reducers
         var normalizedAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
+        if (TryChannelCascadeSum(tensor, normalizedAxes, keepDims, out var channelSum))
+        {
+            DifferentiableOps.RecordUnary("ReduceSum", channelSum, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
+                new object[] { (int[])normalizedAxes.Clone(), keepDims });
+            return channelSum;
+        }
 
         // Fast path: single-axis sum on 2D contiguous float tensor
         if (normalizedAxes.Length == 1 && tensor.Rank == 2 && tensor.IsContiguous && typeof(T) == typeof(float))
@@ -11125,6 +11131,19 @@ public partial class CpuEngine : ITensorLevelEngine
         // A test scope that pins the full-im2col or implicit-GEMM route must reach it: the direct and batched routes
         // below are chosen first, so a pinned comparison would otherwise compare one of them with itself.
         bool routePinned = t_forceFullIm2Col || t_forceImplicitGemmForTest || t_forceRowBlockForTest;
+        if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && height == 1 && kernelHeight == 1 && outputHeight == 1 && padH == 0 && strideH == 1
+            && inChannels >= 16 && kernelWidth > 1)
+        {
+            int inputOffset = 0, kernelOffset = 0, outputOffset = 0;
+            var source = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inputOffset) : null);
+            var weights = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kernelOffset) : null);
+            var destination = outputData ?? output.GetCpuBackingForContiguousWrite(out outputOffset);
+            if (source is not null && weights is not null && destination is not null
+                && TryConv1DChannelBlocks(source, inputOffset, weights, kernelOffset, destination, outputOffset,
+                    batch, inChannels, width, outChannels, kernelWidth, strideW, padW, dilationW, outputWidth))
+                return;
+        }
 #if NET5_0_OR_GREATER
         if (!routePinned && (strideH > 1 || strideW > 1) && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && Simd.Conv1x1Gemm.Applies(batch, kernelHeight, kernelWidth, padH, padW, dilationH, dilationW))
@@ -16971,6 +16990,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
+            if (TryShortWaveInputGradient((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
+                (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
+                return;
+
             if (TryConv1DBackwardInputColumnPanels((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
                 (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))

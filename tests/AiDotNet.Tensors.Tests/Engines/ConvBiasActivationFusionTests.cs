@@ -58,6 +58,7 @@ public class ConvBiasActivationFusionTests
     [InlineData(3, 4, 4, 4, true, true)]
     [InlineData(2, 2, 1, 3, false, false)]
     [InlineData(2, 3, 5, 7, false, true)]
+    [InlineData(3, 1, 5, 7, true, true)]
     public void BackwardMatchesSeparateOps(int n, int c, int h, int w, bool relu, bool accumulateBias)
     {
         var engine = new CpuEngine();
@@ -71,7 +72,7 @@ public class ConvBiasActivationFusionTests
         for (int i = 0; i < masked.Length; i++) masked[i] = relu ? (y[i] > 0 ? dy[i] : 0f) : dy[i];
         var expectedDz = new float[masked.Length];
         for (int i = 0; i < masked.Length; i++) expectedDz[i] = 0f + masked[i];
-        var expectedDb = new Tensor<float>(new[] { n, c, h, w }, new Vector<float>(masked)).Sum(new[] { 0, 2, 3 });
+        var expectedDb = engine.ReduceSum(new Tensor<float>(new[] { n, c, h, w }, new Vector<float>(masked)), new[] { 0, 2, 3 });
         var priorDb = Rnd(new[] { c }, 5);
         var expectedBias = new float[c];
         for (int i = 0; i < c; i++) expectedBias[i] = accumulateBias ? priorDb[i] + expectedDb[i] : expectedDb[i];
