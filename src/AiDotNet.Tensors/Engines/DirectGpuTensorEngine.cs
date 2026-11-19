@@ -7139,7 +7139,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // The lookup's own slot, keyed by its float-index tensor (the backward's savedState[0]), so a second lookup
             // in the step cannot overwrite these ids before this lookup's backward scatters through them.
             IGpuBuffer? idxBuf;
-            if (backend is IResidentIndexBackend converter
+            if (!IsPartialView(floatIndices) && backend is IResidentIndexBackend converter
                 && ResolveResidentBufferNoUpload(backend, floatIndices, numIndices) is { } deviceIds)
             {
                 // Ids already on the device - the caller's ids (a plan input, refreshed in place before every replay)
@@ -7147,9 +7147,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // embedding does): convert them into the lookup's slot on the device, in the step's stream order.
                 // Refreshing the slot from the host before a replay uploaded computed ids one step late (the host copy
                 // holds the previous replay's), and reading them on the host is a download a capture cannot contain.
-                // The conversion truncates; ids are integral, where it equals the host path's rounding.
+                // Match the host lookup's round-to-nearest, ties-to-even contract before the truncating cast.
                 idxBuf = EnsureEmbeddingIndexSlotBuffer(backend, floatIndices, numIndices, refresh: null);
-                converter.ConvertIndicesToInt32(deviceIds, idxBuf, numIndices);
+                var rounded = AllocateTransientScratch(backend, numIndices, fullyWritten: true);
+                try
+                {
+                    backend.Round(deviceIds, rounded.Buffer, numIndices);
+                    converter.ConvertIndicesToInt32(rounded.Buffer, idxBuf, numIndices);
+                }
+                finally
+                {
+                    rounded.DisposeAfterQueuedUse(backend);
+                }
             }
             else
             {
