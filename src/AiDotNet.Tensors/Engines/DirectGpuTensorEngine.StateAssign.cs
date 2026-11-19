@@ -44,14 +44,22 @@ public partial class DirectGpuTensorEngine
     /// Gives a captured plan's input slot a persistent device buffer holding its current host value and binds it,
     /// so the capture records reads of that address and every replay refreshes it in place. No-op when bound.
     /// </summary>
-    internal IGpuBuffer? PinInputResident<T>(Tensor<T> input)
+    internal IGpuBuffer? PinInputResident<T>(Tensor<T> input) => PinResident(input, deviceAuthoritative: true);
+
+    /// <summary>
+    /// Gives a leaf a captured plan reads (a constant, a weight) a persistent device buffer, so the capture records a
+    /// read of a stable address instead of a transient upload. The host copy stays authoritative (nothing downloads).
+    /// </summary>
+    internal IGpuBuffer? PinLeafResident<T>(Tensor<T> leaf) => PinResident(leaf, deviceAuthoritative: false);
+
+    private IGpuBuffer? PinResident<T>(Tensor<T> tensor, bool deviceAuthoritative)
     {
-        if (input is null) throw new ArgumentNullException(nameof(input));
-        if (!input.IsContiguous || IsPartialView(input) || !TryGetBackend(out var backend)) return null;
-        if (input._gpuBuffer is { } bound && bound.Handle != IntPtr.Zero && bound.Size >= input.Length
-            && ReferenceEquals(input._gpuBackend, backend) && input._gpuBufferVersion == input.GpuCacheVersion) return bound;
-        var buffer = PersistentBufferFor(backend, input);
-        BindResidentBuffer(input, buffer, backend);
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (!tensor.IsContiguous || IsPartialView(tensor) || !TryGetBackend(out var backend)) return null;
+        if (tensor._gpuBuffer is { } bound && bound.Handle != IntPtr.Zero && bound.Size >= tensor.Length
+            && ReferenceEquals(tensor._gpuBackend, backend) && tensor._gpuBufferVersion == tensor.GpuCacheVersion) return bound;
+        var buffer = PersistentBufferFor(backend, tensor);
+        BindResidentBuffer(tensor, buffer, backend, isDeviceModified: deviceAuthoritative);
         return buffer;
     }
 

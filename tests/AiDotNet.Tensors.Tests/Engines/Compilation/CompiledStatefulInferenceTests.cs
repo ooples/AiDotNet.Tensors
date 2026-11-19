@@ -145,6 +145,65 @@ public sealed class CompiledStatefulInferenceTests
         }
     }
 
+    // A one-hot position [1, P] shifted each step by Concat(0, Narrow(state)) and read as onehot · table: the rows of
+    // the table come out in order, on every path.
+    private static void RunOneHotPosition(IEngine engine, bool expectGraph)
+    {
+        const int P = 16, W = 8;
+        var table = new Tensor<float>([P, W]);
+        for (int i = 0; i < table.Length; i++) table[i / W, i % W] = i * 0.25f - 3f;
+        var oneHot = new Tensor<float>([1, P]);
+        oneHot[0, 0] = 1f;
+        var zero = new Tensor<float>([1, 1]);
+        var bias = new Tensor<float>([1, W]);
+        CompiledInferencePlan<float> plan;
+        using (new EngineScope(engine))
+        using (var scope = GraphMode.EnableInference())
+        {
+            var row = engine.TensorAdd(engine.TensorMatMul(oneHot, table), bias);
+            var next = engine.TensorConcatenate([zero, engine.TensorNarrow(oneHot, 1, 0, P - 1)], 1);
+            plan = scope.CompileInference(row, new[] { bias }, new[] { (oneHot, next) });
+        }
+        using (plan)
+        {
+            for (int t = 0; t < P; t++)
+            {
+                plan.SetInputs(new[] { new Tensor<float>([1, W]) });
+                var got = plan.Execute().ToArray();
+                for (int j = 0; j < W; j++)
+                    Assert.True(got[j] == table[t, j], $"step {t} col {j}: {got[j]} vs {table[t, j]}");
+            }
+            if (expectGraph)
+            {
+                var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
+            }
+        }
+    }
+
+    [Fact]
+    public void A_one_hot_position_state_walks_the_table_on_the_cpu_engine() => RunOneHotPosition(new CpuEngine(), expectGraph: false);
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_one_hot_position_state_walks_the_table_on_the_gpu(bool capture)
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            if (capture)
+                Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = capture;
+            try { RunOneHotPosition(gpu!, expectGraph: capture); }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+        }
+    }
+
     [Fact]
     public void The_public_entry_point_compiles_a_stateful_plan()
     {

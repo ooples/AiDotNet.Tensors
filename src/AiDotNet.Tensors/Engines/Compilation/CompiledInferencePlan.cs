@@ -926,6 +926,15 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // engine's transient upload path would otherwise have none).
                             foreach (var input in _compiledInputTensors.Where(input => input is not null))
                                 gte.PinInputResident(input);
+                            // And every other leaf the steps read (constants, weights): read through the transient
+                            // upload path they would be re-uploaded inside the capture.
+                            var producedHere = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                            foreach (var step in steps) producedHere.Add(step.OutputBuffer);
+                            foreach (var step in steps)
+                                foreach (var leaf in step.Inputs)
+                                    if (!producedHere.Contains(leaf) && Array.IndexOf(_compiledInputTensors, leaf) < 0
+                                        && Array.IndexOf(_stateTensors, leaf) < 0)
+                                        gte.PinLeafResident(leaf);
                             // Each state too (a host read since the last eager write may have moved its binding):
                             // the capture records its state write into exactly this buffer.
                             var stateBuffers = new Engines.DirectGpu.IGpuBuffer[_stateTensors.Length];

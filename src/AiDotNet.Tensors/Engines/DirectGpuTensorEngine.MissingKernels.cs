@@ -5166,7 +5166,6 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
         using var __gpuOp = EnterGpuOp();
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
 
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         int normalizedAxis = axis < 0 ? axis + tensor.Rank : axis;
