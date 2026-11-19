@@ -40,6 +40,14 @@ public sealed class CsrGraph
         for (int e = 0; e < columnIndices.Length; e++)
             if ((uint)columnIndices[e] >= (uint)nodeCount)
                 throw new ArgumentException($"Column index {columnIndices[e]} at edge {e} is outside [0, {nodeCount}).", nameof(columnIndices));
+        var seen = new HashSet<int>();
+        for (int row = 0; row < nodeCount; row++)
+        {
+            seen.Clear();
+            for (int e = rowPointers[row]; e < rowPointers[row + 1]; e++)
+                if (!seen.Add(columnIndices[e]))
+                    throw new ArgumentException($"Duplicate column {columnIndices[e]} in row {row}.", nameof(columnIndices));
+        }
 
         NodeCount = nodeCount;
         RowPointers = rowPointers;
@@ -94,9 +102,6 @@ public sealed class CsrGraph
     internal int[] TransposeRowIndices { get; }
     internal int[] TransposeEdgeIndices { get; }
     internal int[] EdgeRows { get; }
-
-    /// <summary>Device copies an engine keeps for this graph (see <see cref="DirectGpuTensorEngine"/>).</summary>
-    internal object? DeviceCache;
 
     /// <summary>
     /// The nonzero pattern of a dense rank-2 square adjacency matrix, or null when it is not rank 2 and square.

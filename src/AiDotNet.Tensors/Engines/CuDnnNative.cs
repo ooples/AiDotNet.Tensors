@@ -2347,6 +2347,7 @@ public sealed class CuDnnConvolution : IDisposable
         {
             throw new InvalidOperationException($"Failed to allocate cuDNN workspace: {result}");
         }
+        DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
 
         // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
         // recorded, so freeing it would have the graph's replays write into memory reused by something else. And a

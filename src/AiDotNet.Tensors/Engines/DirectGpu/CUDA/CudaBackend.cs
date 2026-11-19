@@ -1612,6 +1612,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // IGpuBatchExecution kernels shared with HIP (#1142).
         CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+        CompileKernelModule(device, BatchExecutionCudaKernels.RfftMagnitudeCudaSource, "rfft_magnitude_precise_kernels",
+            BatchExecutionCudaKernels.RfftMagnitudeKernelNames, useFastMath: false);
         // The GRU kernels again, without --use_fast_math; compiled second, so they replace the fast-math entries above.
         CompileKernelModule(device, BatchExecutionCudaKernels.GruPreciseSource, "gru_precise_kernels",
             BatchExecutionCudaKernels.GruKernelNames, useFastMath: false);
@@ -6823,27 +6825,35 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // that auto-detected the GPU but runs on the CPU engine never maps cuBLAS. AIDOTNET_CUBLAS_PREWARM=0 disables it.
     private int _cublasWarmStarted;
     private System.Threading.Tasks.Task? _cublasWarmup;
+    private readonly object _cublasWarmLock = new();
+    private bool _cublasWarmClosing;
 
     private void StartCublasWarmup()
     {
         if (!AiDotNetEngine.Current.Is<DirectGpuTensorEngine>()) return;
-        if (Interlocked.Exchange(ref _cublasWarmStarted, 1) != 0) return;
-        if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_PREWARM") == "0") return;
-        _cublasWarmup = System.Threading.Tasks.Task.Run(() =>
+        lock (_cublasWarmLock)
         {
-            try
+            if (_cublasWarmClosing || _disposed) return;
+            if (Interlocked.Exchange(ref _cublasWarmStarted, 1) != 0) return;
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_PREWARM") == "0") return;
+            _cublasWarmup = System.Threading.Tasks.Task.Run(() =>
             {
-                // Under the capture gate: cublasCreate initializes the library and allocates on the device, which
-                // invalidates a stream capture another thread has open on this context (CUDA 901) - the first upload
-                // that starts this warmup is often followed at once by a capture. A capture opened meanwhile waits.
-                lock (CaptureGateFor(_cudaContext))
+                try
                 {
-                    using var _ = PushContext();
-                    if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                    // Creation and destruction both synchronize the device: neither may overlap a capture.
+                    lock (CaptureGateFor(_cudaContext))
+                    {
+                        using var _ = PushContext();
+                        if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                    }
                 }
-            }
-            catch (Exception) { /* best effort: the real handle reports any failure on first use */ }
-        });
+                catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException
+                    or InvalidOperationException or TypeInitializationException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[CUDA] cuBLAS prewarm failed: {ex}");
+                }
+            });
+        }
     }
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
@@ -19639,7 +19649,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Dispose()
     {
-        try { _cublasWarmup?.Wait(); } catch (Exception) { }
+        System.Threading.Tasks.Task? warmup;
+        lock (_cublasWarmLock)
+        {
+            _cublasWarmClosing = true;
+            warmup = _cublasWarmup;
+        }
+        try { warmup?.Wait(); }
+        catch (AggregateException ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[CUDA] cuBLAS prewarm worker failed during disposal: {ex}");
+        }
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
     }
@@ -19787,6 +19807,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Direct-PTX modules borrow this backend's context and stream. Unload
         // them while both handles are still alive, before pool/stream teardown.
         DisposeDirectPtxRuntime();
+        DisposeRealFftPlans();
 
         // In-flight staged uploads still own pinned slots; wait for them before the pool frees its memory.
         try { DrainStagedUploads(blockAll: true); } catch { }

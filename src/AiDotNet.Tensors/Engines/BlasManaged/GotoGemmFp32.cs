@@ -386,7 +386,7 @@ internal static class GotoGemmFp32
         bool timing = s_timing;
         long enter = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         long callMax = 0, callMin = long.MaxValue;
-        void Tile(int tileIdx)
+        void Tile(int tileIdx, TileWorkspace workspace)
         {
             int ic = (int)(tileIdx % numIcL) * mcL;
             int jc = (int)(tileIdx / numIcL) * ncL;
@@ -394,7 +394,8 @@ internal static class GotoGemmFp32
             int effNc = Math.Min(ncL, nL - jc);
             if (effMc <= 0 || effNc <= 0) return;
             long start = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+            RunTileWithWorkspace((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL,
+                ic, jc, effMc, effNc, kL, kcL, workspace.PackA, workspace.PackB);
             if (timing)
             {
                 long dur = System.Diagnostics.Stopwatch.GetTimestamp() - start;
@@ -407,19 +408,22 @@ internal static class GotoGemmFp32
         }
         if (maxWorkers == 1)
         {
-            for (int t = 0; t < totalTiles; t++) Tile(t);
+            using var workspace = TileWorkspace.Rent(mcL, ncL, kcL);
+            for (int t = 0; t < totalTiles; t++) Tile(t, workspace);
         }
         else if (maxWorkers > 1 && maxWorkers < totalTiles)
         {
             int workers = maxWorkers;
-            CpuParallelSettings.ParallelForOrSerial(0, workers, (long)m * n * k, w =>
+            CpuParallelSettings.ParallelForIndependentWithLocal(0, workers, (long)m * n * k,
+                () => TileWorkspace.Rent(mcL, ncL, kcL), (w, workspace) =>
             {
-                for (int t = w; t < totalTiles; t += workers) Tile(t);
-            }, deterministicSafe: true);
+                for (int t = w; t < totalTiles; t += workers) Tile(t, workspace);
+            }, static workspace => workspace.Dispose());
         }
         else
         {
-            CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, Tile, deterministicSafe: true);
+            CpuParallelSettings.ParallelForIndependentWithLocal(0, totalTiles, (long)m * n * k,
+                () => TileWorkspace.Rent(mcL, ncL, kcL), Tile, static workspace => workspace.Dispose());
         }
         if (timing)
         {
@@ -506,14 +510,71 @@ internal static class GotoGemmFp32
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc)
     {
+        float[] packA = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked((mc + Mr) * kc + 8), "workspace.blas_goto_tile_packA");
+        try
+        {
+            float[] packB = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(kc * nc), "workspace.blas_goto_tile_packB");
+            try { RunTileWithWorkspace(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, k, kc, packA, packB); }
+            finally { ArrayPool<float>.Shared.Return(packB); }
+        }
+        finally { ArrayPool<float>.Shared.Return(packA); }
+    }
+
+    // A pair belongs to one participant for one GEMM call. Every tile still repacks its
+    // operands in the original order; only the pool lease is retained between tiles.
+    internal sealed class TileWorkspace : IDisposable
+    {
+        private readonly ArrayPool<float> _pool;
+        private float[]? _packA, _packB;
+        internal float[] PackA => _packA ?? throw new ObjectDisposedException(nameof(TileWorkspace));
+        internal float[] PackB => _packB ?? throw new ObjectDisposedException(nameof(TileWorkspace));
+
+        private TileWorkspace(ArrayPool<float> pool, float[] packA, float[] packB)
+        {
+            _pool = pool;
+            _packA = packA;
+            _packB = packB;
+        }
+
+        internal static TileWorkspace Rent(int mc, int nc, int kc, ArrayPool<float>? pool = null)
+        {
+            pool ??= ArrayPool<float>.Shared;
+            // +Mr rows hold the zero-padded M tail; +8 allows the SIMD pack's final store.
+            int aLength = checked((mc + Mr) * kc + 8);
+            int bLength = checked(kc * nc);
+            float[] packA = pool.Rent(aLength);
+            try
+            {
+                CpuStorageAllocationDiagnostics.Record<float>("workspace.blas_goto_tile_packA", aLength);
+                float[] packB = pool.Rent(bLength);
+                try
+                {
+                    CpuStorageAllocationDiagnostics.Record<float>("workspace.blas_goto_tile_packB", bLength);
+                    return new TileWorkspace(pool, packA, packB);
+                }
+                catch { pool.Return(packB); throw; }
+            }
+            catch { pool.Return(packA); throw; }
+        }
+
+        public void Dispose()
+        {
+            float[]? packA = _packA, packB = _packB;
+            _packA = null;
+            _packB = null;
+            try { if (packA is not null) _pool.Return(packA); }
+            finally { if (packB is not null) _pool.Return(packB); }
+        }
+    }
+
+    [MethodImpl(Hot)]
+    private static unsafe void RunTileWithWorkspace(
+        float* a, int lda, float* b, int ldb, float* c, int ldc,
+        int ic, int jc, int effMc, int effNc, int k, int kc, float[] paArr, float[] pbArr)
+    {
         int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
         int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
         int mTail = effMc - mFull;
-        // +Mr rows: the zero-padded M-tail sub-panel; +8: the SIMD A-pack transpose may store 2 past the last tile.
-        float[] paArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<float>((mc + Mr) * kc + 8, "workspace.blas_goto_tile_packA");
-        float[] pbArr = Helpers.CpuStorageAllocationDiagnostics.RentWorkspace<float>(kc * nc, "workspace.blas_goto_tile_packB");
-        try
-        {
             fixed (float* pa = paArr, pb = pbArr)
             {
                 var kAcc = Kernel(); var kOw = KernelOw();
@@ -567,8 +628,6 @@ internal static class GotoGemmFp32
                     if (timing) Interlocked.Add(ref s_tailTicks, System.Diagnostics.Stopwatch.GetTimestamp() - t3);
                 }
             }
-        }
-        finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<float>.Shared.Return(pbArr); }
     }
 
     /// <summary>

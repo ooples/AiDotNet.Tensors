@@ -142,6 +142,7 @@ public sealed partial class CudaBackend
                 cudnn.PrepareStream(_captureStream);
             }
             TestHookCaptureSetup?.Invoke();
+            PrepareRealFftStream(_captureStream);
             // Everything this thread already enqueued on the compute stream happens before the captured work.
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_captureOrderEvent, _mainStream), "cuEventRecord(capture order)");
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_captureStream, _captureOrderEvent, 0), "cuStreamWaitEvent(capture order)");
