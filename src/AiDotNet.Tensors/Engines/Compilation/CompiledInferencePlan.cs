@@ -1518,7 +1518,16 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 explicitOutput = last.GetInputsArray()[0];
         }
 
-        var compiler = new LazyGraphCompiler();
+        // A stateful plan reads each next state once more, in its trailing state write (appended after compilation):
+        // fusion must keep those values observable rather than fold them into a consumer.
+        HashSet<ILazyNode>? observableNodes = null;
+        if (stateUpdates is { Count: > 0 })
+        {
+            observableNodes = new HashSet<ILazyNode>();
+            foreach (var update in stateUpdates)
+                if (update.Next?.LazySource is ILazyNode producer) observableNodes.Add(producer);
+        }
+        var compiler = new LazyGraphCompiler(observableOutputs: observableNodes);
         List<ILazyNode> optimized;
         var priorDynamic = SparseLinearFusionPattern.t_dynamicLeaves;
         if (stateUpdates is { Count: > 0 })
