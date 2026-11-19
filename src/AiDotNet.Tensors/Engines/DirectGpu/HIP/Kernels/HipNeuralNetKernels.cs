@@ -809,11 +809,11 @@ extern ""C"" __global__ __launch_bounds__(256) void arg_extreme_axis_rows(
     // The max of key' = findMin ? -key : key. |xf_key| <= 0x7F800000, so the negation cannot overflow.
     bool have = false;
     int bestKey = 0, bestIdx = 0;
-    for (int i = tid; i < axisSize; i += blockDim.x) {
+    for (long long i = tid; i < axisSize; i += blockDim.x) {
         unsigned int v = row[i];
         if (xf_isnan(v)) continue;
         int key = findMin ? -xf_key(v) : xf_key(v);
-        if (!have || key > bestKey) { have = true; bestKey = key; bestIdx = i; }
+        if (!have || key > bestKey) { have = true; bestKey = key; bestIdx = (int)i; }
     }
     sKey[tid] = have ? bestKey : (int)0x80000000;   // INT_MIN: below every finite or infinite key
     sIdx[tid] = have ? bestIdx : 0x7FFFFFFF;

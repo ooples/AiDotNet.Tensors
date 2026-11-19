@@ -14533,6 +14533,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // Rows at least this wide reduce with one block per row (arg_extreme_axis_rows); narrower rows keep one thread per
     // row, which is already coalesced across rows and pays no shared-memory reduction.
     internal const int ArgExtremeRowKernelMinWidth = 512;
+    private long _argExtremeRowLaunches;
+    internal long ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
+
 
     private unsafe bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
     {
@@ -14550,6 +14553,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         args[3] = &reduceSizeVal;
         args[4] = &findMinVal;
         LaunchKernel(kernel, (uint)outerSize, DefaultBlockSize, args);
+        System.Threading.Interlocked.Increment(ref _argExtremeRowLaunches);
         return true;
     }
 

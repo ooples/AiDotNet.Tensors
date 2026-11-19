@@ -2145,8 +2145,57 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var values = new Tensor<float>(data, new[] { rows, width });
         IEngine cpu = new CpuEngine();
         IEngine gpu = Gpu;
-        Assert.Equal(cpu.TensorArgMax(values, 1).GetDataArray(), gpu.TensorArgMax(values, 1).GetDataArray());
-        Assert.Equal(cpu.TensorArgMin(values, 1).GetDataArray(), gpu.TensorArgMin(values, 1).GetDataArray());
+        var backend = Gpu.GetBackend();
+        long Launches() => backend switch
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda => cuda.ArgExtremeRowLaunches,
+            AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend hip => hip.ArgExtremeRowLaunches,
+            _ => 0
+        };
+        long launches = Launches();
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            var gpuMax = gpu.TensorArgMax(values, 1);
+            var gpuMin = gpu.TensorArgMin(values, 1);
+            Assert.Equal(cpu.TensorArgMax(values, 1).GetDataArray(), gpuMax.GetDataArray());
+            Assert.Equal(cpu.TensorArgMin(values, 1).GetDataArray(), gpuMin.GetDataArray());
+            long expectedLaunches = width >= 512 && backend is
+                (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend or AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend) ? 2 : 0;
+            Assert.Equal(expectedLaunches, Launches() - launches);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(512)]
+    [InlineData(511)]
+    public void ArgMaxArgMin_SignedZeroTies_KeepFirstIndex(int width)
+    {
+        SkipIfNoDirectGpu();
+        var data = new float[2 * width];
+        for (int i = 0; i < width; i++)
+        {
+            data[i] = i % 2 == 0 ? -0f : 0f;
+            data[width + i] = i % 2 == 0 ? 0f : -0f;
+        }
+        var values = new Tensor<float>(data, new[] { 2, width });
+        bool saved = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            IEngine gpu = Gpu;
+            Assert.Equal(new[] { 0, 0 }, gpu.TensorArgMax(values, 1).GetDataArray());
+            Assert.Equal(new[] { 0, 0 }, gpu.TensorArgMin(values, 1).GetDataArray());
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = saved;
+        }
     }
 
     [SkippableFact]

@@ -235,13 +235,13 @@ public sealed class GpuCpuEdgeValueComparisonTests
         // second value repeated 129 elements later (another thread's stride) so the first of equal extremes must win
         // across threads. "Lead" puts the first value at index 0 (a leading NaN or infinity); "Mid" puts it mid-row.
         const int longWidth = 600;
-        float[] LongRows(bool lead)
+        float[] LongRows(bool lead, float filler)
         {
             var r = new float[N * N * longWidth];
             for (int i = 0; i < N * N; i++)
             {
                 int o = i * longWidth, k1 = 1 + (i * 37) % 150, k2 = k1 + 129;
-                for (int j = 0; j < longWidth; j++) r[o + j] = -2f;
+                for (int j = 0; j < longWidth; j++) r[o + j] = filler;
                 r[o + (lead ? 0 : k1 + 7)] = pa[i];
                 r[o + k1] = pb[i];
                 r[o + k2] = pb[i];
@@ -256,8 +256,9 @@ public sealed class GpuCpuEdgeValueComparisonTests
         };
         foreach (var (name, f) in longOps)
         {
-            yield return (name + "LongLead", (e, make) => f(e, make(LongRows(lead: true), longShape)), true);
-            yield return (name + "LongMid", (e, make) => f(e, make(LongRows(lead: false), longShape)), true);
+            float filler = name == "ArgMax" ? float.NegativeInfinity : float.PositiveInfinity;
+            yield return (name + "LongLead", (e, make) => f(e, make(LongRows(lead: true, filler: filler), longShape)), true);
+            yield return (name + "LongMid", (e, make) => f(e, make(LongRows(lead: false, filler: filler), longShape)), true);
         }
 
         // Running max / min along the last axis (pairs and triples) and along a leading axis.
