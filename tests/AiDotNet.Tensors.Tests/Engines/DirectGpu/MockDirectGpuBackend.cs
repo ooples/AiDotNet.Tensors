@@ -64,6 +64,8 @@ internal sealed class MockBackendState
     public string DeviceVendor { get; set; } = "Mock";
     public List<int> AllocationSizes { get; } = new();
     public List<MockGpuBuffer> AllocatedBuffers { get; } = new();
+    public int FailIntAllocationAt { get; set; }
+    public int IntAllocationCalls { get; set; }
     public int DownloadBufferCalls { get; set; }
     public int ClassifyFloatCalls { get; set; }
     public int FillCalls { get; set; }
@@ -130,6 +132,8 @@ public class MockDirectGpuBackend : DispatchProxy
     protected override object Invoke(MethodInfo targetMethod, object[] args)
     {
         if (_state.ThrowOnCall.TryGetValue(targetMethod.Name, out var injected)) throw injected;
+        if (targetMethod.Name == "AllocateIntBuffer" && ++_state.IntAllocationCalls == _state.FailIntAllocationAt)
+            throw new InvalidOperationException("Injected integer allocation failure.");
         switch (targetMethod.Name)
         {
             // ── Identity / device info — implemented ──

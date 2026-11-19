@@ -38,7 +38,7 @@ public partial class CpuEngine
         if (graph is null) throw new ArgumentNullException(nameof(graph));
         if (attention.Rank != 2 || attention.Shape[1] % 2 != 0 || attention.Shape[1] == 0)
             throw new ArgumentException($"attention must be [heads, 2 * features]; got [{string.Join(", ", attention._shape)}].", nameof(attention));
-        if (dropoutRate < 0.0 || dropoutRate >= 1.0)
+        if (double.IsNaN(dropoutRate) || dropoutRate < 0.0 || dropoutRate >= 1.0)
             throw new ArgumentOutOfRangeException(nameof(dropoutRate), "dropoutRate must be in [0, 1).");
         int heads = attention.Shape[0], features = attention.Shape[1] / 2;
         long rowWidth = (long)heads * features;
