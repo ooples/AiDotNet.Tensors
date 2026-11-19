@@ -183,10 +183,6 @@ jobs:
         # Empty for the non-partitioned shards (unset => full set); "k/N" for the op-registry sub-shards.
         AIDOTNET_PARITY_SHARD: ${{ matrix.shard }}
         AIDOTNET_OPPARITY_REPORT_DIR: ${{ runner.temp }}/opparity
-        # POCL writes each program's source into its kernel cache before building it: kept and uploaded below, it
-        # names the program a compiler abort happened on.
-        POCL_KERNEL_CACHE: '1'
-        POCL_CACHE_DIR: ${{ runner.temp }}/pocl-cache
       run: |
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
           --configuration Release --no-build --framework net10.0 \
@@ -194,15 +190,6 @@ jobs:
           --logger "trx;LogFilePath=${{ runner.temp }}/trx/${{ matrix.name }}.trx" \
           --blame-hang --blame-hang-timeout 600s --blame-crash \
           ${{ matrix.coverage && '--collect:"XPlat Code Coverage" --results-directory ./coverage -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*"' || '' }}
-
-    - name: Upload the POCL kernel cache
-      if: always()
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-      with:
-        name: pocl-cache-${{ matrix.name }}
-        path: ${{ runner.temp }}/pocl-cache
-        if-no-files-found: warn
-        retention-days: 7
 
     - name: Report skipped tests
       # A skip does not fail a build, so a shard can go green without running its tests: list every skip with its reason.
