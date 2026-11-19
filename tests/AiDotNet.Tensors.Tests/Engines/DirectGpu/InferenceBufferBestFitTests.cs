@@ -82,8 +82,10 @@ public sealed class InferenceBufferBestFitTests
         Assert.Equal(1, cell.Releases);
     }
 
-    [Fact]
-    public void ReuseRequiresEnabledMatchingInferenceAndNeverCrossesAnOutstandingLoan()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ReuseRequiresEnabledMatchingInferenceAndNeverCrossesAnOutstandingLoan(bool reuseOnly)
     {
         bool previous = InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled;
         var backend = MockDirectGpuBackend.Create(new MockBackendState());
@@ -96,7 +98,8 @@ public sealed class InferenceBufferBestFitTests
         {
             InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled = true;
             Assert.False(pool.TryRentForBackend(64, backend, out _));
-            using var scope = InferenceWorkspaceDemandScope.Enter(engine);
+            using var scope = reuseOnly ? InferenceWorkspaceDemandScope.EnterIdleBufferReuse(engine)
+                : InferenceWorkspaceDemandScope.Enter(engine);
             InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled = false;
             Assert.False(pool.TryRentForBackend(64, backend, out _));
             InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled = true;
@@ -115,6 +118,35 @@ public sealed class InferenceBufferBestFitTests
             Assert.NotEqual(IntPtr.Zero, rented.Handle);
             pool.Dispose(); Assert.Equal(0, cell.Releases);
             rented.Release(); Assert.Equal(1, cell.Releases);
+        }
+        finally { InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled = previous; }
+    }
+
+    [Fact]
+    public void ReuseOnlyPreservesWorkspaceAndRestoresNestedPredictionPolicy()
+    {
+        bool previous = InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled;
+        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var pool = new GpuBufferPool<Cell>(4, 1024);
+        var small = new Cell(64); var larger = new Cell(256);
+        pool.Return(small); pool.Return(larger);
+        try
+        {
+            InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled = true;
+            using var prediction = InferenceWorkspaceDemandScope.Enter(engine);
+            using (InferenceWorkspaceDemandScope.EnterIdleBufferReuse(engine))
+            {
+                using (InferenceWorkspaceDemandScope.Enter(engine)) { }
+                Assert.False(InferenceWorkspaceDemandScope.TryReturnIncompatibleIdleCache(backend, pool, 1024, default));
+                Assert.Equal(0, small.Releases); Assert.Equal(0, larger.Releases);
+                Assert.True(pool.TryRentForBackend(128, backend, out var rented));
+                Assert.Same(larger, rented); Assert.Equal(128, rented!.Size);
+                pool.Return(rented);
+            }
+            Assert.True(InferenceWorkspaceDemandScope.TryReturnIncompatibleIdleCache(backend, pool, 1024, default));
+            Assert.Equal(1, small.Releases); Assert.Equal(1, larger.Releases);
         }
         finally { InferenceWorkspaceDemandScope.BestFitIdleBuffersEnabled = previous; }
     }
