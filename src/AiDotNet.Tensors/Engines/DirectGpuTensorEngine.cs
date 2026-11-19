@@ -28743,8 +28743,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
-        Compilation.GraphMode.ThrowIfInferenceUnsupported(
-            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         int normalizedAxis = axis < 0 ? tensor.Rank + axis : axis;
         // Graph capture records its lazy node in the host implementation; a tape does not stop the kernel, which records
         // its own entry below.
