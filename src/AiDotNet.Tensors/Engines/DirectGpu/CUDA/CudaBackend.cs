@@ -18821,6 +18821,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_backward_ckpt");
 
         using var _ = PushContext();
+        if (TryGlaScanBackwardTiled(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim))
+            return;
         // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
         // method is self-contained and correct even if the caller reuses dirty buffers.
         Fill(dQ, 0f, batch * seqLen * modelDim);
@@ -18843,6 +18845,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
         ba[16] = &chunk;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+    }
+
+    // gla_scan_backward_tiled: one 1024-thread block per (batch, head), up to 12 state elements per thread (headDim*headDim <= 12,288),
+    // reductions through a shared [headDim][headDim|1] tile (deterministic, no atomics). Used while the tile fits the
+    // default 48 KB per block (headDim <= 108); wider heads keep gla_scan_backward_ckpt.
+    internal static int GlaTiledSharedBytes(int headDim) => (headDim * (headDim | 1) + 4 * headDim + Kernels.CudaGlaKernels.TileWarpPartials) * sizeof(float);
+
+    private unsafe bool TryGlaScanBackwardTiled(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int shared = GlaTiledSharedBytes(headDim);
+        if (headDim * headDim > Kernels.CudaGlaKernels.TileElementsPerThread * Kernels.CudaGlaKernels.TileThreads
+            || shared > Kernels.CudaGlaKernels.TileSharedMemoryLimitBytes
+            || !_kernelCache.TryGetValue("gla_scan_backward_tiled", out var kernel))
+            return false;
+        var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        using var ckptBuf = AllocateBuffer(ckptLen);
+        using var scratchBuf = AllocateBuffer(scratchLen);
+        IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle;
+        IntPtr pck = ckptBuf.Handle, psc = scratchBuf.Handle;
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pdg = dG.Handle;
+        void** ba = stackalloc void*[17];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg; ba[5] = &pck; ba[6] = &psc;
+        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pdg;
+        ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
+        ba[16] = &chunk;
+        LaunchKernelWithSharedMem(kernel, (uint)(batch * numHeads), (uint)Kernels.CudaGlaKernels.TileThreads, (uint)shared, ba);
+        return true;
     }
 
     // ── Fused xLSTM (mLSTM) scan forward (#1464) ───────────────────────────────────────────
