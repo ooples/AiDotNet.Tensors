@@ -12001,6 +12001,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             arrayOf[g] = pick;
             active.Add((lastUse[g], pick));
         }
+        ImproveGradientPacking(tenants, firstWrite, lastUse, allGrads, ref arrayOf, ref sizes);
         capacity = sizes;
         return arrayOf;
     }
