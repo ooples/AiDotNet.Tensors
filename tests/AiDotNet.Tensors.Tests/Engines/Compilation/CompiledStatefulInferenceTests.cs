@@ -325,6 +325,69 @@ public sealed class CompiledStatefulInferenceTests
         }
     }
 
+    // A captured inference plan whose embedding ids are computed on the device (a decode step feeding back its own
+    // choice) gathers from the float ids in one launch: ties round to even, NaN and out-of-range ids give zero rows.
+    [SkippableFact]
+    public void A_captured_lookup_of_device_float_ids_matches_the_host_contract()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = true;
+            try
+            {
+                const int V = 6, E = 4, N = 7;
+                var table = new Tensor<float>([V, E]);
+                for (int i = 0; i < table.Length; i++) table[i / E, i % E] = i * 0.5f + 1f;
+                var raw = new Tensor<float>([N]);
+                CompiledInferencePlan<float> plan;
+                using (new EngineScope(gpu))
+                using (var scope = GraphMode.EnableInference())
+                {
+                    var ids = gpu.TensorAddScalar(raw, 0.25f);      // computed on the device
+                    var rows = gpu.TensorEmbeddingLookupFromFloatIndices(table, ids);
+                    plan = scope.CompileInference(rows, new[] { raw }, Array.Empty<(Tensor<float>, Tensor<float>)>());
+                }
+                float[][] feeds =
+                [
+                    [0f, 1f, 2f, 3f, 4f, 5f, 0.25f],                // 0.5 -> 0 (ties to even)
+                    [2.25f, 1.25f, -1f, 6f, 9f, float.NaN, -0.75f], // 2.5 -> 2, 1.5 -> 2, -0.75, 6.25, 9.25, NaN -> zero, -0.5 -> 0
+                    [4.25f, 0.75f, 5.5f, 3f, 2f, 1f, 0f],           // 4.5 -> 4, 1.0, 5.75 -> 6 invalid
+                ];
+                using (plan)
+                {
+                    long before = gpu.FusedFloatIdLookups;
+                    for (int rep = 0; rep < 4; rep++)
+                        foreach (var feed in feeds)
+                        {
+                            plan.SetInputs(new[] { new Tensor<float>([N], new Vector<float>((float[])feed.Clone())) });
+                            var got = plan.Execute().ToArray();
+                            for (int i = 0; i < N; i++)
+                            {
+                                float id = feed[i] + 0.25f;
+                                double r = Math.Round((double)id, MidpointRounding.ToEven);
+                                bool valid = !float.IsNaN(id) && r >= 0 && r < V;
+                                for (int j = 0; j < E; j++)
+                                {
+                                    float expect = valid ? table[(int)r, j] : 0f;
+                                    Assert.True(got[i * E + j] == expect, $"rep {rep} id {id} col {j}: {got[i * E + j]} vs {expect}");
+                                }
+                            }
+                        }
+                    var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                    Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
+                    Assert.True(gpu.FusedFloatIdLookups > before, "the captured lookup did not take the fused float-id gather");
+                }
+            }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+        }
+    }
+
     // Two stacked recurrent layers (batched like a multi-head scan, with a per-row decay): the second layer's
     // intermediates have the first's shapes, and its input is a unary chain the first layer's output also feeds.
     private static (Tensor<float> Output, Tensor<float> Next1, Tensor<float> Next2) TwoLayers(IEngine e,

@@ -7261,6 +7261,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the table from the PERSISTENT weight cache and the indices from the resident input buffer — no host gather
     /// (3× GetDataArray = DtoH downloads = non-capturable CUDA-900 that invalidates the whole graph capture).
     /// This is the SOURCE of the forward residency chain; without it every downstream op re-uploads.</summary>
+    private long _fusedFloatIdLookups;
+
+    /// <summary>Resident float-id lookups served by the one-launch fused gather (inference captures; for tests).</summary>
+    internal long FusedFloatIdLookups => Interlocked.Read(ref _fusedFloatIdLookups);
+
     internal bool TryEmbeddingFromFloatIndicesResidentInto<T>(Tensor<T> output, Tensor<T> embeddings, Tensor<T> floatIndices, int numIndices, int embeddingDim)
     {
         using var __gpuOp = EnterGpuOp();
@@ -7278,6 +7283,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // The lookup's own slot, keyed by its float-index tensor (the backward's savedState[0]), so a second lookup
             // in the step cannot overwrite these ids before this lookup's backward scatters through them.
             IGpuBuffer? idxBuf;
+            // An inference capture has no backward to scatter through the lookup's int32 slot: gather straight from
+            // the device float ids in one launch (round half to even, zero rows for NaN or out-of-range ids, the
+            // contract of the converted path) instead of round + convert + select.
+            if (InferenceCaptureActive && !IsPartialView(floatIndices)
+                && backend is IFusedIndexKernels { HasFloatIdEmbeddingKernels: true } fusedIds
+                && ResolveResidentBufferNoUpload(backend, floatIndices, numIndices) is { } inferenceIds)
+            {
+                fusedIds.EmbeddingFromFloatIds(inferenceIds, tableBuf, outBuf, numIndices, embeddingDim, embeddings.Shape._dims[0]);
+                Interlocked.Increment(ref _fusedFloatIdLookups);
+                ResidentSyncCheck("Embedding");
+                BindResidentBuffer(output, outBuf, backend);
+                return true;
+            }
             if (!IsPartialView(floatIndices) && backend is IResidentIndexBackend converter
                 && ResolveResidentBufferNoUpload(backend, floatIndices, numIndices) is { } deviceIds)
             {
