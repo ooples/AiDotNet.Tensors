@@ -25,11 +25,19 @@ public partial class CpuEngine
         // rounded partial sum. The long-waveform envelope amortizes filter packing.
         if (channels != outChannels || channels < 32 || channels > 128 || channels % 16 != 0
             || reduction > 512 || stride != 1 || outputWidth != width || width < 16384
-            || width % WaveformTileColumns != 0 || padding > width / WaveformMicroColumns
+            || width % 256 != 0 || padding > width / WaveformMicroColumns
             || 2L * padding != (long)(taps - 1) * dilation
             || !Avx2.IsSupported || !Fma.IsSupported || BlasManaged.BlasManaged.s_disableGotoGemm
             || (BlasProvider.IsDeterministicMode && BlasManaged.BlasManaged.s_disableDeterministicGoto)
             || !GotoGemmFp32.IsAvailable)
+            return false;
+
+        // The general convolution uses 256-column GEMMs throughout this envelope.
+        // A Goto dispatch can round at its K-panel boundary, including when a run
+        // requests only one CPU thread. Keep that dispatch for split reductions.
+        if (reduction > GotoGemmFp32.ChooseParallelBlocks(channels, 256).kc
+            && (GotoGemmFp32.PreferShape(channels, 256, reduction, Environment.ProcessorCount)
+                || GotoGemmFp32.PreferShape(channels, 256, reduction, Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism))))
             return false;
 
         int fullRows = channels / WaveformMicroRows * WaveformMicroRows;
