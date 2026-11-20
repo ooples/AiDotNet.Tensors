@@ -2146,6 +2146,54 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Backward of a training BatchNorm whose output feeds a LeakyReLU of positive slope -- fused by the compiled plan
+    /// (<see cref="Compilation.BatchNormLeakyReluFusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is
+    /// the LeakyReLU's output; savedState = mean, variance, epsilon, whether the forward ran the kernel, slope. One launch
+    /// where the backend takes it, else LeakyReluBackward (on the output: the same sign as its input) and
+    /// BatchNormBackward.
+    /// </summary>
+    internal static void BatchNormLeakyReluBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+        var slope = (double)savedState[4];
+        Tensor<T> gradInput, gradGamma, gradBeta;
+        var parked = TakeParkedGradient(engine, output);
+        Tensor<T>? intoInput = null;
+        bool addInput = false;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
+            intoInput = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out addInput);
+        if (gpu is not null
+            && gpu.TryBatchNormReluBackwardCore(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon, false,
+                MaskFromInput(savedState) ? inputs[2] : null, parked, intoInput, addInput, (float)slope) is { } fused)
+        {
+            if (intoInput is not null && ReferenceEquals(fused.GradInput, intoInput))
+            {
+                DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], intoInput);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], fused.GradGamma, engine);
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], fused.GradBeta, engine);
+                return;
+            }
+            gradInput = fused.GradInput;
+            gradGamma = fused.GradGamma;
+            gradBeta = fused.GradBeta;
+        }
+        else
+        {
+            if (parked is not null) gradOutput = AddParked(engine, gradOutput, parked);
+            var scaled = engine.LeakyReluBackward(gradOutput, output, slope);
+            gradInput = engine.BatchNormBackward(scaled, inputs[0], inputs[1], mean, variance, epsilon,
+                out gradGamma, out gradBeta);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+    }
+
+    /// <summary>
     /// Backward of a training BatchNorm whose output feeds a ReLU6 -- fused by the compiled plan
     /// (<see cref="Compilation.BatchNormRelu6FusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is the
     /// ReLU6's output. Its mask comes from the output: 0 &lt; ReLU6(z) &lt; 6 exactly when 0 &lt; z &lt; 6, so the

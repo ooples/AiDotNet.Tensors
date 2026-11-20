@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 // #1489: the register-resident training BatchNorm (IBatchNormVarianceBackend) on Vulkan, through PortableBatchNorm and
 // BatchNormRegisterKernelTemplate's kernels as GLSL compute shaders, built on first need.
-public sealed unsafe partial class VulkanBackend : IBatchNormVarianceBackend
+public sealed unsafe partial class VulkanBackend : IBatchNormVarianceBackend, IBatchNormLeakyReluBackend
 {
     private static readonly Dictionary<string, string> s_batchNormRegisterShaders = BuildBatchNormRegisterShaders();
 
@@ -80,4 +80,18 @@ public sealed unsafe partial class VulkanBackend : IBatchNormVarianceBackend
         => BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
             saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, reluOutput,
             gradResidual, beta, gradOutput2, accumulateGradInput: accumulateGradInput);
+
+    bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluTraining(IGpuBuffer input, IGpuBuffer output,
+        IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels,
+        int spatial, float epsilon, float slope)
+        => PortableBatchNorm.IsLeakySlope(slope) && BatchNormRegisterReady && PortableBatchNorm.TryForward(this, LaunchBatchNormRegister, input, output, gamma, beta,
+            saveMean, saveVariance, batch, channels, spatial, epsilon, true, null, leakySlope: slope);
+
+    bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluBackward(IGpuBuffer gradOutput, IGpuBuffer leakyOutput,
+        IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer? beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int channels, int spatial,
+        float epsilon, float slope, IGpuBuffer? gradOutput2, bool accumulateGradInput)
+        => PortableBatchNorm.IsLeakySlope(slope) && BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
+            saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, leakyOutput,
+            null, beta, gradOutput2, accumulateGradInput: accumulateGradInput, leakySlope: slope);
 }
