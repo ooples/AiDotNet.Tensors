@@ -13,10 +13,12 @@ public partial class DirectGpuTensorEngine
     {
         if (GraphMode.IsActive) return base.GatedDeltaNetStep(state, query, key, value, alpha, beta);
         var (rows, dv, dk) = ValidateGatedDeltaNetStep(state, query, key, value, alpha, beta);
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IGatedDeltaNetStepBackend step
-            || IsPartialView(state))
+        if (typeof(T) != typeof(float) || IsPartialView(state))
             return base.GatedDeltaNetStep(state, query, key, value, alpha, beta);
+        // The lease comes before the backend lookup: strict lease checking asserts it on TryGetBackend.
         using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend) || backend is not IGatedDeltaNetStepBackend step)
+            return base.GatedDeltaNetStep(state, query, key, value, alpha, beta);
         // The state's own persistent buffer, holding its current value: the kernel writes it in place.
         var stateBuffer = PinInputResident(state) ?? throw new InvalidOperationException("The state could not be made device-resident.");
         using var q = GetOrAllocateBuffer(backend, query);

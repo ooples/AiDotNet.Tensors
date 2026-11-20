@@ -12,10 +12,12 @@ public partial class DirectGpuTensorEngine
     {
         if (GraphMode.IsActive) return base.CausalConv1dStep(history, input, weight, bias, silu);
         var (taps, batch, channels) = ValidateCausalConv1dStep(history, input, weight, bias);
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not ICausalConv1dStepBackend step
-            || taps == 0 || taps > ICausalConv1dStepBackend.Limits.MaxTaps || IsPartialView(history))
+        if (typeof(T) != typeof(float) || taps == 0 || taps > ICausalConv1dStepBackend.Limits.MaxTaps || IsPartialView(history))
             return base.CausalConv1dStep(history, input, weight, bias, silu);
+        // The lease comes before the backend lookup: strict lease checking asserts it on TryGetBackend.
         using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend) || backend is not ICausalConv1dStepBackend step)
+            return base.CausalConv1dStep(history, input, weight, bias, silu);
         // The history's own persistent buffer, holding its current value: the kernel shifts it in place.
         var historyBuffer = PinInputResident(history) ?? throw new InvalidOperationException("The history could not be made device-resident.");
         using var x = GetOrAllocateBuffer(backend, input);
