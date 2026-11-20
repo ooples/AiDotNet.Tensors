@@ -160,6 +160,29 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableFact]
+    public void VectorReductions_OfDouble_UseTheCpuEngine_AndOfFloat_MatchIt()
+    {
+        // Sum and Mean cast every Vector<T> to Vector<float> for the kernel; for double that threw
+        // InvalidCastException out of the engine (AiDotNet DecisionTreeRegression feature importances), and
+        // DotProduct threw and swallowed it on every call.
+        SkipIfNoDirectGpu();
+        var gpu = (IEngine)Gpu;
+        var cpu = new CpuEngine();
+        var a = new Vector<double>([0.1, 2.5, -3.75, 1e-3, 7.0]);
+        var b = new Vector<double>([1.5, -0.5, 2.0, 4.0, 0.25]);
+
+        Assert.Equal(cpu.Sum(a), gpu.Sum(a));
+        Assert.Equal(cpu.Mean(a), gpu.Mean(a));
+        Assert.Equal(cpu.DotProduct(a, b), gpu.DotProduct(a, b));
+
+        var af = new Vector<float>([0.1f, 2.5f, -3.75f, 1e-3f, 7.0f]);
+        var bf = new Vector<float>([1.5f, -0.5f, 2.0f, 4.0f, 0.25f]);
+        Assert.Equal(cpu.Sum(af), gpu.Sum(af), 4);
+        Assert.Equal(cpu.Mean(af), gpu.Mean(af), 4);
+        Assert.Equal(cpu.DotProduct(af, bf), gpu.DotProduct(af, bf), 4);
+    }
+
+    [SkippableFact]
     public void EagerResidentBinary_ReuploadsVersionBumpedInput()
     {
         SkipIfNoDirectGpu();
