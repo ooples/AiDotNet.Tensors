@@ -113,8 +113,15 @@ public partial class CpuEngine
             CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * columns, row =>
             {
                 var values = v.Span.Slice(row * columns, columns);
-                float inverse = (float)(1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + (float)epsilon));
-                Simd.SimdKernels.MultiplyScalar(values, g.Span[row] * inverse, w.Span.Slice(row * columns, columns));
+                float scale;
+                if (WeightNormRoundedNormEnabled)
+                    scale = g.Span[row] / RoundedWeightNormRowNorm(values, (float)epsilon);
+                else
+                {
+                    float inverse = (float)(1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + (float)epsilon));
+                    scale = g.Span[row] * inverse;
+                }
+                Simd.SimdKernels.MultiplyScalar(values, scale, w.Span.Slice(row * columns, columns));
             }, deterministicSafe: true);
             return;
         }
@@ -172,12 +179,14 @@ public partial class CpuEngine
             {
                 var values = v.Span.Slice(row * columns, columns);
                 var upstream = h.Span.Slice(row * columns, columns);
-                float inverse = (float)(1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + (float)epsilon));
+                float roundedNorm = WeightNormRoundedNormEnabled ? RoundedWeightNormRowNorm(values, (float)epsilon) : 0f;
+                float inverse = WeightNormRoundedNormEnabled ? 1f / roundedNorm
+                    : (float)(1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + (float)epsilon));
                 float dot = Simd.SimdKernels.DotProduct(upstream, values);
                 if (writeDirection)
                 {
                     var destination = dv.Span.Slice(row * columns, columns);
-                    float scale = g.Span[row] * inverse;
+                    float scale = WeightNormRoundedNormEnabled ? g.Span[row] / roundedNorm : g.Span[row] * inverse;
                     float projection = dot * inverse * inverse;
                     if (accumulateDirection)
                     {
@@ -190,7 +199,8 @@ public partial class CpuEngine
                         Simd.SimdKernels.MultiplyScalar(destination, scale, destination);
                     }
                 }
-                if (writeGain) dg.Span[row] = (accumulateGain ? dg.Span[row] : 0f) + inverse * dot;
+                float gainGradient = WeightNormRoundedNormEnabled ? dot / roundedNorm : inverse * dot;
+                if (writeGain) dg.Span[row] = (accumulateGain ? dg.Span[row] : 0f) + gainGradient;
             }, deterministicSafe: true);
             return;
         }
