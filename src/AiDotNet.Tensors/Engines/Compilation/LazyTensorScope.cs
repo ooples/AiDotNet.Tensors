@@ -512,6 +512,13 @@ internal sealed class LazyTensorScope : IDisposable
         foreach (var target in inPlaceTargets)
             if (Array.IndexOf(inputs, target) < 0)
                 throw new ArgumentException("Every in-place target must be one of the op's inputs.", nameof(inPlaceTargets));
+        // These ops are forward only (decoding) and record no backward. A training trace that still expects a gradient
+        // here would compile a plan that silently drops it for every input, so the trace is refused instead; inside a
+        // no-grad scope nothing is expected and the op records as usual.
+        if (_traceKind == GraphTraceKind.Training && !RecordsWithoutGradient<T>())
+            throw new NotSupportedException(
+                $"{opName} is forward only and records no gradient, so it cannot be part of a training trace. "
+                + "Run it inside a no-grad scope, or train through the eager tape.");
         var output = RentOutput<T>(outputShape);
         var node = new LazyNode<T>(opType, opName, inputs, output, execute) { RecordedUnderNoGrad = true };
         // The op itself overwrites the targets, so it is ordered after each target's earlier readers (as RecordInPlace
