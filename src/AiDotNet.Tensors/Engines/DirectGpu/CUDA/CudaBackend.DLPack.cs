@@ -71,7 +71,8 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
     {
         if (_disposed && _cudaContext == IntPtr.Zero) return;   // torn down: nothing of ours can run on the memory
         using var _ = PushContext();
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(DLPack release)");
+        // Through the capture gate: a context-wide synchronize during another thread's capture invalidates it (CUDA 901).
+        CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize(DLPack release)");
     }
 
     private sealed class ExportHold : IDisposable

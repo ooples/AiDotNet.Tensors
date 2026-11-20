@@ -49,7 +49,9 @@ env:
 jobs:
   gemm-bench:
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
-    runs-on: ${{ vars.GEMM_BENCH_RUNNER || 'ubuntu-latest' }}
+    # Default pinned to the image the gate was validated on: on ubuntu-26.04 the paired OFF/ON ratio of the opt-in
+    # lever sat at 1.13-1.15 on tuned shapes across runs with no GEMM change, while 24.04 measured 0.94-1.02.
+    runs-on: ${{ vars.GEMM_BENCH_RUNNER || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

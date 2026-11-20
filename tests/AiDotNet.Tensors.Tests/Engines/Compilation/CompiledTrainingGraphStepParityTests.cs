@@ -783,6 +783,470 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     }
 
     /// <summary>
+    /// Index selects through host <c>Tensor&lt;int&gt;</c> ids - a constant id table, and ids the caller rewrites every
+    /// step - must train like the CPU plan, eager and captured. Each call uploaded its host ids into a fresh device
+    /// buffer, an allocation and synchronous copy a capture cannot contain, so the op fell back to the host path, whose
+    /// read of its device-resident input aborted the capture.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, true, true)]
+    [InlineData(true, true, true)]
+    public void Index_selects_through_host_ids_train_like_the_cpu_plan(bool capture, bool residentIds, bool viewIds)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            // residentIds: the ids live on the device (Gpu()) and each step's batch is written on the host.
+            // viewIds: the fed ids are an offset view of a larger tensor, written through its base.
+            var run = TrainHostIdSelects(gpu, capture, residentIds, viewIds);
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainHostIdSelects(cpu, capture: false, residentIds: false, viewIds);
+            AiDotNetEngine.Current = prior;
+            _output.WriteLine("cpu " + string.Join(" ", truth.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("gpu " + string.Join(" ", run.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(truth.Losses.Distinct().Count() == Steps, "the losses repeat; the comparison would be vacuous");
+            if (capture) Assert.True(run.Replayed, "the captured plan is not replaying a graph after warm-up");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - run.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {run.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            for (int p = 0; p < truth.Weights.Length; p++)
+                for (int i = 0; i < truth.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(truth.Weights[p][i] - run.Weights[p][i]) <= 1e-4f,
+                        $"param {p}[{i}]: GPU {run.Weights[p][i]} != CPU {truth.Weights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A fused linear cross-entropy whose host <c>Tensor&lt;int&gt;</c> labels the caller rewrites every step must train
+    /// like the CPU plan, eager and captured. The GPU op refused a capture with host-backed labels (the upload would
+    /// be replayed as the captured batch's labels), so a language-model step never replayed as one graph; it now reads
+    /// the labels' per-replay device copy in the forward and in the backward.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void A_fused_cross_entropy_over_fed_labels_trains_like_the_cpu_plan(bool capture, bool residentLabels)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            // residentLabels: the labels live on the device and each step's batch is written on the host; a replay reads
+            // their own buffer, so a stale buffer would train on the first batch's labels.
+            var run = TrainFusedCrossEntropy(gpu, capture, badLabelAtStep: -1, residentLabels);
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainFusedCrossEntropy(cpu, capture: false, badLabelAtStep: -1);
+            AiDotNetEngine.Current = prior;
+            _output.WriteLine("cpu " + string.Join(" ", truth.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("gpu " + string.Join(" ", run.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(truth.Losses.Distinct().Count() == Steps, "the losses repeat; the comparison would be vacuous");
+            if (capture) Assert.True(run.Replayed, "the captured plan is not replaying a graph after warm-up");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - run.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {run.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            for (int p = 0; p < truth.Weights.Length; p++)
+                for (int i = 0; i < truth.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(truth.Weights[p][i] - run.Weights[p][i]) <= 1e-4f,
+                        $"param {p}[{i}]: GPU {run.Weights[p][i]} != CPU {truth.Weights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A captured replay cannot check its labels on the device, so the labels' device copy checks them on the host
+    /// when it uploads them before the replay: an out-of-range label is rejected as an eager call rejects it, not
+    /// turned into a wrong loss.
+    /// </summary>
+    [SkippableFact]
+    public void A_captured_fused_cross_entropy_rejects_an_out_of_range_fed_label()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            Assert.ThrowsAny<ArgumentOutOfRangeException>(() => TrainFusedCrossEntropy(gpu, capture: true, badLabelAtStep: Steps - 1));
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public void A_resident_out_of_range_label_is_caught_on_the_device_and_the_plan_recovers(bool capture, bool repairGradients)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            if (capture)
+            {
+                Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                    "Whole-step graph capture is CUDA-only.");
+                Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                    "Graph capture is disabled for this process.");
+            }
+            const int vocab = 24;
+            var labels = new Tensor<int>([Batch]);
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var w = Rand([Inputs, Inputs], 4, 0.3f);
+            var head = Rand([Inputs, vocab], 5, 0.3f);
+            var bias = Rand([vocab], 6, 0.1f);
+            var parameters = new[] { w, head, bias };
+            foreach (var t in parameters) t.Gpu();
+            void Feed(int step, bool bad)
+            {
+                var rng = new Random(900 + step);
+                for (int i = 0; i < Batch; i++) labels.SetFlat(i, bad && i == 0 ? vocab : rng.Next(vocab));
+                labels.MarkModified();
+            }
+            Feed(0, bad: false);
+            labels.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                var h = gpu.TensorTanh(gpu.TensorMatMul(x, w));
+                gpu.FusedLinearCrossEntropyWithLogits(h, head, bias, labels);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 1e-2f, weightDecay: 0.1f);
+                if (repairGradients)
+                {
+                    var configured = (CompiledTrainingPlan<float>)plan;
+                    configured.SetMaxGradNorm(1.0);
+                    configured.SetNonFiniteGradientPolicy(AiDotNet.Tensors.Engines.Gpu.NonFiniteGradientPolicy.ZeroNonFinite);
+                }
+                for (int s = 0; s < Steps; s++)
+                {
+                    if (s > 0) Feed(s, bad: false);
+                    plan.Step();
+                }
+                if (capture) AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
+                var beforeBad = parameters.Select(p => p.ToArray()).ToArray();
+                int acceptedBefore = ((CompiledTrainingPlan<float>)plan).OptimizerStep;
+                Feed(Steps, bad: true);
+                var caught = Assert.ThrowsAny<ArgumentOutOfRangeException>(() => plan.Step());
+                Assert.Equal(acceptedBefore, ((CompiledTrainingPlan<float>)plan).OptimizerStep);
+                for (int p = 0; p < parameters.Length; p++)
+                    Assert.Equal(beforeBad[p], parameters[p].ToArray());
+                Assert.NotNull(caught);
+                // Detected on the device, not by a host-side check of the uploaded ids.
+                Assert.DoesNotContain("out of bounds for vocabulary", caught!.Message);
+                // Recovery: good batches step without rethrowing the old count.
+                for (int s = Steps + 2; s < Steps + 5; s++)
+                {
+                    Feed(s, bad: false);
+                    var loss = plan.Step().ToArray()[0];
+                    Assert.True(!float.IsNaN(loss) && !float.IsInfinity(loss), $"step {s} loss {loss}");
+                }
+            }
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainFusedCrossEntropy(IEngine engine, bool capture,
+        int badLabelAtStep, bool residentLabels = false)
+    {
+        const int vocab = 24;
+        var labels = new Tensor<int>([Batch]);
+        var x = Rand([Batch, Inputs], 1, 1f);
+        var w = Rand([Inputs, Inputs], 4, 0.3f);
+        var head = Rand([Inputs, vocab], 5, 0.3f);
+        var bias = Rand([vocab], 6, 0.1f);
+        var parameters = new[] { w, head, bias };
+        if (engine is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(900 + step);
+            for (int i = 0; i < Batch; i++) labels.SetFlat(i, step == badLabelAtStep && i == 0 ? vocab : rng.Next(vocab));
+            labels.MarkModified();
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        if (residentLabels && engine is DirectGpuTensorEngine) labels.Gpu();
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var h = engine.TensorTanh(engine.TensorMatMul(x, w));
+            engine.FusedLinearCrossEntropyWithLogits(h, head, bias, labels);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (capture && s == badLabelAtStep) AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            bool replayed = false;
+            if (plan is CompiledTrainingPlan<float> c)
+            {
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                replayed = execField.GetValue(c) is IntPtr handle && handle != IntPtr.Zero;
+            }
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), replayed);
+        }
+    }
+
+    /// <summary>
+    /// Ids the step computes on the device (an argmax over a fed input) are read as they are: the resident int refresh
+    /// that brings a host write into a device-resident ids buffer must never upload stale host bytes over device-written
+    /// ids.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Device_computed_ids_train_like_the_cpu_plan(bool capture)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            var run = TrainDeviceComputedIds(gpu, capture);
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainDeviceComputedIds(cpu, capture: false);
+            AiDotNetEngine.Current = prior;
+            _output.WriteLine("cpu " + string.Join(" ", truth.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("gpu " + string.Join(" ", run.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(truth.Losses.Distinct().Count() == Steps, "the losses repeat; the comparison would be vacuous");
+            if (capture) Assert.True(run.Replayed, "the captured plan is not replaying a graph after warm-up");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - run.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {run.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            for (int p = 0; p < truth.Weights.Length; p++)
+                for (int i = 0; i < truth.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(truth.Weights[p][i] - run.Weights[p][i]) <= 1e-4f,
+                        $"param {p}[{i}]: GPU {run.Weights[p][i]} != CPU {truth.Weights[p][i]}");
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainDeviceComputedIds(IEngine engine, bool capture)
+    {
+        const int rows = 40;
+        var scores = Rand([Batch, rows], 11, 1f);
+        var x = Rand([Batch, Inputs], 1, 1f);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var table = Rand([rows, Inputs], 5, 0.5f);
+        var w = Rand([Inputs, Outputs], 4, 0.3f);
+        var parameters = new[] { table, w };
+        if (engine is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(800 + step);
+            var span = scores.AsWritableSpan();
+            for (int i = 0; i < span.Length; i++) span[i] = (float)rng.NextDouble();
+            scores.IncrementVersion();
+            FeedTarget(y, step);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var ids = engine.TensorArgMax(scores, 1);   // computed on the device each step
+            var a = engine.TensorIndexSelect(table, ids, 0);
+            engine.TensorMSELoss(engine.TensorMatMul(engine.TensorMultiply(a, x), w), y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            bool replayed = false;
+            if (plan is CompiledTrainingPlan<float> c)
+            {
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                replayed = execField.GetValue(c) is IntPtr handle && handle != IntPtr.Zero;
+            }
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), replayed);
+        }
+    }
+
+    /// <summary>
+    /// A captured graph reads a device-resident ids tensor through the buffer it baked: if the tensor is given another
+    /// buffer (without its version moving), the plan retires the graph and computes the step from the new binding.
+    /// </summary>
+    [SkippableFact]
+    public void A_replay_recovers_when_resident_ids_move_to_another_buffer()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            const int rows = 40;
+            var ids = new Tensor<int>([Batch]);
+            for (int i = 0; i < Batch; i++) ids.AsWritableSpan()[i] = (5 * i + 1) % rows;
+            ids.IncrementVersion();
+            ids.Gpu();
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var table = Rand([rows, Inputs], 5, 0.5f);
+            var w = Rand([Inputs, Outputs], 4, 0.3f);
+            var parameters = new[] { table, w };
+            foreach (var p in parameters) p.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                var a = gpu.TensorIndexSelect(table, ids, 0);
+                gpu.TensorMSELoss(gpu.TensorMatMul(gpu.TensorMultiply(a, x), w), y);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                for (int s = 0; s < Steps; s++) plan.Step();
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                Assert.True(execField.GetValue(plan) is IntPtr handle && handle != IntPtr.Zero,
+                    "the captured plan is not replaying a graph after warm-up");
+                // A replacement buffer with a different lookup, at the same version.
+                var backend = gpu.GetBackend()!;
+                var replacement = ids.ToArray().Select(id => (id + 1) % rows).ToArray();
+                var cpu = new CpuEngine();
+                var hostTable = new Tensor<float>(table.ToArray(), table.Shape.ToArray());
+                var hostWeight = new Tensor<float>(w.ToArray(), w.Shape.ToArray());
+                var selected = cpu.TensorIndexSelect(hostTable, new Tensor<int>(replacement, new[] { Batch }), 0);
+                var expected = cpu.TensorMSELoss(cpu.TensorMatMul(cpu.TensorMultiply(selected, x), hostWeight), y).ToArray()[0];
+                var moved = backend.AllocateBuffer(AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine.ToFloatArray(replacement));
+                var original = ids._gpuBuffer;
+                int version = ids._gpuBufferVersion;
+                ids._gpuBuffer = moved;
+                ids._gpuBufferVersion = version;
+                try
+                {
+                    var loss = plan.Step().ToArray();
+                    Assert.Single(loss);
+                    Assert.InRange(Math.Abs(loss[0] - expected), 0f, 1e-4f * (1f + Math.Abs(expected)));
+                    Assert.Equal(IntPtr.Zero, (IntPtr)execField.GetValue(plan)!);
+                }
+                finally
+                {
+                    ids._gpuBuffer = original;
+                    ids._gpuBufferVersion = version;
+                    moved.Dispose();
+                }
+            }
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainHostIdSelects(IEngine engine, bool capture,
+        bool residentIds = false, bool viewIds = false)
+    {
+        const int rows = 40;
+        var fedBase = new Tensor<int>([Batch + 3]);
+        var fed = viewIds ? fedBase.Slice(0, 2, 2 + Batch) : new Tensor<int>([Batch]);
+        var constant = new Tensor<int>([Batch]);
+        for (int i = 0; i < Batch; i++) constant.AsWritableSpan()[i] = (7 * i + 3) % rows;
+        var x = Rand([Batch, Inputs], 1, 1f);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var tableA = Rand([rows, Inputs], 5, 0.5f);
+        var tableB = Rand([rows, Inputs], 6, 0.5f);
+        var w = Rand([Inputs, Outputs], 4, 0.3f);
+        var parameters = new[] { tableA, tableB, w };
+        if (engine is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(700 + step);
+            var written = viewIds ? fedBase : fed;
+            var span = written.AsWritableSpan();
+            int offset = viewIds ? 2 : 0;
+            for (int i = 0; i < span.Length; i++) span[i] = 0;
+            for (int i = 0; i < Batch; i++) span[offset + i] = rng.Next(rows);
+            written.IncrementVersion();
+            FeedTarget(y, step);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        if (residentIds && engine is DirectGpuTensorEngine) (viewIds ? fedBase : fed).Gpu();
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var a = engine.TensorIndexSelect(tableA, fed, 0);
+            var b = engine.TensorIndexSelect(tableB, constant, 0);
+            var h = engine.TensorAdd(engine.TensorMultiply(a, x), engine.TensorMultiplyScalar(b, 0.5f));
+            engine.TensorMSELoss(engine.TensorMatMul(h, w), y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            int recordedAtStep3 = -1;
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+                if (engine is DirectGpuTensorEngine g && s == 3) recordedAtStep3 = g.CapturedResidentIndexCount;
+            }
+            // One record per tensor: the pre-replay refresh list does not grow with the steps.
+            if (engine is DirectGpuTensorEngine ge && recordedAtStep3 >= 0)
+                Assert.Equal(recordedAtStep3, ge.CapturedResidentIndexCount);
+            bool replayed = false;
+            if (plan is CompiledTrainingPlan<float> c)
+            {
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                replayed = execField.GetValue(c) is IntPtr handle && handle != IntPtr.Zero;
+            }
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), replayed);
+        }
+    }
+
+    /// <summary>
     /// A replay copies only the inputs the host changed since the replay that last copied them (the step I/O prologue's
     /// copy mask): fed every third step, once, or one input every step and the other once, a captured plan must train
     /// exactly like the eager one, through the replays that skip every copy, make every copy, or make exactly one. With
@@ -1164,6 +1628,112 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             var captured = TrainOnce(capture: true);
             for (int i = 0; i < eager.Length; i++)
                 Assert.True(Math.Abs(eager[i] - captured[i]) <= 1e-5f, $"w[{i}] captured {captured[i]} != eager {eager[i]}");
+        }
+    }
+
+    /// <summary>
+    /// A plan with several float-index embedding gathers - one fed by the caller's ids, one through a constant address
+    /// table, one through ids the plan itself computed on the device (an address looked up by an earlier gather, as a
+    /// factored embedding does) - must train like the CPU plan, eager and captured. The resident gather kept ONE engine-wide
+    /// index buffer: every gather's forward and backward read whichever indices were uploaded last, and indices computed
+    /// on the device were read back to the host, which a capture cannot do.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, 7)]
+    [InlineData(true, 7)]
+    [InlineData(true, 3)]
+    [InlineData(true, 5)]
+    public void A_plan_with_several_float_index_gathers_trains_like_the_cpu_plan(bool capture, int gathers)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(capture && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+            var run = TrainSeveralGathers(gpu, capture, gathers);
+            var prior = AiDotNetEngine.Current;
+            var cpu = new CpuEngine();
+            AiDotNetEngine.Current = cpu;
+            var truth = TrainSeveralGathers(cpu, capture: false, gathers);
+            AiDotNetEngine.Current = prior;
+            _output.WriteLine("cpu " + string.Join(" ", truth.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("gpu " + string.Join(" ", run.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(truth.Losses.Distinct().Count() == Steps, "the losses repeat; the comparison would be vacuous");
+            if (capture) Assert.True(run.Replayed, "the captured plan is not replaying a graph after warm-up");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(truth.Losses[s] - run.Losses[s]) <= 1e-4 * Math.Max(1, Math.Abs(truth.Losses[s])),
+                    $"step {s}: GPU plan loss {run.Losses[s]:G6} != CPU plan {truth.Losses[s]:G6}");
+            for (int p = 0; p < truth.Weights.Length; p++)
+                for (int i = 0; i < truth.Weights[p].Length; i++)
+                    Assert.True(Math.Abs(truth.Weights[p][i] - run.Weights[p][i]) <= 1e-4f,
+                        $"param {p}[{i}]: GPU {run.Weights[p][i]} != CPU {truth.Weights[p][i]}");
+        }
+    }
+
+    private static (double[] Losses, float[][] Weights, bool Replayed) TrainSeveralGathers(IEngine engine, bool capture, int gathers)
+    {
+        const int vocab = 40, slots = 7;
+        var floatIds = new Tensor<float>([Batch]);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var tokenTable = Rand([vocab, Inputs], 5, 0.5f);
+        var slotTable = Rand([slots, Inputs], 6, 0.5f);
+        var rowTable = Rand([vocab, Inputs], 7, 0.5f);
+        // A constant (non-trained) address column: token v -> slot (3v + 1) mod slots, stored as floats.
+        var address = new Tensor<float>([vocab, 1]);
+        for (int v = 0; v < vocab; v++) address.AsWritableSpan()[v] = (3 * v + 1) % slots;
+        // A constant id list for the third gather: rows (5i + 2) mod vocab.
+        var constIds = new Tensor<float>([Batch]);
+        for (int i = 0; i < Batch; i++) constIds.AsWritableSpan()[i] = (5 * i + 2) % vocab;
+        var w = Rand([Inputs, Outputs], 4, 0.3f);
+        var parameters = new[] { tokenTable, slotTable, rowTable, w };
+        if (engine is DirectGpuTensorEngine) foreach (var p in parameters) p.Gpu();
+
+        void Feed(int step)
+        {
+            var rng = new Random(500 + step);
+            var span = floatIds.AsWritableSpan();
+            for (int i = 0; i < Batch; i++) span[i] = rng.Next(vocab);
+            floatIds.IncrementVersion();
+            FeedTarget(y, step);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        Feed(0);
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var token = engine.TensorEmbeddingLookupFromFloatIndices(tokenTable, floatIds);                 // caller's ids
+            var slotIds = engine.Reshape(engine.TensorEmbeddingLookupFromFloatIndices(address, floatIds), [Batch]);
+            var slot = engine.TensorEmbeddingLookupFromFloatIndices(slotTable, slotIds);                    // device ids
+            var row = engine.TensorEmbeddingLookupFromFloatIndices(rowTable, constIds);                     // constant ids
+            // gathers: 1 = the caller's ids (always), 2 = device-computed ids, 4 = constant ids.
+            var x = token;
+            if ((gathers & 2) != 0) x = engine.TensorAdd(x, engine.TensorMultiplyScalar(slot, 2f));
+            if ((gathers & 4) != 0) x = engine.TensorAdd(x, engine.TensorMultiplyScalar(row, -0.5f));
+            engine.TensorMSELoss(engine.TensorMatMul(x, w), y);
+            plan = scope.CompileTraining(parameters);
+        }
+        using (plan)
+        {
+            if (!capture && plan is CompiledTrainingPlan<float> concrete) concrete.DisableGraphStep();
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            var losses = new double[Steps];
+            for (int s = 0; s < Steps; s++)
+            {
+                if (s > 0) Feed(s);
+                losses[s] = plan.Step().ToArray()[0];
+            }
+            bool replayed = false;
+            if (plan is CompiledTrainingPlan<float> c)
+            {
+                var execField = typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)
+                    ?? throw new InvalidOperationException("_stepGraphExec field not found.");
+                replayed = execField.GetValue(c) is IntPtr handle && handle != IntPtr.Zero;
+            }
+            return (losses, parameters.Select(p => p.ToArray()).ToArray(), replayed);
         }
     }
 
@@ -2847,4 +3417,3 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         finally { AiDotNetEngine.Current = prior; }
     }
 }
-

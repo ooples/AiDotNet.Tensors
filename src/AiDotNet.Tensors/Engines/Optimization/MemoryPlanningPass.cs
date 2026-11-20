@@ -42,6 +42,16 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         CompiledStep<T>[] steps,
         IEngine engine,
         Tensor<T>? protectedOutput)
+        => TryOptimize(steps, engine, protectedOutput is null ? null : new[] { protectedOutput });
+
+    /// <summary>
+    /// As the single-output overload, for several tensors that must stay live through the end of the plan: the
+    /// output and, in a stateful plan, every next-state value its trailing state writes read.
+    /// </summary>
+    internal CompiledStep<T>[]? TryOptimize<T>(
+        CompiledStep<T>[] steps,
+        IEngine engine,
+        IReadOnlyList<Tensor<T>>? protectedOutputs)
     {
         if (steps.Length < 4) return null; // Not worth the overhead for tiny plans
 
@@ -81,7 +91,7 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
                 lastUse[step.Inputs[j]] = i;
         }
 
-        if (protectedOutput is not null)
+        foreach (var protectedOutput in protectedOutputs ?? Array.Empty<Tensor<T>>())
         {
             // A pure-view output is not necessarily a step output by identity. Protect every
             // produced tensor that shares its TensorStorage so a later operation cannot recycle

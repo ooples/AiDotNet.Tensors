@@ -47,6 +47,16 @@ public static class AiDotNetEngine
     private static readonly AsyncLocal<IEngine?> _threadEngine = new();
     private static int _threadOverrides;
 
+    // The module initializer's GPU detection, owed until something first asks for the engine. Detecting at assembly
+    // load made every consumer pay for it (an OpenCL/CUDA probe, about two seconds and a page of driver log), also
+    // the ones that only call the SIMD kernels or the helpers and never touch an engine. 1 while it is still owed.
+    private static int _deferredDetection;
+    private static bool _deferredVerbose;
+    private static readonly object _deferredLock = new object();
+
+    // Set on the thread that is running the owed detection, whose own reads of Current must not start it again.
+    [ThreadStatic] private static bool t_completingDeferred;
+
     /// <summary>
     /// Makes <see cref="Current"/> return <paramref name="engine"/> in the calling execution context (the calling thread
     /// and work it starts), until the returned scope is disposed. Other threads keep seeing the process-wide engine. Scopes nest.
@@ -86,6 +96,48 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
+    /// Records that the module initializer's GPU detection is owed. It runs on the first read of
+    /// <see cref="Current"/>, so an engine is detected exactly when one is first needed and a process that
+    /// never needs one never probes for a GPU.
+    /// </summary>
+    internal static void DeferGpuAutoDetection(bool verbose)
+    {
+        _deferredVerbose = verbose;
+        Volatile.Write(ref _deferredDetection, 1);
+    }
+
+    /// <summary>Whether the module initializer's GPU detection has been requested and has not run yet.</summary>
+    internal static bool IsGpuAutoDetectionDeferred => Volatile.Read(ref _deferredDetection) != 0;
+
+    // Other threads that read Current while the detection runs wait here, so no thread starts work on the CPU
+    // engine a moment before the GPU engine is adopted. Detection must not throw into a property getter.
+    private static void CompleteDeferredGpuDetection()
+    {
+        lock (_deferredLock)
+        {
+            if (Volatile.Read(ref _deferredDetection) == 0) return;
+            t_completingDeferred = true;
+            try
+            {
+                // Before the engine loads the OpenCL runtime, which reads these once.
+                DirectGpu.OpenCL.OpenClRuntimeDefaults.Apply();
+                AutoDetectAndConfigureGpu(_deferredVerbose);
+            }
+#pragma warning disable CA1031 // A failed probe leaves the CPU engine in place, as it did at module load.
+            catch (Exception)
+#pragma warning restore CA1031
+            {
+                // AutoDetectAndConfigureGpu already falls back to CPU on its own failures; this guards the rest.
+            }
+            finally
+            {
+                t_completingDeferred = false;
+                Volatile.Write(ref _deferredDetection, 0);
+            }
+        }
+    }
+
+    /// <summary>
     /// Gets or sets the current execution engine.
     /// </summary>
     /// <remarks>
@@ -117,6 +169,7 @@ public static class AiDotNetEngine
             // A thread override (a program trace) is visible only to the thread that installed it. The counter keeps
             // the thread-static read off the hot path while no override exists anywhere.
             if (Volatile.Read(ref _threadOverrides) != 0 && _threadEngine.Value is { } local) return local;
+            if (Volatile.Read(ref _deferredDetection) != 0 && !t_completingDeferred) CompleteDeferredGpuDetection();
             return Volatile.Read(ref _current);
         }
         set
@@ -126,8 +179,11 @@ public static class AiDotNetEngine
                 throw new ArgumentNullException(nameof(value), "Engine cannot be null");
             }
 
+            // An engine the caller chose before anything asked for one stands; the owed detection must not replace it.
+            lock (_deferredLock)
             lock (_adoptionLock)
             {
+                Volatile.Write(ref _deferredDetection, 0);
                 Volatile.Write(ref _current, value);
                 // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
                 Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
@@ -253,6 +309,9 @@ public static class AiDotNetEngine
     /// <returns>True if GPU was successfully configured, false otherwise.</returns>
     public static bool AutoDetectAndConfigureGpu(bool verbose)
     {
+        // An explicit call is the detection; nothing is owed after it.
+        if (!t_completingDeferred) Volatile.Write(ref _deferredDetection, 0);
+
         // Honor the AIDOTNET_DISABLE_GPU opt-out HERE, not only at module-init. Callers such as the
         // AiModelBuilder facade re-enter this method on every BuildAsync (its default, no-GPU-config
         // path auto-detects), so a process that disabled GPU must stay on CPU instead of repeatedly
@@ -477,9 +536,12 @@ public static class AiDotNetEngine
     /// </remarks>
     private static void SwitchToCpuEngine()
     {
+        // A caller that asked for the CPU engine before anything read Current must not get the GPU on that read.
         DirectGpuTensorEngine? parked = null;
+        lock (_deferredLock)
         lock (_adoptionLock)
         {
+            if (!t_completingDeferred) Volatile.Write(ref _deferredDetection, 0);
             var observed = Volatile.Read(ref _current);
             // A reset hands the choice back to the library either way, also when it keeps a plain CPU engine.
             Volatile.Write(ref _callerAssigned, false);

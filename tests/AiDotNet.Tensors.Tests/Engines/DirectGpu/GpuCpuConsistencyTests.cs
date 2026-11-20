@@ -468,6 +468,57 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             Assert.True(Math.Abs(cpuB[i] - gpuB[i]) <= 1e-3f * (1 + Math.Abs(cpuB[i])), $"dB[{i}] cpu={cpuB[i]} gpu={gpuB[i]}");
     }
 
+    [SkippableTheory]
+    [InlineData(16, 256, 4, 65)]  // a HarmonicEngine v2 training step (batch 16, seq 256, 4 heads of 64 + normaliser)
+    [InlineData(3, 37, 2, 65)]    // the Born scan width (64 + normaliser), seqLen not a multiple of the chunk
+    [InlineData(2, 20, 3, 8)]
+    [InlineData(2, 33, 2, 64)]    // even head dim: the odd tile stride keeps banks distinct
+    [InlineData(1, 17, 2, 100)]   // 10,000 state elements: 10 per thread
+    [InlineData(1, 17, 1, 108)]   // the widest head the tiled kernel takes (shared 47.8 KB)
+    [InlineData(1, 17, 1, 109)]   // one wider: the atomic checkpoint kernel
+    [InlineData(1, 17, 1, 128)]
+    public void GlaScanBackward_MatchesHostBptt(int batch, int seqLen, int numHeads, int headDim)
+    {
+        SkipIfNoDirectGpu();
+        int modelDim = numHeads * headDim;
+        var shape = new[] { batch, seqLen, modelDim };
+        float[] Wave(int n, double phase, double scale) =>
+            Enumerable.Range(0, n).Select(i => (float)(Math.Sin(0.37 * (i + 1) + phase) * scale)).ToArray();
+        var qd = Wave(batch * seqLen * modelDim, 0.1, 0.4);
+        var kd = Wave(batch * seqLen * modelDim, 0.7, 0.4);
+        var vd = Wave(batch * seqLen * modelDim, 1.3, 0.5);
+        var gd = Wave(batch * seqLen * numHeads, 2.1, 1.0).Select(x => 1f / (1f + MathF.Exp(-2f * x))).ToArray();
+        var wd = Wave(batch * seqLen * modelDim, 2.9, 1.0);   // dOut: the gradient of sum(output * w)
+
+        var dq = new float[qd.Length]; var dk = new float[kd.Length]; var dv = new float[vd.Length]; var dg = new float[gd.Length];
+        AiDotNet.Tensors.Engines.DirectGpu.Cpu.RecurrenceCpuKernels.GlaBackward(
+            wd, qd, kd, vd, gd, dq, dk, dv, dg, batch, seqLen, modelDim, numHeads, headDim);
+
+        IEngine gpu = Gpu;
+        var q = new Tensor<float>(qd, shape); var k = new Tensor<float>(kd, shape); var v = new Tensor<float>(vd, shape);
+        var g = new Tensor<float>(gd, new[] { batch, seqLen, numHeads });
+        var w = new Tensor<float>(wd, shape);
+        System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads;
+        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+        {
+            var o = gpu.GlaScanForward(q, k, v, g, numHeads);
+            var loss = gpu.ReduceSum(gpu.TensorMultiply(o, w), null);
+            grads = tape.ComputeGradients(loss, new[] { q, k, v, g });
+        }
+
+        void Match(float[] expected, Tensor<float> actual, string name)
+        {
+            var a = actual.GetDataArray();
+            double scale = expected.Max(x => Math.Abs((double)x)), worst = 0;
+            for (int i = 0; i < expected.Length; i++) worst = Math.Max(worst, Math.Abs(expected[i] - a[i]));
+            Assert.True(worst <= 1e-4 * Math.Max(scale, 1.0), $"{name}: max |host - gpu| {worst} (scale {scale})");
+        }
+        Match(dq, grads[q], "dQ");
+        Match(dk, grads[k], "dK");
+        Match(dv, grads[v], "dV");
+        Match(dg, grads[g], "dG");
+    }
+
     [SkippableFact]
     public void FusedLstmSequenceTrain_ForwardAndGradients_MatchDecomposedCpu()
     {
@@ -2106,6 +2157,96 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         Assert.Equal(expectedMax.GetDataArray(), actualMax.GetDataArray());
         Assert.Equal(expectedMin.GetDataArray(), actualMin.GetDataArray());
         Assert.Equal(expectedBuckets.GetDataArray(), actualBuckets.GetDataArray());
+    }
+
+    [SkippableTheory]
+    [InlineData(1, 49152)]   // one vocabulary row: the B=1 decode argmax
+    [InlineData(5, 4097)]
+    [InlineData(3, 512)]     // the row-kernel threshold
+    [InlineData(4, 511)]     // just below it: the one-thread-per-row kernel
+    public void ArgMaxArgMin_WideRows_MatchCpuScanExactly(int rows, int width)
+    {
+        SkipIfNoDirectGpu();
+        var rng = new Random(rows * 7919 + width);
+        var data = new float[rows * width];
+        for (int i = 0; i < data.Length; i++) data[i] = (float)Math.Round(rng.NextDouble() * 8 - 4, 1); // many exact ties
+        for (int r = 0; r < rows; r++)
+        {
+            int o = r * width;
+            switch (r % 5)
+            {
+                case 0: // ties at the extreme: the first of them must win, from several threads' slices
+                    data[o + width - 1] = 100f; data[o + 3] = 100f; data[o + width / 2] = 100f;
+                    data[o + width - 2] = -100f; data[o + 5] = -100f;
+                    break;
+                case 1: // a later NaN is skipped; infinities are ordinary extremes
+                    data[o + 1] = float.NaN; data[o + width - 1] = float.PositiveInfinity; data[o + 2] = float.NegativeInfinity;
+                    break;
+                case 2: // a leading NaN wins both
+                    data[o] = float.NaN; data[o + 9] = 1e30f;
+                    break;
+                case 3: // signed zeros tie (same bit key 0): the first wins; subnormals still order exactly
+                    for (int i = 0; i < width; i++) data[o + i] = i % 2 == 0 ? -1e-40f : -0f;
+                    data[o + width - 1] = 0f; data[o + 6] = 1e-45f; data[o + width - 3] = 1e-45f;
+                    break;
+                default:
+                    break;
+            }
+        }
+        var values = new Tensor<float>(data, new[] { rows, width });
+        IEngine cpu = new CpuEngine();
+        IEngine gpu = Gpu;
+        var backend = Gpu.GetBackend();
+        long Launches() => backend switch
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda => cuda.ArgExtremeRowLaunches,
+            AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend hip => hip.ArgExtremeRowLaunches,
+            _ => 0
+        };
+        long launches = Launches();
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            var gpuMax = gpu.TensorArgMax(values, 1);
+            var gpuMin = gpu.TensorArgMin(values, 1);
+            Assert.Equal(cpu.TensorArgMax(values, 1).GetDataArray(), gpuMax.GetDataArray());
+            Assert.Equal(cpu.TensorArgMin(values, 1).GetDataArray(), gpuMin.GetDataArray());
+            long expectedLaunches = width >= 512 && backend is
+                (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend or AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend) ? 2 : 0;
+            Assert.Equal(expectedLaunches, Launches() - launches);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(512)]
+    [InlineData(511)]
+    public void ArgMaxArgMin_SignedZeroTies_KeepFirstIndex(int width)
+    {
+        SkipIfNoDirectGpu();
+        var data = new float[2 * width];
+        for (int i = 0; i < width; i++)
+        {
+            data[i] = i % 2 == 0 ? -0f : 0f;
+            data[width + i] = i % 2 == 0 ? 0f : -0f;
+        }
+        var values = new Tensor<float>(data, new[] { 2, width });
+        bool saved = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            IEngine gpu = Gpu;
+            Assert.Equal(new[] { 0, 0 }, gpu.TensorArgMax(values, 1).GetDataArray());
+            Assert.Equal(new[] { 0, 0 }, gpu.TensorArgMin(values, 1).GetDataArray());
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = saved;
+        }
     }
 
     [SkippableFact]

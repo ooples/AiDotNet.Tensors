@@ -26,6 +26,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
             {
                 "im2col",
                 "col2im",
+                "nchw_to_cnhw",
+                "col2im_cnhw_bias",
                 "conv2d_direct",
                 "conv2d_backward_input",
                 "conv2d_backward_kernel",

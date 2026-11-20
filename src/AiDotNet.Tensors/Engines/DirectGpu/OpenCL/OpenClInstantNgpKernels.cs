@@ -4,7 +4,7 @@ public static class OpenClInstantNgpKernels
 {
     public static string[] GetKernelNames() =>
         ["instant_ngp_hash_encode_level", "instant_ngp_hash_encode_level_backward",
-            "frexp_decompose", "unique_consecutive_compact", "unique_consecutive_with_info", "unique_sorted_with_info", "project_gaussians_3d_to_2d", "sample_rays_with_occupancy", "resident_mode", "resident_indices_to_int32", "resident_one_hot_int32", "resident_index_add", "resident_index_select", "resident_scatter_max_argmax_rows", "resident_uniform_mesh_laplacian", "resident_scatter_mean_rows_counts", "nonzero_compact", "ctc_loss_forward", "importance_sampling", "resident_nms",
+            "frexp_decompose", "unique_consecutive_compact", "unique_consecutive_with_info", "unique_sorted_with_info", "project_gaussians_3d_to_2d", "sample_rays_with_occupancy", "resident_mode", "resident_indices_to_int32", "fused_ce_target_positions", "resident_one_hot_int32", "resident_index_add", "resident_index_select", "resident_scatter_max_argmax_rows", "resident_uniform_mesh_laplacian", "resident_scatter_mean_rows_counts", "nonzero_compact", "ctc_loss_forward", "importance_sampling", "resident_nms",
             "generate_spiral_indices"];
 
     public static string GetSource() => @"
@@ -329,6 +329,20 @@ __kernel void resident_mode(
     }
     output[0] = bestValue;
     output[1] = (float)bestCount;
+}
+
+__kernel void fused_ce_target_positions(
+    __global const int* ids,
+    __global float* positionBits,
+    int rows, int chunk, int vocab)
+{
+    int gid = get_global_id(0);
+    if (gid >= rows) return;
+    int raw = ids[gid];
+    int id = raw < 0 ? 0 : (raw >= vocab ? vocab - 1 : raw);
+    positionBits[gid] = as_float((gid % chunk) * vocab + id);
+    positionBits[rows + gid] = raw == id ? 0.0f : as_float(0x7fc00000);
+    positionBits[2 * rows + gid] = raw == id ? 0.0f : 1.0f;
 }
 
 __kernel void resident_indices_to_int32(
