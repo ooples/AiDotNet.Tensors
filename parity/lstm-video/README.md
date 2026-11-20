@@ -10,6 +10,8 @@ These are the two training programs and the screen recorder used for the publish
 
 The numbers are the last line in each trainer's log. Each log includes the elapsed time, loss and held-out score at every 64th update. [AiDotNet checkpoints](evidence/ai/live.jsonl) · [PyTorch checkpoints](evidence/torch/live.jsonl) · [Original run metadata](evidence/result.json)
 
+A fresh recording from the restored source on the same GPU took 2.982 seconds for AiDotNet and 16.438 seconds for PyTorch. Both trainers reproduced the original loss and correct-answer count at all 65 checkpoints. [Rerun summary](evidence/rerun/summary.json) · [AiDotNet rerun](evidence/rerun/ai.jsonl) · [PyTorch rerun](evidence/rerun/torch.jsonl)
+
 ## Run it yourself
 
 Use Git, the .NET 10 SDK, Python 3.13 and an NVIDIA GPU with a compatible driver and CUDA development libraries. On Windows use the x64 Developer PowerShell for Visual Studio with the C++ tools. From the root of this Tensors checkout, activate a Python virtual environment and install the versions used for the clip:
