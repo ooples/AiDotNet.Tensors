@@ -18,6 +18,54 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public class CompiledGpuRunningStatTests
 {
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void WholeStorageReshapeKeepsTheRunningStatesResidentBinding(bool readBetweenSteps, bool editState)
+    {
+        DirectGpuTensorEngine engine;
+        try { engine = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (engine)
+        {
+            Skip.IfNot(engine.IsGpuAvailable, "No GPU device.");
+            var state = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+            var increment = new Tensor<float>(new[] { .5f, -1f, 2f, -2f }, new[] { 1, 4 });
+            ICompiledTrainingPlan<float> plan;
+            using (var graph = GraphMode.EnableTraining(new[] { increment }))
+            {
+                var view = engine.Reshape(state, new[] { 1, 4 });
+                var next = engine.TensorAdd(view, increment);
+                engine.TensorCopyInPlace(state, engine.Reshape(next, new[] { 4 }));
+                plan = graph.CompileTraining(new[] { increment }, engine.ReduceSum(next));
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0);
+                for (int i = 0; i < 3; i++) plan.Step();
+                var binding = state._gpuBuffer;
+                Assert.NotNull(binding);
+                for (int i = 0; i < 3; i++)
+                {
+                    if (editState && i == 1) state[0] = 10f;
+                    plan.Step();
+                    Assert.Same(binding, state._gpuBuffer);
+                    if (readBetweenSteps)
+                    {
+                        float first = editState && i >= 1 ? 10f + .5f * i : 3f + .5f * i;
+                        Assert.Equal(new[] { first, -2f - i, 11f + 2f * i, -4f - 2f * i }, state.ToArray());
+                    }
+                }
+                Assert.Equal(new[] { editState ? 11f : 4f, -4f, 15f, -8f }, state.ToArray());
+            }
+        }
+    }
+
     private static Tensor<float> Filled(int[] shape, int seed, float scale)
     {
         var rng = new Random(seed);

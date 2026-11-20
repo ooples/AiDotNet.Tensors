@@ -1197,6 +1197,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var leaf = leaves[i];
             int version = leaf.GpuCacheVersion;
+            // A state-first graph can name its running state as its compiled input. That buffer
+            // contains the next replay's input until the caller writes a new value on the host.
+            if (ReferenceEquals(leaf, _compiledInputTensor) && CompiledInputIsRunningState
+                && leaf._gpuBufferVersion == version)
+            {
+                copiedSlot[i] = -1;
+                StepIoInputCopiesSkipped++;
+                continue;
+            }
             if (leaf.IsGpuResident && copiedSlot[i] >= 0 && copiedVersion[i] == version)
             {
                 StepIoInputCopiesSkipped++;
@@ -1344,6 +1353,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepIoBuffers = null;
         _stepIoLaunched = 0;
         _stepIoLossCaptured = false;
+    }
+
+    private void RefreshCapturedStateAndLoss(Engines.DirectGpuTensorEngine gte)
+    {
+        // A graph launch runs the writes without repeating their managed bind actions. Rearm the
+        // readback for the current binding, including when a host observer read the previous step.
+        foreach (var state in InPlaceStateTensors())
+        {
+            if (state._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero && state._gpuBackend is { } backend)
+            {
+                state.IncrementVersion();
+                gte.BindResidentBuffer(state, buffer, backend);
+            }
+        }
+        RefreshLossFromCapturedGraph(gte);
     }
 
     private void RefreshLossFromCapturedGraph(Engines.DirectGpuTensorEngine gte)
@@ -4354,7 +4378,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Executes THIS step on the just-uploaded indices (through the step I/O's staging when it has one).
                     if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, exec);
                     else LaunchStepGraph(cb, exec);
-                    RefreshLossFromCapturedGraph(gte);
+                    RefreshCapturedStateAndLoss(gte);
                     if (_capturedOptimizer is { } capturedFirst)
                     {
                         capturedFirst.AfterReplay?.Invoke();   // the graph ran the update
@@ -4397,7 +4421,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, _stepGraphExec);
                 else LaunchStepGraph(cb, _stepGraphExec);
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
-                RefreshLossFromCapturedGraph(gte);
+                RefreshCapturedStateAndLoss(gte);
                 if (_capturedOptimizer is { } capturedReplay)
                 {
                     capturedReplay.AfterReplay?.Invoke();   // the graph ran the update
@@ -4466,8 +4490,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     // Keep forward values readable without forcing a host download.
                     var released = new HashSet<Engines.DirectGpu.IGpuBuffer>(ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
-                    gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false, released);
-                    DetachReleasedBindings(released);
+                    var protectedState = BuildStepEvictionProtectSet();
+                    gte.EvictActivationsCreatedAfter(snapshot, protectedState, materializePending: false, released);
+                    DetachReleasedBindings(released, protectedState);
                     gte.ReclaimGpuMemoryUnderPressure();
                     RearmUnreadLossReadback();
                 }
@@ -4507,6 +4532,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     private bool CompiledInputIsParameter => _compiledInputIsParameter ??=
         _compiledInputTensor is { } input && Array.Exists(_parameters, p => ReferenceEquals(p, input));
+
+    private bool? _compiledInputIsRunningState;
+    private bool CompiledInputIsRunningState => _compiledInputIsRunningState ??=
+        _compiledInputTensor is { } input && Array.Exists(InPlaceStateTensors(), state => ReferenceEquals(state, input));
 
     private bool IsOwnedLeafBinding(Tensor<T> leaf)
         => leaf._gpuBuffer is { } bound && _ownedLeafBuffers.TryGetValue(leaf, out var owned)
@@ -4589,6 +4618,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // fused LSTM's bias add). Like every parameter it is read by the graph and updated by the optimizer on the
         // device, so refreshing it from the host downloaded and re-uploaded it, stalling the stream every replay.
         if (CompiledInputIsParameter) return allLive;
+        if (CompiledInputIsRunningState && inT._gpuBuffer is { } stateBuffer && ReferenceEquals(inT._gpuBackend, cb)
+            && inT._gpuBufferVersion == inT.GpuCacheVersion)
+            return allLive && stateBuffer.Handle != IntPtr.Zero;
         Engines.DirectGpu.IGpuBuffer? buf;
         if (GraphExternalLeaves().Contains(inT))
         {
@@ -5996,12 +6028,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 finally
                 {
                     var released = new HashSet<Engines.DirectGpu.IGpuBuffer>(ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
+                    var protectedState = BuildStepEvictionProtectSet();
                     stepActivationEngine.EvictActivationsCreatedAfter(
                         stepActivationSnapshot,
-                        BuildStepEvictionProtectSet(),
+                        protectedState,
                         materializePending: false,
                         released);
-                    DetachReleasedBindings(released);
+                    DetachReleasedBindings(released, protectedState);
                 }
             }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
@@ -6020,7 +6053,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// cross-entropy divided by a supervised-row count of 0, and a Born attention by a zeroed denominator, on their
     /// second step. A detached tensor is resolved afresh when it is next written.
     /// </summary>
-    private void DetachReleasedBindings(HashSet<Engines.DirectGpu.IGpuBuffer> released)
+    private void DetachReleasedBindings(HashSet<Engines.DirectGpu.IGpuBuffer> released, HashSet<object> protectedState)
     {
         if (_dataForwardReplay is { } dataReplay)
         {
@@ -6032,8 +6065,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // activation it was written into, and is recomputed next step: it is unbound whatever was released, as the
         // graph step does. In-place state keeps the only current value on the device; the loss was materialized.
         if (_forwardSteps != null)
-            foreach (var step in _forwardSteps.Where(s => !ReferenceEquals(s.OutputBuffer, _lossGradDest) && !IsInPlaceState(s) && !_retainedOutputs.Contains(s.OutputBuffer)))
-                DetachDeviceBinding(step.OutputBuffer);
+            foreach (var step in _forwardSteps)
+            {
+                var output = step.OutputBuffer;
+                // A reshape of a running statistic shares its binding and pending host readback.
+                // Detaching the view would also detach the state subsequent steps read.
+                if (!ReferenceEquals(output, _lossGradDest) && !protectedState.Contains(output.StorageIdentity))
+                    DetachDeviceBinding(output);
+            }
         if (released.Count == 0) return;
         // Everything else by device handle: a binding can be a different buffer object over the same memory.
         var handles = new HashSet<IntPtr>(released.Select(buffer => buffer.Handle).Where(handle => handle != IntPtr.Zero));
@@ -6085,15 +6124,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         AddActivationCacheKeys(protect, _lossGradSeed);
         foreach (var output in _retainedOutputs)
         {
-            AddActivationCacheKeys(protect, output);
-            if (output._gpuBuffer is { } buffer) protect.Add(buffer);
+            ForwardOnlyHeterogeneousReplay.ProtectTensor(protect, output);
         }
         // State an in-place step updates on the device lives across steps.
         if (_forwardSteps != null)
             foreach (var step in _forwardSteps.Where(s => IsInPlaceState(s)))
             {
-                AddActivationCacheKeys(protect, step.OutputBuffer);
-                if (step.OutputBuffer._gpuBuffer is { } buffer) protect.Add(buffer);
+                ForwardOnlyHeterogeneousReplay.ProtectTensor(protect, step.OutputBuffer);
             }
         return protect;
     }
