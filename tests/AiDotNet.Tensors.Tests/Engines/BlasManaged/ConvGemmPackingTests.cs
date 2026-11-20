@@ -1,12 +1,16 @@
 using System;
 using System.Buffers;
 using AiDotNet.Tensors.Engines.BlasManaged;
+using ManagedBlas = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
 public class ConvGemmPackingTests
 {
+    private static readonly (int Mr, int Nr) Tile =
+        ManagedBlas.GetEvolutionTuningTile<float>(PackingMode.ForcePackBoth, deterministic: false);
+
     private sealed class CountingPool<T> : ArrayPool<T>
     {
         public int Rents, Returns;
@@ -15,12 +19,13 @@ public class ConvGemmPackingTests
     }
 
     [Theory]
-    [InlineData(12, 16)]
-    [InlineData(48, 17)]
-    [InlineData(12, 65)]
-    public void Spatial_panels_share_filter_stripes_and_replace_changing_input(int rows, int columns)
+    [InlineData(2, 1, 0)]
+    [InlineData(8, 1, 1)]
+    [InlineData(2, 4, 1)]
+    public void Spatial_panels_share_filter_stripes_and_replace_changing_input(int rowTiles, int columnTiles, int tailColumns)
     {
-        const int k = 21, firstRow = 6;
+        const int k = 21;
+        int firstRow = Tile.Mr, rows = rowTiles * Tile.Mr, columns = columnTiles * Tile.Nr + tailColumns;
         var a = new float[(rows + firstRow) * k];
         var b = new float[k * columns];
         var output = new float[rows * columns];
@@ -75,7 +80,8 @@ public class ConvGemmPackingTests
     [Fact]
     public void Joined_operation_returns_filter_and_worker_storage_on_exception()
     {
-        const int rows = 12, columns = 16, k = 21;
+        const int k = 21;
+        int rows = 2 * Tile.Mr, columns = Tile.Nr;
         var a = new float[rows * k];
         var filters = new CountingPool<float>();
         var columnsPool = new CountingPool<byte>();
@@ -96,7 +102,8 @@ public class ConvGemmPackingTests
     [Fact]
     public void Nested_and_failed_operations_preserve_private_ownership()
     {
-        const int rows = 12, cols = 16, k = 21;
+        const int k = 21;
+        int rows = 2 * Tile.Mr, cols = Tile.Nr;
         var a = new float[rows * k];
         var b = new float[k * cols];
         var c = new float[rows * cols];
@@ -123,6 +130,6 @@ public class ConvGemmPackingTests
     {
         fixed (float* aPtr = a, bPtr = b, cPtr = c)
             PackBothStrategy.RunSingleRegionSerialUnsafe(aPtr + firstRow * k, invalidLength ? -1 : rows * k, k,
-                bPtr, b.Length, cols, cPtr, c.Length, cols, rows, cols, k, 12, 8, 6, 16, sizeof(float), worker);
+                bPtr, b.Length, cols, cPtr, c.Length, cols, rows, cols, k, 2 * Tile.Mr, 8, Tile.Mr, Tile.Nr, sizeof(float), worker);
     }
 }
