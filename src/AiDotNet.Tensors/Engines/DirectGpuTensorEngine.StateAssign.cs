@@ -58,6 +58,7 @@ public partial class DirectGpuTensorEngine
         var destinations = new IGpuBuffer[states.Count];
         var sources = new OwnedBuffer[states.Count];
         var lengths = new int[states.Count];
+        bool ordered = false;
         try
         {
             for (int i = 0; i < states.Count; i++)
@@ -74,17 +75,45 @@ public partial class DirectGpuTensorEngine
                 sources[i] = GetOrAllocateBuffer(backend, next);
                 lengths[i] = state.Length;
             }
-            batched.CopyMany(sources.Select(s => s.Buffer).ToArray(), destinations, lengths);
+            var sourceBuffers = sources.Select(s => s.Buffer).ToArray();
+            // One launch runs its copies concurrently, so it is only equivalent to the declared-order writes when no
+            // copy touches another's buffer: two states sharing one backing array, or a next that is a view of another
+            // state. Those take the ordered per-state path below.
+            ordered = StateCopiesOverlap(sourceBuffers, destinations);
+            if (!ordered) batched.CopyMany(sourceBuffers, destinations, lengths);
         }
         finally
         {
             foreach (var s in sources) s.Dispose();
+        }
+        if (ordered)
+        {
+            for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
+            return;
         }
         for (int i = 0; i < states.Count; i++)
         {
             states[i].IncrementVersion();
             BindResidentBuffer(states[i], destinations[i], backend);
         }
+    }
+
+    /// <summary>
+    /// Whether a batch of state copies cannot run as one concurrent launch: two destinations are the same device buffer,
+    /// or a source is another copy's destination (it would be read before or after that copy overwrites it).
+    /// </summary>
+    internal static bool StateCopiesOverlap(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations)
+    {
+        static bool Same(IGpuBuffer a, IGpuBuffer b)
+            => ReferenceEquals(a, b) || (a.Handle != IntPtr.Zero && a.Handle == b.Handle);
+        for (int i = 0; i < destinations.Count; i++)
+            for (int j = 0; j < destinations.Count; j++)
+            {
+                if (i == j) continue;
+                if (j > i && Same(destinations[i], destinations[j])) return true;
+                if (Same(sources[i], destinations[j])) return true;
+            }
+        return false;
     }
 
     /// <summary>
@@ -120,7 +149,16 @@ public partial class DirectGpuTensorEngine
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (!TryGetBackend(out var backend)) throw new InvalidOperationException("No GPU backend.");
         var snapshot = AllocateDeviceBufferUninitialized(backend, length);
-        backend.Copy(buffer, snapshot, length);
+        try
+        {
+            backend.Copy(buffer, snapshot, length);
+        }
+        catch
+        {
+            // The caller never receives the snapshot, so nothing else can release it.
+            snapshot.Dispose();
+            throw;
+        }
         return snapshot;
     }
 

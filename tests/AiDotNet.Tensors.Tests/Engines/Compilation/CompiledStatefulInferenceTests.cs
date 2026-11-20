@@ -17,6 +17,28 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 [Collection("DirectGpuSerial")]
 public sealed class CompiledStatefulInferenceTests
 {
+    // Batched state writes run concurrently, so they are only taken when no copy touches another's buffer. With
+    // A = 1, B = 10, nextA = A + 1 and nextB a view of A, the declared-order writes leave B = 2; a concurrent launch
+    // could read A before its own copy and leave B = 1.
+    [Fact]
+    public void BatchedStateWrites_AreRefusedWhenACopyTouchesAnothersBuffer()
+    {
+        var a = new AiDotNet.Tensors.Tests.Engines.DirectGpu.MockGpuBuffer(new[] { 1f });
+        var b = new AiDotNet.Tensors.Tests.Engines.DirectGpu.MockGpuBuffer(new[] { 10f });
+        var nextA = new AiDotNet.Tensors.Tests.Engines.DirectGpu.MockGpuBuffer(new[] { 2f });
+        var nextB = new AiDotNet.Tensors.Tests.Engines.DirectGpu.MockGpuBuffer(new[] { 11f });
+
+        // Disjoint sources and destinations: one launch.
+        Assert.False(DirectGpuTensorEngine.StateCopiesOverlap(new[] { nextA, nextB }, new[] { a, b }));
+        // A state's own next may be its own buffer (a copy onto itself reads nothing another copy writes).
+        Assert.False(DirectGpuTensorEngine.StateCopiesOverlap(new[] { a, nextB }, new[] { a, b }));
+        // nextB is state A's buffer: B's copy reads what A's copy writes.
+        Assert.True(DirectGpuTensorEngine.StateCopiesOverlap(new[] { nextA, a }, new[] { a, b }));
+        Assert.True(DirectGpuTensorEngine.StateCopiesOverlap(new[] { b, nextB }, new[] { a, b }));
+        // Two states resolved to one device buffer: the last declared write must win.
+        Assert.True(DirectGpuTensorEngine.StateCopiesOverlap(new[] { nextA, nextB }, new[] { a, a }));
+    }
+
     [Fact]
     public void ReturnedIntermediateAndStateConsumerRefreshIndependently()
     {
@@ -306,8 +328,12 @@ public sealed class CompiledStatefulInferenceTests
                         }
                         else plan.SetInputs(new[] { new Tensor<float>([1, W], new Vector<float>((float[])data.Clone())) });
                         if (t == 2) skippedBefore = plan.InputUploadsSkipped;   // the graph is replaying from here on
-                        else if (t > 2 && previous is not null
-                                 && data.Select(Bits).SequenceEqual(previous.Select(Bits)))
+                        // Every replay from t == 2 on is in the measured interval, the first one included. A replay skips
+                        // the upload when the input is bit-identical to the previous call's and was not written through
+                        // the indexer: an in-place write changes the slot's version, so it is uploaded even when the
+                        // values match.
+                        if (t >= 2 && !inPlace && previous is not null
+                            && data.Select(Bits).SequenceEqual(previous.Select(Bits)))
                             expectedSkips++;
                         var got = plan.Execute().ToArray();
                         for (int j = 0; j < W; j++)

@@ -981,18 +981,38 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // warmup calls wrote them).
                             // The pre-residency pass would advance every in-place leaf once more than this call does
                             // (the launch below is this call's advance): snapshot them on the device and restore after.
-                            var snapshots = new Engines.DirectGpu.IGpuBuffer[_inPlaceLeaves.Length];
-                            for (int i = 0; i < snapshots.Length; i++)
-                                snapshots[i] = gte.TakeDeviceSnapshot(_capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
-                            RunStepsPooled(gte, engine, steps, steps.Length - _stateTensors.Length);
-                            for (int i = 0; i < snapshots.Length; i++)
+                            var snapshots = new Engines.DirectGpu.IGpuBuffer?[_inPlaceLeaves.Length];
+                            try
                             {
-                                if (!ReferenceEquals(_inPlaceLeaves[i]._gpuBuffer, _capturedInPlaceBuffers[i]))
+                                for (int i = 0; i < snapshots.Length; i++)
+                                    snapshots[i] = gte.TakeDeviceSnapshot(_capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+                                RunStepsPooled(gte, engine, steps, steps.Length - _stateTensors.Length);
+                            }
+                            catch
+                            {
+                                // A step that threw may follow one that already advanced a leaf. The eager fallback
+                                // advances every leaf once itself, so the leaves go back to their snapshots first; if
+                                // that cannot be done the call fails instead of running the plan on advanced state.
+                                try
                                 {
-                                    for (int j = i; j < snapshots.Length; j++) snapshots[j].Dispose();
-                                    throw new InvalidOperationException("An in-place write moved its tensor to another device buffer; the graph cannot replay it.");
+                                    RestoreInPlaceLeaves(gte, snapshots);
                                 }
-                                gte.RestoreDeviceSnapshot(snapshots[i], _capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+                                catch
+                                {
+                                    stateLaunchAttempted = true;
+                                    throw;
+                                }
+                                throw;
+                            }
+                            try
+                            {
+                                RestoreInPlaceLeaves(gte, snapshots);
+                            }
+                            catch
+                            {
+                                // The leaves hold this pass's extra advance and cannot be put back.
+                                stateLaunchAttempted = true;
+                                throw;
                             }
 
                             // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
@@ -1069,6 +1089,32 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             steps[i].Execute(engine, steps[i].OutputBuffer);
         }
         return _finalOutput;
+    }
+
+    // Writes each acquired pre-residency snapshot back into its in-place leaf and releases it. On any failure the
+    // snapshots not yet released are disposed before the error propagates, so none outlives the call.
+    private void RestoreInPlaceLeaves(DirectGpuTensorEngine gte, Engines.DirectGpu.IGpuBuffer?[] snapshots)
+    {
+        try
+        {
+            for (int i = 0; i < snapshots.Length; i++)
+            {
+                if (snapshots[i] is not { } snapshot) continue;
+                if (!ReferenceEquals(_inPlaceLeaves[i]._gpuBuffer, _capturedInPlaceBuffers[i]))
+                    throw new InvalidOperationException("An in-place write moved its tensor to another device buffer; the graph cannot replay it.");
+                snapshots[i] = null;
+                gte.RestoreDeviceSnapshot(snapshot, _capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < snapshots.Length; i++)
+            {
+                if (snapshots[i] is not { } leftover) continue;
+                snapshots[i] = null;
+                leftover.Dispose();
+            }
+        }
     }
 
     // An abandoned capture leaves the plan eager: its input slots, pinned to buffers only a graph replay refreshes,
