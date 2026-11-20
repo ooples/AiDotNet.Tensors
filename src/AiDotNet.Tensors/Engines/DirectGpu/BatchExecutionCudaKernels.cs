@@ -24,7 +24,7 @@ internal static partial class BatchExecutionCudaKernels
 
     public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource + WeightNormSource + RfftMagnitudeSource + ChannelBiasLeakySource + GroupedConv2DSource + ChannelBiasResidualSource;
 
-    private static string CoreSource => KernelSourceResources.Load("BatchExecution.core.c");
+    private static string CoreSource => KernelSourceResources.Read("BatchExecution.core.c");
 
     public static string[] GetKernelNames() => new[]
     {
