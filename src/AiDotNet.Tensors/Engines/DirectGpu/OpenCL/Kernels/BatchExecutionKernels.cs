@@ -20,7 +20,12 @@ public static class BatchExecutionKernels
     /// The IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C so OpenCL runs the same
     /// code HIP and Metal run: kernel qualifiers, global pointers, the thread index and the float builtins.
     /// </summary>
-    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.DecodeLinearSource + K.DirectConvSource + K.WeightNormSource + K.RfftMagnitudeSource + K.ChannelBiasLeakySource + K.GroupedConv2DSource + K.ChannelBiasResidualSource);
+    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.DecodeLinearSource + K.DirectConvSource + K.WeightNormSource + K.RfftMagnitudeSource + K.ChannelBiasLeakySource + K.GroupedConv2DSource + K.ChannelBiasResidualSource)
+        .Replace(TranslateSolvers(K.ChannelBiasLeakySource), GetChannelBiasLeakySource());
+
+    // Keep the shared CUDA constant intact so all backends deduplicate the common module in CLR metadata.
+    // The OpenCL fusion preserves the bias and activation modules' different denormal policies.
+    internal static string GetChannelBiasLeakySource() => KernelSourceResources.Read("ChannelBiasLeaky.opencl.c");
 
     private static string TranslateSolvers(string cuda)
     {

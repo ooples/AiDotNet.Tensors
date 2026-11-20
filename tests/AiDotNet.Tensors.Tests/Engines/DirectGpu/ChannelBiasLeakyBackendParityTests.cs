@@ -29,15 +29,17 @@ public sealed class ChannelBiasLeakyBackendParityTests
         Assert.Equal(before, GpuLaunchProbe.Count);
     }
 
-    private static void Verify(IDirectGpuBackend backend)
+    private static void Verify(IDirectGpuBackend backend, float[]? channelBiases = null)
     {
         const int batch = 2, channels = 3, spatial = 259, count = batch * channels * spatial;
         const float alpha = .1f, sentinel = 123.75f;
         float[] pattern = { 0f, BitConverter.Int32BitsToSingle(unchecked((int)0x80000000)), 1f, -1f, float.Epsilon, -float.Epsilon,
             1.17549435E-38f, -1.17549435E-38f, float.NaN, float.PositiveInfinity, float.NegativeInfinity,
-            .75f, -.5f, BitConverter.Int32BitsToSingle(0x3f800001) };
+            .75f, -.5f, BitConverter.Int32BitsToSingle(0x3f800001), BitConverter.Int32BitsToSingle(0x007fffff),
+            -BitConverter.Int32BitsToSingle(0x00800001), BitConverter.Int32BitsToSingle(0x0c800000),
+            BitConverter.Int32BitsToSingle(0x0d000000) };
         var values = Enumerable.Range(0, count).Select(i => pattern[i % pattern.Length]).ToArray();
-        var biases = new[] { -.75f, 0f, .5f };
+        var biases = channelBiases ?? new[] { -.75f, 0f, .5f };
         var padded = Enumerable.Repeat(sentinel, count + 7).ToArray();
         using var input = backend.AllocateBuffer(values);
         using var bias = backend.AllocateBuffer(biases);
@@ -77,7 +79,13 @@ public sealed class ChannelBiasLeakyBackendParityTests
     { using var backend = new HipBackend(); Skip.IfNot(backend.IsAvailable, "HIP unavailable."); Verify(backend); }
     [SkippableFact]
     public void OpenCl_matches_separate_bias_then_leaky_in_one_launch()
-    { using var backend = new OpenClBackend(); Skip.IfNot(backend.IsAvailable, "OpenCL unavailable."); Verify(backend); }
+    {
+        using var backend = new OpenClBackend();
+        Skip.IfNot(backend.IsAvailable, "OpenCL unavailable.");
+        Verify(backend);
+        float largestSubnormal = BitConverter.Int32BitsToSingle(0x007fffff);
+        Verify(backend, new[] { float.Epsilon, -largestSubnormal, largestSubnormal });
+    }
     [SkippableFact]
     public void Metal_matches_separate_bias_then_leaky_in_one_launch()
     {
