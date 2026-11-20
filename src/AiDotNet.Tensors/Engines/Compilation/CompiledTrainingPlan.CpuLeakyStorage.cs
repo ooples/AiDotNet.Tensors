@@ -12,7 +12,8 @@ internal sealed partial class CompiledTrainingPlan<T>
     internal static int ShareCpuLeakyBiasStorage(IReadOnlyList<CompiledStep<T>> steps, Tensor<T>[] parameters,
         Tensor<T> loss, HashSet<Tensor<T>> retained, IEngine engine, LazyTensorScope scope)
     {
-        if (engine.GetType() != typeof(CpuEngine) || (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        if (!ReferenceEquals(engine, engine.Unwrap()) || engine.Unwrap().GetType() != typeof(CpuEngine)
+            || (typeof(T) != typeof(float) && typeof(T) != typeof(double))
             || scope.HostReadOp is not null || ForwardStepObserver is not null || SanitizeForwardBuffers
             || !steps.Any(step => step.OpType == OpType.LeakyReLU)
             || !steps.Any(step => step.OpName == "TensorChannelBiasAdd"))
