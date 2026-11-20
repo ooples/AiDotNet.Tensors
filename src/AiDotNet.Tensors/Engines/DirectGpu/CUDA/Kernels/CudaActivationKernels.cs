@@ -1256,6 +1256,41 @@ extern ""C"" __global__ __launch_bounds__(256) void conv2d_bias_add(float* __res
         output[(long long)bc * spatialSize + spatialIdx] += __ldg(&bias[bc % channels]);
 }
 
+// A convolution's epilogue from its channels-last result: dst[n, c, s] = act(src[n, s, c] + bias[c]) for an NHWC src
+// (what cuDNN's tensor-core kernels write natively) and an NCHW dst. The layout change cuDNN otherwise runs as its own
+// pass after an NCHW convolution is this kernel's load and store, so the bias add and the activation cost no pass of
+// their own. Each block moves a 32 x 32 (spatial x channel) tile through shared memory: both the load (over channels)
+// and the store (over spatial) are coalesced. The values are conv2d_bias_add's sum and the relu / relu6 kernels' own
+// operations, so the result equals the convolution, then conv2d_bias_add, then the activation pass.
+// act: 0 none, 1 ReLU, 2 ReLU6. bias may be null. Grid (ceil(spatial / 32), ceil(channels / 32), batch), block (32, 8).
+extern ""C"" __global__ __launch_bounds__(256) void conv_epilogue_nhwc_nchw(const float* __restrict__ src,
+    const float* __restrict__ bias, float* __restrict__ dst, int channels, int spatial, int act)
+{
+    __shared__ float tile[32][33];
+    const long long image = (long long)blockIdx.z * channels * spatial;
+    const int s0 = blockIdx.x * 32, c0 = blockIdx.y * 32;
+    #pragma unroll
+    for (int r = threadIdx.y; r < 32; r += 8)
+    {
+        const int s = s0 + r, c = c0 + threadIdx.x;
+        if (s < spatial && c < channels) tile[r][threadIdx.x] = src[image + (long long)s * channels + c];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int r = threadIdx.y; r < 32; r += 8)
+    {
+        const int c = c0 + r, s = s0 + threadIdx.x;
+        if (c < channels && s < spatial)
+        {
+            float v = tile[threadIdx.x][r];
+            if (bias != nullptr) v += __ldg(&bias[c]);
+            if (act == 1) v = relu_nan_safe(v);
+            else if (act == 2) v = xf_clampf(v, 0.0f, 6.0f);
+            dst[image + (long long)c * spatial + s] = v;
+        }
+    }
+}
+
 // ===========================================================================
 // TRIGONOMETRIC KERNELS
 // ===========================================================================
@@ -1661,6 +1696,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "bias_add",
                 "bias_add_out",
                 "conv2d_bias_add",
+                "conv_epilogue_nhwc_nchw",
                 "conv2d_bias_add_out",
                 // Vectorized (float4) unary
                 "relu_vec4",

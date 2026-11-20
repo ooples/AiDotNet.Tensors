@@ -11676,20 +11676,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Execute GPU transposed convolution
-            backend.ConvTranspose2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
-                batch, inChannels, inHeight, inWidth,
-                outChannels, outHeight, outWidth,
-                kernelH, kernelW,
-                strideH, strideW, padH, padW,
-                outputPadH, outputPadW);
-
             int outputSize = batch * outChannels * outHeight * outWidth;
             int spatialSize = outHeight * outWidth;
-            if (bias != null)
+            if (bias != null && backend is AiDotNet.Tensors.Engines.DirectGpu.IConvTranspose2DBiasBackend fusedBias)
             {
+                // CUDA adds the bias inside the transposed convolution where its route allows (the overlap-add of the
+                // single-GEMM route): one write of the biased output instead of a second pass.
                 using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
-                backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
+                fusedBias.ConvTranspose2DBias(inputBuffer.Buffer, kernelBuffer.Buffer, biasBuffer.Buffer, outputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW,
+                    strideH, strideW, padH, padW, outputPadH, outputPadW);
+            }
+            else
+            {
+                // Execute GPU transposed convolution
+                backend.ConvTranspose2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW,
+                    strideH, strideW, padH, padW,
+                    outputPadH, outputPadW);
+                if (bias != null)
+                {
+                    using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+                    backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
+                }
             }
 
             if (activation != FusedActivationType.None)

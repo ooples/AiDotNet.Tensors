@@ -3996,6 +3996,21 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>ConvTranspose2D backward</summary>
+    /// <summary>
+    /// The backward of <c>FusedConvTranspose2DBias</c> (ConvTransposeBiasFusionPattern): convTranspose2d(x, k) + b[c]. The
+    /// bias gradient is the output gradient summed over batch and space; x and k take the transposed convolution's own
+    /// backward with the same output gradient (the bias add passes it through).
+    /// </summary>
+    internal static void FusedConvTranspose2DBiasBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (DifferentiableOps.IsGradientRequired(inputs[2]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[2],
+                engine.ReduceSum(gradOutput, new[] { 0, 2, 3 }, keepDims: false), engine);
+        ConvTranspose2DBackward(gradOutput, new[] { inputs[0], inputs[1] }, output, savedState, engine, grads);
+    }
+
     internal static void ConvTranspose2DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)

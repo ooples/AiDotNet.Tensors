@@ -67,14 +67,18 @@ internal readonly struct CudaConv2DArgs
 
     internal int OutputCount => Batch * OutChannels * OutHeight * OutWidth;
 
-    /// <summary>Shape class: every geometric parameter (output extent follows from them).</summary>
+    /// <summary>Shape class: every geometric parameter (output extent follows from them) and the epilogue (bias,
+    /// activation, input prologue): the fastest route differs with it -- a route that applies the epilogue in its own
+    /// output store saves passes another route runs after -- so a convolution with a bias and the same one without (a
+    /// transposed convolution's data gradient runs as a bias-free forward) are tuned apart.</summary>
     internal unsafe TunedShape Shape()
     {
-        int* d = stackalloc int[15];
+        int* d = stackalloc int[16];
         d[0] = Batch; d[1] = InChannels; d[2] = InHeight; d[3] = InWidth; d[4] = OutChannels;
         d[5] = KernelH; d[6] = KernelW; d[7] = StrideH; d[8] = StrideW; d[9] = PadH; d[10] = PadW;
         d[11] = DilationH; d[12] = DilationW; d[13] = OutHeight; d[14] = OutWidth;
-        return TunedShape.Create(TunedKernelDType.Float32, new ReadOnlySpan<int>(d, 15));
+        d[15] = (Bias is null ? 0 : 1) | (PreScale is null ? 0 : 2) | ((int)Activation << 2);
+        return TunedShape.Create(TunedKernelDType.Float32, new ReadOnlySpan<int>(d, 16));
     }
 }
 
