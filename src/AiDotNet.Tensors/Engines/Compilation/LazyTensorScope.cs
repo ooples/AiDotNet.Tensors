@@ -521,6 +521,7 @@ internal sealed class LazyTensorScope : IDisposable
                 + "Run it inside a no-grad scope, or train through the eager tape.");
         var output = RentOutput<T>(outputShape);
         var node = new LazyNode<T>(opType, opName, inputs, output, execute) { RecordedUnderNoGrad = true };
+        SnapshotTraceStateTargets(node, inPlaceTargets);
         // The op itself overwrites the targets, so it is ordered after each target's earlier readers (as RecordInPlace
         // orders its write).
         var readers = new List<ILazyNode>();
@@ -536,6 +537,35 @@ internal sealed class LazyTensorScope : IDisposable
         foreach (var target in inPlaceTargets)
             RecordInPlace<T>(opType, opName + ".StateWrite", target, new[] { output }, static (_, _) => { });
         return output;
+    }
+
+    // A trace may realize part of its graph while it is still being recorded: an op whose graph-mode path computes its
+    // value eagerly (to capture its outputs) reads its input, which runs every node upstream of it, including a
+    // state-writing decode op, whose state would then be advanced by the trace itself and once more by every execution.
+    // So each such op's targets are snapshotted when it is recorded (only a target's first write in the trace: that
+    // snapshot is the pre-trace state), and compiling or abandoning the trace writes the snapshot back into any target
+    // the trace advanced. Kept on the root scope, which is the one that compiles.
+    private List<(ILazyNode Node, ISignatureTensor Target, ISignatureTensor Snapshot)>? _traceStateSnapshots;
+
+    private void SnapshotTraceStateTargets<T>(ILazyNode node, Tensor<T>[] targets)
+    {
+        var root = this;
+        while (root._parent is not null) root = root._parent;
+        foreach (var target in targets)
+        {
+            if (target.LazySource is not null) continue;
+            if (root._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, target)) == true) continue;
+            var snapshot = new Tensor<T>((int[])target._shape.Clone(), new Vector<T>(target.ToArray()));
+            (root._traceStateSnapshots ??= new()).Add((node, target, snapshot));
+        }
+    }
+
+    private void RestoreTraceStateTargets()
+    {
+        if (_traceStateSnapshots is not { } snapshots) return;
+        _traceStateSnapshots = null;
+        foreach (var (node, target, snapshot) in snapshots)
+            if (node.IsRealized) target.CopyLeafFrom(snapshot);
     }
 
     /// <summary>Records a variadic operation as a lazy node.</summary>
@@ -787,6 +817,10 @@ internal sealed class LazyTensorScope : IDisposable
         {
             Abandon();
             throw;
+        }
+        finally
+        {
+            RestoreTraceStateTargets();
         }
     }
 

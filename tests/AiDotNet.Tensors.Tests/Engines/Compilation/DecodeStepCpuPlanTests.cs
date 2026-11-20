@@ -121,6 +121,46 @@ public class DecodeStepCpuPlanTests
             }
     }
 
+    // A stateful plan (declared state updates) that also holds an in-place decode op: compiling must not leave the op's
+    // state advanced, and each execution must advance it exactly once. With realizeInTrace, an RMSNorm downstream of the
+    // append computes its graph-mode value eagerly, which realizes the append while the step is still being traced.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_stateful_cpu_plan_with_a_cache_append_advances_the_position_once_per_execution(bool realizeInTrace)
+    {
+        const int batch = 1, capacity = 4, width = 2;
+        var cpu = new CpuEngine();
+        var cache = new Tensor<float>([batch, capacity, width]);
+        var position = new Tensor<float>([1]);
+        var counter = new Tensor<float>([1]);
+        var x = new Tensor<float>([batch, width]);
+        ICompiledPlan<float> plan;
+        using (new EngineScope(cpu))
+        {
+            var models = new CompiledModelCache<float>();
+            plan = models.CompileStatefulInference(new[] { x }, () =>
+            {
+                var weights = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                if (realizeInTrace)
+                    weights = cpu.TensorAdd(weights, cpu.TensorMultiplyScalar(
+                        cpu.RMSNorm(cpu.Reshape(weights, [1, capacity]), T([capacity], _ => 1f), 1e-6, out _), 0f));
+                var next = cpu.TensorAddScalar(counter, 1f);
+                return (weights, new[] { (counter, next) });
+            });
+        }
+        Assert.Equal(0f, position.ToArray()[0]);
+        using (plan)
+            for (int t = 0; t < capacity; t++)
+            {
+                plan.SetInputs(new[] { T([batch, width], i => t + 1) });
+                var w = plan.Execute().ToArray();
+                for (int s = 0; s < capacity; s++) Assert.Equal(s <= t ? 1f / (t + 1) : 0f, w[s], 6);
+                Assert.Equal(t + 1, position.ToArray()[0]);
+                Assert.Equal(t + 1, counter.ToArray()[0]);
+            }
+    }
+
     [Fact]
     public void Malformed_decode_step_arguments_are_rejected()
     {

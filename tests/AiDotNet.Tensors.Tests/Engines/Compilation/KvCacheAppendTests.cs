@@ -84,10 +84,14 @@ public class KvCacheAppendTests
 
     // A compiled plan appending each step's input: the position advances on the device once per execution (the capture
     // call included), the mask follows it, and the captured graph copies nothing.
+    // With realizeInTrace an RMSNorm downstream of the append computes its graph-mode value eagerly, which runs the
+    // append during the trace; compiling must put the cache and position back, so the first execution writes slot 0.
     [SkippableTheory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void A_compiled_plan_appends_once_per_execution_from_a_device_position(bool capture)
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public void A_compiled_plan_appends_once_per_execution_from_a_device_position(bool capture, bool realizeInTrace)
     {
         DirectGpuTensorEngine? gpu = null;
         try { gpu = new DirectGpuTensorEngine(); }
@@ -107,6 +111,9 @@ public class KvCacheAppendTests
                 using (var scope = GraphMode.EnableInference())
                 {
                     var weights = gpu!.Softmax(gpu.KvCacheAppend(cache, position, x), -1);   // uniform over the filled slots
+                    if (realizeInTrace)
+                        weights = gpu.TensorAdd(weights, gpu.TensorMultiplyScalar(gpu.RMSNorm(gpu.Reshape(weights, [1, Capacity]),
+                            new Tensor<float>([Capacity], new Vector<float>(Enumerable.Repeat(1f, Capacity).ToArray())), 1e-6, out _), 0f));
                     plan = scope.CompileInference(weights, new[] { x }, Array.Empty<(Tensor<float>, Tensor<float>)>());
                 }
                 using (plan)
