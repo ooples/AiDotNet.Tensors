@@ -253,10 +253,17 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                         .GetField("_forwardSteps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
                     var intermediate = steps.Select(st => st.OutputBuffer)
                         .First(o => !ReferenceEquals(o, lossOutput) && o._gpuBuffer is not null);
-                    var key = intermediate.GetBackingArrayForCacheLookupUnsafe()!;
+                    // A pending download is keyed by the host array, or by the vector for an output whose host memory
+                    // is not allocated yet; retiring consults both keys.
+                    object key = intermediate.GetBackingArrayForCacheLookupUnsafe() is { } hostArray
+                        ? hostArray
+                        : intermediate.DataVector;
                     var released = backend.AllocateBuffer(new float[intermediate.Length]);
-                    AiDotNet.Tensors.Helpers.HostSync.Register(key, arr =>
-                        System.Array.Copy(backend.DownloadBuffer(released), (float[])arr, intermediate.Length));
+                    AiDotNet.Tensors.Helpers.HostSync.Register(key, target =>
+                    {
+                        var data = backend.DownloadBuffer(released);
+                        if (target is float[] host) System.Array.Copy(data, host, intermediate.Length);
+                    });
                     released.Dispose();
                     run.ReleasedIntermediatePending = AiDotNet.Tensors.Helpers.HostSync.IsPending(key);
                 }
