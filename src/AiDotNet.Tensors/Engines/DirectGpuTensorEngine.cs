@@ -753,6 +753,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBuffer = buf;
         t._gpuBackend = cb;
         t._gpuBufferVersion = t.GpuCacheVersion;
+        _allocatedResidentInputs.GetValue(t, static _ => new WeakReference<IGpuBuffer>(null!)).SetTarget(buf);
+    }
+
+    // Track only allocations made for this tensor. A buffer another tensor lent it must never be
+    // overwritten. A weak value lets a replaced buffer retire independently of its former tensor.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, WeakReference<IGpuBuffer>>
+        _allocatedResidentInputs = new();
+
+    internal bool TryRestoreResidentState<T>(Tensor<T> snapshot, Tensor<T> target)
+    {
+        using var operation = EnterGpuOp();
+        if (typeof(T) != typeof(float) || target.IsView || !target.IsContiguous || target.StorageOffset != 0
+            || target.Length == 0 || target.DataVector.Length != target.Length
+            || snapshot.IsView || !snapshot.IsContiguous || snapshot.Length != target.Length || InferenceCaptureActive
+            || !_allocatedResidentInputs.TryGetValue(target, out var binding) || !binding.TryGetTarget(out var buffer)
+            || !ReferenceEquals(target._gpuBuffer, buffer) || !TryGetBackend(out var backend)
+            || !ReferenceEquals(target._gpuBackend, backend) || buffer.SizeInBytes < (long)target.Length * sizeof(float)
+            || backend is IGpuGraphCapture capture && capture.IsStreamCapturing())
+            return false;
+
+        using var saved = snapshot.LeaseArray();
+        target.PrepareForInPlaceWrite();
+        if (!ReferenceEquals(target._gpuBuffer, buffer) || saved.Array.Length != target.Length
+            || target.GetBackingArrayForCacheLookupUnsafe() is not T[] host || host.Length < target.Length)
+            return false;
+        try { backend.UploadBufferInPlace((float[])(object)saved.Array, buffer); }
+        catch (NotSupportedException unavailable)
+        {
+            GpuLaunchProbe.OnFallback(nameof(TryRestoreResidentState), unavailable);
+            return false;
+        }
+        Array.Copy(saved.Array, host, target.Length);
+        target.IncrementVersion();
+        BindResidentBuffer(target, buffer, backend, isDeviceModified: false);
+        base.InvalidatePersistentTensor(target);
+        return true;
     }
 
     /// <summary>Downloads <paramref name="t"/>'s resident GPU buffer (which a replayed graph just wrote) into a
