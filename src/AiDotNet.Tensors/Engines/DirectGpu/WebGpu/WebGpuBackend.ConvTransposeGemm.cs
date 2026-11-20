@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // The transposed-convolution forward as one GEMM per batch chunk and an overlap-add on WebGPU, through
 // PortableConvTransposeGemm and the WGSL restatement of ConvTransposeGemmKernelTemplate (WebGpuConvTransposeGemmKernels),
 // built on first need.
-public sealed partial class WebGpuBackend
+public sealed partial class WebGpuBackend : IConvTranspose2DBiasBackend
 {
     private const string ConvTransposeGemmModulePrefix = "ConvTransposeGemm_";
     private bool? _convTransposeGemmReady;
@@ -58,10 +58,25 @@ public sealed partial class WebGpuBackend
     /// <summary>The transposed forward through one GEMM per batch chunk. False: nothing launched.</summary>
     internal bool TryConvTranspose2DGemm(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output, int batch,
         int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth, int kernelH,
-        int kernelW, int strideH, int strideW, int padH, int padW)
+        int kernelW, int strideH, int strideW, int padH, int padW, IGpuBuffer? bias = null)
         => PortableConvTransposeGemm.Enabled && ConvTransposeGemmReady
            && PortableConvTransposeGemm.TryForward(this, LaunchConvTransposeGemm, input, kernel, output, batch,
                inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW,
-               padH, padW);
+               padH, padW, bias);
+
+    /// <summary>IConvTranspose2DBiasBackend: the bias added in the single-GEMM route's overlap-add; where that route does
+    /// not serve the shape, the conv_transpose2d kernel and the bias kernel.</summary>
+    void IConvTranspose2DBiasBackend.ConvTranspose2DBias(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer bias,
+        IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight,
+        int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int outputPadH,
+        int outputPadW)
+    {
+        if (TryConvTranspose2DGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                outWidth, kernelH, kernelW, strideH, strideW, padH, padW, bias))
+            return;
+        ConvTranspose2D(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+            kernelH, kernelW, strideH, strideW, padH, padW, outputPadH, outputPadW);
+        Conv2DBiasAdd(output, bias, batch, outChannels, outHeight * outWidth);
+    }
 }
 #endif

@@ -54,12 +54,13 @@ internal static class PortableConvTransposeGemm
     }
 
     /// <summary>
-    /// y = the transposed convolution of x by W ([Cin, Cout, kH, kW]); overwrites y. False, nothing launched, when the
-    /// shape is not served (see <see cref="Chunk"/>) or the route is turned off.
+    /// y = the transposed convolution of x by W ([Cin, Cout, kH, kW]), plus <paramref name="bias"/>[c] when given (added
+    /// in the overlap-add); overwrites y. False, nothing launched, when the shape is not served (see
+    /// <see cref="Chunk"/>) or the route is turned off.
     /// </summary>
     internal static bool TryForward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer input, IGpuBuffer kernel,
         IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight,
-        int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+        int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, IGpuBuffer? bias = null)
     {
         if (backend is null) throw new ArgumentNullException(nameof(backend));
         if (launch is null) throw new ArgumentNullException(nameof(launch));
@@ -82,7 +83,8 @@ internal static class PortableConvTransposeGemm
             // Row-major col[P, n] = W[Cin, P]^T xt[Cin, n].
             gemm.MatMulTransposedA(kernel, xt, col, P, n, inChannels);
             int outTotal = nb * outSample;
-            launch(ConvTransposeGemmKernelTemplate.OverlapAdd, (outTotal + G - 1) / G, new[] { col, output },
+            launch(bias is null ? ConvTransposeGemmKernelTemplate.OverlapAdd : ConvTransposeGemmKernelTemplate.OverlapAddBias,
+                (outTotal + G - 1) / G, bias is null ? new[] { col, output } : new[] { col, output, bias },
                 new[] { nb, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
                     inHeight, inWidth, b0 * outSample });
         }

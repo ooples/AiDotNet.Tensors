@@ -41,9 +41,9 @@ internal readonly struct CudaConvVariantArgs
     internal CudaConvVariantArgs(DeclaredConvVariant variant, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output,
         int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
         int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int outputPadH = 0, int outputPadW = 0,
-        int multiplier = 1)
+        int multiplier = 1, IGpuBuffer? bias = null)
     {
-        Variant = variant; A = a; B = b; Output = output;
+        Variant = variant; A = a; B = b; Output = output; Bias = bias;
         Batch = batch; InChannels = inChannels; InHeight = inHeight; InWidth = inWidth;
         OutChannels = outChannels; OutHeight = outHeight; OutWidth = outWidth;
         KernelH = kernelH; KernelW = kernelW; StrideH = strideH; StrideW = strideW; PadH = padH; PadW = padW;
@@ -51,6 +51,9 @@ internal readonly struct CudaConvVariantArgs
     }
 
     internal DeclaredConvVariant Variant { get; }
+
+    /// <summary>A per-output-channel bias added to a transposed forward's result (null: none).</summary>
+    internal IGpuBuffer? Bias { get; }
     internal IGpuBuffer A { get; }
     internal IGpuBuffer B { get; }
     internal IGpuBuffer Output { get; }
@@ -228,6 +231,7 @@ public sealed partial class CudaBackend
                         {
                             // Not yet built under a capture (a persisted decision met first there): the incumbent.
                             if (!TryDeclaredConvVariant(a, sc)) RunConvVariantIncumbent(a);
+                            else AddVariantBias(a);
                         }));
                 }
                 _convVariantSlots[(int)variant] = new TunedKernelSlot<CudaConvVariantArgs>(VariantOp(variant),
@@ -269,6 +273,7 @@ public sealed partial class CudaBackend
                 ConvTranspose2DIncumbent(a.A, a.B, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                     a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
                     a.OutputPadH, a.OutputPadW);
+                AddVariantBias(a);
                 break;
             case DeclaredConvVariant.TransposeBackwardData:
                 ConvTranspose2DBackwardInputIncumbent(a.A, a.B, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
@@ -306,13 +311,17 @@ public sealed partial class CudaBackend
         {
             case DeclaredConvVariant.TransposeForward:
                 // A = transposed input x [B, inC, H, W] (the convolution's output gradient), Output = y.
-                if (TryConvTranspose2DGemm(a.A, a.B, a.Output, null, a.Batch, a.InChannels, a.InHeight, a.InWidth,
+                if (TryConvTranspose2DGemm(a.A, a.B, a.Output, a.Bias, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                         a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH,
                         a.PadW))
+                {
+                    if (a.Bias is not null) System.Threading.Interlocked.Increment(ref ConvTransposeBiasInOverlapAdd);
                     return true;
+                }
                 Conv2DBackwardInput(a.A, a.B, a.Output, a.Batch, a.OutChannels, a.OutHeight, a.OutWidth,
                     a.InChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW,
                     1, 1);
+                AddVariantBias(a);
                 return true;
             case DeclaredConvVariant.TransposeBackwardData:
                 // A = dy [B, outC, outH, outW] (the convolution's input), Output = dx.
@@ -367,6 +376,31 @@ public sealed partial class CudaBackend
             inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
             outputPadH, outputPadW);
         if (!TryConvVariantSlot(args)) RunConvVariantIncumbent(args);
+    }
+
+    /// <summary>
+    /// The transposed forward plus a per-output-channel bias: y[n, c] = convTranspose2d(x, k)[n, c] + bias[c]. The bias is
+    /// added in the overlap-add of the single-GEMM route when that route runs, otherwise by one pass after whichever
+    /// route the slot chose -- the same values as ConvTranspose2D followed by Conv2DBiasAdd.
+    /// </summary>
+    void IConvTranspose2DBiasBackend.ConvTranspose2DBias(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer bias, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int outputPadH, int outputPadW)
+    {
+        var args = new CudaConvVariantArgs(DeclaredConvVariant.TransposeForward, input, kernel, output, batch, inChannels,
+            inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW,
+            outputPadH, outputPadW, bias: bias);
+        if (!TryConvVariantSlot(args)) RunConvVariantIncumbent(args);
+    }
+
+    /// <summary>Transposed forwards whose bias was added inside the overlap-add (tests).</summary>
+    internal static long ConvTransposeBiasInOverlapAdd;
+
+    // A route that wrote the transposed forward without its bias: add it now.
+    private void AddVariantBias(in CudaConvVariantArgs a)
+    {
+        if (a.Variant == DeclaredConvVariant.TransposeForward && a.Bias is { } bias)
+            Conv2DBiasAdd(a.Output, bias, a.Batch, a.OutChannels, a.OutHeight * a.OutWidth);
     }
 
     public void ConvTranspose2DBackwardInput(IGpuBuffer gradOutput, IGpuBuffer kernel, IGpuBuffer gradInput,

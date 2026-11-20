@@ -78,6 +78,70 @@ public sealed partial class CudaBackend
         RunConvEpiloguePasses(a);
     }
 
+    // AIDOTNET_CUDNN_NHWC_EPILOGUE=0 keeps the NCHW output and the epilogue passes (A/B, tests).
+    internal static bool s_cudnnChannelsLastEpilogue =
+        Environment.GetEnvironmentVariable("AIDOTNET_CUDNN_NHWC_EPILOGUE") != "0";
+
+    // The channels-last twin of a cuDNN forward candidate: its epilogue route where it applies, else the NCHW forward
+    // and passes. A separate candidate rather than the plain one's behavior because it is not always faster: where cuDNN
+    // runs a kernel native to NCHW (no layout passes of its own), asking for a channels-last result moves it to another
+    // kernel, which can cost more than the bias pass saved (a 3-channel first layer: implicit_convolve_sgemm). The
+    // slot measures both per shape.
+    private void RunCudnnForwardChannelsLast(in CudaConv2DArgs a, int algorithm)
+    {
+        if (!TryCudnnForwardChannelsLastEpilogue(a, algorithm)) RunCudnnForward(a, algorithm);
+    }
+
+    /// <summary>cuDNN forwards whose bias and activation ran in the layout-changing epilogue (tests).</summary>
+    internal static long CudnnChannelsLastEpilogues;
+
+    private IGpuBuffer? _convNhwcScratch;
+
+    /// <summary>
+    /// A cuDNN forward with a bias or activation: cuDNN writes the result channels-last into a scratch buffer -- its
+    /// tensor-core kernels' native layout, so the NCHW conversion it otherwise runs after them is skipped -- and one
+    /// kernel (conv_epilogue_nhwc_nchw) converts it to NCHW while adding the bias and applying the activation. Three
+    /// passes over the output (cuDNN's conversion, the bias add, the activation) become one, with the same values.
+    /// False -- nothing launched -- without the kernel, when the scratch cannot be sized (during a capture), or when the
+    /// algorithm does not take a channels-last output; the caller then runs the NCHW forward and the passes.
+    /// </summary>
+    private unsafe bool TryCudnnForwardChannelsLastEpilogue(in CudaConv2DArgs a, int algorithm)
+    {
+        if (!s_cudnnChannelsLastEpilogue || (a.Bias is null && a.Activation == FusedActivationType.None)
+            || !CudaConvFuses(a.Activation) || a.PreScale is not null
+            || !_kernelCache.TryGetValue("conv_epilogue_nhwc_nchw", out var epilogue))
+            return false;
+        int spatial = a.OutHeight * a.OutWidth;
+        using var _ = PushContext();
+        EnsureCudnnConv();
+        if (_cudnnConv is not { } conv || _cudnnContext is not { } context) return false;
+        var scratch = TryConvScratch(ref _convNhwcScratch, (long)a.OutputCount);
+        if (scratch is null) return false;
+        lock (context.StreamBindingLock)
+        {
+            context.BindStream(_stream);
+            try
+            {
+                conv.Conv2DForwardGpu(a.Input.Handle, a.Kernel.Handle, scratch.Handle, a.Batch, a.InChannels, a.InHeight,
+                    a.InWidth, a.OutChannels, a.KernelH, a.KernelW, a.OutHeight, a.OutWidth, a.PadH, a.PadW, a.StrideH,
+                    a.StrideW, a.DilationH, a.DilationW, CuDnnNative.CudnnDataType.Float, algorithm, CudnnConvMath,
+                    outputNhwc: true);
+            }
+            catch (NotSupportedException)
+            {
+                return false;   // this algorithm does not write channels-last: nothing was launched
+            }
+        }
+        IntPtr src = scratch.Handle, bias = a.Bias?.Handle ?? IntPtr.Zero, dst = a.Output.Handle;
+        int channels = a.OutChannels, s = spatial;
+        int act = a.Activation == FusedActivationType.ReLU ? 1 : a.Activation == FusedActivationType.ReLU6 ? 2 : 0;
+        void** args = stackalloc void*[6];
+        args[0] = &src; args[1] = &bias; args[2] = &dst; args[3] = &channels; args[4] = &s; args[5] = &act;
+        LaunchKernel3D(epilogue, (uint)((spatial + 31) / 32), (uint)((channels + 31) / 32), (uint)a.Batch, 32, 8, 1, args);
+        System.Threading.Interlocked.Increment(ref CudnnChannelsLastEpilogues);
+        return true;
+    }
+
     private void RunCudnnBackward(in TunedConv2DBackwardArgs a, int algorithm)
     {
         using var _ = PushContext();
@@ -116,12 +180,17 @@ public sealed partial class CudaBackend
                             _ => true, (in CudaConv2DArgs a) => RunCudnnForward(a, -1)),
                     };
                     candidates.AddRange(_conv2DForwardCandidateList ?? Array.Empty<ITunedKernelCandidate<CudaConv2DArgs>>());
+                    candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("cudnn.conv2d.default.nhwc",
+                        TunedKernelOrigin.Vendor, true, _ => true, (in CudaConv2DArgs a) => RunCudnnForwardChannelsLast(a, -1)));
                     for (int algorithm = 0; algorithm < (int)CuDnnNative.CudnnConvolutionFwdAlgo.Count; algorithm++)
                     {
                         int al = algorithm;
                         candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("cudnn.conv2d.algo" + al,
                             TunedKernelOrigin.Vendor, CudnnAlgorithmIsDeterministic(0, al), shape => CudnnAdmits(0, al, shape),
                             (in CudaConv2DArgs a) => RunCudnnForward(a, al)));
+                        candidates.Add(new CudaTunedKernelCandidate<CudaConv2DArgs>("cudnn.conv2d.algo" + al + ".nhwc",
+                            TunedKernelOrigin.Vendor, CudnnAlgorithmIsDeterministic(0, al), shape => CudnnAdmits(0, al, shape),
+                            (in CudaConv2DArgs a) => RunCudnnForwardChannelsLast(a, al)));
                     }
                     _conv2DForwardVendorSlot = new TunedKernelSlot<CudaConv2DArgs>(TunedKernelOp.Conv2DForward,
                         TunedDeviceKey,

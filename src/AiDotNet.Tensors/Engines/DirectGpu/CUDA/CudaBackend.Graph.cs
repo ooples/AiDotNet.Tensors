@@ -444,6 +444,7 @@ public sealed partial class CudaBackend
         try
         {
             _backendStreamCaptureActive = true;
+            System.Threading.Interlocked.Increment(ref _captureGeneration);
             TestHookInsideCapture?.Invoke();
             launch();
         }
@@ -626,6 +627,7 @@ public sealed partial class CudaBackend
         try
         {
             _backendStreamCaptureActive = true;
+            System.Threading.Interlocked.Increment(ref _captureGeneration);
             relaunch();
         }
         catch (Exception ex)

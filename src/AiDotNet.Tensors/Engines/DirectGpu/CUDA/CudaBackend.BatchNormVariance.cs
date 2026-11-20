@@ -60,8 +60,7 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend, IBatchNormL
         if (_batchNormSplitPartials is { } held && held.Size >= floats) return held;
         if (IsStreamCapturing()) return null;
         int size = Math.Max(floats, _batchNormSplitPartials is null ? floats : (int)Math.Min(int.MaxValue, 2L * _batchNormSplitPartials.Size));
-        _batchNormSplitPartials?.Dispose();
-        _batchNormSplitPartials = AllocateBuffer(size);
+        ReplaceScratch(ref _batchNormSplitPartials, size);   // retired, not freed, if a captured graph may hold it
         return _batchNormSplitPartials;
     }
 

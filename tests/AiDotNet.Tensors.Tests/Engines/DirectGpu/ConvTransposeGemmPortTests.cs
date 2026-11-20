@@ -17,7 +17,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <see cref="ConvTransposeGemmKernelTemplate"/>) on each non-CUDA backend against a float64 reference: the DCGAN
 /// generator's stem, middle stage and RGB head, an output padding, odd geometry and a batch past the column cap (chunked),
 /// each within 1e-4 of sum|terms|, every output written, bit-reproducible across two runs. Both the route itself and the
-/// backend's public ConvTranspose2D, which takes it first, are checked. HIP's module is compiled as CUDA C++ under NVRTC
+/// backend's public ConvTranspose2D, which takes it first, are checked, and the bias form (IConvTranspose2DBiasBackend,
+/// the bias added in the overlap-add) must equal the route's output plus the bias bit for bit. HIP's module is compiled as CUDA C++ under NVRTC
 /// (the dialect has nothing HIP-specific), so it is checked on any CUDA box; CUDA's own route is covered by
 /// ConvTranspose GPU-vs-CPU tests.
 /// </summary>
@@ -127,7 +128,7 @@ public sealed class ConvTransposeGemmPortTests
 
     internal delegate bool Route(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output, int batch, int inChannels,
         int inHeight, int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH,
-        int strideW, int padH, int padW);
+        int strideW, int padH, int padW, IGpuBuffer? bias);
 
     private static float[] Rand(int n, Random rng)
     {
@@ -150,13 +151,25 @@ public sealed class ConvTransposeGemmPortTests
         using var y1 = backend.AllocateBuffer(poison);
         using var y2 = backend.AllocateBuffer(poison);
         using var y3 = backend.AllocateBuffer(poison);
+        using var y4 = backend.AllocateBuffer(poison);
+        var biasValues = Rand(outC, new Random(77 + outC));
+        using var bias = backend.AllocateBuffer(biasValues);
         foreach (var y in new[] { y1, y2 })
-            Assert.True(route(x, w, y, batch, inC, inH, inW, outC, outH, outW, k, k, s, s, p, p),
+            Assert.True(route(x, w, y, batch, inC, inH, inW, outC, outH, outW, k, k, s, s, p, p, null),
                 "the transposed-convolution GEMM route refused a served shape");
         // The public entry point takes the route first.
         backend.ConvTranspose2D(x, w, y3, batch, inC, inH, inW, outC, outH, outW, k, k, s, s, p, p, op, op);
+        var fusedBias = Assert.IsAssignableFrom<IConvTranspose2DBiasBackend>(backend);
+        fusedBias.ConvTranspose2DBias(x, w, bias, y4, batch, inC, inH, inW, outC, outH, outW, k, k, s, s, p, p, op, op);
         backend.Synchronize();
         float[] got = backend.DownloadBuffer(y1), again = backend.DownloadBuffer(y2), viaPublic = backend.DownloadBuffer(y3);
+        float[] biased = backend.DownloadBuffer(y4);
+        for (int i = 0; i < biased.Length; i++)
+        {
+            float expected = got[i] + biasValues[i / (outH * outW) % outC];
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected) == TestHelpers.MathCompat.SingleToInt32Bits(biased[i]),
+                $"y[{i}] with the bias: {biased[i]} vs the route's output plus the bias {expected}");
+        }
         double worst = 0;
         for (int i = 0; i < got.Length; i++)
         {

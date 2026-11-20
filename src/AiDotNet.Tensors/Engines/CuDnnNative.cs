@@ -2020,6 +2020,21 @@ public sealed class CuDnnConvolution : IDisposable
         int dilationH = 1, int dilationW = 1,
         CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float,
         int algorithm = -1, CuDnnNative.CudnnMathType mathType = CuDnnNative.CudnnMathType.TensorOp)
+        => Conv2DForwardGpu(inputDevPtr, filterDevPtr, outputDevPtr, n, c, h, w, k, filterH, filterW, outputHeight,
+            outputWidth, padH, padW, strideH, strideW, dilationH, dilationW, dataType, algorithm, mathType, outputNhwc: false);
+
+    /// <summary>As the public overload; with <paramref name="outputNhwc"/> the result is written channels-last.</summary>
+    internal void Conv2DForwardGpu(
+        IntPtr inputDevPtr, IntPtr filterDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h, int w,
+        int k, int filterH, int filterW,
+        int outputHeight, int outputWidth,
+        int padH, int padW,
+        int strideH, int strideW,
+        int dilationH, int dilationW,
+        CuDnnNative.CudnnDataType dataType,
+        int algorithm, CuDnnNative.CudnnMathType mathType,
+        bool outputNhwc)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
 
@@ -2049,7 +2064,12 @@ public sealed class CuDnnConvolution : IDisposable
                 $"cuDNN output shape {cudnnOutN}x{cudnnOutC}x{cudnnOutH}x{cudnnOutW} " +
                 $"disagrees with caller's expected {n}x{k}x{outputHeight}x{outputWidth}.");
 
-        outputDesc.Set4D(dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
+        // outputNhwc: the result is written channels-last ([n, oh, ow, k]), which cuDNN's tensor-core kernels produce
+        // natively: no layout pass after them (the caller's epilogue changes the layout instead).
+        if (outputNhwc)
+            outputDesc.Set4D(CuDnnNative.CudnnTensorFormat.NHWC, dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
+        else
+            outputDesc.Set4D(dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
 
         // Algorithm selection: an explicit algorithm as asked; otherwise cuDNN's own heuristic choice for the shape and
         // math type (what PyTorch runs with cudnn.benchmark off), cached per shape. This is the convolution slots'
@@ -2059,7 +2079,8 @@ public sealed class CuDnnConvolution : IDisposable
         var algo = algorithm >= 0
             ? (CuDnnNative.CudnnConvolutionFwdAlgo)algorithm
             : HeuristicForwardAlgorithm(inputDesc.Handle, filterDesc.Handle, convDesc.Handle, outputDesc.Handle, mathType,
-                (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, (int)dataType, (int)mathType));
+                (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW,
+                    (int)dataType | (outputNhwc ? 1 << 16 : 0), (int)mathType));
         ulong workspaceSize;
         status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
             _context.Handle, inputDesc.Handle, filterDesc.Handle,
