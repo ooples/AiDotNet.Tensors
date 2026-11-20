@@ -5,6 +5,12 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 
 internal sealed partial class CompiledTrainingPlan<T>
 {
+    // The plan's tensor at its concrete element type, for a branch already selected by typeof(T). A direct
+    // conversion between two closed forms of an open generic does not compile; this checks the type once.
+    private static Tensor<TElement> ElementTyped<TElement>(Tensor<T> tensor)
+        => tensor as Tensor<TElement>
+           ?? throw new InvalidCastException($"A Tensor<{typeof(T).Name}> is not a Tensor<{typeof(TElement).Name}>.");
+
     // Resolve tensors after pooling has assigned their storage. The old replay allocated the full derivative,
     // then copied it into this same planned gradient. No public kernel or higher-order derivative changes.
     internal static Action<IEngine>? BuildCpuLeakyReluBackward(CompiledStep<T> step,
@@ -52,13 +58,13 @@ internal sealed partial class CompiledTrainingPlan<T>
                 using var upstreamKeep = new KeepAliveScope(gradOutput);
                 using var destinationKeep = new KeepAliveScope(gradInput);
                 if (typeof(T) == typeof(float))
-                    WriteCpuLeakyReluGradient(((Tensor<float>)(object)input).AsSpanUnmarked(),
-                        ((Tensor<float>)(object)gradOutput).AsSpanUnmarked(),
-                        ((Tensor<float>)(object)gradInput).AsWritableSpanUnmarked(), (float)slope, add);
+                    WriteCpuLeakyReluGradient(ElementTyped<float>(input).AsSpanUnmarked(),
+                        ElementTyped<float>(gradOutput).AsSpanUnmarked(),
+                        ElementTyped<float>(gradInput).AsWritableSpanUnmarked(), (float)slope, add);
                 else
-                    WriteCpuLeakyReluGradient(((Tensor<double>)(object)input).AsSpanUnmarked(),
-                        ((Tensor<double>)(object)gradOutput).AsSpanUnmarked(),
-                        ((Tensor<double>)(object)gradInput).AsWritableSpanUnmarked(), slope, add);
+                    WriteCpuLeakyReluGradient(ElementTyped<double>(input).AsSpanUnmarked(),
+                        ElementTyped<double>(gradOutput).AsSpanUnmarked(),
+                        ElementTyped<double>(gradInput).AsWritableSpanUnmarked(), slope, add);
             }
             input.Grad = gradInput;
         };

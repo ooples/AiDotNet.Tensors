@@ -14,6 +14,8 @@ internal sealed class ConvGemmPacking<T> : IDisposable where T : unmanaged
     private readonly int _rows, _reduction;
     private readonly ArrayPool<T> _pool;
     private readonly WorkerSlot[] _slots;
+    // Guards the one-time packing; a private object, so no caller can contend on this instance.
+    private readonly object _packGate = new();
     private T[]? _packed;
     private int _mr;
 
@@ -50,7 +52,7 @@ internal sealed class ConvGemmPacking<T> : IDisposable where T : unmanaged
         if (elements * sizeof(T) > 2 * 1024 * 1024) return null;
         var existing = Volatile.Read(ref _packed);
         if (existing is not null) return _mr == mr ? existing : null;
-        lock (this)
+        lock (_packGate)
         {
             if (_packed is not null) return _mr == mr ? _packed : null;
             var buffer = _pool.Rent((int)elements);

@@ -43,11 +43,11 @@ internal sealed partial class CompiledTrainingPlan<T>
             using var upstreamKeep = new KeepAliveScope(upstream);
             using var matrixGradientKeep = new KeepAliveScope(matrixGradient);
             using var scalarGradientKeep = new KeepAliveScope(scalarGradient);
-            var values = ((Tensor<float>)(object)matrix).AsSpanUnmarked();
-            var seeds = ((Tensor<float>)(object)upstream).AsSpanUnmarked();
-            float scale = ((Tensor<float>)(object)scalar).AsSpanUnmarked()[0];
-            var destination = ((Tensor<float>)(object)matrixGradient).AsWritableSpanUnmarked();
-            var scalarDestination = ((Tensor<float>)(object)scalarGradient).AsWritableSpanUnmarked();
+            var values = ElementTyped<float>(matrix).AsSpanUnmarked();
+            var seeds = ElementTyped<float>(upstream).AsSpanUnmarked();
+            float scale = ElementTyped<float>(scalar).AsSpanUnmarked()[0];
+            var destination = ElementTyped<float>(matrixGradient).AsWritableSpanUnmarked();
+            var scalarDestination = ElementTyped<float>(scalarGradient).AsWritableSpanUnmarked();
             // Finish all reads needed by the scalar derivative before an aliased destination
             // is written. Upstream's exact alias is elementwise safe; partial overlap is not.
             float sum = 0f;
@@ -103,15 +103,15 @@ internal sealed partial class CompiledTrainingPlan<T>
             bool add = AccumulatesInto(destination, shared);
             if (typeof(T) == typeof(float))
             {
-                float value = ((Tensor<float>)(object)upstream).AsSpanUnmarked()[0] * floatScale;
-                var target = ((Tensor<float>)(object)destination).AsWritableSpanUnmarked();
+                float value = ElementTyped<float>(upstream).AsSpanUnmarked()[0] * floatScale;
+                var target = ElementTyped<float>(destination).AsWritableSpanUnmarked();
                 if (!add) target.Fill(value);
                 else for (int i = 0; i < target.Length; i++) target[i] += value;
             }
             else
             {
-                double value = ((Tensor<double>)(object)upstream).AsSpanUnmarked()[0] * doubleScale;
-                var target = ((Tensor<double>)(object)destination).AsWritableSpanUnmarked();
+                double value = ElementTyped<double>(upstream).AsSpanUnmarked()[0] * doubleScale;
+                var target = ElementTyped<double>(destination).AsWritableSpanUnmarked();
                 if (!add) target.Fill(value);
                 else for (int i = 0; i < target.Length; i++) target[i] += value;
             }
