@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -87,6 +87,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         y.IncrementVersion();
     }
 
+    // The same batch FeedInput / FeedTarget write, produced on the device (x * 1 is exact) and copied into the plan's
+    // input on the device, as a batch a model assembles on the GPU (a GAN's [real; fake] concatenation) arrives.
+    private static void FeedOnDevice(DirectGpuTensorEngine gpu, Tensor<float> destination, int seed)
+    {
+        var onDevice = gpu.TensorMultiplyScalar(Rand(destination.Shape.ToArray(), seed, 1f), 1f);
+        Assert.True(onDevice.IsGpuResident, "the device-produced batch is not GPU-resident");
+        ((IEngine)gpu).TensorCopy(onDevice, destination);
+    }
+
     private sealed class Run
     {
         public double[] Losses = Array.Empty<double>();
@@ -109,13 +118,14 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public int MixedMaskReplays;   // replays whose copy mask held some inputs but not all
         public long InputCopiesSkipped;   // replays' skipped input copies (unchanged inputs)
         public long ResidentCopiesSkipped;   // ... of device-resident inputs, on an unchanged version alone
+        public long DeviceWrittenSkipped;   // ... of inputs a device copy had already written into the graph's buffer
         public bool ClobberedLossGradient;
         public bool CapturedUpdateBeforeOutsideStep;   // the update ran in the step graph when the outside step came
         public bool ParityGraphsBeforeOutsideStep;   // ... and two parity graphs alternated
         public bool ReleasedIntermediatePending;   // a forward intermediate held a download from a released buffer at retirement   // the loss gradient's device buffer was zeroed between replays
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool releasedIntermediateDownload = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false, int outsideAt = -1)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool releasedIntermediateDownload = false, bool droppedTargetBinding = false, int nonFiniteStep = -1, double maxGradNorm = 0, int clipOffFromStep = int.MaxValue, LrSchedule? schedule = null, OptimizerType optimizer = OptimizerType.Adam, int clipOnFromStep = int.MaxValue, bool pingPong = true, int feedEvery = 1, int feedTargetEvery = 0, bool poisonSkippedStaging = false, bool clobberLossGradient = false, bool residentInputs = false, int outsideAt = -1, bool deviceFeedOddSteps = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -178,8 +188,18 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             int targetEvery = feedTargetEvery > 0 ? feedTargetEvery : feedEvery;
             for (int s = 0; s < Steps; s++)
             {
-                if (s % feedEvery == 0) FeedInput(x, s);
-                if (s % targetEvery == 0) FeedTarget(y, s);
+                if (deviceFeedOddSteps && s % 2 == 1)
+                {
+                    // Odd steps copy the batch in on the device, even steps write it through the host: the replay must
+                    // skip staging a device-written input and stage the next host-written one again.
+                    FeedOnDevice(gpu, x, 100 + s);
+                    FeedOnDevice(gpu, y, 200 + s);
+                }
+                else
+                {
+                    if (s % feedEvery == 0) FeedInput(x, s);
+                    if (s % targetEvery == 0) FeedTarget(y, s);
+                }
                 if (s == clipOffFromStep) plan.SetMaxGradNorm(0);
                 if (s == clipOnFromStep)
                 {
@@ -230,7 +250,11 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 }
                 // Reference loss from the exact host batch and pre-step weights: a mismatch message then says whether the
                 // plan computed a wrong loss or reported one it never downloaded.
-                double reference = CpuLoss(x, y, parameters, composedMse);
+                // A device-fed step reads the same batch from its seeds: reading x and y would download the batch the
+                // replay is meant to use in place.
+                double reference = deviceFeedOddSteps && s % 2 == 1
+                    ? CpuLoss(Rand(x.Shape.ToArray(), 100 + s, 1f), Rand(y.Shape.ToArray(), 200 + s, 1f), parameters, composedMse)
+                    : CpuLoss(x, y, parameters, composedMse);
                 if (s == outsideAt)
                 {
                     run.CapturedUpdateBeforeOutsideStep = typeof(CompiledTrainingPlan<float>)
@@ -296,6 +320,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             run.ReplayedParityGraphs = concrete.ReplaysParityGraphs;
             run.InputCopiesSkipped = concrete.StepIoInputCopiesSkipped;
             run.ResidentCopiesSkipped = concrete.StepIoResidentCopiesSkipped;
+            run.DeviceWrittenSkipped = concrete.StepIoDeviceWrittenInputsSkipped;
             plan.Dispose();
             run.WeightsAfterDispose = parameters.Select(p => p.ToArray()).ToArray();
             return run;
@@ -1293,6 +1318,41 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 Assert.True(captured.ResidentCopiesSkipped > 0, "no resident input was skipped on its version alone");
             else
                 Assert.Equal(0L, captured.ResidentCopiesSkipped);
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A batch copied into the plan's input on the device (TensorCopy of a device-resident tensor, as a GAN feeds its
+    /// discriminator the [real; fake] batch it concatenates on the GPU) is already in the graph's buffer: the replay must
+    /// not lease the input's host array, which downloaded the batch only to stage it straight back, and must stage the
+    /// next host-written batch again. Alternating the two feeds, a captured plan must train exactly like the eager one.
+    /// </summary>
+    [SkippableFact]
+    public void A_device_copied_batch_replays_without_a_host_round_trip()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false, deviceFeedOddSteps: true);
+            var captured = Train(gpu, capture: true, deviceFeedOddSteps: true, poisonSkippedStaging: true);
+            _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+            Assert.True(captured.DeviceWrittenSkipped > 0, "no replay used a device-copied batch in place");
+            Assert.True(captured.PoisonedSkippedCopies > 0, "no replay with a clear mask bit had its staging poisoned");
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");

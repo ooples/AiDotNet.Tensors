@@ -1087,6 +1087,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>Of those, the device-resident inputs skipped on an unchanged storage version alone (tests).</summary>
     internal long StepIoResidentCopiesSkipped { get; private set; }
+
+    /// <summary>Of those, the inputs a device copy had already written into the graph's buffer (tests).</summary>
+    internal long StepIoDeviceWrittenInputsSkipped { get; private set; }
     private bool _stepIoLossCaptured;   // the epilogue publishes the loss
     // The loss-gradient reseed (seed -> destination) the graph being captured makes in its step I/O prologue instead of
     // a copy node: the buffers handed to IGraphStepIo.TrySetPrologueCopy, or null.
@@ -1222,6 +1225,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var copiedVersion = _stepIoCopiedVersion!;
         int slot = (int)(replay & 1);
         uint copyMask = 0;
+        var de = _engine.As<Engines.DirectGpuTensorEngine>();
         for (int i = 0; i < leaves.Length; i++)
         {
             var leaf = leaves[i];
@@ -1233,6 +1237,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 copiedSlot[i] = -1;
                 StepIoInputCopiesSkipped++;
+                continue;
+            }
+            if (de is not null && de.ResidentInputHoldsDeviceWrite(leaf))
+            {
+                // A device copy into the graph's own buffer (TensorCopy of a device-resident batch) already holds this
+                // input, and the host copy is a pending download of it: leasing that array downloaded the batch and
+                // staged it straight back, a round trip of every input per step. The buffer no longer mirrors either
+                // staging slot, so the next host-written value is staged again.
+                StepIoInputCopiesSkipped++;
+                StepIoDeviceWrittenInputsSkipped++;
+                copiedSlot[i] = -1;
+                copiedVersion[i] = version;
+                leaf._gpuBufferVersion = version;
                 continue;
             }
             if (leaf.IsGpuResident && copiedSlot[i] >= 0 && copiedVersion[i] == version)
