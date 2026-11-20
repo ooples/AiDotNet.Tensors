@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Reflection;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
@@ -50,5 +51,32 @@ public class CudaScratchRetirementTests
         replace.Invoke(backend, args);
         Assert.Equal(1, backend.RetiredScratchCount);
         ((IGpuBuffer)args[0]!).Dispose();
+    }
+
+    [SkippableFact]
+    public void An_outgrown_cudnn_workspace_is_freed_unless_a_capture_began_since_it_was_allocated()
+    {
+        // The workspace grows mostly while the autotuner times candidates, before any step is captured: retiring every
+        // outgrown size kept 102 MiB of a DCGAN step's 211 MiB of workspaces allocated for nothing.
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
+        Skip.IfNot(CuDnnConvolution.IsAvailable, "cuDNN is unavailable.");
+        using var conv = new CuDnnConvolution();
+        var ensure = typeof(CuDnnConvolution).GetMethod("EnsureWorkspaceUnlocked", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var retired = (System.Collections.ICollection)typeof(CuDnnConvolution)
+            .GetField("_retiredWorkspaces", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(conv)!;
+        var epoch = typeof(CudaBackend).GetField("s_captureEpoch", BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        ensure.Invoke(conv, new object[] { 1UL << 20, false });
+        ensure.Invoke(conv, new object[] { 4UL << 20, false });
+        Assert.Equal(0, retired.Count);      // no capture since the 1 MiB workspace was allocated: freed
+
+        // A capture began (it may have recorded a convolution with the 4 MiB workspace): growing retires it.
+        epoch.SetValue(null, (long)epoch.GetValue(null)! + 1);
+        ensure.Invoke(conv, new object[] { 16UL << 20, false });
+        Assert.Equal(1, retired.Count);
+
+        // The 16 MiB workspace was allocated after that capture began: growing it frees it.
+        ensure.Invoke(conv, new object[] { 64UL << 20, false });
+        Assert.Equal(1, retired.Count);
     }
 }

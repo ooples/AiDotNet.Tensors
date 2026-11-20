@@ -445,6 +445,7 @@ public sealed partial class CudaBackend
         {
             _backendStreamCaptureActive = true;
             System.Threading.Interlocked.Increment(ref _captureGeneration);
+            System.Threading.Interlocked.Increment(ref s_captureEpoch);
             TestHookInsideCapture?.Invoke();
             launch();
         }
@@ -461,6 +462,10 @@ public sealed partial class CudaBackend
         finally
         {
             _backendStreamCaptureActive = false;
+            // Bumped again as the capture ends, so a buffer allocated inside it (a workspace or scratch grown while the
+            // captured work ran) is older than the current value and so is retired, never freed, when replaced.
+            System.Threading.Interlocked.Increment(ref _captureGeneration);
+            System.Threading.Interlocked.Increment(ref s_captureEpoch);
         }
 
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
@@ -628,6 +633,7 @@ public sealed partial class CudaBackend
         {
             _backendStreamCaptureActive = true;
             System.Threading.Interlocked.Increment(ref _captureGeneration);
+            System.Threading.Interlocked.Increment(ref s_captureEpoch);
             relaunch();
         }
         catch (Exception ex)
@@ -643,6 +649,10 @@ public sealed partial class CudaBackend
         finally
         {
             _backendStreamCaptureActive = false;
+            // Bumped again as the capture ends, so a buffer allocated inside it (a workspace or scratch grown while the
+            // captured work ran) is older than the current value and so is retired, never freed, when replaced.
+            System.Threading.Interlocked.Increment(ref _captureGeneration);
+            System.Threading.Interlocked.Increment(ref s_captureEpoch);
         }
 
         var endRc = CudaNativeBindings.cuStreamEndCapture(_stream, out var newGraph);

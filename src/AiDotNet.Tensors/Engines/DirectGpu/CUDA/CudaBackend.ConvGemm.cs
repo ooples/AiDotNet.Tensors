@@ -37,6 +37,13 @@ public sealed partial class CudaBackend
     // be baked into a captured graph.
     private long _captureGeneration;
 
+    // Stream captures begun in this process, on any backend: a device buffer allocated after the last one began cannot be
+    // baked into any captured graph yet, so it may be freed when it is replaced (the cuDNN workspace).
+    private static long s_captureEpoch;
+
+    /// <summary>The number of stream captures begun in this process.</summary>
+    internal static long CaptureEpoch => System.Threading.Interlocked.Read(ref s_captureEpoch);
+
     // Scratch buffers a captured graph may still replay into: kept until the backend is disposed instead of returned to
     // the pool, where another tensor could take the memory the graph writes. Shapes are fixed per plan, but one plan's
     // eager warm-up can grow a scratch after another plan captured it (a GAN's two networks, each its own plan).

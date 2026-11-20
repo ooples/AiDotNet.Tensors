@@ -258,6 +258,34 @@ public sealed class TensorScopeTests
     }
 
     // A result built over a buffer it owns (Tensor.FromGpuBuffer, as the fused attention and FFT paths make them).
+    [SkippableTheory]
+    [InlineData(256)]
+    [InlineData(1 << 20)]
+    public void ACopyIntoATensorCreatedInTheScope_IsFreedUnlessKept(int length)
+    {
+        // A snapshot taken with new Tensor<T>(shape) + TensorCopy inside the scope gets a device buffer that is neither an
+        // owned op result nor an activation-cache entry; the scope must free it like any result (only the garbage
+        // collector did, so a GAN's per-step snapshots piled up between collections), and a kept copy must survive.
+        using var gpu = TryEngine(out string noGpu);
+        Skip.If(gpu is null, noGpu);
+        var source = Resident(gpu, length, 3f);
+        Tensor<float> dead, kept;
+        using (var scope = TensorScope.Begin())
+        {
+            dead = new Tensor<float>(new[] { length });
+            ((IEngine)gpu).TensorCopy(source, dead);
+            kept = new Tensor<float>(new[] { length });
+            ((IEngine)gpu).TensorCopy(source, kept);
+            scope.Keep(kept);
+        }
+
+        Assert.Equal(3f, kept.ToArray()[0]);
+        Assert.Equal(3f + length - 1, kept.ToArray()[length - 1]);
+        var ex = Assert.Throws<InvalidOperationException>(() => dead.ToArray());
+        Assert.Contains("TensorScope", ex.Message);
+        Assert.Equal(3f, source.ToArray()[0]);   // the source predates the scope
+    }
+
     [SkippableFact]
     public void OwnedBufferResults_AreFreedToo()
     {
