@@ -107,7 +107,7 @@ def main():
         for device in args.devices:
             cmd = ["dotnet", str(dll), "--verify-step1", str(ref), "--models", models, "--device", device]
             log = dest / f"verify-{device}.log"
-            if run_logged(cmd, project, env, log):
+            if run_logged(cmd, project, dict(env, AIDOTNET_DIRECTGPU_BACKENDS="cuda") if device == "cuda" else env, log):
                 sys.exit(f"Step-1 check failed for {device}. See {dest}")
             verdicts = log.read_bytes().decode("utf-8", errors="replace").splitlines()
             if not all(any(line.startswith(f"[step1] {model}: PASS ") for line in verdicts) for model in models.split(",")):
@@ -125,7 +125,11 @@ def main():
                     tag = f"{side}-{launch}-{device}-{model}"
                     command = cmd + ["--models", model, "--device", device, *common, "--output", str(dest / (tag + ".json"))]
                     started = datetime.now(timezone.utc).isoformat()
-                    code = run_logged(command, cwd, env, dest / (tag + ".log"))
+                    # A CUDA run of AiDotNet may use no other GPU backend: the harness reports every direct-GPU engine
+                    # as cuda, so an inherited backend order (opencl first) would be compared as CUDA. With cuda as the
+                    # only candidate, a CUDA failure leaves no GPU engine and the process fails instead.
+                    run_env = dict(env, AIDOTNET_DIRECTGPU_BACKENDS="cuda") if side == "aidotnet" and device == "cuda" else env
+                    code = run_logged(command, cwd, run_env, dest / (tag + ".log"))
                     write_json(dest / (tag + ".receipt.json"), dict(command=command, startedUtc=started,
                                finishedUtc=datetime.now(timezone.utc).isoformat(), exitCode=code))
                     if code:

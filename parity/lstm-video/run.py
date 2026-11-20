@@ -1,6 +1,7 @@
 """Run the two CUDA trainers from the 17-second LSTM video."""
 import argparse
 import hashlib
+import html
 import json
 import math
 import os
@@ -90,6 +91,15 @@ def main():
     pair.mkdir(parents=True)
     for name in HASHES["original_files"]:
         shutil.copyfile(ORIGINAL / name, pair / name)
+    # The original recorder captions the clip with the GPU it was recorded on. The files under original/ stay
+    # byte-identical, so only this take's staged copy is captioned with the GPU measured here.
+    recorder = pair / "record_pair.py"
+    caption = b"LIVE LSTM TRAINING  /  GTX 1660 Ti"
+    source = recorder.read_bytes()
+    if source.count(caption) != 1:
+        sys.exit("The original recorder's GPU caption was not found; refusing to record with a wrong GPU name.")
+    gpu_name = torch.cuda.get_device_name(0).replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
+    recorder.write_bytes(source.replace(caption, ("LIVE LSTM TRAINING  /  " + html.escape(gpu_name)).encode("utf-8")))
     project = pair / "Pair.csproj"
     xml = ET.parse(project)
     dashboard = tree / "AiDotNet/src/AiDotNet.Dashboard/AiDotNet.Dashboard.csproj"
