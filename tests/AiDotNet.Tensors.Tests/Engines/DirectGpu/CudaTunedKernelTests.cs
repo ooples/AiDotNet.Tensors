@@ -285,6 +285,50 @@ public sealed class CudaTunedKernelTests
     }
 
     [SkippableFact]
+    public void Gate_ReusesEachCandidatesTimingGraph_AndDropsThemWhenItEnds()
+    {
+        using var backend = RequireBackend();
+        backend.DeclaredKernelsSwitch = false;
+        TunedKernelMode? previousMode = TunedKernelPolicy.ModeOverride;
+        bool previousPersist = TunedKernelPolicy.PersistDecisions;
+        bool previousIgnore = TunedKernelPolicy.IgnoreProfiles;
+        double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
+        TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
+        TunedKernelPolicy.PersistDecisions = false;
+        TunedKernelPolicy.IgnoreProfiles = true;
+        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        try
+        {
+            const int rows = 4096, n = 64;
+            float[] x = Values(rows * n, 7, 5f);
+            using var input = backend.AllocateBuffer(x);
+            using var output = backend.AllocateBuffer(x.Length);
+            backend.SoftmaxSlot.InvalidateDecisions();
+            long captured = backend.TuneGraphsCaptured, reused = backend.TuneGraphsReused;
+            backend.Softmax(input, output, rows, n);
+            backend.Synchronize();
+            var decision = Assert.Single(backend.SoftmaxSlot.CachedDecisions);
+            Skip.If(decision.Reason is not (TunedKernelDecisionReason.Tuned or TunedKernelDecisionReason.ReferenceWon
+                or TunedKernelDecisionReason.Inconclusive), $"the gate did not time candidates ({decision.Reason})");
+
+            long newCaptures = backend.TuneGraphsCaptured - captured, newReuses = backend.TuneGraphsReused - reused;
+            // About twenty timing samples per candidate on the same arguments: captured once per repetition count,
+            // replayed for the rest. Capturing every sample cost a gate 150-650 ms of host and driver time.
+            Assert.True(newCaptures > 0, "the gate timed in captured graphs");
+            Assert.True(newReuses > 4 * newCaptures, $"{newReuses} reuses for {newCaptures} captures");
+            Assert.Equal(0, backend.SessionTuneGraphCount);
+        }
+        finally
+        {
+            TunedKernelPolicy.ModeOverride = previousMode;
+            TunedKernelPolicy.PersistDecisions = previousPersist;
+            TunedKernelPolicy.IgnoreProfiles = previousIgnore;
+            TunedKernelPolicy.BudgetMilliseconds = previousBudget;
+            backend.SoftmaxSlot.InvalidateDecisions();
+        }
+    }
+
+    [SkippableFact]
     public void PublicSoftmax_ThroughTheRegistry_MatchesTheReferenceAndCachesADecision()
     {
         using var backend = RequireBackend();

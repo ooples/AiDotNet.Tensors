@@ -21,6 +21,13 @@ public class GpuFusedConvReLU6Tests
         return t;
     }
 
+    private static Tensor<float> Abs(Tensor<float> t)
+    {
+        var r = new Tensor<float>(t.Shape.ToArray());
+        for (int i = 0; i < t.Length; i++) r[i] = Math.Abs(t[i]);
+        return r;
+    }
+
     [SkippableFact]
     public void FusedConv2D_WithReLU6_MatchesTheCpu()
     {

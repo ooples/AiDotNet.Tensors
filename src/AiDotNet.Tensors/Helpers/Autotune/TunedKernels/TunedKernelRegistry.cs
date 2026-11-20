@@ -496,9 +496,16 @@ public static class TunedKernelRegistry
 
     internal static void EndMeasurement()
     {
-        t_measuring--;
+        if (--t_measuring == 0) MeasurementSessionEnded?.Invoke();
         NoteMeasurement();
     }
+
+    /// <summary>
+    /// Raised on the measuring thread when its outermost measurement session ends, before anything can release the
+    /// session's candidate workspaces: a backend that kept per-session state (captured timing graphs reading those
+    /// workspaces) drops it here.
+    /// </summary>
+    internal static event Action? MeasurementSessionEnded;
 
     internal static void Record(TunedKernelDecision decision)
     {
