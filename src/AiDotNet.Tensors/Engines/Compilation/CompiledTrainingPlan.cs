@@ -15843,10 +15843,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // needs no reduction ([64] against a [1, 64] output: the padded axis has size 1 on both sides) holds the
             // same elements under a different shape, and TensorAddInto refuses mismatched shapes, so an accumulating
             // inputB threw every step and the whole plan fell back to the eager tape (DeepFactor, found by the model
-            // census). View the output gradient in inputB's shape once, here; a contiguous Reshape is O(1).
-            var gradOutForB = reduceAxesArr.Length == 0 && !System.Linq.Enumerable.SequenceEqual(gradOut._shape, inputBShape)
-                ? gradOut.Reshape(inputBShape)
-                : gradOut;
+            // census). The two hold the same elements in the same order, so that case adds element for element over the
+            // spans. A reshaped view of the output gradient taken here, at compile time, went stale once the plan
+            // rebound the gradient's storage: the accumulation then added the view's old storage and inputB lost the
+            // contribution of this add.
+            bool reshapedForB = reduceAxesArr.Length == 0 && !System.Linq.Enumerable.SequenceEqual(gradOut._shape, inputBShape);
 
             // Detect the NCHW→[1,C,1,1] bias-add pattern: reduce axes are
             // exactly {0, 2, 3} (batch + both spatial dims) AND output is
@@ -15899,8 +15900,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // gradInputB: reduce-sum gradOut over the broadcast axes.
                 if (reduceAxesArr.Length == 0)
                 {
-                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, gradOutForB);
-                    else gradOutForB.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    if (!accumB) gradOut.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    else if (!reshapedForB) eng.TensorAddInto(gradInputB, gradInputB, gradOut);
+                    else
+                    {
+                        var destination = gradInputB.AsWritableSpan();
+                        MathHelper.GetNumericOperations<T>().Add(destination, gradOut.AsSpan(), destination);
+                    }
                 }
                 else if (isNchwChannelReduce)
                 {
