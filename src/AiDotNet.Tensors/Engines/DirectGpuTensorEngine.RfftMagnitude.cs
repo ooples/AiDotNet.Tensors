@@ -12,10 +12,15 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRfftMagnitude<T>(Tensor<T> input, double epsilon = 1e-9)
     {
-        var (rows, _, bins) = ValidateRfftMagnitude(input, null, epsilon);
+        var (rows, n, bins) = ValidateRfftMagnitude(input, null, epsilon);
         if (GraphMode.IsActive) return base.TensorRfftMagnitude(input, epsilon);
         using var operation = EnterGpuOp();
         var backend = RequireRfftBackend<T>();
+        if (rows != 0 && !HasDeviceRfft(backend, rows, n))
+        {
+            ReportHostRfft(n);
+            return base.TensorRfftMagnitude(input, epsilon);
+        }
         int[] shape = (int[])input._shape.Clone();
         shape[shape.Length - 1] = bins;
         var output = rows == 0 ? TensorAllocator.RentUninitialized<T>(shape) : CreateResidentOutput<T>(backend, shape);
@@ -31,6 +36,12 @@ public partial class DirectGpuTensorEngine
         var (rows, n, _) = ValidateRfftMagnitude(input, output, epsilon);
         using var operation = EnterGpuOp();
         var backend = RequireRfftBackend<T>();
+        if (rows != 0 && !HasDeviceRfft(backend, rows, n))
+        {
+            ReportHostRfft(n);
+            base.TensorRfftMagnitudeInto(output, input, epsilon);
+            return;
+        }
         RequireRfftDestination(output);
         if (rows == 0) return;
         using var source = GetRfftInputBuffer(backend, input);
@@ -52,6 +63,12 @@ public partial class DirectGpuTensorEngine
         var (rows, n, _) = ValidateRfftMagnitudeBackward(gradOutput, input, gradInput, epsilon);
         using var operation = EnterGpuOp();
         var backend = RequireRfftBackend<T>();
+        if (rows != 0 && !HasDeviceRfft(backend, rows, n))
+        {
+            ReportHostRfft(n);
+            base.TensorRfftMagnitudeBackwardInto(gradOutput, input, gradInput, epsilon, accumulate);
+            return;
+        }
         RequireRfftDestination(gradInput);
         if (rows == 0) return;
         using var source = GetRfftInputBuffer(backend, input);
@@ -144,6 +161,14 @@ public partial class DirectGpuTensorEngine
         }
         catch { spectrum.Dispose(); throw; }
     }
+
+    // The device serves a length through the vendor plan (any length) or the portable radix-2 transform (powers of two).
+    // Any other length runs on the host engine, which takes every length: a real FFT of 129 samples is a valid call.
+    private static bool HasDeviceRfft(IDirectGpuBackend backend, int rows, int n)
+        => (n & (n - 1)) == 0 || ((IRfftMagnitudeKernels)backend).GetOptimizedRealFftPlan(n, rows, inverse: false) is not null;
+
+    private static void ReportHostRfft(int n)
+        => GpuLaunchProbe.OnFallback($"TensorRfftMagnitude: length {n} is not a power of two and the backend has no vendor FFT plan", null);
 
     private static void PortableRfftTransform(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int rows, int n, bool inverse)
     {
