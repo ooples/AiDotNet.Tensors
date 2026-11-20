@@ -252,6 +252,79 @@ public sealed class CompiledStatefulInferenceTests
         }
     }
 
+    // A replayed graph re-reads its input buffers: an input whose host data is unchanged is not uploaded again, and
+    // every change - a new tensor through SetInputs, or the caller writing the compiled slot itself - is uploaded.
+    [SkippableFact]
+    public void A_replay_skips_unchanged_inputs_and_uploads_every_change()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = true;
+            try
+            {
+                const int W = 8;
+                var x = new Tensor<float>([1, W]);
+                var w = new Tensor<float>([1, W]);
+                for (int j = 0; j < W; j++) w[0, j] = j + 1f;
+                var counter = new Tensor<float>([1, 1]);
+                CompiledInferencePlan<float> plan;
+                using (new EngineScope(gpu))
+                using (var scope = GraphMode.EnableInference())
+                {
+                    var y = gpu.TensorAdd(gpu.TensorMultiply(x, w), counter);
+                    var next = gpu.TensorAddScalar(counter, 1f);
+                    plan = scope.CompileInference(y, new[] { x }, new[] { (counter, next) });
+                }
+                using (plan)
+                {
+                    float[] A = Enumerable.Range(0, W).Select(j => j * 0.5f).ToArray();
+                    float[] B = Enumerable.Range(0, W).Select(j => -j - 1f).ToArray();
+                    float[] Negz = Enumerable.Range(0, W).Select(j => j == 0 ? -0f : j * 0.5f).ToArray();
+                    // (input, fed through the compiled slot itself instead of a new tensor)
+                    var feeds = new (float[] Data, bool InPlace)[]
+                    {
+                        (A, false), (A, false), (A, false), (B, false), (B, false), (A, true), (A, true), (B, true),
+                        (Negz, false), (A, false), (B, false), (B, false),
+                    };
+                    long skippedBefore = 0;
+                    int expectedSkips = 0;
+                    float[]? previous = null;
+                    for (int t = 0; t < feeds.Length; t++)
+                    {
+                        var (data, inPlace) = feeds[t];
+                        if (inPlace)
+                        {
+                            for (int j = 0; j < W; j++) x[0, j] = data[j];
+                            plan.SetInputs(new[] { x });
+                        }
+                        else plan.SetInputs(new[] { new Tensor<float>([1, W], new Vector<float>((float[])data.Clone())) });
+                        if (t == 2) skippedBefore = plan.InputUploadsSkipped;   // the graph is replaying from here on
+                        else if (t > 2 && previous is not null
+                                 && data.Select(BitConverter.SingleToInt32Bits).SequenceEqual(previous.Select(BitConverter.SingleToInt32Bits)))
+                            expectedSkips++;
+                        var got = plan.Execute().ToArray();
+                        for (int j = 0; j < W; j++)
+                        {
+                            float expect = data[j] * (j + 1f) + t;
+                            Assert.True(got[j] == expect, $"step {t} col {j}: {got[j]} vs {expect}");
+                        }
+                        previous = data;
+                    }
+                    var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                    Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
+                    Assert.Equal(expectedSkips, plan.InputUploadsSkipped - skippedBefore);
+                }
+            }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+        }
+    }
+
     // Two stacked recurrent layers (batched like a multi-head scan, with a per-row decay): the second layer's
     // intermediates have the first's shapes, and its input is a unary chain the first layer's output also feeds.
     private static (Tensor<float> Output, Tensor<float> Next1, Tensor<float> Next2) TwoLayers(IEngine e,

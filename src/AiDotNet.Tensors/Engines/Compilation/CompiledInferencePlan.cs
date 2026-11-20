@@ -41,6 +41,16 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // The device buffers a capture recorded the states at (the replays write there).
     private Engines.DirectGpu.IGpuBuffer[] _capturedStateBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
     private int[] _capturedStateVersions = Array.Empty<int>();
+    // The host data each captured-graph input buffer last received (bitwise), the buffer it went to and the input's
+    // cache version then: a replay whose input still matches all three skips the upload (a decode step re-feeding
+    // the same id, a constant flag input).
+    private float[]?[] _uploadedInputs = Array.Empty<float[]?>();
+    private IntPtr[] _uploadedInputHandles = Array.Empty<IntPtr>();
+    private int[] _uploadedInputVersions = Array.Empty<int>();
+    private long _inputUploadsSkipped;
+
+    /// <summary>Captured-graph input uploads skipped because the input was unchanged (for tests).</summary>
+    internal long InputUploadsSkipped => Interlocked.Read(ref _inputUploadsSkipped);
     // The stable buffers the pre-residency pass and the capture draw each step's outputs and temporaries from, keyed by
     // step (see Engines.StepScratchPool): a capture may not allocate, so an op needing scratch (a two-sided broadcast,
     // say) otherwise declined to the CPU engine and abandoned the capture. Lives as long as the captured graph.
@@ -1175,8 +1185,29 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 throw new InvalidOperationException(
                     $"Captured-graph input {i} resident buffer (size {buf.Size}) is smaller than its host data " +
                     $"({data.Length}); cannot refresh in place.");
-            cb.UploadBufferInPlace((float[])(object)data, buf);
-            inT._gpuBufferVersion = inT.GpuCacheVersion;
+            var host = (float[])(object)data;
+            if (_uploadedInputs.Length != inputs.Length)
+            {
+                _uploadedInputs = new float[]?[inputs.Length];
+                _uploadedInputHandles = new IntPtr[inputs.Length];
+                _uploadedInputVersions = new int[inputs.Length];
+            }
+            int version = inT.GpuCacheVersion;
+            // Bitwise comparison: host writes through spans do not all advance the version, so the data itself
+            // decides (and -0 vs +0 or one NaN payload vs another is a change).
+            if (_uploadedInputs[i] is { } last && _uploadedInputHandles[i] == buf.Handle && _uploadedInputVersions[i] == version
+                && System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(host.AsSpan())
+                    .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(last.AsSpan())))
+            {
+                Interlocked.Increment(ref _inputUploadsSkipped);
+                continue;
+            }
+            cb.UploadBufferInPlace(host, buf);
+            inT._gpuBufferVersion = version;
+            if (_uploadedInputs[i] is not { } copy || copy.Length != host.Length) _uploadedInputs[i] = copy = new float[host.Length];
+            host.AsSpan().CopyTo(copy);
+            _uploadedInputHandles[i] = buf.Handle;
+            _uploadedInputVersions[i] = version;
         }
     }
 
