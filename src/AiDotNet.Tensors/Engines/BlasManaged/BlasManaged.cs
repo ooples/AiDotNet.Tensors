@@ -238,9 +238,7 @@ public static partial class BlasManaged
                     MemoryMarshal.Cast<T, double>(a), MemoryMarshal.Cast<T, double>(b),
                     MemoryMarshal.Cast<T, double>(c), m, k, n);
         }
-        else if (isFloat && k > ThinMDirectPackedMinK && m >= ThinMDirectPackedMinM && (n & 15) == 0
-            && ThinMDeepKTakesGoto(m, k)
-            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.IsAvailable)
+        else if (isFloat && ThinMUsesPackedGoto(m, n, k))
         {
             // Deep K: the packed GotoBLAS kernel (machine-code microkernel on L2-resident panels) beats the unpacked
             // direct kernel, which streams B at row stride for every 6-row block. The parity MLP's first layer
@@ -296,6 +294,10 @@ public static partial class BlasManaged
         EpilogueChain.Apply<T>(c, ldc, m, n, in epi);
         return true;
     }
+
+    internal static bool ThinMUsesPackedGoto(int m, int n, int k)
+        => k > ThinMDirectPackedMinK && m >= ThinMDirectPackedMinM && (n & 15) == 0
+            && ThinMDeepKTakesGoto(m, k) && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.IsAvailable;
 #endif
 
     /// <summary>

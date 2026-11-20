@@ -21,10 +21,8 @@ public partial class CpuEngine
         int taps, int stride, int padding, int dilation, int outputWidth)
     {
         int reduction = checked(channels * taps);
-        // One K panel preserves the existing FMA reduction without an extra
-        // rounded partial sum. The long-waveform envelope amortizes filter packing.
-        if (channels != outChannels || channels < 32 || channels > 128 || channels % 16 != 0
-            || reduction > 512 || stride != 1 || outputWidth != width || width < 16384
+        if (channels != outChannels || channels < 32 || channels > 256 || channels % 16 != 0
+            || reduction > 4096 || stride != 1 || outputWidth != width || width < 2048
             || width % 256 != 0 || padding > width / WaveformMicroColumns
             || 2L * padding != (long)(taps - 1) * dilation
             || !Avx2.IsSupported || !Fma.IsSupported || BlasManaged.BlasManaged.s_disableGotoGemm
@@ -32,28 +30,50 @@ public partial class CpuEngine
             || !GotoGemmFp32.IsAvailable)
             return false;
 
-        // The general convolution uses 256-column GEMMs throughout this envelope.
-        // A Goto dispatch can round at its K-panel boundary, including when a run
-        // requests only one CPU thread. Keep that dispatch for split reductions.
-        if (reduction > GotoGemmFp32.ChooseParallelBlocks(channels, 256).kc
-            && (GotoGemmFp32.PreferShape(channels, 256, reduction, Environment.ProcessorCount)
-                || GotoGemmFp32.PreferShape(channels, 256, reduction, Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism))))
-            return false;
+        int reductionPanel = reduction;
+        if (reduction <= 512)
+        {
+            // The general convolution uses 256-column GEMMs throughout this envelope.
+            // Keep the original dispatch when it could round between K panels.
+            if (channels > 128 || width < 16384 ||
+                (reduction > GotoGemmFp32.ChooseParallelBlocks(channels, 256).kc
+                 && (GotoGemmFp32.PreferShape(channels, 256, reduction, Environment.ProcessorCount)
+                     || GotoGemmFp32.PreferShape(channels, 256, reduction, Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism)))))
+                return false;
+        }
+        else
+        {
+            // Reproduce the generic convolution's blocked GEMM reduction, including its
+            // final spatial panel. A different K boundary changes every rounded partial sum.
+            int originalColumns = Math.Min(256, 524288 / reduction) / 16 * 16;
+            int totalColumns = checked(batch * width);
+            int originalTiles = (totalColumns - 1) / originalColumns + 1;
+            if (channels >= 192 && originalTiles < Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism))
+                return false; // The generic route may partition the output rows too.
+            int lastColumns = (totalColumns - 1) % originalColumns + 1;
+            if (!WaveformUsesGoto(channels, originalColumns, reduction) ||
+                (lastColumns != originalColumns && !WaveformUsesGoto(channels, lastColumns, reduction)))
+                return false;
+            reductionPanel = Math.Min(reduction, GotoGemmFp32.ChooseParallelBlocks(channels, originalColumns).kc);
+        }
 
+        int paddedReduction = checked(((reduction - 1) / reductionPanel + 1) * reductionPanel);
+        if (paddedReduction > 4096) return false;
         int fullRows = channels / WaveformMicroRows * WaveformMicroRows;
         int tailRows = channels - fullRows;
-        int weightCount = checked((fullRows + (tailRows == 0 ? 0 : WaveformMicroRows)) * reduction);
+        int weightCount = checked((fullRows + (tailRows == 0 ? 0 : WaveformMicroRows)) * paddedReduction);
         float[] weights = CpuStorageAllocationDiagnostics.RentWorkspace<float>(weightCount, "workspace.conv1d_waveform_packed_filter");
         try
         {
             int[] offsets = CpuStorageAllocationDiagnostics.RentWorkspace<int>(reduction * 2, "workspace.conv1d_waveform_offsets");
             try
             {
-                PackWaveformFilter(kernel, kernelOffset, weights, offsets, channels, width, taps, padding, dilation, fullRows);
+                PackWaveformFilter(kernel, kernelOffset, weights, offsets, channels, width, taps, padding, dilation, fullRows,
+                    reductionPanel, paddedReduction);
                 int tilesPerImage = width / WaveformTileColumns;
                 int tiles = checked(batch * tilesPerImage);
                 int workers = Math.Min(tiles, Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism));
-                int panelLength = reduction * WaveformTileColumns;
+                int panelLength = paddedReduction * WaveformTileColumns;
                 int scratchLength = panelLength + (tailRows > 0 ? WaveformMicroRows * WaveformTileColumns : 0);
                 int imageElements = checked(channels * width);
                 fixed (float* source = input, filter = weights, destination = output)
@@ -71,17 +91,17 @@ public partial class CpuEngine
                                     int image = tile / tilesPerImage, first = (tile % tilesPerImage) * WaveformTileColumns;
                                     float* x = (float*)inputAddress + image * imageElements;
                                     float* y = (float*)outputAddress + image * imageElements;
-                                    PackWaveformInput(x, panel, offsets, reduction, width, padding, first);
+                                    PackWaveformInput(x, panel, offsets, reduction, reductionPanel, width, padding, first);
                                     // Both blocks consist of complete microtiles. The scalar-tail
                                     // operands are unused, so no dense input or product is needed.
                                     GotoGemmFp32.RunBlockPackedAB(null, 0, null, 0, y, width, 0, first,
-                                        fullRows, WaveformTileColumns, reduction, reduction, (float*)weightAddress, panel, 0, 1);
+                                        fullRows, WaveformTileColumns, reduction, reductionPanel, (float*)weightAddress, panel, 0, 1);
                                     if (tailRows > 0)
                                     {
                                         float* tail = panel + panelLength;
                                         GotoGemmFp32.RunBlockPackedAB(null, 0, null, 0, tail, WaveformTileColumns, 0, 0,
-                                            WaveformMicroRows, WaveformTileColumns, reduction, reduction,
-                                            (float*)weightAddress + fullRows * reduction, panel, 0, 1);
+                                            WaveformMicroRows, WaveformTileColumns, reduction, reductionPanel,
+                                            (float*)weightAddress + fullRows * paddedReduction, panel, 0, 1);
                                         for (int row = 0; row < tailRows; row++)
                                             new ReadOnlySpan<float>(tail + row * WaveformTileColumns, WaveformTileColumns)
                                                 .CopyTo(new Span<float>(y + (fullRows + row) * width + first, WaveformTileColumns));
@@ -98,8 +118,19 @@ public partial class CpuEngine
         return true;
     }
 
+    private static bool WaveformUsesGoto(int channels, int columns, int reduction)
+    {
+        if ((columns & 15) != 0) return false;
+        if (BlasManaged.BlasManaged.ThinMDirectServesShape(channels, columns, reduction, false, false))
+            return BlasManaged.BlasManaged.ThinMUsesPackedGoto(channels, columns, reduction);
+        // Outside the thin-M path the enclosing convolution uses DisableAutotune and
+        // an explicit inner worker count. Deterministic Goto honors that configuration.
+        return BlasProvider.IsDeterministicMode && !BlasProvider.GetThreadLocalDeterministicMode().HasValue
+            && GotoGemmFp32.PreferShape(channels, columns, reduction, Environment.ProcessorCount);
+    }
+
     private static void PackWaveformFilter(float[] kernel, int kernelOffset, float[] weights, int[] offsets,
-        int channels, int width, int taps, int padding, int dilation, int fullRows)
+        int channels, int width, int taps, int padding, int dilation, int fullRows, int reductionPanel, int paddedReduction)
     {
         int reduction = channels * taps;
         int tailRows = channels - fullRows;
@@ -112,13 +143,15 @@ public partial class CpuEngine
                     int shift = tap * dilation - padding;
                     offsets[k] = channel * width + shift;
                     offsets[reduction + k] = shift;
+                    int panelBase = k / reductionPanel * reductionPanel;
+                    int columnOffset = panelBase * fullRows + (k - panelBase) * WaveformMicroRows;
                     for (int row = 0; row < fullRows; row += WaveformMicroRows)
                         for (int lane = 0; lane < WaveformMicroRows; lane++)
-                            weights[row * reduction + k * WaveformMicroRows + lane] =
+                            weights[columnOffset + row * reductionPanel + lane] =
                                 kernel[kernelOffset + ((row + lane) * channels + channel) * taps + tap];
                     if (tailRows > 0)
                     {
-                        int target = fullRows * reduction + k * WaveformMicroRows;
+                        int target = fullRows * paddedReduction + k * WaveformMicroRows;
                         for (int lane = 0; lane < tailRows; lane++)
                             weights[target + lane] = kernel[kernelOffset + ((fullRows + lane) * channels + channel) * taps + tap];
                         for (int lane = tailRows; lane < WaveformMicroRows; lane++) weights[target + lane] = 0;
@@ -127,29 +160,34 @@ public partial class CpuEngine
     }
 
     private static unsafe void PackWaveformInput(float* input, float* panel, int[] offsets, int reduction,
-        int width, int padding, int first)
+        int reductionPanel, int width, int padding, int first)
     {
         for (int column = 0; column < WaveformTileColumns; column += WaveformMicroColumns)
         {
             int time = first + column;
-            float* packed = panel + column * reduction;
-            if (time >= padding && time + WaveformMicroColumns <= width - padding)
+            bool interior = time >= padding && time + WaveformMicroColumns <= width - padding;
+            for (int begin = 0; begin < reduction; begin += reductionPanel)
             {
-                for (int k = 0; k < reduction; k++, packed += WaveformMicroColumns)
+                int end = Math.Min(reduction, begin + reductionPanel);
+                float* packed = panel + begin * WaveformTileColumns + column * reductionPanel;
+                if (interior)
                 {
-                    float* source = input + offsets[k] + time;
-                    Avx.Store(packed, Avx.LoadVector256(source));
-                    Avx.Store(packed + 8, Avx.LoadVector256(source + 8));
+                    for (int k = begin; k < end; k++, packed += WaveformMicroColumns)
+                    {
+                        float* source = input + offsets[k] + time;
+                        Avx.Store(packed, Avx.LoadVector256(source));
+                        Avx.Store(packed + 8, Avx.LoadVector256(source + 8));
+                    }
                 }
-            }
-            else
-            {
-                for (int k = 0; k < reduction; k++, packed += WaveformMicroColumns)
+                else
                 {
-                    int index = time + offsets[reduction + k];
-                    float* source = input + offsets[k] + time;
-                    for (int lane = 0; lane < WaveformMicroColumns; lane++)
-                        packed[lane] = (uint)(index + lane) < (uint)width ? source[lane] : 0;
+                    for (int k = begin; k < end; k++, packed += WaveformMicroColumns)
+                    {
+                        int index = time + offsets[reduction + k];
+                        float* source = input + offsets[k] + time;
+                        for (int lane = 0; lane < WaveformMicroColumns; lane++)
+                            packed[lane] = (uint)(index + lane) < (uint)width ? source[lane] : 0;
+                    }
                 }
             }
         }

@@ -9,24 +9,28 @@ namespace AiDotNet.Tensors.Tests.Engines;
 public sealed class Conv1DTaskGridTests
 {
     [Theory]
-    [InlineData(2, 32, 7, 3, 8)]
-    [InlineData(1, 64, 7, 1, 8)]
-    [InlineData(1, 48, 3, 5, 8)]
-    [InlineData(1, 128, 3, 1, 1)]
-    public void PackedWaveformPreservesOffsetBatchesDilationAndCurrentWeights(int batch, int channels, int taps, int dilation, int threads)
+    [InlineData(2, 32, 16384, 7, 3, 8)]
+    [InlineData(1, 64, 16384, 7, 1, 8)]
+    [InlineData(1, 48, 16384, 3, 5, 8)]
+    [InlineData(1, 128, 16384, 3, 1, 1)]
+    [InlineData(1, 128, 16384, 7, 1, 8)]
+    [InlineData(2, 256, 2048, 11, 3, 8)]
+    [InlineData(1, 256, 2048, 7, 1, 1)]
+    [InlineData(1, 64, 32768, 11, 3, 8)]
+    public void PackedWaveformPreservesOffsetBatchesDilationAndCurrentWeights(int batch, int channels, int width, int taps, int dilation, int threads)
     {
         int previous = CpuParallelSettings.MaxDegreeOfParallelism;
         try
         {
             CpuParallelSettings.MaxDegreeOfParallelism = threads;
-            AssertWaveformMatchesOriginal(batch, channels, taps, dilation);
+            AssertWaveformMatchesOriginal(batch, channels, width, taps, dilation);
         }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = previous; }
     }
 
-    private static void AssertWaveformMatchesOriginal(int batch, int channels, int taps, int dilation)
+    private static void AssertWaveformMatchesOriginal(int batch, int channels, int width, int taps, int dilation)
     {
-        const int width = 16384, offset = 3;
+        const int offset = 3;
         int length = batch * channels * width;
         int padding = taps / 2 * dilation;
         var random = new Random(443);
