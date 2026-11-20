@@ -1312,9 +1312,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     // Planner identity probes must not use DataVector: its getter realizes lazy nodes. An output can be rebound
     // only before residency is established and while the tensor and the known trace lease are its sole owners.
     internal object GraphVectorIdentity => _data;
-    internal bool CanShareUnboundGraphStorage(bool hasTraceLease) => !IsView && CoversWholeVector
+    internal bool CanShareUnboundGraphStorage(bool hasTraceLease) =>
+        !IsView && CanShareUnboundGraphStorage(hasTraceLease, _disposed ? 0 : 1);
+
+    // A lowering that has identified every live whole-storage reshape can account for their
+    // references as well. An unobserved view or another vector-backed storage still vetoes it.
+    internal bool CanShareUnboundGraphStorage(bool hasTraceLease, int knownLiveOwners) => CoversWholeVector
         && _gpuBuffer is null && _data.LiveStorages == 1
-        && _storage.RefCount == (_disposed ? 0 : 1) + (hasTraceLease ? 1 : 0)
+        && _storage.RefCount == knownLiveOwners + (hasTraceLease ? 1 : 0)
         && (!_data.TryGetBackingArrayIdentity(out var array, out int offset) || offset == 0 && array!.Length == Length)
         && (_data.ResultOwner is null || (!_data.ResultOwner.State.Escaped && _data.ResultOwner.State.Wrappers == 1));
 

@@ -10568,9 +10568,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
 
         if (dataReplay is null && fp16HeteroOrder is null && forwardSteps.Count > 0)
+        {
             ShareWeightNormForwardStorage(forwardSteps, parameters,
                 explicitLoss ?? recordedLastOutput ?? forwardSteps[forwardSteps.Count - 1].OutputBuffer,
                 retainedOutputs, engine, scope);
+            if (Environment.GetEnvironmentVariable("AIDOTNET_CPU_COMPILED_LEAKY_STORAGE") == "1")
+                ShareCpuLeakyBiasStorage(forwardSteps, parameters,
+                    explicitLoss ?? recordedLastOutput ?? forwardSteps[forwardSteps.Count - 1].OutputBuffer,
+                    retainedOutputs, engine, scope);
+        }
 
         if (LazyTensorScope.DeferCpuTrainingOutputs && engine.Is<CpuEngine>() && !engine.SupportsGpu
             && ReferenceEquals(engine, engine.Unwrap()))
