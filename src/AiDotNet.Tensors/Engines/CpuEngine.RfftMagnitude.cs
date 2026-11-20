@@ -80,6 +80,8 @@ public partial class CpuEngine
     {
         if (rows == 0) return;
         int scratchLength = checked(2 * length);
+        if (stridedDestination is null && TryMklRfftMagnitudeRows(source, upstream, destination,
+                rows, length, bins, epsilon, backward, accumulate)) return;
         // Logical tensor writes can privatize COW storage on their first write. Keep that rare strided
         // path serial; contiguous destinations were privatized before entering the parallel region.
         int workers = stridedDestination is null ? Math.Max(1, Math.Min(rows, CpuParallelSettings.MaxDegreeOfParallelism)) : 1;
