@@ -5063,6 +5063,11 @@ public partial class DirectGpuTensorEngine
     }
 
     private const int TopKChunk = 128;
+    // Above this a row is long enough that one thread scanning it is slower than the sort (or the tournament).
+    private const int SmallTopKMaxColumns = 1024;
+    private int _topKSmallRowsCompleted;
+    /// <summary>Number of TensorTopK calls the one-launch small-row kernel served (tests).</summary>
+    internal int TopKSmallRowsCompleted => Volatile.Read(ref _topKSmallRowsCompleted);
 
     private int _topKTournamentsCompleted;
 
@@ -5196,6 +5201,25 @@ public partial class DirectGpuTensorEngine
             int columns = tensor._shape[1];
             int selected = Math.Min(k, columns);
             using var input = GetOrAllocateBuffer(backend, tensor);
+            // Small k over a short row (a router's top-2 of 8): one launch, one thread per row, in the row sort's order.
+            if (columns <= SmallTopKMaxColumns && backend is DirectGpu.ISmallTopKRowsBackend small && selected <= small.MaxSmallTopK)
+            {
+                using var smallValues = AllocateFullyWrittenOutputBuffer(backend, rows * selected);
+                using var smallIndices = AllocateFullyWrittenOutputBuffer(backend, rows * selected);
+                small.TopKRowsSmall(input.Buffer, smallValues.Buffer, smallIndices.Buffer, rows, columns, selected);
+                var smallTop = DeferTensorResult<T>(backend, smallValues.Buffer, rows * selected, new[] { rows, selected });
+                smallValues.RelinquishOwnership();
+                indices = DeferTensorResult<int>(backend, smallIndices.Buffer, rows * selected, new[] { rows, selected });
+                smallIndices.RelinquishOwnership();
+                Interlocked.Increment(ref _topKSmallRowsCompleted);
+                if (Autodiff.DifferentiableOps.IsRecording<T>())
+                {
+                    var savedIndices = SnapshotIndices(backend, indices);
+                    Autodiff.DifferentiableOps.RecordUnary("TopK", smallTop, tensor,
+                        Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { savedIndices, 1 });
+                }
+                return smallTop;
+            }
             // Small k over a long row (LM logits: k = 32 of 49,152): exact chunk tournament instead of sorting the row.
             int sortedStride = columns;
             bool tournament = selected * 2 <= TopKChunk && columns >= 4 * TopKChunk;

@@ -418,6 +418,38 @@ struct ConvertP { length: i32 };
 }
 ";
 
+    /// <summary>Top k (k &lt;= 16) of each row in the bitonic row sort's order: NaN first, larger, ties to the lower index.</summary>
+    public static string TopKRowsSmall => @"
+@group(0) @binding(0) var<storage, read> input_ : array<f32>;
+@group(0) @binding(1) var<storage, read_write> values_ : array<f32>;
+@group(0) @binding(2) var<storage, read_write> indices_ : array<f32>;
+struct TopKP { rows: i32, cols: i32, k: i32, pad: i32 };
+@group(0) @binding(3) var<uniform> p : TopKP;
+fn isnan_(x : f32) -> bool { return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u; }
+fn before_(va : f32, ia : f32, vb : f32, ib : f32) -> bool {
+    let na = isnan_(va); let nb = isnan_(vb);
+    if (na != nb) { return na; }
+    if (!na && va != vb) { return va > vb; }
+    return ia < ib;
+}
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let r = i32(id.x);
+    if (r >= p.rows) { return; }
+    let base_ = r * p.cols;
+    var tv : array<f32, 16>; var ti : array<f32, 16>; var n = 0;
+    for (var c = 0; c < p.cols; c++) {
+        let v = input_[base_ + c]; let ic = f32(c); var pos = n;
+        for (var j = 0; j < n; j++) { if (before_(v, ic, tv[j], ti[j])) { pos = j; break; } }
+        if (pos < p.k) {
+            var m = select(p.k - 1, n, n < p.k);
+            loop { if (m <= pos) { break; } tv[m] = tv[m - 1]; ti[m] = ti[m - 1]; m--; }
+            tv[pos] = v; ti[pos] = ic; if (n < p.k) { n++; }
+        }
+    }
+    for (var j = 0; j < p.k; j++) { values_[r * p.k + j] = tv[j]; indices_[r * p.k + j] = ti[j]; }
+}
+";
+
     public static string OneHotInt32 => @"
 @group(0) @binding(0) var<storage, read> indices : array<i32>;
 @group(0) @binding(1) var<storage, read_write> output_ : array<f32>;

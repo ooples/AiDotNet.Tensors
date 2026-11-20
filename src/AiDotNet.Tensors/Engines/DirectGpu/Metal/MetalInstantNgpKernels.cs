@@ -381,6 +381,39 @@ kernel void resident_indices_to_int32(
     if (int(gid) < length) output[gid] = int(input[gid]);
 }
 
+// Top k (k <= 16) of each row, one thread per row: an insertion list in registers, in the bitonic row sort's order
+// (NaN first, then larger values, ties to the lower index). Indices are written as floats, as that sort writes them.
+// NaN is tested on the bits, so a fast-math compile cannot fold it away.
+inline bool topk_small_before(float va, float ia, float vb, float ib) {
+    bool na = (as_type<uint>(va) & 0x7fffffffu) > 0x7f800000u, nb = (as_type<uint>(vb) & 0x7fffffffu) > 0x7f800000u;
+    if (na != nb) return na;
+    if (!na && va != vb) return va > vb;
+    return ia < ib;
+}
+kernel void resident_topk_rows_small(
+    device const float* input [[buffer(0)]],
+    device float* values [[buffer(1)]],
+    device float* indices [[buffer(2)]],
+    constant int& rows [[buffer(3)]],
+    constant int& cols [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int r = int(gid); if (r >= rows) return;
+    device const float* row = input + (ulong)r * cols;
+    float tv[16]; float ti[16]; int n = 0;
+    for (int c = 0; c < cols; c++) {
+        float v = row[c]; float ic = (float)c; int pos = n;
+        for (int j = 0; j < n; j++) if (topk_small_before(v, ic, tv[j], ti[j])) { pos = j; break; }
+        if (pos < k) {
+            int last = n < k ? n : k - 1;
+            for (int m = last; m > pos; m--) { tv[m] = tv[m - 1]; ti[m] = ti[m - 1]; }
+            tv[pos] = v; ti[pos] = ic; if (n < k) n++;
+        }
+    }
+    for (int j = 0; j < k; j++) { values[(ulong)r * k + j] = tv[j]; indices[(ulong)r * k + j] = ti[j]; }
+}
+
 kernel void resident_one_hot_int32(
     device const int* indices [[buffer(0)]],
     device float* output [[buffer(1)]],
