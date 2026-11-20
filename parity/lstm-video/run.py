@@ -158,11 +158,13 @@ def main():
         py_cmd = [sys.executable, "-c", bootstrap, str(pair / "torch_train.py"), str(pt), str(fixture), str(weights)]
         ai_cmd = ["dotnet", str(dll), "train", str(ai), str(fixture), str(weights)]
         if args.record:
+            require_external_power(args.allow_battery, "before the PyTorch trainer")
             with worker(py_cmd, py_models, env, pt / "train.log") as trainer:
                 ready(trainer, pt)
                 ff = pair.parent / ".media-tools/imageio_ffmpeg/binaries/ffmpeg-host.exe"
                 ff.parent.mkdir(parents=True)
                 shutil.copy2(get_ffmpeg_exe(), ff)
+                require_external_power(args.allow_battery, "before the recorder starts AiDotNet")
                 subprocess.run([sys.executable, str(pair / "record_pair.py")], cwd=pair, env=env, check=True)
                 if trainer.wait(timeout=900) != 0:
                     sys.exit(f"PyTorch failed. See {pt / 'train.log'}")

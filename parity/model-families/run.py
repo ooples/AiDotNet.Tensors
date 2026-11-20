@@ -178,6 +178,9 @@ def main():
                     try:
                         if code:
                             raise ValueError("process failed")
+                        # The check before the next process cannot cover this one: its own receipt does.
+                        if receipt["externalPowerAfter"] is False and not args.allow_battery:
+                            raise ValueError("the machine was on battery power when it finished")
                     except ValueError as error:
                         failures.append(f"{tag}: {error}")
     if failures:

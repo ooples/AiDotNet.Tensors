@@ -24,10 +24,24 @@ def on_external_power():
             return None
     supplies = list(Path("/sys/class/power_supply").glob("*"))
     kinds = {s: (s / "type").read_text().strip() for s in supplies if (s / "type").is_file()}
-    mains = [s for s, kind in kinds.items() if kind == "Mains"]
-    if mains:
-        return any((s / "online").read_text().strip() == "1" for s in mains if (s / "online").is_file())
-    return None if "Battery" in kinds.values() else True
+    def read(supply, name):
+        return (supply / name).read_text().strip() if (supply / name).is_file() else None
+
+    # Mains, and the USB types a laptop charges through (USB, USB_C, USB_PD, ...), are external supplies.
+    external = [s for s, kind in kinds.items() if kind == "Mains" or kind.startswith("USB")]
+    if any(read(s, "online") == "1" for s in external):
+        return True
+    batteries = [s for s, kind in kinds.items() if kind == "Battery"]
+    if not batteries:
+        return True
+    states = {read(s, "status") for s in batteries}
+    if "Discharging" in states:
+        return False
+    if states & {"Charging", "Full"}:
+        return True
+    # A battery that does not say: every external supply reporting offline means battery; none reporting is unknown.
+    reported = [read(s, "online") for s in external]
+    return False if reported and all(state == "0" for state in reported) else None
 
 
 def require_external_power(allow_battery, when="now"):
