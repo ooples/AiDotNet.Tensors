@@ -25609,6 +25609,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    [ThreadStatic] internal static string? ForecastDiagnosticPhase;
+
     private Tensor<T> ExecutePlannedBatchedGemm<T>(
         IDirectGpuBackend backend,
         Tensor<T> a,
@@ -25632,6 +25634,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             backend.BatchedGemm(bufferA.Buffer, bufferB.Buffer, bufferOut.Buffer, m, n, k, batchCount);
+            if (ForecastDiagnosticPhase is { } phase && batchCount == 8 && m == 72 && n == 72 && k == 64)
+            {
+                var folder=Environment.GetEnvironmentVariable("FORECAST_GEMM_DIAGNOSTIC_PATH");
+                if (!string.IsNullOrEmpty(folder))
+                {
+                    string prefix=System.IO.Path.Combine(folder, phase+"-score");
+                    if (!System.IO.File.Exists(prefix+"-A.f32"))
+                    {
+                        void Save(string suffix, IGpuBuffer source, int count)
+                        {
+                            var values=backend.DownloadBuffer(source);
+                            var bytes=new byte[count*sizeof(float)];
+                            System.Buffer.BlockCopy(values,0,bytes,0,bytes.Length);
+                            System.IO.File.WriteAllBytes(prefix+suffix,bytes);
+                        }
+                        Save("-A.f32",bufferA.Buffer,batchCount*m*k); Save("-B.f32",bufferB.Buffer,batchCount*k*n);
+                        Save("-C.f32",bufferOut.Buffer,batchCount*m*n);
+                        Console.Error.WriteLine($"GEMM_INPUTS phase={phase} A={bufferA.Buffer.Handle} aBound={a._gpuBuffer?.Handle} aId={System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(a)} aContig={a.IsContiguous} aShape={string.Join(",",a.Shape.ToArray())} B={bufferB.Buffer.Handle} bBound={b._gpuBuffer?.Handle} bId={System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(b)} bContig={b.IsContiguous} bShape={string.Join(",",b.Shape.ToArray())} C={bufferOut.Buffer.Handle}");
+                    }
+                }
+            }
             var result = DeferTensorResult<T>(backend, bufferOut.Buffer, outputLength, outputShape);
             Gpu.GpuPrecisionDiagnostics.Publish(plan);
             return result;
@@ -30360,6 +30383,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 // GPU concat failed — fall back to the CPU base. Surface the reason at Trace level
                 // (don't swallow silently); never mask OOM, which must propagate. (#652 review)
+                if (Environment.GetEnvironmentVariable("AIDOTNET_DIAG_CAPTURE_INPUTS") == "1")
+                {
+                    Console.Error.WriteLine("CONCAT FALLBACK " + ex);
+                    foreach (var tensor in tensors)
+                        Console.Error.WriteLine($"CONCAT INPUT shape={string.Join(",",tensor.Shape.ToArray())} id={System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(tensor)} storage={tensor._storageOffset} contig={tensor.IsContiguous} host_v={tensor.GpuCacheVersion} bound_v={tensor._gpuBufferVersion} bound={tensor._gpuBuffer?.Handle}");
+                }
                 System.Diagnostics.Trace.TraceWarning($"GPU TensorConcatenate fallback to CPU: {ex.GetType().Name}: {ex.Message}");
                 AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnFallback("TensorConcatenate", ex);
                 if (ThrowOnGpuKernelFallback) throw;

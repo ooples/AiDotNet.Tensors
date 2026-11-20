@@ -119,6 +119,33 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         // step already wrote, and rebinding it there moved the target onto a donor's storage between the write and the
         // update, which then read the donor's stale values (measured: MultiHeadAttentionForward +
         // TensorBroadcastAddInPlace of its bias). Groups are decided before any rebind (a rebind replaces _storage).
+        // A compiled GPU reshape borrows its input buffer through CopyResultInto. The trace can give the
+        // two tensors distinct host storage, but later device writes through either one overwrite both.
+        // Plan these storage lifetimes together, including chains of reshapes and existing storage views.
+        Dictionary<object, object>? deviceAliases = null;
+        object StorageGroup(object storage)
+        {
+            if (deviceAliases is null || !deviceAliases.TryGetValue(storage, out var root)) return storage;
+            while (deviceAliases.TryGetValue(root, out var parent)) root = parent;
+            deviceAliases[storage] = root;
+            return root;
+        }
+
+        if (engine.Is<DirectGpuTensorEngine>())
+        {
+            deviceAliases = new Dictionary<object, object>(ReferenceEqualityComparer<object>.Instance);
+            foreach (var step in steps)
+            {
+                if (step.Inputs.Length != 1) continue;
+                bool aliasesInput = step.OpName == "Reshape" ||
+                    (step.OpName == "Tile" && step.Inputs[0].Length == step.OutputBuffer.Length);
+                if (!aliasesInput) continue;
+                object input = StorageGroup(step.Inputs[0]._storage);
+                object output = StorageGroup(step.OutputBuffer._storage);
+                if (!ReferenceEquals(input, output)) deviceAliases[output] = input;
+            }
+        }
+
         var groupOf = new Dictionary<Tensor<T>, object>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         var groupSize = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
         var groupLastUse = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
@@ -126,7 +153,7 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         void Note(Tensor<T> t)
         {
             if (groupOf.ContainsKey(t)) return;
-            object g = t._storage;
+            object g = StorageGroup(t._storage);
             groupOf[t] = g;
             groupSize[g] = (groupSize.TryGetValue(g, out var n) ? n : 0) + 1;
             if (!producedHere.Contains(t)) groupHoldsExternal.Add(g);

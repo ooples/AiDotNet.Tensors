@@ -41,6 +41,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // The device buffers a capture recorded the states at (the replays write there).
     private Engines.DirectGpu.IGpuBuffer[] _capturedStateBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
     private int[] _capturedStateVersions = Array.Empty<int>();
+    private static readonly List<Engines.DirectGpu.IGpuBuffer?[]> DebugGraphBuffers = new();
+    private (Tensor<T> Tensor, Engines.DirectGpu.IGpuBuffer? Buffer, int Version)[] _capturedLeaves =
+        Array.Empty<(Tensor<T>, Engines.DirectGpu.IGpuBuffer?, int)>();
     private readonly List<GCHandle> _pinnedHandles = new();
     private TensorStorageLeaseSet? _storageLeases;
 
@@ -869,12 +872,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         if (_stateTensors[i].GpuCacheVersion != _capturedStateVersions[i])
                             throw new InvalidOperationException("A captured state was modified outside the plan.");
                     RefreshInferenceInputsInPlace(cb);
+                    RefreshCapturedLeaves(cb);
                     stateLaunchAttempted = _stateTensors.Length != 0;
                     cb.LaunchCapturedGraph(_graphExec);
                     RearmStates();
                     replayed = RefreshFinalOutputFromResident(); // fresh DtoH into _finalOutput's host storage
                 }
-                catch (InvalidOperationException ex) { replayError = ex; }
+                catch (InvalidOperationException ex) { replayError = ex; Console.Error.WriteLine($"PHYSICAL_REPLAY_FAILURE {ex}"); }
                 if (replayed) return _finalOutput;
 
                 // Fail closed: an input could not be refreshed in place, or the output could not be downloaded
@@ -907,6 +911,21 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 bool stateLaunchAttempted = false;
                 try
                 {
+                    float[][]? ordinarySteps = null;
+                    float[]? ordinaryFinal = null;
+                    if (Environment.GetEnvironmentVariable("AIDOTNET_CAPTURE_COMPARE_EAGER") == "1" && _stateTensors.Length == 0)
+                    {
+                        DirectGpuTensorEngine.ForecastDiagnosticPhase = "ordinary";
+                        ordinarySteps = new float[steps.Length][];
+                        for (int i = 0; i < steps.Length; i++)
+                        {
+                            var output = steps[i].OutputBuffer;
+                            steps[i].Execute(engine, output);
+                            ordinarySteps[i] = ((float[])(object)output.ToArray()).Take(Math.Min(output.Length, 65536)).ToArray();
+                        }
+                        ordinaryFinal = (float[])(object)_finalOutput.ToArray();
+                        DirectGpuTensorEngine.ForecastDiagnosticPhase = null;
+                    }
                     if (!_graphEvictionSuspended) { gte.BeginGraphLifetime(); _graphEvictionSuspended = true; }
                     gte.BeginInferenceCapture();
                     try
@@ -935,14 +954,57 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             for (int i = 0; i < steps.Length - _stateTensors.Length; i++)
                                 steps[i].Execute(engine, steps[i].OutputBuffer);
 
+                            // Non-input leaves include decoder placeholders, masks and learned weights.
+                            // Bind them before native capture, where an upload from pageable host storage cannot run.
+                            BindCaptureLeaves(gte);
+
                             // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
                             // capture is non-capturable), then record the step launches. Capture RECORDS
                             // but does not execute, so launch once afterwards to produce this call's output.
                             RefreshInferenceInputsInPlace(cb);
+                            var snapshotDevice = Environment.GetEnvironmentVariable("AIDOTNET_CAPTURE_STEP_SNAPSHOTS") == "1" ? gte.GetBackend() : null;
+                            var snapshots = snapshotDevice is null ? null : new Engines.DirectGpu.IGpuBuffer?[steps.Length];
+                            var expectedSteps = snapshotDevice is null ? null : new float[steps.Length][];
+                            if (snapshotDevice is not null)
+                            {
+                                DirectGpuTensorEngine.ForecastDiagnosticPhase = "resident";
+                                lock (DebugGraphBuffers) DebugGraphBuffers.Add(snapshots!);
+                                for (int i = 0; i < steps.Length; i++)
+                                {
+                                    var tensor = steps[i].OutputBuffer;
+                                    steps[i].Execute(engine, tensor);
+                                    if (i >= 20 && i <= 47 && steps.Length > 43 && steps[43].OpName == "BatchMatMul")
+                                    {
+                                        static int Od(object? obj) => obj is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
+                                        static string Which(Tensor<T> t) => $"id={Od(t)} vec={Od(t.DataVector)} store={Od(t._storage)} arr={Od(t.GetBackingArrayForCacheLookupUnsafe())} ptr={t._gpuBuffer?.Handle} shape={string.Join(",",t.Shape.ToArray())}";
+                                        var q = steps[43].Inputs[0];
+                                        var sample = q._gpuBuffer is { } qb && qb.Handle != IntPtr.Zero ? snapshotDevice.DownloadBuffer(qb)[0] : float.NaN;
+                                        Console.Error.WriteLine($"Q_LIFETIME {i} {steps[i].OpName} Q=[{Which(q)}] q0={sample:R} out=[{Which(tensor)}] in=[{string.Join(" / ",steps[i].Inputs.Select(Which))}]");
+                                    }
+                                    if (tensor._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero && buffer.Size >= tensor.Length && tensor.Length > 0)
+                                    {
+                                        int n = Math.Min(tensor.Length, 65536);
+                                        var mirror = snapshots![i] = snapshotDevice.AllocateBuffer(n);
+                                        snapshotDevice.Copy(buffer, 0, mirror, 0, n);
+                                        expectedSteps![i] = snapshotDevice.DownloadBuffer(mirror);
+                                    }
+                                }
+                                DirectGpuTensorEngine.ForecastDiagnosticPhase = null;
+                            }
                             var exec = cb.CaptureGraph(() =>
                             {
                                 for (int i = 0; i < steps.Length; i++)
+                                {
+                                    if (Environment.GetEnvironmentVariable("AIDOTNET_DIAG_CAPTURE_INPUTS") == "1" && steps[i].OpName.IndexOf("concat", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        var details = string.Join(";", steps[i].Inputs.Select(t =>
+                                            $"shape={string.Join(",",t.Shape.ToArray())}:id={System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(t)}:storage={t._storageOffset}:contig={t.IsContiguous}:host_v={t.GpuCacheVersion}:bound_v={t._gpuBufferVersion}:bound={t._gpuBuffer?.Handle}"));
+                                        Console.Error.WriteLine($"CAPTURE CONCAT step={i} op={steps[i].OpName} {details}");
+                                    }
                                     steps[i].Execute(engine, steps[i].OutputBuffer);
+                                    if (snapshotDevice is not null && snapshots![i] is { } mirror && steps[i].OutputBuffer._gpuBuffer is { } buffer)
+                                        snapshotDevice.Copy(buffer, 0, mirror, 0, mirror.Size);
+                                }
                             });
                             if (exec != IntPtr.Zero)
                             {
@@ -951,6 +1013,30 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 _graphEngine = gte;
                                 stateLaunchAttempted = _stateTensors.Length != 0;
                                 cb.LaunchCapturedGraph(exec);
+                                if (snapshotDevice is not null)
+                                {
+                                    for (int i = 0; i < steps.Length; i++)
+                                    {
+                                        if (snapshots![i] is not { } mirror) continue;
+                                        var captured = snapshotDevice.DownloadBuffer(mirror);
+                                        double max = 0;
+                                        int index = 0;
+                                        double ordinaryMax = 0;
+                                        int ordinaryIndex = 0;
+                                        for (int j = 0; j < captured.Length; j++)
+                                        {
+                                            double delta = captured[j].Equals(expectedSteps![i][j]) ? 0 : Math.Abs(captured[j] - expectedSteps[i][j]);
+                                            if (delta > max || double.IsNaN(delta)) { max = delta; index = j; }
+                                            if (ordinarySteps is not null)
+                                            {
+                                                double d = ordinarySteps[i][j].Equals(captured[j]) ? 0 : Math.Abs(captured[j]-ordinarySteps[i][j]);
+                                                if (d > ordinaryMax || double.IsNaN(d)) { ordinaryMax = d; ordinaryIndex = j; }
+                                            }
+                                        }
+                                        Console.Error.WriteLine($"STEP_DIFF {i} {steps[i].OpName} n={mirror.Size} diff={max:R} at={index} ref={expectedSteps![i][index]:R} gpu={captured[index]:R}");
+                                        if (ordinarySteps is not null) Console.Error.WriteLine($"ORDINARY_DIFF {i} {steps[i].OpName} n={mirror.Size} diff={ordinaryMax:R} at={ordinaryIndex} ref={ordinarySteps[i][ordinaryIndex]:R} gpu={captured[ordinaryIndex]:R}");
+                                    }
+                                }
                                 RearmStates();
                                 // Force a fresh DtoH into _finalOutput's host storage (else the returned tensor
                                 // exposes capture-time host data). If the output is not resident-downloadable,
@@ -958,6 +1044,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 if (!RefreshFinalOutputFromResident())
                                     throw new InvalidOperationException(
                                         "Captured-graph output is not resident-downloadable; abandoning capture.");
+                                if (ordinaryFinal is not null)
+                                {
+                                    var delivered=(float[])(object)_finalOutput.ToArray();
+                                    Console.Error.WriteLine($"DELIVERED_DIFF n={delivered.Length} max={delivered.Zip(ordinaryFinal,(a,b)=>Math.Abs(a-b)).Max():R}");
+                                }
                                 return _finalOutput;
                             }
                         }
@@ -1108,6 +1199,40 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// in place (stable pointer), so a replayed graph — which reads the address captured at record
     /// time — sees fresh per-call data. Mirrors CompiledTrainingPlan.RefreshGraphInputInPlace.
     /// </summary>
+    private void BindCaptureLeaves(DirectGpuTensorEngine engine)
+    {
+        var excluded = new HashSet<Tensor<T>>(_compiledInputTensors, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        excluded.UnionWith(_stateTensors);
+        _capturedLeaves = EnumerateLeafInputs(_steps).Where(tensor => tensor.Length > 0 && !excluded.Contains(tensor))
+            .Select(tensor => (tensor, engine.PinInputResident(tensor), tensor.GpuCacheVersion)).ToArray();
+    }
+
+    private void RefreshCapturedLeaves(Engines.DirectGpu.IGpuGraphCapture backend)
+    {
+        for (int i = 0; i < _capturedLeaves.Length; i++)
+        {
+            ref var leaf = ref _capturedLeaves[i];
+            var tensor = leaf.Tensor;
+            int version = tensor.GpuCacheVersion;
+            if (leaf.Buffer is not { } buffer)
+            {
+                // Strided views can depend on a separate device allocation. A changed view must be rebound by
+                // the ordinary plan, which can choose a new buffer without invalidating a captured pointer.
+                if (version != leaf.Version) throw new InvalidOperationException("A captured external view changed.");
+                continue;
+            }
+            if (buffer.Handle == IntPtr.Zero || !ReferenceEquals(tensor._gpuBuffer, buffer) || !ReferenceEquals(tensor._gpuBackend, backend))
+                throw new InvalidOperationException("A captured external tensor changed its device storage.");
+            if (version == leaf.Version) continue;
+            if (tensor._gpuBufferVersion != version)
+            {
+                backend.UploadBufferInPlace((float[])(object)tensor.GetReadOnlyDataArray(), buffer);
+                tensor._gpuBufferVersion = version;
+            }
+            leaf.Version = version;
+        }
+    }
+
     private void RefreshInferenceInputsInPlace(Engines.DirectGpu.IGpuGraphCapture cb)
     {
         var inputs = _compiledInputTensors;
@@ -1903,7 +2028,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return steps[0].Inputs.Length > 0 ? steps[0].Inputs[0] : null;
     }
 
-    private static IEnumerable<Tensor<T>> EnumerateLeafInputs(List<CompiledStep<T>> steps)
+    private static IEnumerable<Tensor<T>> EnumerateLeafInputs(IReadOnlyList<CompiledStep<T>> steps)
     {
         var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int i = 0; i < steps.Count; i++)
@@ -2015,7 +2140,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             arr = reordered;
 
         var memoryPlanning = new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass();
-        if (memoryPlanning.IsEnabled &&
+        if (memoryPlanning.IsEnabled && Environment.GetEnvironmentVariable("AIDOTNET_FORECAST_DIAG_NO_MEMORY_PLANNING") != "1" &&
             memoryPlanning.TryOptimize(arr, engine, protectedOutputs) is { } memoryPlanned)
             arr = memoryPlanned;
 
