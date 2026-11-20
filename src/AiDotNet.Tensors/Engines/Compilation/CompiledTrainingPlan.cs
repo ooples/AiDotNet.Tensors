@@ -10999,6 +10999,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                 });
             }
+            backwardActions[backwardActions.Count - 1] = ObserveCpuWaveBoundary(step, gradMap, engine,
+                backwardActions[backwardActions.Count - 1]);
+
         }
         // Append fused backward actions in reverse order — TryFuseForwardBackward records
         // them in forward order, but autodiff requires backward (reverse) order.
