@@ -607,6 +607,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// its own post-optimization snapshot. This also releases storages abandoned by memory
     /// planning rebinds instead of retaining them for the plan's lifetime.
     /// </summary>
+    internal bool OwnsStorageLease(object identity) => _storageLeases.ContainsStorage(identity);
+
     internal void ReleaseStorageLeases() => _storageLeases.Dispose();
 
     /// <summary>

@@ -599,8 +599,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void RebindStorageFromGraph(TensorBase<T> source)
         => RebindStorageFromCore(source, graphOwnsStorage: true);
 
+    internal void RebindGraphReshapeStorageFrom(TensorBase<T> source)
+    {
+        if (!CoversWholeVector || !source.CoversWholeVector || Length != source.Length)
+            throw new InvalidOperationException("A graph reshape must cover the same contiguous element range.");
+        RebindStorageFromCore(source, graphOwnsStorage: true, wholeVectorReshape: true);
+    }
+
     [MethodImpl(Hot)]
-    private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage)
+    private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage, bool wholeVectorReshape = false)
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (source is null) throw new ArgumentNullException(nameof(source));
@@ -609,18 +616,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // element-for-element or the rebind would leave our `_shape`/`_strides`
         // out of sync with the new storage. We accept any shape permutation
         // the caller claims — strides/shape on `this` are untouched.
-        if (source._shape.Length != _shape.Length)
-            throw new ArgumentException(
-                $"Rebind requires same rank. This tensor has rank {_shape.Length}, " +
-                $"source has rank {source._shape.Length}.",
-                nameof(source));
-        for (int i = 0; i < _shape.Length; i++)
+        if (!wholeVectorReshape)
         {
-            if (_shape[i] != source._shape[i])
+            if (source._shape.Length != _shape.Length)
                 throw new ArgumentException(
-                    $"Rebind requires same shape. This [{string.Join(", ", _shape)}] vs " +
-                    $"source [{string.Join(", ", source._shape)}].",
+                    $"Rebind requires same rank. This tensor has rank {_shape.Length}, " +
+                    $"source has rank {source._shape.Length}.",
                     nameof(source));
+            for (int i = 0; i < _shape.Length; i++)
+            {
+                if (_shape[i] != source._shape[i])
+                    throw new ArgumentException(
+                        $"Rebind requires same shape. This [{string.Join(", ", _shape)}] vs " +
+                        $"source [{string.Join(", ", source._shape)}].",
+                        nameof(source));
+            }
         }
 
         // Contiguity + zero-offset: the layout in `this` must describe a flat
@@ -1302,6 +1312,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// length), so its device copy IS the vector's shared one.
     /// </summary>
     private bool CoversWholeVector => IsContiguous && _storageOffset == 0 && _data is not null && Length == _data.Length;
+
+    // Planner identity probes must not use DataVector: its getter realizes lazy nodes. An output can be rebound
+    // only before residency is established and while the tensor and the known trace lease are its sole owners.
+    internal object GraphVectorIdentity => _data;
+    // A lowering that has identified every live whole-storage reshape can account for their
+    // references as well. An unobserved view or another vector-backed storage still vetoes it.
+    internal bool CanShareUnboundGraphStorage(bool hasTraceLease, int knownLiveOwners) => CoversWholeVector
+        && _gpuBuffer is null && _data.LiveStorages == 1
+        && _storage.RefCount == knownLiveOwners + (hasTraceLease ? 1 : 0)
+        && (!_data.TryGetBackingArrayIdentity(out var array, out int offset) || offset == 0 && array!.Length == Length)
+        && (_data.ResultOwner is null || (!_data.ResultOwner.State.Escaped && _data.ResultOwner.State.Wrappers == 1));
+
+    internal Array? GraphBackingArrayIdentity => _data.TryGetBackingArrayIdentity(out var array, out _) ? array : null;
 
     /// <summary>
     /// True when <see cref="_gpuBuffer"/> stores a logical <c>Tensor&lt;Complex&lt;T&gt;&gt;</c>

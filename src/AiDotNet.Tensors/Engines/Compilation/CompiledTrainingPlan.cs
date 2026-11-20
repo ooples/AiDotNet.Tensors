@@ -10168,6 +10168,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
 
 
+        if (forwardSteps.Count > 0 && dataReplay is null && fp16HeteroOrder is null
+            && Environment.GetEnvironmentVariable("AIDOTNET_CPU_COMPILED_LEAKY_STORAGE") != "0")
+            ShareCpuLeakyBiasStorage(forwardSteps, parameters,
+                explicitLoss ?? recordedLastOutput ?? forwardSteps[forwardSteps.Count - 1].OutputBuffer,
+                retainedOutputs, engine, scope);
+
         // Map each tensor to its consumer count (how many backward steps write to it)
         var consumerCount = new Dictionary<Tensor<T>, int>();
         foreach (var step in forwardSteps)
