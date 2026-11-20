@@ -14,8 +14,11 @@ def git(path, *args):
 
 
 def prepare(work, snapshot):
-    root = work.resolve() / snapshot
-    for name, pin in REVISIONS[snapshot].items():
+    return prepare_sources(work.resolve() / snapshot, REVISIONS[snapshot], HERE / "sources")
+
+
+def prepare_sources(root, revisions, sources):
+    for name, pin in revisions.items():
         dest = root / name
         if not dest.exists():
             dest.mkdir(parents=True)
@@ -27,11 +30,11 @@ def prepare(work, snapshot):
         head = subprocess.run(["git", "-C", str(dest), "rev-parse", "--verify", "--quiet", "HEAD"],
                               capture_output=True, text=True).stdout.strip()
         if not head:
-            print(f"Fetching public {name} sources for {snapshot}...", flush=True)
+            print(f"Fetching public {name} sources for {pin['commit'][:10]}...", flush=True)
             git(dest, "fetch", "--quiet", "--no-tags", "--depth=1", "origin",
                 *(f"{sha}:refs/benchmark-inputs/{sha}" for sha in pin["fetch"]))
             if "bundle" in pin:
-                bundle = str(HERE / "sources" / pin["bundle"])
+                bundle = str(sources / pin["bundle"])
                 git(dest, "bundle", "verify", bundle)
                 git(dest, "fetch", "--quiet", "--no-tags", bundle, pin["ref"])
             git(dest, "checkout", "--quiet", "--detach", pin["commit"])

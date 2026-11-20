@@ -1,0 +1,47 @@
+{
+  "AiDotNet": {
+    "url": "https://github.com/ooples/AiDotNet.git",
+    "fetch": [
+      "c4d8fa3b9a02a7f8301d38fe7b5a7c83a605bdf3",
+      "963b16080aeba630dfc072f25c7f41564de0ebdf",
+      "f48f6f5dff492314f9ba8154fa86a1c8393b1e9c",
+      "0b14ed81d40723bd145b2ac7d75554fc384e81fe",
+      "e8736407d60608a1ba8822b748a053dc30e96174",
+      "3a2105230621d1b02aff6057f908eaad963d6bb3",
+      "415c10615d38c6ae2c9813386435bc823cfefb31",
+      "93e0dd7c8e0e452e1c0cc193774650297c4a3015"
+    ],
+    "bundle": "AiDotNet.bundle",
+    "ref": "refs/heads/bench/reddit-rc1-20261119",
+    "commit": "71a1dc700a84492017f7c856c2289105f12d7331",
+    "tree": "cdb561e2d708a8c96bb070aebc37cbdaba0e6f41"
+  },
+  "AiDotNet.Tensors": {
+    "url": "https://github.com/ooples/AiDotNet.Tensors.git",
+    "fetch": [
+      "4e97cde075c259d9904f683ad9f17d685e5b66d9",
+      "88a513313745827815b22b9bdfcb51c7efdcaf6c",
+      "16eb28ede58a1281ab39cf08bf1f8229589f16bc",
+      "d239e4021d131388c9cd44195258258460990e4a",
+      "00338234c7458b5a816d63b91e56566be8e3aff8",
+      "8335606bdd3161a2d95eb70de0e550f023975e77",
+      "3aa39b516374bac4eeb0f50ba0cf2d3f54cbb0e4",
+      "38f7540ee7864d9177761212735f5b694aa797e4",
+      "6f9d894ab80fd46e8ec58424cd0ccfcd070ca83e",
+      "011b6776a223d4016b6bff4e0faff5ee699eaad2",
+      "9d9eb57e949cab3e65f780933d841dc5a2c70173",
+      "9820645c57d55067e72f721255759562a49d2e95",
+      "fb195237b9abd27ed089f3b126f30633a366714d",
+      "97428e34db133c4c4f98458eb00f6b9478db37fb",
+      "70d499f21d9d305f32e174c46bbfd85b2f8de0bf",
+      "8572e706e41b88dc94d220e6348d07aee9994096",
+      "c5d74864849931b5062ee5ee6712fe5017adb6ae",
+      "c93c7211a968f1bb247ddc3c778d2ba8c0ebcc55",
+      "53a2b0752b8aafcd1dad03bc3f30fd72f18e3874"
+    ],
+    "bundle": "AiDotNet.Tensors.bundle",
+    "ref": "refs/heads/bench/reddit-rc2-20261119",
+    "commit": "75b03c2532d651d5ca102bd1014f9c8e7aac6048",
+    "tree": "ff3c32128365caa844896959d44c58c82bd4a3a7"
+  }
+}

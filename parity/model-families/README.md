@@ -7,7 +7,7 @@ This is the end-to-end benchmark used to test how changes to AiDotNet.Tensors af
 | November 13 baseline, public mainline commits | [Training and inference CSV](evidence/2026-11-13.csv) | [88 reports and run settings](evidence/2026-11-13.zip) |
 | November 19 experiment, combined PR revisions | [Training and inference CSV](evidence/2026-11-19.csv) | [88 reports, process receipts, source and binary fingerprints, and step-one checks](evidence/2026-11-19.zip) |
 
-Each CSV includes both launches, across all 11 models, on CPU and CUDA. The 17-second LSTM video was a separate experiment with different source and a different training task.
+Each CSV includes both launches, across all 11 models, on CPU and CUDA. The [17-second LSTM video benchmark](../lstm-video/README.md) has its own training code, recording scripts and raw checkpoints.
 
 You can read both implementations of the November 13 baseline directly on GitHub. [Python models and training loop](https://github.com/ooples/AiDotNet/blob/8e1066a7454f95b1f2441229b8e736032fb6111c/benchmarks/AiDotNet.PyTorchParity/pytorch/benchmark.py) · [C# benchmark](https://github.com/ooples/AiDotNet/tree/8e1066a7454f95b1f2441229b8e736032fb6111c/benchmarks/AiDotNet.PyTorchParity)
 
