@@ -5542,7 +5542,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // the dropped buffers, and a live graph's buffers are never dropped.
             if (executed && completed && _scratchPool is { } scratchPool && !HasLiveStepGraph)
             {
-                long dropped = scratchPool.TrimUnleased();
+                scratchPool.TrimUnleased(backend);
+                long dropped = 0;
                 foreach (long slot in _firstWriteRedirects.RedirectedSlots) dropped += scratchPool.Forget(slot);
                 // The dropped buffers are long-lived (allocated on the plan's first runs), so only a full collection
                 // returns them; without one a GPU DenseNet-121 step went on holding ~1.5 GB of them. This happens on the
