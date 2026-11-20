@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -112,7 +113,7 @@ public sealed class ConvTransposeInferenceArenaTests
         var backing = new float[32];
         var destination = Tensor<float>.FromMemory(new Memory<float>(backing, 0, 3), new[] { 1, 1, 1, 3 });
         int downloads = 0;
-        HostSync.Register(backing, value => { downloads++; Array.Fill((float[])value, 91f); });
+        HostSync.Register(backing, value => { downloads++; ((float[])value).AsSpan().Fill(91f); });
         Assert.True(HostSync.IsPending(backing));
         using var noGrad = new NoGradScope<float>();
         engine.ConvTranspose2DInto(destination, input, kernel, new[] { 1, 1 }, new[] { 0, 0 }, new[] { 0, 0 });
@@ -177,7 +178,7 @@ public sealed class ConvTransposeInferenceArenaTests
         if (typeof(T) == typeof(float))
         {
             for (int i = 0; i < expected.Length; i++)
-                Assert.Equal(BitConverter.SingleToInt32Bits((float)(object)expected[i]!), BitConverter.SingleToInt32Bits((float)(object)actual[i]!));
+                Assert.Equal(MathCompat.SingleToInt32Bits((float)(object)expected[i]!), MathCompat.SingleToInt32Bits((float)(object)actual[i]!));
         }
         else
         {

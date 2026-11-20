@@ -21,6 +21,15 @@ public sealed class WebGpuBatchExecutionKernelsTests
     public static IEnumerable<object[]> KernelNames()
         => BatchExecutionCudaKernels.GetKernelNames().Select(n => new object[] { n });
 
+    [Fact]
+    public void Residual_only_shader_binds_one_writable_output()
+    {
+        var shader = WebGpuBatchExecutionKernels.ByKernelName[WebGpuBatchExecutionKernels.ChannelBiasResidualOnlyName];
+        Assert.Equal(1, Regex.Matches(shader, @"var<storage, read_write>", RegexOptions.None, RegexTimeout).Count);
+        Assert.Contains("outp[i] = value", shader);
+        Assert.DoesNotContain("activated", shader);
+    }
+
     [Theory]
     [MemberData(nameof(KernelNames))]
     public void Port_MirrorsTheCudaSignature(string name)

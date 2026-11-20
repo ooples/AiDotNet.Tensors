@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
@@ -230,8 +231,8 @@ internal static class WeightNormSharingTestGraph
         Assert.Equal(baseline.NoGradWeightNormNodes, candidate.NoGradWeightNormNodes);
         Assert.Equal(baseline.Values.Count, candidate.Values.Count);
         for (int row = 0; row < baseline.Values.Count; ++row)
-            Assert.Equal(baseline.Values[row].Select(BitConverter.SingleToInt32Bits),
-                candidate.Values[row].Select(BitConverter.SingleToInt32Bits));
+            Assert.Equal(baseline.Values[row].Select(MathCompat.SingleToInt32Bits),
+                candidate.Values[row].Select(MathCompat.SingleToInt32Bits));
     }
 
     private static (double Loss, double[] Output, double[][] Gradients) Oracle(float[] direction, float[] gain, bool secondNoGrad)

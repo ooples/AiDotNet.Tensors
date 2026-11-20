@@ -1515,10 +1515,14 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     gbhh[i] = s;
 }");
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
-    public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
+    public static readonly IReadOnlyDictionary<string, string> ByKernelName;
+
+    // Shader fields live in several partial files. Populate the lookup after every field initializer has run.
+    static WebGpuBatchExecutionKernels() => ByKernelName = new Dictionary<string, string>
     {
         [BatchExecutionCudaKernels.ChannelBiasLeaky] = ChannelBiasLeaky,
         [BatchExecutionCudaKernels.ChannelBiasResidual] = ChannelBiasResidual,
+        [ChannelBiasResidualOnlyName] = ChannelBiasResidualOnly,
         [BatchExecutionCudaKernels.GroupedConv2D] = GroupedConv2DShaders.Forward,
         [BatchExecutionCudaKernels.GroupedConv2DInputGrad] = GroupedConv2DShaders.InputGrad,
         [BatchExecutionCudaKernels.GroupedConv2DKernelGrad] = GroupedConv2DShaders.KernelGrad,

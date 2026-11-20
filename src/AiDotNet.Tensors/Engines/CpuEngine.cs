@@ -20690,10 +20690,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Output length {output.Length} does not match expected {expectedOutLen} for shape [{batch},{outChannels},{outputHeight},{outputWidth}].",
                 nameof(output));
 
-        using var inputDataLease = input.LeaseArray();
-        var inputData = inputDataLease.Array;
-        using var kernelDataLease = kernel.LeaseArray();
-        var kernelData = kernelDataLease.Array;
+        using var inputOwnerKeep = new KeepAliveScope(input);
+        using var kernelOwnerKeep = new KeepAliveScope(kernel);
+        var inputData = input.GetReadOnlyDataArrayUnmarked();
+        var kernelData = kernel.GetReadOnlyDataArrayUnmarked();
         using var outputOwnerKeep = new KeepAliveScope(output);
         output.EnsureOwnedForDeviceWrite(); // Same COW/streaming write guard as LeaseArray, without a padded copy.
         var liveOutputArray = output.GetLiveBackingArrayAllowingPaddingOrNull();

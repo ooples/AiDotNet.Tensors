@@ -9,6 +9,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -178,7 +179,7 @@ public sealed class GroupedConv2DCudaTests
             Assert.True(released > 0, "A recorded grouped node must preserve real private-gradient retirement eligibility.");
             Assert.Equal(baseline.Count, actual.Count);
             for (int i = 0; i < baseline.Count; ++i)
-                Assert.Equal(baseline[i].Select(BitConverter.SingleToInt32Bits), actual[i].Select(BitConverter.SingleToInt32Bits));
+                Assert.Equal(baseline[i].Select(MathCompat.SingleToInt32Bits), actual[i].Select(MathCompat.SingleToInt32Bits));
         }
         finally
         {
@@ -202,6 +203,28 @@ public sealed class GroupedConv2DCudaTests
         GroupedConv2DSemanticTests.Close(reference.Dx, input.ToArray(), 2e-4);
         GroupedConv2DSemanticTests.Close(reference.Dw, kernel.ToArray(), 2e-4);
         Assert.Equal(reference.Dy, dy.ToArray());
+    }
+
+    [SkippableFact]
+    public void Cold_accumulators_remain_readable_and_shared_peers_keep_their_original_values()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        Skip.IfNot(engine.IsGpuAvailable && engine.GetBackend() is CudaBackend, "CUDA unavailable.");
+        var g = new GroupedConv2DGeometry(2, 4, 1, 9, 4, 1, 1, 1, 1, 0, 0, 1, 1, 2);
+        var reference = Reference(g);
+        using var input = new Tensor<float>(reference.X, g.InputShape);
+        using var kernel = new Tensor<float>(reference.W, g.KernelShape);
+        using var dy = new Tensor<float>(reference.Dy, g.OutputShape);
+        using var dx = new Tensor<float>(Enumerable.Repeat(.25f, g.InputCount).ToArray(), g.InputShape);
+        using var dw = new Tensor<float>(Enumerable.Repeat(-.5f, g.KernelCount).ToArray(), g.KernelShape);
+        using var peerX = (Tensor<float>)dx.CloneShared();
+        using var peerW = (Tensor<float>)dw.CloneShared();
+        GroupedConvolution.BackwardInto(engine, dy, input, kernel, dx, dw, g, true, true);
+        using var later = engine.TensorAdd(dx, dx);
+        GroupedConv2DSemanticTests.Close(reference.Dx.Select(v => 2 * (.25f + v)), later.ToArray(), 4e-4);
+        GroupedConv2DSemanticTests.Close(reference.Dw.Select(v => -.5f + v), dw.ToArray(), 2e-4);
+        Assert.All(peerX.ToArray(), v => Assert.Equal(.25f, v));
+        Assert.All(peerW.ToArray(), v => Assert.Equal(-.5f, v));
     }
 
     [SkippableFact]

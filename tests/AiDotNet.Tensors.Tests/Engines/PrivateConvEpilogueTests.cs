@@ -3,6 +3,7 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -29,7 +30,7 @@ public sealed class PrivateConvEpilogueTests
         var expected = bias ? engine.TensorChannelBiasAdd(input, biasTensor) : input;
         if (residual) expected = engine.TensorAdd(expected, residualTensor);
         engine.AddPrivateConvolutionBiasResidual(destination, bias ? biasTensor : null, residual ? residualTensor : null);
-        Assert.Equal(expected.ToArray().Select(BitConverter.SingleToInt32Bits), destination.ToArray().Select(BitConverter.SingleToInt32Bits));
+        Assert.Equal(expected.ToArray().Select(MathCompat.SingleToInt32Bits), destination.ToArray().Select(MathCompat.SingleToInt32Bits));
         Assert.All(storage.Take(7), v => Assert.Equal(99.5f, v));
         Assert.All(storage.Skip(storage.Length - 7), v => Assert.Equal(99.5f, v));
         Assert.Equal(values, input.ToArray()); Assert.Equal(other, residualTensor.ToArray());
