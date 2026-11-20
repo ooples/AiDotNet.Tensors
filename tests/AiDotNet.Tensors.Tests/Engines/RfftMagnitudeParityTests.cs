@@ -8,8 +8,8 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
-[Collection("BlasManaged-Stats-Serial")]
-public sealed class RfftMagnitudeCpuTests
+[Collection("DirectGpuSerial")]
+public sealed class RfftMagnitudeParityTests
 {
     [Theory]
     [InlineData(1)]
@@ -23,7 +23,15 @@ public sealed class RfftMagnitudeCpuTests
         CheckDft<double>(new CpuEngine(), n, 2e-11);
     }
 
-    internal static void CheckDft<T>(CpuEngine engine, int n, double tolerance)
+    [SkippableFact]
+    public void OddLengthMagnitudeAndAdjointMatchDft()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "A GPU backend is required.");
+        CheckDft<float>(gpu, 129, 3e-4);
+    }
+
+    private static void CheckDft<T>(CpuEngine engine, int n, double tolerance)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int bins = n / 2 + 1;
@@ -272,17 +280,5 @@ public sealed class RfftMagnitudeCpuTests
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.InRange(Math.Abs(actual[i] - expected[i]), 0, tolerance * Math.Max(1, Math.Abs(expected[i])));
-    }
-}
-
-[Collection("DirectGpuSerial")]
-public sealed class GpuRfftMagnitudeTests
-{
-    [SkippableFact]
-    public void OddLengthMagnitudeAndAdjointMatchDft()
-    {
-        using var gpu = new DirectGpuTensorEngine();
-        Skip.IfNot(gpu.IsGpuAvailable, "A GPU backend is required.");
-        RfftMagnitudeCpuTests.CheckDft<float>(gpu, 129, 3e-4);
     }
 }
