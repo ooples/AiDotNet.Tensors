@@ -848,7 +848,7 @@ public partial class CpuEngine
                 // h_{t-1} for row (b, t): each sample's h_0..h_{seqLen-1} are contiguous in the saved hiddens.
                 int hStride = (seqLen + 1) * hidden;
                 var hiddens = ws.Hiddens;
-                var hPrev = System.Buffers.ArrayPool<float>.Shared.Rent(rowsAll * hidden);
+                var hPrev = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rowsAll * hidden, "workspace.lstm_backward_pool");
                 try
                 {
                     for (int b = 0; b < batch; b++)
@@ -1153,9 +1153,9 @@ public partial class CpuEngine
         // keeps it, so it is pooled scratch: inference used to allocate the gates, cells and hiddens every call.
         bool recording = DifferentiableOps.IsRecording<double>();
         var pool = System.Buffers.ArrayPool<double>.Shared;
-        var gates = recording ? new double[totalRows * G] : pool.Rent(totalRows * G);
-        var cells = recording ? new double[batch * (seqLen + 1) * hidden] : pool.Rent(batch * (seqLen + 1) * hidden);
-        var hiddens = recording ? new double[batch * (seqLen + 1) * hidden] : pool.Rent(batch * (seqLen + 1) * hidden);
+        var gates = recording ? new double[totalRows * G] : CpuStorageAllocationDiagnostics.RentWorkspace<double>(totalRows * G, "workspace.lstm_training_forward_pool");
+        var cells = recording ? new double[batch * (seqLen + 1) * hidden] : CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * (seqLen + 1) * hidden, "workspace.lstm_training_forward_pool");
+        var hiddens = recording ? new double[batch * (seqLen + 1) * hidden] : CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * (seqLen + 1) * hidden, "workspace.lstm_training_forward_pool");
 
         var output = new Tensor<double>(LstmTrainingOutputShape(batch, seqLen, hidden, returnSequences, wantState));
         using var outSpanLease = output.LeaseWritable();
@@ -1216,7 +1216,7 @@ public partial class CpuEngine
 
         // Wx[b,t,:] = wIh @ x[b,t] (+ bIh): one big GEMM x[totalRows, inF] @ wIh^T[inF, G].
         var pool = System.Buffers.ArrayPool<double>.Shared;
-        var wx = pool.Rent(totalRows * G);
+        var wx = CpuStorageAllocationDiagnostics.RentWorkspace<double>(totalRows * G, "workspace.lstm_training_forward_pool");
         GemmBigD(inSpan, inFeatures, false, wIhSpan, inFeatures, true,
                  wx.AsSpan(0, totalRows * G), totalRows, inFeatures, G);
         if (bIhArr is not null)
@@ -1227,19 +1227,19 @@ public partial class CpuEngine
             }
 
         // Pre-transpose wHh [G, hidden] → wHhT [hidden, G] for the per-step recurrent GEMM.
-        var wHhT = pool.Rent(hidden * G);
+        var wHhT = CpuStorageAllocationDiagnostics.RentWorkspace<double>(hidden * G, "workspace.lstm_training_forward_pool");
         for (int g = 0; g < G; g++)
             for (int h = 0; h < hidden; h++)
                 wHhT[h * G + g] = wHhSpan[g * hidden + h];
 
-        var hPrev = pool.Rent(batch * hidden);
-        var hh = pool.Rent(batch * G);
+        var hPrev = CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * hidden, "workspace.lstm_training_forward_pool");
+        var hh = CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * G, "workspace.lstm_training_forward_pool");
         for (int b = 0; b < batch; b++)
             Array.Copy(hiddens, b * (seqLen + 1) * hidden, hPrev, b * hidden, hidden);
 
         int bh = batch * hidden;
-        var act = pool.Rent(4 * bh);
-        var cbuf = pool.Rent(bh);
+        var act = CpuStorageAllocationDiagnostics.RentWorkspace<double>(4 * bh, "workspace.lstm_training_forward_pool");
+        var cbuf = CpuStorageAllocationDiagnostics.RentWorkspace<double>(bh, "workspace.lstm_training_forward_pool");
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -1347,9 +1347,9 @@ public partial class CpuEngine
         var gradOutSpan = gradOutput.GetFlattenedData().AsSpan();
 
         var pool = System.Buffers.ArrayPool<double>.Shared;
-        var dgatesAll = pool.Rent(totalRows * G);
-        var dhNext = pool.Rent(batch * hidden);
-        var dcNext = pool.Rent(batch * hidden);
+        var dgatesAll = CpuStorageAllocationDiagnostics.RentWorkspace<double>(totalRows * G, "workspace.lstm_backward_pool");
+        var dhNext = CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * hidden, "workspace.lstm_backward_pool");
+        var dcNext = CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * hidden, "workspace.lstm_backward_pool");
         System.Array.Clear(dhNext, 0, batch * hidden);
         System.Array.Clear(dcNext, 0, batch * hidden);
         if (meta.Length > 9 && meta[9] != 0)
@@ -1358,8 +1358,8 @@ public partial class CpuEngine
             gradOutSpan.Slice(stateOffset, batch * hidden).CopyTo(dhNext);
             gradOutSpan.Slice(stateOffset + batch * hidden, batch * hidden).CopyTo(dcNext);
         }
-        var dgatesT = pool.Rent(batch * G);
-        var dhPrev = pool.Rent(batch * hidden);
+        var dgatesT = CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * G, "workspace.lstm_backward_pool");
+        var dhPrev = CpuStorageAllocationDiagnostics.RentWorkspace<double>(batch * hidden, "workspace.lstm_backward_pool");
 
         for (int t = seqLen - 1; t >= 0; t--)
         {
@@ -1431,7 +1431,7 @@ public partial class CpuEngine
         DifferentiableOps.AccumulateGrad(grads, wIh, gradWIh, engine);
 
         // gradWHh = dgatesAll^T @ hPrevAll → [G, hidden]; hPrevAll[b,t] = h_{t-1}.
-        var hPrevAll = pool.Rent(totalRows * hidden);
+        var hPrevAll = CpuStorageAllocationDiagnostics.RentWorkspace<double>(totalRows * hidden, "workspace.lstm_backward_pool");
         for (int b = 0; b < batch; b++)
             for (int t = 0; t < seqLen; t++)
                 Array.Copy(hiddens, (b * (seqLen + 1) + t) * hidden,
