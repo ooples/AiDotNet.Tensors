@@ -842,7 +842,8 @@ internal static class DifferentiableOps
     /// A caller that writes the returned buffer must call <see cref="TensorBase{T}.IncrementVersion"/> afterwards.
     /// </summary>
     internal static Tensor<T>? TryGetDirectGradTarget<T>(
-        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool overwrite)
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool overwrite,
+        Tensor<T>? upstream = null, bool firstWriteOnly = false)
     {
         overwrite = false;
         if (_isBackwardCreateGraph || engine.SupportsGpu || !engine.Is<CpuEngine>()) return null;
@@ -853,6 +854,11 @@ internal static class DifferentiableOps
             : (grads.TryGetValue(tensor, out var found) ? found : null);
         if (existing is null || !existing.IsContiguous || existing.HasPendingGpuData
             || existing.Length != tensor.Length) return null;
+        if (firstWriteOnly && IsWrittenThisStep(existing)) return null;
+        // A fused derivative can read both the forward input and its upstream gradient while writing.
+        if (upstream is not null && (existing.IsSparse || HasOverlappingStorage(existing, upstream)
+            || HasOverlappingStorage(existing, tensor))) return null;
+        BackwardStepGradientWrites<T>.Note(tensor);
         overwrite = ClaimFirstWrite(existing);
         if (indexed) _indexedGrads![idx] = existing;
         grads[tensor] = existing;
