@@ -39,10 +39,12 @@ public sealed class CompiledGpuSharedWorkspaceTests
         return plan;
     }
 
-    private static (List<float[]> Samples, long Shared, long Reuses) Run(IEngine engine, bool share, bool retainView,
+    internal static (List<float[]> Samples, long Shared, long Reuses, long Handoff) Run(IEngine engine, bool share, bool retainView,
         bool inputGradients)
     {
         AiDotNetEngine.Current = engine;
+        long handoffBefore = engine is DirectGpuTensorEngine beforeGpu
+            ? beforeGpu.CompiledWorkspaceBroker.CacheReturnedForInferenceBytes : 0;
         CompiledTrainingPlan<float>.ShareTransientWorkspaceForTests = share;
         CompiledTrainingPlan<float>.CompiledInputGradientsForTests = inputGradients;
         var aInput = Values(8, 8, 1);
@@ -77,7 +79,9 @@ public sealed class CompiledGpuSharedWorkspaceTests
             if (retainView) samples.Add(publicView!.ToArray());
             if (inputGradients) samples.Add(Assert.IsType<Tensor<float>>(aInputGradient).ToArray());
         }
-        return (samples, shared, engine is DirectGpuTensorEngine gpu ? gpu.CompiledWorkspaceBroker.ReuseCount : 0);
+        return (samples, shared, engine is DirectGpuTensorEngine gpu ? gpu.CompiledWorkspaceBroker.ReuseCount : 0,
+            engine is DirectGpuTensorEngine afterGpu
+                ? afterGpu.CompiledWorkspaceBroker.CacheReturnedForInferenceBytes - handoffBefore : 0);
     }
 
     [SkippableTheory]
@@ -103,7 +107,7 @@ public sealed class CompiledGpuSharedWorkspaceTests
             for (int sample = 0; sample < shared.Samples.Count; sample++)
             {
                 AssertClose(expected.Samples[sample], isolated.Samples[sample], $"CPU vs sharing-off sample {sample}");
-                AssertClose(isolated.Samples[sample], shared.Samples[sample], $"sharing-off vs sharing-on sample {sample}");
+                Assert.Equal(isolated.Samples[sample], shared.Samples[sample]);
             }
         }
         finally
@@ -155,7 +159,7 @@ public sealed class CompiledGpuSharedWorkspaceTests
         }
     }
 
-    private static DirectGpuTensorEngine CreateGpu()
+    internal static DirectGpuTensorEngine CreateGpu()
     {
         DirectGpuTensorEngine gpu;
         try { gpu = new DirectGpuTensorEngine(); }
@@ -169,7 +173,7 @@ public sealed class CompiledGpuSharedWorkspaceTests
         return gpu;
     }
 
-    private static void AssertClose(float[] expected, float[] actual, string context)
+    internal static void AssertClose(float[] expected, float[] actual, string context)
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)

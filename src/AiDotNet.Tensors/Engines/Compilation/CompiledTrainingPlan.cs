@@ -4607,7 +4607,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (ran)
                 {
                     // Keep forward values readable without forcing a host download.
-                    if (completedWorkspaceStep) ReturnTransientWorkspace(gte, cb);
+                    if (completedWorkspaceStep)
+                    {
+                        ReturnTransientWorkspace(gte, cb);
+                        ReturnCompletedBackwardScratch(gte, cb);
+                    }
 
                     var released = new HashSet<Engines.DirectGpu.IGpuBuffer>(ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
                     gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false, released);
@@ -5399,6 +5403,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _workspaceSharingBodyAllowed = redirectEngine is not null && CanShareTransientWorkspace(redirectEngine);
             leasingPool.WorkspaceBroker = _workspaceSharingBodyAllowed
                 ? redirectEngine!.CompiledWorkspaceBroker : null;
+            leasingPool.ShareBackwardScratch = _shareBackwardScratch && _workspaceSharingBodyAllowed;
+
         }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
@@ -5415,7 +5421,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
                 redirectEngine.FirstWriteRedirects = null;
-                if (_scratchPool is { } finishedPool) finishedPool.WorkspaceBroker = null;
+                if (_scratchPool is { } finishedPool)
+                {
+                    finishedPool.WorkspaceBroker = null;
+                    finishedPool.ShareBackwardScratch = false;
+                }
 
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
