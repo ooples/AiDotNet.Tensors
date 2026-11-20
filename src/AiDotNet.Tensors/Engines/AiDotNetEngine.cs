@@ -187,15 +187,22 @@ public static class AiDotNetEngine
                 throw new ArgumentNullException(nameof(value), "Engine cannot be null");
             }
 
-            // An engine the caller chose before anything asked for one stands; the owed detection must not replace it.
-            lock (_deferredLock)
-            lock (_adoptionLock)
-            {
-                Volatile.Write(ref _deferredDetection, 0);
-                PublishCurrent(value);
-                // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
-                Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
-            }
+            AssignCurrent(value);
+        }
+    }
+
+    // The locks order this assignment against deferred detection and adoption, which also publish an engine. They do
+    // not guard reads: Current's getter is lock-free by design and sees the reference through its volatile publication.
+    private static void AssignCurrent(IEngine value)
+    {
+        // An engine the caller chose before anything asked for one stands; the owed detection must not replace it.
+        lock (_deferredLock)
+        lock (_adoptionLock)
+        {
+            Volatile.Write(ref _deferredDetection, 0);
+            PublishCurrent(value);
+            // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
+            Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
         }
     }
 
