@@ -10057,7 +10057,8 @@ public partial class DirectGpuTensorEngine
             outShape[normalizedAxis] = indices.Length;
             int outputLength = outerSize * indices.Length * innerSize;
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousInput);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: axisSize, requireUnique: true);
+            // Gather only reads: repeated source indices are valid, so only the bounds are checked.
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: axisSize);
             // Every output element is gathered (the indices were bounds-checked): no zero fill.
             return DispatchDeferredGpuOp<T>(backend, outputLength, outShape, output =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, output,
