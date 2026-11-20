@@ -54,7 +54,11 @@ jobs:
     if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
     # POCL runs on hosted CPUs, so an offline self-hosted runner cannot strand required work.
     # Keep every shard scheduled; device initialization and parity checks still fail on errors.
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: that label is moving to ubuntu-26.04, whose POCL 6.0 / LLVM 18.1.8 aborts the test
+    # host while compiling the recurrent kernels ("LLVM ERROR: Instruction Combining did not reach a fixpoint after 1
+    # iterations"). ubuntu-24.04 ships POCL 5.0, which compiles them. A job got either image at random during the
+    # rollout, so the recurrent-foundations shard went red on unrelated pull requests.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
