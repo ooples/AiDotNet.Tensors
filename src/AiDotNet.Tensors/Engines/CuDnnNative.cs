@@ -2337,21 +2337,26 @@ public sealed partial class CuDnnConvolution : IDisposable
 
     private void EnsureWorkspaceUnlocked(ulong requiredSize, bool exactSize = false)
     {
-        if (_workspaceSize >= requiredSize) return;
+        if (!TryEnsureWorkspaceUnlocked(requiredSize, exactSize, out var result))
+            throw new InvalidOperationException($"Failed to allocate cuDNN workspace: {result}");
+    }
+
+    /// <summary>Grows the workspace, retrying at the exact size; returns false (and keeps the current workspace) when even that fails.</summary>
+    private bool TryEnsureWorkspaceUnlocked(ulong requiredSize, bool exactSize, out CudaResult result)
+    {
+        result = CudaResult.Success;
+        if (_workspaceSize >= requiredSize) return true;
 
         // Grow at least twofold, so the retired workspaces below add up to less than the live one.
         // A low-memory fallback must request only its required size.
         ulong size = exactSize ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
-        var result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
+        result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
         if (result == CudaResult.OutOfMemory && size > requiredSize)
         {
             size = requiredSize;
             result = CuBlasNative.cuMemAlloc(out grown, size);
         }
-        if (result != CudaResult.Success)
-        {
-            throw new InvalidOperationException($"Failed to allocate cuDNN workspace: {result}");
-        }
+        if (result != CudaResult.Success) return false;
         DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
 
         // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
@@ -2363,6 +2368,7 @@ public sealed partial class CuDnnConvolution : IDisposable
         _workspaceSize = size;
         _workspaceMemory = default;
         _workspaceMemory.OnAllocated(MemoryAccount, (long)size);
+        return true;
     }
 
     public void Dispose()

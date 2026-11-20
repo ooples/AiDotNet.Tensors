@@ -19,9 +19,7 @@ public sealed partial class CudaBackend : IConvBiasResidualBackend
                 _cudnnContext.BindStream(_stream);
                 if (_cudnnConv!.TryConvBiasResidualGpu(args))
                 {
-                    long launches = System.Threading.Interlocked.Increment(ref _convBiasResidualVendorLaunchCount);
-                    if (launches == 1 && Environment.GetEnvironmentVariable("AIDOTNET_GPU_CONV_BIAS_RESIDUAL_TRACE") == "1")
-                        Console.Error.WriteLine("[CONV-BIAS-RESIDUAL] CUDA cuDNN fused store succeeded; strict FP32 FMA.");
+                    System.Threading.Interlocked.Increment(ref _convBiasResidualVendorLaunchCount);
                     if (args.WriteActivation) LeakyRelu(args.Output, args.Activated, args.Alpha, count);
                     return true;
                 }

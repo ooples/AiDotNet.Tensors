@@ -29,7 +29,9 @@ public sealed partial class CuDnnConvolution
         lock (_context.StreamBindingLock)
         lock (_workspaceLock)
         {
-            if (bytes > 0) EnsureWorkspaceUnlocked(bytes);
+            // The vendor store is optional: when even an exact-size workspace cannot be allocated, decline so the
+            // caller's composition path (which needs no cuDNN workspace) runs instead of failing inference.
+            if (bytes > 0 && !TryEnsureWorkspaceUnlocked(bytes, exactSize: false, out _)) return false;
             float alpha1 = 1f, alpha2 = 1f;
             status = ConvBiasResidualNative.Forward(_context.Handle, ref alpha1,
                 input.Handle, args.Input.Handle, filter.Handle, args.Kernel.Handle,

@@ -172,17 +172,27 @@ public sealed class PackBothParticipantWorkspaceTests : IDisposable
     {
         CpuParallelSettings.UseCooperativePool = cooperative;
         var pool = new TrackingPool { ThrowOnRent = rentFailure ? 2 : int.MaxValue };
+        int bodyFailures = 0;
         void Run() => CpuParallelSettings.ParallelForIndependentWithLocal(0, 64, 64L * 1024 * 1024,
             () => new PackBothParticipantWorkspace("workspace.test", pool), (index, workspace) =>
             {
                 workspace.ForPanel((index % 3 + 1) * 32).Fill((byte)index);
-                if (!rentFailure && index == 4) throw new InvalidOperationException("Deliberate body failure.");
+                if (!rentFailure && index == 4)
+                {
+                    Interlocked.Increment(ref bodyFailures);
+                    throw new InvalidOperationException("Deliberate body failure.");
+                }
             }, static workspace => workspace.Dispose(), maximumDegreeOfParallelism: 2);
         Assert.ThrowsAny<Exception>(Run);
+        // The selected failure, not an unrelated one before any lease existed, must have ended the dispatch.
+        Assert.Equal(rentFailure ? 1 : 0, pool.RentFailures);
+        Assert.Equal(rentFailure ? 0 : 1, bodyFailures);
+        Assert.True(pool.SuccessfulRents >= 1, "The failure must follow at least one successful rent.");
         var stats = PackBothParticipantWorkspace.SnapshotDiagnostics();
         Assert.Equal(stats["owners_created"], stats["owners_disposed"]);
         Assert.InRange(stats["owners_created"], 1, 2);
         Assert.Equal(stats["rents"], stats["returns"]);
+        Assert.True(stats["rents"] >= 1);
         Assert.Equal(0, pool.Outstanding);
         Assert.Equal(0, stats["live_backing_bytes"]);
     }
@@ -237,14 +247,20 @@ public sealed class PackBothParticipantWorkspaceTests : IDisposable
     private sealed class TrackingPool : ArrayPool<byte>
     {
         private readonly ConcurrentDictionary<byte[], byte> _live = new();
-        private int _rentCalls, _returnCalls;
+        private int _rentCalls, _returnCalls, _rentFailures, _successfulRents;
         internal int ThrowOnRent = int.MaxValue;
         internal int ReturnCalls => _returnCalls;
         internal int Outstanding => _live.Count;
+        internal int RentFailures => Volatile.Read(ref _rentFailures);
+        internal int SuccessfulRents => Volatile.Read(ref _successfulRents);
         public override byte[] Rent(int minimumLength)
         {
             if (Interlocked.Increment(ref _rentCalls) == ThrowOnRent)
+            {
+                Interlocked.Increment(ref _rentFailures);
                 throw new InvalidOperationException("Deliberate rent failure.");
+            }
+            Interlocked.Increment(ref _successfulRents);
             var array = new byte[minimumLength + 32];
             Assert.True(_live.TryAdd(array, 0));
             return array;

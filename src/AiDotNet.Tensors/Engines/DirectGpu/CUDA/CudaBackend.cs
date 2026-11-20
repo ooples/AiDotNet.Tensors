@@ -1615,6 +1615,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // WeightNorm's row scale and reduction use explicit FP32 arithmetic; keep subnormals and sqrt/div semantics.
         CompileKernelModule(device, BatchExecutionCudaKernels.WeightNormPreciseSource, "weight_norm_precise_kernels",
             new[] { BatchExecutionCudaKernels.WeightNorm }, useFastMath: false);
+        CompileKernelModule(device, BatchExecutionCudaKernels.WeightNormBackwardPreciseSource, "weight_norm_backward_precise_kernels",
+            BatchExecutionCudaKernels.WeightNormBackwardKernelNames, useFastMath: false);
 
         CompileKernelModule(device, BatchExecutionCudaKernels.RfftMagnitudeCudaSource, "rfft_magnitude_precise_kernels",
             BatchExecutionCudaKernels.RfftMagnitudeKernelNames, useFastMath: false);
