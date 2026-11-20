@@ -11705,6 +11705,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             tenants.Sort((x, y) => firstWrite[x] != firstWrite[y] ? firstWrite[x].CompareTo(firstWrite[y]) : lastUse[x].CompareTo(lastUse[y]));
             var arrayOf = AssignPooledArrays(tenants, firstWrite, lastUse, allGrads, out var capacity);
+            ExportGradientPacking(tenants, firstWrite, lastUse, allGrads, arrayOf, capacity);
+
             if (Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
                 TraceGradientPooling(tenants, capacity, allGrads, placeholders, excluded, firstWrite, readBeforeWrite, unused);
 
