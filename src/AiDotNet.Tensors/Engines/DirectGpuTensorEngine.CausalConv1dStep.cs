@@ -20,15 +20,11 @@ public partial class DirectGpuTensorEngine
         var historyBuffer = PinInputResident(history) ?? throw new InvalidOperationException("The history could not be made device-resident.");
         using var x = GetOrAllocateBuffer(backend, input);
         using var w = GetOrAllocateBuffer(backend, weight);
-        OwnedBuffer? b = bias is null ? null : GetOrAllocateBuffer(backend, bias);
-        try
-        {
-            var output = AllocateFullyWrittenOutputBuffer(backend, batch * channels);   // every element written
-            step.CausalConv1dStep(historyBuffer, x.Buffer, w.Buffer, b?.Buffer, output.Buffer, taps, batch, channels, silu);
-            history.IncrementVersion();
-            BindResidentBuffer(history, historyBuffer, backend);
-            return DeferTensorResult<T>(backend, output.Buffer, batch * channels, new[] { batch, channels });
-        }
-        finally { b?.Dispose(); }
+        using OwnedBuffer? b = bias is null ? null : GetOrAllocateBuffer(backend, bias);
+        var output = AllocateFullyWrittenOutputBuffer(backend, batch * channels);   // every element written
+        step.CausalConv1dStep(historyBuffer, x.Buffer, w.Buffer, b?.Buffer, output.Buffer, taps, batch, channels, silu);
+        history.IncrementVersion();
+        BindResidentBuffer(history, historyBuffer, backend);
+        return DeferTensorResult<T>(backend, output.Buffer, batch * channels, new[] { batch, channels });
     }
 }
