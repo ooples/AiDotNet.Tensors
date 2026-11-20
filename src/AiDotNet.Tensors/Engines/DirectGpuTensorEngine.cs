@@ -18719,15 +18719,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// output plus the batch mean and biased variance. Null -- nothing launched -- when the backend or shape does not
     /// take the register-resident kernel; the caller then runs BatchNorm and ReLU. Records nothing: the compiled plan's
     /// BatchNorm+ReLU fusion supplies the backward (<see cref="Autodiff.BackwardFunctions{T}.BatchNormReluBackward"/>).
+    /// With a <paramref name="leakySlope"/> (positive; NaN: ReLU) the activation is that LeakyReLU, bit-identical to
+    /// BatchNorm then LeakyReLU (the BatchNorm+LeakyReLU fusion's forward).
     /// </summary>
     internal Tensor<T>? TryBatchNormReluForward<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon,
-        out Tensor<T>? mean, out Tensor<T>? variance, Tensor<T>? residual = null)
+        out Tensor<T>? mean, out Tensor<T>? variance, Tensor<T>? residual = null, float leakySlope = float.NaN)
     {
         using var __gpuOp = EnterGpuOp();
         mean = null;
         variance = null;
+        bool leaky = !float.IsNaN(leakySlope);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
+            || (leaky && (residual is not null || !(leakySlope > 0f)
+                || backend is not AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend))
             || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
             // Asked before anything is allocated: a compiled step keeps every buffer an action rents, so outputs rented
             // for a launch the backend then declined stayed as dead slots (an activation per fused node, every step).
@@ -18741,9 +18746,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufMean = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufVar = AllocateFullyWrittenOutputBuffer(backend, channels);
-        if (!varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
-                bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
-                residual: residual is null ? null : bufResidual.Buffer))
+        if (!(leaky
+                ? ((AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend)backend).TryBatchNormLeakyReluTraining(bufIn.Buffer,
+                    bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial,
+                    (float)epsilon, leakySlope)
+                : varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer,
+                    bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
+                    residual: residual is null ? null : bufResidual.Buffer)))
         {
             bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             return null;
@@ -18790,11 +18799,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal (Tensor<T> GradInput, Tensor<T> GradGamma, Tensor<T> GradBeta, Tensor<T>? GradResidual)?
         TryBatchNormReluBackwardCore<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
             Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, bool withResidual,
-            Tensor<T>? beta = null, Tensor<T>? gradOutput2 = null, Tensor<T>? intoInput = null, bool addInput = false)
+            Tensor<T>? beta = null, Tensor<T>? gradOutput2 = null, Tensor<T>? intoInput = null, bool addInput = false,
+            float leakySlope = float.NaN)
     {
         using var __gpuOp = EnterGpuOp();
+        // leakySlope (positive; NaN: ReLU): the activation was that LeakyReLU, and reluOutput is its output.
+        bool leaky = !float.IsNaN(leakySlope);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
+            || (leaky && (withResidual || !(leakySlope > 0f) || backend is not AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend))
             || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
             || !varianceBackend.AcceptsTrainingShape(batch, channels, spatial))
             return null;
@@ -18820,11 +18833,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
         using var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
         using var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
-        bool launched = varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer,
-            bufMean.Buffer, bufVar.Buffer, directTarget is { } dtLaunch ? dtLaunch.Buffer : bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial,
-            (float)epsilon, reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null,
-            beta: beta is not null && !withResidual ? bufBeta.Buffer : null,
-            gradOutput2: gradOutput2 is not null ? bufDy2.Buffer : null, accumulateGradInput: directTarget is not null && addInput);
+        var dxLaunch = directTarget is { } dtLaunch ? dtLaunch.Buffer : bufDx.Buffer;
+        bool launched = leaky
+            ? ((AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend)backend).TryBatchNormLeakyReluBackward(bufDy.Buffer,
+                bufOut.Buffer, bufIn.Buffer, bufGamma.Buffer, beta is not null ? bufBeta.Buffer : null, bufMean.Buffer,
+                bufVar.Buffer, dxLaunch, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial, (float)epsilon, leakySlope,
+                gradOutput2 is not null ? bufDy2.Buffer : null, directTarget is not null && addInput)
+            : varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer,
+                bufMean.Buffer, bufVar.Buffer, dxLaunch, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial,
+                (float)epsilon, reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null,
+                beta: beta is not null && !withResidual ? bufBeta.Buffer : null,
+                gradOutput2: gradOutput2 is not null ? bufDy2.Buffer : null, accumulateGradInput: directTarget is not null && addInput);
         if (!launched)
         {
             return null;
