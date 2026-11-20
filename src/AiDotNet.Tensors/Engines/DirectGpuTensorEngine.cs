@@ -30432,17 +30432,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         OwnedBuffer inputLease = default;
         IGpuBuffer? output = null;
+        OwnedBuffer outputLease = default;
+        bool outputLeaseActive = false;
         bool handedOff = false;
         try
         {
             inputLease = GetOrAllocateBuffer(backend, tensor);
             var input = inputLease.Buffer;
-            output = AllocateDeviceBufferUninitialized(backend, total);   // every route below writes all of it
+            // Compiled forward/backward actions reuse their declared scratch lifetime, as the other device outputs do.
+            // Ordinary slicing retains its existing allocation/reclamation behavior.
+            if (ScratchPoolingActive)
+            {
+                outputLease = AllocateFullyWrittenOutputBuffer(backend, total);
+                outputLeaseActive = true;
+                output = outputLease.Buffer;
+            }
+            else output = AllocateDeviceBufferUninitialized(backend, total); // All routes write the whole output.
             int segment = length[tensor.Rank - 1];
             int rows = total / segment;
             if (TryLastAxisOnlySlice(backend, input, output, tensor, start, length, rows, segment))
             {
                 var fast = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                if (outputLeaseActive) outputLease.RelinquishOwnership();
                 handedOff = true;
                 return fast;
             }
@@ -30453,6 +30464,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 rect.RectSlice(input, output, tensor.Shape._dims, start, length, scatter: false);
                 var single = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                if (outputLeaseActive) outputLease.RelinquishOwnership();
                 handedOff = true;
                 return single;
             }
@@ -30475,6 +30487,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             var result = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+            if (outputLeaseActive) outputLease.RelinquishOwnership();
             handedOff = true;
             return result;
         }
@@ -30487,7 +30500,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         finally
         {
             inputLease.DisposeAfterQueuedUse(backend);
-            if (!handedOff && output is not null) DisposeBufferAfterQueuedUse(backend, output);
+            if (!handedOff)
+            {
+                if (outputLeaseActive) outputLease.DisposeAfterQueuedUse(backend);
+                else if (output is not null) DisposeBufferAfterQueuedUse(backend, output);
+            }
         }
     }
 
@@ -31416,9 +31433,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var gi = UploadTensorRaw(b, input);
-                var go = b.AllocateBuffer(input.Length);
-                b.PowScalar(gi, go, Convert.ToSingle(exponent), input.Length);
-                return DeferTensorResult<T>(b, go, input.Length, input.Shape.ToArray());
+                // Pow fully overwrites its output. Reuse the compiled action's scratch just like other unary ops.
+                var outputLease = AllocateFullyWrittenOutputBuffer(b, input.Length);
+                try
+                {
+                    b.PowScalar(gi, outputLease.Buffer, Convert.ToSingle(exponent), input.Length);
+                    var result = DeferTensorResult<T>(b, outputLease.Buffer, input.Length, input.Shape.ToArray());
+                    outputLease.RelinquishOwnership();
+                    return result;
+                }
+                finally
+                {
+                    outputLease.DisposeAfterQueuedUse(b);
+                }
             }
             catch { }
         }

@@ -24,7 +24,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// cache write either).
 /// </para>
 /// </summary>
-internal static class AutotuneDispatcher
+internal static partial class AutotuneDispatcher
 {
     /// <summary>
     /// Decide the parallelism axis + blocking parameters for the current GEMM
@@ -71,7 +71,7 @@ internal static class AutotuneDispatcher
             return FallbackToHeuristic(m, n, k, mr, nr, procs, isDeterministic);
         }
 
-        var shape = BlasManagedAutotune.EncodeShape<T>(m, n, k, transA, transB, mr, nr, hasEpilogue, isDeterministic);
+        var shape = DispatcherShape<T>(m, n, k, transA, transB, mr, nr, hasEpilogue, isDeterministic);
 
         // Cache hit?
         var cached = BlasManagedAutotune.TryLookup(shape);

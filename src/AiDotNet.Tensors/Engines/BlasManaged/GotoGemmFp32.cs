@@ -53,6 +53,14 @@ internal static class GotoGemmFp32
     internal static bool IsPreferredForThreadBudget(int maxDegreeOfParallelism)
         => maxDegreeOfParallelism >= 48;
 
+    // Small M tiles underfill or tail-split the packed kernel. The single-thread route
+    // also avoids repacking A. Very wide thin-M shapes can still favor parallel PackBoth.
+    internal static bool PreferShape(int m, int n, int k, int threadBudget)
+        => (IsPreferredForThreadBudget(threadBudget) || PackBothUnderOccupies(m, threadBudget)
+                || PackBothNeedsTailSplit(m) || threadBudget == 1)
+            && (long)m * n * k >= ParallelMinWork
+            && (threadBudget == 1 || BeatsPackBoth(m, n, k));
+
     /// <summary>
     /// Smallest M-block PackBoth will cut to when it is short of parallel work; it parallelises over M
     /// blocks only (see the Sub-G occupancy floor in <c>AutotuneDispatcher.FallbackToHeuristic</c>).
