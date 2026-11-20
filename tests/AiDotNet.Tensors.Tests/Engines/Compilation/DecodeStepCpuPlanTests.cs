@@ -161,6 +161,44 @@ public class DecodeStepCpuPlanTests
             }
     }
 
+    // Two layers' caches in one plan: memory planning must not rebind one layer's carried state onto storage another
+    // tensor of the same shape (the other layer's position) later shares, so each advances once per execution.
+    [Fact]
+    public void Two_caches_in_one_cpu_plan_keep_their_own_positions()
+    {
+        const int batch = 1, capacity = 4, width = 2;
+        var cpu = new CpuEngine();
+        var caches = new[] { new Tensor<float>([batch, capacity, width]), new Tensor<float>([batch, capacity, width]) };
+        var positions = new[] { new Tensor<float>([1]), new Tensor<float>([1]) };
+        var x = new Tensor<float>([batch, width]);
+        CompiledInferencePlan<float> plan;
+        using (new EngineScope(cpu))
+        using (var scope = GraphMode.EnableInference())
+        {
+            var h = x;
+            Tensor<float>? y = null;
+            for (int l = 0; l < 2; l++)
+            {
+                var w = cpu.Softmax(cpu.KvCacheAppend(caches[l], positions[l], h), -1);                  // [capacity]
+                var scale = cpu.ReduceSum(cpu.TensorMultiplyScalar(w, 1f), new[] { 0 }, keepDims: true);   // [1]
+                h = cpu.TensorMultiply(cpu.TensorAddScalar(h, 1f), cpu.Reshape(scale, [1, 1]));
+                y = y is null ? w : cpu.TensorAdd(y, w);
+            }
+            plan = scope.CompileInference(y!, new[] { x }, Array.Empty<(Tensor<float>, Tensor<float>)>());
+        }
+        using (plan)
+            for (int t = 0; t < capacity; t++)
+            {
+                plan.SetInputs(new[] { T([batch, width], i => t + i) });
+                var w = plan.Execute().ToArray();
+                for (int s = 0; s < capacity; s++) Assert.Equal(s <= t ? 2f / (t + 1) : 0f, w[s], 5);
+                Assert.Equal(t + 1, positions[0].ToArray()[0]);
+                Assert.Equal(t + 1, positions[1].ToArray()[0]);
+                Assert.False(ReferenceEquals(((ISignatureTensor)positions[0]).SignatureStorageIdentity,
+                    ((ISignatureTensor)positions[1]).SignatureStorageIdentity));
+            }
+    }
+
     [Fact]
     public void Malformed_decode_step_arguments_are_rejected()
     {

@@ -65,10 +65,20 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
         // weights that were really leftover activation data.
         // HashSet<T>(int, IEqualityComparer<T>) is net472+; use the no-
         // capacity ctor so net471 compiles.
+        // A tensor a step reads before any step produced it is external even when a later step writes it: an in-place
+        // step's output is its target, so a carried state the plan advances in place (a decode cache, a scan state)
+        // is a step output by identity. Donating it let memory planning rebind two such states onto one storage
+        // (measured: two layers' KV-cache positions both advanced by every layer's append).
         var producedHere = new HashSet<Tensor<T>>(
             ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var readBeforeProduced = new HashSet<Tensor<T>>(
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int i = 0; i < steps.Length; i++)
-            producedHere.Add(steps[i].OutputBuffer);
+        {
+            foreach (var input in steps[i].Inputs)
+                if (!producedHere.Contains(input)) readBeforeProduced.Add(input);
+            if (!readBeforeProduced.Contains(steps[i].OutputBuffer)) producedHere.Add(steps[i].OutputBuffer);
+        }
 
         // Phase 1: Compute tensor lifetimes
         // Map each tensor (by reference identity) to its last-use step index.
@@ -173,7 +183,8 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
             // Try to reuse a dead buffer for this step's output
             long key = BufferKey(output);
             bool firstWrite = written.Add(output);
-            if (firstWrite && groupSize[groupOf[output]] == 1 && deadPool.TryGetValue(key, out var pool) && pool.Count > 0)
+            // An external tensor keeps its own storage: a carried state's first write here is an in-place advance.
+            if (firstWrite && producedHere.Contains(output) && groupSize[groupOf[output]] == 1 && deadPool.TryGetValue(key, out var pool) && pool.Count > 0)
             {
                 // Rebind: the step's Execute writes to its output parameter, so the OUTPUT is rebound to share the
                 // DONOR's storage: the donor's memory (dead) is overwritten and the output now lives in it. The most
