@@ -67,18 +67,19 @@ internal readonly struct CudaConv2DArgs
 
     internal int OutputCount => Batch * OutChannels * OutHeight * OutWidth;
 
-    /// <summary>Shape class: every geometric parameter (output extent follows from them) and the epilogue (bias,
-    /// activation, input prologue): the fastest route differs with it -- a route that applies the epilogue in its own
-    /// output store saves passes another route runs after -- so a convolution with a bias and the same one without (a
-    /// transposed convolution's data gradient runs as a bias-free forward) are tuned apart.</summary>
+    /// <summary>Shape class: every geometric parameter (output extent follows from them), never the epilogue (bias,
+    /// activation, input prologue). One geometry runs one algorithm whether or not a bias and activation are fused in:
+    /// keyed apart, a compiled plan's fused convolution and the eager tape's bare one were tuned apart, ran different
+    /// TF32 cuDNN algorithms, and trained differently (MobileNetV2's fused step vs its eager tape, through batch norms
+    /// over four values). The channels-last epilogue twins compete in the same decision; a bare call that picks one runs
+    /// the twin's algorithm without the epilogue.</summary>
     internal unsafe TunedShape Shape()
     {
-        int* d = stackalloc int[16];
+        int* d = stackalloc int[15];
         d[0] = Batch; d[1] = InChannels; d[2] = InHeight; d[3] = InWidth; d[4] = OutChannels;
         d[5] = KernelH; d[6] = KernelW; d[7] = StrideH; d[8] = StrideW; d[9] = PadH; d[10] = PadW;
         d[11] = DilationH; d[12] = DilationW; d[13] = OutHeight; d[14] = OutWidth;
-        d[15] = (Bias is null ? 0 : 1) | (PreScale is null ? 0 : 2) | ((int)Activation << 2);
-        return TunedShape.Create(TunedKernelDType.Float32, new ReadOnlySpan<int>(d, 16));
+        return TunedShape.Create(TunedKernelDType.Float32, new ReadOnlySpan<int>(d, 15));
     }
 }
 
