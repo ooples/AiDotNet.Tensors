@@ -15482,14 +15482,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
             int[] inputBShape = (int[])inputB._shape.Clone();
             int[] outShape = (int[])output._shape.Clone();
-            // With no reduce axes the output gradient goes to inputB element for element. A lower-rank inputB that
-            // needs no reduction ([64] against a [1, 64] output: the padded axis has size 1 on both sides) holds the
-            // same elements under a different shape, and TensorAddInto refuses mismatched shapes, so an accumulating
-            // inputB threw every step and the whole plan fell back to the eager tape (DeepFactor, found by the model
-            // census). View the output gradient in inputB's shape once, here; a contiguous Reshape is O(1).
-            var gradOutForB = reduceAxesArr.Length == 0 && !System.Linq.Enumerable.SequenceEqual(gradOut._shape, inputBShape)
-                ? gradOut.Reshape(inputBShape)
-                : gradOut;
+            // With no reduced axis a lower-rank bias has the same ordered elements as the output.
+            // Read the live spans during replay because the alias pool can rebind either gradient after compilation.
+            bool differentRank = gradOut.Rank != gradInputB.Rank;
+            var broadcastOps = MathHelper.GetNumericOperations<T>();
 
             // Detect the NCHW→[1,C,1,1] bias-add pattern: reduce axes are
             // exactly {0, 2, 3} (batch + both spatial dims) AND output is
@@ -15542,8 +15538,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // gradInputB: reduce-sum gradOut over the broadcast axes.
                 if (reduceAxesArr.Length == 0)
                 {
-                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, gradOutForB);
-                    else gradOutForB.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    if (!accumB) gradOut.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    else if (differentRank) broadcastOps.Add(gradInputB.AsSpan(), gradOut.AsSpan(), gradInputB.AsWritableSpan());
+                    else eng.TensorAddInto(gradInputB, gradInputB, gradOut);
                 }
                 else if (isNchwChannelReduce)
                 {

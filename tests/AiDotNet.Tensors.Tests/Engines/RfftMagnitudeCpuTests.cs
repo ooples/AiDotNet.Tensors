@@ -19,13 +19,12 @@ public sealed class RfftMagnitudeCpuTests
     [InlineData(17)]
     public void FloatAndDoubleMatchIndependentDftAndAdjoint(int n)
     {
-        CheckDft<float>(n, 3e-6);
-        CheckDft<double>(n, 2e-11);
+        CheckDft<float>(new CpuEngine(), n, 3e-6);
+        CheckDft<double>(new CpuEngine(), n, 2e-11);
     }
 
-    private static void CheckDft<T>(int n, double tolerance)
+    internal static void CheckDft<T>(CpuEngine engine, int n, double tolerance)
     {
-        var engine = new CpuEngine();
         var ops = MathHelper.GetNumericOperations<T>();
         int bins = n / 2 + 1;
         var values = Enumerable.Range(0, 6 * n).Select(i => .2 + .3 * Math.Sin(.31 * i)).Select(ops.FromDouble).ToArray();
@@ -273,5 +272,17 @@ public sealed class RfftMagnitudeCpuTests
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.InRange(Math.Abs(actual[i] - expected[i]), 0, tolerance * Math.Max(1, Math.Abs(expected[i])));
+    }
+}
+
+[Collection("DirectGpuSerial")]
+public sealed class GpuRfftMagnitudeTests
+{
+    [SkippableFact]
+    public void OddLengthMagnitudeAndAdjointMatchDft()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "A GPU backend is required.");
+        RfftMagnitudeCpuTests.CheckDft<float>(gpu, 129, 3e-4);
     }
 }

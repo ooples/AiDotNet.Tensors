@@ -11,8 +11,7 @@ internal static partial class BackwardFunctions<T>
     {
         var input = inputs[0];
         double epsilon = (double)savedState[0];
-        if (CreatesGraph && TryCompositeBackwardFor(gradOutput, inputs, engine, grads, FirstInput,
-                e => RfftMagnitudeHigherOrder(e, input, epsilon)))
+        if (CreatesGraph && TryRfftMagnitudeHigherOrder(gradOutput, inputs, engine, grads, epsilon))
             return;
         if (!DifferentiableOps.IsGradientRequired(input)) return;
         var target = DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add);
@@ -27,6 +26,11 @@ internal static partial class BackwardFunctions<T>
         engine.TensorRfftMagnitudeBackwardInto(gradOutput, input, target, epsilon, add);
         DifferentiableOps.CommitDirectGradWrite(grads, input, target);
     }
+
+    private static bool TryRfftMagnitudeHigherOrder(Tensor<T> gradOutput, Tensor<T>[] inputs,
+        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads, double epsilon)
+        => TryCompositeBackwardFor(gradOutput, inputs, engine, grads, FirstInput,
+            e => RfftMagnitudeHigherOrder(e, inputs[0], epsilon));
 
     // The first-order operator uses a native FFT and an analytic adjoint. Explicit
     // higher-order requests retain a graph of resident primitive operations.

@@ -147,15 +147,22 @@ public partial class DirectGpuTensorEngine
 
     private static void PortableRfftTransform(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int rows, int n, bool inverse)
     {
-        if ((n & (n - 1)) != 0)
-            throw new NotSupportedException($"{backend.BackendName} requires a power-of-two real FFT length without a supported vendor plan. No host fallback was performed.");
         int count = checked(rows * n);
         using var re = AllocateTransientScratch(backend, count, fullyWritten: true);
         using var im = AllocateTransientScratch(backend, count, fullyWritten: true);
-        using var outRe = AllocateTransientScratch(backend, count, fullyWritten: true);
-        using var outIm = AllocateTransientScratch(backend, count, fullyWritten: true);
         backend.StridedGather(input, re.Buffer, 0, 2, count);
         backend.StridedGather(input, im.Buffer, 1, 2, count);
+        if ((n & (n - 1)) != 0)
+        {
+            if (backend is not IGenericFftBackend generic || !generic.SupportsFftElementType(FftElementType.Float32))
+                throw new NotSupportedException($"{backend.BackendName} has no device FFT for length {n}.");
+            generic.LaunchFftGeneric(re.Buffer, im.Buffer, rows, n, inverse, FftElementType.Float32);
+            backend.StridedScatter(re.Buffer, output, 0, 2, count);
+            backend.StridedScatter(im.Buffer, output, 1, 2, count);
+            return;
+        }
+        using var outRe = AllocateTransientScratch(backend, count, fullyWritten: true);
+        using var outIm = AllocateTransientScratch(backend, count, fullyWritten: true);
         backend.BatchedFFT(re.Buffer, im.Buffer, outRe.Buffer, outIm.Buffer, rows, n, inverse);
         backend.StridedScatter(outRe.Buffer, output, 0, 2, count);
         backend.StridedScatter(outIm.Buffer, output, 1, 2, count);
