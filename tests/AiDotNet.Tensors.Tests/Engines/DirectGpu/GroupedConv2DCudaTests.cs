@@ -126,6 +126,7 @@ public sealed class GroupedConv2DCudaTests
     [SkippableTheory] [InlineData(false)] [InlineData(true)]
     public void Recorded_grouped_node_preserves_public_reads_and_private_retirement_across_training(bool inputGradients)
     {
+#if INFERENCE_WORKSPACE_DEMAND
         using var engine = new DirectGpuTensorEngine();
         Skip.IfNot(engine.IsGpuAvailable && engine.GetBackend() is CudaBackend, "CUDA unavailable.");
         var previousEngine = AiDotNetEngine.Current;
@@ -186,6 +187,9 @@ public sealed class GroupedConv2DCudaTests
             AiDotNet.Tensors.Engines.Compilation.CompiledTrainingPlan<float>.CompiledInputGradientsForTests = previousInputGradients;
             AiDotNetEngine.Current = previousEngine;
         }
+#else
+        Skip.If(true, "The grouped convolution and inference workspace integration test requires both implementations.");
+#endif
     }
 
     [SkippableFact]
