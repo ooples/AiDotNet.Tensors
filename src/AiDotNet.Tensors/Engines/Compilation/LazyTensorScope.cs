@@ -482,6 +482,38 @@ internal sealed class LazyTensorScope : IDisposable
     }
 
     /// <summary>Records a variadic operation as a lazy node.</summary>
+    /// <summary>
+    /// Records an op that returns a new output AND writes <paramref name="inPlaceTarget"/> (one of its inputs) in place,
+    /// as one kernel (a recurrent decode step: the output and the advanced state from one pass over the state). The op's
+    /// node runs after every node that read the target before it; a no-op in-place node on the target, after the op,
+    /// becomes the target's producer, so later readers see the written value and a compiled plan sees the target as a
+    /// leaf written in place. Forward only.
+    /// </summary>
+    internal Tensor<T> RecordVariadicWritingInPlace<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T>[] inputs,
+        int[] outputShape,
+        Tensor<T> inPlaceTarget,
+        Action<IEngine, Tensor<T>> execute)
+    {
+        if (Array.IndexOf(inputs, inPlaceTarget) < 0)
+            throw new ArgumentException("The in-place target must be one of the op's inputs.", nameof(inPlaceTarget));
+        var output = RentOutput<T>(outputShape);
+        var node = new LazyNode<T>(opType, opName, inputs, output, execute) { RecordedUnderNoGrad = true };
+        // The op itself overwrites the target, so it is ordered after the target's earlier readers (as RecordInPlace orders
+        // its write).
+        long since = inPlaceTarget.LazySource?.RecordOrder ?? 0;
+        var readers = new List<ILazyNode>();
+        for (var scope = this; scope is not null; scope = scope._parent)
+            CollectReadersSince(scope._nodes, inPlaceTarget, since, readers);
+        node.SetEarlierReaders(readers.ToArray());
+        output.LazySource = node;
+        AddNode(node);
+        RecordInPlace<T>(opType, opName + ".StateWrite", inPlaceTarget, new[] { output }, static (_, _) => { });
+        return output;
+    }
+
     internal Tensor<T> RecordVariadic<T>(
         LazyNodeType opType,
         string opName,

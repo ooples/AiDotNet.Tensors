@@ -1378,6 +1378,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Several device copies in one launch (CopyMany): one graph node for a stateful plan's state writes.
         CompileKernelModule(device, KernelSourceResources.Read("CudaCopyMany.c"), "copy_many_kernels", new[] { "copy_many8" });
 
+        // The gated delta rule's decode step (IGatedDeltaNetStepBackend): state updated in place, output in one pass.
+        CompileKernelModule(device, KernelSourceResources.Read("CudaGatedDeltaNetStep.c"), "gdn_step_kernels", new[] { "gdn_step" });
+
         // The octonion backward and fused-ReLU kernels were defined in CudaOctonionKernels, which nothing compiled, so
         // OctonionLinearBackward{Input,Weights,Biases} and OctonionLinearForwardFusedReLU threw kernel-not-found and
         // ran on the CPU. octonion_linear_forward keeps coming from the specialized module. Optional, like the parity

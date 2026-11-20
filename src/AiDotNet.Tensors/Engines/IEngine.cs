@@ -4693,6 +4693,27 @@ public partial interface IEngine
         int numHeads);
 
     /// <summary>
+    /// One decode position of the gated delta rule, per state row r: <c>pred = S k</c>, <c>delta = beta (v - pred)</c>,
+    /// <c>S &lt;- alpha S + delta k^T</c>, <c>o = S q</c> (S read before this position's decay). <paramref name="state"/>
+    /// is updated IN PLACE, so a compiled decode plan keeps it in one persistent buffer; the output and the new state come
+    /// from one pass over the state. Forward only (decoding).
+    /// </summary>
+    /// <param name="state">The memory [rows, valueDim, keyDim], contiguous; written in place.</param>
+    /// <param name="query">This position's queries, rows x keyDim values.</param>
+    /// <param name="key">This position's keys (already scaled as the caller's rule requires), rows x keyDim values.</param>
+    /// <param name="value">This position's values, rows x valueDim values.</param>
+    /// <param name="alpha">The decay per row (rows values).</param>
+    /// <param name="beta">The write strength per row (rows values).</param>
+    /// <returns>The output <c>o</c> [rows, valueDim].</returns>
+    Tensor<T> GatedDeltaNetStep<T>(
+        Tensor<T> state,
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        Tensor<T> alpha,
+        Tensor<T> beta);
+
+    /// <summary>
     /// Fused xLSTM (mLSTM) matrix-memory recurrence over a whole sequence as one differentiable op
     /// (forward + analytic BPTT backward); see <c>CpuEngine.XLstmScan.cs</c> (#1464).
     /// </summary>
