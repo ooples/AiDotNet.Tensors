@@ -11,6 +11,53 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("EngineCurrentGlobalState")]
 public sealed class SingleOutputConvBiasTests
 {
+#if NET7_0_OR_GREATER
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public void MultiChannelWaveformsMatchBiasSeededConvolutionAcrossBatches(int dilation)
+    {
+        if (!Avx2.IsSupported || !Fma.IsSupported) return;
+        const int batches = 2, channels = 16, filters = 8, width = 96, taps = 5;
+        var random = new Random(479);
+        float[] Values(int length) => Enumerable.Range(0, length).Select(_ => (float)(random.NextDouble() - .5)).ToArray();
+        var signal = Values(batches * channels * width);
+        var weights = Values(filters * channels * taps);
+        var biases = Values(filters);
+        using var input = new Tensor<float>(signal, new[] { batches, channels, 1, width });
+        using var kernel = new Tensor<float>(weights, new[] { filters, channels, 1, taps });
+        using var bias = new Tensor<float>(biases, new[] { filters });
+        using var output = new Tensor<float>(new[] { batches, filters, 1, width });
+        int padding = dilation * (taps / 2);
+        bool previous = CpuEngine.SingleOutputConvBiasEnabled;
+        try
+        {
+            CpuEngine.SingleOutputConvBiasEnabled = true;
+            new CpuEngine().Conv2DBiasActivationInto(output, input, kernel, bias, false,
+                new[] { 1, 1 }, new[] { 0, padding }, new[] { 1, dilation });
+        }
+        finally { CpuEngine.SingleOutputConvBiasEnabled = previous; }
+
+        var actual = output.ToArray();
+        for (int batch = 0; batch < batches; batch++)
+            for (int filter = 0; filter < filters; filter++)
+                for (int t = 0; t < width; t++)
+                {
+                    float sum = biases[filter];
+                    for (int group = 0; group < channels; group += 8)
+                        for (int tap = 0; tap < taps; tap++)
+                            for (int ch = group; ch < group + 8; ch++)
+                            {
+                                int sample = t + tap * dilation - padding;
+                                if ((uint)sample < (uint)width)
+                                    sum = MathF.FusedMultiplyAdd(signal[(batch * channels + ch) * width + sample],
+                                        weights[(filter * channels + ch) * taps + tap], sum);
+                            }
+                    Assert.Equal(sum, actual[(batch * filters + filter) * width + t]);
+                }
+    }
+#endif
+
     [Theory]
     [InlineData(256)]
     [InlineData(273)]
