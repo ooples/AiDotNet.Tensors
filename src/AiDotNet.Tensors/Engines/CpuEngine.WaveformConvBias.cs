@@ -11,8 +11,6 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class CpuEngine
 {
-    private static bool s_waveformConvBiasObserved;
-
     private bool TryWaveformConvBiasInto(Tensor<float> output, Tensor<float> input, Tensor<float> kernel,
         Tensor<float> bias, int[] stride, int[] padding, int[] dilation)
     {
@@ -24,7 +22,8 @@ public partial class CpuEngine
             || input._shape[2] != 1 || kernel._shape[2] != 1 || output._shape[2] != 1
             || stride[0] != 1 || stride[1] != 1 || padding[0] != 0 || dilation[0] != 1 || dilation[1] <= 0
             || width < 64 || width % 32 != 0 || output._shape[3] != width || channels < 8 || channels % 8 != 0
-            || filters < 8 || taps < 3 || taps > 15 || taps % 2 == 0 || padding[1] != (long)(taps / 2) * dilation[1])
+            || filters < 8 || taps < 3 || taps > 15 || taps % 2 == 0 || padding[1] != (long)(taps / 2) * dilation[1]
+            || (long)(taps - 1) * dilation[1] + width > int.MaxValue)
             return false;
         using var keepInput = new KeepAliveScope(input);
         using var keepKernel = new KeepAliveScope(kernel);
@@ -45,11 +44,6 @@ public partial class CpuEngine
                 y.Span.Slice(row * width, width), channels, width, taps, spacing, pad);
         }, deterministicSafe: true);
         output.IncrementVersion();
-        if (!s_waveformConvBiasObserved && Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
-        {
-            s_waveformConvBiasObserved = true;
-            AiDotNetEngine.LogDiagnostic("[WAVEFORM-CONV-BIAS] executed");
-        }
         return true;
     }
 
