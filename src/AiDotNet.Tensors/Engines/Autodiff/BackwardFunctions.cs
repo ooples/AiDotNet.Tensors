@@ -2186,6 +2186,33 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Backward of a convolution whose channel bias feeds a training BatchNorm + activation, the bias folded into the
+    /// BatchNorm by the compiled plan (<see cref="Compilation.ConvBiasBatchNormFusionPattern"/>). inputs = x, kernel, bias,
+    /// gamma, beta; savedState = the convolution's backward and saved state, the BatchNorm + activation's backward and saved
+    /// state, and z, the bias-free convolution output the BatchNorm normalized. The BatchNorm + activation backward gives
+    /// z's gradient, the convolution's backward takes it to x and the kernel, and the bias gets its exact gradient, zero:
+    /// the per-channel sum of a training BatchNorm's input gradient vanishes.
+    /// </summary>
+    internal static void ConvBiasBatchNormBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var convBackward = (BackwardFunction<T>)savedState[0];
+        var convSaved = (object[])savedState[1];
+        var innerBackward = (BackwardFunction<T>)savedState[2];
+        var innerSaved = (object[])savedState[3];
+        var z = (Tensor<T>)savedState[4];
+        innerBackward(gradOutput, new[] { z, inputs[3], inputs[4] }, output, innerSaved, engine, grads);
+        if (grads.TryGetValue(z, out var gradZ))
+        {
+            grads.Remove(z);
+            convBackward(gradZ, new[] { inputs[0], inputs[1] }, z, convSaved, engine, grads);
+        }
+        if (DifferentiableOps.IsGradientRequired(inputs[2]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], new Tensor<T>((int[])inputs[2]._shape.Clone()), engine);
+    }
+
+    /// <summary>
     /// Backward of a training BatchNorm whose output feeds a ReLU6 -- fused by the compiled plan
     /// (<see cref="Compilation.BatchNormRelu6FusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is the
     /// ReLU6's output. Its mask comes from the output: 0 &lt; ReLU6(z) &lt; 6 exactly when 0 &lt; z &lt; 6, so the
