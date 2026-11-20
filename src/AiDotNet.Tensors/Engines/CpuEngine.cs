@@ -39012,7 +39012,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 // the GPU gather read this step's tokens while the table gradient went to the trace
                                 // batch's rows (measured: a GPU-compiled int-id plan diverged from the CPU from step 2).
                                 var liveIds = capturedIndices.GetReadOnlyDataArray();
-                                for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveIds[i]);
+                                for (int i = 0; i < n; i++) idxSnap[i] = EmbeddingIndexToInt64(liveIds[i]);
                                 return;
                             }
                         }
@@ -39025,7 +39025,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // forward gather AND the matching backward (which holds the same idxSnap array) use the
                         // current step's tokens. Covered by EmbeddingIndicesMustRefreshAcrossStep_NotFrozenAtCompileTime.
                         var liveRaw = capturedIndices.GetReadOnlyDataArray();
-                        for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveRaw[i]);
+                        for (int i = 0; i < n; i++) idxSnap[i] = EmbeddingIndexToInt64(liveRaw[i]);
                         // Replay forward: re-execute the row-gather into
                         // the pre-allocated output buffer.
                         // Embedding tables are input operands. Inference may keep them in a
@@ -39071,7 +39071,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // meaningful error instead of OverflowException from Convert.ToInt32.
         for (int i = 0; i < numIndices; i++)
         {
-            long tokenIdxLong = Convert.ToInt64(idxData[i]);
+            long tokenIdxLong = EmbeddingIndexToInt64(idxData[i]);
 
             if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                 throw new ArgumentOutOfRangeException(nameof(indices),
@@ -39299,8 +39299,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int n = indices.Length;
         var snap = new long[n];
         var raw = indices.GetReadOnlyDataArray();
-        for (int i = 0; i < n; i++) snap[i] = Convert.ToInt64(raw[i]);
+        for (int i = 0; i < n; i++) snap[i] = EmbeddingIndexToInt64(raw[i]);
         return snap;
+    }
+
+    [MethodImpl(HotInline)]
+    private static long EmbeddingIndexToInt64<TIndex>(TIndex value) where TIndex : unmanaged
+    {
+        // Convert.ToInt64(object) boxes each generic token. Int32 and Int64 are the usual
+        // index tensors, and a compiled lookup refreshes every token on every replay.
+        if (typeof(TIndex) == typeof(int)) return Unsafe.As<TIndex, int>(ref value);
+        if (typeof(TIndex) == typeof(long)) return Unsafe.As<TIndex, long>(ref value);
+        return Convert.ToInt64(value);
     }
 
     /// <inheritdoc/>
@@ -39363,7 +39373,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             for (int i = 0; i < numIndices; i++)
             {
-                long tokenIdxLong = Convert.ToInt64(idxData[i]);
+                long tokenIdxLong = EmbeddingIndexToInt64(idxData[i]);
 
                 if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                     throw new ArgumentOutOfRangeException(nameof(indices),
