@@ -21,6 +21,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         var tensors = new HashSet<Tensor<T>>(parameters, comparer) { loss };
         tensors.UnionWith(retained);
         var producers = new Dictionary<Tensor<T>, CompiledStep<T>?>(comparer);
+        var reshapedViews = new Dictionary<Tensor<T>, Tensor<T>?>(comparer);
         var readers = new Dictionary<Tensor<T>, int>(comparer);
         var protectedStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         foreach (var tensor in tensors) protectedStorage.Add(tensor.StorageIdentity);
@@ -30,6 +31,12 @@ internal sealed partial class CompiledTrainingPlan<T>
         {
             tensors.Add(step.OutputBuffer);
             producers[step.OutputBuffer] = producers.ContainsKey(step.OutputBuffer) ? null : step;
+            if (step.OpName == "Reshape" && step.BackwardFn == BackwardFunctions<T>.ReshapeBackward
+                && !step.ReplaysHostState && step.Inputs.Length == 1 && step.OutputBuffer.SharesStorageWith(step.Inputs[0]))
+            {
+                var parent = step.Inputs[0];
+                reshapedViews[parent] = reshapedViews.ContainsKey(parent) ? null : step.OutputBuffer;
+            }
             foreach (var input in step.Inputs)
             {
                 if (input is null) continue;
@@ -86,10 +93,17 @@ internal sealed partial class CompiledTrainingPlan<T>
             }
             if (source.OpName != "TensorChannelBiasAdd" || source.Inputs.Length != 2
                 || source.BackwardFn != BackwardFunctions<T>.ChannelBiasAddBackward || source.OutputBuffer.IsView
-                || !Private(output, null) || !Private(input, biasViewSource)
+                || !Private(input, biasViewSource)
                 || biasViewSource is not null && input.SharesStorageWith(biasViewSource) && !Private(biasViewSource, input))
                 continue;
+            reshapedViews.TryGetValue(output, out var outputView);
+            if (!Private(output, outputView) || outputView is not null && !Private(outputView, output))
+                continue;
+            // Rebind the complete result and its recorded reshape together. A caller-held
+            // view, retained state, or an unrelated storage wrapper fails the ownership checks.
+            protectedStorage.Add(input.StorageIdentity);
             output.RebindStorageFromGraph(input);
+            outputView?.RebindGraphReshapeStorageFrom(output);
             sharedCount++;
         }
         return sharedCount;

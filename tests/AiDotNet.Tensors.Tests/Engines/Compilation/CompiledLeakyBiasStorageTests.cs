@@ -26,7 +26,20 @@ public sealed class CompiledLeakyBiasStorageTests
         Assert.Equal(baseline.Values, candidate.Values);
     }
 
-    private static (bool Shared, float[] Values) Run(bool enabled, bool reshape, float slope, bool retainPreactivation)
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Recorded_output_reshape_keeps_its_values_and_respects_retention(bool retainResult)
+    {
+        var baseline = Run(false, true, .1f, false, true, retainResult);
+        var candidate = Run(true, true, .1f, false, true, retainResult);
+        Assert.False(baseline.Shared);
+        Assert.Equal(!retainResult, candidate.Shared);
+        Assert.Equal(baseline.Values, candidate.Values);
+    }
+
+    private static (bool Shared, float[] Values) Run(bool enabled, bool reshape, float slope, bool retainPreactivation,
+        bool reshapeResult = false, bool retainResult = false)
     {
         const string switchName = "AIDOTNET_CPU_COMPILED_LEAKY_STORAGE";
         string? previous = Environment.GetEnvironmentVariable(switchName);
@@ -37,15 +50,17 @@ public sealed class CompiledLeakyBiasStorageTests
             var input = new Tensor<float>(new[] { -2f, 0f, 1f, 3f, -4f, .25f }, new[] { 1, 2, 1, 3 });
             var bias = new Tensor<float>(new[] { 0f, -.25f }, new[] { 2 });
             var parameters = new[] { input, bias };
-            Tensor<float> shifted, activated;
+            Tensor<float> shifted, activated, result;
             ICompiledTrainingPlan<float> compiled;
             using (var graph = GraphMode.EnableTraining(parameters))
             {
                 var biased = engine.TensorChannelBiasAdd(input, bias);
                 shifted = reshape ? engine.Reshape(biased, new[] { 1, 2, 3 }) : biased;
                 activated = engine.LeakyReLU(shifted, slope);
+                result = reshapeResult ? engine.Reshape(activated, new[] { 3, 2 }) : activated;
                 if (retainPreactivation) graph.RetainOutput(shifted);
-                compiled = graph.CompileTraining(parameters, engine.ReduceSum(activated));
+                if (retainResult) graph.RetainOutput(result);
+                compiled = graph.CompileTraining(parameters, engine.ReduceSum(result));
             }
             using (compiled)
             {
@@ -57,6 +72,7 @@ public sealed class CompiledLeakyBiasStorageTests
                 {
                     values.AddRange(plan.Step().ToArray());
                     if (retainPreactivation) values.AddRange(shifted.ToArray());
+                    if (retainResult) values.AddRange(result.ToArray());
                     foreach (var parameter in parameters)
                     {
                         values.AddRange(parameter.Grad!.ToArray());

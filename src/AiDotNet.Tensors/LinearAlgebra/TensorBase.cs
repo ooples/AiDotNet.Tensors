@@ -605,8 +605,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void RebindStorageFromGraph(TensorBase<T> source)
         => RebindStorageFromCore(source, graphOwnsStorage: true);
 
+    internal void RebindGraphReshapeStorageFrom(TensorBase<T> source)
+    {
+        if (!CoversWholeVector || !source.CoversWholeVector || Length != source.Length)
+            throw new InvalidOperationException("A graph reshape must cover the same contiguous element range.");
+        RebindStorageFromCore(source, graphOwnsStorage: true, wholeVectorReshape: true);
+    }
+
     [MethodImpl(Hot)]
-    private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage)
+    private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage, bool wholeVectorReshape = false)
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (source is null) throw new ArgumentNullException(nameof(source));
@@ -615,18 +622,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // element-for-element or the rebind would leave our `_shape`/`_strides`
         // out of sync with the new storage. We accept any shape permutation
         // the caller claims — strides/shape on `this` are untouched.
-        if (source._shape.Length != _shape.Length)
-            throw new ArgumentException(
-                $"Rebind requires same rank. This tensor has rank {_shape.Length}, " +
-                $"source has rank {source._shape.Length}.",
-                nameof(source));
-        for (int i = 0; i < _shape.Length; i++)
+        if (!wholeVectorReshape)
         {
-            if (_shape[i] != source._shape[i])
+            if (source._shape.Length != _shape.Length)
                 throw new ArgumentException(
-                    $"Rebind requires same shape. This [{string.Join(", ", _shape)}] vs " +
-                    $"source [{string.Join(", ", source._shape)}].",
+                    $"Rebind requires same rank. This tensor has rank {_shape.Length}, " +
+                    $"source has rank {source._shape.Length}.",
                     nameof(source));
+            for (int i = 0; i < _shape.Length; i++)
+            {
+                if (_shape[i] != source._shape[i])
+                    throw new ArgumentException(
+                        $"Rebind requires same shape. This [{string.Join(", ", _shape)}] vs " +
+                        $"source [{string.Join(", ", source._shape)}].",
+                        nameof(source));
+            }
         }
 
         // Contiguity + zero-offset: the layout in `this` must describe a flat
