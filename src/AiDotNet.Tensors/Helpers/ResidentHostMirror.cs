@@ -40,7 +40,10 @@ internal static partial class ResidentHostMirror
         private void Download(object key)
         {
             var vector = key as VectorBase<T>;
-            var array = vector is null ? (T[])key : vector.GetBackingArrayUnsafe() ?? new T[vector.Length];
+            T[]? existing;
+            T[] array;
+            if (vector is null) { existing = (T[])key; array = existing; }
+            else { existing = vector.GetBackingArrayUnsafe(); array = existing ?? new T[vector.Length]; }
             WeakReference<Tensor<T>>[] members;
             lock (Members) members = Members.ToArray();
             IGpuBuffer? lastBuffer = null;
@@ -73,7 +76,14 @@ internal static partial class ResidentHostMirror
                 lastOffset = t._storageOffset;
                 lastLength = t.Length;
             }
-            if (lastBuffer is null) throw new InvalidOperationException(NoLiveReaderMessage);
+            // With no reader left, storage that already has a host array keeps it: a member whose buffer was released
+            // has nothing to contribute and its host slice is already the value. Deferred storage has no host value to
+            // fall back on, so publishing a fresh array there would invent zeros; that case is the error.
+            if (lastBuffer is null)
+            {
+                if (existing is null) throw new InvalidOperationException(NoLiveReaderMessage);
+                return;
+            }
             if (vector is not null)
             {
                 // Publish only after every slice downloaded successfully. Subsequent array-backed binds
