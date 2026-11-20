@@ -1375,6 +1375,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
             Kernels.CudaMissingLookupKernels.GetKernelNames());
 
+        // Several device copies in one launch (CopyMany): one graph node for a stateful plan's state writes.
+        CompileKernelModule(device, KernelSourceResources.Read("CudaCopyMany.c"), "copy_many_kernels", new[] { "copy_many8" });
+
         // The octonion backward and fused-ReLU kernels were defined in CudaOctonionKernels, which nothing compiled, so
         // OctonionLinearBackward{Input,Weights,Biases} and OctonionLinearForwardFusedReLU threw kernel-not-found and
         // ran on the CPU. octonion_linear_forward keeps coming from the specialized module. Optional, like the parity
@@ -11117,6 +11120,47 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // counted, so ops whose device work is one whole-buffer copy (TensorReal/TensorImag of a split-complex
         // input) showed up on the residency probe as CPU fallbacks.
         GpuLaunchProbe.OnLaunch();
+    }
+
+    /// <summary>
+    /// <c>destinations[i][0..lengths[i]) = sources[i][0..lengths[i])</c> for every i, stream-ordered like <see cref="Copy(IGpuBuffer, IGpuBuffer, int)"/>,
+    /// as one kernel launch per eight copies (one graph node where each copy would be a memcpy node). The copies must
+    /// not overlap one another.
+    /// </summary>
+    internal unsafe void CopyMany(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations, IReadOnlyList<int> lengths)
+    {
+        if (sources is null) throw new ArgumentNullException(nameof(sources));
+        if (destinations is null) throw new ArgumentNullException(nameof(destinations));
+        if (lengths is null) throw new ArgumentNullException(nameof(lengths));
+        if (destinations.Count != sources.Count || lengths.Count != sources.Count)
+            throw new ArgumentException("CopyMany needs one destination and one length per source.");
+        if (!IsAvailable)
+            throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        if (!_kernelCache.TryGetValue("copy_many8", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: copy_many8");
+        const int Slots = 8, Threads = 256;
+        using var _ = PushContext();
+        for (int start = 0; start < sources.Count; start += Slots)
+        {
+            int count = Math.Min(Slots, sources.Count - start), longest = 0;
+            var handles = stackalloc IntPtr[2 * Slots];
+            var n = stackalloc int[Slots];
+            for (int k = 0; k < Slots; k++)
+            {
+                int i = start + Math.Min(k, count - 1);
+                handles[k] = sources[i].Handle;
+                handles[Slots + k] = destinations[i].Handle;
+                n[k] = k < count ? lengths[i] : 0;   // unused slots copy nothing
+                if (n[k] < 0) throw new ArgumentOutOfRangeException(nameof(lengths), "A copy length is negative.");
+                longest = Math.Max(longest, n[k]);
+            }
+            if (longest == 0) continue;
+            var args = stackalloc void*[3 * Slots];
+            for (int k = 0; k < 2 * Slots; k++) args[k] = &handles[k];
+            for (int k = 0; k < Slots; k++) args[2 * Slots + k] = &n[k];
+            uint blocks = (uint)Math.Min(1024, (longest + Threads - 1) / Threads);
+            LaunchKernel2D(kernel, blocks, (uint)count, Threads, 1, args);
+        }
     }
 
     public void Fill(IGpuBuffer buffer, float value, int size)

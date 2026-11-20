@@ -41,6 +41,53 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// <see cref="AssignStateInPlace"/> for several states at once: on CUDA the copies are one launch (one graph node
+    /// in a captured plan instead of one memcpy node per state). The states must be distinct tensors.
+    /// </summary>
+    internal void AssignStatesInPlace<T>(IReadOnlyList<Tensor<T>> states, IReadOnlyList<Tensor<T>> nexts)
+    {
+        if (states is null) throw new ArgumentNullException(nameof(states));
+        if (nexts is null) throw new ArgumentNullException(nameof(nexts));
+        if (nexts.Count != states.Count) throw new ArgumentException("One next value per state.", nameof(nexts));
+        if (states.Count < 2 || typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cuda)
+        {
+            for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
+            return;
+        }
+        using var lease = EnterGpuOp();
+        var destinations = new IGpuBuffer[states.Count];
+        var sources = new OwnedBuffer[states.Count];
+        var lengths = new int[states.Count];
+        try
+        {
+            for (int i = 0; i < states.Count; i++)
+            {
+                var (state, next) = (states[i], nexts[i]);
+                if (state is null) throw new ArgumentNullException(nameof(states));
+                if (next is null) throw new ArgumentNullException(nameof(nexts));
+                if (next.Length != state.Length)
+                    throw new ArgumentException(
+                        $"A state of {state.Length} elements cannot be assigned a value of {next.Length}.", nameof(nexts));
+                if (!state.IsContiguous || IsPartialView(state))
+                    throw new ArgumentException("A plan state must be a whole contiguous tensor, not a view.", nameof(states));
+                destinations[i] = PersistentBufferFor(backend, state);
+                sources[i] = GetOrAllocateBuffer(backend, next);
+                lengths[i] = state.Length;
+            }
+            cuda.CopyMany(sources.Select(s => s.Buffer).ToArray(), destinations, lengths);
+        }
+        finally
+        {
+            foreach (var s in sources) s.Dispose();
+        }
+        for (int i = 0; i < states.Count; i++)
+        {
+            states[i].IncrementVersion();
+            BindResidentBuffer(states[i], destinations[i], backend);
+        }
+    }
+
+    /// <summary>
     /// Gives a captured plan's input slot a persistent device buffer holding its current host value and binds it,
     /// so the capture records reads of that address and every replay refreshes it in place. No-op when bound.
     /// </summary>

@@ -375,6 +375,63 @@ public sealed class CompiledStatefulInferenceTests
         }
     }
 
+    // Several states are written by one copy launch: the captured graph has no memcpy node for them, and every state
+    // still advances exactly once per execution (checked against a CPU recurrence, including the capture call).
+    [SkippableFact]
+    public void A_captured_plan_writes_all_its_states_in_one_launch()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            var cuda = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)gpu.GetBackend()!;
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = true;
+            try
+            {
+                // Lengths differ (and one exceeds a single launch's 1024 x 256 grid stride) so a slot mix-up shows.
+                int[] lengths = { 7, 300_001, 64 };
+                var rng = new Random(5);
+                float[] Rand(int n) => Enumerable.Range(0, n).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray();
+                var states = lengths.Select(n => new Tensor<float>([n], new Vector<float>(Rand(n)))).ToArray();
+                var expect = states.Select(t => t.ToArray()).ToArray();
+                var x = new Tensor<float>([1]);
+                CompiledInferencePlan<float> plan;
+                using (new EngineScope(gpu))
+                using (var scope = GraphMode.EnableInference())
+                {
+                    // next_k = state_k * 0.5 + x (x broadcast); the output reads every state so each is live.
+                    var nexts = states.Select(st => gpu.TensorAdd(gpu.TensorMultiplyScalar(st, 0.5f), gpu.TensorBroadcastAdd(new Tensor<float>(st.Shape.ToArray()), x))).ToArray();
+                    var y = gpu.TensorAdd(gpu.ReduceSum(nexts[0], null, false), gpu.TensorAdd(gpu.ReduceSum(nexts[1], null, false), gpu.ReduceSum(nexts[2], null, false)));
+                    plan = scope.CompileInference(y, new[] { x }, states.Zip(nexts, (st, nx) => (st, nx)).ToArray());
+                }
+                using (plan)
+                {
+                    for (int t = 0; t < 5; t++)
+                    {
+                        float xv = 0.25f * (t + 1);
+                        plan.SetInputs(new[] { new Tensor<float>([1], new Vector<float>(new[] { xv })) });
+                        plan.Execute();
+                        for (int k = 0; k < states.Length; k++)
+                        {
+                            for (int i = 0; i < expect[k].Length; i++) expect[k][i] = expect[k][i] * 0.5f + xv;
+                            var got = states[k].ToArray();
+                            for (int i = 0; i < got.Length; i++)
+                                Assert.True(Math.Abs(got[i] - expect[k][i]) <= 1e-5f, $"step {t} state {k}[{i}]: {got[i]} vs {expect[k][i]}");
+                        }
+                    }
+                    var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                    Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
+                    Assert.Equal(0, cuda.LastCaptureMemcpyNodeCount);
+                }
+            }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+        }
+    }
+
     // Ops that write every output element (RMSNorm, A*B^T with beta 0, a last-axis broadcast multiply, a gather by
     // bounds-checked host indices) take their first-pass output buffers without a zero fill: that pass is the one the
     // graph captures, so a fill would replay as a memset node every step. The replayed values match the CPU engine.

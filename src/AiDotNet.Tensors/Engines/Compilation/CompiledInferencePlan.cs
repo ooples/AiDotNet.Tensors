@@ -1055,10 +1055,26 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var outer = DirectGpuTensorEngine.EnterScratchPool(_captureScratchPool ??= gte.CreateScratchPool());
         try
         {
-            for (int i = 0; i < count; i++)
+            // A full run of a plan with several states writes them together: one copy launch (one captured graph node)
+            // instead of one copy per state. ValidateStateStepsSurvived guarantees the state writes are the last steps.
+            int states = count == steps.Length && _stateTensors.Length >= 2 ? _stateTensors.Length : 0;
+            for (int i = 0; i < count - states; i++)
             {
                 gte.SetCurrentScratchAction(i);
                 steps[i].Execute(engine, steps[i].OutputBuffer);
+            }
+            if (states > 0)
+            {
+                gte.SetCurrentScratchAction(count - states);
+                var targets = new Tensor<T>[states];
+                var nexts = new Tensor<T>[states];
+                for (int k = 0; k < states; k++)
+                {
+                    var step = steps[count - states + k];
+                    targets[k] = step.OutputBuffer;
+                    nexts[k] = step.Inputs[0];
+                }
+                gte.AssignStatesInPlace(targets, nexts);
             }
         }
         finally
