@@ -325,6 +325,55 @@ public sealed class CompiledStatefulInferenceTests
         }
     }
 
+    // The explicit output ends a fusable linear chain (matmul + bias add) and also feeds a state update through a
+    // ReLU: the chain still fuses into the output tensor, the output is written, and the state reads it.
+    [Fact]
+    public void An_observable_output_that_ends_a_fusable_chain_is_fused_and_still_written()
+    {
+        var engine = new CpuEngine();
+        var x = new Tensor<float>([2, 3]);
+        var w = new Tensor<float>([3, 4]);
+        var bias = new Tensor<float>([4]);
+        for (int i = 0; i < w.Length; i++) w[i / 4, i % 4] = (i % 5) * 0.25f - 0.5f;
+        for (int i = 0; i < 4; i++) bias[i] = i * 0.1f - 0.2f;
+        var state = new Tensor<float>([2, 4]);
+        CompiledInferencePlan<float> plan;
+        Tensor<float> sum;
+        using (new EngineScope(engine))
+        using (var scope = GraphMode.EnableInference())
+        {
+            sum = engine.TensorBroadcastAdd(engine.TensorMatMul(x, w), bias);
+            var next = engine.TensorAdd(state, engine.ReLU(sum));
+            plan = scope.CompileInference(sum, new[] { x }, new[] { (state, next) });
+        }
+        using (plan)
+        {
+            var steps = (Array)typeof(CompiledInferencePlan<float>).GetField("_steps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan)!;
+            var names = steps.Cast<object>().Select(st => st.GetType().GetField("OpName", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(st) as string ?? "").ToArray();
+            Assert.True(names.Any(name => name.IndexOf("FusedLinear", StringComparison.Ordinal) >= 0),
+                "the chain did not fuse: " + string.Join(", ", names));
+            var acc = new float[8];
+            for (int t = 0; t < 3; t++)
+            {
+                var xs = Enumerable.Range(0, 6).Select(i => (i + t) * 0.5f - 1f).ToArray();
+                plan.SetInputs(new[] { new Tensor<float>([2, 3], new Vector<float>(xs)) });
+                var got = plan.Execute().ToArray();
+                var observed = sum.ToArray();
+                for (int r = 0; r < 2; r++)
+                    for (int c = 0; c < 4; c++)
+                    {
+                        float e = bias[c];
+                        for (int k = 0; k < 3; k++) e += xs[r * 3 + k] * w[k, c];
+                        Assert.True(Math.Abs(got[r * 4 + c] - e) <= 1e-5f, $"step {t} out[{r},{c}] {got[r * 4 + c]} vs {e}");
+                        Assert.True(Math.Abs(observed[r * 4 + c] - e) <= 1e-5f, $"step {t} observed sum[{r},{c}] {observed[r * 4 + c]} vs {e}");
+                        acc[r * 4 + c] += Math.Max(0f, e);
+                    }
+                var st = state.ToArray();
+                for (int i = 0; i < 8; i++) Assert.True(Math.Abs(st[i] - acc[i]) <= 1e-4f, $"step {t} state[{i}] {st[i]} vs {acc[i]}");
+            }
+        }
+    }
+
     // A captured inference plan whose embedding ids are computed on the device (a decode step feeding back its own
     // choice) gathers from the float ids in one launch: ties round to even, NaN and out-of-range ids give zero rows.
     [SkippableFact]

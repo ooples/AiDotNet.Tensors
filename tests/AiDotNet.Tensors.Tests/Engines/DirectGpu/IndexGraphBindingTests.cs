@@ -11,7 +11,7 @@ public sealed class IndexGraphBindingTests
 {
     private static IGpuBuffer Copy(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<int> ids, int bound = 0)
         => (IGpuBuffer)typeof(DirectGpuTensorEngine).GetMethod("GetHostIndexDeviceCopy", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .Invoke(engine, new object[] { backend, ids, bound })!;
+            .Invoke(engine, new object[] { backend, ids, bound, false })!;
     private static int First(IGpuBuffer buffer)
         => BitConverter.ToInt32(BitConverter.GetBytes(((MockGpuBuffer)buffer).Data[0]), 0);
 
