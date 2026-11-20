@@ -4,11 +4,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 public sealed partial class WebGpuBackend
 {
+    private const int WeightNormReductionWidth = 256;
+
     public void WeightNorm(IGpuBuffer direction, IGpuBuffer gain, IGpuBuffer output, int rows, int columns, float epsilon)
-        => LaunchBatch(BatchExecutionCudaKernels.WeightNorm, checked(rows * 256), direction, gain, output, rows, columns, epsilon);
+        => LaunchBatch(BatchExecutionCudaKernels.WeightNorm, checked(rows * WeightNormReductionWidth), direction, gain, output, rows, columns, epsilon);
 
     public void WeightNormStats(IGpuBuffer gradOutput, IGpuBuffer direction, IGpuBuffer stats, int rows, int columns, float epsilon)
-        => LaunchBatch(BatchExecutionCudaKernels.WeightNormStats, checked(rows * 256), gradOutput, direction, stats, rows, columns, epsilon);
+        => LaunchBatch(BatchExecutionCudaKernels.WeightNormStats, checked(rows * WeightNormReductionWidth), gradOutput, direction, stats, rows, columns, epsilon);
 
     public void WeightNormDirectionGradient(IGpuBuffer gradOutput, IGpuBuffer direction, IGpuBuffer gain, IGpuBuffer stats,
         IGpuBuffer gradDirection, int rows, int columns, bool accumulate)

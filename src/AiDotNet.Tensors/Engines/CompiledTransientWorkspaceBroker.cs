@@ -13,6 +13,8 @@ internal sealed class CompiledTransientWorkspaceBroker
 {
     private readonly StepScratchPool _owner;
     private readonly List<(long Key, IDirectGpuBackend Backend, int Thread, IGpuBuffer Buffer)> _free = new();
+    // Keep a bounded idle set per engine, including buffers stranded on retired execution threads.
+    private const long MaxIdleBytes = 256L * 1024 * 1024;
     private long _nextKey;
     internal long ReuseCount { get; private set; }
     internal long ReuseBytes { get; private set; }
@@ -46,14 +48,36 @@ internal sealed class CompiledTransientWorkspaceBroker
 
     internal void Return(IDirectGpuBackend backend, IGpuBuffer buffer)
     {
+        ReturnedBytes += buffer.SizeInBytes;
+        if (buffer.SizeInBytes > MaxIdleBytes - RetainedBytes)
+        {
+            // Retire on the submitting thread so queue-local backends preserve ordering.
+            Retire(backend, buffer);
+            return;
+        }
         long key = ++_nextKey;
         _owner.Track(buffer);
         _owner.Slots.Add(key, buffer);
         // OpenCL's canonical compute queue is thread-local. Host locking alone does not order two different queues.
         // Keep independent native checkouts for execution threads rather than adding a synchronizing handoff.
         _free.Add((key, backend, Environment.CurrentManagedThreadId, buffer));
-        ReturnedBytes += buffer.SizeInBytes;
         RetainedBytes += buffer.SizeInBytes;
+    }
+
+    private static void Retire(IDirectGpuBackend backend, IGpuBuffer buffer)
+    {
+        StepScratchPool.Untrack(buffer);
+        try
+        {
+            if (backend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);
+            else buffer.Dispose();
+        }
+        catch (Exception ex)
+        {
+            // The backend owns final cleanup if its queue cannot synchronize during teardown.
+            try { AiDotNetEngine.LogDiagnostic($"Workspace release on {backend.BackendName} failed: {ex.Message}"); }
+            catch (Exception) { /* A diagnostic sink cannot interrupt teardown. */ }
+        }
     }
 
     internal void Release()
@@ -61,9 +85,7 @@ internal sealed class CompiledTransientWorkspaceBroker
         foreach (var item in _free)
         {
             _owner.Slots.Remove(item.Key);
-            StepScratchPool.Untrack(item.Buffer);
-            if (item.Backend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(item.Buffer);
-            else item.Buffer.Dispose();
+            Retire(item.Backend, item.Buffer);
         }
         _free.Clear();
         RetainedBytes = 0;

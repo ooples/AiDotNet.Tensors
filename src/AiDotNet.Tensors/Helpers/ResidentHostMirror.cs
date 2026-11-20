@@ -43,36 +43,37 @@ internal static partial class ResidentHostMirror
             var array = vector is null ? (T[])key : vector.GetBackingArrayUnsafe() ?? new T[vector.Length];
             WeakReference<Tensor<T>>[] members;
             lock (Members) members = Members.ToArray();
-            bool downloaded = false, liveReader = false;
+            IGpuBuffer? lastBuffer = null;
+            object? lastBackend = null;
+            int lastOffset = -1, lastLength = -1;
             foreach (var weak in members)
             {
                 if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
                 if (!ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)
                     && (vector is null || !ReferenceEquals(t.DataVector, vector))) continue; // re-homed since
-                liveReader = true;
-                // A member bound to a pooled scratch buffer that was since released (ClearActionScratchPool) has
-                // nothing to contribute; its host slice is already the value. One such member must not abort the
-                // host read for every other view on the array.
-                if (t._gpuBuffer is not { } gpuBuffer || gpuBuffer.Handle == IntPtr.Zero || t._gpuBackend is not { } gpuBackend) continue;
+                if (t._gpuBuffer is not { } gpuBuffer || !DirectGpuTensorEngine.IsLiveDeviceBuffer(gpuBuffer)
+                    || t._gpuBackend is not { } gpuBackend) continue;
+                if (ReferenceEquals(lastBuffer, gpuBuffer) && ReferenceEquals(lastBackend, gpuBackend)
+                    && lastOffset == t._storageOffset && lastLength == t.Length) continue;
                 if (array is float[] floatArray && t._storageOffset == 0 && floatArray.Length >= gpuBuffer.Size && t.Length >= gpuBuffer.Size)
                 {
                     try { gpuBackend.DownloadBuffer(gpuBuffer, floatArray); }
                     catch (ObjectDisposedException) { continue; }
-                    downloaded = true;
-                    continue;
                 }
-                float[] floats;
-                try { floats = gpuBackend.DownloadBuffer(gpuBuffer); }
-                catch (ObjectDisposedException) { continue; }
-                var values = DirectGpuEngine.FromFloatArray<T>(floats);
-                Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
-                downloaded = true;
+                else
+                {
+                    float[] floats;
+                    try { floats = gpuBackend.DownloadBuffer(gpuBuffer); }
+                    catch (ObjectDisposedException) { continue; }
+                    var values = DirectGpuEngine.FromFloatArray<T>(floats);
+                    Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
+                }
+                lastBuffer = gpuBuffer;
+                lastBackend = gpuBackend;
+                lastOffset = t._storageOffset;
+                lastLength = t.Length;
             }
-            // A pending device write has no proven current host copy. Do not turn an empty weak-reader list into a
-            // successfully materialized zero array. A live reader whose buffer was released or disposed leaves its
-            // host slice as the value (see above), so only the absence of any reader fails the read.
-            if (!downloaded && !liveReader)
-                throw new InvalidOperationException(NoLiveReaderMessage);
+            if (lastBuffer is null) throw new InvalidOperationException(NoLiveReaderMessage);
             if (vector is not null)
             {
                 // Publish only after every slice downloaded successfully. Subsequent array-backed binds
@@ -170,7 +171,7 @@ internal static partial class ResidentHostMirror
             if (!ReferenceEquals(t._gpuBackend, backend) || !ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)) continue;
             if (!t.SharesStorageWith(view)) continue;
             var b = t._gpuBuffer!;
-            if (b.Handle == IntPtr.Zero) continue;
+            if (!DirectGpuTensorEngine.IsLiveDeviceBuffer(b)) continue;
             int start = offset - t._storageOffset;
             if (start < 0 || start + length > t.Length || b.Size < (long)start + length) continue;
             buffer = b; bufferOffset = start;

@@ -48,8 +48,9 @@ public partial class DirectGpuTensorEngine
     private void ExecuteWeightNormInto<T>(Tensor<T> output, Tensor<T> direction, Tensor<T> gain, int rows, int columns,
         float epsilon, IDirectGpuBackend backend, IGpuBatchExecution native, bool callerOwned)
     {
-        using var sourceDirection = GetResidentOrPersistentInputBuffer(backend, direction);
-        using var sourceGain = GetResidentOrPersistentInputBuffer(backend, gain);
+        output.EnsureOwnedForDeviceWrite();
+        using var sourceDirection = GetWeightNormInput(backend, direction);
+        using var sourceGain = GetWeightNormInput(backend, gain);
         var destination = GetOrCreateResidentBuffer(backend, output, output.Length, fullyWritten: true);
         // A writable alias may straddle several rows. Snapshot only actual native
         // allocation overlap; ordinary normalized weights allocate no such scratch.
@@ -79,15 +80,17 @@ public partial class DirectGpuTensorEngine
             return;
         }
 
-        using var sourceOutput = GetResidentOrPersistentInputBuffer(backend, gradOutput);
-        using var sourceDirection = GetResidentOrPersistentInputBuffer(backend, direction);
-        using var sourceGain = GetResidentOrPersistentInputBuffer(backend, gain);
+        gradDirection?.EnsureOwnedForDeviceWrite();
+        gradGain?.EnsureOwnedForDeviceWrite();
+        using var sourceOutput = GetWeightNormInput(backend, gradOutput);
+        using var sourceDirection = GetWeightNormInput(backend, direction);
+        using var sourceGain = GetWeightNormInput(backend, gain);
         bool gainFollowsDirection = gradDirection is not null && gradGain is not null
             && (ReferenceEquals(gradDirection, gradGain) || gradDirection.SharesStorageWith(gradGain));
         using var oldDirection = gradDirection is not null && accumulateDirection
-            ? GetResidentOrPersistentInputBuffer(backend, gradDirection) : default;
+            ? GetWeightNormInput(backend, gradDirection) : default;
         using var oldGain = gradGain is not null && accumulateGain && !gainFollowsDirection
-            ? GetResidentOrPersistentInputBuffer(backend, gradGain) : default;
+            ? GetWeightNormInput(backend, gradGain) : default;
         var targetDirection = gradDirection is null ? null : accumulateDirection ? oldDirection.Buffer
             : GetOrCreateResidentBuffer(backend, gradDirection, gradDirection.Length, fullyWritten: true);
         var targetGain = gainFollowsDirection ? targetDirection : gradGain is null ? null : accumulateGain ? oldGain.Buffer
@@ -104,6 +107,7 @@ public partial class DirectGpuTensorEngine
                 stats.Buffer, targetDirection, rows, columns, accumulateDirection);
             gradDirection!.IncrementVersion();
             BindResidentBuffer(gradDirection, targetDirection, backend);
+            if (accumulateDirection) AdoptAccumulationUpload(gradDirection, oldDirection, backend);
             MarkCallerOwnedDestination(gradDirection);
         }
         // Complete dV before dG. For a tied target, accumulation observes the dV
@@ -113,10 +117,14 @@ public partial class DirectGpuTensorEngine
             native.WeightNormGainGradient(stats.Buffer, targetGain, rows, accumulateGain);
             gradGain!.IncrementVersion();
             BindResidentBuffer(gradGain, targetGain, backend);
+            if (accumulateGain && !gainFollowsDirection) AdoptAccumulationUpload(gradGain, oldGain, backend);
             MarkCallerOwnedDestination(gradGain);
         }
         ResidentSyncCheck("WeightNormBackward");
     }
+
+    private OwnedBuffer GetWeightNormInput<T>(IDirectGpuBackend backend, Tensor<T> input)
+        => ResidentStepActive ? GetResidentOrPersistentInputBuffer(backend, input) : GetOrAllocateBuffer(backend, input);
 
     private static OwnedBuffer SnapshotWeightNormAlias(IDirectGpuBackend backend, IGpuBuffer input, int length,
         IGpuBuffer? firstDestination, IGpuBuffer? secondDestination = null)

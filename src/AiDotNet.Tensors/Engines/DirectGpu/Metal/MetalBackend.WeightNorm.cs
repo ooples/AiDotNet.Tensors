@@ -5,6 +5,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 public sealed partial class MetalBackend
 {
+    private const int WeightNormReductionWidth = 256;
+
     public void WeightNorm(IGpuBuffer direction, IGpuBuffer gain, IGpuBuffer output, int rows, int columns, float epsilon)
         => LaunchWeightNormRows(BatchExecutionCudaKernels.WeightNorm, rows, direction, gain, output, rows, columns, epsilon);
 
@@ -19,7 +21,7 @@ public sealed partial class MetalBackend
         if (rows <= 0) return;
         ThrowIfDisposed();
         var pipeline = GetBatchPipeline(name);
-        int maximum = Math.Min(256, pipeline.MaxTotalThreadsPerThreadgroup);
+        int maximum = Math.Min(WeightNormReductionWidth, pipeline.MaxTotalThreadsPerThreadgroup);
         if (maximum < 1) throw new InvalidOperationException("Metal pipeline has no valid weight-norm workgroup width.");
         int local = 1;
         while (local * 2 <= maximum) local *= 2;

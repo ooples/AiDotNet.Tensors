@@ -13,6 +13,12 @@ public partial class CpuEngine
     private static int t_conv1DSharedKernelRuns;
     internal static int Conv1DSharedKernelRunsOnThisThread => t_conv1DSharedKernelRuns;
 
+    private const int Conv1DPanelMinimumWork = 1_048_576;
+    private const int Conv1DPanelWorkspaceFloats = 262_144;
+    private const int Conv1DPanelMinColumns = 32;
+    private const int Conv1DPanelMaxColumns = 256;
+    private const int Conv1DPanelAlignment = 16;
+
     // A waveform has only one output row, so row-blocked im2col cannot bound its scratch or distribute its columns.
     // Split its time axis instead. At most one panel per worker is live, independently of waveform length and batch.
     private static bool TryConv1DColumnPanels(
@@ -23,12 +29,15 @@ public partial class CpuEngine
         int kernelStorageOffset = 0)
     {
         if (height != 1 || kernelHeight != 1 || outputHeight != 1 || padH != 0 || strideH != 1
-            || kernelWidth <= 1 || (long)inChannels * kernelWidth * outputWidth < 1_048_576)
+            || kernelWidth <= 1 || (long)inChannels * kernelWidth * outputWidth < Conv1DPanelMinimumWork)
             return false;
 
+        if (ReferenceEquals(input, output) && input.AsSpan(inputStorageOffset, checked(batch * inChannels * width))
+            .Overlaps(output.AsSpan(outputStorageOffset, checked(batch * outChannels * outputWidth)))) return false;
         int k = checked(inChannels * kernelWidth);
         // About 1 MiB per panel, rounded to a GEMM column tile. A 32-column floor keeps wide kernels useful.
-        int columns = Math.Min(outputWidth, Math.Max(32, Math.Min(256, (262_144 / k) / 16 * 16)));
+        int columns = Math.Min(outputWidth, Math.Max(Conv1DPanelMinColumns, Math.Min(Conv1DPanelMaxColumns,
+            (Conv1DPanelWorkspaceFloats / k) / Conv1DPanelAlignment * Conv1DPanelAlignment)));
         int blocksPerImage = (outputWidth + columns - 1) / columns;
         int blocks = checked(batch * blocksPerImage);
         int workers = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, blocks));
@@ -45,7 +54,7 @@ public partial class CpuEngine
         {
             var options = new BlasManaged.BlasOptions<float>
             {
-                NumThreads = 1,
+                NumThreads = workers == 1 ? CpuParallelSettings.MaxDegreeOfParallelism : 1,
                 PackingMode = BlasManaged.PackingMode.ForcePackBoth,
                 Mc = 96, Nc = 256, Kc = 256,
                 BetaZero = true,
@@ -132,7 +141,7 @@ public partial class CpuEngine
         if (height != 1 || kernelHeight != 1 || outputHeight != 1 || strideH != 1 || strideW != 1 || padH != 0
             || kernelWidth <= 1 || transposedPadding < 0 || transposedPadding > int.MaxValue
             || !gradient.IsContiguous || !kernel.IsContiguous
-            || (long)outChannels * kernelWidth * width < 1_048_576)
+            || (long)outChannels * kernelWidth * width < Conv1DPanelMinimumWork)
             return false;
         var g = gradient.GetCpuBackingForStridedRead(out int gOffset);
         var k = kernel.GetCpuBackingForStridedRead(out int kOffset);

@@ -1,6 +1,8 @@
 using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -10,6 +12,57 @@ namespace AiDotNet.Tensors.Tests.Engines;
 [Collection("BlasManaged-Stats-Serial")]
 public sealed class WeightNormCpuTests
 {
+    [Fact]
+    public void TiedGradientAddsBothContributionsOnTapeAndOnEachCompiledStep()
+    {
+        var engine = new CpuEngine();
+        Tensor<float> Objective(Tensor<float> x) => engine.TensorAdd(
+            engine.ReduceSum(engine.TensorWeightNorm(x, x, 3), null),
+            engine.TensorMultiplyScalar(engine.ReduceSum(x, null), 2f));
+        var x = Tensor<float>(new[] { 1.0 }, new[] { 1 });
+        using (var tape = new GradientTape<float>())
+            Assert.Equal(2.875f, tape.ComputeGradients(Objective(x), sources: new[] { x })[x][0]);
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Objective(x);
+            plan = scope.CompileTraining(new[] { x });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0f);
+            for (int i = 0; i < 2; i++)
+            {
+                plan.Step();
+                Assert.Equal(2.875f, x.Grad![0]);
+            }
+        }
+    }
+
+    [Fact]
+    public void LargeFiniteRowsAndSmallAccumulatedGradientsRemainRepresentable()
+    {
+        CheckExtremeRow<float>(1e20, 1e-8);
+        CheckExtremeRow<double>(1e200, 1e-18);
+    }
+
+    private static void CheckExtremeRow<T>(double large, double small)
+    {
+        var engine = new CpuEngine();
+        var shape = new[] { 1 };
+        var direction = Tensor<T>(new[] { large }, shape);
+        var one = Tensor<T>(new[] { 1.0 }, shape);
+        var dg = new Tensor<T>(shape);
+        var dv = Tensor<T>(new[] { small }, shape);
+        Assert.Equal(one[0], engine.TensorWeightNorm(direction, one, 0)[0]);
+        engine.TensorWeightNormBackwardInto(one, direction, one, dv, dg, 0, accumulateDirection: true);
+        Assert.Equal(one[0], dg[0]);
+        T existing = Tensor<T>(new[] { small }, shape)[0];
+        Assert.Equal(existing, dv[0]);
+        engine.TensorWeightNormBackwardInto(one, one, one, dv, null, 0, accumulateDirection: true);
+        Assert.Equal(existing, dv[0]);
+    }
+
     [Theory]
     [InlineData(1e-24)]
     [InlineData(.001)]
@@ -280,7 +333,7 @@ public sealed class WeightNormCpuTests
         Assert.All(output.ToArray(), x => Assert.Equal(19, x));
     }
 
-    [Fact]
+    [SkippableFact]
     public void OrdinaryIntoAllocationDoesNotScaleWithWeightPayload()
     {
         int previous = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -290,14 +343,8 @@ public sealed class WeightNormCpuTests
 #if NETFRAMEWORK
             // The 4.7.1 reference assemblies omit the per-thread counter exposed by newer desktop CLRs.
             var counter = typeof(GC).GetMethod("GetAllocatedBytesForCurrentThread", Type.EmptyTypes);
-            Func<long> allocatedBytes;
-            if (counter != null)
-                allocatedBytes = (Func<long>)Delegate.CreateDelegate(typeof(Func<long>), counter);
-            else
-            {
-                AppDomain.MonitoringIsEnabled = true;
-                allocatedBytes = () => AppDomain.CurrentDomain.MonitoringTotalAllocatedMemorySize;
-            }
+            Skip.If(counter is null, "This runtime has no thread-local allocation counter.");
+            var allocatedBytes = (Func<long>)Delegate.CreateDelegate(typeof(Func<long>), counter!);
 #else
             Func<long> allocatedBytes = GC.GetAllocatedBytesForCurrentThread;
 #endif

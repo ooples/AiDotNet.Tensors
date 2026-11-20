@@ -144,9 +144,16 @@ internal sealed partial class CompiledTrainingPlan<T>
             var buckets = new SortedDictionary<int, int>();
             foreach (var buffer in _workspaceCandidates)
                 buckets[buffer.Size] = buckets.TryGetValue(buffer.Size, out int count) ? count + 1 : 1;
-            Console.Error.WriteLine($"[PLAN-WORKSPACE] plan={_planId} slots={transferred} bytes={SharedWorkspaceBytesLastStep} " +
+            try
+            {
+                AiDotNetEngine.LogDiagnostic($"[PLAN-WORKSPACE] plan={_planId} slots={transferred} bytes={SharedWorkspaceBytesLastStep} " +
                 $"broker_bytes={broker.RetainedBytes} reuse_count={broker.ReuseCount} reuse_bytes={broker.ReuseBytes} " +
                 $"buckets=[{string.Join(",", buckets)}]");
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A diagnostic sink cannot roll back the completed optimizer update.
+            }
         }
     }
 }

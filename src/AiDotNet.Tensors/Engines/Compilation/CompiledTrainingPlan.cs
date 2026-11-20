@@ -5237,6 +5237,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static readonly System.Reflection.MethodInfo s_reshapeBackward =
         ((BackwardFunction<T>)BackwardFunctions<T>.ReshapeBackward).Method;
 
+    private static readonly System.Reflection.MethodInfo s_narrowBackward =
+        ((BackwardFunction<T>)BackwardFunctions<T>.NarrowBackward).Method;
+
     private static bool IsReshape(CompiledStep<T> step) => step.BackwardFn?.Method is { } method && method.Equals(s_reshapeBackward);
 
     /// <summary>
@@ -5282,7 +5285,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 foreach (var t in saved.OfType<Tensor<T>>()) unsafeTensors.Add(t);
         }
 
-        // The last forward action reading `output` or, through reshapes, any view of it: a device reshape of a
+        // The last forward action reading `output` or, through reshapes or narrows, any view of it: a device reshape of a
         // contiguous tensor shares its input's buffer, so the buffer lives until the last reader of every view. -1 when a
         // reader (of the output or of a view) is not a single-step action whose backward ignores its inputs.
         int LastReader(Tensor<T> output, int depth)
@@ -5295,7 +5298,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (emitKinds[r] != ForwardEmit.Rebuildable
                     || (backwardSteps is null || backwardSteps.Contains(r)) && !BackwardIgnoresForwardInputs(reader)) return -1;
                 last = Math.Max(last, actionOf[r]);
-                if (IsReshape(reader))
+                if (IsReshape(reader) || reader.BackwardFn?.Method.Equals(s_narrowBackward) == true)
                 {
                     int viewLast = LastReader(reader.OutputBuffer, depth + 1);
                     if (viewLast < 0) return -1;
@@ -10199,6 +10202,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             t_gradPlaceholders = null;
             t_gradAliasTargets = null;
+            t_privateGradientHostOwnership = false;
             t_requestedInputGradientLeaves = null;
             t_requestedInputGradientSteps = null;
         }
@@ -10476,6 +10480,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 t_gradPlaceholders = gradPlaceholders;
                 t_gradAliasTargets = AliasTargetsByView(aliasedGradViews);
+                t_privateGradientHostOwnership = engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
+                    && ReferenceEquals(engine, engine.Unwrap());
             }
         }
 
@@ -11245,6 +11251,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 t_gradPlaceholders = null;   // pooling settled every placeholder; Compile clears it again on a throw
                 t_gradAliasTargets = null;
+                t_privateGradientHostOwnership = false;
             }
         }
         // BIND EVERY FORWARD OUTPUT'S LIVE BACKING BEFORE THE PLAN RUNS.
@@ -11608,7 +11615,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 TraceGradientPooling(tenants, capacity, allGrads, placeholders, excluded, firstWrite, readBeforeWrite, unused);
 
             var arrays = new T[capacity.Count][];
-            for (int b = 0; b < arrays.Length; b++) arrays[b] = new T[capacity[b]];
+            var privateOwners = t_privateGradientHostOwnership ? new ResultBufferOwner?[arrays.Length] : null;
+            for (int b = 0; b < arrays.Length; b++)
+            {
+                arrays[b] = new T[capacity[b]];
+                if (privateOwners is not null) privateOwners[b] = ResultBufferTracker.TrackFreshPrivateArray(arrays[b], 0);
+            }
             foreach (int g in tenants)
             {
                 var grad = allGrads[g];
@@ -11619,6 +11631,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 anyPooled = true;
                 (schedule[firstWrite[g]] ??= new List<int>()).Add(g);
             }
+            GC.KeepAlive(privateOwners); // Owners must survive until every fresh array has its first vector wrapper.
             if (aliasTargets is not null)
                 foreach (var alias in aliasTargets)
                     if (indexOf.TryGetValue(alias.Value, out int t) && pooled[t]) RepointAliasView(alias.Key, alias.Value);
@@ -11847,6 +11860,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Gradient buffers still backed by the shared compile-time placeholder (gradient pooling, PoolGradientBuffers).
     // Set only while a plan's backward is being built on this thread.
     [ThreadStatic] private static HashSet<Tensor<T>>? t_gradPlaceholders;
+    [ThreadStatic] private static bool t_privateGradientHostOwnership;
 
 
     // The alias views among the gradients (AliasReshapeViewGradients' device aliases) and the gradient each views, while

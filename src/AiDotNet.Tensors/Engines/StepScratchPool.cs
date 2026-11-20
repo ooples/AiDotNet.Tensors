@@ -124,8 +124,8 @@ internal sealed partial class StepScratchPool
             Keys.Remove(buffer);
             _leasedThisRun.Remove(buffer);
             if (!_workspaceTransferred.Add(buffer)) continue;
-            broker.Return(backend, buffer);
             bytes += buffer.SizeInBytes;
+            broker.Return(backend, buffer);
         }
         transferred = _workspaceTransferred.Count;
         return bytes;
@@ -190,9 +190,12 @@ internal sealed partial class StepScratchPool
             ["spanning"] = (0, 0),
         };
         var handles = new HashSet<IntPtr>();
+        var handleless = new HashSet<IGpuBuffer>();
         void Add(string category, IGpuBuffer buffer)
         {
-            if (buffer.Handle == IntPtr.Zero || !handles.Add(buffer.Handle)) return;
+            buffer = GpuBufferViewRoot.Of(buffer);
+            if (!DirectGpuTensorEngine.IsLiveDeviceBuffer(buffer)) return;
+            if (buffer.Handle == IntPtr.Zero ? !handleless.Add(buffer) : !handles.Add(buffer.Handle)) return;
             var previous = result[category];
             result[category] = (previous.Count + 1, previous.Bytes + buffer.SizeInBytes);
         }

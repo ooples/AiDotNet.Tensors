@@ -24,7 +24,7 @@ public static class BatchExecutionKernels
 
     private static string TranslateSolvers(string cuda)
     {
-        string body = cuda.Replace("extern \"C\" __global__ __launch_bounds__(256) void", "__kernel void")
+        string body = cuda.Replace("__device__ __forceinline__", "inline").Replace("extern \"C\" __global__ __launch_bounds__(256) void", "__kernel void")
             .Replace("bx_gid()", "(int)get_global_id(0)")
             .Replace("__uint_as_float(", "as_float(")
             .Replace("__int_as_float(", "as_float(")

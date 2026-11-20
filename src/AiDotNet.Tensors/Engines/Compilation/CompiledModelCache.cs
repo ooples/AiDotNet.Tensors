@@ -18,6 +18,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 public sealed class CompiledModelCache<T> : IDisposable
 {
     private readonly ConcurrentDictionary<long, ICompiledPlan<T>> _inferencePlans = new();
+    private readonly ConcurrentDictionary<long, ICompiledPlan<T>> _ownedInputPlans = new();
     private readonly ConcurrentDictionary<long, ICompiledTrainingPlan<T>> _trainingPlans = new();
     private readonly object _compileLock = new();
     private bool _disposed;
@@ -155,12 +156,12 @@ public sealed class CompiledModelCache<T> : IDisposable
 
         long key = ComputeShapeKey(inputs);
         var primaryShape = inputs[0]._shape;
-        if (_inferencePlans.TryGetValue(key, out var cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
+        if (_ownedInputPlans.TryGetValue(key, out var cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
             return cached;
 
         lock (_compileLock)
         {
-            if (_inferencePlans.TryGetValue(key, out cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
+            if (_ownedInputPlans.TryGetValue(key, out cached) && cached.IsValid(primaryShape) && TryRebind(cached, inputs))
                 return cached;
 
             // The slots are copies of this call's data, so the new plan already reflects this call.
@@ -172,10 +173,10 @@ public sealed class CompiledModelCache<T> : IDisposable
             ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput, slots);
 
-            if (_inferencePlans.TryGetValue(key, out var old))
+            if (_ownedInputPlans.TryGetValue(key, out var old))
                 old.Dispose();
 
-            _inferencePlans[key] = plan;
+            _ownedInputPlans[key] = plan;
             return plan;
         }
     }
@@ -284,6 +285,8 @@ public sealed class CompiledModelCache<T> : IDisposable
         {
             foreach (var plan in _inferencePlans.Values) plan.Dispose();
             foreach (var plan in _trainingPlans.Values) plan.Dispose();
+            foreach (var plan in _ownedInputPlans.Values) plan.Dispose();
+            _ownedInputPlans.Clear();
             _inferencePlans.Clear();
             _trainingPlans.Clear();
             _templates.Clear();
@@ -291,7 +294,7 @@ public sealed class CompiledModelCache<T> : IDisposable
     }
 
     /// <summary>Number of cached inference plans.</summary>
-    public int InferencePlanCount => _inferencePlans.Count;
+    public int InferencePlanCount => _inferencePlans.Count + _ownedInputPlans.Count;
 
     /// <summary>Number of cached training plans.</summary>
     public int TrainingPlanCount => _trainingPlans.Count;
