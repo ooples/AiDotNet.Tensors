@@ -9,25 +9,64 @@ namespace AiDotNet.Tensors.Tests.Engines;
 public sealed class LstmWorkspaceRequestTests
 {
     [Fact]
-    public void BatchOneForwardCountsAllSevenWorkspaceRequestsIncludingPoolHits()
+    public void BatchOneForwardBorrowsOneBoundedWorkspaceOnEveryCall()
     {
         var engine = new CpuEngine();
         var input = new Tensor<float>(new int[] { 1, 32, 32 });
         var inputWeight = new Tensor<float>(new int[] { 256, 32 });
         var recurrentWeight = new Tensor<float>(new int[] { 256, 64 });
-        // Wx, transposed recurrent weights, four 64-element states and one 256-element recurrent projection.
-        const long bytes = (32 * 256 + 64 * 256 + 4 * 64 + 256) * sizeof(float);
+        // Eight projected input rows, one projected hidden row, and the current hidden and cell vectors.
+        const long bytes = (8 * 256 + 256 + 2 * 64) * sizeof(float);
         var before = ForwardRequests();
         for (int call = 0; call < 2; call++)
         {
             var result = engine.LstmSequenceForward(input, null, null, inputWeight, recurrentWeight, null, null);
             var after = ForwardRequests();
-            Assert.Equal(CpuStorageAllocationDiagnostics.Enabled ? 7L : 0L, after.Count - before.Count);
+            Assert.Equal(CpuStorageAllocationDiagnostics.Enabled ? 1L : 0L, after.Count - before.Count);
             Assert.Equal(CpuStorageAllocationDiagnostics.Enabled ? bytes : 0L, after.Bytes - before.Bytes);
             Assert.Equal(new[] { 1, 64 }, result.Shape.ToArray());
             Assert.All(result.ToVector().ToArray(), value => Assert.Equal(0f, value));
             before = after;
         }
+    }
+
+    [Theory]
+    [InlineData(3, false)]
+    [InlineData(3, true)]
+    [InlineData(16, false)]
+    [InlineData(16, true)]
+    public void BatchOneMatchesIndependentBatchedRecurrenceAcrossTileBoundary(int hidden, bool returnSequences)
+    {
+        const int steps = 11, inputs = 5;
+        var engine = new CpuEngine();
+        var random = new Random(827);
+        float[] Values(int length) => Enumerable.Range(0, length).Select(_ => (float)(random.NextDouble() - .5)).ToArray();
+        var x = Values(steps * inputs);
+        var h = Values(hidden);
+        var c = Values(hidden);
+        var wi = new Tensor<float>(Values(4 * hidden * inputs), new[] { 4 * hidden, inputs });
+        var wh = new Tensor<float>(Values(4 * hidden * hidden), new[] { 4 * hidden, hidden });
+        var bi = new Tensor<float>(Values(4 * hidden), new[] { 4 * hidden });
+        var bh = new Tensor<float>(Values(4 * hidden), new[] { 4 * hidden });
+        var one = engine.LstmSequenceForward(new Tensor<float>(x, new[] { 1, steps, inputs }),
+            new Tensor<float>(h, new[] { 1, hidden }), new Tensor<float>(c, new[] { 1, hidden }),
+            wi, wh, bi, bh, out var h1, out var c1, returnSequences);
+        var two = engine.LstmSequenceForward(new Tensor<float>(x.Concat(x).ToArray(), new[] { 2, steps, inputs }),
+            new Tensor<float>(h.Concat(h).ToArray(), new[] { 2, hidden }),
+            new Tensor<float>(c.Concat(c).ToArray(), new[] { 2, hidden }),
+            wi, wh, bi, bh, out var h2, out var c2, returnSequences);
+
+        static void CheckFirstRow(Tensor<float> actual, Tensor<float> batched)
+        {
+            var a = actual.ToVector().ToArray();
+            var b = batched.ToVector().ToArray();
+            Assert.Equal(2 * a.Length, b.Length);
+            for (int i = 0; i < a.Length; i++)
+                Assert.InRange(Math.Abs(a[i] - b[i]), 0f, 1e-5f);
+        }
+        CheckFirstRow(one, two);
+        CheckFirstRow(h1, h2);
+        CheckFirstRow(c1, c2);
     }
 
     private static (long Count, long Bytes) ForwardRequests()

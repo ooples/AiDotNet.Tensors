@@ -500,6 +500,11 @@ public partial class CpuEngine
                 : AutoTensorCache.RentOrAllocate<float>(new[] { batch, hidden });
         }
 
+        // A single sequence can project the original recurrent weights without a transpose.
+        if (batch == 1)
+            return LstmSingleSequenceForwardFloat(input, h0, c0, wIh, wHh, bIh, bHh,
+                seqLen, inFeatures, hidden, gateRows, returnSequences, wantState, out finalHidden, out finalCell);
+
         // Pre-compute Wx = input @ wIh^T as one big GEMM via SimdGemm.
         // input is [B, seq, in] — treat as [B*seq, in] row-major.
         // wIh is [4H, in] — we want input @ wIh^T which is [B*seq, 4H].
@@ -681,6 +686,79 @@ public partial class CpuEngine
             if (!perChunkProjection) pool.Return(wxBuf);
             pool.Return(wHhTBuf);
             if (wIhT is not null) pool.Return(wIhT);
+        }
+    }
+
+    private static Tensor<float> LstmSingleSequenceForwardFloat(
+        Tensor<float> input, Tensor<float>? h0, Tensor<float>? c0, Tensor<float> wIh, Tensor<float> wHh,
+        Tensor<float>? bIh, Tensor<float>? bHh, int seqLen, int inFeatures, int hidden, int gateRows,
+        bool returnSequences, bool wantState, out Tensor<float> finalHidden, out Tensor<float> finalCell)
+    {
+        int tileRows = Math.Min(seqLen, 8);
+        int gateOffset = checked(tileRows * gateRows);
+        int hOffset = checked(gateOffset + gateRows);
+        int cOffset = checked(hOffset + hidden);
+        var output = AutoTensorCache.RentOrAllocate<float>(returnSequences ? new[] { 1, seqLen, hidden } : new[] { 1, hidden });
+        finalHidden = wantState ? new Tensor<float>(new[] { 1, hidden }) : s_emptyState;
+        finalCell = wantState ? new Tensor<float>(new[] { 1, hidden }) : s_emptyState;
+        var inputData = input.GetFlattenedData();
+        var inputWeights = wIh.GetFlattenedData();
+        var hiddenWeights = wHh.GetFlattenedData();
+        var inputBias = bIh?.GetFlattenedData();
+        var hiddenBias = bHh?.GetFlattenedData();
+        var workspace = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(cOffset + hidden), "workspace.lstm_forward_pool");
+        try
+        {
+            var gates = workspace.AsSpan(gateOffset, gateRows);
+            var hiddenState = workspace.AsSpan(hOffset, hidden);
+            var cellState = workspace.AsSpan(cOffset, hidden);
+            if (h0 is null) hiddenState.Clear();
+            else h0.GetFlattenedData().AsSpan(0, hidden).CopyTo(hiddenState);
+            if (c0 is null) cellState.Clear();
+            else c0.GetFlattenedData().AsSpan(0, hidden).CopyTo(cellState);
+            using var outputLease = output.LeaseWritable();
+            for (int first = 0; first < seqLen; first += tileRows)
+            {
+                int rows = Math.Min(tileRows, seqLen - first);
+                var projection = workspace.AsSpan(0, rows * gateRows);
+                SimdGemm.Sgemm(inputData.AsSpan(first * inFeatures, rows * inFeatures), inFeatures, false,
+                    inputWeights, inFeatures, true, projection, rows, inFeatures, gateRows);
+                for (int t = 0; t < rows; t++)
+                {
+                    // W_hh is [4H,H]. Matrix-times-vector writes all gates without a transpose.
+                    BlasManaged.GemvKernel.Run<float>(hiddenWeights, hidden, false, hiddenState, 1, false,
+                        gates, 1, gateRows, 1, hidden);
+                    var wx = projection.Slice(t * gateRows, gateRows);
+                    if (inputBias is not null) SimdKernels.Add(wx, inputBias.AsSpan(0, gateRows), wx);
+                    SimdKernels.Add(wx, gates, gates);
+                    if (hiddenBias is not null) SimdKernels.Add(gates, hiddenBias.AsSpan(0, gateRows), gates);
+                    var inputForget = gates.Slice(0, 2 * hidden);
+                    var candidate = gates.Slice(2 * hidden, hidden);
+                    var outputGate = gates.Slice(3 * hidden, hidden);
+                    SimdKernels.Sigmoid(inputForget, inputForget);
+                    SimdKernels.Tanh(candidate, candidate);
+                    SimdKernels.Sigmoid(outputGate, outputGate);
+                    CellUpdateRow(workspace, gateOffset, gateOffset + hidden, gateOffset + 2 * hidden,
+                        workspace, cOffset, cOffset, workspace, hOffset, hidden);
+                    SimdKernels.Tanh(hiddenState, hiddenState);
+                    HiddenOutRow(workspace, gateOffset + 3 * hidden, workspace, hOffset, workspace, hOffset, hidden);
+                    if (returnSequences)
+                        hiddenState.CopyTo(outputLease.Span.Slice((first + t) * hidden, hidden));
+                }
+            }
+            if (!returnSequences) hiddenState.CopyTo(outputLease.Span);
+            if (wantState)
+            {
+                using var h = finalHidden.LeaseWritable();
+                using var c = finalCell.LeaseWritable();
+                hiddenState.CopyTo(h.Span);
+                cellState.CopyTo(c.Span);
+            }
+            return output;
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(workspace);
         }
     }
 
