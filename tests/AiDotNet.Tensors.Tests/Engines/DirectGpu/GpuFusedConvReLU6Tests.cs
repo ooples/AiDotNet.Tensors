@@ -21,6 +21,13 @@ public class GpuFusedConvReLU6Tests
         return t;
     }
 
+    private static Tensor<float> Abs(Tensor<float> t)
+    {
+        var r = new Tensor<float>(t.Shape.ToArray());
+        for (int i = 0; i < t.Length; i++) r[i] = Math.Abs(t[i]);
+        return r;
+    }
+
     [SkippableFact]
     public void FusedConv2D_WithReLU6_MatchesTheCpu()
     {
@@ -40,12 +47,19 @@ public class GpuFusedConvReLU6Tests
             var bias = Filled(new[] { 5 }, 3, 4f);
             var expected = new CpuEngine().FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU6).ToArray();
             var actual = gpu.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU6).ToArray();
+            // Ampere+ convolutions run TF32 by default (CudaDispatchPolicy, as torch.backends.cudnn.allow_tf32): each
+            // operand keeps 10 mantissa bits, so a product is off by up to 2^-10 of its magnitude and an output by up to
+            // 2^-10 of sum |x * w| (the clamp is 1-Lipschitz, so ReLU6 only shrinks it). A fixed 1e-3 relative bound
+            // failed on that rounding alone: 0.7437572 vs 0.7460286 where sum |x * w| is several units.
+            var magnitude = new CpuEngine().FusedConv2D(Abs(input), Abs(kernel), new Tensor<float>(new[] { 5 }),
+                1, 1, 1, 1, 1, 1, FusedActivationType.None).ToArray();
 
             Assert.Contains(expected, v => v == 6f);
             Assert.Contains(expected, v => v == 0f);
             Assert.Equal(expected.Length, actual.Length);
             for (int i = 0; i < expected.Length; i++)
-                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-3f * (1f + Math.Abs(expected[i])), $"[{i}]: cpu {expected[i]}, gpu {actual[i]}");
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= Math.Pow(2, -10) * magnitude[i] + 1e-4 * (1 + Math.Abs(expected[i])),
+                    $"[{i}]: cpu {expected[i]}, gpu {actual[i]}, sum |x * w| {magnitude[i]}");
         }
     }
 }
