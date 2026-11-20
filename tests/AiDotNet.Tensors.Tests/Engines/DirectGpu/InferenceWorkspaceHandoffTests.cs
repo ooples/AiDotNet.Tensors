@@ -38,6 +38,30 @@ public sealed class InferenceWorkspaceHandoffTests
     }
 
     [Fact]
+    public void Completed_training_returns_only_unused_private_backward_leases()
+    {
+        var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        var pool = engine.CreateScratchPool();
+        var obsolete = pool.Lease(0, backend, 16);
+        var reused = pool.Lease(1, backend, 64);
+        var pinned = pool.Lease(2, backend, 128);
+        pool.EndLeases(new HashSet<IGpuBuffer> { pinned });
+        pool.TrimUnleased(backend);
+        Assert.Equal(0, Assert.IsType<MockGpuBuffer>(obsolete).DisposeCount);
+
+        Assert.Same(reused, pool.Lease(1, backend, 64));
+        pool.EndLeases(null);
+        pool.TrimUnleased(backend);
+        Assert.Equal(1, Assert.IsType<MockGpuBuffer>(obsolete).DisposeCount);
+        Assert.Equal(0, Assert.IsType<MockGpuBuffer>(reused).DisposeCount);
+        Assert.Equal(0, Assert.IsType<MockGpuBuffer>(pinned).DisposeCount);
+        Assert.Equal(0, pool.CacheReturnedForInferenceBytes);
+        pool.Release();
+    }
+
+    [Fact]
     public void Step_pool_returns_free_leases_and_keeps_pinned_slots_and_transient_storage()
     {
         var backend = MockDirectGpuBackend.Create(new MockBackendState());
