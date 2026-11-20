@@ -629,6 +629,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal void ReleaseStorageLeases() => _storageLeases.Dispose();
 
+    internal bool OwnsStorageLease(object identity) => _storageLeases.ContainsStorage(identity);
+
     /// <summary>
     /// Compiles the lazy graph into an inference plan for zero-overhead replay.
     /// Call this instead of Realize() when you want to cache and replay the plan.
