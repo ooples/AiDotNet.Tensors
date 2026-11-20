@@ -8,8 +8,12 @@ public sealed partial class WebGpuBackend : IChannelBiasResidualBackend
     {
         if (!ChannelBiasResidualGeometry.TryCount(input, bias, residual, output, activated,
             batch, channels, spatial, alpha, writeActivation, out int count)) return false;
-        LaunchBatch(BatchExecutionCudaKernels.ChannelBiasResidual, count, input, bias, residual, output, activated,
-            batch, channels, spatial, alpha, writeActivation ? 1 : 0);
+        if (writeActivation)
+            LaunchBatch(BatchExecutionCudaKernels.ChannelBiasResidual, count, input, bias, residual, output, activated,
+                batch, channels, spatial, alpha, 1);
+        else
+            LaunchBatch(WebGpuBatchExecutionKernels.ChannelBiasResidualOnlyName, count, input, bias, residual, output,
+                batch, channels, spatial);
         return true;
     }
 }

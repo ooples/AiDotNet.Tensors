@@ -61,8 +61,8 @@ public sealed class GroupedConv2DSemanticTests
                 var yData = Enumerable.Repeat(sentinel, g.OutputCount + 14).ToArray();
                 var dxData = Enumerable.Repeat(sentinel, g.InputCount + 14).ToArray();
                 var dwData = Enumerable.Repeat(sentinel, g.KernelCount + 14).ToArray();
-                Array.Fill(dxData, .25f, 7, g.InputCount);
-                Array.Fill(dwData, -.125f, 7, g.KernelCount);
+                dxData.AsSpan(7, g.InputCount).Fill(.25f);
+                dwData.AsSpan(7, g.KernelCount).Fill(-.125f);
                 using var y = Tensor<float>.FromMemory(yData.AsMemory(7, g.OutputCount), g.OutputShape);
                 using var dx = Tensor<float>.FromMemory(dxData.AsMemory(7, g.InputCount), g.InputShape);
                 using var dw = Tensor<float>.FromMemory(dwData.AsMemory(7, g.KernelCount), g.KernelShape);

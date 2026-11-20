@@ -32,6 +32,7 @@ public partial class DirectGpuTensorEngine
             base.GroupedConv2DInto(output, input, kernel, g);
             return;
         }
+        output.PrepareForInPlaceWrite();
         ExecuteGroupedConv2D(output, input, kernel, g, backend, native, callerOwned: true);
     }
 
@@ -67,18 +68,14 @@ public partial class DirectGpuTensorEngine
             base.GroupedConv2DBackwardInto(gradOutput, input, kernel, gradInput, gradKernel, g, accumulateInput, accumulateKernel);
             return;
         }
+        bool tied = gradInput is not null && ReferenceEquals(gradInput, gradKernel);
+        gradInput?.PrepareForInPlaceWrite();
+        if (!tied) gradKernel?.PrepareForInPlaceWrite();
         using var sourceOutput = GetResidentOrPersistentInputBuffer(backend, gradOutput);
         using var sourceInput = gradKernel is not null ? GetResidentOrPersistentInputBuffer(backend, input) : default;
         using var sourceKernel = gradInput is not null ? GetResidentOrPersistentInputBuffer(backend, kernel) : default;
-        bool tied = gradInput is not null && ReferenceEquals(gradInput, gradKernel);
-        using var oldInput = gradInput is not null && accumulateInput
-            ? GetResidentOrPersistentInputBuffer(backend, gradInput) : default;
-        using var oldKernel = gradKernel is not null && accumulateKernel && !tied
-            ? GetResidentOrPersistentInputBuffer(backend, gradKernel) : default;
-        var dx = gradInput is null ? null : accumulateInput ? oldInput.Buffer
-            : GetOrCreateResidentBuffer(backend, gradInput, gradInput.Length, fullyWritten: true);
-        var dw = tied ? dx : gradKernel is null ? null : accumulateKernel ? oldKernel.Buffer
-            : GetOrCreateResidentBuffer(backend, gradKernel, gradKernel.Length, fullyWritten: true);
+        var dx = gradInput is null ? null : GroupedGradientDestination(backend, gradInput, accumulateInput);
+        var dw = tied ? dx : gradKernel is null ? null : GroupedGradientDestination(backend, gradKernel, accumulateKernel);
         // Resolve all primal aliases before either pass writes a destination.
         using var readOutput = SnapshotWeightNormAlias(backend, sourceOutput.Buffer, gradOutput.Length, dx, dw);
         using var readInput = dw is not null ? SnapshotWeightNormAlias(backend, sourceInput.Buffer, input.Length, dx, dw) : default;
@@ -96,5 +93,26 @@ public partial class DirectGpuTensorEngine
             gradKernel.IncrementVersion(); BindResidentBuffer(gradKernel, dw, backend); MarkCallerOwnedDestination(gradKernel);
         }
         ResidentSyncCheck("GroupedConv2DBackward");
+    }
+
+    private IGpuBuffer GroupedGradientDestination<T>(IDirectGpuBackend backend, Tensor<T> gradient, bool accumulate)
+    {
+        if (!accumulate) return GetOrCreateResidentBuffer(backend, gradient, gradient.Length, fullyWritten: true);
+        using var previous = GetResidentOrPersistentInputBuffer(backend, gradient);
+        if (!previous.OwnsBuffer) return previous.Buffer;
+
+        // Eager accumulation can start with a host-only gradient. Transfer its upload to the activation cache
+        // before either backward kernel runs, so later reads and a failure of the other kernel retain an owner.
+        object key = (object?)gradient.GetBackingArrayForCacheLookupUnsafe() ?? gradient.DataVector;
+        if (CacheActivation(key, previous.Buffer, gradient._shape, backend, hostVersion: gradient.GpuCacheVersion))
+        {
+            previous.RelinquishOwnership();
+            return previous.Buffer;
+        }
+
+        var destination = GetOrCreateResidentBuffer(backend, gradient, gradient.Length, fullyWritten: true);
+        backend.Copy(previous.Buffer, 0, destination, 0, gradient.Length);
+        previous.DisposeAfterQueuedUse(backend);
+        return destination;
     }
 }

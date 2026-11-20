@@ -2,6 +2,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
@@ -40,7 +41,7 @@ public sealed class CompiledCpuLeakyReluGradientTests : IDisposable
         for (int i = 0; i < expected.Length; i++)
         {
             if (float.IsNaN(expected[i])) Assert.True(float.IsNaN(output[i]));
-            else Assert.Equal(BitConverter.SingleToInt32Bits(expected[i]), BitConverter.SingleToInt32Bits(output[i]));
+            else Assert.Equal(MathCompat.SingleToInt32Bits(expected[i]), MathCompat.SingleToInt32Bits(output[i]));
         }
     }
 

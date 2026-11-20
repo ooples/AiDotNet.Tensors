@@ -160,7 +160,11 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
     public void Six_backend_types_implement_the_composition_contract()
     {
         Type[] types = { typeof(CudaBackend), typeof(AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend), typeof(AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend),
-            typeof(AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend), typeof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend), typeof(AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend) };
+            typeof(AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend), typeof(AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend),
+#if NET7_0_OR_GREATER
+            typeof(AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend),
+#endif
+        };
         foreach (Type type in types) Assert.True(typeof(IConvBiasResidualBackend).IsAssignableFrom(type), type.FullName);
     }
 

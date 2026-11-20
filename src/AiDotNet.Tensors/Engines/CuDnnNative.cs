@@ -2343,6 +2343,11 @@ public sealed partial class CuDnnConvolution : IDisposable
         // A low-memory fallback must request only its required size.
         ulong size = exactSize ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
         var result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
+        if (result == CudaResult.OutOfMemory && size > requiredSize)
+        {
+            size = requiredSize;
+            result = CuBlasNative.cuMemAlloc(out grown, size);
+        }
         if (result != CudaResult.Success)
         {
             throw new InvalidOperationException($"Failed to allocate cuDNN workspace: {result}");

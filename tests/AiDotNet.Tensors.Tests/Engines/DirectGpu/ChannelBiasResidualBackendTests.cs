@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -20,10 +21,10 @@ public sealed class ChannelBiasResidualBackendTests
         CudaTestDevice.Require(backend);
         const int batch = 2, channels = 3, spatial = 259, count = batch * channels * spatial;
         const float alpha = .1f, sentinel = 123.75f;
-        float[] pattern = { 0f, BitConverter.Int32BitsToSingle(unchecked((int)0x80000000)), 1f, -1f,
+        float[] pattern = { 0f, MathCompat.Int32BitsToSingle(unchecked((int)0x80000000)), 1f, -1f,
             float.Epsilon, -float.Epsilon, 1.17549435E-38f, -1.17549435E-38f,
             float.NaN, float.PositiveInfinity, float.NegativeInfinity, .75f, -.5f,
-            BitConverter.Int32BitsToSingle(0x3f800001), 16777216f, -16777216f };
+            MathCompat.Int32BitsToSingle(0x3f800001), 16777216f, -16777216f };
         float[] values = Enumerable.Range(0, count).Select(i => pattern[i % pattern.Length]).ToArray();
         float[] residuals = Enumerable.Range(0, count).Select(i => pattern[(i + 3) % pattern.Length]).ToArray();
         float[] biases = { -.75f, 0f, .5f };
@@ -101,6 +102,6 @@ public sealed class ChannelBiasResidualBackendTests
         Assert.Equal(expected.Length, actual.Length);
         for (int index = 0; index < expected.Length; ++index)
             if (float.IsNaN(expected[index])) Assert.True(float.IsNaN(actual[index]), $"Expected NaN at {index}.");
-            else Assert.Equal(BitConverter.SingleToInt32Bits(expected[index]), BitConverter.SingleToInt32Bits(actual[index]));
+            else Assert.Equal(MathCompat.SingleToInt32Bits(expected[index]), MathCompat.SingleToInt32Bits(actual[index]));
     }
 }

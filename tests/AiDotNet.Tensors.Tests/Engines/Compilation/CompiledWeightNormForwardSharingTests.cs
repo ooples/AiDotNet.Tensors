@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
@@ -151,8 +152,8 @@ internal static class WeightNormSharingTestGraph
                         first[0] += 7f;
                         Assert.Equal(peer, second[0]);
                     }
-                    var storages = new HashSet<object>(ReferenceEqualityComparer.Instance);
-                    var vectors = new HashSet<object>(ReferenceEqualityComparer.Instance);
+                    var storages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+                    var vectors = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
                     long vectorCapacityBytes = 0;
                     foreach (var step in weightNorm)
                     {
@@ -168,7 +169,7 @@ internal static class WeightNormSharingTestGraph
                     {
                         var arrays = weightNorm.Select(step => step.OutputBuffer.GetBackingArrayForCacheLookupUnsafe()).ToArray();
                         Assert.All(arrays, array => Assert.NotNull(array));
-                        var distinct = new HashSet<float[]>(ReferenceEqualityComparer.Instance);
+                        var distinct = new HashSet<float[]>(ReferenceEqualityComparer<object>.Instance);
                         foreach (float[] array in arrays.Cast<float[]>())
                             if (distinct.Add(array)) bytes += (long)array.Length * sizeof(float);
                         arrayCount = distinct.Count;
@@ -230,8 +231,8 @@ internal static class WeightNormSharingTestGraph
         Assert.Equal(baseline.NoGradWeightNormNodes, candidate.NoGradWeightNormNodes);
         Assert.Equal(baseline.Values.Count, candidate.Values.Count);
         for (int row = 0; row < baseline.Values.Count; ++row)
-            Assert.Equal(baseline.Values[row].Select(BitConverter.SingleToInt32Bits),
-                candidate.Values[row].Select(BitConverter.SingleToInt32Bits));
+            Assert.Equal(baseline.Values[row].Select(MathCompat.SingleToInt32Bits),
+                candidate.Values[row].Select(MathCompat.SingleToInt32Bits));
     }
 
     private static (double Loss, double[] Output, double[][] Gradients) Oracle(float[] direction, float[] gain, bool secondNoGrad)

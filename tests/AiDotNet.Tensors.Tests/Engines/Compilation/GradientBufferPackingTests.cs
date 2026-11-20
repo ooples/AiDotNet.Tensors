@@ -57,7 +57,7 @@ public sealed class GradientBufferPackingTests
             for (int action = 0; action < 96; action++)
             {
                 foreach (var interval in intervals.Where(value => value.First == action))
-                    Array.Fill(banks[result.BankOf[interval.Id]], interval.Id + 1, 0, interval.Elements);
+                    banks[result.BankOf[interval.Id]].AsSpan(0, interval.Elements).Fill(interval.Id + 1);
                 foreach (var interval in intervals.Where(value => value.First <= action && action <= value.Last))
                     Assert.True(banks[result.BankOf[interval.Id]].Take(interval.Elements).All(value => value == interval.Id + 1));
             }

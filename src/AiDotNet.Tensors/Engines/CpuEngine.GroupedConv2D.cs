@@ -311,10 +311,13 @@ public partial class CpuEngine
         int k = checked(channels * geometry.KernelH * geometry.KernelW);
         int spatial = checked(geometry.OutHeight * geometry.OutWidth);
         int columns = Math.Min(256, spatial), weights = checked(outputs * k);
-        var source = input.GetCpuBackingForStridedRead(out int inputOffset)
-            ?? throw new InvalidOperationException("Contiguous grouped input needs managed backing.");
-        var gradient = upstream.GetCpuBackingForStridedRead(out int gradientOffset)
-            ?? throw new InvalidOperationException("Contiguous grouped gradient needs managed backing.");
+        var source = input.GetCpuBackingForStridedRead(out int inputOffset);
+        var gradient = upstream.GetCpuBackingForStridedRead(out int gradientOffset);
+        if (source is null || gradient is null)
+        {
+            GroupedKernelGradientGeneric(destination, input, upstream, geometry, accumulate);
+            return;
+        }
         if (TryGroupedParallelKernelGradient(destination, source, inputOffset, gradient, gradientOffset, geometry, accumulate)) return;
         var panel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(k * columns), "workspace.grouped_conv_columns");
         float[]? partial = null, sum = null;
