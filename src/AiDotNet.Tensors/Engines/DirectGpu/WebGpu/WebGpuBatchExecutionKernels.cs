@@ -1517,6 +1517,11 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
     /// <summary>The WGSL port of each shared kernel, keyed by its <see cref="BatchExecutionCudaKernels"/> name.</summary>
     public static readonly IReadOnlyDictionary<string, string> ByKernelName = new Dictionary<string, string>
     {
+        [BatchExecutionCudaKernels.ChannelBiasLeaky] = ChannelBiasLeaky,
+        [BatchExecutionCudaKernels.ChannelBiasResidual] = ChannelBiasResidual,
+        [BatchExecutionCudaKernels.GroupedConv2D] = GroupedConv2DShaders.Forward,
+        [BatchExecutionCudaKernels.GroupedConv2DInputGrad] = GroupedConv2DShaders.InputGrad,
+        [BatchExecutionCudaKernels.GroupedConv2DKernelGrad] = GroupedConv2DShaders.KernelGrad,
         [BatchExecutionCudaKernels.RfftMagnitude] = RfftMagnitudeShaders.Magnitude,
         [BatchExecutionCudaKernels.RfftMagnitudeSeed] = RfftMagnitudeShaders.Seed,
         [BatchExecutionCudaKernels.RfftRealGradient] = RfftMagnitudeShaders.Gradient,

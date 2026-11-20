@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <DefineConstants Condition="Exists('../../src/AiDotNet.Tensors/Engines/InferenceWorkspaceDemandScope.cs')">$(DefineConstants);INFERENCE_WORKSPACE_DEMAND</DefineConstants>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>

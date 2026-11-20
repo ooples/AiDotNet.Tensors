@@ -1612,6 +1612,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // IGpuBatchExecution kernels shared with HIP (#1142).
         CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+        // WeightNorm's row scale and reduction use explicit FP32 arithmetic; keep subnormals and sqrt/div semantics.
+        CompileKernelModule(device, BatchExecutionCudaKernels.WeightNormPreciseSource, "weight_norm_precise_kernels",
+            new[] { BatchExecutionCudaKernels.WeightNorm }, useFastMath: false);
+
         CompileKernelModule(device, BatchExecutionCudaKernels.RfftMagnitudeCudaSource, "rfft_magnitude_precise_kernels",
             BatchExecutionCudaKernels.RfftMagnitudeKernelNames, useFastMath: false);
         // The GRU kernels again, without --use_fast_math; compiled second, so they replace the fast-math entries above.

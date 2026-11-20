@@ -527,7 +527,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
 
                 // Compile neural network kernels (activation gradients, loss, optimizers)
-                var nnProgram = CompileOrLoadCached(NeuralNetKernels.GetSource(), optimizationFlags, "Neural network kernels");
+                // The fused channel bias and leaky activation inherits the scalar kernels' denormal policy.
+                var nnProgram = CompileOrLoadCached(NeuralNetKernels.GetSource() + BatchExecutionKernels.GetChannelBiasLeakySource(),
+                    optimizationFlags, "Neural network kernels");
                 _programs.Add(nnProgram);
                 foreach (var name in NeuralNetKernels.GetKernelNames())
                 {
@@ -957,7 +959,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 var batchExecutionProgram = CompileOrLoadCached(BatchExecutionKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Batch execution kernels");
                 _programs.Add(batchExecutionProgram);
                 foreach (var name in BatchExecutionKernels.GetKernelNames())
-                    _kernelCache[name] = new DirectOpenClKernel(_context, batchExecutionProgram, name);
+                {
+                    var program = name == BatchExecutionCudaKernels.ChannelBiasLeaky ? nnProgram : batchExecutionProgram;
+                    _kernelCache[name] = new DirectOpenClKernel(_context, program, name);
+                }
                 // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
                 var complexProgram = CompileOrLoadCached(ComplexKernels.GetSource(), optimizationFlags, "Complex kernels");
                 _programs.Add(complexProgram);
