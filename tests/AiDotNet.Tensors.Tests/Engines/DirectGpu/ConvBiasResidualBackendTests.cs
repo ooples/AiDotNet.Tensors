@@ -1,15 +1,36 @@
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.Optimization;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class ConvBiasResidualBackendTests
+public sealed class ConvBiasResidualBackendTests : IDisposable
 {
-    [Theory]
+    private const string Feature = "AIDOTNET_GPU_INFERENCE_CONV_BIAS_RESIDUAL";
+    private readonly string? _previousFeature = Environment.GetEnvironmentVariable(Feature);
+    private readonly bool _previousCudnn = TensorCodecOptions.Current.UseCudnn;
+    private readonly bool _previousTf32 = CudaDispatchPolicy.AllowTF32;
+
+    public ConvBiasResidualBackendTests()
+    {
+        Environment.SetEnvironmentVariable(Feature, "1");
+        TensorCodecOptions.Current.UseCudnn = true;
+        CudaDispatchPolicy.AllowTF32 = false;
+    }
+
+    public void Dispose()
+    {
+        CudaDispatchPolicy.AllowTF32 = _previousTf32;
+        TensorCodecOptions.Current.UseCudnn = _previousCudnn;
+        Environment.SetEnvironmentVariable(Feature, _previousFeature);
+    }
+
+    [SkippableTheory]
     [InlineData(1, 8, 33, false)]
     [InlineData(1, 8, 33, true)]
     [InlineData(1, 32, 257, false)]
@@ -20,9 +41,11 @@ public sealed class ConvBiasResidualBackendTests
     [InlineData(4, 64, 2048, true)]
     public void Cuda_composition_preserves_inputs_and_independent_outputs(int batch, int channels, int spatial, bool activate)
     {
-        using var engine = new DirectGpuTensorEngine();
-        Assert.True(engine.IsGpuAvailable, "Actual CUDA execution required.");
-        var backend = Assert.IsType<CudaBackend>(engine.GetBackend());
+        using var backend = new CudaBackend();
+        CudaTestDevice.Require(backend);
+        Skip.IfNot(CuDnnConvolution.IsAvailable, "The vendor composition requires cuDNN.");
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
         var rng = new Random(73529);
         float[] Values(int count) => Enumerable.Range(0, count).Select(_ => (float)(rng.NextDouble() - .5)).ToArray();
         var inputValues = Values(batch * channels * spatial); var kernelValues = Values(channels * channels * 3);
@@ -58,10 +81,11 @@ public sealed class ConvBiasResidualBackendTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Cuda_rejects_output_aliases_and_geometry_before_native_work()
     {
-        using var backend = new CudaBackend(); Assert.True(backend.IsAvailable);
+        using var backend = new CudaBackend();
+        CudaTestDevice.Require(backend);
         using var input = backend.AllocateBuffer(new[] { 1f, 2f, 3f, 4f });
         using var kernel = backend.AllocateBuffer(new[] { 2f }); using var bias = backend.AllocateBuffer(new[] { .5f });
         using var residual = backend.AllocateBuffer(new[] { 4f, 3f, 2f, 1f });
@@ -91,12 +115,14 @@ public sealed class ConvBiasResidualBackendTests
         Assert.False(args.TryCount(out _));
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void Shared_composition_matches_the_vendor_route_and_reuses_scratch(bool activate)
     {
-        using var backend = new CudaBackend(); Assert.True(backend.IsAvailable);
+        using var backend = new CudaBackend();
+        CudaTestDevice.Require(backend);
+        Skip.IfNot(CuDnnConvolution.IsAvailable, "The vendor composition requires cuDNN.");
         using var input = backend.AllocateBuffer(new[] { 1f, -2f, 3f, -4f });
         using var kernel = backend.AllocateBuffer(new[] { 2f }); using var bias = backend.AllocateBuffer(new[] { .5f });
         using var residual = backend.AllocateBuffer(new[] { 4f, 3f, -2f, 1f });
@@ -104,12 +130,12 @@ public sealed class ConvBiasResidualBackendTests
         var args = new ConvBiasResidualArgs(input, kernel, bias, residual, output, activated,
             1, 1, 1, 4, 1, 1, 4, 1, 1, 1, 1, 0, 0, 1, 1, .1f, activate);
         long vendor = backend.ConvBiasResidualVendorLaunchCount;
-        Assert.True(GpuMemoryTracker.Enabled, "Native tracking must be enabled before test process startup.");
         for (int warm = 0; warm < 2; warm++) Assert.True(ConvBiasResidualComposition.TryExecute(backend, args));
-        var sequence = typeof(GpuMemoryTracker).GetField("s_seq", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
-        long warmed = (long)sequence.GetValue(null)!;
+        var warmed = GpuMemoryStats.Snapshot(backend);
         for (int repeat = 0; repeat < 6; repeat++) Assert.True(ConvBiasResidualComposition.TryExecute(backend, args));
-        Assert.Equal(warmed, (long)sequence.GetValue(null)!);
+        var after = GpuMemoryStats.Snapshot(backend);
+        Assert.Equal(warmed.DeviceAllocations, after.DeviceAllocations);
+        Assert.Equal(warmed.DeviceFrees, after.DeviceFrees);
         Assert.Equal(vendor, backend.ConvBiasResidualVendorLaunchCount);
         var composed = backend.DownloadBuffer(output);
         var composedActivated = activate ? backend.DownloadBuffer(activated) : null;
