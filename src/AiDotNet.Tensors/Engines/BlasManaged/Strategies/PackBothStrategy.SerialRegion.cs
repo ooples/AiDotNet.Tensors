@@ -98,8 +98,9 @@ internal static partial class PackBothStrategy
         }
         finally
         {
-            if (workerB is null) ArrayPool<byte>.Shared.Return(packBArray);
-            else packing?.ReleaseB();
+            // The worker's own B buffer goes back to the worker; a rented one goes back to the pool.
+            if (packing is { } worker && workerB is not null) worker.ReleaseB();
+            else ArrayPool<byte>.Shared.Return(packBArray);
         }
     }
 }
