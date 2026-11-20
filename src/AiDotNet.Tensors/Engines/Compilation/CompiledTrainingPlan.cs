@@ -1226,6 +1226,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var leaf = leaves[i];
             int version = leaf.GpuCacheVersion;
+            // A state-first graph can name its running state as its compiled input. That buffer
+            // contains the next replay's input until the caller writes a new value on the host.
+            if (ReferenceEquals(leaf, _compiledInputTensor) && CompiledInputIsRunningState
+                && leaf._gpuBufferVersion == version)
+            {
+                copiedSlot[i] = -1;
+                StepIoInputCopiesSkipped++;
+                continue;
+            }
             if (leaf.IsGpuResident && copiedSlot[i] >= 0 && copiedVersion[i] == version)
             {
                 StepIoInputCopiesSkipped++;
@@ -1372,6 +1381,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepIoBuffers = null;
         _stepIoLaunched = 0;
         _stepIoLossCaptured = false;
+    }
+
+    private void RefreshCapturedStateAndLoss(Engines.DirectGpuTensorEngine gte)
+    {
+        // A graph launch runs the writes without repeating their managed bind actions. Rearm the
+        // readback for the current binding, including when a host observer read the previous step.
+        foreach (var state in InPlaceStateTensors())
+        {
+            if (state._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero && state._gpuBackend is { } backend)
+            {
+                state.IncrementVersion();
+                gte.BindResidentBuffer(state, buffer, backend);
+            }
+        }
+        RefreshLossFromCapturedGraph(gte);
     }
 
     private void RefreshLossFromCapturedGraph(Engines.DirectGpuTensorEngine gte)
@@ -4565,7 +4589,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Executes THIS step on the just-uploaded indices (through the step I/O's staging when it has one).
                     if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, NextStepGraph);
                     else LaunchStepGraph(cb, exec);
-                    RefreshLossFromCapturedGraph(gte);
+                    RefreshCapturedStateAndLoss(gte);
                     if (_capturedOptimizer is { } capturedFirst)
                     {
                         capturedFirst.AfterReplay?.Invoke();   // the graph ran the update
@@ -4630,7 +4654,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
                 _planGraphReplayCount++;
 
-                RefreshLossFromCapturedGraph(gte);
+                RefreshCapturedStateAndLoss(gte);
                 if (_capturedOptimizer is { } capturedReplay)
                 {
                     capturedReplay.AfterReplay?.Invoke();   // the graph ran the update
@@ -4777,6 +4801,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool CompiledInputIsParameter => _compiledInputIsParameter ??=
         _compiledInputTensor is { } input && Array.Exists(_parameters, p => ReferenceEquals(p, input));
 
+    private bool? _compiledInputIsRunningState;
+    private bool CompiledInputIsRunningState => _compiledInputIsRunningState ??=
+        _compiledInputTensor is { } input && Array.Exists(InPlaceStateTensors(), state => ReferenceEquals(state, input));
+
     private bool IsOwnedLeafBinding(Tensor<T> leaf)
         => leaf._gpuBuffer is { } bound && _ownedLeafBuffers.TryGetValue(leaf, out var owned)
            && ReferenceEquals(owned, bound);
@@ -4872,6 +4900,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // fused LSTM's bias add). Like every parameter it is read by the graph and updated by the optimizer on the
         // device, so refreshing it from the host downloaded and re-uploaded it, stalling the stream every replay.
         if (CompiledInputIsParameter) return allLive;
+        if (CompiledInputIsRunningState && inT._gpuBuffer is { } stateBuffer && ReferenceEquals(inT._gpuBackend, cb)
+            && inT._gpuBufferVersion == inT.GpuCacheVersion)
+            return allLive && stateBuffer.Handle != IntPtr.Zero;
         Engines.DirectGpu.IGpuBuffer? buf;
         if (GraphExternalLeaves().Contains(inT))
         {

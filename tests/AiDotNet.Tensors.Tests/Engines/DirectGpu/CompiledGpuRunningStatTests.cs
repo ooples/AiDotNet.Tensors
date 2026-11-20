@@ -18,8 +18,11 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 [Collection("DirectGpuSerial")]
 public class CompiledGpuRunningStatTests
 {
-    [SkippableFact]
-    public void WholeStorageReshapeKeepsTheRunningStatesResidentBinding()
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void WholeStorageReshapeKeepsTheRunningStatesResidentBinding(bool readBetweenSteps, bool editState)
     {
         DirectGpuTensorEngine engine;
         try { engine = new DirectGpuTensorEngine(); }
@@ -49,10 +52,16 @@ public class CompiledGpuRunningStatTests
                 Assert.NotNull(binding);
                 for (int i = 0; i < 3; i++)
                 {
+                    if (editState && i == 1) state[0] = 10f;
                     plan.Step();
                     Assert.Same(binding, state._gpuBuffer);
+                    if (readBetweenSteps)
+                    {
+                        float first = editState && i >= 1 ? 10f + .5f * i : 3f + .5f * i;
+                        Assert.Equal(new[] { first, -2f - i, 11f + 2f * i, -4f - 2f * i }, state.ToArray());
+                    }
                 }
-                Assert.Equal(new[] { 4f, -4f, 15f, -8f }, state.ToArray());
+                Assert.Equal(new[] { editState ? 11f : 4f, -4f, 15f, -8f }, state.ToArray());
             }
         }
     }
