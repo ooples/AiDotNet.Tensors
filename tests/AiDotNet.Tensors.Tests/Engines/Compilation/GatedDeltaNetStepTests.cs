@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// IEngine.GatedDeltaNetStep: one decode position of the gated delta rule with the state updated in place, against a
 /// float64 implementation of the rule's definition, eagerly on the CPU and GPU engines and replayed by a captured plan.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class GatedDeltaNetStepTests
 {
     private sealed class EngineScope : IDisposable

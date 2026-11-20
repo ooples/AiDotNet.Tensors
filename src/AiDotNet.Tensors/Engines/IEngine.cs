@@ -4714,6 +4714,25 @@ public partial interface IEngine
         Tensor<T> beta);
 
     /// <summary>
+    /// One decode position of a causal depthwise 1-D convolution of kernel size K, with the K - 1 previous inputs
+    /// carried in <paramref name="history"/>: <c>y = x w[:, 0] + sum_m history[m - 1] w[:, m] + bias</c> (then SiLU when
+    /// <paramref name="silu"/>), and the history shifted IN PLACE (<c>history[m] = history[m - 1]</c>,
+    /// <c>history[0] = x</c>). A zero history is the sequence start (the full convolution's zero padding). Forward only.
+    /// </summary>
+    /// <param name="history">The previous inputs [K - 1, batch, channels], most recent first; written in place.</param>
+    /// <param name="input">This position's input, batch x channels values.</param>
+    /// <param name="weight">The taps [channels, K]: column 0 weights this position, column m the input m positions back.</param>
+    /// <param name="bias">Per-channel bias [channels], or null.</param>
+    /// <param name="silu">Apply SiLU (x sigmoid(x)) to the output.</param>
+    /// <returns>The output [batch, channels].</returns>
+    Tensor<T> CausalConv1dStep<T>(
+        Tensor<T> history,
+        Tensor<T> input,
+        Tensor<T> weight,
+        Tensor<T>? bias,
+        bool silu);
+
+    /// <summary>
     /// Fused xLSTM (mLSTM) matrix-memory recurrence over a whole sequence as one differentiable op
     /// (forward + analytic BPTT backward); see <c>CpuEngine.XLstmScan.cs</c> (#1464).
     /// </summary>
