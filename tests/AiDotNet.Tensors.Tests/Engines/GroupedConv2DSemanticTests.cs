@@ -23,6 +23,20 @@ public sealed class GroupedConv2DSemanticTests
         var g = twoDimensional
             ? new GroupedConv2DGeometry(2, 16, 9, 67, 24, 3, 5, 1, 2, 1, 3, 1, 2, 4)
             : new GroupedConv2DGeometry(2, 32, 1, 521, 48, 1, 5, 1, 2, 0, 3, 1, 2, 4);
+        CheckGroupedResults(g, accumulate);
+    }
+
+    [Theory]
+    [InlineData(1, 270, 1, false)]
+    [InlineData(4, 35, 3, true)]
+    public void Waveform_panel_clips_padding_across_tile_boundaries(int stride, int padding, int dilation, bool accumulate)
+    {
+        var g = new GroupedConv2DGeometry(1, 8, 1, 1027, 8, 1, 5, 1, stride, 0, padding, 1, dilation, 4);
+        CheckGroupedResults(g, accumulate);
+    }
+
+    private static void CheckGroupedResults(GroupedConv2DGeometry g, bool accumulate)
+    {
         var engine = new CpuEngine();
         using var input = Values<float>(g.InputShape);
         using var kernel = Values<float>(g.KernelShape, .71);
