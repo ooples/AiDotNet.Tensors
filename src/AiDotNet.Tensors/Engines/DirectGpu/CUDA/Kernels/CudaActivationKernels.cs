@@ -1341,7 +1341,7 @@ extern ""C"" __global__ __launch_bounds__(256) void round_vector(const float* __
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    B[idx] = roundf(A[idx]);
+    B[idx] = rintf(A[idx]); // Match CPU TensorRound and embedding IDs at half-integers.
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void trunc_vector(const float* __restrict__ A, float* __restrict__ B, int size)

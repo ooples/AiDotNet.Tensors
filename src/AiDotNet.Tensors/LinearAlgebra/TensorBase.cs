@@ -1307,7 +1307,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// True when this tensor covers its whole data vector in the vector's own layout (contiguous, offset 0, same
     /// length), so its device copy IS the vector's shared one.
     /// </summary>
-    private bool CoversWholeVector => IsContiguous && _storageOffset == 0 && _data is not null && Length == _data.Length;
+    internal bool CoversWholeVector => IsContiguous && _storageOffset == 0 && _data is not null && Length == _data.Length;
 
     // Planner identity probes must not use DataVector: its getter realizes lazy nodes. An output can be rebound
     // only before residency is established and while the tensor and the known trace lease are its sole owners.

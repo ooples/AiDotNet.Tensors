@@ -54,7 +54,10 @@ jobs:
     if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
     # POCL runs on hosted CPUs, so an offline self-hosted runner cannot strand required work.
     # Keep every shard scheduled; device initialization and parity checks still fail on errors.
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, whose apt POCL 6.0 (LLVM 18) aborts compiling a recurrent kernel with
+    # "Instruction Combining did not reach a fixpoint" (an LLVM verifier abort, not a parity failure). The lane was
+    # validated on 24.04's POCL 5.0; move it when the kernel compiles under POCL 6.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

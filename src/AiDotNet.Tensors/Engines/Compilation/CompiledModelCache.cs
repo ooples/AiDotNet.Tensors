@@ -227,6 +227,31 @@ public sealed class CompiledModelCache<T> : IDisposable
     }
 
     /// <summary>
+    /// Compiles a STATEFUL inference plan, uncached (each call is a new plan the caller owns and disposes). The traced
+    /// forward returns its output and its state updates: pairs of a leaf it reads (the state, for example a recurrent
+    /// scan state, a conv history or a one-hot position) and the value it computes to replace it. Every
+    /// <see cref="ICompiledPlan{T}.Execute"/> ends by writing each new value into its state's own storage, in the
+    /// declared order, so the next execution reads the advanced state; with inference CUDA graphs on, a whole
+    /// recurrent decode step replays as one graph launch with the state advanced on the device.
+    /// </summary>
+    /// <param name="inputs">The per-call input slots (refreshed with <see cref="ICompiledPlan{T}.SetInputs"/>).</param>
+    /// <param name="forward">The step to trace, called once. A state must be a leaf the step reads, not an input slot;
+    /// its next value must be computed by the step and have the state's length.</param>
+    public ICompiledPlan<T> CompileStatefulInference(Tensor<T>[] inputs,
+        Func<(Tensor<T> Output, IReadOnlyList<(Tensor<T> State, Tensor<T> Next)> StateUpdates)> forward)
+    {
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (forward is null) throw new ArgumentNullException(nameof(forward));
+        lock (_compileLock)
+        {
+            using var scope = GraphMode.EnableInference();
+            var (output, updates) = forward();
+            ThrowIfForwardRecordedNothing(scope, output);
+            return scope.CompileInference<T>(output, inputs, updates ?? Array.Empty<(Tensor<T>, Tensor<T>)>());
+        }
+    }
+
+    /// <summary>
     /// Gets a cached training plan for the given input shape, or compiles a new one.
     /// The forward + loss computation is traced once and compiled with backward pass.
     /// </summary>

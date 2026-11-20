@@ -151,7 +151,9 @@ FN U64 dgn_roundshift(U64 m, int sh, int sticky)
     if (sh > 64) return 0;
     U64 q = sh == 64 ? (U64)0 : (m >> sh);
     int roundBit = (int)((m >> (sh - 1)) & DGN_ONE);
-    int rest = sticky || (sh > 1 && (m & (~(U64)0 >> (65 - sh))) != 0);
+    // The low sh - 1 bits (none when sh is 1). One mask, not a guarded shift: POCL 6's LLVM 18 aborts (Instruction
+    // Combining did not reach a fixpoint) on the guarded form when the program binary is requested.
+    int rest = sticky || (m & ((DGN_ONE << (sh - 1)) - DGN_ONE)) != 0;
     if (roundBit && (rest || (q & DGN_ONE) != 0)) q++;
     return q;
 }
@@ -237,7 +239,12 @@ FN void dgn_to_double(U64 alo, U64 ahi, int v, PPTR(U32) wlo, PPTR(U32) whi)
             U64 top, h;
             dgn_shr128(alo, ahi, sh, &top, &h);
             int roundBit = dgn_bitat(alo, ahi, sh - 1);
-            int rest = sh > 1 && dgn_lowbits(alo, ahi, sh - 1);
+            // Sticky bit: any of the low sh - 1 bits set. Written with masks rather than dgn_lowbits: POCL 6's
+            // LLVM 18 aborts (Instruction Combining did not reach a fixpoint) on the dgn_lowbits form here.
+            int rb = sh - 1;
+            U64 mlo = rb >= 64 ? ~(U64)0 : ((DGN_ONE << rb) - DGN_ONE);
+            U64 mhi = rb > 64 ? ((DGN_ONE << (rb - 64)) - DGN_ONE) : (U64)0;
+            int rest = ((alo & mlo) | (ahi & mhi)) != 0;
             m = top;
             if (roundBit && (rest || (m & DGN_ONE) != 0)) m++;
             e = v + sh;

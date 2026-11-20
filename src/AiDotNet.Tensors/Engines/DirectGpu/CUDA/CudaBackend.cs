@@ -1945,6 +1945,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 static state => state.Item1.AllocateBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        if (Volatile.Read(ref _cublasWarmStarted) == 0) StartCublasWarmup();
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Cuda);
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
         LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
@@ -6827,6 +6828,44 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // the GC has finalized that ThreadLocal (its Values then throws), and its handles still have to be destroyed.
     private readonly ConcurrentQueue<ThreadCublas> _allThreadCublas = new();
 
+    // The first cuBLAS handle loads cublas64/cublasLt64 (hundreds of MB, ~50 ms) and initializes the library; done
+    // lazily, that lands inside the first training step's graph capture. The first host upload of an adopted GPU
+    // engine (weights, the first batch) starts a throwaway handle on a pool thread so the load overlaps model setup;
+    // the per-thread handle created later then only pays cublasCreate. Gated on the engine being current so a process
+    // that auto-detected the GPU but runs on the CPU engine never maps cuBLAS. AIDOTNET_CUBLAS_PREWARM=0 disables it.
+    private int _cublasWarmStarted;
+    private System.Threading.Tasks.Task? _cublasWarmup;
+    private readonly object _cublasWarmLock = new();
+    private bool _cublasWarmClosing;
+
+    private void StartCublasWarmup()
+    {
+        if (!AiDotNetEngine.Current.Is<DirectGpuTensorEngine>()) return;
+        lock (_cublasWarmLock)
+        {
+            if (_cublasWarmClosing || _disposed) return;
+            if (Interlocked.Exchange(ref _cublasWarmStarted, 1) != 0) return;
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_PREWARM") == "0") return;
+            _cublasWarmup = System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    // Creation and destruction both synchronize the device: neither may overlap a capture.
+                    lock (CaptureGateFor(_cudaContext))
+                    {
+                        using var _ = PushContext();
+                        if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                    }
+                }
+                catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException
+                    or InvalidOperationException or TypeInitializationException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[CUDA] cuBLAS prewarm failed: {ex}");
+                }
+            });
+        }
+    }
+
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
     // cuMemFree) from the GC finalizer thread races with op threads' driver entry and faults with an
     // uncatchable 0xC0000005 under the heavy GC the full test suite produces (DirectGpu-only, with low
@@ -10168,12 +10207,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         args[0] = &gradOutPtr;
         args[1] = &idxPtr;
         args[2] = &gradEmbPtr;
         args[3] = &numIndices;
         args[4] = &embeddingDim;
+        args[5] = &vocabSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -13877,12 +13917,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         args[0] = &srcPtr;
         args[1] = &idxPtr;
         args[2] = &dstPtr;
         args[3] = &sourceSize;
         args[4] = &embDim;
+        args[5] = &destSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -14559,8 +14600,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // Rows at least this wide reduce with one block per row (arg_extreme_axis_rows); narrower rows keep one thread per
+    // row, which is already coalesced across rows and pays no shared-memory reduction.
+    internal const int ArgExtremeRowKernelMinWidth = 512;
+    private long _argExtremeRowLaunches;
+    internal long ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
+
+
+    private unsafe bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
+    {
+        if (reduceSize < ArgExtremeRowKernelMinWidth || outerSize <= 0
+            || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var kernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr inputPtr = A.Handle;
+        IntPtr indicesPtr = indices.Handle;
+        int outerSizeVal = outerSize, reduceSizeVal = reduceSize, findMinVal = findMin;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPtr;
+        args[1] = &indicesPtr;
+        args[2] = &outerSizeVal;
+        args[3] = &reduceSizeVal;
+        args[4] = &findMinVal;
+        LaunchKernel(kernel, (uint)outerSize, DefaultBlockSize, args);
+        System.Threading.Interlocked.Increment(ref _argExtremeRowLaunches);
+        return true;
+    }
+
     public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
@@ -14578,6 +14647,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 1)) return;
         if (!_kernelCache.TryGetValue("argmin_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmin_axis");
 
@@ -17388,6 +17458,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if ((long)outerSize * reduceSize > A.Size)
             throw new ArgumentOutOfRangeException(nameof(outerSize), $"outerSize*reduceSize ({(long)outerSize * reduceSize}) exceeds buffer A length ({A.Size}).");
 
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
@@ -18820,6 +18891,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_backward_ckpt");
 
         using var _ = PushContext();
+        if (TryGlaScanBackwardTiled(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim))
+            return;
         // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
         // method is self-contained and correct even if the caller reuses dirty buffers.
         Fill(dQ, 0f, batch * seqLen * modelDim);
@@ -18842,6 +18915,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
         ba[16] = &chunk;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+    }
+
+    // gla_scan_backward_tiled: one 1024-thread block per (batch, head), up to 12 state elements per thread (headDim*headDim <= 12,288),
+    // reductions through a shared [headDim][headDim|1] tile (deterministic, no atomics). Used while the tile fits the
+    // default 48 KB per block (headDim <= 108); wider heads keep gla_scan_backward_ckpt.
+    internal static int GlaTiledSharedBytes(int headDim) => (headDim * (headDim | 1) + 4 * headDim + Kernels.CudaGlaKernels.TileWarpPartials) * sizeof(float);
+
+    private unsafe bool TryGlaScanBackwardTiled(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int shared = GlaTiledSharedBytes(headDim);
+        if (headDim * headDim > Kernels.CudaGlaKernels.TileElementsPerThread * Kernels.CudaGlaKernels.TileThreads
+            || shared > Kernels.CudaGlaKernels.TileSharedMemoryLimitBytes
+            || !_kernelCache.TryGetValue("gla_scan_backward_tiled", out var kernel))
+            return false;
+        var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        using var ckptBuf = AllocateBuffer(ckptLen);
+        using var scratchBuf = AllocateBuffer(scratchLen);
+        IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle;
+        IntPtr pck = ckptBuf.Handle, psc = scratchBuf.Handle;
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pdg = dG.Handle;
+        void** ba = stackalloc void*[17];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg; ba[5] = &pck; ba[6] = &psc;
+        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pdg;
+        ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
+        ba[16] = &chunk;
+        LaunchKernelWithSharedMem(kernel, (uint)(batch * numHeads), (uint)Kernels.CudaGlaKernels.TileThreads, (uint)shared, ba);
+        return true;
     }
 
     // ── Fused xLSTM (mLSTM) scan forward (#1464) ───────────────────────────────────────────
@@ -19620,6 +19723,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Dispose()
     {
+        System.Threading.Tasks.Task? warmup;
+        lock (_cublasWarmLock)
+        {
+            _cublasWarmClosing = true;
+            warmup = _cublasWarmup;
+        }
+        try { warmup?.Wait(); }
+        catch (AggregateException ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[CUDA] cuBLAS prewarm worker failed during disposal: {ex}");
+        }
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
     }

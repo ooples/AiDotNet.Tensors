@@ -1762,6 +1762,95 @@ internal static class Im2ColHelper
 
     #region ConvTranspose2D GEMM-based fast path
 
+    /// <summary>AIDOTNET_CONV_TRANSPOSE_BATCHED_GEMM=0 restores the per-sample GEMM + scatter.</summary>
+    private static readonly bool s_convTransposeBatchedGemm =
+        Environment.GetEnvironmentVariable("AIDOTNET_CONV_TRANSPOSE_BATCHED_GEMM") != "0";
+
+    // The batched path's column buffer is bounded: the batch is processed in chunks beyond this many floats.
+    // AIDOTNET_CONV_TRANSPOSE_COL_CAP overrides it (floats).
+    private static readonly long ConvTransposeColCap =
+        long.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_CONV_TRANSPOSE_COL_CAP"), out long cap) && cap > 0
+            ? cap
+            : 4L << 20;
+
+    /// <summary>
+    /// The transposed forward as one GEMM per batch chunk: x regrouped from [B, Cin, L] to [Cin, B*L], then
+    /// col[Cout*kH*kW, B*L] = W^T x and an output-parallel gather of the (kH/sH)*(kW/sW) columns that land on each
+    /// output element. The per-sample path runs one GEMM with N = L per sample (16 at a DCGAN generator's 4x4 stem,
+    /// far too narrow to fill the micro-kernel) and a scatter per sample.
+    /// </summary>
+    private static void ConvTranspose2DBatchedGemm(
+        float[] input, float[] kernel, float[] output,
+        int batch, int inChannels, int inputHeight, int inputWidth, int outChannels,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+    {
+        int hw = inputHeight * inputWidth;
+        int kmkn = outChannels * kernelH * kernelW;
+        int outPlane = outputHeight * outputWidth;
+        int chunk = (int)Math.Max(1, Math.Min(batch, Math.Min(ConvTransposeColCap, int.MaxValue) / Math.Max(1L, (long)kmkn * hw)));
+        var pool = ArrayPool<float>.Shared;
+        float[] xt = pool.Rent(checked(inChannels * chunk * hw));
+        float[] col = pool.Rent(checked(kmkn * chunk * hw));
+        try
+        {
+            for (int b0 = 0; b0 < batch; b0 += chunk)
+            {
+                int nb = Math.Min(chunk, batch - b0);
+                int n = nb * hw;
+                int first = b0;
+                CpuParallelSettings.ParallelForOrSerial(0, inChannels, (long)inChannels * n, ci =>
+                {
+                    for (int b = 0; b < nb; b++)
+                        Array.Copy(input, ((first + b) * inChannels + ci) * hw, xt, ci * n + b * hw, hw);
+                });
+
+                BlasManaged.Gemm<float>(
+                    a: kernel.AsSpan(0, inChannels * kmkn), lda: kmkn, transA: true,
+                    b: xt.AsSpan(0, inChannels * n), ldb: n, transB: false,
+                    c: col.AsSpan(0, kmkn * n), ldc: n,
+                    m: kmkn, n: n, k: inChannels);
+
+                // Overlap-add as a gather that keeps the per-sample output plane hot: each output row sums, in kh then kw
+                // order (the order the per-element gather used, so the result is bitwise the same), the column rows that
+                // land on it. For a fixed (oh, kh, kw) the contributing input columns are contiguous and their outputs are
+                // sW apart, so the inner loop has no division, modulo or bounds test.
+                CpuParallelSettings.ParallelForOrSerial(0, nb * outChannels, (long)nb * outChannels * outPlane, idx =>
+                {
+                    int b = idx / outChannels, oc = idx - b * outChannels;
+                    int outBase = ((first + b) * outChannels + oc) * outPlane;
+                    int colSample = b * hw;
+                    Array.Clear(output, outBase, outPlane);
+                    for (int oh = 0; oh < outputHeight; oh++)
+                    {
+                        int rowBase = outBase + oh * outputWidth;
+                        for (int kh = (oh + padH) % strideH; kh < kernelH; kh += strideH)
+                        {
+                            int ih = (oh + padH - kh) / strideH;
+                            if ((uint)ih >= (uint)inputHeight) continue;
+                            for (int kw = 0; kw < kernelW; kw++)
+                            {
+                                int lead = padW - kw;
+                                int iwStart = lead <= 0 ? 0 : (lead + strideW - 1) / strideW;
+                                int tail = outputWidth - 1 + padW - kw;
+                                if (tail < 0) continue;
+                                int iwEnd = Math.Min(inputWidth - 1, tail / strideW);
+                                int colRow = ((oc * kernelH + kh) * kernelW + kw) * n + colSample + ih * inputWidth;
+                                int o = rowBase + iwStart * strideW - padW + kw;
+                                for (int iw = iwStart; iw <= iwEnd; iw++, o += strideW)
+                                    output[o] += col[colRow + iw];
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        finally
+        {
+            pool.Return(col);
+            pool.Return(xt);
+        }
+    }
+
     /// <summary>
     /// Performs ConvTranspose2D (transposed convolution) using GEMM + Col2Im for float.
     /// Mathematically: y[b, oc, oh, ow] = sum_{ic, kh, kw} x[b, ic, ih, iw] * w[ic, oc, kh, kw]
@@ -1806,6 +1895,13 @@ internal static class Im2ColHelper
         int outSliceSize = outChannels * outputHeight * outputWidth;
         int inSliceSize  = inChannels * inputHeight * inputWidth;
         int kernelSize   = inChannels * kmkn;
+
+        if (s_convTransposeBatchedGemm)
+        {
+            ConvTranspose2DBatchedGemm(input, kernel, output, batch, inChannels, inputHeight, inputWidth, outChannels,
+                kernelH, kernelW, strideH, strideW, padH, padW, outputHeight, outputWidth);
+            return true;
+        }
 
         // CodeRabbit #366: the old useTranspose heuristic existed to dodge
         // OpenBLAS/MKL's slow transA=true path by materialising kernel^T

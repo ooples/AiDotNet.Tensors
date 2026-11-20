@@ -171,7 +171,7 @@ public static class CuBlasNative
 
 #endif
 
-    private static string[] GetCudaBinDirectories()
+    internal static string[] GetCudaBinDirectories()
     {
         var dirs = new System.Collections.Generic.List<string>();
 
@@ -1212,7 +1212,11 @@ public sealed class CudaBlasContext : IDisposable
     public void Synchronize()
     {
         ThrowIfDisposed();
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize");
+        // Through the capture gate: a context-wide synchronize while another thread captures on this context
+        // invalidates that capture (CUDA 901), whatever its capture mode.
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxGetCurrent(out var context), "cuCtxGetCurrent");
+        CuBlasNative.CheckCudaResult(
+            DirectGpu.CUDA.CudaBackend.SynchronizeContextOutsideCapture(context), "cuCtxSynchronize");
     }
 
     private void ThrowIfDisposed()

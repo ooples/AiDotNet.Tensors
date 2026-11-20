@@ -49,6 +49,19 @@ on:
         description: Manual regression suites only; OR-separated FullyQualifiedName~class terms (no model families or timing benchmarks)
         type: string
         default: ''
+      producer_run_id:
+        description: Optional successful coordination-package run ID for exact packaged DLL validation
+        type: string
+        default: ''
+      producer_artifact_id:
+        description: Immutable artifact ID from that producer run (required with producer_run_id)
+        type: string
+        default: ''
+      producer_artifact_digest:
+        description: Immutable sha256 artifact digest (required with producer_run_id)
+        type: string
+        default: ''
+
       # Runs one architecture's job alone (for example to exercise a newly registered runner) instead of all of them.
       arch:
         description: Run only this architecture's job (all runs every architecture the nightly schedule runs; pr-models runs only the AiDotNet model families on an RTX 3080)
@@ -68,6 +81,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
@@ -193,6 +207,26 @@ jobs:
           Write-Output '::error::suite_filter requires a manual dispatch, ratchets_only=false, and OR-separated FullyQualifiedName~class terms.'
           exit 1
         }
+
+    - name: Validate exact-artifact selection
+      env:
+        PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+        PRODUCER_ARTIFACT_ID: ${{ inputs.producer_artifact_id }}
+        PRODUCER_ARTIFACT_DIGEST: ${{ inputs.producer_artifact_digest }}
+        SUITE_FILTER: ${{ inputs.suite_filter }}
+        DISPATCH_EVENT: ${{ github.event_name }}
+        REQUESTED_ARCH: ${{ inputs.arch }}
+      run: |
+        if ($env:PRODUCER_RUN_ID -or $env:PRODUCER_ARTIFACT_ID -or $env:PRODUCER_ARTIFACT_DIGEST) {
+          if ($env:DISPATCH_EVENT -ne 'workflow_dispatch' -or $env:REQUESTED_ARCH -ne 'sm86' -or
+              $env:PRODUCER_RUN_ID -notmatch '^[1-9][0-9]*$' -or $env:PRODUCER_ARTIFACT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:PRODUCER_ARTIFACT_DIGEST -notmatch '^sha256:[0-9a-f]{64}$' -or
+              @($env:SUITE_FILTER -split '\|') -notcontains 'FullyQualifiedName~GpuLaneBackendTests' -or
+              @($env:SUITE_FILTER -split '\|') -notcontains 'FullyQualifiedName~CompiledCudaOptimizerEnrollmentTests') {
+            throw 'Exact-artifact validation requires immutable producer identity, sm86, and both mandatory CUDA suites.'
+          }
+        }
+
     # First, before anything writes: these runners keep caches between jobs, and a full drive failed later steps in ways
     # that hid the cause (gtx1660ti-cuda, 11-12/13: cuDNN's DLL vanished from its cache, then its re-download hit "not
     # enough space on the disk" and the test build output was missing). Report the free space and every cache this job
@@ -450,6 +484,138 @@ jobs:
     - name: Build tests (net10.0)
       if: matrix.arch != 'pr-models'
       run: dotnet build AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
+    # Validate the immutable producer, then execute its exact packaged bytes with matching-source tests.
+    - name: Install exact coordination artifact for CUDA validation
+      if: inputs.producer_run_id != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+        PRODUCER_ARTIFACT_ID: ${{ inputs.producer_artifact_id }}
+        PRODUCER_ARTIFACT_DIGEST: ${{ inputs.producer_artifact_digest }}
+      run: |
+        @'
+        import hashlib, io, json, os, re, urllib.request, zipfile
+        from pathlib import Path
+        repo, source = os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_SHA']
+        run_id, artifact_id = os.environ['PRODUCER_RUN_ID'], os.environ['PRODUCER_ARTIFACT_ID']
+        digest = os.environ['PRODUCER_ARTIFACT_DIGEST']
+        assert re.fullmatch(r'[1-9][0-9]*', run_id) and re.fullmatch(r'[1-9][0-9]*', artifact_id)
+        assert re.fullmatch(r'sha256:[0-9a-f]{64}', digest)
+        class SafeRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+                if redirected is not None:
+                    redirected.remove_header('Authorization')
+                return redirected
+        opener = urllib.request.build_opener(SafeRedirect())
+        base = os.environ['GITHUB_API_URL'] + '/repos/' + repo
+        def api(path, raw=False):
+            request = urllib.request.Request(base + path, headers={
+                'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+            with opener.open(request, timeout=120) as response:
+                payload = response.read()
+            return payload if raw else json.loads(payload)
+        artifact = api('/actions/artifacts/' + artifact_id)
+        prefix = f"tensors-coordination-{source}-{run_id}-"
+        matched = re.fullmatch(re.escape(prefix) + r'([1-9][0-9]*)', artifact['name'])
+        assert matched, 'Artifact name does not bind the requested source and producer run'
+        attempt = int(matched.group(1))
+        expected_name = prefix + str(attempt)
+        run = api(f'/actions/runs/{run_id}/attempts/{attempt}')
+        workflow = api('/actions/workflows/coordination-package.yml')
+        assert run['id'] == int(run_id) and run['run_attempt'] == attempt and run['workflow_id'] == workflow['id']
+        assert run['path'].split('@')[0] == '.github/workflows/coordination-package.yml'
+        assert run['conclusion'] == 'success' and run['status'] == 'completed'
+        assert run['head_sha'] == source and run['repository']['full_name'] == repo
+        assert run['event'] == 'push' and run['head_branch'] == 'codex/2524-ci-coordination'
+        assert artifact['id'] == int(artifact_id) and artifact['name'] == expected_name
+        assert not artifact['expired'] and artifact['digest'] == digest
+        assert artifact['workflow_run']['id'] == int(run_id)
+        assert artifact['workflow_run']['head_sha'] == source
+        archive_bytes = api('/actions/artifacts/' + artifact_id + '/zip', raw=True)
+        assert 'sha256:' + hashlib.sha256(archive_bytes).hexdigest() == digest, 'Downloaded artifact digest mismatch'
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            assert archive.namelist().count('manifest.json') == 1
+            manifest = json.loads(archive.read('manifest.json'))
+            assert manifest['repository'] == repo and manifest['sourceCommit'] == source
+            assert manifest['workflowRun'] == f"https://github.com/{repo}/actions/runs/{run_id}"
+            assert manifest['runAttempt'] == run['run_attempt']
+            version = f"0.151.1-coordination.{run_id}.{run['run_attempt']}.g{source[:12]}"
+            assert manifest['packageVersion'] == version
+            assert set(manifest['targetFrameworks']) == {'net10.0','net8.0','net471','net462','netstandard2.0'}
+            # Fixed approved groups; the checksummed producer TRX must prove every identity passed.
+            expected_groups = {'testCounters': 99, 'retainedOutputTestCounters': 26,
+                'heterogeneousReplayTestCounters': 15, 'noGradTestCounters': 9,
+                'optimizerEnrollmentTestCounters': 43, 'enrollmentCheckpointTestCounters': 38}
+            assert all(n > 0 for n in expected_groups.values()), 'Invalid reviewed CPU group count'
+            for key, expected in expected_groups.items():
+                counters = manifest[key]
+                assert all(int(counters[k]) == expected for k in ('total','executed','passed')), (key, counters)
+                assert int(counters.get('failed', 0)) == 0 and int(counters.get('notExecuted', 0)) == 0
+            assert manifest['mandatoryCpuTestCount'] == sum(expected_groups.values())
+            for name, expected_hash in manifest['sha256'].items():
+                assert hashlib.sha256(archive.read(name)).hexdigest() == expected_hash, name
+            import xml.etree.ElementTree as ET
+            def passed_results(name, count):
+                assert name in manifest['sha256'], 'Missing checksummed TRX: ' + name
+                trx = ET.fromstring(archive.read(name))
+                results = trx.findall('.//{*}UnitTestResult')
+                names = [r.attrib['testName'] for r in results]
+                assert len(results) == len(set(names)) == count, (name, len(results))
+                assert all(r.attrib['outcome'] == 'Passed' for r in results), name
+                return set(names)
+            passed_results('TestResults/lstm-signature.trx', 99)
+            retained = passed_results('TestResults/retained-output-signature.trx', 26)
+            assert retained == set(manifest['retainedOutputTestCases'])
+            new_case_fields = ['heterogeneousReplayTestCases', 'noGradTestCases',
+                'optimizerEnrollmentTestCases', 'enrollmentCheckpointTestCases']
+            # Pin the reviewed exact sets compactly: ordinal ASCII sort, UTF-8 LF join, no trailing LF.
+            approved_cases = [
+                (15, 'de0075e3f1733158969ac80614c060ec5503fca2c224f1d20a7fc639921b4d6d'),
+                (9, '337e7ee0a35bee20cfbd1eac8233c492ef750437ab57409b4a29fe5af3ae05e5'),
+                (43, '359f487a34663544290a09d33b38529875bedf4e6719aff3b82aa931782b691f'),
+                (38, '71f778ef513854883c35373163eb00e8fc4978b5a43c930cf8b1ccf411c41cd0')]
+            union = set()
+            for field, (count, expected_identity_hash) in zip(new_case_fields, approved_cases):
+                assert count > 0 and re.fullmatch(r'[0-9a-f]{64}', expected_identity_hash), 'Invalid reviewed CPU identity pin'
+                cases = manifest[field]
+                assert isinstance(cases, list) and len(cases) == len(set(cases)) == count
+                assert all(isinstance(case, str) and case.isascii() for case in cases)
+                assert hashlib.sha256('\n'.join(sorted(cases)).encode('utf-8')).hexdigest() == expected_identity_hash, field
+                assert not union.intersection(cases), 'Overlapping CPU group identities'
+                union.update(cases)
+            assert passed_results('TestResults/optimizer-enrollment-signature.trx', len(union)) == union
+
+            packages = [name for name in manifest['sha256'] if name.endswith('.nupkg') and not name.endswith('.snupkg')]
+            assert len(packages) == 1
+            package_bytes = archive.read(packages[0])
+            with zipfile.ZipFile(io.BytesIO(package_bytes)) as package:
+                import xml.etree.ElementTree as ET
+                nuspec = ET.fromstring(package.read('AiDotNet.Tensors.nuspec'))
+                assert nuspec.find('.//{*}version').text == version
+                dll = package.read('lib/net10.0/AiDotNet.Tensors.dll')
+                assert {name.split('/')[1] for name in package.namelist()
+                    if name.startswith('lib/') and name.endswith('/AiDotNet.Tensors.dll')} == set(manifest['targetFrameworks'])
+        dll_hash = hashlib.sha256(dll).hexdigest()
+        assert dll_hash == manifest['testedAndPackagedNet10BinarySha256']
+        target = Path('AiDotNet.Tensors/tests/AiDotNet.Tensors.Tests/bin/Release/net10.0/AiDotNet.Tensors.dll')
+        assert target.is_file()
+        target.write_bytes(dll)
+        assert hashlib.sha256(target.read_bytes()).hexdigest() == dll_hash
+        evidence = Path(os.environ['RUNNER_TEMP']) / 'trx'
+        evidence.mkdir(parents=True, exist_ok=True)
+        (evidence / 'exact-artifact.json').write_text(json.dumps({
+            'producerRunId': int(run_id), 'producerRunAttempt': attempt,
+            'artifactId': int(artifact_id), 'artifactName': expected_name,
+            'artifactDigest': digest, 'sourceCommit': source, 'packageVersion': version,
+            'packagedDllSha256': dll_hash, 'testRuntimeDll': str(target.resolve()),
+            'cpuGroups': expected_groups}, indent=2))
+        with open(os.environ['GITHUB_ENV'], 'a') as env:
+            env.write('AIDOTNET_EXPECT_TENSORS_DLL_SHA256=' + dll_hash + '\n')
+        '@ | python -
+        if ($LASTEXITCODE -ne 0) { throw 'Exact-artifact CUDA validation bootstrap failed.' }
+
 
     # The card is shared with research runs on the same machine; see the script. The cap keeps the wait inside each
     # lane's budget: the suites' watchdog counts from the job start on a pull request.
@@ -793,6 +959,39 @@ jobs:
           }
         }
         if ($failed) { exit 1 }
+    - name: Require every exact-artifact CUDA validation case
+      if: ${{ always() && inputs.producer_run_id != '' }}
+      run: |
+        @'
+        import hashlib, json, os, re
+        from pathlib import Path
+        import xml.etree.ElementTree as ET
+        root = Path(os.environ['RUNNER_TEMP']) / 'trx'
+        results = ET.parse(root / 'cuda-targeted.trx').getroot().findall('.//{*}UnitTestResult')
+        prefix = 'AiDotNet.Tensors.Tests.Engines.Compilation.CompiledCudaOptimizerEnrollmentTests.'
+        cases = [r for r in results if r.attrib['testName'].startswith(prefix)]
+        names = [r.attrib['testName'] for r in cases]
+        assert len(cases) == len(set(names)) == 7, 'Missing or duplicate mandatory CUDA cases'
+        assert all(r.attrib['outcome'] == 'Passed' for r in cases), 'A mandatory CUDA case did not pass'
+        expected_identity_hash = '4eea1668e71a3ca98d0652ee432a5c7fd3b3f04a54cb74ce67a079be43e8c2cd'
+        assert re.fullmatch(r'[0-9a-f]{64}', expected_identity_hash), 'CUDA discovery identities require reviewed pin'
+        actual_identity_hash = hashlib.sha256('\n'.join(sorted(names)).encode('utf-8')).hexdigest()
+        assert actual_identity_hash == expected_identity_hash, 'Mandatory CUDA case identity mismatch'
+        probe_name = 'AiDotNet.Tensors.Tests.Engines.DirectGpu.GpuLaneBackendTests.TheEngine_ResolvesTheBackendTheLaneRequires'
+        probe = [r for r in results if r.attrib['testName'] == probe_name]
+        assert len(probe) == 1 and probe[0].attrib['outcome'] == 'Passed', 'CUDA backend/DLL probe did not pass'
+        evidence_path = root / 'exact-artifact.json'
+        evidence = json.loads(evidence_path.read_text())
+        assert os.environ['AIDOTNET_EXPECT_TENSORS_DLL_SHA256'] == evidence['packagedDllSha256']
+        evidence['cudaTestCases'] = sorted(names)
+        evidence['cudaTestCasesSha256'] = actual_identity_hash
+        evidence['backendProbe'] = probe_name
+        evidence['cudaValidationPassed'] = True
+        evidence_path.write_text(json.dumps(evidence, indent=2))
+        '@ | python -
+        if ($LASTEXITCODE -ne 0) { throw 'Mandatory exact-artifact CUDA cases failed validation.' }
+
+
 
 
     - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
