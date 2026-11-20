@@ -39091,7 +39091,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 // the GPU gather read this step's tokens while the table gradient went to the trace
                                 // batch's rows (measured: a GPU-compiled int-id plan diverged from the CPU from step 2).
                                 var liveIds = capturedIndices.GetReadOnlyDataArray();
-                                for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveIds[i]);
+                                for (int i = 0; i < n; i++) idxSnap[i] = EmbeddingIndexToInt64(liveIds[i]);
                                 return;
                             }
                         }
@@ -39104,7 +39104,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // forward gather AND the matching backward (which holds the same idxSnap array) use the
                         // current step's tokens. Covered by EmbeddingIndicesMustRefreshAcrossStep_NotFrozenAtCompileTime.
                         var liveRaw = capturedIndices.GetReadOnlyDataArray();
-                        for (int i = 0; i < n; i++) idxSnap[i] = Convert.ToInt64(liveRaw[i]);
+                        for (int i = 0; i < n; i++) idxSnap[i] = EmbeddingIndexToInt64(liveRaw[i]);
                         // Replay forward: re-execute the row-gather into
                         // the pre-allocated output buffer.
                         // Embedding tables are input operands. Inference may keep them in a
@@ -39150,7 +39150,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // meaningful error instead of OverflowException from Convert.ToInt32.
         for (int i = 0; i < numIndices; i++)
         {
-            long tokenIdxLong = Convert.ToInt64(idxData[i]);
+            long tokenIdxLong = EmbeddingIndexToInt64(idxData[i]);
 
             if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                 throw new ArgumentOutOfRangeException(nameof(indices),
@@ -39378,8 +39378,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int n = indices.Length;
         var snap = new long[n];
         var raw = indices.GetReadOnlyDataArray();
-        for (int i = 0; i < n; i++) snap[i] = Convert.ToInt64(raw[i]);
+        for (int i = 0; i < n; i++) snap[i] = EmbeddingIndexToInt64(raw[i]);
         return snap;
+    }
+
+    [MethodImpl(HotInline)]
+    private static long EmbeddingIndexToInt64<TIndex>(TIndex value) where TIndex : unmanaged
+    {
+        // Convert.ToInt64(object) boxes each generic token. Int32 and Int64 are the usual
+        // index tensors, and a compiled lookup refreshes every token on every replay.
+        if (typeof(TIndex) == typeof(int)) return Unsafe.As<TIndex, int>(ref value);
+        if (typeof(TIndex) == typeof(long)) return Unsafe.As<TIndex, long>(ref value);
+        return Convert.ToInt64(value);
     }
 
     /// <inheritdoc/>
@@ -39442,7 +39452,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             for (int i = 0; i < numIndices; i++)
             {
-                long tokenIdxLong = Convert.ToInt64(idxData[i]);
+                long tokenIdxLong = EmbeddingIndexToInt64(idxData[i]);
 
                 if (tokenIdxLong < 0 || tokenIdxLong >= vocabSize)
                     throw new ArgumentOutOfRangeException(nameof(indices),
@@ -39703,7 +39713,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int i = 0; i < tensor._shape.Length; i++)
                     outShape[i] = tensor._shape[i] * multiples[i];
                 return scope.RecordUnary(LazyNodeType.Custom, "Tile", tensor, outShape,
-                    (eng, output) => { var r = eng.TensorTile(captured, capMultiples); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        if (eng.Unwrap().GetType() == typeof(CpuEngine) && TryCopyTileInto(captured, output, outShape)) return;
+                        var tiled = eng.TensorTile(captured, capMultiples);
+                        DirectGpuTensorEngine.CopyResultInto(eng, tiled, output);
+                    },
                     BackwardFunctions<T>.TileBackward);
             }
         }
@@ -39720,25 +39735,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
-        using var tensorDataLease = tensor.LeaseArray();
-        var tensorData = tensorDataLease.Array;
-        using var resultDataLease = result.LeaseArray();
-        var resultData = resultDataLease.Array;
-        int srcLen = tensor.Length;
-
-        // Fast path: only tiling along axis 0 (other axes multiply=1)
-        bool onlyAxis0 = true;
-        for (int i = 1; i < multiples.Length; i++)
-            if (multiples[i] != 1) { onlyAxis0 = false; break; }
-
-        if (onlyAxis0)
+        if (!TryCopyTileInto(tensor, result, outputShape))
         {
-            // Just copy the source data `multiples[0]` times
-            for (int m = 0; m < multiples[0]; m++)
-                Array.Copy(tensorData, 0, resultData, m * srcLen, srcLen);
-        }
-        else
-        {
+            using var tensorDataLease = tensor.LeaseArray();
+            var tensorData = tensorDataLease.Array;
+            using var resultDataLease = result.LeaseArray();
+            var resultData = resultDataLease.Array;
             // General tiling via per-element index mapping
             int totalElements = result.Length;
             CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, [MethodImpl(Hot)] (flatIdx) =>

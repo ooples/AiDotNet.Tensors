@@ -403,9 +403,40 @@ kernel void resident_index_add(
     constant int& sourceAxis [[buffer(5)]],
     constant int& destinationAxis [[buffer(6)]],
     constant int& innerSize [[buffer(7)]],
-    uint gid [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]], uint localIndex [[thread_index_in_threadgroup]],
+    uint groupSize [[threads_per_threadgroup]])
 {
     int total = outerSize * destinationAxis * innerSize;
+    // Scan each index once per workgroup. A single source can be read directly, while
+    // duplicates use the ordered loop below, including when the index buffer changes on replay.
+    threadgroup atomic_int owners[1024];
+    int lane = (int)localIndex;
+    int width = (int)groupSize;
+    const int indexAddMinAxis = 512;
+    const int indexAddNoOwner = -1;
+    const int indexAddMultipleOwners = -2;
+    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= indexAddMinAxis && width <= 1024 && width <= sourceAxis) {
+        atomic_store_explicit(&owners[lane], indexAddNoOwner, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int first = (int(gid) - lane) % destinationAxis;
+        for (uint j = (uint)lane; j < (uint)sourceAxis; j += (uint)width) {
+            int index = indices[j];
+            if (index < 0 || index >= destinationAxis) continue;
+            int slot = index - first;
+            if (slot < 0) slot += destinationAxis;
+            if (slot < width && atomic_exchange_explicit(&owners[slot], int(j), memory_order_relaxed) != indexAddNoOwner)
+                atomic_exchange_explicit(&owners[slot], indexAddMultipleOwners, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (int(gid) >= total) return;
+        int owner = atomic_load_explicit(&owners[lane], memory_order_relaxed);
+        if (owner != indexAddMultipleOwners) {
+            float value = destination[gid];
+            if (owner >= 0) value += source[(int(gid) / destinationAxis) * sourceAxis + owner];
+            output[gid] = value;
+            return;
+        }
+    }
     if (int(gid) >= total) return;
     int inner = int(gid) % innerSize;
     int dst = (int(gid) / innerSize) % destinationAxis;

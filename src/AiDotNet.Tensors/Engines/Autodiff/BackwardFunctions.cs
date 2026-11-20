@@ -215,6 +215,14 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var scalar = (T)savedState[0];
+        // A compiled first write already has a destination for the entire scaled gradient.
+        if (!gradOutput.IsSparse && engine.Unwrap().GetType() == typeof(CpuEngine) &&
+            DifferentiableOps.TryGetDirectGradTarget(grads, inputs[0], engine, out _, gradOutput, firstWriteOnly: true) is { } target)
+        {
+            engine.TensorMultiplyScalarInto(target, gradOutput, scalar);
+            target.IncrementVersion();
+            return;
+        }
         var grad = engine.TensorMultiplyScalar(gradOutput, scalar);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -4202,6 +4210,26 @@ internal static partial class BackwardFunctions<T>
         }
 
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
+        if (engine.Unwrap().GetType() == typeof(CpuEngine) && gradOutput.IsContiguous && !gradOutput.IsSparse
+            && CpuEngine.TryGetTileSlab(inShape, outShape, out int width, out int repeats))
+        {
+            // Add each repeated slab in forward order, preserving the per-element sum order.
+            using (var src = gradOutput.Lease())
+            using (var dst = inputGrad.LeaseWritable())
+            {
+                int read = 0;
+                for (int offset = 0; offset < inputGrad.Length; offset += width)
+                {
+                    var sum = dst.Span.Slice(offset, width);
+                    for (int repeat = 0; repeat < repeats; repeat++, read += width)
+                        numOps.Add(sum, src.Span.Slice(read, width), sum);
+                }
+            }
+            inputGrad.IncrementVersion();
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+            return;
+        }
+
         for (int flat = 0; flat < totalOut; flat++)
         {
             int remaining = flat;
@@ -9890,21 +9918,56 @@ internal static partial class BackwardFunctions<T>
                 Scale(engine, engine.TensorExp(engine.TensorNegate(Squared(engine, x))), c), engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
         using var xSrcLease = x.Lease();
         var xSrc = xSrcLease.Span;
         using var dYLease = gradOutput.Lease();
         var dY = dYLease.Span;
-        var gX = new Tensor<T>(x._shape);
+        var target = DifferentiableOps.TryGetDirectGradTarget(grads, x, engine, out bool overwrite, gradOutput);
+        var gX = target ?? new Tensor<T>(x._shape);
+        bool add = target is not null && !overwrite;
         using var dXLease = gX.LeaseWritable();
         var dX = dXLease.Span;
-        var cT = ops.FromDouble(c);
-        for (int i = 0; i < dX.Length; i++)
+        if (typeof(T) == typeof(float))
         {
-            var expTerm = ops.Exp(ops.Negate(ops.Multiply(xSrc[i], xSrc[i])));
-            dX[i] = ops.Multiply(dY[i], ops.Multiply(cT, expTerm));
+            for (int i = 0; i < dX.Length; i++)
+            {
+                float value = (float)(object)xSrc[i]!;
+                float exp = (float)Math.Exp(-(value * value));
+                float contribution = (float)(object)dY[i]! * ((float)c * exp);
+                dX[i] = (T)(object)(add ? (float)(object)dX[i]! + contribution : contribution);
+            }
         }
-        DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        else if (typeof(T) == typeof(double))
+        {
+            for (int i = 0; i < dX.Length; i++)
+            {
+                double value = (double)(object)xSrc[i]!;
+                double contribution = (double)(object)dY[i]! * (c * Math.Exp(-(value * value)));
+                dX[i] = (T)(object)(add ? (double)(object)dX[i]! + contribution : contribution);
+            }
+        }
+        else
+        {
+            ErfcGradientGeneric(xSrc, dY, dX, c, add);
+        }
+        if (target is null)
+            DifferentiableOps.AccumulateGrad(grads, x, gX, engine);
+        else
+            target.IncrementVersion();
+    }
+
+    [ScalarKernel("The fallback for non-float and non-double element types preserves the numeric type's exponential and ordered gradient addition.")]
+    private static void ErfcGradientGeneric(ReadOnlySpan<T> x, ReadOnlySpan<T> upstream,
+        Span<T> gradient, double coefficient, bool add)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var c = ops.FromDouble(coefficient);
+        for (int i = 0; i < gradient.Length; i++)
+        {
+            var exp = ops.Exp(ops.Negate(ops.Multiply(x[i], x[i])));
+            var contribution = ops.Multiply(upstream[i], ops.Multiply(c, exp));
+            gradient[i] = add ? ops.Add(gradient[i], contribution) : contribution;
+        }
     }
 
     /// <summary>Erfinv backward: d/dy erfinv(y) = √π/2 · e^(erfinv(y)²).</summary>

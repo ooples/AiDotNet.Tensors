@@ -375,6 +375,36 @@ __kernel void resident_index_add(
 {
     int gid = get_global_id(0);
     int total = outerSize * destinationAxis * innerSize;
+    // Scan each index once per workgroup. A single source can be read directly, while
+    // duplicates use the ordered loop below, including when the index buffer changes on replay.
+    __local int owners[1024];
+    int lane = (int)get_local_id(0);
+    int width = (int)get_local_size(0);
+    const int indexAddMinAxis = 512;
+    const int indexAddNoOwner = -1;
+    const int indexAddMultipleOwners = -2;
+    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= indexAddMinAxis && width <= 1024 && width <= sourceAxis) {
+        owners[lane] = indexAddNoOwner;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        int first = (gid - lane) % destinationAxis;
+        for (uint j = (uint)lane; j < (uint)sourceAxis; j += (uint)width) {
+            int index = indices[j];
+            if (index < 0 || index >= destinationAxis) continue;
+            int slot = index - first;
+            if (slot < 0) slot += destinationAxis;
+            if (slot < width && atomic_xchg(&owners[slot], (int)j) != indexAddNoOwner)
+                atomic_xchg(&owners[slot], indexAddMultipleOwners);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (gid >= total) return;
+        int owner = owners[lane];
+        if (owner != indexAddMultipleOwners) {
+            float value = destination[gid];
+            if (owner >= 0) value += source[(gid / destinationAxis) * sourceAxis + owner];
+            output[gid] = value;
+            return;
+        }
+    }
     if (gid >= total) return;
     int inner = gid % innerSize;
     int dst = (gid / innerSize) % destinationAxis;

@@ -4475,15 +4475,74 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorErfc<T>(Tensor<T> tensor)
     {
-        var lazy = TryRecordLazyUnary("TensorErfc", tensor,
-            eng => eng.TensorErfc(tensor), BackwardFunctions<T>.ErfcBackward);
-        if (lazy != null) return lazy;
-        var result = ElementwiseUnary(tensor, x => {
-            var ops = MathHelper.GetNumericOperations<T>();
-            return MathHelper.Erfc(x);
-        }, "TensorErfc");
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            return scope.RecordUnary(LazyNodeType.Custom, "TensorErfc", tensor, (int[])tensor._shape.Clone(),
+                (engine, output) =>
+                {
+                    if (engine.Unwrap().GetType() == typeof(CpuEngine) && !tensor.IsSparse && !output.IsSparse
+                        && tensor.IsContiguous && output.IsContiguous && tensor.Length == output.Length
+                        && !ReferenceEquals(tensor.StorageIdentity, output.StorageIdentity))
+                    {
+                        ErfcInto(tensor, output);
+                        return;
+                    }
+                    var computed = engine.TensorErfc(tensor);
+                    DirectGpuTensorEngine.CopyResultInto(engine, computed, output);
+                }, BackwardFunctions<T>.ErfcBackward);
+        }
+        Tensor<T> result;
+        if (tensor.IsSparse)
+            result = ElementwiseUnary(tensor, MathHelper.Erfc, "TensorErfc");
+        else
+        {
+            var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
+            result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+            ErfcInto(source, result);
+        }
         DifferentiableOps.RecordUnary("TensorErfc", result, tensor, BackwardFunctions<T>.ErfcBackward);
         return result;
+    }
+
+    private static void ErfcInto<T>(Tensor<T> input, Tensor<T> output)
+    {
+        using var keepInput = new KeepAliveScope(input);
+        using var keepOutput = new KeepAliveScope(output);
+        var src = input.ReadOnlyDataUnmarked;
+        var dst = output.DataUnmarked;
+        int chunks = ElementwiseChunks(src.Length);
+        if (chunks == 1)
+            ErfcRange(src.Span, dst.Span);
+        else
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, src.Length, chunk =>
+            {
+                int start = (int)((long)src.Length * chunk / chunks);
+                int end = (int)((long)src.Length * (chunk + 1) / chunks);
+                ErfcRange(src.Span.Slice(start, end - start), dst.Span.Slice(start, end - start));
+            });
+        }
+        output.IncrementVersion();
+    }
+
+    private static void ErfcRange<T>(ReadOnlySpan<T> src, Span<T> dst)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = (T)(object)(float)ErrorFunction.Erfc((float)(object)src[i]!);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = (T)(object)ErrorFunction.Erfc((double)(object)src[i]!);
+        }
+        else
+        {
+            for (int i = 0; i < src.Length; i++)
+                dst[i] = MathHelper.Erfc(src[i]);
+        }
     }
 
     /// <inheritdoc/>
