@@ -19,10 +19,12 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public class CompiledGpuRunningStatTests
 {
     [SkippableTheory]
-    [InlineData(false, false)]
-    [InlineData(true, false)]
-    [InlineData(true, true)]
-    public void WholeStorageReshapeKeepsTheRunningStatesResidentBinding(bool readBetweenSteps, bool editState)
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(true, false, true)]
+    public void WholeStorageReshapeKeepsTheRunningStatesResidentBinding(bool readBetweenSteps, bool editState,
+        bool recordAnotherObjective)
     {
         DirectGpuTensorEngine engine;
         try { engine = new DirectGpuTensorEngine(); }
@@ -50,6 +52,19 @@ public class CompiledGpuRunningStatTests
                 for (int i = 0; i < 3; i++) plan.Step();
                 var binding = state._gpuBuffer;
                 Assert.NotNull(binding);
+                if (recordAnotherObjective)
+                {
+                    // TensorMax determines its output shape by evaluating its operand during recording. The
+                    // speculative in-place write must roll back before the first plan reuses the statistic.
+                    using (GraphMode.EnableTraining(new[] { increment }))
+                    {
+                        var next = engine.TensorAdd(state, engine.Reshape(increment, new[] { 4 }));
+                        engine.TensorCopyInPlace(state, next);
+                        _ = ((IEngine)engine).TensorMax(state, .25f);
+                    }
+                    Assert.Same(binding, state._gpuBuffer);
+                    Assert.Equal(new[] { 2.5f, -1f, 9f, -2f }, state.ToArray());
+                }
                 for (int i = 0; i < 3; i++)
                 {
                     if (editState && i == 1) state[0] = 10f;

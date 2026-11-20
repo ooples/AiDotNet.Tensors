@@ -4331,6 +4331,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         binding.DeviceWrittenVersion = -1;
     }
 
+    internal bool TryRestoreResidentState<T>(Tensor<T> snapshot, Tensor<T> target)
+    {
+        using var operation = EnterGpuOp();
+        if (typeof(T) != typeof(float) || !target.CoversWholeVector || target.IsView || target.Length == 0
+            || !snapshot.CoversWholeVector || snapshot.Length != target.Length || InferenceCaptureActive
+            || !_residentInputBindings.TryGetValue(target, out var binding) || binding.Buffer is not { } buffer
+            || !ReferenceEquals(target._gpuBuffer, buffer) || !IsBoundDeviceAuthoritative(target)
+            || !TryGetBackend(out var backend) || !ReferenceEquals(target._gpuBackend, backend)
+            || buffer.SizeInBytes < (long)target.Length * sizeof(float)
+            || backend is IGpuGraphCapture capture && capture.IsStreamCapturing())
+            return false;
+
+        using var saved = snapshot.LeaseArray();
+        target.PrepareForInPlaceWrite();
+        if (!ReferenceEquals(target._gpuBuffer, buffer) || saved.Array.Length != target.Length
+            || target.GetBackingArrayForCacheLookupUnsafe() is not T[] host || host.Length < target.Length)
+            return false;
+
+        // The snapshot owns the complete logical value. Update both copies, including the host array a
+        // caller may already hold. BindResidentBuffer removes any pending download of the speculative write.
+        try { backend.UploadBufferInPlace((float[])(object)saved.Array, buffer); }
+        catch (NotSupportedException unavailable)
+        {
+            GpuLaunchProbe.OnFallback(nameof(TryRestoreResidentState), unavailable);
+            return false;
+        }
+        Array.Copy(saved.Array, host, target.Length);
+        target.IncrementVersion();
+        BindResidentBuffer(target, buffer, backend, isDeviceModified: false);
+        base.InvalidatePersistentTensor(target);
+        return true;
+    }
+
     /// <summary>
     /// Whether <paramref name="tensor"/>'s value is the one a device copy last wrote into the buffer
     /// <see cref="EnsureResidentInput{T}"/> bound to it: no version change and no host write since (a host write
