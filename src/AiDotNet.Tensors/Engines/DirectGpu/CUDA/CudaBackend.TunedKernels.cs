@@ -286,7 +286,11 @@ public sealed partial class CudaBackend
         bool keep = false;
         try
         {
-            if (!reused) LaunchCapturedGraph(exec);   // warm: first replay uploads the graph
+            // Warm replay before the timed one, reused or not: the first replay uploads the graph, and queued behind it the
+            // timed replay starts on a busy stream. Timing a reused graph from an idle stream added the launch latency to
+            // every sample, which compressed microsecond kernels' ratios toward 1 (a tiny ConvTranspose2D's FP32
+            // candidate went from Tuned at 1.15x to Inconclusive, and the fallback served a TF32 route).
+            LaunchCapturedGraph(exec);
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneStartEvent, _stream), "cuEventRecord(tune)");
             LaunchCapturedGraph(exec);
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneEndEvent, _stream), "cuEventRecord(tune)");

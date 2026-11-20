@@ -374,7 +374,10 @@ public static class TunedKernelPolicy
     /// <summary>Environment variable selecting the mode: <c>tune</c> (default), <c>pinned</c>, or <c>off</c>.</summary>
     public const string ModeEnvironmentVariable = "AIDOTNET_KERNEL_REGISTRY";
 
-    /// <summary>Environment variable for the per-process online tuning budget in milliseconds (default 2000).</summary>
+    /// <summary>
+    /// Environment variable for the per-process online tuning budget in milliseconds (default 15000; first runs are not
+    /// charged, and decisions persist, so it is spent once per device and shape set).
+    /// </summary>
     public const string BudgetEnvironmentVariable = "AIDOTNET_KERNEL_TUNE_BUDGET_MS";
 
     /// <summary>Prefix of the per-op override variable, e.g. <c>AIDOTNET_KERNEL_CONV2DFORWARD=cudnn.fwd.winograd</c>.</summary>
@@ -438,9 +441,18 @@ public static class TunedKernelPolicy
         _ => TunedKernelMode.Tune,
     };
 
+    /// <summary>
+    /// Default per-process tuning budget, in milliseconds of measurement (first runs are not charged). Decisions persist,
+    /// so it is spent once per device and shape set. 2000 covered about a dozen shapes, all from a model's warm-up: a
+    /// DCGAN's full tune charges 11.1 s with its own kernels and 13.6 s with cuDNN candidates (RTX 3090), and at 2000 it
+    /// trained at 17.7-18.0 ms/step against 15.7 tuned (14.8-16.0 against 12.7 with cuDNN) until later runs filled the
+    /// cache in.
+    /// </summary>
+    internal const double DefaultBudgetMilliseconds = 15_000;
+
     private static double ParseBudget(string? value) =>
         double.TryParse(value, System.Globalization.NumberStyles.Float,
-            System.Globalization.CultureInfo.InvariantCulture, out double ms) && ms >= 0 ? ms : 2000.0;
+            System.Globalization.CultureInfo.InvariantCulture, out double ms) && ms >= 0 ? ms : DefaultBudgetMilliseconds;
 }
 
 /// <summary>Process-wide view of every slot and decision, for inventories and reports.</summary>
