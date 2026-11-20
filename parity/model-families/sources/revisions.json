@@ -1,0 +1,53 @@
+{
+  "2026-11-13": {
+    "AiDotNet": {
+      "url": "https://github.com/ooples/AiDotNet.git",
+      "fetch": [
+        "8e1066a7454f95b1f2441229b8e736032fb6111c"
+      ],
+      "commit": "8e1066a7454f95b1f2441229b8e736032fb6111c",
+      "tree": "dd718df60146a903d286d7c2833f7d88f20b5ef5"
+    },
+    "AiDotNet.Tensors": {
+      "url": "https://github.com/ooples/AiDotNet.Tensors.git",
+      "fetch": [
+        "d9dd73f4c335799b7d3fd6901891f78bc2a08b59"
+      ],
+      "commit": "d9dd73f4c335799b7d3fd6901891f78bc2a08b59",
+      "tree": "2f8279ac869472806bb0c1a9de310b25da4591b7"
+    }
+  },
+  "2026-11-19": {
+    "AiDotNet": {
+      "url": "https://github.com/ooples/AiDotNet.git",
+      "fetch": [
+        "c4d8fa3b9a02a7f8301d38fe7b5a7c83a605bdf3",
+        "415c10615d38c6ae2c9813386435bc823cfefb31",
+        "963b16080aeba630dfc072f25c7f41564de0ebdf",
+        "f48f6f5dff492314f9ba8154fa86a1c8393b1e9c",
+        "0b14ed81d40723bd145b2ac7d75554fc384e81fe"
+      ],
+      "bundle": "AiDotNet.bundle",
+      "ref": "refs/heads/bench/reddit-all-open-2026-11-19",
+      "commit": "bc213ae0a602035313437e9f06aea2aba1a63cae",
+      "tree": "3aa7a5eed4cadfe382171587b3404ad4d6f0ab00"
+    },
+    "AiDotNet.Tensors": {
+      "url": "https://github.com/ooples/AiDotNet.Tensors.git",
+      "fetch": [
+        "4e97cde075c259d9904f683ad9f17d685e5b66d9",
+        "70d499f21d9d305f32e174c46bbfd85b2f8de0bf",
+        "6f9d894ab80fd46e8ec58424cd0ccfcd070ca83e",
+        "88a513313745827815b22b9bdfcb51c7efdcaf6c",
+        "16eb28ede58a1281ab39cf08bf1f8229589f16bc",
+        "8572e706e41b88dc94d220e6348d07aee9994096",
+        "d239e4021d131388c9cd44195258258460990e4a",
+        "011b6776a223d4016b6bff4e0faff5ee699eaad2"
+      ],
+      "bundle": "AiDotNet.Tensors.bundle",
+      "ref": "refs/heads/bench/reddit-all-open-2026-11-19",
+      "commit": "40e707ff74f8d3b83949b0d6a5d48fa54190e5b3",
+      "tree": "ee65fc30c28f6d2b5ef2e60eb81e8ecd8fa26800"
+    }
+  }
+}
