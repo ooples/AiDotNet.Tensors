@@ -935,13 +935,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 gte.PinInputResident(input);
                             // And every other leaf the steps read (constants, weights): read through the transient
                             // upload path they would be re-uploaded inside the capture.
-                            var producedHere = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-                            foreach (var step in steps) producedHere.Add(step.OutputBuffer);
-                            foreach (var step in steps)
-                                foreach (var leaf in step.Inputs)
-                                    if (!producedHere.Contains(leaf) && Array.IndexOf(_compiledInputTensors, leaf) < 0
-                                        && Array.IndexOf(_stateTensors, leaf) < 0)
-                                        gte.PinLeafResident(leaf);
+                            var producedHere = new HashSet<Tensor<T>>(steps.Select(step => step.OutputBuffer),
+                                ReferenceEqualityComparer<Tensor<T>>.Instance);
+                            foreach (var leaf in steps.SelectMany(step => step.Inputs).Where(leaf => !producedHere.Contains(leaf)
+                                         && Array.IndexOf(_compiledInputTensors, leaf) < 0 && Array.IndexOf(_stateTensors, leaf) < 0))
+                                gte.PinLeafResident(leaf);
                             // Each state too (a host read since the last eager write may have moved its binding):
                             // the capture records its state write into exactly this buffer.
                             var stateBuffers = new Engines.DirectGpu.IGpuBuffer[_stateTensors.Length];
@@ -1035,8 +1033,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // must go back to the engine's ordinary upload path (SetInputs writes the host copy only).
     private void UnpinInputs(DirectGpuTensorEngine gte)
     {
-        foreach (var input in _compiledInputTensors)
-            if (input is not null) gte.UnpinInput(input);
+        foreach (var input in _compiledInputTensors.Where(input => input is not null))
+            gte.UnpinInput(input);
     }
 
     // Runs the first count steps with this plan's scratch pool current, each step its own pool action, so a step's
@@ -1564,9 +1562,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         HashSet<ILazyNode>? observableNodes = null;
         if (stateUpdates is { Count: > 0 })
         {
-            observableNodes = new HashSet<ILazyNode>();
-            foreach (var update in stateUpdates)
-                if (update.Next?.LazySource is ILazyNode producer) observableNodes.Add(producer);
+            observableNodes = new HashSet<ILazyNode>(stateUpdates.Select(update => update.Next?.LazySource).OfType<ILazyNode>());
         }
         var compiler = new LazyGraphCompiler(observableOutputs: observableNodes);
         List<ILazyNode> optimized;
