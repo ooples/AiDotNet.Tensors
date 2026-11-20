@@ -1804,11 +1804,14 @@ internal static class Im2ColHelper
                         Array.Copy(input, ((first + b) * inChannels + ci) * hw, xt, ci * n + b * hw, hw);
                 });
 
-                BlasManaged.Gemm<float>(
-                    a: kernel.AsSpan(0, inChannels * kmkn), lda: kmkn, transA: true,
-                    b: xt.AsSpan(0, inChannels * n), ldb: n, transB: false,
-                    c: col.AsSpan(0, kmkn * n), ldc: n,
-                    m: kmkn, n: n, k: inChannels);
+                if (!ConvTransposeThinGemm.TryMultiply(kernel, xt, col, kmkn, n, inChannels))
+                {
+                    BlasManaged.Gemm<float>(
+                        a: kernel.AsSpan(0, inChannels * kmkn), lda: kmkn, transA: true,
+                        b: xt.AsSpan(0, inChannels * n), ldb: n, transB: false,
+                        c: col.AsSpan(0, kmkn * n), ldc: n,
+                        m: kmkn, n: n, k: inChannels);
+                }
 
                 // Overlap-add as a gather that keeps the per-sample output plane hot: each output row sums, in kh then kw
                 // order (the order the per-element gather used, so the result is bitwise the same), the column rows that
