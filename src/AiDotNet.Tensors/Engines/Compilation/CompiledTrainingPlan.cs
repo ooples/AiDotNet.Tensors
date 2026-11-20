@@ -323,7 +323,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 buffer = backend.AllocateBuffer(array.Length);
                 buffers[array] = buffer;
-                RecordPrivateGradientAllocation(buffer);
             }
             if (!ReferenceEquals(grad._gpuBuffer, buffer)) engine.BindResidentBuffer(grad, buffer, backend);
         }
@@ -364,11 +363,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var grad = _preAllocatedGrads[i];
             DetachDeviceBinding(grad);
             using (var own = new Tensor<T>((int[])grad._shape.Clone()))
-            {
-                if (typeof(T) == typeof(float) && _engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine))
-                    TrackFreshPrivateGradientTensor(own);
                 grad.RebindStorageFrom(own);
-            }
             if (_aliasedGradViews is not null)
                 foreach (var alias in _aliasedGradViews)
                     if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
@@ -389,11 +384,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var grad = _preAllocatedGrads[index];
         DetachDeviceBinding(grad);
         using (var own = new Tensor<T>((int[])grad._shape.Clone()))
-        {
-            if (typeof(T) == typeof(float) && _engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine))
-                TrackFreshPrivateGradientTensor(own);
             grad.RebindStorageFrom(own);
-        }
         if (_aliasedGradViews is not null)
             foreach (var alias in _aliasedGradViews)
                 if (ReferenceEquals(alias.Target, grad)) RepointAliasView(alias.View, grad);
@@ -4702,7 +4693,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     DetachReleasedBindings(released);
                     gte.ReclaimGpuMemoryUnderPressure();
                     RearmUnreadLossReadback();
-                    if (completedWorkspaceStep) RegisterPrivateGradientDemandOwner(gte, cb);
                 }
             }
         }
@@ -5667,15 +5657,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             BindPooledGradientsResident(residentEngine, backend);
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
-            {
-                if (FailPrivateGradientResidencyAtForTesting == i)
-                {
-                    FailPrivateGradientResidencyAtForTesting = -1;
-                    throw new NotSupportedException("Injected private-gradient residency failure.");
-                }
-                var buffer = residentEngine.EnsureResidentBufferWithAllocationInfo(_preAllocatedGrads[i], out bool allocated);
-                if (allocated && buffer is not null) RecordPrivateGradientAllocation(buffer);
-            }
+                residentEngine.EnsureResidentBuffer(_preAllocatedGrads[i]);
             if (_aliasedGradViews is { } views)
                 foreach (var (view, target) in views)
                     if (target._gpuBuffer is { } targetBuffer && target._gpuBackend is { } targetBackend)
@@ -10381,7 +10363,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             t_gradPlaceholders = null;
             t_gradAliasTargets = null;
-            t_privateGradientHostOwnership = false;
             t_requestedInputGradientLeaves = null;
             t_requestedInputGradientSteps = null;
         }
@@ -10663,8 +10644,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 t_gradPlaceholders = gradPlaceholders;
                 t_gradAliasTargets = AliasTargetsByView(aliasedGradViews);
-                t_privateGradientHostOwnership = engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
-                    && ReferenceEquals(engine, engine.Unwrap());
             }
         }
 
@@ -11434,7 +11413,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 t_gradPlaceholders = null;   // pooling settled every placeholder; Compile clears it again on a throw
                 t_gradAliasTargets = null;
-                t_privateGradientHostOwnership = false;
             }
         }
         // BIND EVERY FORWARD OUTPUT'S LIVE BACKING BEFORE THE PLAN RUNS.
@@ -11798,12 +11776,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 TraceGradientPooling(tenants, capacity, allGrads, placeholders, excluded, firstWrite, readBeforeWrite, unused);
 
             var arrays = new T[capacity.Count][];
-            var privateOwners = t_privateGradientHostOwnership ? new ResultBufferOwner?[arrays.Length] : null;
-            for (int b = 0; b < arrays.Length; b++)
-            {
-                arrays[b] = new T[capacity[b]];
-                if (privateOwners is not null) privateOwners[b] = ResultBufferTracker.TrackFreshPrivateArray(arrays[b], 0);
-            }
+            for (int b = 0; b < arrays.Length; b++) arrays[b] = new T[capacity[b]];
             foreach (int g in tenants)
             {
                 var grad = allGrads[g];
@@ -11814,7 +11787,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 anyPooled = true;
                 (schedule[firstWrite[g]] ??= new List<int>()).Add(g);
             }
-            GC.KeepAlive(privateOwners); // Owners must survive until every fresh array has its first vector wrapper.
             if (aliasTargets is not null)
                 foreach (var alias in aliasTargets)
                     if (indexOf.TryGetValue(alias.Value, out int t) && pooled[t]) RepointAliasView(alias.Key, alias.Value);
@@ -12043,7 +12015,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Gradient buffers still backed by the shared compile-time placeholder (gradient pooling, PoolGradientBuffers).
     // Set only while a plan's backward is being built on this thread.
     [ThreadStatic] private static HashSet<Tensor<T>>? t_gradPlaceholders;
-    [ThreadStatic] private static bool t_privateGradientHostOwnership;
 
 
     // The alias views among the gradients (AliasReshapeViewGradients' device aliases) and the gradient each views, while
@@ -12082,7 +12053,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             return aliases is not null && aliases.TryGetValue(tensor, out var viewed) ? MaterializeIfGradPlaceholder(viewed) : 0;
         placeholders.Remove(tensor);
         using var own = new Tensor<T>((int[])tensor._shape.Clone());
-        if (t_privateGradientHostOwnership) TrackFreshPrivateGradientTensor(own);
         tensor.RebindStorageFrom(own);
         if (aliases is not null)
             foreach (var alias in aliases)

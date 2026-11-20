@@ -218,9 +218,6 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
     }
 
     internal static WebGpuBuffer Rent(int elementCount, out bool fromPool)
-        => Rent(elementCount, owner: null, out fromPool);
-
-    internal static WebGpuBuffer Rent(int elementCount, IDirectGpuBackend? owner, out bool fromPool)
     {
         if (elementCount <= 0)
         {
@@ -232,13 +229,13 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
         long reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation(charge);
 
         WebGpuBuffer buffer;
-        if (PoolingEnabled && Pool.TryRentForBackend(elementCount, owner, out var parked) && parked is not null)
+        if (PoolingEnabled && Pool.TryRent(elementCount, out var parked) && parked is not null)
         {
             buffer = FromParked(parked, elementCount);
             fromPool = true;
         }
         else if (PoolingEnabled && DeviceMemoryReclaim.CollectOnPoolMiss() &&
-                 PendingFreesDrainAndTryRent(elementCount, owner, out parked) && parked is not null)
+                 PendingFreesDrainAndTryRent(elementCount, out parked) && parked is not null)
         {
             buffer = FromParked(parked, elementCount);
             fromPool = true;
@@ -254,10 +251,10 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
         return buffer;
     }
 
-    private static bool PendingFreesDrainAndTryRent(int elementCount, IDirectGpuBackend? owner, out WebGpuBuffer? parked)
+    private static bool PendingFreesDrainAndTryRent(int elementCount, out WebGpuBuffer? parked)
     {
         PendingFrees.Drain();
-        return Pool.TryRentForBackend(elementCount, owner, out parked);
+        return Pool.TryRent(elementCount, out parked);
     }
 
     private static WebGpuBuffer FromParked(WebGpuBuffer parked, int elementCount)

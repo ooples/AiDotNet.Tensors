@@ -208,9 +208,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         ThrowIfNotInitialized();
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)elementCount * sizeof(float), MaxBufferAllocBytes, DeviceName);
-        InferenceWorkspaceDemandScope.BeforeAllocation(this, elementCount);
-
-        var buffer = WebGpuBuffer.Rent(elementCount, this, out bool fromPool);
+        var buffer = WebGpuBuffer.Rent(elementCount, out bool fromPool);
         if (fromPool && zeroInitialize)
         {
             // A queued device clear, not Fill: Fill waits for its dispatch, and a browser's single .NET thread cannot
@@ -234,9 +232,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         if (data is null) throw new ArgumentNullException(nameof(data));
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
-        InferenceWorkspaceDemandScope.BeforeAllocation(this, data.Length);
-
-        var buffer = WebGpuBuffer.Rent(data.Length, this, out _);
+        var buffer = WebGpuBuffer.Rent(data.Length, out _);
         buffer.CopyFrom(data);
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.WebGpu);
         return buffer;
