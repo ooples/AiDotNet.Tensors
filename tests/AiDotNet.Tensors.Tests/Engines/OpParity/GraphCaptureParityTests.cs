@@ -55,7 +55,7 @@ public sealed class GraphCaptureParityTests
             return;
         }
 
-        if (op.GraphCaptureSignatureConstraint != GraphCaptureSignatureConstraint.None ||
+        if ((op.GraphCaptureSignatureConstraint != GraphCaptureSignatureConstraint.None && !op.GraphCaptureRecordsMixedSignature) ||
             op.GraphCaptureExpectation is GraphCaptureExpectation.DataDependentOutputShape or
             GraphCaptureExpectation.HeterogeneousInput or
             GraphCaptureExpectation.HeterogeneousOutput or
