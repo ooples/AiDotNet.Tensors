@@ -29,6 +29,15 @@ public partial class CpuEngine
         if ((ReferenceEquals(input, output) && input.AsSpan(inputOffset, inputCount).Overlaps(destination))
             || (ReferenceEquals(kernel, output) && kernel.AsSpan(kernelOffset, kernelCount).Overlaps(destination)))
             return false;
+#if NET5_0_OR_GREATER
+        if (splitChannels && TryConv1DPackedWaveform(input, inputOffset, kernel, kernelOffset, output, outputOffset,
+                batch, inChannels, width, outChannels, kernelWidth, stride, padding, dilation, outputWidth))
+        {
+            t_conv1DChannelBlockRuns++;
+            t_conv1DColumnPanelRuns++;
+            return true;
+        }
+#endif
         int rows = Math.Min(outChannels, Math.Max(1, (aBudget / reduction) / 16 * 16));
         int totalColumns = checked(batch * outputWidth);
         int columns = Math.Min(256, Math.Min(workerBudget / reduction, workerBudget / rows));
