@@ -45,11 +45,14 @@ public partial class CpuEngine
     /// </param>
     internal bool TryRecordCompiledOp<T>(string opName, Tensor<T>?[] inputs, Func<IEngine, Tensor<T>> forward,
         [NotNullWhen(true)] out Tensor<T>? result, Func<IEngine, Tensor<T>>? backwardForward = null,
-        bool replaysHostState = false)
+        bool replaysHostState = false, bool inInferenceTrace = false)
     {
         result = null;
-        if (BeginCompiledRecord(inputs, out var operands) is not { } scope) return false;
+        // No tensor operands of the element type is allowed when the closure reads another node's auxiliary output
+        // (a one-hot of TopK's indices): BindCaptures makes that node's output an operand, so the op is ordered after it.
+        if (BeginCompiledRecord(inputs, out var operands, inInferenceTrace, allowNoOperands: true) is not { } scope) return false;
         BindCaptures(scope, forward, operands);
+        if (operands.Count == 0) return false;
         if (backwardForward is not null) BindCaptures(scope, backwardForward, operands);
 
         Tensor<T> traced;
@@ -96,10 +99,11 @@ public partial class CpuEngine
 
     // The recording scope of a training trace that binds this engine, and the distinct non-null operands in order;
     // null when the op runs eagerly (no trace, an inference trace, another engine's trace, or no tensor operand).
-    private LazyTensorScope? BeginCompiledRecord<T>(Tensor<T>?[] inputs, out List<Tensor<T>> operands)
+    private LazyTensorScope? BeginCompiledRecord<T>(Tensor<T>?[] inputs, out List<Tensor<T>> operands,
+        bool inInferenceTrace = false, bool allowNoOperands = false)
     {
         operands = new List<Tensor<T>>(inputs.Length);
-        if (!GraphMode.IsActive || GraphMode.IsInferenceTrace) return null;
+        if (!GraphMode.IsActive || (GraphMode.IsInferenceTrace && !inInferenceTrace)) return null;
         var current = GraphMode.Current;
         if (current is null || !current.BindEngine(this)) return null;
         for (int i = 0; i < inputs.Length; i++)
@@ -108,7 +112,7 @@ public partial class CpuEngine
             if (input is not null && !operands.Contains(input)) operands.Add(input);
         }
 
-        return operands.Count == 0 ? null : current;
+        return operands.Count == 0 && !allowNoOperands ? null : current;
     }
 
     // The trace-time run materializes the node's output, and the plan builds on that value. Its kernels read operands
@@ -174,14 +178,19 @@ public partial class CpuEngine
     /// <paramref name="backward"/>, when given, is the node's own backward; it must read what the latest replay of
     /// <paramref name="forward"/> kept. Without it the backward re-runs the forward under a tape.
     /// </para>
+    /// <para>
+    /// <paramref name="inInferenceTrace"/> records the op in an inference trace too (its replay refreshes the
+    /// auxiliary output in place, which an inference plan's readers of it see the same way a training plan's do).
+    /// </para>
     /// </remarks>
     internal bool TryRecordCompiledOp<T, TAux>(string opName, Tensor<T>?[] inputs,
         Func<IEngine, (Tensor<T> Result, TAux Aux)> forward, Action<IEngine, TAux, TAux> refreshAux,
-        [NotNullWhen(true)] out Tensor<T>? result, [MaybeNullWhen(false)] out TAux aux, BackwardFunction<T>? backward = null)
+        [NotNullWhen(true)] out Tensor<T>? result, [MaybeNullWhen(false)] out TAux aux, BackwardFunction<T>? backward = null,
+        bool inInferenceTrace = false)
     {
         result = null;
         aux = default;
-        if (BeginCompiledRecord(inputs, out var operands) is not { } scope) return false;
+        if (BeginCompiledRecord(inputs, out var operands, inInferenceTrace) is not { } scope) return false;
         BindCaptures(scope, forward, operands);
 
         Tensor<T> traced;

@@ -42464,8 +42464,15 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorOneHot<T>(Tensor<int> indices, int depth)
     {
         if (indices == null) throw new ArgumentNullException(nameof(indices));
-        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
         if (depth <= 0) throw new ArgumentException("Depth must be positive", nameof(depth));
+        // Indices a recorded node refreshes in place each execution (TopK's): recorded as a node after that producer, in
+        // training and inference traces. Any other index tensor (a frozen one, or another int op's output, such as a
+        // reshape of TopK's indices traced as its own node) still crosses element types.
+        var capturedIndices = indices;
+        if (GraphMode.IsActive && TryRecordCompiledOp("TensorOneHot", Array.Empty<Tensor<T>?>(),
+                e => e.TensorOneHot<T>(capturedIndices, depth), out var recorded, inInferenceTrace: true))
+            return recorded;
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numIndices = indices.Length;
@@ -43314,7 +43321,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int capturedAxis = axis;
         if (TryRecordCompiledOp("TensorTopK", new Tensor<T>?[] { tensor },
                 e => (e.TensorTopK(tensor, k, capturedAxis, out var fresh), fresh),
-                RefreshIndices, out var compiledNode, out var compiledIndices))
+                RefreshIndices, out var compiledNode, out var compiledIndices, inInferenceTrace: true))
         {
             indices = compiledIndices;
             return compiledNode;
