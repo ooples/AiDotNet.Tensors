@@ -406,8 +406,11 @@ void main() {
     // duplicates use the ordered loop below, including when the index buffer changes on replay.
     int lane = int(gl_LocalInvocationIndex);
     int width = 256;
-    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= 512) {
-        owners[lane] = -1;
+    const int indexAddMinAxis = 512;
+    const int indexAddNoOwner = -1;
+    const int indexAddMultipleOwners = -2;
+    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= indexAddMinAxis) {
+        owners[lane] = indexAddNoOwner;
         barrier();
         int first = (gid - lane) % destinationAxis;
         for (uint j = uint(lane); j < uint(sourceAxis); j += uint(width)) {
@@ -415,13 +418,13 @@ void main() {
             if (index < 0 || index >= destinationAxis) continue;
             int slot = index - first;
             if (slot < 0) slot += destinationAxis;
-            if (slot < width && atomicExchange(owners[slot], int(j)) != -1)
-                atomicExchange(owners[slot], -2);
+            if (slot < width && atomicExchange(owners[slot], int(j)) != indexAddNoOwner)
+                atomicExchange(owners[slot], indexAddMultipleOwners);
         }
         barrier();
         if (gid >= total) return;
         int owner = owners[lane];
-        if (owner != -2) {
+        if (owner != indexAddMultipleOwners) {
             float value = destination[gid];
             if (owner >= 0) value += source[(gid / destinationAxis) * sourceAxis + owner];
             output_[gid] = value;

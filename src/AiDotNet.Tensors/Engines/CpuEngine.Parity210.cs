@@ -4488,8 +4488,8 @@ public partial class CpuEngine
                         ErfcInto(tensor, output);
                         return;
                     }
-                    var result = engine.TensorErfc(tensor);
-                    DirectGpuTensorEngine.CopyResultInto(engine, result, output);
+                    var computed = engine.TensorErfc(tensor);
+                    DirectGpuTensorEngine.CopyResultInto(engine, computed, output);
                 }, BackwardFunctions<T>.ErfcBackward);
         }
         Tensor<T> result;

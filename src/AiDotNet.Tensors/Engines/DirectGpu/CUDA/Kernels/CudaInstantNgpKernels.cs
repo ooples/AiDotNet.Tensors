@@ -383,8 +383,11 @@ extern ""C"" __global__ __launch_bounds__(256) void resident_index_add(
     __shared__ int owners[256];
     int lane = (int)threadIdx.x;
     int width = (int)blockDim.x;
-    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= 512) {
-        owners[lane] = -1;
+    const int indexAddMinAxis = 512;
+    const int indexAddNoOwner = -1;
+    const int indexAddMultipleOwners = -2;
+    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= indexAddMinAxis) {
+        owners[lane] = indexAddNoOwner;
         __syncthreads();
         int first = (gid - lane) % destinationAxis;
         for (unsigned int j = (unsigned int)lane; j < (unsigned int)sourceAxis; j += (unsigned int)width) {
@@ -392,13 +395,13 @@ extern ""C"" __global__ __launch_bounds__(256) void resident_index_add(
             if (index < 0 || index >= destinationAxis) continue;
             int slot = index - first;
             if (slot < 0) slot += destinationAxis;
-            if (slot < width && atomicExch(&owners[slot], (int)j) != -1)
-                atomicExch(&owners[slot], -2);
+            if (slot < width && atomicExch(&owners[slot], (int)j) != indexAddNoOwner)
+                atomicExch(&owners[slot], indexAddMultipleOwners);
         }
         __syncthreads();
         if (gid >= total) return;
         int owner = owners[lane];
-        if (owner != -2) {
+        if (owner != indexAddMultipleOwners) {
             float value = destination[gid];
             if (owner >= 0) value += source[(gid / destinationAxis) * sourceAxis + owner];
             output[gid] = value;

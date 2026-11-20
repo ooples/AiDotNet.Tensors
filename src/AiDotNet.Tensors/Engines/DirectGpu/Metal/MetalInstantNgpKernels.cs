@@ -395,8 +395,11 @@ kernel void resident_index_add(
     threadgroup atomic_int owners[1024];
     int lane = (int)localIndex;
     int width = (int)groupSize;
-    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= 512 && width <= 1024 && width <= sourceAxis) {
-        atomic_store_explicit(&owners[lane], -1, memory_order_relaxed);
+    const int indexAddMinAxis = 512;
+    const int indexAddNoOwner = -1;
+    const int indexAddMultipleOwners = -2;
+    if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= indexAddMinAxis && width <= 1024 && width <= sourceAxis) {
+        atomic_store_explicit(&owners[lane], indexAddNoOwner, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         int first = (int(gid) - lane) % destinationAxis;
         for (uint j = (uint)lane; j < (uint)sourceAxis; j += (uint)width) {
@@ -404,13 +407,13 @@ kernel void resident_index_add(
             if (index < 0 || index >= destinationAxis) continue;
             int slot = index - first;
             if (slot < 0) slot += destinationAxis;
-            if (slot < width && atomic_exchange_explicit(&owners[slot], int(j), memory_order_relaxed) != -1)
-                atomic_exchange_explicit(&owners[slot], -2, memory_order_relaxed);
+            if (slot < width && atomic_exchange_explicit(&owners[slot], int(j), memory_order_relaxed) != indexAddNoOwner)
+                atomic_exchange_explicit(&owners[slot], indexAddMultipleOwners, memory_order_relaxed);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (int(gid) >= total) return;
         int owner = atomic_load_explicit(&owners[lane], memory_order_relaxed);
-        if (owner != -2) {
+        if (owner != indexAddMultipleOwners) {
             float value = destination[gid];
             if (owner >= 0) value += source[(int(gid) / destinationAxis) * sourceAxis + owner];
             output[gid] = value;

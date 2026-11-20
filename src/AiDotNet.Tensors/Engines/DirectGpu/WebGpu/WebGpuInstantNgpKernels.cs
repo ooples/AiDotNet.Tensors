@@ -427,8 +427,11 @@ var<workgroup> owners: array<atomic<i32>, 256>;
     let gid = i32(id.x);
     let total = p.outerSize * p.destinationAxis * p.innerSize;
     // Scan each index once per workgroup. Duplicates retain the original summation order.
-    if (p.innerSize == 1 && p.sourceAxis == p.destinationAxis && p.sourceAxis >= 512) {
-        atomicStore(&owners[lane], -1);
+    const indexAddMinAxis: i32 = 512;
+    const indexAddNoOwner: i32 = -1;
+    const indexAddMultipleOwners: i32 = -2;
+    if (p.innerSize == 1 && p.sourceAxis == p.destinationAxis && p.sourceAxis >= indexAddMinAxis) {
+        atomicStore(&owners[lane], indexAddNoOwner);
         workgroupBarrier();
         let first = (gid - i32(lane)) % p.destinationAxis;
         for (var j = lane; j < u32(p.sourceAxis); j += 256u) {
@@ -437,15 +440,15 @@ var<workgroup> owners: array<atomic<i32>, 256>;
             var slot = index - first;
             if (slot < 0) { slot += p.destinationAxis; }
             if (slot < 256) {
-                if (atomicExchange(&owners[slot], i32(j)) != -1) {
-                    atomicStore(&owners[slot], -2);
+                if (atomicExchange(&owners[slot], i32(j)) != indexAddNoOwner) {
+                    atomicStore(&owners[slot], indexAddMultipleOwners);
                 }
             }
         }
         workgroupBarrier();
         if (gid >= total) { return; }
         let owner = atomicLoad(&owners[lane]);
-        if (owner != -2) {
+        if (owner != indexAddMultipleOwners) {
             var uniqueValue = destination[gid];
             if (owner >= 0) {
                 uniqueValue += source[(gid / p.destinationAxis) * p.sourceAxis + owner];
