@@ -41,7 +41,7 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
-    /// <see cref="AssignStateInPlace"/> for several states at once: on CUDA the copies are one launch (one graph node
+    /// <see cref="AssignStateInPlace"/> for several states at once: with <see cref="IBatchedCopyBackend"/> (CUDA) the copies are one launch (one graph node
     /// in a captured plan instead of one memcpy node per state). The states must be distinct tensors.
     /// </summary>
     internal void AssignStatesInPlace<T>(IReadOnlyList<Tensor<T>> states, IReadOnlyList<Tensor<T>> nexts)
@@ -49,7 +49,7 @@ public partial class DirectGpuTensorEngine
         if (states is null) throw new ArgumentNullException(nameof(states));
         if (nexts is null) throw new ArgumentNullException(nameof(nexts));
         if (nexts.Count != states.Count) throw new ArgumentException("One next value per state.", nameof(nexts));
-        if (states.Count < 2 || typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cuda)
+        if (states.Count < 2 || typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IBatchedCopyBackend batched)
         {
             for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
             return;
@@ -74,7 +74,7 @@ public partial class DirectGpuTensorEngine
                 sources[i] = GetOrAllocateBuffer(backend, next);
                 lengths[i] = state.Length;
             }
-            cuda.CopyMany(sources.Select(s => s.Buffer).ToArray(), destinations, lengths);
+            batched.CopyMany(sources.Select(s => s.Buffer).ToArray(), destinations, lengths);
         }
         finally
         {
