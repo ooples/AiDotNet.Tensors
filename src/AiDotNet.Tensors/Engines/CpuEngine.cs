@@ -43496,7 +43496,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 DependOnProducer(scope, indices, operands);
                 return scope.RecordVariadic(LazyNodeType.Custom, "TensorIndexSelect", operands.ToArray(), outShape,
                     (eng, output) => { var r = eng.TensorIndexSelect(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
-                    BackwardFunctions<T>.IndexSelectBackward, new object[] { capIndices, capAxis });
+                    BackwardFunctions<T>.IndexSelectBackward, new object[] { capIndices, capAxis },
+                    // A producer operand only orders the schedule. It is not a gradient edge: IndexSelectBackward writes a
+                    // gradient for the selected tensor alone, and scores that feed only the indices must not become loss
+                    // ancestors (the optimizer would still apply weight decay to them).
+                    differentiableInputIndices: operands.Count > 1 ? new[] { 0 } : null);
             }
         }
 
