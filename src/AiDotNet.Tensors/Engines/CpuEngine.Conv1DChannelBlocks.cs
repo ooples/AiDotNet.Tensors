@@ -91,12 +91,17 @@ public partial class CpuEngine
                 int rowTasks = (rowCount + taskRows - 1) / taskRows;
                 int tasks = checked(blocks * rowTasks);
                 int workers = Math.Min(workerBudgetCount, tasks);
+                using var filterPacking = blocks > 1
+                    ? new BlasManaged.ConvGemmPacking<float>(packedKernel, rowCount, reduction, workers) : null;
                 CpuParallelSettings.ParallelForOrSerial(0, workers, (long)rowCount * reduction * totalColumns, worker =>
                 {
                     // Match the regular deterministic TensorMatMul dispatch. A logical N-tail
                     // keeps its packed reduction across every bounded panel, including aligned ones.
+                    using BlasManaged.ConvGemmPacking<float>.Worker? packing = filterPacking is null ? null
+                        : new BlasManaged.ConvGemmPacking<float>.Worker(filterPacking, worker);
                     var options = new BlasManaged.BlasOptions<float>
                     {
+                        ConvPacking = packing,
                         NumThreads = workers == 1 ? 0 : 1,
                         PackingMode = totalColumns % 16 == 0 ? BlasManaged.PackingMode.DisableAutotune : BlasManaged.PackingMode.ForcePackBoth,
                         BetaZero = true,
