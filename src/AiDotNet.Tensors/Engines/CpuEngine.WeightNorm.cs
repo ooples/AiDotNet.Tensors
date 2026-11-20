@@ -1,4 +1,6 @@
 using System;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -6,6 +8,24 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class CpuEngine
 {
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorWeightNorm<T>(Tensor<T> direction, Tensor<T> gain, double epsilon = 1e-24)
+    {
+        ValidateWeightNorm(direction, gain, epsilon);
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            return scope.RecordBinary(LazyNodeType.Custom, "TensorWeightNorm", direction, gain, direction._shape,
+                (engine, output) => engine.TensorWeightNormInto(output, direction, gain, epsilon),
+                BackwardFunctions<T>.WeightNormBackward, new object[] { epsilon });
+        }
+        var result = TensorAllocator.RentUninitialized<T>(direction._shape);
+        TensorWeightNormInto(result, direction, gain, epsilon);
+        DifferentiableOps.RecordBinary("TensorWeightNorm", result, direction, gain,
+            BackwardFunctions<T>.WeightNormBackward, new object[] { epsilon });
+        return result;
+    }
+
     internal static (int Rows, int Columns) ValidateWeightNorm<T>(Tensor<T> direction, Tensor<T> gain, double epsilon)
     {
         if (direction is null) throw new ArgumentNullException(nameof(direction));
@@ -113,7 +133,13 @@ public partial class CpuEngine
             CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * columns, row =>
             {
                 var values = v.Span.Slice(row * columns, columns);
-                float inverse = (float)(1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + (float)epsilon));
+                double squared = (double)Simd.SimdKernels.DotProduct(values, values) + epsilon;
+                if (double.IsInfinity(squared) || squared == 0)
+                {
+                    WeightNormForwardScaled(values, g.Span[row], epsilon, w.Span.Slice(row * columns, columns));
+                    return;
+                }
+                float inverse = (float)(1.0 / Math.Sqrt(squared));
                 Simd.SimdKernels.MultiplyScalar(values, g.Span[row] * inverse, w.Span.Slice(row * columns, columns));
             }, deterministicSafe: true);
             return;
@@ -126,7 +152,13 @@ public partial class CpuEngine
             CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * columns, row =>
             {
                 var values = v.Span.Slice(row * columns, columns);
-                double inverse = 1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + epsilon);
+                double squared = (double)Simd.SimdKernels.DotProduct(values, values) + epsilon;
+                if (double.IsInfinity(squared) || squared == 0)
+                {
+                    WeightNormForwardScaled(values, g.Span[row], epsilon, w.Span.Slice(row * columns, columns));
+                    return;
+                }
+                double inverse = (double)(1.0 / Math.Sqrt(squared));
                 Simd.SimdKernels.MultiplyScalar(values, g.Span[row] * inverse, w.Span.Slice(row * columns, columns));
             }, deterministicSafe: true);
             return;
@@ -172,8 +204,14 @@ public partial class CpuEngine
             {
                 var values = v.Span.Slice(row * columns, columns);
                 var upstream = h.Span.Slice(row * columns, columns);
-                float inverse = (float)(1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + (float)epsilon));
+                double squared = (double)Simd.SimdKernels.DotProduct(values, values) + epsilon;
                 float dot = Simd.SimdKernels.DotProduct(upstream, values);
+                if (double.IsInfinity(squared) || squared == 0 || float.IsInfinity(dot))
+                {
+                    WeightNormBackwardScaled(values, upstream, g.Span[row], epsilon, writeDirection ? dv.Span.Slice(row * columns, columns) : default, writeGain ? dg.Span.Slice(row, 1) : default, accumulateDirection, accumulateGain);
+                    return;
+                }
+                float inverse = (float)(1.0 / Math.Sqrt(squared));
                 if (writeDirection)
                 {
                     var destination = dv.Span.Slice(row * columns, columns);
@@ -181,8 +219,8 @@ public partial class CpuEngine
                     float projection = dot * inverse * inverse;
                     if (accumulateDirection)
                     {
-                        Simd.SimdKernels.ScalarMultiplyAdd(destination, upstream, scale, destination);
-                        Simd.SimdKernels.ScalarMultiplyAdd(destination, values, -scale * projection, destination);
+                        for (int i = 0; i < columns; i++)
+                            destination[i] += scale * (upstream[i] - values[i] * projection);
                     }
                     else
                     {
@@ -205,8 +243,14 @@ public partial class CpuEngine
             {
                 var values = v.Span.Slice(row * columns, columns);
                 var upstream = h.Span.Slice(row * columns, columns);
-                double inverse = 1.0 / Math.Sqrt(Simd.SimdKernels.DotProduct(values, values) + epsilon);
+                double squared = (double)Simd.SimdKernels.DotProduct(values, values) + epsilon;
                 double dot = Simd.SimdKernels.DotProduct(upstream, values);
+                if (double.IsInfinity(squared) || squared == 0 || double.IsInfinity(dot))
+                {
+                    WeightNormBackwardScaled(values, upstream, g.Span[row], epsilon, writeDirection ? dv.Span.Slice(row * columns, columns) : default, writeGain ? dg.Span.Slice(row, 1) : default, accumulateDirection, accumulateGain);
+                    return;
+                }
+                double inverse = (double)(1.0 / Math.Sqrt(squared));
                 if (writeDirection)
                 {
                     var destination = dv.Span.Slice(row * columns, columns);
@@ -214,8 +258,8 @@ public partial class CpuEngine
                     double projection = dot * inverse * inverse;
                     if (accumulateDirection)
                     {
-                        Simd.SimdKernels.ScalarMultiplyAdd(destination, upstream, scale, destination);
-                        Simd.SimdKernels.ScalarMultiplyAdd(destination, values, -scale * projection, destination);
+                        for (int i = 0; i < columns; i++)
+                            destination[i] += scale * (upstream[i] - values[i] * projection);
                     }
                     else
                     {
@@ -313,5 +357,52 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < values.Length; i++) output[i] = accumulate ? ops.Add(output[i], values[i]) : values[i];
+    }
+
+    // Exceptional rows use scaled coordinates when a native squared sum or projection overflows.
+    [ScalarKernel("Exceptional float and double rows need scaled double coordinates when the vectorized reduction overflows or underflows.")]
+    private static (double Divisor, double Norm) WeightNormScaledCoordinates<T>(ReadOnlySpan<T> values, double epsilon)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        double regularizer = Math.Sqrt(epsilon);
+        double divisor = regularizer;
+        foreach (var value in values) divisor = Math.Max(divisor, Math.Abs(ops.ToDouble(value)));
+        double e = regularizer / divisor;
+        double sum = e * e;
+        foreach (var value in values)
+        {
+            double component = ops.ToDouble(value) / divisor;
+            sum += component * component;
+        }
+        return (divisor, Math.Sqrt(sum));
+    }
+
+    [ScalarKernel("Exceptional float and double rows need scaled double coordinates when the vectorized reduction overflows or underflows.")]
+    private static void WeightNormForwardScaled<T>(ReadOnlySpan<T> values, T gain, double epsilon, Span<T> result)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var (divisor, norm) = WeightNormScaledCoordinates(values, epsilon);
+        double gainValue = ops.ToDouble(gain);
+        for (int i = 0; i < values.Length; i++)
+            result[i] = ops.FromDouble((ops.ToDouble(values[i]) / divisor / norm) * gainValue);
+    }
+
+    [ScalarKernel("Exceptional float and double rows need scaled double coordinates when the vectorized reduction overflows or underflows.")]
+    private static void WeightNormBackwardScaled<T>(ReadOnlySpan<T> values, ReadOnlySpan<T> upstream, T gain, double epsilon,
+        Span<T> result, Span<T> gainResult, bool accumulateDirection, bool accumulateGain)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var (divisor, norm) = WeightNormScaledCoordinates(values, epsilon);
+        double gainGradient = 0;
+        for (int i = 0; i < values.Length; i++)
+            gainGradient += ops.ToDouble(upstream[i]) * (ops.ToDouble(values[i]) / divisor / norm);
+        for (int i = 0; i < result.Length; i++)
+        {
+            double normalized = ops.ToDouble(values[i]) / divisor / norm;
+            double contribution = ((ops.ToDouble(upstream[i]) - normalized * gainGradient) / norm) * (ops.ToDouble(gain) / divisor);
+            result[i] = ops.FromDouble((accumulateDirection ? ops.ToDouble(result[i]) : 0) + contribution);
+        }
+        if (!gainResult.IsEmpty)
+            gainResult[0] = ops.FromDouble((accumulateGain ? ops.ToDouble(gainResult[0]) : 0) + gainGradient);
     }
 }

@@ -2158,10 +2158,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
             // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
             // get the same from the plan's input refresh (RefreshGraphInputInPlace).
-            if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts
+            if (ResidentStepActive && IsLiveDeviceBuffer(tensor._gpuBuffer) && tensor is Tensor<int> residentInts
                 && residentInts.CoversWholeVector)
                 PrepareResidentIndexForCompiledStep(backend, residentInts);
-            if (tensor._gpuBuffer.Handle != IntPtr.Zero
+            if (IsLiveDeviceBuffer(tensor._gpuBuffer)
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
@@ -2270,7 +2270,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private bool IsCachedGpuBufferLive<T>(Tensor<T> tensor, IDirectGpuBackend backend)
     {
-        if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
+        if (tensor._gpuBuffer is null || !IsLiveDeviceBuffer(tensor._gpuBuffer)) return false;
         if (tensor.IsGpuResident) return true;
         if ((tensor._ownsGpuBuffer || tensor._storage.OwnsGpuBuffer(tensor._gpuBuffer)) && ReferenceEquals(tensor._gpuBackend, backend)) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
@@ -2623,10 +2623,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
             // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
             // get the same from the plan's input refresh (RefreshGraphInputInPlace).
-            if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts
+            if (ResidentStepActive && IsLiveDeviceBuffer(tensor._gpuBuffer) && tensor is Tensor<int> residentInts
                 && residentInts.CoversWholeVector)
                 PrepareResidentIndexForCompiledStep(backend, residentInts);
-            if (tensor._gpuBuffer.Handle != IntPtr.Zero
+            if (IsLiveDeviceBuffer(tensor._gpuBuffer)
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases
 
@@ -2838,6 +2838,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (_activationCache.TryGetValue(destination.DataVector, out var byVector))
                 byVector.HostOrigin = true;
         }
+    }
+
+    private void AdoptAccumulationUpload<T>(Tensor<T> destination, OwnedBuffer upload, IDirectGpuBackend backend)
+    {
+        if (!upload.OwnsBuffer) return;
+        destination._ownsGpuBuffer = true;
+        upload.RelinquishOwnership();
+        if (_ownsDirectGpu) _ownedResults.Add(destination.DataVector, backend);
     }
 
     private void RemoveActivationCacheEntry(object cacheKey)
@@ -5210,7 +5218,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Whether <paramref name="buffer"/> still holds device memory. A native handle covers CUDA, HIP, OpenCL, Vulkan
     /// and Metal; a WebGPU buffer has no native handle (its buffer lives on the JS side), so its own validity is used.
     /// </summary>
-    private static bool IsLiveDeviceBuffer(IGpuBuffer buffer)
+    internal static bool IsLiveDeviceBuffer(IGpuBuffer buffer)
         => buffer.Handle != IntPtr.Zero
 #if NET7_0_OR_GREATER
            || buffer is DirectGpu.WebGpu.WebGpuBuffer { IsValid: true }
@@ -5261,6 +5269,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         dest._gpuBufferVersion = dest.GpuCacheVersion;
         dest._ownsGpuBuffer = true;
         RegisterHostDownload<T>(dest.DataVector, backend, copy);
+        if (_ownsDirectGpu) _ownedResults.Add(dest.DataVector, backend);
         return true;
     }
 
@@ -6280,7 +6289,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Makes <paramref name="output"/> the device copy of <paramref name="destination"/> (deferred host storage, see
     /// <see cref="IsUnboundDeferredHostDestination"/>), owned by it; a host read downloads it.
     /// </summary>
-    private static void BindDeferredHostResult<T>(IDirectGpuBackend backend, OwnedBuffer output, Tensor<T> destination)
+    private void BindDeferredHostResult<T>(IDirectGpuBackend backend, OwnedBuffer output, Tensor<T> destination)
     {
         destination.IncrementVersion();
         destination._gpuBuffer = output.Buffer;
@@ -6288,6 +6297,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         destination._gpuBufferVersion = destination.GpuCacheVersion;
         destination._ownsGpuBuffer = true;
         RegisterHostDownload<T>(destination.DataVector, backend, output.Buffer);
+        if (_ownsDirectGpu) _ownedResults.Add(destination.DataVector, backend);
         output.RelinquishOwnership();
     }
 
@@ -7746,6 +7756,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             using var bufferA = GetOrAllocateContiguousInputBuffer(backend, left);
             using var bufferB = GetOrAllocateContiguousInputBuffer(backend, right);
+            if (boundDeferredDestination && !IsBoundDeferredHostDestination(destination, left.Length, backend))
+                return false;
             var output = boundDeferredDestination
                 ? new OwnedBuffer(destination._gpuBuffer!, ownsBuffer: false)
                 : AllocateOutputBuffer(backend, left.Length);

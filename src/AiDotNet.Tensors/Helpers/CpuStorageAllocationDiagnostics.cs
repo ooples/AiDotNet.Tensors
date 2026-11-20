@@ -63,9 +63,11 @@ internal static class CpuStorageAllocationDiagnostics
         var tags = new Dictionary<string, object>();
         foreach (var pair in Recorder.Snapshot())
         {
-            bytes += pair.Value.Bytes;
-            count += pair.Value.Count;
-            tags[pair.Key] = new Dictionary<string, object> { ["bytes"] = pair.Value.Bytes, ["count"] = pair.Value.Count };
+            long itemBytes = pair.Value.Bytes;
+            long itemCount = pair.Value.Count;
+            bytes += itemBytes;
+            count += itemCount;
+            tags[pair.Key] = new Dictionary<string, object> { ["bytes"] = itemBytes, ["count"] = itemCount };
         }
         return new Dictionary<string, object>
         {

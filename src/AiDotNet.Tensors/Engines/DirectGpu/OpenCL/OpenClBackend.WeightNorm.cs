@@ -3,15 +3,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 public sealed partial class OpenClBackend
 {
+    private const int WeightNormReductionWidth = 256;
+
     // The cooperative row reductions require a power-of-two local group. Some
-    // OpenCL devices support fewer than 256 threads, unlike a flat elementwise call.
+    // OpenCL devices support fewer than WeightNormReductionWidth threads, unlike a flat elementwise call.
     private void LaunchWeightNormRows(string name, int rows, params object[] args)
     {
         if (rows <= 0) return;
-        int maximum = CalculateOptimalWorkGroupSize1D(256);
-        int local = 1;
-        while (local * 2 <= maximum && local < 256) local *= 2;
         var kernel = GetBatchKernel(name);
+        int maximum = (int)Math.Min((ulong)CalculateOptimalWorkGroupSize1D(WeightNormReductionWidth), kernel.MaxWorkGroupSize);
+        if (maximum < 1) throw new InvalidOperationException("OpenCL kernel has no valid weight-norm workgroup width.");
+        int local = 1;
+        while (local * 2 <= maximum) local *= 2;
         for (int i = 0; i < args.Length; i++)
         {
             switch (args[i])

@@ -80,12 +80,14 @@ internal static class BufferAllocationDiagnostics
         var backends = new Dictionary<string, object>();
         foreach (var pair in totals)
         {
-            bytes += pair.Value.Bytes;
-            count += pair.Value.Count;
+            long itemBytes = pair.Value.Bytes;
+            long itemCount = pair.Value.Count;
+            bytes += itemBytes;
+            count += itemCount;
             backends[pair.Key] = new Dictionary<string, object>
             {
-                ["bytes"] = pair.Value.Bytes,
-                ["count"] = pair.Value.Count,
+                ["bytes"] = itemBytes,
+                ["count"] = itemCount,
             };
         }
         return new Dictionary<string, object>

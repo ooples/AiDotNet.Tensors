@@ -31,14 +31,16 @@ public partial class DirectGpuTensorEngine
         var (rows, n, _) = ValidateRfftMagnitude(input, output, epsilon);
         using var operation = EnterGpuOp();
         var backend = RequireRfftBackend<T>();
+        float deviceEpsilon = RfftDeviceEpsilon(epsilon);
         RequireRfftDestination(output);
+        output.EnsureOwnedForDeviceWrite();
         if (rows == 0) return;
         using var source = GetRfftInputBuffer(backend, input);
         // All input reads finish before the output is written, including actual
         // overlapping input/output views. The spectrum is action-local scratch.
         using var spectrum = RfftSpectrum(backend, source.Buffer, rows, n, out int stride);
         var destination = GetOrCreateResidentBuffer(backend, output, output.Length, fullyWritten: true);
-        ((IRfftMagnitudeKernels)backend).RfftMagnitude(spectrum.Buffer, destination, rows, n, stride, (float)epsilon);
+        ((IRfftMagnitudeKernels)backend).RfftMagnitude(spectrum.Buffer, destination, rows, n, stride, deviceEpsilon);
         ResidentSyncCheck("RfftMagnitude");
         output.IncrementVersion();
         BindResidentBuffer(output, destination, backend);
@@ -52,14 +54,16 @@ public partial class DirectGpuTensorEngine
         var (rows, n, _) = ValidateRfftMagnitudeBackward(gradOutput, input, gradInput, epsilon);
         using var operation = EnterGpuOp();
         var backend = RequireRfftBackend<T>();
+        float deviceEpsilon = RfftDeviceEpsilon(epsilon);
         RequireRfftDestination(gradInput);
+        gradInput.EnsureOwnedForDeviceWrite();
         if (rows == 0) return;
         using var source = GetRfftInputBuffer(backend, input);
         using var upstream = GetRfftInputBuffer(backend, gradOutput);
         using var spectrum = RfftSpectrum(backend, source.Buffer, rows, n, out int stride);
         using var seed = AllocateTransientScratch(backend, checked(rows * n * 2), fullyWritten: true);
         var kernels = (IRfftMagnitudeKernels)backend;
-        kernels.RfftMagnitudeSeed(spectrum.Buffer, upstream.Buffer, seed.Buffer, rows, n, stride, (float)epsilon);
+        kernels.RfftMagnitudeSeed(spectrum.Buffer, upstream.Buffer, seed.Buffer, rows, n, stride, deviceEpsilon);
         // Real-input one-sided FFT adjoint: zero-pad the negative bins and
         // take Re(IFFT(seed)). cuFFT is unnormalized; portable inverse is 1/N.
         using var transformed = AllocateTransientScratch(backend, checked(rows * n * 2), fullyWritten: true);
@@ -78,12 +82,13 @@ public partial class DirectGpuTensorEngine
         }
         // Resolve a read-modify-write destination only after every primal and
         // upstream read, so in-place VJPs preserve alias semantics.
-        using var old = accumulate ? GetResidentOrPersistentInputBuffer(backend, gradInput) : default;
+        using var old = accumulate ? GetRfftInputBuffer(backend, gradInput) : default;
         var destination = accumulate ? old.Buffer : GetOrCreateResidentBuffer(backend, gradInput, gradInput.Length, fullyWritten: true);
         kernels.RfftRealGradient(transformed.Buffer, destination, gradInput.Length, scale, accumulate);
         ResidentSyncCheck("RfftMagnitudeBackward");
         gradInput.IncrementVersion();
         BindResidentBuffer(gradInput, destination, backend);
+        if (accumulate) AdoptAccumulationUpload(gradInput, old, backend);
         MarkCallerOwnedDestination(gradInput);
     }
 
@@ -96,6 +101,14 @@ public partial class DirectGpuTensorEngine
         return backend;
     }
 
+    private static float RfftDeviceEpsilon(double epsilon)
+    {
+        float value = (float)epsilon;
+        if (float.IsInfinity(value) || (epsilon > 0 && value == 0))
+            throw new ArgumentOutOfRangeException(nameof(epsilon), "RFFT epsilon must be representable in Float32.");
+        return value;
+    }
+
     private static void RequireRfftDestination<T>(Tensor<T> destination)
     {
         if (!IsCanonicalDenseAllocation(destination))
@@ -104,7 +117,8 @@ public partial class DirectGpuTensorEngine
 
     private OwnedBuffer GetRfftInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> input)
     {
-        if (!IsPartialView(input)) return GetResidentOrPersistentInputBuffer(backend, input);
+        if (!IsPartialView(input)) return ResidentStepActive
+            ? GetResidentOrPersistentInputBuffer(backend, input) : GetOrAllocateBuffer(backend, input);
         // The general resolver may eventually call Contiguous() on the host.
         // Native FFT never silently downloads an unsupported resident layout.
         if (!IsFp16Resident(input))
@@ -147,19 +161,15 @@ public partial class DirectGpuTensorEngine
 
     private static void PortableRfftTransform(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int rows, int n, bool inverse)
     {
-        bool powerOfTwo = (n & (n - 1)) == 0;
-        // Other lengths run the backend's device Bluestein transform (same 1/n inverse scaling as BatchedFFT).
-        var generic = powerOfTwo ? null : backend as IGenericFftBackend;
-        if (!powerOfTwo && (generic is null || !generic.SupportsFftElementType(FftElementType.Float32)))
-            throw new NotSupportedException($"{backend.BackendName} has no vendor plan or device transform for real FFT length {n}. No host fallback was performed.");
         int count = checked(rows * n);
         using var re = AllocateTransientScratch(backend, count, fullyWritten: true);
         using var im = AllocateTransientScratch(backend, count, fullyWritten: true);
         backend.StridedGather(input, re.Buffer, 0, 2, count);
         backend.StridedGather(input, im.Buffer, 1, 2, count);
-        if (generic is not null)
+        if ((n & (n - 1)) != 0)
         {
-            // In place on the split planes.
+            if (backend is not IGenericFftBackend generic || !generic.SupportsFftElementType(FftElementType.Float32))
+                throw new NotSupportedException($"{backend.BackendName} has no device FFT for length {n}.");
             generic.LaunchFftGeneric(re.Buffer, im.Buffer, rows, n, inverse, FftElementType.Float32);
             backend.StridedScatter(re.Buffer, output, 0, 2, count);
             backend.StridedScatter(im.Buffer, output, 1, 2, count);

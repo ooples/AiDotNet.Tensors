@@ -11213,18 +11213,33 @@ public partial class CpuEngine : ITensorLevelEngine
 #endif
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && height == 1 && kernelHeight == 1 && outputHeight == 1
-            && (long)inChannels * kernelWidth * outputWidth >= 1_048_576)
+            && (long)inChannels * kernelWidth * outputWidth >= Conv1DPanelMinimumWork)
         {
             int inOffP = 0, kOffP = 0, outOffP = 0;
             var inArrP = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOffP) : null);
             var kArrP = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOffP) : null);
             var outArrP = outputData ?? output.GetCpuBackingForContiguousWrite(out outOffP);
-            if (inArrP is not null && kArrP is not null && outArrP is not null
-                && TryConv1DColumnPanels(inArrP, kArrP, outArrP,
+            if (inArrP is not null && kArrP is not null && outArrP is not null)
+            {
+                var written = outArrP.AsSpan(outOffP, output.Length);
+                // A later column panel still needs the original samples. The fallback can also
+                // materialize an offset destination into a detached array, losing its writes.
+                if (inArrP.AsSpan(inOffP, input.Length).Overlaps(written))
+                {
+                    inArrP = inArrP.AsSpan(inOffP, input.Length).ToArray();
+                    inOffP = 0;
+                }
+                if (kArrP.AsSpan(kOffP, kernel.Length).Overlaps(written))
+                {
+                    kArrP = kArrP.AsSpan(kOffP, kernel.Length).ToArray();
+                    kOffP = 0;
+                }
+                if (TryConv1DColumnPanels(inArrP, kArrP, outArrP,
                     batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
                     strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth,
                     inputStorageOffset: inOffP, outputStorageOffset: outOffP, kernelStorageOffset: kOffP))
-                return;
+                    return;
+            }
         }
         if (!routePinned && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))

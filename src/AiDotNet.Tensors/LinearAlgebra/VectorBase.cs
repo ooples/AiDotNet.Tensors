@@ -586,7 +586,10 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
             // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
             // allocated (zero) array behind and every later read silently returns it.
             Helpers.HostSync.ThrowIfReleased(this);
-            MaterializeBacking(new T[_logicalLength]);
+            // A deferred device result can supply its own array. Finish its download before publishing
+            // any fallback storage, so a failed read leaves the vector available for retry.
+            SyncHostFromDevice();
+            if (IsLazyAllocated) MaterializeBacking(new T[_logicalLength]);
             Helpers.CpuStorageAllocationDiagnostics.Record<T>("tensor.host_materialization", _logicalLength);
         }
         SyncHostFromDevice();

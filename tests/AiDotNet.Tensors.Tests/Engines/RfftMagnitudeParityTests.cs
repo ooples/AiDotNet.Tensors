@@ -8,8 +8,8 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
-[Collection("BlasManaged-Stats-Serial")]
-public sealed class RfftMagnitudeCpuTests
+[Collection("DirectGpuSerial")]
+public sealed class RfftMagnitudeParityTests
 {
     [Theory]
     [InlineData(1)]
@@ -21,13 +21,37 @@ public sealed class RfftMagnitudeCpuTests
     [InlineData(64)]
     public void FloatAndDoubleMatchIndependentDftAndAdjoint(int n)
     {
-        CheckDft<float>(n, 3e-6);
-        CheckDft<double>(n, 2e-11);
+        CheckDft<float>(new CpuEngine(), n, 3e-6);
+        CheckDft<double>(new CpuEngine(), n, 2e-11);
     }
 
-    private static void CheckDft<T>(int n, double tolerance)
+    [SkippableFact]
+    public void OddLengthMagnitudeAndAdjointMatchDft()
     {
-        var engine = new CpuEngine();
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "A GPU backend is required.");
+        CheckDft<float>(gpu, 129, 3e-4);
+    }
+
+    [SkippableFact]
+    public void DeviceMagnitudeHandlesLargeBinsAndFreshAccumulationDestination()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "A GPU backend is required.");
+        var input = new Tensor<float>(new[] { 1e20f }, new[] { 1 });
+        var seed = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        var initial = new Tensor<float>(new[] { 2f }, new[] { 1 });
+        var gradient = (Tensor<float>)initial.CloneShared();
+        Assert.Equal(1e20f, gpu.TensorRfftMagnitude(input, 0)[0]);
+        gpu.TensorRfftMagnitudeBackwardInto(seed, input, gradient, 0, accumulate: true);
+        Assert.Equal(3f, gradient[0]);
+        Assert.Equal(2f, initial[0]);
+        Assert.Throws<ArgumentOutOfRangeException>(() => gpu.TensorRfftMagnitudeInto(gradient, input, 1e-50));
+        Assert.Throws<ArgumentOutOfRangeException>(() => gpu.TensorRfftMagnitudeBackwardInto(seed, input, gradient, 1e100));
+    }
+
+    private static void CheckDft<T>(CpuEngine engine, int n, double tolerance)
+    {
         var ops = MathHelper.GetNumericOperations<T>();
         int bins = n / 2 + 1;
         var values = Enumerable.Range(0, 6 * n).Select(i => .2 + .3 * Math.Sin(.31 * i)).Select(ops.FromDouble).ToArray();

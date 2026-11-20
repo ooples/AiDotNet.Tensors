@@ -5419,6 +5419,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static readonly System.Reflection.MethodInfo s_reshapeBackward =
         ((BackwardFunction<T>)BackwardFunctions<T>.ReshapeBackward).Method;
 
+    private static readonly System.Reflection.MethodInfo s_narrowBackward =
+        ((BackwardFunction<T>)BackwardFunctions<T>.NarrowBackward).Method;
+
     private static bool IsReshape(CompiledStep<T> step) => step.BackwardFn?.Method is { } method && method.Equals(s_reshapeBackward);
 
     /// <summary>
@@ -5478,7 +5481,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 foreach (var t in saved.OfType<Tensor<T>>()) unsafeTensors.Add(t);
         }
 
-        // The last forward action reading `output` or, through reshapes, any view of it: a device reshape of a
+        // The last forward action reading `output` or, through reshapes or narrows, any view of it: a device reshape of a
         // contiguous tensor shares its input's buffer, so the buffer lives until the last reader of every view. -1 when a
         // reader (of the output or of a view) is not a single-step action whose backward ignores its inputs.
         int LastReader(Tensor<T> output, int depth)
@@ -5491,7 +5494,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (emitKinds[r] != ForwardEmit.Rebuildable
                     || (backwardSteps is null || backwardSteps.Contains(r)) && !BackwardIgnoresForwardInputs(reader)) return -1;
                 last = Math.Max(last, actionOf[r]);
-                if (IsReshape(reader))
+                if (IsReshape(reader) || reader.BackwardFn?.Method.Equals(s_narrowBackward) == true)
                 {
                     int viewLast = LastReader(reader.OutputBuffer, depth + 1);
                     if (viewLast < 0) return -1;
