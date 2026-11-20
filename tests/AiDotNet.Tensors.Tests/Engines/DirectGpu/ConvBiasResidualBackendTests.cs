@@ -15,17 +15,20 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
     private readonly string? _previousFeature = Environment.GetEnvironmentVariable(Feature);
     private readonly bool _previousCudnn = TensorCodecOptions.Current.UseCudnn;
     private readonly bool _previousTf32 = CudaDispatchPolicy.AllowTF32;
+    private readonly bool _previousConvTf32 = CudaDispatchPolicy.ConvReducedPrecisionTF32;
 
     public ConvBiasResidualBackendTests()
     {
         Environment.SetEnvironmentVariable(Feature, "1");
         TensorCodecOptions.Current.UseCudnn = true;
         CudaDispatchPolicy.AllowTF32 = false;
+        CudaDispatchPolicy.ConvReducedPrecisionTF32 = false;
     }
 
     public void Dispose()
     {
         CudaDispatchPolicy.AllowTF32 = _previousTf32;
+        CudaDispatchPolicy.ConvReducedPrecisionTF32 = _previousConvTf32;
         TensorCodecOptions.Current.UseCudnn = _previousCudnn;
         Environment.SetEnvironmentVariable(Feature, _previousFeature);
     }
@@ -144,6 +147,13 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
         Assert.Equal(vendor + 1, backend.ConvBiasResidualVendorLaunchCount);
         Close(composed, backend.DownloadBuffer(output));
         if (activate) Close(composedActivated!, backend.DownloadBuffer(activated));
+
+        // Convolution precision is configured separately from GEMM. The strict
+        // cuDNN epilogue must defer to the configured convolution in this case.
+        CudaDispatchPolicy.ConvReducedPrecisionTF32 = true;
+        Assert.True(((IConvBiasResidualBackend)backend).TryConvBiasResidual(args));
+        Assert.Equal(vendor + 1, backend.ConvBiasResidualVendorLaunchCount);
+        Close(composed, backend.DownloadBuffer(output));
     }
 
     [Fact]
@@ -158,7 +168,8 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-6f + 1e-5f * Math.Abs(expected[i]), $"Output mismatch at {i}.");
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-6f + 1e-5f * Math.Abs(expected[i]),
+                $"Output mismatch at {i}: expected {expected[i]:R}, actual {actual[i]:R}.");
     }
 
     private sealed class FakeBuffer : IGpuBuffer
