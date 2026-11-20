@@ -111,6 +111,34 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// A device copy of the first <paramref name="length"/> elements of <paramref name="buffer"/> (stream-ordered), so a
+    /// pass that writes the buffer in place can be undone with <see cref="RestoreDeviceSnapshot"/>.
+    /// </summary>
+    internal IGpuBuffer TakeDeviceSnapshot(IGpuBuffer buffer, int length)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (!TryGetBackend(out var backend)) throw new InvalidOperationException("No GPU backend.");
+        var snapshot = AllocateDeviceBufferUninitialized(backend, length);
+        backend.Copy(buffer, snapshot, length);
+        return snapshot;
+    }
+
+    /// <summary>Writes a <see cref="TakeDeviceSnapshot"/> back into <paramref name="buffer"/> and frees the snapshot.</summary>
+    internal void RestoreDeviceSnapshot(IGpuBuffer snapshot, IGpuBuffer buffer, int length)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        try
+        {
+            if (!TryGetBackend(out var backend)) throw new InvalidOperationException("No GPU backend.");
+            backend.Copy(snapshot, buffer, length);
+        }
+        finally { snapshot.Dispose(); }
+    }
+
+    /// <summary>
     /// Downloads the first <paramref name="length"/> elements of a buffer a captured graph writes (a replayed plan's
     /// output), independent of any tensor's binding to it. Null when the buffer is gone.
     /// </summary>

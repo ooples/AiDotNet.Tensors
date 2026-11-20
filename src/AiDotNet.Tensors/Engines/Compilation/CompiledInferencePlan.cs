@@ -40,6 +40,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private Tensor<T>[] _stateTensors = Array.Empty<Tensor<T>>();
     // The device buffers a capture recorded the states at (the replays write there).
     private Engines.DirectGpu.IGpuBuffer[] _capturedStateBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
+    // Leaves the steps write in place (a static decode cache updated by an in-place op, no declared state), their
+    // captured device buffers, and the versions the last execution left them at.
+    private Tensor<T>[] _inPlaceLeaves = Array.Empty<Tensor<T>>();
+    private Engines.DirectGpu.IGpuBuffer[] _capturedInPlaceBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
+    private int[] _capturedInPlaceVersions = Array.Empty<int>();
     private int[] _capturedStateVersions = Array.Empty<int>();
     // The host data each captured-graph input buffer last received (bitwise), the buffer it went to and the input's
     // cache version then: a replay whose input still matches all three skips the upload (a decode step re-feeding
@@ -890,8 +895,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                     for (int i = 0; i < _stateTensors.Length; i++)
                         if (_stateTensors[i].GpuCacheVersion != _capturedStateVersions[i])
                             throw new InvalidOperationException("A captured state was modified outside the plan.");
+                    for (int i = 0; i < _inPlaceLeaves.Length; i++)
+                        if (_inPlaceLeaves[i].GpuCacheVersion != _capturedInPlaceVersions[i])
+                            throw new InvalidOperationException("A tensor the captured graph writes in place was modified outside the plan.");
                     RefreshInferenceInputsInPlace(cb);
-                    stateLaunchAttempted = _stateTensors.Length != 0;
+                    stateLaunchAttempted = _stateTensors.Length != 0 || _inPlaceLeaves.Length != 0;
                     cb.LaunchCapturedGraph(_graphExec);
                     RearmStates();
                     replayed = RefreshFinalOutputFromResident(); // fresh DtoH into _finalOutput's host storage
@@ -947,6 +955,16 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // upload path they would be re-uploaded inside the capture.
                             var producedHere = new HashSet<Tensor<T>>(steps.Select(step => step.OutputBuffer),
                                 ReferenceEqualityComparer<Tensor<T>>.Instance);
+                            // A leaf an in-place step writes (its output is one of its inputs) and no other step
+                            // produces: persistent state the plan advances every execution (a static decode cache).
+                            var producedOutOfPlace = new HashSet<Tensor<T>>(steps.Where(step => !IsInPlaceStep(step)).Select(step => step.OutputBuffer),
+                                ReferenceEqualityComparer<Tensor<T>>.Instance);
+                            _inPlaceLeaves = steps.Where(IsInPlaceStep).Select(step => step.OutputBuffer)
+                                .Where(t => !producedOutOfPlace.Contains(t) && Array.IndexOf(_compiledInputTensors, t) < 0 && Array.IndexOf(_stateTensors, t) < 0)
+                                .Distinct(ReferenceEqualityComparer<Tensor<T>>.Instance).ToArray();
+                            _capturedInPlaceBuffers = _inPlaceLeaves.Select(t => gte.PinInputResident(t)
+                                ?? throw new InvalidOperationException("A tensor written in place could not be made device-resident.")).ToArray();
+                            _capturedInPlaceVersions = new int[_inPlaceLeaves.Length];
                             foreach (var leaf in steps.SelectMany(step => step.Inputs).Where(leaf => !producedHere.Contains(leaf)
                                          && Array.IndexOf(_compiledInputTensors, leaf) < 0 && Array.IndexOf(_stateTensors, leaf) < 0))
                                 gte.PinLeafResident(leaf);
@@ -961,7 +979,21 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // A stateful plan's trailing state writes are left out: the launch below performs
                             // this call's one state advance, and the state buffers already exist (the eager
                             // warmup calls wrote them).
+                            // The pre-residency pass would advance every in-place leaf once more than this call does
+                            // (the launch below is this call's advance): snapshot them on the device and restore after.
+                            var snapshots = new Engines.DirectGpu.IGpuBuffer[_inPlaceLeaves.Length];
+                            for (int i = 0; i < snapshots.Length; i++)
+                                snapshots[i] = gte.TakeDeviceSnapshot(_capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
                             RunStepsPooled(gte, engine, steps, steps.Length - _stateTensors.Length);
+                            for (int i = 0; i < snapshots.Length; i++)
+                            {
+                                if (!ReferenceEquals(_inPlaceLeaves[i]._gpuBuffer, _capturedInPlaceBuffers[i]))
+                                {
+                                    for (int j = i; j < snapshots.Length; j++) snapshots[j].Dispose();
+                                    throw new InvalidOperationException("An in-place write moved its tensor to another device buffer; the graph cannot replay it.");
+                                }
+                                gte.RestoreDeviceSnapshot(snapshots[i], _capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+                            }
 
                             // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
                             // capture is non-capturable), then record the step launches. Capture RECORDS
@@ -974,7 +1006,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 _graphBackend = cb;
                                 _graphEngine = gte;
                                 _capturedOutputBuffer = _finalOutput._gpuBuffer;
-                                stateLaunchAttempted = _stateTensors.Length != 0;
+                                stateLaunchAttempted = _stateTensors.Length != 0 || _inPlaceLeaves.Length != 0;
                                 cb.LaunchCapturedGraph(exec);
                                 RearmStates();
                                 // Force a fresh DtoH into _finalOutput's host storage (else the returned tensor
@@ -1041,6 +1073,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
     // An abandoned capture leaves the plan eager: its input slots, pinned to buffers only a graph replay refreshes,
     // must go back to the engine's ordinary upload path (SetInputs writes the host copy only).
+    // An in-place step writes the tensor it also reads (see CompiledTrainingPlan.IsInPlaceState).
+    private static bool IsInPlaceStep(CompiledStep<T> step)
+    {
+        foreach (var input in step.Inputs)
+            if (ReferenceEquals(input, step.OutputBuffer)) return true;
+        return false;
+    }
+
     private void UnpinInputs(DirectGpuTensorEngine gte)
     {
         foreach (var input in _compiledInputTensors.Where(input => input is not null))
@@ -1088,7 +1128,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // host read downloads this execution's value.
     private void RearmStates()
     {
-        if (_capturedStateBuffers.Length == 0 || _graphEngine is not { } gte) return;
+        if (_graphEngine is not { } gte) return;
+        for (int i = 0; i < _inPlaceLeaves.Length; i++)
+        {
+            gte.RearmStateAfterReplay(_inPlaceLeaves[i], _capturedInPlaceBuffers[i]);
+            _capturedInPlaceVersions[i] = _inPlaceLeaves[i].GpuCacheVersion;
+        }
+        if (_capturedStateBuffers.Length == 0) return;
         for (int i = 0; i < _stateTensors.Length; i++)
         {
             gte.RearmStateAfterReplay(_stateTensors[i], _capturedStateBuffers[i]);

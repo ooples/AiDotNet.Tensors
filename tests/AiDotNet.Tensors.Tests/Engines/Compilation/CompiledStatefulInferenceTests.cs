@@ -375,6 +375,61 @@ public sealed class CompiledStatefulInferenceTests
         }
     }
 
+    // A leaf written in place by the traced step (a static decode cache: TensorAddInPlace into a persistent tensor, no
+    // declared state) advances exactly once per execution, the capture call included, and the host sees each value.
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void An_in_place_write_to_a_leaf_advances_once_per_execution(bool capture)
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = capture;
+            try
+            {
+                const int N = 37;
+                var cache = new Tensor<float>([N]);
+                var x = new Tensor<float>([N]);
+                CompiledInferencePlan<float> plan;
+                using (new EngineScope(gpu))
+                using (var scope = GraphMode.EnableInference())
+                {
+                    gpu.TensorAddInPlace(cache, x);
+                    var y = gpu.TensorMultiplyScalar(cache, 2f);
+                    plan = scope.CompileInference(y, new[] { x }, Array.Empty<(Tensor<float>, Tensor<float>)>());
+                }
+                using (plan)
+                {
+                    var expect = new float[N];
+                    for (int t = 0; t < 6; t++)
+                    {
+                        var xv = Enumerable.Range(0, N).Select(i => 0.5f * i + t).ToArray();
+                        plan.SetInputs(new[] { new Tensor<float>([N], new Vector<float>(xv)) });
+                        var y = plan.Execute().ToArray();
+                        for (int i = 0; i < N; i++) expect[i] += xv[i];
+                        var got = cache.ToArray();
+                        for (int i = 0; i < N; i++)
+                        {
+                            Assert.True(Math.Abs(got[i] - expect[i]) <= 1e-4f, $"step {t} cache[{i}]: {got[i]} vs {expect[i]}");
+                            Assert.True(Math.Abs(y[i] - 2 * expect[i]) <= 1e-4f, $"step {t} y[{i}]: {y[i]} vs {2 * expect[i]}");
+                        }
+                    }
+                    if (capture && gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)
+                    {
+                        var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                        Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
+                    }
+                }
+            }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+        }
+    }
+
     // Several states are written by one copy launch: the captured graph has no memcpy node for them, and every state
     // still advances exactly once per execution (checked against a CPU recurrence, including the capture call).
     [SkippableFact]
