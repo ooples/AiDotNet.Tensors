@@ -729,9 +729,14 @@ public partial class CpuEngine
                     BlasManaged.GemvKernel.Run<float>(hiddenWeights, hidden, false, hiddenState, 1, false,
                         gates, 1, gateRows, 1, hidden);
                     var wx = projection.Slice(t * gateRows, gateRows);
-                    if (inputBias is not null) SimdKernels.Add(wx, inputBias.AsSpan(0, gateRows), wx);
-                    SimdKernels.Add(wx, gates, gates);
-                    if (hiddenBias is not null) SimdKernels.Add(gates, hiddenBias.AsSpan(0, gateRows), gates);
+                    for (int gate = 0; gate < gateRows; gate++)
+                    {
+                        float projected = wx[gate];
+                        if (inputBias is not null) projected += inputBias[gate];
+                        float value = projected + gates[gate];
+                        if (hiddenBias is not null) value += hiddenBias[gate];
+                        gates[gate] = value;
+                    }
                     var inputForget = gates.Slice(0, 2 * hidden);
                     var candidate = gates.Slice(2 * hidden, hidden);
                     var outputGate = gates.Slice(3 * hidden, hidden);
