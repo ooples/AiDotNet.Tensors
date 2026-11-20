@@ -5308,8 +5308,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Scratch dropped in one run (Forget, TrimUnleased) past which the plan collects so it is freed now.
     private const long DroppedScratchCollectBytes = 16L << 20;
 
-    /// <summary>Test hook: the bytes of those buffers.</summary>
-    internal long ScratchBufferBytes => _scratchPool?.BufferBytes ?? 0;
+    /// <summary>
+    /// Test hook: the bytes of the scratch the last step worked in. That is what the pool holds plus what the step handed
+    /// to the engine's shared workspace when it ended; without the second term a sharing plan reports only what it kept.
+    /// </summary>
+    internal long ScratchBufferBytes => (_scratchPool?.BufferBytes ?? 0) + SharedWorkspaceBytesLastStep;
     /// <summary>Enables the test-only unique-native-handle working-storage observation.</summary>
     internal static bool ObserveScratchStorageForTests { get; set; }
     /// <summary>Actual unique native backing after the last executed body cleanup, before any broker transfer.</summary>
