@@ -7276,7 +7276,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             var tableBuf = ResolveResidentEmbeddingTable(backend, embeddings);
             if (tableBuf is null) return false;
-            var outBuf = output.TryGetGpuBuffer() ?? GetOrCreateResidentBuffer(backend, output, numIndices * embeddingDim);
+            // Every branch below writes every output row (a NaN or out-of-range id writes a zero row).
+            var outBuf = output.TryGetGpuBuffer() ?? GetOrCreateResidentBuffer(backend, output, numIndices * embeddingDim, fullyWritten: true);
             // Indices via the EXTERNALLY-MANAGED stable buffer (mirrors TryEmbeddingGatherGpu): register the refresh
             // so the plan re-uploads fresh indices before each captured replay; upload inline only on the eager
             // (non-managed) pass. The index upload (the only HtoD) thus never happens INSIDE the capture (= the 906).
@@ -21754,7 +21755,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufferB = GetOrAllocateBuffer(backend, b);
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
                     backend.BroadcastMultiplyLastAxis(
-                        bufferA.Buffer, bufferB.Buffer, output, outerSize, innerSize)));
+                        bufferA.Buffer, bufferB.Buffer, output, outerSize, innerSize), fullyWritten: true));
             }
 
             // Pattern 2: (outer..., inner...) * (outer..., 1...) -> one scale per leading-prefix row, any rank (a [N, M]
@@ -21795,7 +21796,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     using var bufferB = GetOrAllocateBuffer(backend, b);
                     return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
                         backend.BroadcastMultiplyLastAxis(
-                            bufferA.Buffer, bufferB.Buffer, output, outerSize, innerSize)));
+                            bufferA.Buffer, bufferB.Buffer, output, outerSize, innerSize), fullyWritten: true));
                 }
             }
 
@@ -21820,14 +21821,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, a.Length, a.Shape.ToArray(), output =>
-                    backend.BroadcastMultiplyLastAxis(bufferA.Buffer, bufferB.Buffer, output, a.Length / tileB, tileB)));
+                    backend.BroadcastMultiplyLastAxis(bufferA.Buffer, bufferB.Buffer, output, a.Length / tileB, tileB), fullyWritten: true));
             }
             if (IsTrailingTileBroadcast(b, a, out int tileA))
             {
                 using var bufferA = GetOrAllocateBuffer(backend, a);
                 using var bufferB = GetOrAllocateBuffer(backend, b);
                 return RecordGpuResult(DispatchDeferredGpuOp<T>(backend, b.Length, b.Shape.ToArray(), output =>
-                    backend.BroadcastMultiplyLastAxis(bufferB.Buffer, bufferA.Buffer, output, b.Length / tileA, tileA)));
+                    backend.BroadcastMultiplyLastAxis(bufferB.Buffer, bufferA.Buffer, output, b.Length / tileA, tileA), fullyWritten: true));
             }
 
             if (TryRunGeneralBroadcastBinary(a, b,
@@ -25870,7 +25871,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             using var bufA = GetOrAllocateBuffer(backend, a);
             using var bufB = GetOrAllocateBuffer(backend, b);
-            var bufOut = AllocateOutputBuffer(backend, M * N);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, M * N);   // A·Bᵀ with beta 0 writes every element
             // Backend-native A·Bᵀ: cuBLAS / rocBLAS / MPS / CLBlast use
             // their transB flag; Vulkan/WebGPU dispatch a custom kernel
             // that reads B with the [N, K] index pattern. Either way,
@@ -28840,7 +28841,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 innerSize *= tensor.Shape._dims[dimension];
             var contiguousTensor = tensor.IsContiguous ? tensor : tensor.Contiguous();
             var contiguousIndices = indices.IsContiguous ? indices : indices.Contiguous();
-            if (!HasResidentIndexStorage(contiguousIndices))
+            bool hostChecked = !HasResidentIndexStorage(contiguousIndices);
+            if (hostChecked)
             {
                 using var indexDataLease = contiguousIndices.LeaseArray();
                 var indexData = indexDataLease.Array;
@@ -28855,9 +28857,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outShape[normalizedAxis] = numIndices;
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousTensor);
             using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            // Host indices were bounds-checked above, so every output element is gathered: no zero fill.
             var output = DispatchDeferredGpuOp<T>(backend, total, outShape, result =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, result,
-                    outerSize, axisSize, numIndices, innerSize));
+                    outerSize, axisSize, numIndices, innerSize), fullyWritten: hostChecked);
             if (IsTapeActive<T>())
                 Autodiff.DifferentiableOps.RecordUnary("IndexSelect", output, tensor,
                     Autodiff.BackwardFunctions<T>.IndexSelectBackward,

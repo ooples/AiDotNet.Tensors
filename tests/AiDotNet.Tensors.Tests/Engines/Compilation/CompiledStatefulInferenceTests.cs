@@ -292,6 +292,7 @@ public sealed class CompiledStatefulInferenceTests
                         (A, false), (A, false), (A, false), (B, false), (B, false), (A, true), (A, true), (B, true),
                         (Negz, false), (A, false), (B, false), (B, false),
                     };
+                    static int Bits(float f) => BitConverter.ToInt32(BitConverter.GetBytes(f), 0);   // net471 has no SingleToInt32Bits
                     long skippedBefore = 0;
                     int expectedSkips = 0;
                     float[]? previous = null;
@@ -306,7 +307,7 @@ public sealed class CompiledStatefulInferenceTests
                         else plan.SetInputs(new[] { new Tensor<float>([1, W], new Vector<float>((float[])data.Clone())) });
                         if (t == 2) skippedBefore = plan.InputUploadsSkipped;   // the graph is replaying from here on
                         else if (t > 2 && previous is not null
-                                 && data.Select(BitConverter.SingleToInt32Bits).SequenceEqual(previous.Select(BitConverter.SingleToInt32Bits)))
+                                 && data.Select(Bits).SequenceEqual(previous.Select(Bits)))
                             expectedSkips++;
                         var got = plan.Execute().ToArray();
                         for (int j = 0; j < W; j++)
@@ -371,6 +372,72 @@ public sealed class CompiledStatefulInferenceTests
                 var st = state.ToArray();
                 for (int i = 0; i < 8; i++) Assert.True(Math.Abs(st[i] - acc[i]) <= 1e-4f, $"step {t} state[{i}] {st[i]} vs {acc[i]}");
             }
+        }
+    }
+
+    // Ops that write every output element (RMSNorm, A*B^T with beta 0, a last-axis broadcast multiply, a gather by
+    // bounds-checked host indices) take their first-pass output buffers without a zero fill: that pass is the one the
+    // graph captures, so a fill would replay as a memset node every step. The replayed values match the CPU engine.
+    [SkippableFact]
+    public void A_captured_chain_of_fully_written_outputs_has_no_memset_nodes()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            var cuda = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)gpu.GetBackend()!;
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = true;
+            try
+            {
+                const int R = 2, E = 64, N = 48, K = 20;
+                var rng = new Random(11);
+                Tensor<float> Rand(int[] shape) => new(shape, new Vector<float>(Enumerable.Range(0, shape.Aggregate(1, (a, b) => a * b)).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray()));
+                var gamma = Rand([E]);
+                var w = Rand([N, E]);
+                var scale = Rand([N]);
+                var idx = new Tensor<int>(Enumerable.Range(0, K).Select(i => (i * 7) % N).ToArray(), [K]);
+                var x = new Tensor<float>([R, E]);
+                var state = new Tensor<float>([R, K]);
+                Tensor<float> Chain(IEngine e, Tensor<float> input)
+                    => e.TensorIndexSelect(e.TensorMultiply(e.TensorMatMulTransposed(e.RMSNorm(input, gamma, 1e-6, out _), w), scale), idx, 1);
+                CompiledInferencePlan<float> plan;
+                using (new EngineScope(gpu))
+                using (var scope = GraphMode.EnableInference())
+                {
+                    var y = Chain(gpu, x);
+                    plan = scope.CompileInference(y, new[] { x }, new[] { (state, gpu.TensorAdd(state, y)) });
+                }
+                using (plan)
+                {
+                    var cpu = new CpuEngine();
+                    var acc = new float[R * K];
+                    for (int t = 0; t < 4; t++)
+                    {
+                        var input = Rand([R, E]);
+                        plan.SetInputs(new[] { input });
+                        var got = plan.Execute().ToArray();
+                        var expect = Chain(cpu, input).ToArray();
+                        Assert.Equal(expect.Length, got.Length);
+                        for (int i = 0; i < got.Length; i++)
+                        {
+                            Assert.True(Math.Abs(got[i] - expect[i]) <= 1e-4f * (1f + Math.Abs(expect[i])), $"step {t} [{i}]: {got[i]} vs {expect[i]}");
+                            acc[i] += expect[i];
+                        }
+                        var st = state.ToArray();
+                        for (int i = 0; i < acc.Length; i++)
+                            Assert.True(Math.Abs(st[i] - acc[i]) <= 1e-4f * (1f + Math.Abs(acc[i])), $"step {t} state[{i}]: {st[i]} vs {acc[i]}");
+                    }
+                    var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                    Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
+                    Assert.True(cuda.LastCaptureKernelNodeCount > 0, "the capture recorded no kernels");
+                    Assert.Equal(0, cuda.LastCaptureMemsetNodeCount);
+                }
+            }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
         }
     }
 
