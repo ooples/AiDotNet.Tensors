@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <summary>
 /// The CUDA convolution slots' defaults for shapes the process has no tuning budget left to measure (#2561). Without
 /// them every such shape ran the slot's reference: on a cold cache DenseNet-121's 128->32 3x3 forward took 3.2 ms per
-/// call at batch 64 on an RTX 1000 Ada against 0.55 ms tuned, and only the first few shapes fit the 2 s budget. The
+/// call at batch 64 on an RTX 1000 Ada against 0.55 ms tuned, and only the first few shapes fit the then 2 s budget. The
 /// lists follow what online tuning chose on that device across 417 ResNet / DenseNet / MobileNet / VGG shapes:
 /// Winograd F(2x2,3x3) for undilated stride-1 3x3 (forward, input and weight gradient), the 8x8-micro-tile weight
 /// gradient elsewhere, and the sub-pixel input-gradient kernels for stride 2. A default is used only after one run
