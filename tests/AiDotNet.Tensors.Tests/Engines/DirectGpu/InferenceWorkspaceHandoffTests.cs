@@ -106,12 +106,14 @@ public sealed class InferenceWorkspaceHandoffTests
         finally { InferenceWorkspaceDemandScope.HandoffIdleWorkspaceEnabled = previous; }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void Train_predict_train_preserves_unread_gradients_retained_views_and_optimizer_updates(bool inputGradients)
     {
-        using var gpu = new DirectGpuTensorEngine(); Assert.True(gpu.IsGpuAvailable);
+        using var gpu = new DirectGpuTensorEngine();
+        // A device trajectory: the hosted build runners have no GPU, the GPU lanes run it.
+        Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
         var previous = AiDotNetEngine.Current;
         bool handoff = InferenceWorkspaceDemandScope.HandoffIdleWorkspaceEnabled;
         bool? gradients = CompiledTrainingPlan<float>.CompiledInputGradientsForTests;
