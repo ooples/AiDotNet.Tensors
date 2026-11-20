@@ -217,6 +217,9 @@ public static class TensorAllocator
     public static Tensor<T> RentPinned<T>(int[] shape)
     {
         if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (CpuStorageAllocationDiagnostics.Enabled && !CpuStorageAllocationDiagnostics.IsInsideRequest)
+            return CpuStorageAllocationDiagnostics.Observe("tensor.RentPinned", CpuStorageAllocationDiagnostics.ShapeBytes<T>(shape),
+                shape, static value => RentPinned<T>(value));
         // Use long arithmetic for the dim product so an intermediate
         // multiplication can't overflow Int32 (~2.1 B). The arrays we
         // actually allocate still cap at Array.MaxLength (slightly under
@@ -406,6 +409,9 @@ public static class TensorAllocator
     public static Tensor<T> Rent<T>(int[] shape)
     {
         if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (CpuStorageAllocationDiagnostics.Enabled && !CpuStorageAllocationDiagnostics.IsInsideRequest)
+            return CpuStorageAllocationDiagnostics.Observe("tensor.Rent", CpuStorageAllocationDiagnostics.ShapeBytes<T>(shape),
+                shape, static value => Rent<T>(value));
         // Use long arithmetic for the dim product so an intermediate
         // multiplication can't overflow Int32 (~2.1 B). The arrays we
         // actually allocate still cap at Array.MaxLength (slightly under
@@ -519,6 +525,9 @@ public static class TensorAllocator
     /// </summary>
     public static Tensor<T> RentUninitialized<T>(int[] shape)
     {
+        if (CpuStorageAllocationDiagnostics.Enabled && !CpuStorageAllocationDiagnostics.IsInsideRequest)
+            return CpuStorageAllocationDiagnostics.Observe("tensor.RentUninitialized", CpuStorageAllocationDiagnostics.ShapeBytes<T>(shape),
+                shape, static value => RentUninitialized<T>(value));
         int totalSize = 1;
         for (int i = 0; i < shape.Length; i++)
             totalSize = checked(totalSize * shape[i]);

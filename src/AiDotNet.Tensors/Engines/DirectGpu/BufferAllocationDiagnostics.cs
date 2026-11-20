@@ -1,0 +1,177 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu;
+
+/// <summary>
+/// Opt-in successful primitive8/primitive32 backend buffer requests, including pool hits and framework workspaces.
+/// These are allocator-interface requests, not Tensor wrappers, driver allocations, or reserved device bytes.
+/// </summary>
+internal static class BufferAllocationDiagnostics
+{
+    internal static readonly bool Enabled = Environment.GetEnvironmentVariable("AIDOTNET_BUFFER_ALLOC_DIAG") == "1";
+    private static readonly RequestRecorder Recorder = new();
+    private static readonly Totals CudaNativeApiRequests = new();
+    private static readonly Totals CompiledWorkspaceLoans = new();
+    private static readonly Totals StepScratchReuseRequests = new();
+    private static readonly Totals CudnnWorkspaceAcquisitions = new();
+    internal static bool IsInsideRequest => RequestRecorder.IsInside;
+
+    // Keep diagnostics from changing a backend's existing null-validation order or exception type.
+    internal static long Primitive32Bytes(Array? data) => data is null ? 0 : (long)data.Length * sizeof(float);
+
+    internal static T Observe<T>(string backend, long bytes, Func<T> allocate)
+        => Recorder.Observe(backend, bytes, allocate);
+
+    internal static TResult Observe<TState, TResult>(string backend, long bytes, TState state, Func<TState, TResult> allocate)
+        => Recorder.Observe(backend, bytes, state, allocate);
+
+    internal static void RecordCudaNativeApiRequest(long bytes)
+    {
+        if ((Enabled || Volatile.Read(ref s_nativeObservers) != 0) && bytes > 0) CudaNativeApiRequests.Add(bytes);
+    }
+
+    private static int s_nativeObservers;
+
+    // Count the same successful native allocations as the full tracker without collecting allocation stacks.
+    internal sealed class NativeAllocationMeasurement : IDisposable
+    {
+        private readonly long _start;
+        private int _disposed;
+
+        internal NativeAllocationMeasurement()
+        {
+            Interlocked.Increment(ref s_nativeObservers);
+            _start = CudaNativeApiRequests.Count;
+        }
+
+        internal long Count => CudaNativeApiRequests.Count - _start;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0) Interlocked.Decrement(ref s_nativeObservers);
+        }
+    }
+
+    internal static void RecordCompiledWorkspaceLoan(int requestedFloat32Length)
+    {
+        if (Enabled && requestedFloat32Length > 0)
+            CompiledWorkspaceLoans.Add((long)requestedFloat32Length * sizeof(float));
+    }
+
+    internal static void RecordStepScratchReuse(int requestedFloat32Length)
+    {
+        if (Enabled && requestedFloat32Length > 0)
+            StepScratchReuseRequests.Add((long)requestedFloat32Length * sizeof(float));
+    }
+
+    internal static void RecordCudnnWorkspaceAllocation(long bytes)
+    {
+        if (Enabled && bytes > 0) CudnnWorkspaceAcquisitions.Add(bytes);
+    }
+
+    // The benchmark accesses this internal diagnostic reflectively, so the public library API need not grow.
+    internal static Dictionary<string, object> Snapshot()
+    {
+        var totals = Recorder.Snapshot();
+        long bytes = 0, count = 0;
+        var backends = new Dictionary<string, object>();
+        foreach (var pair in totals)
+        {
+            long itemBytes = pair.Value.Bytes;
+            long itemCount = pair.Value.Count;
+            bytes += itemBytes;
+            count += itemCount;
+            backends[pair.Key] = new Dictionary<string, object>
+            {
+                ["bytes"] = itemBytes,
+                ["count"] = itemCount,
+            };
+        }
+        return new Dictionary<string, object>
+        {
+            ["enabled"] = Enabled,
+            ["gpu_buffer_requested"] = new Dictionary<string, object>
+            {
+                ["bytes"] = bytes,
+                ["count"] = count,
+                ["coverage"] = Enabled ? "primitive8_32_backend_buffer_api_only" : "disabled",
+                ["scope"] = "Successful backend buffer requests including framework workspaces and pool hits; excludes views and delegated duplicate calls.",
+                ["backends"] = backends,
+            },
+            ["cpu_storage_requested"] = Helpers.CpuStorageAllocationDiagnostics.Snapshot(),
+            ["gpu_compiled_workspace_loan_requested"] = new Dictionary<string, object>
+            {
+                ["bytes"] = CompiledWorkspaceLoans.Bytes,
+                ["count"] = CompiledWorkspaceLoans.Count,
+                ["coverage"] = Enabled ? "successful_compiled_broker_loans_only" : "disabled",
+                ["scope"] = "Successful cross-plan compiled workspace loans at CompiledTransientWorkspaceBroker.TryRent. Requested float32 length, including reused capacity; excludes failed rents, stable slot lookups, aliases/views and native backing API acquisitions. Other private pool/arena borrow routes require separate coverage.",
+            },
+            ["gpu_step_scratch_reuse_requested"] = new Dictionary<string, object>
+            {
+                ["bytes"] = StepScratchReuseRequests.Bytes,
+                ["count"] = StepScratchReuseRequests.Count,
+                ["coverage"] = Enabled ? "successful_step_scratch_free_loans_only" : "disabled",
+                ["scope"] = "Successful reused-free-buffer acquisitions in StepScratchPool.Lease and TryTakeFree. Requested float32 length; excludes backend allocation misses (counted by backend API), retained stable-slot lookups, aliases/views, cross-plan broker loans and native backing API acquisitions.",
+            },
+            ["gpu_cudnn_workspace_acquired"] = new Dictionary<string, object>
+            {
+                ["bytes"] = CudnnWorkspaceAcquisitions.Bytes,
+                ["count"] = CudnnWorkspaceAcquisitions.Count,
+                ["coverage"] = Enabled ? "successful_cudnn_conv_workspace_growth_only" : "disabled",
+                ["scope"] = "Successful framework-owned cuDNN convolution workspace growth via cuMemAlloc in EnsureWorkspaceUnlocked. API acquisition capacity bytes, including geometric growth; excludes repeated use of the same owned workspace, cuDNN internal bypass allocations, buffer views and backend API allocations counted elsewhere. Not physical driver backing events.",
+            },
+            ["gpu_native_api_requested"] = new Dictionary<string, object>
+            {
+                ["bytes"] = CudaNativeApiRequests.Bytes,
+                ["count"] = CudaNativeApiRequests.Count,
+                ["coverage"] = Enabled ? "cuda_tracker_hook_sites_only" : "disabled",
+                ["scope"] = "Successful CUDA native allocation API requests at GpuMemoryTracker.OnAlloc hook sites. Includes cuMemAllocAsync driver-pool suballocations; not physical backing allocation count or complete vendor allocation coverage.",
+            },
+            // Explicitly unknown: these categories cannot be inferred from buffer requests or GC object bytes.
+            ["cpu_framework_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
+            ["gpu_framework_requested"] = new Dictionary<string, object> { ["coverage"] = "unverified_api_coverage" },
+            ["cpu_backing"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
+            ["gpu_backing"] = new Dictionary<string, object> { ["coverage"] = "unverified" },
+        };
+    }
+
+    internal sealed class Totals
+    {
+        private long _bytes, _count;
+        internal long Bytes => Interlocked.Read(ref _bytes);
+        internal long Count => Interlocked.Read(ref _count);
+        internal void Add(long bytes)
+        {
+            Interlocked.Add(ref _bytes, bytes);
+            Interlocked.Increment(ref _count);
+        }
+    }
+
+    internal sealed class RequestRecorder
+    {
+        [ThreadStatic] private static int t_depth;
+        private readonly ConcurrentDictionary<string, Totals> _totals = new();
+        internal static bool IsInside => t_depth != 0;
+
+        internal T Observe<T>(string backend, long bytes, Func<T> allocate)
+            => Observe(backend, bytes, allocate, static action => action());
+
+        internal TResult Observe<TState, TResult>(string backend, long bytes, TState state, Func<TState, TResult> allocate)
+        {
+            bool outermost = t_depth++ == 0;
+            try
+            {
+                TResult result = allocate(state);
+                // Only successful, positive-size requests count. An OOM/invalid argument leaves no allocation.
+                if (outermost && bytes > 0) _totals.GetOrAdd(backend, _ => new Totals()).Add(bytes);
+                return result;
+            }
+            finally { t_depth--; }
+        }
+
+        internal Dictionary<string, Totals> Snapshot() => new(_totals);
+    }
+}

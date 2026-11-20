@@ -3511,8 +3511,34 @@ internal static partial class BackwardFunctions<T>
         // source gathered by 3 indices produced uniform garbage instead of per-occurrence sums,
         // and never-selected slices came back nonzero when they must be exactly 0.
         if (axis == 0 && TryScatterRowsIntoGrad(gradOutput, indices, inputs[0], engine, grads)) return;
+        // A GPU engine index-adds on the device along any axis; the dense ScatterAdd below has a device path only for
+        // axis 0, so a gather along a later axis (Autoformer's lag roll) downloaded the gradient every step.
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu)
+            && GatherBackwardOnDevice(gpu, gradOutput, indices, axis, inputShape) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var grad = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    // Gather backward as a device index-add into zeros of the source shape: the indices flattened to [count], the
+    // gradient viewed as source[..axis] x [count] x source[axis+1..] (the same contiguous layout). Null when the
+    // device route does not take it.
+    private static Tensor<T>? GatherBackwardOnDevice(
+        DirectGpuTensorEngine gpu, Tensor<T> gradOutput, Tensor<int> indices, int axis, int[] inputShape)
+    {
+        if (axis < 0 || axis >= inputShape.Length || !gradOutput.IsContiguous) return null;
+        int count = indices.Length;
+        var flatIndices = indices.Rank == 1 ? indices : indices.Reshape(new[] { count });
+        var viewShape = (int[])inputShape.Clone();
+        viewShape[axis] = count;
+        long viewLength = 1;
+        foreach (var d in viewShape) viewLength *= d;
+        if (viewLength != gradOutput.Length) return null;
+        var view = indices.Rank == 1 && gradOutput.Rank == inputShape.Length ? gradOutput : gradOutput.Reshape(viewShape);
+        return gpu.TryIndexSelectBackwardOnDevice(inputShape, axis, flatIndices, view);
     }
 
     /// <summary>
@@ -4173,6 +4199,16 @@ internal static partial class BackwardFunctions<T>
                 return;
         }
 
+        // A GPU engine sums the tiles on the device: each output axis of extent m*n is the input axis repeated m
+        // times, so viewing it as [m, n] and summing the m axes is the gradient. The host loop below read every
+        // element through the indexer, a download per step inside a compiled GPU plan.
+        if (outShape.Length == inShape.Length && engine.TryGet<DirectGpuTensorEngine>(out _)
+            && TileBackwardByReduce(gradOutput, inShape, outShape, engine) is { } reduced)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], reduced, engine);
+            return;
+        }
+
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
         if (engine.Unwrap().GetType() == typeof(CpuEngine) && gradOutput.IsContiguous && !gradOutput.IsSparse
             && CpuEngine.TryGetTileSlab(inShape, outShape, out int width, out int repeats))
@@ -4211,6 +4247,27 @@ internal static partial class BackwardFunctions<T>
             inputGrad[srcIdx] = numOps.Add(inputGrad[srcIdx], gradOutput[flat]);
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
+    }
+
+    // Tile backward as engine ops: gradOutput viewed as [m0, n0, m1, n1, ...] (n the input extents, m the multiples),
+    // summed over the m axes. Null for a shape the view cannot express (an input extent of 0, or not a multiple).
+    private static Tensor<T>? TileBackwardByReduce(Tensor<T> gradOutput, int[] inShape, int[] outShape, IEngine engine)
+    {
+        int rank = inShape.Length;
+        var view = new int[2 * rank];
+        var repeatAxes = new List<int>(rank);
+        for (int d = 0; d < rank; d++)
+        {
+            if (inShape[d] <= 0 || outShape[d] % inShape[d] != 0) return null;
+            int m = outShape[d] / inShape[d];
+            view[2 * d] = m;
+            view[2 * d + 1] = inShape[d];
+            if (m != 1) repeatAxes.Add(2 * d);
+        }
+        if (repeatAxes.Count == 0) return engine.Reshape(gradOutput, (int[])inShape.Clone());
+        if (!gradOutput.IsContiguous) return null;
+        var summed = engine.ReduceSum(engine.Reshape(gradOutput, view), repeatAxes.ToArray(), keepDims: false);
+        return engine.Reshape(summed, (int[])inShape.Clone());
     }
 
     // The create-graph path of TileBackward, kept out of it so its first-order path allocates no closure.

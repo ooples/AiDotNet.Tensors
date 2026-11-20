@@ -22,8 +22,15 @@ namespace AiDotNet.Tensors.Helpers;
 /// copy goes into the existing array (never a replacement), because other views and owners alias it.
 /// </para>
 /// </remarks>
-internal static class ResidentHostMirror
+internal static partial class ResidentHostMirror
 {
+    private const string NoLiveReaderMessage = "The resident host mirror has no live reader for its pending device value.";
+
+    /// <summary>Whether <paramref name="error"/> is a host read that failed because no enrolled reader holds the
+    /// pending device value (the value is unrecoverable, as for a released buffer).</summary>
+    internal static bool IsNoLiveReader(Exception error)
+        => error is InvalidOperationException && error.Message == NoLiveReaderMessage;
+
     private sealed class Group<T>
     {
         public readonly List<WeakReference<Tensor<T>>> Members = new();
@@ -33,29 +40,49 @@ internal static class ResidentHostMirror
         private void Download(object key)
         {
             var vector = key as VectorBase<T>;
-            var array = vector is null ? (T[])key : vector.GetBackingArrayUnsafe() ?? new T[vector.Length];
+            T[]? existing;
+            T[] array;
+            if (vector is null) { existing = (T[])key; array = existing; }
+            else { existing = vector.GetBackingArrayUnsafe(); array = existing ?? new T[vector.Length]; }
             WeakReference<Tensor<T>>[] members;
             lock (Members) members = Members.ToArray();
+            IGpuBuffer? lastBuffer = null;
+            object? lastBackend = null;
+            int lastOffset = -1, lastLength = -1;
             foreach (var weak in members)
             {
                 if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
                 if (!ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)
                     && (vector is null || !ReferenceEquals(t.DataVector, vector))) continue; // re-homed since
-                // A member bound to a pooled scratch buffer that was since released (ClearActionScratchPool) has
-                // nothing to contribute; its host slice is already the value. One such member must not abort the
-                // host read for every other view on the array.
-                if (t._gpuBuffer is not { } gpuBuffer || gpuBuffer.Handle == IntPtr.Zero || t._gpuBackend is not { } gpuBackend) continue;
+                if (t._gpuBuffer is not { } gpuBuffer || !DirectGpuTensorEngine.IsLiveDeviceBuffer(gpuBuffer)
+                    || t._gpuBackend is not { } gpuBackend) continue;
+                if (ReferenceEquals(lastBuffer, gpuBuffer) && ReferenceEquals(lastBackend, gpuBackend)
+                    && lastOffset == t._storageOffset && lastLength == t.Length) continue;
                 if (array is float[] floatArray && t._storageOffset == 0 && floatArray.Length >= gpuBuffer.Size && t.Length >= gpuBuffer.Size)
                 {
                     try { gpuBackend.DownloadBuffer(gpuBuffer, floatArray); }
                     catch (ObjectDisposedException) { continue; }
-                    continue;
                 }
-                float[] floats;
-                try { floats = gpuBackend.DownloadBuffer(gpuBuffer); }
-                catch (ObjectDisposedException) { continue; }
-                var values = DirectGpuEngine.FromFloatArray<T>(floats);
-                Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
+                else
+                {
+                    float[] floats;
+                    try { floats = gpuBackend.DownloadBuffer(gpuBuffer); }
+                    catch (ObjectDisposedException) { continue; }
+                    var values = DirectGpuEngine.FromFloatArray<T>(floats);
+                    Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
+                }
+                lastBuffer = gpuBuffer;
+                lastBackend = gpuBackend;
+                lastOffset = t._storageOffset;
+                lastLength = t.Length;
+            }
+            // With no reader left, storage that already has a host array keeps it: a member whose buffer was released
+            // has nothing to contribute and its host slice is already the value. Deferred storage has no host value to
+            // fall back on, so publishing a fresh array there would invent zeros; that case is the error.
+            if (lastBuffer is null)
+            {
+                if (existing is null) throw new InvalidOperationException(NoLiveReaderMessage);
+                return;
             }
             if (vector is not null)
             {
@@ -106,6 +133,33 @@ internal static class ResidentHostMirror
     }
 
     /// <summary>
+    /// Keeps an existing mirror reader reachable through an equivalent metadata view.
+    /// A partial view that merely inherited its parent's whole buffer is not enrolled.
+    /// </summary>
+    internal static void AttachShapeAlias<T>(Tensor<T> source, Tensor<T> view)
+    {
+        if (!source.IsContiguous || !view.IsContiguous || source._storageOffset != view._storageOffset
+            || source.Length != view.Length || !ReferenceEquals(source.StorageIdentity, view.StorageIdentity)
+            || !ReferenceEquals(source._gpuBuffer, view._gpuBuffer)
+            || source._gpuMaterializerCallback?.Target is not Group<T> group)
+            return;
+        lock (group.Members)
+        {
+            int sourceIndex = -1;
+            for (int i = 0; i < group.Members.Count; i++)
+                if (group.Members[i].TryGetTarget(out var member))
+                {
+                    if (ReferenceEquals(member, view)) return;
+                    if (ReferenceEquals(member, source)) sourceIndex = i;
+                }
+            if (sourceIndex < 0) return;
+            // Alias creation is not a device write. Preserve the writer ordering:
+            // a newer overlapping member must still override this source's range.
+            group.Members.Insert(sourceIndex + 1, new WeakReference<Tensor<T>>(view));
+        }
+    }
+
+    /// <summary>
     /// The resident member on <paramref name="array"/> whose device buffer holds storage range
     /// [<paramref name="offset"/>, <paramref name="offset"/> + <paramref name="length"/>), and where that range starts
     /// in its buffer. A slice of a resident step tensor shares this array but not the member's buffer field, so this
@@ -127,7 +181,7 @@ internal static class ResidentHostMirror
             if (!ReferenceEquals(t._gpuBackend, backend) || !ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)) continue;
             if (!t.SharesStorageWith(view)) continue;
             var b = t._gpuBuffer!;
-            if (b.Handle == IntPtr.Zero) continue;
+            if (!DirectGpuTensorEngine.IsLiveDeviceBuffer(b)) continue;
             int start = offset - t._storageOffset;
             if (start < 0 || start + length > t.Length || b.Size < (long)start + length) continue;
             buffer = b; bufferOffset = start;

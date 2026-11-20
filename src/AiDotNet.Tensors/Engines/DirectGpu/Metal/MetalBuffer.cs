@@ -29,7 +29,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// <item><b>Managed</b>: Metal manages synchronization (macOS only).</item>
 /// </list>
 /// </remarks>
-public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
 {
     private const long MinimumReclaimCharge = 128 * 1024;
 
@@ -62,6 +62,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     private readonly long _byteOffset;
     // A view keeps its parent reachable, so the parent's finalizer cannot release memory the view still addresses.
     private readonly MetalGpuBuffer? _viewParent;
+    IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
     // The buffer that owns the MTLBuffer: this one, or the root of a view chain.
     private MetalGpuBuffer Owner => _viewParent is null ? this : _viewParent.Owner;
     // Live views of this owner's MTLBuffer, and device copies queued to read it and not yet completed. While either is

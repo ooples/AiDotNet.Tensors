@@ -12,7 +12,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Buffers bind in declaration order; push constants are the kernel's scalars in order, 4 bytes each, with a
 /// 64-bit seed split into its low and high words.
 /// </summary>
-internal static class VulkanBatchExecutionKernels
+internal static partial class VulkanBatchExecutionKernels
 {
     private const string Common = @"
 uint bx_hash(uint counter, uint key) {

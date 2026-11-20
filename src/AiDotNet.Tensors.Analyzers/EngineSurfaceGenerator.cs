@@ -79,6 +79,9 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
             Matrix = c.GetTypeByMetadataName(MatrixMetadataName),
         };
         var interfaces = new[] { m.Engine }.Concat(m.Engine.AllInterfaces).ToList();
+        // Optional operations retain their catalog IDs and tracing/replay support without expanding IEngine's ABI.
+        var rfft = c.GetTypeByMetadataName("AiDotNet.Tensors.Engines.IRfftMagnitudeEngine");
+        if (rfft is not null) interfaces.Add(rfft);
         foreach (var iface in interfaces)
         {
             foreach (var member in iface.GetMembers())
@@ -265,6 +268,11 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
     private static string TypeParams(IMethodSymbol method) =>
         method.TypeParameters.Length == 0 ? "" : "<" + string.Join(", ", method.TypeParameters.Select(t => t.Name)) + ">";
 
+    private static string Receiver(Op op, string declaringType, string engine)
+        => op.Declaring.Name == "IRfftMagnitudeEngine"
+            ? $"global::AiDotNet.Tensors.Engines.RfftMagnitudeEngineExtensions.Require({engine})"
+            : $"(({declaringType}){engine})";
+
     private static string EmitTracingEngine(Model m)
     {
         var sb = new StringBuilder();
@@ -298,7 +306,7 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
             var tps = TypeParams(method);
             var pars = string.Join(", ", method.Parameters.Select(ParamDecl));
             var args = string.Join(", ", method.Parameters.Select(ArgUse));
-            var call = $"(({decl})_inner).{method.Name}{tps}({args})";
+            var call = $"{Receiver(op, decl, "_inner")}.{method.Name}{tps}({args})";
             sb.AppendLine($"    {ret} {decl}.{method.Name}{tps}({pars})");
             sb.AppendLine("    {");
             // Out parameters must be assigned on every path, so the pass-through path also calls the inner engine.
@@ -390,7 +398,7 @@ public sealed class EngineSurfaceGenerator : IIncrementalGenerator
                 else args.Add($"global::AiDotNet.Tensors.Engines.Export.EngineArgCoercion.As<{t}>(a[{i}])");
             }
             var tps = method.TypeParameters.Length == 1 ? "<TElem>" : "";
-            var call = $"(({decl})e).{method.Name}{tps}({string.Join(", ", args)})";
+            var call = $"{Receiver(op, decl, "e")}.{method.Name}{tps}({string.Join(", ", args)})";
             var outs = string.Concat(method.Parameters.Select((p, i) => p.RefKind == RefKind.Out ? $" a[{i}] = __o{i};" : ""));
             sb.AppendLine($"            case {op.Index}: {{ {outDecls}{(method.ReturnsVoid ? call + ";" : "result = " + call + ";")}{outs} return true; }}");
         }

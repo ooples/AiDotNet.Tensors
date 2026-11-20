@@ -69,7 +69,11 @@ public class CompiledGpuForwardLeaseTests
             var compiled = plan as CompiledTrainingPlan<float>;
             var all = new System.Collections.Generic.List<float>();
             foreach (var p in parameters) all.AddRange(p.ToArray());
-            return (all.ToArray(), compiled?.ScratchBufferBytes ?? -1, compiled?.ForwardSpanLeaseCandidates ?? -1);
+            // An explicitly uncaptured plan hands its transient backing to the next one (CompiledTransientWorkspaceBroker),
+            // so its pool reports what it inherited: measure the storage its own step used, before that transfer.
+            long bytes = compiled is null ? -1
+                : captured ? compiled.ScratchBufferBytes : compiled.LastStepScratchBytesBeforeTransfer;
+            return (all.ToArray(), bytes, compiled?.ForwardSpanLeaseCandidates ?? -1);
         }
     }
 
@@ -95,12 +99,14 @@ public class CompiledGpuForwardLeaseTests
             Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true },
                 "The backend does not capture step graphs.");
         bool previous = CompiledTrainingPlan<float>.LeaseForwardOutputs;
+        bool previousObservation = CompiledTrainingPlan<float>.ObserveScratchStorageForTests;
         using (gpu)
         {
             try
             {
                 // Enough steps that a captured graph replays several times after the warm-up and capture steps.
                 int steps = captured ? 8 : 4;
+                CompiledTrainingPlan<float>.ObserveScratchStorageForTests = true;
                 var expected = Train(new CpuEngine(), steps, captured: false).Parameters;
                 CompiledTrainingPlan<float>.LeaseForwardOutputs = false;
                 var keptAll = Train(gpu, steps, captured);
@@ -121,6 +127,7 @@ public class CompiledGpuForwardLeaseTests
             finally
             {
                 CompiledTrainingPlan<float>.LeaseForwardOutputs = previous;
+                CompiledTrainingPlan<float>.ObserveScratchStorageForTests = previousObservation;
             }
         }
     }
