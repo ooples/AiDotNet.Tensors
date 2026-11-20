@@ -45,6 +45,10 @@ public partial class CpuEngine
         int divisor = bothMr, remainder = onlyMr;
         while (remainder != 0) { int next = divisor % remainder; divisor = remainder; remainder = next; }
         int rowAlignment = checked(bothMr / divisor * onlyMr);
+        bool UsesDeterministicGoto(int m, int n) => BlasProvider.IsDeterministicMode
+            && !BlasManaged.BlasManaged.s_disableGotoGemm && !BlasManaged.BlasManaged.s_disableDeterministicGoto
+            && BlasManaged.GotoGemmFp32.IsAvailable && BlasManaged.GotoGemmFp32.IsThreadCountInvariant(n)
+            && BlasManaged.GotoGemmFp32.PreferShape(m, n, reduction, Environment.ProcessorCount);
         var packedKernel = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(rows * reduction), "workspace.conv1d_channel_block_filter");
         try
         {
@@ -70,6 +74,19 @@ public partial class CpuEngine
                 {
                     int partitions = Math.Min((workerBudgetCount + blocks - 1) / blocks, rowCount / 96);
                     taskRows = Math.Min(rowCount, ((rowCount + partitions * rowAlignment - 1) / (partitions * rowAlignment)) * rowAlignment);
+                    // An aligned panel can change from packed GEMM to Goto or back when M
+                    // changes. Keep the original row block unless every slice uses the
+                    // same deterministic Goto kernel, including the final spatial panel.
+                    if (taskRows < rowCount && totalColumns % 16 == 0)
+                    {
+                        int lastRows = (rowCount - 1) % taskRows + 1;
+                        int lastColumns = (totalColumns - 1) % columns + 1;
+                        bool PreservesPanelWidths(int m) => UsesDeterministicGoto(m, columns)
+                            && (lastColumns == columns || UsesDeterministicGoto(m, lastColumns));
+                        if (!PreservesPanelWidths(rowCount) || !PreservesPanelWidths(taskRows)
+                            || (lastRows != taskRows && !PreservesPanelWidths(lastRows)))
+                            taskRows = rowCount;
+                    }
                 }
                 int rowTasks = (rowCount + taskRows - 1) / taskRows;
                 int tasks = checked(blocks * rowTasks);
