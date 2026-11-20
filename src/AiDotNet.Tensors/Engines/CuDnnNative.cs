@@ -1848,6 +1848,8 @@ public sealed partial class CuDnnConvolution : IDisposable
     private readonly List<(IntPtr Pointer, DevicePrimitives.DeviceMemoryHold Memory)> _retiredWorkspaces = new();
     private IntPtr _workspace;
     private ulong _workspaceSize;
+    // CudaBackend.CaptureEpoch when the live workspace was allocated.
+    private long _workspaceEpoch;
     private bool _disposed;
 
     /// <summary>Creates a new cuDNN convolution helper with shared context.</summary>
@@ -2380,11 +2382,22 @@ public sealed partial class CuDnnConvolution : IDisposable
         if (result != CudaResult.Success) return false;
         DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
 
-        // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
-        // recorded, so freeing it would have the graph's replays write into memory reused by something else. And a
-        // cuMemFree on a capturing thread is itself not permitted during the capture. It stays allocated, so it keeps
-        // its charge until Dispose frees it.
-        if (_workspace != IntPtr.Zero) _retiredWorkspaces.Add((_workspace, _workspaceMemory));
+        // Once a stream capture has begun since the old workspace was allocated, it is retired, not freed: a captured CUDA
+        // graph keeps the pointer of every convolution it recorded, so freeing it would have the graph's replays write
+        // into memory reused by something else, and a cuMemFree on a capturing thread is itself not permitted during the
+        // capture. It stays allocated, keeping its charge until Dispose frees it. With no capture since, no graph can name
+        // it: it is freed (cuMemFree waits for the work already queued that uses it). The workspace grows mostly while
+        // the autotuner times candidates, before any step is captured; retiring those sizes kept every one of them
+        // (a DCGAN step held 211 MiB of cuDNN workspaces, 102 MiB of them outgrown).
+        if (_workspace != IntPtr.Zero)
+        {
+            if (DirectGpu.CUDA.CudaBackend.CaptureEpoch == _workspaceEpoch
+                && CuBlasNative.cuMemFree(_workspace) == CudaResult.Success)
+                _workspaceMemory.OnFreed();
+            else
+                _retiredWorkspaces.Add((_workspace, _workspaceMemory));
+        }
+        _workspaceEpoch = DirectGpu.CUDA.CudaBackend.CaptureEpoch;
         _workspace = grown;
         _workspaceSize = size;
         _workspaceMemory = default;
