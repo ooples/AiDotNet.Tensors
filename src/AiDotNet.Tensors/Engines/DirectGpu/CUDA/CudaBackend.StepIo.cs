@@ -106,6 +106,8 @@ public sealed partial class CudaBackend
         private IGpuBuffer? _guard;           // device double: the gradients' sum of squares
         private uint _initialApplied;
         private MultiTensorTable? _gradientTable;   // private to this graph (see PrepareOptimizer)
+        // The captured clip's own record, coefficient, reduction partials and ticket (PrepareGlobalNormClip).
+        private IGpuBuffer? _clipRecord, _clipScale, _clipPartials, _clipTicket;
         private MultiTensorTable? _adamTable;
         private IGpuBuffer? _acceptedOffsets; // optional private int64 per-parameter offsets; no all-zero allocation
         private long _minimumAcceptedOffset;
@@ -384,6 +386,41 @@ public sealed partial class CudaBackend
                 _guard, _dynamicScalars.Handle, _adamTable, _acceptedOffsets?.Handle ?? IntPtr.Zero, _state.Handle);
         }
 
+        public void PrepareGlobalNormClip()
+        {
+            if (_gradientTable is not { } table)
+                throw new InvalidOperationException("PrepareOptimizer was not called before PrepareGlobalNormClip.");
+            using var _ = _backend.PushContext();
+            int partialWords = Math.Max(1, table.TotalChunks) * Gpu.DeterministicGradientNorm.PartialWords;
+            if (_clipPartials is null || _clipPartials.Size < partialWords)
+            {
+                _clipPartials?.Dispose();
+                _clipPartials = _backend.AllocateBuffer(partialWords);
+            }
+            _clipRecord ??= _backend.AllocateBuffer(Gpu.DeterministicGradientNorm.RecordWords);
+            _clipScale ??= _backend.AllocateBuffer(1);
+            // Starts at zero; the launch's last block resets it for the next replay.
+            _clipTicket ??= _backend.AllocateBuffer(new float[1]);
+        }
+
+        public void CaptureGlobalNormClip(float maxNorm, Gpu.NonFiniteGradientPolicy policy)
+        {
+            if (policy == Gpu.NonFiniteGradientPolicy.Error)
+                throw new ArgumentException("The Error policy raises from a host read, which a captured step cannot make.", nameof(policy));
+            if (!(maxNorm > 0f) || float.IsInfinity(maxNorm))
+                throw new ArgumentOutOfRangeException(nameof(maxNorm), maxNorm, "The clip bound must be positive and finite.");
+            if (_gradientTable is not { } table || _clipRecord is null || _clipScale is null || _clipPartials is null
+                || _clipTicket is null)
+                throw new InvalidOperationException("PrepareGlobalNormClip was not called before the capture.");
+            if (!_backend._kernelCache.TryGetValue("dgn_norm_clip", out var normClip)
+                || !_backend._kernelCache.TryGetValue("dgn_multi_tensor_scale", out var scale))
+                throw new GpuCapabilityUnavailableException("CUDA kernels not found: dgn_norm_clip / dgn_multi_tensor_scale");
+            _backend.LaunchNormAndClipScale(normClip, table, _clipPartials, _clipTicket, _clipRecord, maxNorm, _clipScale,
+                policy);
+            _backend.LaunchMultiTensorClipScale(scale, table, _clipScale,
+                policy == Gpu.NonFiniteGradientPolicy.ZeroNonFinite);
+        }
+
         public void Flush()
         {
             using var _ = _backend.PushContext();
@@ -486,6 +523,10 @@ public sealed partial class CudaBackend
             _gradientTable?.Dispose();
             _adamTable?.Dispose();
             _acceptedOffsets?.Dispose();
+            _clipRecord?.Dispose();
+            _clipScale?.Dispose();
+            _clipPartials?.Dispose();
+            _clipTicket?.Dispose();
             DisposePingPong();
             if (_results != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_results);
             _results = IntPtr.Zero;

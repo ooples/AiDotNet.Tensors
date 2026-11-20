@@ -15436,18 +15436,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // dgn_mul: one IEEE multiply that keeps subnormal operands and products (this module's fast-math flushes them).
         if (!_kernelCache.TryGetValue("dgn_multi_tensor_scale", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: dgn_multi_tensor_scale");
-        void** args = stackalloc void*[7];
-        uint zero = zeroNonFinite ? 1u : 0u;
         lock (_gradientTableSync)
         {
             var table = GetGradientTable(tensors, sizes);
             using var _ = PushContext();
-            IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
-            IntPtr scH = scale.Handle;
-            int totalChunks = table.TotalChunks;
-            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH; args[6] = &zero;
-            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), DeterministicNormKernels.GroupSize, args);
+            LaunchMultiTensorClipScale(kernel, table, scale, zeroNonFinite);
         }
+    }
+
+    /// <summary>The multi-tensor scale over a given table (the shared one, or a captured graph's own).</summary>
+    private unsafe void LaunchMultiTensorClipScale(IntPtr kernel, MultiTensorTable table, IGpuBuffer scale, bool zeroNonFinite)
+    {
+        void** args = stackalloc void*[7];
+        uint zero = zeroNonFinite ? 1u : 0u;
+        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+        IntPtr scH = scale.Handle;
+        int totalChunks = table.TotalChunks;
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &scH; args[6] = &zero;
+        LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorScaleMaxBlocks), DeterministicNormKernels.GroupSize, args);
     }
 
     public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
