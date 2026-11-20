@@ -86,6 +86,8 @@ public sealed class TensorScope : IDisposable
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         ThrowIfDisposed();
+        if (DirectGpu.GpuMemoryTracker.CaptureObservationActive)
+            DirectGpu.GpuMemoryTracker.TraceOwnedScopeEvent(tensor._gpuBuffer?.Handle ?? IntPtr.Zero, "keep", this, _outer);
         object storage = tensor.DataVector;
         _kept.Add(storage);
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) _kept.Add(array);

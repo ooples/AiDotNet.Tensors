@@ -61,6 +61,19 @@ public static class GpuMemoryTracker
         Environment.GetEnvironmentVariable("AIDOTNET_GPU_CAPTURE_TRACE") == "1";
     private static int s_capturing;
     private static readonly System.Collections.Generic.List<string> s_captureAllocs = new();
+    private static readonly System.Collections.Generic.List<string> s_captureFrees = new();
+    private static readonly System.Collections.Generic.List<string> s_captureOwnership = new();
+    private static long s_captureStartSequence;
+    internal static bool CaptureObservationActive => Enabled && CaptureTrace && Volatile.Read(ref s_capturing) > 0;
+    internal static void TraceOwnedScopeEvent(IntPtr address, string phase, object? scope, object? outer)
+    {
+        if (!CaptureObservationActive || !s_live.TryGetValue((long)address, out var record)
+            || record.Seq <= Volatile.Read(ref s_captureStartSequence)) return;
+        int Id(object? value) => value is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(value);
+        string site = phase == "created" || phase.StartsWith("pool-rent", StringComparison.Ordinal) ? CaptureSite() : string.Empty;
+        lock (s_captureLock)
+            s_captureOwnership.Add($"seq={record.Seq} ptr={(long)address:x} bytes={record.Bytes} phase={phase} scope={Id(scope)} outer={Id(outer)} site={site}");
+    }
     private static readonly object s_captureLock = new();
 
     // Download-trace (PR #638 Phase A0): attribute every device→host copy (cuMemcpyDtoH) to the op that
@@ -104,7 +117,7 @@ public static class GpuMemoryTracker
     public static IDisposable BeginCapture(string label)
     {
         if (!CaptureTrace) return NoopScope.Instance;
-        Interlocked.Increment(ref s_capturing);
+        if (Interlocked.Increment(ref s_capturing) == 1) s_captureStartSequence = Interlocked.Read(ref s_seq);
         return new CaptureScope(label);
     }
 
@@ -118,7 +131,14 @@ public static class GpuMemoryTracker
         {
             Interlocked.Decrement(ref s_capturing);
             string[] snapshot;
-            lock (s_captureLock) { snapshot = s_captureAllocs.ToArray(); s_captureAllocs.Clear(); }
+            string[] frees;
+            string[] ownership;
+            lock (s_captureLock)
+            {
+                snapshot = s_captureAllocs.ToArray(); s_captureAllocs.Clear();
+                frees = s_captureFrees.ToArray(); s_captureFrees.Clear();
+                ownership = s_captureOwnership.ToArray(); s_captureOwnership.Clear();
+            }
             try
             {
                 string path = Environment.GetEnvironmentVariable("AIDOTNET_GPU_MEMTRACK_FILE")
@@ -126,6 +146,10 @@ public static class GpuMemoryTracker
                 var sb = new StringBuilder();
                 sb.AppendLine($"==== capture window [{_label}] — {snapshot.Length} device alloc(s) DURING capture (graph-purity violations) ====");
                 foreach (var s in snapshot) sb.AppendLine("  " + s);
+                sb.AppendLine($"==== diagnostic native-free requests [{_label}] — {frees.Length}; tracker observations are not CUDA-success or timing proof ====");
+                foreach (var s in frees) sb.AppendLine("  " + s);
+                sb.AppendLine($"==== diagnostic ownership events [{_label}] — {ownership.Length} ====");
+                foreach (var s in ownership) sb.AppendLine("  " + s);
                 System.IO.File.AppendAllText(path, sb.ToString());
             }
             catch { /* diagnostics must never destabilize the caller */ }
@@ -255,6 +279,12 @@ public static class GpuMemoryTracker
         {
             Interlocked.Add(ref s_liveBytes, -rec.Bytes);
             Interlocked.Increment(ref s_totalFrees);
+            if (CaptureTrace && Volatile.Read(ref s_capturing) > 0)
+            {
+                string freeSite = CaptureSite();
+                lock (s_captureLock)
+                    s_captureFrees.Add($"{rec.Bytes / 1024.0,10:F1} KB seq={rec.Seq} FREE {freeSite} ALLOCATED {rec.Site}");
+            }
         }
     }
 

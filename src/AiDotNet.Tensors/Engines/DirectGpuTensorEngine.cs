@@ -5272,7 +5272,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (GradientTape.ReleaseDroppedGradients).
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
         // Inside a TensorScope the result is freed when the scope ends unless kept (#1432), not when the GC finalizes it.
-        if (TensorScope.Current is not null) TensorScope.Track(vector, () => ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true));
+        var ownershipTraceAddress = GpuMemoryTracker.CaptureObservationActive ? outputBuffer.Handle : IntPtr.Zero;
+        if (ownershipTraceAddress != IntPtr.Zero)
+            GpuMemoryTracker.TraceOwnedScopeEvent(ownershipTraceAddress, "created", TensorScope.Current, null);
+        if (TensorScope.Current is not null) TensorScope.Track(vector, () =>
+        {
+            if (ownershipTraceAddress != IntPtr.Zero)
+                GpuMemoryTracker.TraceOwnedScopeEvent(ownershipTraceAddress,
+                    "scope-release-current=" + (tensor._gpuBuffer?.Handle ?? IntPtr.Zero).ToInt64().ToString("x")
+                    + "-state=" + (tensor.DataVector._deviceState?.Buffer?.Handle ?? IntPtr.Zero).ToInt64().ToString("x"),
+                    TensorScope.Current, null);
+            ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true);
+        });
         return tensor;
     }
 

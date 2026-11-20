@@ -475,7 +475,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
     {
         if (_backendStreamCaptureActive || _mainStream == IntPtr.Zero) return null;
-        return _bufferPool.TryRentForBackend(size, AsyncPoolAffinity, this, out var pooled) ? pooled : null;
+        var rented = _bufferPool.TryRentForBackend(size, AsyncPoolAffinity, this, out var pooled) ? pooled : null;
+        if (rented is not null && GpuMemoryTracker.CaptureObservationActive)
+            GpuMemoryTracker.TraceOwnedScopeEvent(rented.Handle, "pool-rent-size=" + size, null, null);
+        return rented;
     }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
     // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
