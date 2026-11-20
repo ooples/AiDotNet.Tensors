@@ -689,7 +689,7 @@ public partial class CpuEngine
         }
     }
 
-    private static Tensor<float> LstmSingleSequenceForwardFloat(
+    private static unsafe Tensor<float> LstmSingleSequenceForwardFloat(
         Tensor<float> input, Tensor<float>? h0, Tensor<float>? c0, Tensor<float> wIh, Tensor<float> wHh,
         Tensor<float>? bIh, Tensor<float>? bHh, int seqLen, int inFeatures, int hidden, int gateRows,
         bool returnSequences, bool wantState, out Tensor<float> finalHidden, out Tensor<float> finalCell)
@@ -729,24 +729,10 @@ public partial class CpuEngine
                     BlasManaged.GemvKernel.Run<float>(hiddenWeights, hidden, false, hiddenState, 1, false,
                         gates, 1, gateRows, 1, hidden);
                     var wx = projection.Slice(t * gateRows, gateRows);
-                    for (int gate = 0; gate < gateRows; gate++)
-                    {
-                        float projected = wx[gate];
-                        if (inputBias is not null) projected += inputBias[gate];
-                        float value = projected + gates[gate];
-                        if (hiddenBias is not null) value += hiddenBias[gate];
-                        gates[gate] = value;
-                    }
-                    var inputForget = gates.Slice(0, 2 * hidden);
-                    var candidate = gates.Slice(2 * hidden, hidden);
-                    var outputGate = gates.Slice(3 * hidden, hidden);
-                    SimdKernels.Sigmoid(inputForget, inputForget);
-                    SimdKernels.Tanh(candidate, candidate);
-                    SimdKernels.Sigmoid(outputGate, outputGate);
-                    CellUpdateRow(workspace, gateOffset, gateOffset + hidden, gateOffset + 2 * hidden,
-                        workspace, cOffset, cOffset, workspace, hOffset, hidden);
-                    SimdKernels.Tanh(hiddenState, hiddenState);
-                    HiddenOutRow(workspace, gateOffset + 3 * hidden, workspace, hOffset, workspace, hOffset, hidden);
+                    if (inputBias is not null) SimdKernels.VectorAdd(wx, inputBias.AsSpan(0, gateRows), wx);
+                    fixed (float* buffer = workspace, bias = hiddenBias)
+                        UpdateLstmCellRow(buffer + t * gateRows, buffer + gateOffset, bias,
+                            buffer + cOffset, buffer + cOffset, buffer + hOffset, null, hidden);
                     if (returnSequences)
                         hiddenState.CopyTo(outputLease.Span.Slice((first + t) * hidden, hidden));
                 }
@@ -787,8 +773,6 @@ public partial class CpuEngine
         float[] outArr, bool returnSequences, float[]? fhArr, float[]? fcArr,
         int r0, int rows, int seqLen, int hidden, int gateRows)
     {
-        bool hasBhh = bHhArr is not null;
-
         // Initial states for this row range. Local buffers are indexed [localRow*hidden];
         // h0/c0 are global [batch, hidden] so they are read at the global offset.
         if (h0Arr is null) Array.Clear(hPrev, 0, rows * hidden);
@@ -799,11 +783,6 @@ public partial class CpuEngine
         // Local ping-pong references (swapped each step). Using locals keeps the
         // caller's array handles fixed for the pool.Return in its finally.
         float[] hP = hPrev, hC = hCurr, cP = cPrev, cC = cCurr;
-
-        bool fusedVec = false;
-#if NET5_0_OR_GREATER
-        fusedVec = Avx2.IsSupported && Fma.IsSupported && (hidden % 8 == 0);
-#endif
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -825,100 +804,17 @@ public partial class CpuEngine
                 hh.AsSpan(0, rows * gateRows),
                 rows, hidden, gateRows);
 
-            // #477 FUSED ELEMENTWISE CELL: read the four gate pre-activations straight
-            // from the natural [row][gateRows] Wx + hh, apply sigmoid/tanh in registers,
-            // and write c = f·c_prev + i·g, h = o·tanh(c) directly — gates never
-            // round-trip through memory. `lr` is the local row; the GLOBAL row r0+lr
-            // indexes the shared wxBuf / outArr / final-state arrays.
-            if (fusedVec)
+            fixed (float* wx = wxBuf, recurrent = hh, bias = bHhArr, previousCell = cP, nextCell = cC,
+                nextHidden = hC, output = outArr)
             {
-#if NET5_0_OR_GREATER
-                fixed (float* wxP = wxBuf)
-                fixed (float* hhP = hh)
-                fixed (float* cPrevP = cP)
-                fixed (float* cCurrP = cC)
-                fixed (float* hCurrP = hC)
-                fixed (float* bHhP = bHhArr)
-                fixed (float* outP = outArr)
+                for (int localRow = 0; localRow < rows; localRow++)
                 {
-                    for (int lr = 0; lr < rows; lr++)
-                    {
-                        int gb = r0 + lr;
-                        int wxRow = ((gb - wxRowBase) * seqLen + t) * gateRows;
-                        int hhRow = lr * gateRows;
-                        int cRow = lr * hidden;
-                        int outRow = (gb * seqLen + t) * hidden;
-                        for (int h = 0; h < hidden; h += 8)
-                        {
-                            var iIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 0 * hidden + h), Avx.LoadVector256(hhP + hhRow + 0 * hidden + h));
-                            var fIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 1 * hidden + h), Avx.LoadVector256(hhP + hhRow + 1 * hidden + h));
-                            var gIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 2 * hidden + h), Avx.LoadVector256(hhP + hhRow + 2 * hidden + h));
-                            var oIn = Avx.Add(Avx.LoadVector256(wxP + wxRow + 3 * hidden + h), Avx.LoadVector256(hhP + hhRow + 3 * hidden + h));
-                            if (hasBhh)
-                            {
-                                iIn = Avx.Add(iIn, Avx.LoadVector256(bHhP + 0 * hidden + h));
-                                fIn = Avx.Add(fIn, Avx.LoadVector256(bHhP + 1 * hidden + h));
-                                gIn = Avx.Add(gIn, Avx.LoadVector256(bHhP + 2 * hidden + h));
-                                oIn = Avx.Add(oIn, Avx.LoadVector256(bHhP + 3 * hidden + h));
-                            }
-
-                            var iG = SimdKernels.FastSigmoid256(iIn);
-                            var fG = SimdKernels.FastSigmoid256(fIn);
-                            var gG = SimdKernels.FastTanh256(gIn);
-                            var oG = SimdKernels.FastSigmoid256(oIn);
-
-                            var cp = Avx.LoadVector256(cPrevP + cRow + h);
-                            var c = Fma.MultiplyAdd(fG, cp, Avx.Multiply(iG, gG)); // f·c_prev + i·g
-                            Avx.Store(cCurrP + cRow + h, c);
-                            var hv = Avx.Multiply(oG, SimdKernels.FastTanh256(c)); // o·tanh(c)
-                            Avx.Store(hCurrP + cRow + h, hv);
-                            if (returnSequences)
-                                Avx.Store(outP + outRow + h, hv);
-                        }
-                    }
-                }
-#endif
-            }
-            else
-            {
-                // Scalar fused fallback (no AVX2/FMA, or hidden % 8 != 0).
-                fixed (float* wxP = wxBuf)
-                fixed (float* hhP = hh)
-                fixed (float* cPrevP = cP)
-                fixed (float* cCurrP = cC)
-                fixed (float* hCurrP = hC)
-                fixed (float* bHhP = bHhArr)
-                fixed (float* outP = outArr)
-                {
-                    for (int lr = 0; lr < rows; lr++)
-                    {
-                        int gb = r0 + lr;
-                        int wxRow = ((gb - wxRowBase) * seqLen + t) * gateRows;
-                        int hhRow = lr * gateRows;
-                        int cRow = lr * hidden;
-                        int outRow = (gb * seqLen + t) * hidden;
-                        for (int h = 0; h < hidden; h++)
-                        {
-                            float iIn = wxP[wxRow + 0 * hidden + h] + hhP[hhRow + 0 * hidden + h];
-                            float fIn = wxP[wxRow + 1 * hidden + h] + hhP[hhRow + 1 * hidden + h];
-                            float gIn = wxP[wxRow + 2 * hidden + h] + hhP[hhRow + 2 * hidden + h];
-                            float oIn = wxP[wxRow + 3 * hidden + h] + hhP[hhRow + 3 * hidden + h];
-                            if (hasBhh)
-                            {
-                                iIn += bHhP[0 * hidden + h]; fIn += bHhP[1 * hidden + h];
-                                gIn += bHhP[2 * hidden + h]; oIn += bHhP[3 * hidden + h];
-                            }
-                            float iG = 1f / (1f + (float)Math.Exp(-iIn));
-                            float fG = 1f / (1f + (float)Math.Exp(-fIn));
-                            float gG = (float)Math.Tanh(gIn);
-                            float oG = 1f / (1f + (float)Math.Exp(-oIn));
-                            float c = fG * cPrevP[cRow + h] + iG * gG;
-                            cCurrP[cRow + h] = c;
-                            float hv = oG * (float)Math.Tanh(c);
-                            hCurrP[cRow + h] = hv;
-                            if (returnSequences) outP[outRow + h] = hv;
-                        }
-                    }
+                    int batchRow = r0 + localRow;
+                    int projectionRow = ((batchRow - wxRowBase) * seqLen + t) * gateRows;
+                    int stateRow = localRow * hidden;
+                    UpdateLstmCellRow(wx + projectionRow, recurrent + localRow * gateRows, bias,
+                        previousCell + stateRow, nextCell + stateRow, nextHidden + stateRow,
+                        returnSequences ? output + (batchRow * seqLen + t) * hidden : null, hidden);
                 }
             }
 
@@ -934,6 +830,69 @@ public partial class CpuEngine
         if (fhArr is not null) Array.Copy(hP, 0, fhArr, r0 * hidden, rows * hidden);
         if (fcArr is not null) Array.Copy(cP, 0, fcArr, r0 * hidden, rows * hidden);
     }
+
+    // All recurrent gates for a row are ready before the cell and hidden state are written.
+    // That allows the bounded workspace to update both states in place.
+    [MethodImpl(Hot)]
+    private static unsafe void UpdateLstmCellRow(float* projection, float* recurrent, float* bias,
+        float* previousCell, float* nextCell, float* nextHidden, float* output, int hidden)
+    {
+#if NET5_0_OR_GREATER
+        if (Avx2.IsSupported && Fma.IsSupported && hidden % 8 == 0)
+        {
+            for (int h = 0; h < hidden; h += 8)
+            {
+                var iIn = Avx.Add(Avx.LoadVector256(projection + h), Avx.LoadVector256(recurrent + h));
+                var fIn = Avx.Add(Avx.LoadVector256(projection + hidden + h), Avx.LoadVector256(recurrent + hidden + h));
+                var gIn = Avx.Add(Avx.LoadVector256(projection + 2 * hidden + h), Avx.LoadVector256(recurrent + 2 * hidden + h));
+                var oIn = Avx.Add(Avx.LoadVector256(projection + 3 * hidden + h), Avx.LoadVector256(recurrent + 3 * hidden + h));
+                if (bias != null)
+                {
+                    iIn = Avx.Add(iIn, Avx.LoadVector256(bias + h));
+                    fIn = Avx.Add(fIn, Avx.LoadVector256(bias + hidden + h));
+                    gIn = Avx.Add(gIn, Avx.LoadVector256(bias + 2 * hidden + h));
+                    oIn = Avx.Add(oIn, Avx.LoadVector256(bias + 3 * hidden + h));
+                }
+
+                var iG = SimdKernels.FastSigmoid256(iIn);
+                var fG = SimdKernels.FastSigmoid256(fIn);
+                var gG = SimdKernels.FastTanh256(gIn);
+                var oG = SimdKernels.FastSigmoid256(oIn);
+
+                var cp = Avx.LoadVector256(previousCell + h);
+                var c = Fma.MultiplyAdd(fG, cp, Avx.Multiply(iG, gG)); // f·c_prev + i·g
+                Avx.Store(nextCell + h, c);
+                var hv = Avx.Multiply(oG, SimdKernels.FastTanh256(c)); // o·tanh(c)
+                Avx.Store(nextHidden + h, hv);
+                if (output != null)
+                    Avx.Store(output + h, hv);
+            }
+            return;
+        }
+#endif
+        for (int h = 0; h < hidden; h++)
+        {
+            float iIn = projection[h] + recurrent[h];
+            float fIn = projection[hidden + h] + recurrent[hidden + h];
+            float gIn = projection[2 * hidden + h] + recurrent[2 * hidden + h];
+            float oIn = projection[3 * hidden + h] + recurrent[3 * hidden + h];
+            if (bias != null)
+            {
+                iIn += bias[h]; fIn += bias[hidden + h];
+                gIn += bias[2 * hidden + h]; oIn += bias[3 * hidden + h];
+            }
+            float iG = 1f / (1f + (float)Math.Exp(-iIn));
+            float fG = 1f / (1f + (float)Math.Exp(-fIn));
+            float gG = (float)Math.Tanh(gIn);
+            float oG = 1f / (1f + (float)Math.Exp(-oIn));
+            float c = fG * previousCell[h] + iG * gG;
+            nextCell[h] = c;
+            float hv = oG * (float)Math.Tanh(c);
+            nextHidden[h] = hv;
+            if (output != null) output[h] = hv;
+        }
+    }
+
 
     /// <summary>
     /// Generic-T path for non-float numerics (double, decimal, BigInteger,
