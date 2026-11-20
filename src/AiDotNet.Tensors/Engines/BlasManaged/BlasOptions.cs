@@ -25,6 +25,8 @@ public readonly ref struct BlasOptions<T> where T : unmanaged
     /// </summary>
     public WeightPackHandle? PackedA { get; init; }
 
+    internal ConvGemmPacking<T>.Worker? ConvPacking { get; init; }
+
     /// <summary>
     /// Pre-packed B buffer from <see cref="BlasManaged.PrePackB"/>. Null = pack on
     /// first call. Reuse across training iterations to amortize pack cost.

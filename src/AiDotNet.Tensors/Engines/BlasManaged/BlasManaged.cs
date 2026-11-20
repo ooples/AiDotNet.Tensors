@@ -631,6 +631,7 @@ public static partial class BlasManaged
                 PackingMode = evolved.PackingMode,
                 Epilogue = options.Epilogue,
                 Workspace = options.Workspace,
+                ConvPacking = options.ConvPacking,
                 PackedA = options.PackedA,
                 PackedB = options.PackedB,
                 NumThreads = evolved.ThreadCount,
@@ -692,6 +693,7 @@ public static partial class BlasManaged
                     PackingMode = options.PackingMode,
                     Epilogue = options.Epilogue,
                     Workspace = options.Workspace,
+                    ConvPacking = options.ConvPacking,
                     PackedA = options.PackedA,
                     PackedB = null,
                     NumThreads = options.NumThreads,
@@ -1157,6 +1159,7 @@ public static partial class BlasManaged
                 // Keep the outer plan when DisableAutotune resolves before tail splitting.
                 PackingMode = options.PackingMode == PackingMode.DisableAutotune ? strategy : options.PackingMode,
                 Workspace = options.Workspace,
+                ConvPacking = options.ConvPacking,
                 PackedA = options.PackedA,
                 PackedB = options.PackedB,
                 NumThreads = options.NumThreads,
