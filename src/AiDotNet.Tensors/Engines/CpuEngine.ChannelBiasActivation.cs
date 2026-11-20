@@ -94,6 +94,11 @@ public partial class CpuEngine
         if (!relu && SingleOutputConvBiasEnabled
             && TrySingleOutputConvBiasInto(output, input, kernel, bias, stride, padding, dilation))
             return;
+#if NET5_0_OR_GREATER
+        if (!relu && SingleOutputConvBiasEnabled
+            && TryWaveformConvBiasInto(output, input, kernel, bias, stride, padding, dilation))
+            return;
+#endif
 
 
 #if NETCOREAPP
