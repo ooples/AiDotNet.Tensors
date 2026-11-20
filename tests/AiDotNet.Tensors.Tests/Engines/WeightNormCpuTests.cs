@@ -287,6 +287,20 @@ public sealed class WeightNormCpuTests
         try
         {
             CpuParallelSettings.MaxDegreeOfParallelism = 1;
+#if NETFRAMEWORK
+            // The 4.7.1 reference assemblies omit the per-thread counter exposed by newer desktop CLRs.
+            var counter = typeof(GC).GetMethod("GetAllocatedBytesForCurrentThread", Type.EmptyTypes);
+            Func<long> allocatedBytes;
+            if (counter != null)
+                allocatedBytes = (Func<long>)Delegate.CreateDelegate(typeof(Func<long>), counter);
+            else
+            {
+                AppDomain.MonitoringIsEnabled = true;
+                allocatedBytes = () => AppDomain.CurrentDomain.MonitoringTotalAllocatedMemorySize;
+            }
+#else
+            Func<long> allocatedBytes = GC.GetAllocatedBytesForCurrentThread;
+#endif
             long Allocated(int rows, int columns)
             {
                 var engine = new CpuEngine();
@@ -303,12 +317,12 @@ public sealed class WeightNormCpuTests
                     engine.TensorWeightNormBackwardInto(h, v, g, dv, dg, accumulateDirection: true, accumulateGain: true);
                 }
                 for (int i = 0; i < 3; i++) Run();
-                long before = GC.GetAllocatedBytesForCurrentThread();
+                long before = allocatedBytes();
                 for (int i = 0; i < 3; i++) Run();
-                return GC.GetAllocatedBytesForCurrentThread() - before;
+                return allocatedBytes() - before;
             }
             long small = Allocated(3, 17), large = Allocated(257, 4097);
-            Assert.True(large <= small + 65536, $"Into allocated {large:N0}B for a4MiB weight payload, versus {small:N0}B for the small case.");
+            Assert.True(large <= small + 65536, $"Into allocated {large:N0}B for a 4 MiB weight payload, versus {small:N0}B for the small case.");
         }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = previous; }
     }
