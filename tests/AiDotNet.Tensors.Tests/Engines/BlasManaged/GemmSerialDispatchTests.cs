@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 using BlasMgd = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
@@ -48,9 +49,10 @@ public sealed class GemmSerialDispatchTests
         Assert.Equal(aBefore, a); Assert.Equal(bBefore, b);
     }
 
-    [Fact]
+    [SkippableFact]
     public static unsafe void WarmSerialRegionAvoidsJoinedDispatchObjectAllocations()
     {
+        Skip.IfNot(ManagedAllocationCounter.SupportsCurrentThread, "Runtime lacks a per-thread allocation counter.");
         var tile = BlasMgd.GetEvolutionTuningTile<float>(PackingMode.ForcePackBoth, false);
         int m = tile.Mr * 4, n = tile.Nr * 2, k = 67, mc = tile.Mr * 2, kc = 16;
         var a = new float[m * k]; var b = new float[k * n]; var c = new float[m * n];
@@ -68,16 +70,16 @@ public sealed class GemmSerialDispatchTests
                     PackBothStrategy.RunParallelSingleRegionJoinedUnsafe(pa, a.Length, k, pb, b.Length, n, pc, c.Length, n,
                         m, n, k, mc, kc, tile.Mr, tile.Nr, in options, sizeof(float));
                 }
-                long start = GC.GetAllocatedBytesForCurrentThread();
+                long start = ManagedAllocationCounter.CurrentThread();
                 for (int i = 0; i < 50; i++)
                     PackBothStrategy.RunSingleRegionSerialUnsafe(pa, a.Length, k, pb, b.Length, n, pc, c.Length, n,
                         m, n, k, mc, kc, tile.Mr, tile.Nr, sizeof(float));
-                long serialBytes = GC.GetAllocatedBytesForCurrentThread() - start;
-                start = GC.GetAllocatedBytesForCurrentThread();
+                long serialBytes = ManagedAllocationCounter.CurrentThread() - start;
+                start = ManagedAllocationCounter.CurrentThread();
                 for (int i = 0; i < 50; i++)
                     PackBothStrategy.RunParallelSingleRegionJoinedUnsafe(pa, a.Length, k, pb, b.Length, n, pc, c.Length, n,
                         m, n, k, mc, kc, tile.Mr, tile.Nr, in options, sizeof(float));
-                long joinedBytes = GC.GetAllocatedBytesForCurrentThread() - start;
+                long joinedBytes = ManagedAllocationCounter.CurrentThread() - start;
                 Assert.True(joinedBytes > 0 && serialBytes * 4 < joinedBytes,
                     $"serial={serialBytes}B joined={joinedBytes}B over50calls");
             }

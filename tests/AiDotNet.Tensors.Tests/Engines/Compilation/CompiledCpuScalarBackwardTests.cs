@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
@@ -113,9 +114,10 @@ public sealed class CompiledCpuScalarBackwardTests : IDisposable
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ReplayingScalarVjpDoesNotAllocateMatrixSizedProducts()
     {
+        Skip.IfNot(ManagedAllocationCounter.SupportsCurrentThread, "Runtime lacks a per-thread allocation counter.");
         var engine = new CpuEngine(); var shape = new[] { 128, 4096 };
         var matrix = new Tensor<float>(shape); var scalar = new Tensor<float>(new[] { .75f }, new[] { 1, 1 });
         var output = new Tensor<float>(shape); var upstream = new Tensor<float>(shape); upstream.Fill(.125f);
@@ -124,11 +126,11 @@ public sealed class CompiledCpuScalarBackwardTests : IDisposable
         var map = new Dictionary<Tensor<float>, Tensor<float>> { [matrix] = target, [scalar] = scalarTarget, [output] = upstream };
         var action = CompiledTrainingPlan<float>.BuildCpuScalarMultiplyBackward(step, map, new(), engine, null)!;
         action(engine); action(engine);
-        long before = GC.GetAllocatedBytesForCurrentThread();
+        long before = ManagedAllocationCounter.CurrentThread();
         action(engine);
-        Assert.InRange(GC.GetAllocatedBytesForCurrentThread() - before, 0, 65536);
+        Assert.InRange(ManagedAllocationCounter.CurrentThread() - before, 0, 65536);
         AssertBits(.09375f, target[0]);
     }
 
-    private static void AssertBits(float expected, float actual) => Assert.Equal(BitConverter.SingleToInt32Bits(expected), BitConverter.SingleToInt32Bits(actual));
+    private static void AssertBits(float expected, float actual) => Assert.Equal(MathCompat.SingleToInt32Bits(expected), MathCompat.SingleToInt32Bits(actual));
 }

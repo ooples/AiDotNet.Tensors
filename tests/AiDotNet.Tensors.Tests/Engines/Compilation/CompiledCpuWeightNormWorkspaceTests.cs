@@ -5,6 +5,7 @@ using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
@@ -29,7 +30,7 @@ public sealed class CompiledCpuWeightNormWorkspaceTests
             var expected = baseline.Values[row]; var actual = checkpoint.Values[row];
             Assert.Equal(expected.Length, actual.Length);
             for (int i = 0; i < expected.Length; i++)
-                Assert.Equal(BitConverter.SingleToInt32Bits(expected[i]), BitConverter.SingleToInt32Bits(actual[i]));
+                Assert.Equal(MathCompat.SingleToInt32Bits(expected[i]), MathCompat.SingleToInt32Bits(actual[i]));
         }
     }
 

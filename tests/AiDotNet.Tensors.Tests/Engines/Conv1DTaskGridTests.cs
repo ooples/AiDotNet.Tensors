@@ -1,5 +1,6 @@
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -33,7 +34,7 @@ public sealed class Conv1DTaskGridTests
             Assert.True(CpuEngine.TryConv1DChannelBlocks(input, 1, kernel, 1, actual, 1,
                 batch, channels, width, outputs, taps, 1, taps / 2, 1, width, splitChannels: true));
             for (int i = 0; i < actual.Length; i++)
-                Assert.Equal(BitConverter.SingleToInt32Bits(expected[i]), BitConverter.SingleToInt32Bits(actual[i]));
+                Assert.Equal(MathCompat.SingleToInt32Bits(expected[i]), MathCompat.SingleToInt32Bits(actual[i]));
             // Changing live weights must not reuse an earlier row-pack.
             kernel[1] += .01f;
             Assert.True(CpuEngine.TryConv1DChannelBlocks(input, 1, kernel, 1, expected, 1,

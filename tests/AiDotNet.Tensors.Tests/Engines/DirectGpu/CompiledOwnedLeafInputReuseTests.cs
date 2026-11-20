@@ -102,7 +102,7 @@ public sealed class CompiledOwnedLeafInputReuseTests
             owned.Dispose(); Detach(state.Input);
             using var tenant = gpu.GetBackend().AllocateBuffer(16);
             Assert.Equal(address, tenant.Handle);
-            var sentinel = new float[16]; Array.Fill(sentinel, 7f);
+            var sentinel = new float[16]; sentinel.AsSpan().Fill(7f);
             gpu.GetBackend().UploadBufferInPlace(sentinel, tenant);
             using var next = Values(.3f); state.Plan.SetInput(next); state.Plan.Step();
             Assert.NotSame(owned, Owned(state.Plan)[state.Input]);

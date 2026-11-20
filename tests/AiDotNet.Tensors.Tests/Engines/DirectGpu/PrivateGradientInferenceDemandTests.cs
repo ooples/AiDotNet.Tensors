@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -23,7 +24,7 @@ public sealed class PrivateGradientInferenceDemandTests
         object storage = tensor.StorageIdentity;
         long version = AiDotNet.Tensors.Engines.Simd.SimdGemm.WeightArrayVersionOf(array);
         int downloads = 0;
-        HostSync.Register(array, value => { downloads++; Array.Fill((float[])value, 17f); });
+        HostSync.Register(array, value => { downloads++; ((float[])value).AsSpan().Fill(17f); });
         try
         {
             cpu.InvalidatePersistentTensor(tensor);
@@ -77,7 +78,7 @@ public sealed class PrivateGradientInferenceDemandTests
         Bind(privateGradient, privateBuffer, backend);
         plan.RecordPrivateGradientAllocation(privateBuffer);
         int downloads = 0;
-        HostSync.Register(publicArray, value => { downloads++; Array.Fill((float[])value, 37f); });
+        HostSync.Register(publicArray, value => { downloads++; ((float[])value).AsSpan().Fill(37f); });
         using var publicView = publicGradient.Reshape(4);
         Assert.NotSame(publicGradient.StorageIdentity, privateGradient.StorageIdentity);
         Assert.NotSame(publicBuffer, privateBuffer);
@@ -123,7 +124,7 @@ public sealed class PrivateGradientInferenceDemandTests
         Bind(privateGradient, privateBuffer, backend);
         plan.RecordPrivateGradientAllocation(privateBuffer);
         int downloads = 0;
-        HostSync.Register(array, value => { downloads++; Array.Fill((float[])value, 53f); });
+        HostSync.Register(array, value => { downloads++; ((float[])value).AsSpan().Fill(53f); });
         plan.RegisterPrivateGradientDemandOwner(engine, backend);
         using (InferenceWorkspaceDemandScope.Enter(engine))
             InferenceWorkspaceDemandScope.BeforeAllocation(backend, 5);
@@ -159,8 +160,8 @@ public sealed class PrivateGradientInferenceDemandTests
             Assert.True(released > 0, "The fixture must actually retire private accumulator native buffers.\n" + evidence);
             Assert.Equal(baseline.Count, retired.Count);
             for (int sample = 0; sample < baseline.Count; sample++)
-                Assert.Equal(baseline[sample].Select(BitConverter.SingleToInt32Bits),
-                    retired[sample].Select(BitConverter.SingleToInt32Bits));
+                Assert.Equal(baseline[sample].Select(MathCompat.SingleToInt32Bits),
+                    retired[sample].Select(MathCompat.SingleToInt32Bits));
         }
         finally
         {

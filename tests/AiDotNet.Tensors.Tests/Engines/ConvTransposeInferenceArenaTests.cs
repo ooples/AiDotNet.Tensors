@@ -161,13 +161,13 @@ public sealed class ConvTransposeInferenceArenaTests
             arena.Reset();
             Assert.Equal(expectedFirst, engine.ConvTranspose2D(input, kernel, stride, padding, extra)[0]);
         }
-        long start = GC.GetTotalAllocatedBytes(precise: true);
+        long start = ManagedAllocationCounter.AllThreads();
         for (int i = 0; i < 4; i++)
         {
             arena.Reset();
             Assert.Equal(expectedFirst, engine.ConvTranspose2D(input, kernel, stride, padding, extra)[0]);
         }
-        long allocated = GC.GetTotalAllocatedBytes(precise: true) - start;
+        long allocated = ManagedAllocationCounter.AllThreads() - start;
         Assert.True(allocated < 1024 * 1024,
             $"Four warm calls allocated {allocated} bytes; each result alone is 1 MiB.");
     }

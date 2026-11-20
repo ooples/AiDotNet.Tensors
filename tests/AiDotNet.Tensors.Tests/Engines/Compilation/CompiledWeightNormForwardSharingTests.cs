@@ -152,8 +152,8 @@ internal static class WeightNormSharingTestGraph
                         first[0] += 7f;
                         Assert.Equal(peer, second[0]);
                     }
-                    var storages = new HashSet<object>(ReferenceEqualityComparer.Instance);
-                    var vectors = new HashSet<object>(ReferenceEqualityComparer.Instance);
+                    var storages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+                    var vectors = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
                     long vectorCapacityBytes = 0;
                     foreach (var step in weightNorm)
                     {
@@ -169,7 +169,7 @@ internal static class WeightNormSharingTestGraph
                     {
                         var arrays = weightNorm.Select(step => step.OutputBuffer.GetBackingArrayForCacheLookupUnsafe()).ToArray();
                         Assert.All(arrays, array => Assert.NotNull(array));
-                        var distinct = new HashSet<float[]>(ReferenceEqualityComparer.Instance);
+                        var distinct = new HashSet<float[]>(ReferenceEqualityComparer<object>.Instance);
                         foreach (float[] array in arrays.Cast<float[]>())
                             if (distinct.Add(array)) bytes += (long)array.Length * sizeof(float);
                         arrayCount = distinct.Count;
