@@ -1,6 +1,7 @@
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
@@ -54,10 +55,11 @@ public sealed class InferenceWorkspaceHandoffTests
         pool.Release();
     }
 
-    [Fact]
+    [SkippableFact]
     public void Cuda_prediction_reuses_handed_off_native_backing_without_allocating_again()
     {
-        using var backend = new CudaBackend(); Assert.True(backend.IsAvailable);
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "Native CUDA is required to check the device allocation counters.");
         using var direct = new DirectGpuEngine(backend);
         using var engine = new DirectGpuTensorEngine(direct);
         var broker = engine.CompiledWorkspaceBroker;
@@ -67,14 +69,15 @@ public sealed class InferenceWorkspaceHandoffTests
         try
         {
             InferenceWorkspaceDemandScope.HandoffIdleWorkspaceEnabled = true;
-            Assert.True(GpuMemoryTracker.Enabled);
-            var sequence = typeof(GpuMemoryTracker).GetField("s_seq", BindingFlags.Static | BindingFlags.NonPublic)!;
-            long before = (long)sequence.GetValue(null)!;
+            var before = GpuMemoryStats.Snapshot(backend);
             using var inference = InferenceWorkspaceDemandScope.Enter(engine);
             Assert.Equal(0, broker.RetainedBytes); Assert.Equal(128, broker.CacheReturnedForInferenceBytes);
             Assert.Equal(IntPtr.Zero, buffer.Handle);
             using var next = backend.AllocateBufferUninitialized(32);
-            Assert.Equal(address, next.Handle); Assert.Equal(before, (long)sequence.GetValue(null)!);
+            Assert.Equal(address, next.Handle);
+            var after = GpuMemoryStats.Snapshot(backend);
+            Assert.Equal(before.DeviceAllocations, after.DeviceAllocations);
+            Assert.Equal(before.DeviceFrees, after.DeviceFrees);
         }
         finally { InferenceWorkspaceDemandScope.HandoffIdleWorkspaceEnabled = previous; }
     }
