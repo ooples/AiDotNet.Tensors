@@ -35,6 +35,34 @@ public class EmbeddingLookupCompiledPlanCollection { }
 [Collection("EmbeddingLookupCompiledPlan")]
 public class TensorEmbeddingLookupLongIndexTests
 {
+#if NET8_0_OR_GREATER
+    [Fact]
+    public void IntegralLookupsAllocateOutputStorageWithoutABoxPerToken()
+    {
+        VerifyTokenAllocations<int>();
+        VerifyTokenAllocations<long>();
+    }
+
+    private static void VerifyTokenAllocations<TIndex>() where TIndex : unmanaged
+    {
+        const int tokens = 32 * 1024;
+        var cpu = new CpuEngine();
+        using var table = new Tensor<float>(new[] { 1, 1 });
+        using var indices = new Tensor<TIndex>(new TIndex[tokens], new[] { tokens });
+        table[0] = 1;
+        using (var warmup = cpu.TensorEmbeddingLookup(table, indices))
+            Assert.Equal(1f, warmup[tokens - 1]);
+
+        long start = GC.GetAllocatedBytesForCurrentThread();
+        using var result = cpu.TensorEmbeddingLookup(table, indices);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - start;
+        Assert.Equal(1f, result[tokens - 1]);
+        // Allows the float output, a full Int64 input snapshot and wrapper overhead.
+        // Boxing one ID per token alone costs more than this entire allowance.
+        Assert.InRange(allocated, 0L, 16L * tokens + 32768);
+    }
+#endif
+
     /// <summary>
     /// Baseline: <c>Tensor&lt;long&gt;</c> indices with small values
     /// (within int range) still produce the expected scatter-add
