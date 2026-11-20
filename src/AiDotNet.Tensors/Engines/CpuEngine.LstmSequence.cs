@@ -526,6 +526,19 @@ public partial class CpuEngine
             numChunks = Math.Max(1, Math.Min(byRows, CpuParallelSettings.MaxDegreeOfParallelism));
         }
 
+        const int batchTileRows = 6;
+        int rowsPerWorker = 1 + (batch - 1) / numChunks;
+        long packedElements = ((long)inFeatures + hidden) * gateRows +
+            (long)numChunks * batchTileRows * (((long)seqLen + 1) * gateRows + 2L * hidden);
+        // One complete GEMM row block and a short tail reuse the same projection storage.
+        // With one worker, packing W_ih must cost less than the projection rows it replaces.
+        if (rowsPerWorker > batchTileRows && rowsPerWorker <= 2 * batchTileRows && packedElements <= int.MaxValue / sizeof(float) &&
+            (numChunks > 1 || (long)(batch - batchTileRows) * seqLen > inFeatures))
+            return LstmBatchedTiledForwardFloat(input, h0, c0, wIh, wHh, bIh, bHh, batch, seqLen,
+                inFeatures, hidden, gateRows, numChunks, rowsPerWorker, batchTileRows, returnSequences, wantState,
+                out finalHidden, out finalCell);
+
+
         // #436: with a fan-out, each chunk projects its OWN rows (Wx for [rows*seq, in]) into chunk-local scratch
         // inside the same dispatch, instead of one parallel GEMM over every row followed by the recurrence
         // region. That removes a fork/join and the [B*seq, 4H] buffer every core wrote and every chunk then read
@@ -688,6 +701,95 @@ public partial class CpuEngine
             if (wIhT is not null) pool.Return(wIhT);
         }
     }
+
+    private static unsafe Tensor<float> LstmBatchedTiledForwardFloat(Tensor<float> input, Tensor<float>? h0,
+        Tensor<float>? c0, Tensor<float> wIh, Tensor<float> wHh, Tensor<float>? bIh, Tensor<float>? bHh,
+        int batch, int steps, int inputs, int hidden, int gates, int workers, int rowsPerWorker, int tileRows,
+        bool returnSequences, bool wantState, out Tensor<float> finalHidden, out Tensor<float> finalCell)
+    {
+        var output = AutoTensorCache.RentOrAllocate<float>(returnSequences ? new[] { batch, steps, hidden } : new[] { batch, hidden });
+        finalHidden = wantState ? new Tensor<float>(new[] { batch, hidden }) : s_emptyState;
+        finalCell = wantState ? new Tensor<float>(new[] { batch, hidden }) : s_emptyState;
+        float[]? lastHidden = wantState ? finalHidden.GetDataArrayUnmarked() : null;
+        float[]? lastCell = wantState ? finalCell.GetDataArrayUnmarked() : null;
+        var inputValues = input.GetFlattenedData();
+        var inputWeights = wIh.GetFlattenedData();
+        var recurrentWeights = wHh.GetFlattenedData();
+        var initialHidden = h0?.GetFlattenedData();
+        var initialCell = c0?.GetFlattenedData();
+        var inputBias = bIh?.GetFlattenedData();
+        var hiddenBias = bHh?.GetFlattenedData();
+
+        int recurrentWeightOffset = checked(inputs * gates);
+        int workerStart = checked(recurrentWeightOffset + hidden * gates);
+        int projectionLength = checked(tileRows * steps * gates);
+        int recurrentOffset = projectionLength;
+        int hiddenOffset = checked(recurrentOffset + tileRows * gates);
+        int cellOffset = checked(hiddenOffset + tileRows * hidden);
+        int stride = checked(cellOffset + tileRows * hidden);
+        var workspace = CpuStorageAllocationDiagnostics.RentWorkspace<float>(checked(workerStart + workers * stride), "workspace.lstm_forward_pool");
+        try
+        {
+            SimdGemm.Transpose(inputWeights, 0, inputs, workspace, 0, gates, gates, inputs);
+            SimdGemm.Transpose(recurrentWeights, 0, hidden, workspace, recurrentWeightOffset, gates, gates, hidden);
+            using var lease = output.LeaseArray();
+            var outputValues = lease.Array;
+            void RunWorker(int worker)
+            {
+                int workerOffset = workerStart + worker * stride;
+                int endRow = Math.Min(batch, (worker + 1) * rowsPerWorker);
+                for (int firstRow = worker * rowsPerWorker; firstRow < endRow; firstRow += tileRows)
+                {
+                    int rows = Math.Min(tileRows, endRow - firstRow);
+                    var projected = workspace.AsSpan(workerOffset, rows * steps * gates);
+                    var recurrent = workspace.AsSpan(workerOffset + recurrentOffset, rows * gates);
+                    var hiddenState = workspace.AsSpan(workerOffset + hiddenOffset, rows * hidden);
+                    var cellState = workspace.AsSpan(workerOffset + cellOffset, rows * hidden);
+                    if (initialHidden is null) hiddenState.Clear();
+                    else initialHidden.AsSpan(firstRow * hidden, hiddenState.Length).CopyTo(hiddenState);
+                    if (initialCell is null) cellState.Clear();
+                    else initialCell.AsSpan(firstRow * hidden, cellState.Length).CopyTo(cellState);
+
+                    SimdGemm.SgemmSequential(inputValues.AsSpan(firstRow * steps * inputs, rows * steps * inputs),
+                        workspace.AsSpan(0, recurrentWeightOffset), projected, rows * steps, inputs, gates);
+                    if (inputBias is not null)
+                        for (int r = 0; r < rows * steps; r++)
+                        {
+                            var row = projected.Slice(r * gates, gates);
+                            SimdKernels.VectorAdd(row, inputBias.AsSpan(0, gates), row);
+                        }
+
+                    fixed (float* memory = workspace, bias = hiddenBias, result = outputValues)
+                    {
+                        for (int t = 0; t < steps; t++)
+                        {
+                            SimdGemm.SgemmRecurrentOverwrite(hiddenState,
+                                workspace.AsSpan(recurrentWeightOffset, hidden * gates), recurrent, rows, hidden, gates);
+                            for (int r = 0; r < rows; r++)
+                            {
+                                float* cell = memory + workerOffset + cellOffset + r * hidden;
+                                float* state = memory + workerOffset + hiddenOffset + r * hidden;
+                                UpdateLstmCellRow(memory + workerOffset + (r * steps + t) * gates,
+                                    memory + workerOffset + recurrentOffset + r * gates, bias, cell, cell, state,
+                                    returnSequences ? result + ((firstRow + r) * steps + t) * hidden : null, hidden);
+                            }
+                        }
+                    }
+                    if (!returnSequences) hiddenState.CopyTo(outputValues.AsSpan(firstRow * hidden, hiddenState.Length));
+                    if (lastHidden is not null) hiddenState.CopyTo(lastHidden.AsSpan(firstRow * hidden, hiddenState.Length));
+                    if (lastCell is not null) cellState.CopyTo(lastCell.AsSpan(firstRow * hidden, cellState.Length));
+                }
+            }
+            if (workers == 1) RunWorker(0);
+            else Helpers.PersistentParallelExecutor.Instance.Execute(workers, RunWorker);
+            return output;
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(workspace);
+        }
+    }
+
 
     private static unsafe Tensor<float> LstmSingleSequenceForwardFloat(
         Tensor<float> input, Tensor<float>? h0, Tensor<float>? c0, Tensor<float> wIh, Tensor<float> wHh,
