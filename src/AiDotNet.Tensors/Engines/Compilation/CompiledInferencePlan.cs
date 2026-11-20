@@ -872,7 +872,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             }
 
             _graphWarmupCalls++;
-            if (_graphWarmupCalls >= InferenceGraphWarmup && _engine.TryGet<DirectGpuTensorEngine>(out var gte))
+            if (_engine.TryGet<DirectGpuTensorEngine>(out var gte))
             {
                 // Enter the resident capture path. ResidentStepActive (capture-path depth + eviction
                 // suspended) flips the engine's GPU ops to stable resident buffers — no host round-trips —
@@ -887,6 +887,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                     {
                         using (gte.EnterCompiledCapturePath())
                         {
+                            foreach (var input in _compiledInputTensors) gte.EnsureResidentInput(input);
                             // Pre-residency pass: run the body once under ResidentStepActive so every op
                             // binds its STABLE resident buffer; the capture below then records reads/writes
                             // against those exact addresses. (Sync uploads here are fine — not capturing yet.)
@@ -894,6 +895,15 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 steps[i].Execute(engine, steps[i].OutputBuffer);
 
                             // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
+                            // Establish stable device outputs from the first execution. An eager warmup
+                            // can leave pending downloads bound to transient buffers that are released
+                            // before the later resident pass reads them.
+                            if (_graphWarmupCalls < InferenceGraphWarmup)
+                            {
+                                _graphEngine = gte;
+                                return _finalOutput;
+                            }
+
                             // capture is non-capturable), then record the step launches. Capture RECORDS
                             // but does not execute, so launch once afterwards to produce this call's output.
                             RefreshInferenceInputsInPlace(cb);
@@ -1481,7 +1491,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // TensorAdd writes to the wrong buffer" failure that surfaced as
         // ONNX Erf / Gelu / MNIST returning an upstream intermediate's
         // value instead of the declared output.
-        steps = RunStepMutatingPasses(steps, engine, explicitOutput);
+        if (!engine.SupportsGpu) steps = RunStepMutatingPasses(steps, engine, explicitOutput);
 
         // Build specialized forward actions (same optimization as CompiledTrainingPlan)
         var specializedSteps = new CompiledStep<T>[steps.Count];
@@ -1491,6 +1501,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         for (int i = 0; i < steps.Count; i++)
         {
             var step = steps[i];
+            // GPU plans retain engine-dispatched actions. CPU specializations can read/write
+            // host spans and cannot form a device-only replay (as in compiled training).
+            if (engine.SupportsGpu)
+            {
+                specializedSteps[i] = step;
+                continue;
+            }
+
 
             // Transpose optimization: operate on exact logical spans so ArrayPool
             // padding, Memory<T> base offsets, and COW output storage are respected.
@@ -1568,7 +1586,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
 
         // Run CPU-level optimization passes (spectral decomposition, dataflow fusion)
-        var optimizedSteps = RunCpuOptimizationPasses(specializedSteps, engine);
+        var optimizedSteps = engine.SupportsGpu ? specializedSteps : RunCpuOptimizationPasses(specializedSteps, engine);
 
         // Clear LazySource on all compiled output tensors to prevent auto-materialization
         // from re-triggering lazy graph execution after compilation
