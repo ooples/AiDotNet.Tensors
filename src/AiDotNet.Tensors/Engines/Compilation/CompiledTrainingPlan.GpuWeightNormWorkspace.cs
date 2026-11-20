@@ -101,11 +101,22 @@ internal sealed partial class CompiledTrainingPlan<T>
             // releasing native views (OpenCL/Vulkan views have their own handles).
             _backend.Synchronize();
             foreach (var pair in _views)
-            foreach (var output in pair.Key.Outputs)
+            {
+                ReleaseViewOutputs(pair.Key.Outputs, pair.Value);
+            }
+            foreach (var view in _views.Values) view.Dispose();
+            foreach (var bank in _banks) bank.Dispose();
+            _views.Clear();
+            _banks.Clear();
+        }
+
+        private static void ReleaseViewOutputs(System.Collections.Generic.IEnumerable<Tensor<T>> outputs, Engines.DirectGpu.IGpuBuffer view)
+        {
+            foreach (var output in outputs)
             {
                 // View creation can be refused before any tensor was changed.
                 // A rejected layout must leave the ordinary replay path intact.
-                if (!ReferenceEquals(output._gpuBuffer, pair.Value)) continue;
+                if (!ReferenceEquals(output._gpuBuffer, view)) continue;
                 HostSync.Release(output.DataVector, DirectGpuTensorEngine.ReleasedIntermediateMessage);
                 if (output.GetBackingArrayForCacheLookupUnsafe() is { } array)
                     HostSync.Release(array, DirectGpuTensorEngine.ReleasedIntermediateMessage);
@@ -113,10 +124,6 @@ internal sealed partial class CompiledTrainingPlan<T>
                 output._gpuBackend = null;
                 output._gpuBufferVersion = -1;
             }
-            foreach (var view in _views.Values) view.Dispose();
-            foreach (var bank in _banks) bank.Dispose();
-            _views.Clear();
-            _banks.Clear();
         }
     }
 }
