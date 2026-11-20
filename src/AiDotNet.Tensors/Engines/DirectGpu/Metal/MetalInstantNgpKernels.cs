@@ -387,14 +387,14 @@ kernel void resident_index_add(
     constant int& destinationAxis [[buffer(6)]],
     constant int& innerSize [[buffer(7)]],
     uint gid [[thread_position_in_grid]], uint localIndex [[thread_index_in_threadgroup]],
-    uint3 groupSize [[threads_per_threadgroup]])
+    uint groupSize [[threads_per_threadgroup]])
 {
     int total = outerSize * destinationAxis * innerSize;
     // Scan each index once per workgroup. A single source can be read directly, while
     // duplicates use the ordered loop below, including when the index buffer changes on replay.
     threadgroup atomic_int owners[1024];
     int lane = (int)localIndex;
-    int width = (int)groupSize.x;
+    int width = (int)groupSize;
     if (innerSize == 1 && sourceAxis == destinationAxis && sourceAxis >= 512 && width <= 1024 && width <= sourceAxis) {
         atomic_store_explicit(&owners[lane], -1, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
