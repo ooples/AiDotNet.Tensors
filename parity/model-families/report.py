@@ -94,6 +94,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reports", type=Path, help="Run directory or historical evidence ZIP")
     args = parser.parse_args()
+    # Write LF line endings on every platform, as the archived CSVs do; Windows would otherwise translate to CRLF.
+    sys.stdout.reconfigure(newline="\n")
     if args.reports.is_dir():
         summarize(args.reports, sys.stdout)
     else:

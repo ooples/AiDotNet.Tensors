@@ -5,6 +5,7 @@ import json
 import math
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "model-families"))
+from power import require_external_power
 from prepare import prepare_sources
 
 ORIGINAL = HERE / "original"
@@ -64,7 +66,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", type=Path, default=HERE / ".work")
     parser.add_argument("--record", action="store_true", help="Capture the dashboards and render an MP4 with the original recorder.")
+    parser.add_argument("--repeats", type=int, default=1,
+                        help="Run the pair this many times, alternating which framework goes first, and report the median")
+    parser.add_argument("--torch-compile-mode", choices=["default", "reduce-overhead"], default="default",
+                        help="torch.compile mode for the PyTorch trainer. The recording used default; reduce-overhead adds CUDA graphs.")
+    parser.add_argument("--allow-battery", action="store_true", help="Run even when the machine is on battery power")
     args = parser.parse_args()
+    if args.repeats < 1 or (args.record and args.repeats != 1):
+        parser.error("Choose a positive --repeats; --record captures a single take.")
+    require_external_power(args.allow_battery)
     import torch
     import torch._dynamo.config as dynamo
     if not torch.cuda.is_available():
@@ -98,8 +108,11 @@ def main():
     tensors = tree / "AiDotNet.Tensors"
     build = ["dotnet", "build", str(project), "-c", "Release", "-p:UseLocalTensors=true",
              f"-p:LocalTensorsRoot={tensors}", "-p:GeneratePackageOnBuild=false", "-p:UseSharedCompilation=false", "-m:1"]
+    # The Visual Studio developer prompt sets Platform=x64, which moves the output to bin/x64/Release; the original
+    # recorder reads bin/Release, so build without it.
+    build_env = {k: v for k, v in os.environ.items() if k.upper() != "PLATFORM"}
     with (output / "build.log").open("w") as log:
-        if subprocess.run(build, stdout=log, stderr=subprocess.STDOUT).returncode:
+        if subprocess.run(build, stdout=log, stderr=subprocess.STDOUT, env=build_env).returncode:
             sys.exit(f"Build failed. See {output / 'build.log'}")
     dll = pair / "bin/Release/net10.0/AiDotNet.PyTorchParity.dll"
     tensor_dll = "AiDotNet.Tensors.dll"
@@ -112,49 +125,70 @@ def main():
     for name, expected in HASHES["inputs"].items():
         check_hash(weights if name == weights.name else fixture / name, expected)
 
-    take = output / "measurements"
-    ai, pt = take / "ai", take / "torch"
-    for d in (ai, pt):
-        d.mkdir(parents=True)
-    (pair / "current.txt").write_text(str(take), encoding="utf-8")
     env = dict(os.environ, AIDOTNET_CPU_THREADS="8", AIDOTNET_BLAS_THREADS="8", AIDOTNET_FUSED_DIAG="1")
+    # Never let the "CUDA" trainer fall back to another GPU backend.
+    env["AIDOTNET_DIRECTGPU_BACKENDS"] = "cuda"
     env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(work / "inductor-cache"))
     env.setdefault("TRITON_CACHE_DIR", str(work / "triton-cache"))
     py_models = tree / "AiDotNet/benchmarks/AiDotNet.PyTorchParity/pytorch"
-    # Preload the pinned model before the historical trainer adds its author's checkout to sys.path.
-    bootstrap = "import sys,os,runpy; sys.path.insert(0,os.getcwd()); import benchmark; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')"
-    py_cmd = [sys.executable, "-c", bootstrap, str(pair / "torch_train.py"), str(pt), str(fixture), str(weights)]
-    ai_cmd = ["dotnet", str(dll), "train", str(ai), str(fixture), str(weights)]
-    with worker(py_cmd, py_models, env, pt / "train.log") as trainer:
-        ready(trainer, pt)
+    # Preload the pinned model before the historical trainer adds its author's checkout to sys.path. A non-default
+    # compile mode is applied by binding torch.compile's mode here, so the original trainer still runs byte-for-byte.
+    bootstrap = ("import sys,os,runpy,functools; sys.path.insert(0,os.getcwd()); import benchmark, torch; "
+                 "mode=os.environ.get('PARITY_TORCH_COMPILE_MODE'); "
+                 "torch.compile=functools.partial(torch.compile, mode=mode) if mode and mode!='default' else torch.compile; "
+                 "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
+    env["PARITY_TORCH_COMPILE_MODE"] = args.torch_compile_mode
+    takes = []
+    for repeat in range(1, args.repeats + 1):
+        take = output / ("measurements" if args.repeats == 1 else f"measurements-{repeat}")
+        ai, pt = take / "ai", take / "torch"
+        for d in (ai, pt):
+            d.mkdir(parents=True)
+        (pair / "current.txt").write_text(str(take), encoding="utf-8")
+        py_cmd = [sys.executable, "-c", bootstrap, str(pair / "torch_train.py"), str(pt), str(fixture), str(weights)]
+        ai_cmd = ["dotnet", str(dll), "train", str(ai), str(fixture), str(weights)]
         if args.record:
-            ff = pair.parent / ".media-tools/imageio_ffmpeg/binaries/ffmpeg-host.exe"
-            ff.parent.mkdir(parents=True)
-            shutil.copy2(get_ffmpeg_exe(), ff)
-            subprocess.run([sys.executable, str(pair / "record_pair.py")], cwd=pair, env=env, check=True)
+            with worker(py_cmd, py_models, env, pt / "train.log") as trainer:
+                ready(trainer, pt)
+                ff = pair.parent / ".media-tools/imageio_ffmpeg/binaries/ffmpeg-host.exe"
+                ff.parent.mkdir(parents=True)
+                shutil.copy2(get_ffmpeg_exe(), ff)
+                subprocess.run([sys.executable, str(pair / "record_pair.py")], cwd=pair, env=env, check=True)
+                if trainer.wait(timeout=900) != 0:
+                    sys.exit(f"PyTorch failed. See {pt / 'train.log'}")
         else:
-            (pt / "go").touch()
-        if trainer.wait(timeout=900) != 0:
-            sys.exit(f"PyTorch failed. See {pt / 'train.log'}")
-    if not args.record:
-        with worker(ai_cmd, pair, env, ai / "train.log") as trainer:
-            ready(trainer, ai)
-            (ai / "go").touch()
-            if trainer.wait(timeout=900) != 0:
-                sys.exit(f"AiDotNet failed. See {ai / 'train.log'}")
-    result = {name: metrics(d) for name, d in [("AiDotNet", ai), ("PyTorch", pt)]}
-    a, b = (v["initial"] for v in result.values())
-    if a["initial"] != b["initial"] or abs(a["firstLoss"] - b["firstLoss"]) >= .002:
-        raise ValueError("Starting predictions or first loss differ between frameworks")
-    result["torch_over_aidotnet"] = result["PyTorch"]["seconds"] / result["AiDotNet"]["seconds"]
-    (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+            # The recording ran PyTorch first; alternate the order between repeats.
+            order = [("PyTorch", py_cmd, py_models, pt), ("AiDotNet", ai_cmd, pair, ai)]
+            for name, command, cwd, side in (order if repeat % 2 else order[::-1]):
+                require_external_power(args.allow_battery, f"before the {name} trainer")
+                with worker(command, cwd, env, side / "train.log") as trainer:
+                    ready(trainer, side)
+                    (side / "go").touch()
+                    if trainer.wait(timeout=900) != 0:
+                        sys.exit(f"{name} failed. See {side / 'train.log'}")
+        result = {name: metrics(d) for name, d in [("AiDotNet", ai), ("PyTorch", pt)]}
+        a, b = (v["initial"] for v in result.values())
+        if a["initial"] != b["initial"] or abs(a["firstLoss"] - b["firstLoss"]) >= .002:
+            raise ValueError("Starting predictions or first loss differ between frameworks")
+        result["torch_over_aidotnet"] = result["PyTorch"]["seconds"] / result["AiDotNet"]["seconds"]
+        takes.append(result)
+        print(f"Take {repeat}: AiDotNet {result['AiDotNet']['seconds']:.3f} s, PyTorch {result['PyTorch']['seconds']:.3f} s, "
+              f"{result['torch_over_aidotnet']:.2f}x", flush=True)
+    seconds = {name: [t[name]["seconds"] for t in takes] for name in ("AiDotNet", "PyTorch")}
+    ratios = [t["torch_over_aidotnet"] for t in takes]
+    summary = dict(torchCompileMode=args.torch_compile_mode, repeats=args.repeats, takes=takes,
+                   median_seconds={name: statistics.median(v) for name, v in seconds.items()},
+                   torch_over_aidotnet_median=statistics.median(ratios),
+                   torch_over_aidotnet_range=[min(ratios), max(ratios)])
+    (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     for name in ("AiDotNet", "PyTorch"):
-        print(f"{name}: {result[name]['seconds']:.3f} s, {result[name]['correct']}/320 correct")
-    print(f"PyTorch time / AiDotNet time: {result['torch_over_aidotnet']:.2f}x")
+        print(f"{name}: median {summary['median_seconds'][name]:.3f} s over {args.repeats} take(s), "
+              f"{takes[-1][name]['correct']}/320 correct")
+    print(f"PyTorch time / AiDotNet time: {summary['torch_over_aidotnet_median']:.2f}x "
+          f"(range {min(ratios):.2f}-{max(ratios):.2f})")
     print(output / "summary.json")
     if args.record:
         print(output / "reddit/cuda-lstm-side-by-side-review.mp4")
-
 
 if __name__ == "__main__":
     main()

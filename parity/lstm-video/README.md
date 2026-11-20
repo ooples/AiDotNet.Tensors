@@ -29,6 +29,8 @@ python parity/lstm-video/run.py
 
 The first invocation fetches the pinned source, builds AiDotNet, generates the original data and checks its SHA-256. It runs PyTorch and AiDotNet one at a time. The output shows your times, your held-out scores, and the location of both raw logs. The build and initial PyTorch compilation can take several minutes. Use `--work PATH` to choose where to put the downloads and results.
 
+The recording used one take, with PyTorch running first, and PyTorch's default `torch.compile` mode. The launcher has three options for checking that result. `--repeats N` runs the pair N times, alternates which framework runs first, and reports each take plus the median and range of the time ratio. `--torch-compile-mode reduce-overhead` compiles the PyTorch trainer with CUDA graphs. The original trainer still runs unchanged, because the launcher binds the mode to `torch.compile` before the trainer starts. The launcher refuses to start or to begin a trainer on battery power unless you pass `--allow-battery`, and it pins AiDotNet to its CUDA backend. These options have not yet been used for a published measurement. The clip's figures above are still one take in the default mode.
+
 To record your own comparison, install the optional capture tools and add `--record`:
 
 ```shell
@@ -52,4 +54,6 @@ The six files under [original/](original) are byte-for-byte copies from the reco
 
 The recorded AiDotNet training assembly identified commit `0f2902c916`, the dashboard identified `71a1dc700a`, and the Tensors assembly identified `75b03c253`. Only a test file changed between the two AiDotNet commits. The launcher builds the identical product sources at `71a1dc700a` and the exact Tensors revision, using Git bundles for the historical integration commits. Builds made in another directory may have different binary hashes. [Pinned source revisions](sources/revisions.json)
 
-For the separate two-launch CPU/CUDA comparison across 11 model families, see the [model-family benchmark](../model-families/README.md).
+## How this relates to the model-family LSTM row
+
+The [model-family benchmark](../model-families/README.md) also has an LSTM row, but it is a different measurement. Its LSTM has the same 25,482 parameters, but the row trains through `Network.Train` in three epochs of 20 updates and reports the steady-state time per update. This clip times 4,096 updates, after eight warm-up updates, and evaluates on held-out data every 64 updates. Its trainer requires every update to use the fused CUDA training path. The clip was built from AiDotNet `71a1dc700a` and Tensors `75b03c253`. The archived November 19 model-family run was built from different integration commits (AiDotNet `bc213ae0a6`, Tensors `40e707ff7`). That build's LSTM training was 7–28× slower on CUDA than on November 13, so its LSTM row does not describe the code in this clip. On November 20, the current code's model-family LSTM row trained 6.55× faster than PyTorch's fastest configuration on CUDA and 2.28× faster on CPU. The two benchmarks measure different code paths and workloads, so their ratios are not expected to match.
