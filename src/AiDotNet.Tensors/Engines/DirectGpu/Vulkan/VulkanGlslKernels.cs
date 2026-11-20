@@ -163,7 +163,7 @@ void main() {
     float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1);
     float z = 0.0;
     switch (op) {
-        case 2u: z = x * (y >= 0.0 ? 1.0 : v0); break;
+        case 2u: z = x * (y > 0.0 ? 1.0 : v0); break;
         case 3u: z = y > 0.0 ? x : 0.0; break;
         case 4u: z = x * y * (1.0 - y); break;
         case 5u: z = x * (1.0 - y * y); break;

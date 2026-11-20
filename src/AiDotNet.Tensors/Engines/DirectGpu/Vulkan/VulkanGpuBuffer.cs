@@ -10,12 +10,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Wraps a Vulkan device-local storage buffer and host-visible staging buffer
 /// as an <see cref="IGpuBuffer"/> for use with <see cref="IDirectGpuBackend"/> operations.
 /// </summary>
-public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
 {
     internal readonly VulkanBuffer Storage;
     internal readonly VulkanBuffer Staging;
     private int _disposed;
     private readonly VulkanGpuBuffer? _viewParent;
+    IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
     private VulkanBackend? _batchUploadOwner;
     // What GpuMemoryStats counts for the device-local storage buffer (the staging buffer is host-visible memory).
     private DeviceMemoryHold _memory;
@@ -298,6 +299,12 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 
     private static void ReleaseNow(VulkanGpuBuffer buffer)
     {
+        if (buffer._viewParent is not null)
+        {
+            buffer.Storage.Dispose();
+            buffer.Staging.Dispose();
+            return;
+        }
         buffer._memory.OnReturned();
         if (PoolingEnabled)
         {
@@ -319,6 +326,12 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         var storage = Storage;
         var staging = Staging;
         int size = Size;
+        if (_viewParent is not null)
+        {
+            // Keep the view and its parent rooted until the last referencing submission completes.
+            PendingFrees.Enqueue(() => ReleaseWhenIdle(this));
+            return;
+        }
         var memory = _memory.TransferToLease();
         // This object is gone; its allocation goes back to the pool under a new wrapper, on the next allocation's
         // thread.

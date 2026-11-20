@@ -119,6 +119,9 @@ public sealed partial class WebGpuBackend
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("WebGPU", (long)size * sizeof(byte), (this, size),
+                static state => state.Item1.AllocateByteBuffer(state.Item2));
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Byte buffer size must be positive.");
@@ -134,6 +137,9 @@ public sealed partial class WebGpuBackend
 
     public IGpuBuffer AllocateIntBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("WebGPU", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Int buffer size must be positive.");
@@ -143,6 +149,9 @@ public sealed partial class WebGpuBackend
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("WebGPU", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));

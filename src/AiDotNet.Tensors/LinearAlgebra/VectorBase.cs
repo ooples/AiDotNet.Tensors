@@ -289,6 +289,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
 #else
         arr = new T[length];
 #endif
+        Helpers.CpuStorageAllocationDiagnostics.Record<T>("tensor.vector_new", length);
         _memory = arr;
         _cachedArray = arr;
         _logicalLength = length;
@@ -343,6 +344,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     protected VectorBase(IEnumerable<T> values)
     {
         var arr = values.ToArray();
+        Helpers.CpuStorageAllocationDiagnostics.Record<T>("tensor.vector_copy", arr.Length);
         _memory = arr;
         _cachedArray = arr;
         _logicalLength = arr.Length;
@@ -584,7 +586,11 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
             // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
             // allocated (zero) array behind and every later read silently returns it.
             Helpers.HostSync.ThrowIfReleased(this);
-            MaterializeBacking(new T[_logicalLength]);
+            // A deferred device result can supply its own array. Finish its download before publishing
+            // any fallback storage, so a failed read leaves the vector available for retry.
+            SyncHostFromDevice();
+            if (IsLazyAllocated) MaterializeBacking(new T[_logicalLength]);
+            Helpers.CpuStorageAllocationDiagnostics.Record<T>("tensor.host_materialization", _logicalLength);
         }
         SyncHostFromDevice();
     }

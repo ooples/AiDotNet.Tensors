@@ -199,6 +199,7 @@ public static class GpuMemoryTracker
     public static void OnAlloc(IntPtr ptr, long bytes)
     {
         if (ptr == IntPtr.Zero || bytes <= 0) return;
+        BufferAllocationDiagnostics.RecordCudaNativeApiRequest(bytes);
         if (CaptureTrace && Volatile.Read(ref s_capturing) > 0)
         {
             string site = CaptureSite();

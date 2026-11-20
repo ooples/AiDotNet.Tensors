@@ -104,6 +104,8 @@ internal static class OpRegistry
         "DepthwiseConv2D", "DepthwiseConv1D", "ConvTranspose2D", "ConvTranspose3D", "LocallyConnectedConv2D",
 
         // Normalization
+        // Weight normalization w = g * v / sqrt(sum(v^2) + eps): native VJP, composite under create-graph
+        "TensorWeightNorm",
         "BatchNorm", "BatchNormAffine", "LayerNorm", "GroupNorm", "RMSNorm", "InstanceNorm",
 
         // Attention/Embedding

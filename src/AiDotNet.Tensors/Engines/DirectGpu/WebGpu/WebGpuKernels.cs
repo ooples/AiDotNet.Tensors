@@ -2125,7 +2125,7 @@ fn relu_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn leaky_relu_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        grad_input[idx] = grad_output[idx] * select(params.alpha, 1.0, forward_data[idx] >= 0.0);
+        grad_input[idx] = grad_output[idx] * select(params.alpha, 1.0, forward_data[idx] > 0.0);
     }
 }
 

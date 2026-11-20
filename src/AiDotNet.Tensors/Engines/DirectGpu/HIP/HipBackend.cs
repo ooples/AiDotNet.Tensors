@@ -1574,6 +1574,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe IGpuBuffer AllocateBuffer(float[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("HIP", BufferAllocationDiagnostics.Primitive32Bytes(data), (this, data),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         var size = (UIntPtr)(data.Length * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
@@ -1656,6 +1659,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public IGpuBuffer AllocateBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
@@ -1685,6 +1691,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// </summary>
     public IGpuBuffer AllocateBufferUninitialized(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBufferUninitialized(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         long sizeInBytes = (long)size * sizeof(float);
         GpuBufferSizeGuard.EnsureFits("HIP", sizeInBytes, MaxBufferAllocBytes, DeviceName);
@@ -3723,6 +3732,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)size * sizeof(byte), (this, size),
+                static state => state.Item1.AllocateByteBuffer(state.Item2));
         IntPtr devicePtr = IntPtr.Zero;
         var sizeBytes = (UIntPtr)size;
         // Issue #285: per-allocation cap check before hipMalloc.
@@ -5970,6 +5982,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("HIP", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         if (data is null) throw new ArgumentNullException(nameof(data));
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
@@ -12862,7 +12877,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 /// <summary>
 /// HIP GPU buffer wrapper implementing IGpuBuffer.
 /// </summary>
-internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
 {
     // The DeviceMemoryReclaim epoch of this buffer's current charge (set at each allocation or pool hit).
     internal long ReclaimEpoch = -1;
@@ -12882,6 +12897,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     internal bool IsReleased =>
         Volatile.Read(ref _poolState) != 0 || (_viewParent is HipGpuBuffer parent && parent.IsReleased);
     private readonly IGpuBuffer? _viewParent;
+    IGpuBuffer? IGpuBufferViewSource.ViewParent => _viewParent;
     private DeviceMemoryHold _memory; // what GpuMemoryStats counts for this memory
     // Device memory another library owns (a DLPack import): never pooled or freed here; releasing the buffer waits for
     // the device's queued work and then runs this once. _isExternal is fixed at construction, so the release path is

@@ -10,6 +10,36 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class ResidentHostMirrorRangeTests
 {
     [Fact]
+    public void ReleasedReaderCannotPublishEmptyDeferredStorage()
+    {
+        var state = new MockBackendState();
+        state.ThrowOnCall["DownloadBuffer"] = new ObjectDisposedException("released scratch");
+        var backend = MockDirectGpuBackend.Create(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var tensor = Tensor<float>.CreateGpuResident(new[] { 2 }, TensorDevice.OpenCL);
+        using var buffer = new MockGpuBuffer(new[] { 3f, 4f });
+        engine.BindResidentBuffer(tensor, buffer, backend);
+        Assert.True(ResidentHostMirror.IsNoLiveReader(Assert.Throws<InvalidOperationException>(() => tensor.ToArray())));
+        Assert.Null(tensor.GetBackingArrayForCacheLookupUnsafe());
+    }
+
+    [Fact]
+    public void ShapeAliasesDownloadTheirSharedSliceOnce()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        using var tensor = Tensor<float>.CreateGpuResident(new[] { 2 }, TensorDevice.OpenCL);
+        using var buffer = new MockGpuBuffer(new[] { 3f, 4f });
+        engine.BindResidentBuffer(tensor, buffer, backend);
+        using var alias = tensor.Reshape(new[] { 1, 2 });
+        Assert.Equal(new[] { 3f, 4f }, alias.ToArray());
+        Assert.Equal(1, state.DownloadBufferCalls);
+    }
+
+    [Fact]
     public void CoveringBuffer_RequiresTheSameStorageAndBackend_AndHonorsDetachment()
     {
         var state = new MockBackendState();

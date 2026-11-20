@@ -38,6 +38,22 @@ public class MultiInputCompiledInferenceTests : IDisposable
     }
 
     [Fact]
+    public void OwnedInputOverloadLeavesBorrowedPlanSlotsUntouched()
+    {
+        var cpu = new CpuEngine();
+        var a = new Tensor<float>(new[] { 2f }, new[] { 1 });
+        var b = new Tensor<float>(new[] { 7f }, new[] { 1 });
+        using var cache = new CompiledModelCache<float>();
+        var borrowed = cache.GetOrCompileInference(new[] { a }, () => cpu.TensorMultiplyScalar(a, 2f));
+        var owned = cache.GetOrCompileInference(new[] { b }, slots => cpu.TensorMultiplyScalar(slots[0], 2f));
+        Assert.NotSame(borrowed, owned);
+        Assert.Equal(2f, a[0]);
+        Assert.Equal(14f, owned.Execute()[0]);
+        Assert.Same(owned, cache.GetOrCompileInference(new[] { a }, slots => cpu.TensorMultiplyScalar(slots[0], 2f)));
+        Assert.Equal(4f, owned.Execute()[0]);
+    }
+
+    [Fact]
     public void MultiInput_RebindsEverySlot_SecondaryInputIsNotBaked()
     {
         var engine = new CpuEngine();

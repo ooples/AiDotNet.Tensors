@@ -6,8 +6,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal interface IGpuBufferViewSource
 {
-    /// <summary>The buffer this view addresses (itself possibly a view).</summary>
-    IGpuBuffer ViewParent { get; }
+    /// <summary>The buffer this view addresses (itself possibly a view), or null for an allocation owner.</summary>
+    IGpuBuffer? ViewParent { get; }
 }
 
 internal static class GpuBufferViewRoot
@@ -15,7 +15,7 @@ internal static class GpuBufferViewRoot
     /// <summary>The buffer that owns <paramref name="buffer"/>'s memory: itself, or the root of its view chain.</summary>
     public static IGpuBuffer Of(IGpuBuffer buffer)
     {
-        while (buffer is IGpuBufferViewSource view) buffer = view.ViewParent;
+        while (buffer is IGpuBufferViewSource { ViewParent: { } parent }) buffer = parent;
         return buffer;
     }
 }
