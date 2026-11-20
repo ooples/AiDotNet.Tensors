@@ -24,7 +24,7 @@ public sealed class LstmWorkspaceRequestTests
             var after = ForwardRequests();
             Assert.Equal(CpuStorageAllocationDiagnostics.Enabled ? 7L : 0L, after.Count - before.Count);
             Assert.Equal(CpuStorageAllocationDiagnostics.Enabled ? bytes : 0L, after.Bytes - before.Bytes);
-            Assert.Equal(new[] { 1, 64 }, result.Shape);
+            Assert.Equal(new[] { 1, 64 }, result.Shape.ToArray());
             Assert.All(result.ToVector().ToArray(), value => Assert.Equal(0f, value));
             before = after;
         }
