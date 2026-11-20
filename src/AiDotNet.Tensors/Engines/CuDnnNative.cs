@@ -2362,9 +2362,12 @@ public sealed class CuDnnConvolution : IDisposable
     {
         if (_workspaceSize >= requiredSize) return;
 
-        // Grow at least twofold, so the retired workspaces below add up to less than the live one.
-        // A low-memory fallback must request only its required size.
-        ulong size = exactSize ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
+        // The old workspace is freed when no capture began since it was allocated (below); then the new one is the size
+        // required (a twofold growth had DCGAN hold 117 MB for a 61 MB need). Only when the old one must be retired does it
+        // grow at least twofold, so the retired workspaces add up to less than the live one. A low-memory fallback
+        // requests only its required size.
+        bool oldIsFreeable = _workspace == IntPtr.Zero || DirectGpu.CUDA.CudaBackend.CaptureEpoch == _workspaceEpoch;
+        ulong size = exactSize || oldIsFreeable ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
         var result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
         if (result != CudaResult.Success)
         {

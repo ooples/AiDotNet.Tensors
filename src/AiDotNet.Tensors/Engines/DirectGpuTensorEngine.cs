@@ -6495,9 +6495,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // A buffer an earlier step's work is still queued against is released stream-ordered (the CUDA buffer frees
             // with cuMemFreeAsync on the compute stream; one a captured graph uses is held until that capture's graphs
             // end - CaptureMemoryPool). A second dispose of an already-released slot is the only failure to ignore.
-            StepScratchPool.Untrack(b);
             pool.Keys.Remove(b);
-            try { b.Dispose(); } catch (ObjectDisposedException) { }
+            if (!pool.ReleaseOwnership(b))   // false: no other plan co-owns it
+            {
+                try { b.Dispose(); } catch (ObjectDisposedException) { }
+            }
         }
         if (pool.Leases(key))
         {
@@ -6535,9 +6537,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return shared;
         }
 
-        var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
+        // First pass at this (action,local): record the stable buffer (possibly a co-owned one: the plan validates what it
+        // took after the run, see StepScratchPool.TakeTakenThisRun).
+        var nb = pool.AllocateNew(backend, length, fullyWritten);
         pool.Slots[key] = nb;
-        pool.Track(nb);
         pool.Keys[nb] = key;
         return nb;
     }
@@ -6559,9 +6562,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var key = (pool.TransientLocal++, sizeClass);
         if (!pool.Transient.TryGetValue(key, out var b) || b.Handle == System.IntPtr.Zero)
         {
-            b = backend.AllocateBuffer(checked((int)sizeClass));
+            b = pool.AllocateNew(backend, checked((int)sizeClass), fullyWritten);
             pool.Transient[key] = b;
-            pool.Track(b);
         }
         else if (!fullyWritten)
         {
