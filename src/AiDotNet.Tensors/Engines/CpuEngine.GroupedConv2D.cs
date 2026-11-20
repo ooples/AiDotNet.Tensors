@@ -263,6 +263,11 @@ public partial class CpuEngine
     private static void AddGroupedColumnGradient(Span<float> destination, int offset, float[] panel,
         int from, int count, in GroupedConv2DGeometry g)
     {
+        if (g.InHeight == 1 && g.KernelH == 1 && g.OutHeight == 1 && g.PadH == 0)
+        {
+            CopyGroupedWaveformPanel(destination, offset, panel, from, count, g, addGradient: true);
+            return;
+        }
         int row = 0;
         for (int channel = 0; channel < g.InChannelsPerGroup; channel++)
             for (int kh = 0; kh < g.KernelH; kh++)
@@ -345,6 +350,11 @@ public partial class CpuEngine
     private static void FillGroupedColumnPanel(float[] input, int offset, float[] panel, int from, int count,
         in GroupedConv2DGeometry g)
     {
+        if (g.InHeight == 1 && g.KernelH == 1 && g.OutHeight == 1 && g.PadH == 0)
+        {
+            CopyGroupedWaveformPanel(input, offset, panel, from, count, g, addGradient: false);
+            return;
+        }
         int row = 0;
         for (int channel = 0; channel < g.InChannelsPerGroup; channel++)
             for (int kh = 0; kh < g.KernelH; kh++)
@@ -357,6 +367,45 @@ public partial class CpuEngine
                         panel[row * count + column] = (uint)ih < (uint)g.InHeight && (uint)iw < (uint)g.InWidth
                             ? input[offset + (channel * g.InHeight + ih) * g.InWidth + iw] : 0f;
                     }
+    }
+
+    // A waveform panel visits one input row. Clip once per kernel tap, then walk that
+    // row with a constant stride. Ascending taps preserve the dX accumulation order.
+    private static void CopyGroupedWaveformPanel(Span<float> signal, int offset, float[] panel,
+        int from, int count, in GroupedConv2DGeometry g, bool addGradient)
+    {
+        for (int tap = 0; tap < g.KernelW; tap++)
+        {
+            long first = (long)from * g.StrideW + (long)tap * g.DilationW - g.PadW;
+            int begin = (int)Math.Min(count, (Math.Max(0L, -first) + g.StrideW - 1) / g.StrideW);
+            int end = (int)Math.Min(count, (Math.Max(0L, g.InWidth - first) + g.StrideW - 1) / g.StrideW);
+            for (int channel = 0; channel < g.InChannelsPerGroup; channel++)
+            {
+                var row = panel.AsSpan((channel * g.KernelW + tap) * count, count);
+                if (!addGradient)
+                {
+                    row.Slice(0, begin).Clear();
+                    row.Slice(end).Clear();
+                }
+                if (end == begin) continue;
+                int index = offset + channel * g.InWidth + (int)(first + (long)begin * g.StrideW);
+                var values = row.Slice(begin, end - begin);
+                if (g.StrideW == 1)
+                {
+                    var samples = signal.Slice(index, values.Length);
+                    if (addGradient) AddGroupedFloat(samples, values);
+                    else samples.CopyTo(values);
+                }
+                else if (addGradient)
+                {
+                    for (int i = 0; i < values.Length; i++, index += g.StrideW) signal[index] += values[i];
+                }
+                else
+                {
+                    for (int i = 0; i < values.Length; i++, index += g.StrideW) values[i] = signal[index];
+                }
+            }
+        }
     }
 
     private static void AddGroupedFloat(Span<float> destination, ReadOnlySpan<float> source)

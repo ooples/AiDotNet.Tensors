@@ -9,6 +9,7 @@ public sealed partial class CudaBackend : IConvBiasResidualBackend
     {
         if (!args.TryCount(out int count)) return false;
         if (CudaDispatchPolicy.UseCudnnForConv && !CudaDispatchPolicy.AllowTF32
+            && !CudaDispatchPolicy.ConvReducedPrecisionTF32
             && !IsStreamCapturing())
         {
             using var current = PushContext();
