@@ -13882,7 +13882,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// dimension <paramref name="cols"/>. Overwrites when <paramref name="accumulate"/> is false, else
     /// <see cref="SimdGemm.SgemmAdd(ReadOnlySpan{float}, int, bool, ReadOnlySpan{float}, int, bool, Span{float}, int, int, int)"/> accumulates.
     /// </summary>
-    private static void SharedOperandGemm(
+    internal static void SharedOperandGemm(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c,
         int rows, int inner, int cols, bool accumulate, ref float[]? scratch)
     {
@@ -13895,9 +13895,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // shared Q/K/V input gradient dY[2048,64]·W[64,64]ᵀ took 31 us there plus the add, against ~80 us accumulating
         // through SgemmAdd (3950X).
         int length = rows * cols;
-        var product = scratch is { } owned && owned.Length >= length ? owned : (scratch = new float[length]);
-        if (SimdGemm.TryGemmSmallJit(a, lda, transA, b, ldb, transB, product, rows, inner, cols))
+        if (SimdGemm.TryGemmSmallJitWithScratch(a, lda, transA, b, ldb, transB, ref scratch, rows, inner, cols))
         {
+            var product = scratch!;
             int width = System.Numerics.Vector<float>.Count, i = 0;
             for (; i + width <= length; i += width)
                 (new System.Numerics.Vector<float>(c, i) + new System.Numerics.Vector<float>(product, i)).CopyTo(c, i);
