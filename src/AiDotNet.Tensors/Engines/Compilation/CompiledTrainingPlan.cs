@@ -4625,6 +4625,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb
             && RetireGraphIfEngineShared(gte))
         {
+            // Another plan revoked memory this plan's graph names (it keeps a value there past its step): re-record.
+            if (_scratchPool?.TakeRevoked() == true && HasLiveStepGraph) InvalidateCapturedStepGraph();
             _graphStepCalls++;
             if (_graphStepCalls > GraphWarmupSteps)
             {
@@ -5717,6 +5719,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var outerScratchPool = redirectEngine is not null
             ? Engines.DirectGpuTensorEngine.EnterScratchPool(_scratchPool ??= redirectEngine.CreateScratchPool())
             : null;
+        // Nested inside another plan's step: memory co-owned with other plans could hold that step's live values.
+        if (outerScratchPool is not null && _scratchPool is { } nestedPool && !nestedPool.NeverCoOwn) nestedPool.LeaveSharing();
         // Backward outputs are leased for their action, with or without graph capture: a captured graph replays the
         // reuse its recording run made, in stream order (a pin seen after it re-captures; see _scratchPinsAtCapture).
         // Kept per output instead, a CUDA step held the sum of its backward outputs (DDPM: ~2.8 GB of 9.8 GB).
@@ -5727,6 +5731,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _workspaceSharingBodyAllowed = redirectEngine is not null && CanShareTransientWorkspace(redirectEngine);
             leasingPool.WorkspaceBroker = _workspaceSharingBodyAllowed
                 ? redirectEngine!.CompiledWorkspaceBroker : null;
+            // A plan that keeps stable pointers co-owns step scratch with the engine's other plans instead. It takes
+            // only on a run that executes: the run that takes must also prove what it took transient (below).
+            leasingPool.Shared = executed && redirectEngine is not null && CanCoOwnStepScratch(redirectEngine)
+                ? redirectEngine.SharedStepScratch : null;
         }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
@@ -5743,7 +5751,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
                 redirectEngine.FirstWriteRedirects = null;
-                if (_scratchPool is { } finishedPool) finishedPool.WorkspaceBroker = null;
+                if (_scratchPool is { } finishedPool)
+                {
+                    finishedPool.WorkspaceBroker = null;
+                    // What this run took from other plans must hold nothing read after the step; what does (a slot
+                    // that became the loss or a retained output), or anything a body that threw took, is revoked from
+                    // them before any of them steps again (steps run one at a time per engine).
+                    if (finishedPool.Shared is { } registry) ValidateTakenStepScratch(registry, finishedPool, completed);
+                    // Offered only after a whole executed run: a capture records, and a body that threw left its
+                    // buffers' roles unknown.
+                    if (executed && completed && finishedPool.Shared is not null && CanCoOwnStepScratch(redirectEngine))
+                        PublishStepScratch(redirectEngine, backend, finishedPool);
+                    finishedPool.Shared = null;
+                }
 
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
