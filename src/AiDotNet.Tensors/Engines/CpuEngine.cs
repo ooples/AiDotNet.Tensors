@@ -9160,12 +9160,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Validate and normalize axes consistently with other reducers
         var normalizedAxes = ValidateAndNormalizeAxes(axes, tensor.Rank);
-        if (TryChannelCascadeSum(tensor, normalizedAxes, keepDims, out var channelSum))
-        {
-            DifferentiableOps.RecordUnary("ReduceSum", channelSum, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
-                new object[] { (int[])normalizedAxes.Clone(), keepDims });
-            return channelSum;
-        }
 
         // Fast path: single-axis sum on 2D contiguous float tensor
         if (normalizedAxes.Length == 1 && tensor.Rank == 2 && tensor.IsContiguous && typeof(T) == typeof(float))
