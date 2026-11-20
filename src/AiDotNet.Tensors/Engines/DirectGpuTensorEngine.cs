@@ -2150,10 +2150,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the GPU pointer and force a re-upload.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            // During a compiled step (eviction suspended) the activation buffers are pinned/stable, so _gpuBuffer
-            // is the LIVE data regardless of the host Version snapshot — accept it. Clearing it on a version
-            // mismatch (the path below) would orphan a deferred materializer registered by BindResidentBuffer →
-            // a later host read fires it on a recycled buffer = #226 "buffer released before materialization".
             // A device-resident int tensor (ids, labels) written on the host after it went to the device: the compiled
             // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
             // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
@@ -2161,6 +2157,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts
                 && residentInts.CoversWholeVector)
                 PrepareResidentIndexForCompiledStep(backend, residentInts);
+            // During a compiled step (eviction suspended) the activation buffers are pinned/stable, so _gpuBuffer
+            // is the LIVE data regardless of the host Version snapshot — accept it. Clearing it on a version
+            // mismatch (the path below) would orphan a deferred materializer registered by BindResidentBuffer →
+            // a later host read fires it on a recycled buffer = #226 "buffer released before materialization".
             if (tensor._gpuBuffer.Handle != IntPtr.Zero
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
@@ -2611,6 +2611,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         ThrowIfReleased(tensor);
         if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
 
+        // A device-resident int tensor (ids, labels) written on the host after it went to the device: the compiled
+        // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
+        // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
+        // get the same from the plan's input refresh (RefreshGraphInputInPlace).
+        if (ResidentStepActive && tensor._gpuBuffer is { } residentBuffer && residentBuffer.Handle != IntPtr.Zero
+            && ReferenceEquals(tensor._gpuBackend, backend) && tensor is Tensor<int> residentInts
+            && residentInts.CoversWholeVector)
+            PrepareResidentIndexForCompiledStep(backend, residentInts);
+
         int hostVersion = tensor.GpuCacheVersion;
         // Fast path: tensor has a GPU buffer from a previous GPU operation, and
         // the tensor's CPU-side Version hasn't advanced since the upload. Stale-
@@ -2619,13 +2628,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            // A device-resident int tensor (ids, labels) written on the host after it went to the device: the compiled
-            // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
-            // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
-            // get the same from the plan's input refresh (RefreshGraphInputInPlace).
-            if (ResidentStepActive && tensor._gpuBuffer.Handle != IntPtr.Zero && tensor is Tensor<int> residentInts
-                && residentInts.CoversWholeVector)
-                PrepareResidentIndexForCompiledStep(backend, residentInts);
             if (tensor._gpuBuffer.Handle != IntPtr.Zero
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases

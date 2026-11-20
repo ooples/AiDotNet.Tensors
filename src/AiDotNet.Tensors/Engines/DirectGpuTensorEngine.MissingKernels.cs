@@ -4686,7 +4686,7 @@ public partial class DirectGpuTensorEngine
     }
 
     private OwnedBuffer GetOrAllocateInt32IndexBuffer(
-        IDirectGpuBackend backend, Tensor<int> indices, Tensor<int>? originalIndices = null, int upperBound = 0)
+        IDirectGpuBackend backend, Tensor<int> indices, Tensor<int>? originalIndices = null, int upperBound = 0, bool requireUnique = false)
     {
         if (ResidentStepActive && originalIndices is not null && !HasResidentIndexStorage(originalIndices))
             indices = originalIndices;
@@ -4696,7 +4696,7 @@ public partial class DirectGpuTensorEngine
             // upload per call is a cuMemAlloc and a synchronous copy inside the captured step, which aborts the capture
             // and sent the op to the host path, whose read of its device-resident input aborted it again.
             if (ResidentStepActive)
-                return new OwnedBuffer(GetHostIndexDeviceCopy(backend, indices, upperBound), ownsBuffer: false);
+                return new OwnedBuffer(GetHostIndexDeviceCopy(backend, indices, upperBound, requireUnique), ownsBuffer: false);
             return new OwnedBuffer(backend.AllocateIntBuffer(indices.GetDataArray()), ownsBuffer: true);
         }
 
@@ -4789,7 +4789,7 @@ public partial class DirectGpuTensorEngine
     /// storage version changed (a constant id table uploads once). A captured step reads it through a stable pointer;
     /// <see cref="RefreshHostIndexDeviceCopiesNow"/> brings every copy up to date before a replay.
     /// </summary>
-    private IGpuBuffer GetHostIndexDeviceCopy(IDirectGpuBackend backend, Tensor<int> indices, int upperBound = 0)
+    private IGpuBuffer GetHostIndexDeviceCopy(IDirectGpuBackend backend, Tensor<int> indices, int upperBound = 0, bool requireUnique = false)
     {
         HostIndexDeviceCopy copy;
         lock (_hostIndexLock)
@@ -4810,11 +4810,11 @@ public partial class DirectGpuTensorEngine
             }
         }
         RefreshHostIndexDeviceCopy(backend, copy, indices, upperBound);
-        RecordHostIndexBinding(copy, indices, upperBound);
+        RecordHostIndexBinding(copy, indices, upperBound, requireUnique);
         return copy.Buffer!;
     }
 
-    private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices, int upperBound = 0)
+    private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices, int upperBound = 0, bool requireUnique = false)
     {
         int n = indices.Length;
         object storage = indices.StorageIdentity;
@@ -4822,11 +4822,13 @@ public partial class DirectGpuTensorEngine
         lock (copy)
         {
             int[]? data = null;
-            if (upperBound > 0)
+            if (upperBound > 0 || requireUnique)
             {
                 data = indices.ToArray();
+                if (requireUnique && new HashSet<int>(data).Count != n)
+                    throw new InvalidOperationException("Captured index writes require distinct destinations.");
                 for (int i = 0; i < n; i++)
-                    if (data[i] < 0 || data[i] >= upperBound)
+                    if (upperBound > 0 && (data[i] < 0 || data[i] >= upperBound))
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Target ID {data[i]} at position {i} is out of bounds for vocabulary size {upperBound}.");
             }
@@ -7273,7 +7275,7 @@ public partial class DirectGpuTensorEngine
                 return base.TensorIndexCopy(tensor, axis, indices, source);
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstAxis);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstAxis, requireUnique: true);
             var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -10055,7 +10057,7 @@ public partial class DirectGpuTensorEngine
             outShape[normalizedAxis] = indices.Length;
             int outputLength = outerSize * indices.Length * innerSize;
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousInput);
-            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: axisSize);
+            using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: axisSize, requireUnique: true);
             return DispatchDeferredGpuOp<T>(backend, outputLength, outShape, output =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, output,
                     outerSize, axisSize, indices.Length, innerSize));
@@ -10198,7 +10200,8 @@ public partial class DirectGpuTensorEngine
             using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
-            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
+            var floatIndex = RentOpScratch(backend, Math.Max(1, indices.Length), leases);
+            IndexConversion.Resolve(backend).Int32ToFloat(int32Index.Buffer, floatIndex, indices.Length);
             IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
             var claims = Scratch(n);
             var winners = Scratch(m);
@@ -10211,7 +10214,7 @@ public partial class DirectGpuTensorEngine
 
             result = DispatchDeferredGpuOp<T>(backend, n, (int[])destination._shape.Clone(), output =>
             {
-                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex, positions, claims, winners,
                     outer, srcDim, dstDim, inner);
                 // torch.scatter keeps the last write to a slot. Only the winning writes carry their source value into
                 // a zeroed buffer, so each written slot receives exactly one non-zero term and the atomic sum is exact.
@@ -10305,11 +10308,12 @@ public partial class DirectGpuTensorEngine
         try
         {
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
-            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
+            var floatIndex = RentOpScratch(backend, Math.Max(1, indices.Length), leases);
+            IndexConversion.Resolve(backend).Int32ToFloat(int32Index.Buffer, floatIndex, indices.Length);
             var claims = RentOpScratch(backend, n, leases);
             var positions = RentOpScratch(backend, m, leases);
             return DispatchDeferredGpuOp<T>(backend, m, (int[])indices._shape.Clone(), winners =>
-                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex, positions, claims, winners,
                     outer, srcDim, dstDim, inner));
         }
         catch (NotSupportedException capabilityGap)

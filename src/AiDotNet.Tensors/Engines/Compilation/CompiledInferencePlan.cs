@@ -1564,13 +1564,18 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             observableNodes = new HashSet<ILazyNode>(stateUpdates.Select(update => update.Next?.LazySource).OfType<ILazyNode>());
         }
+        if (explicitOutput?.LazySource is ILazyNode primaryNode)
+            (observableNodes ??= new HashSet<ILazyNode>()).Add(primaryNode);
         var compiler = new LazyGraphCompiler(observableOutputs: observableNodes);
         List<ILazyNode> optimized;
         var priorDynamic = SparseLinearFusionPattern.t_dynamicLeaves;
-        if (stateUpdates is { Count: > 0 })
+        if (explicitInput is not null || explicitInputs is not null || stateUpdates is { Count: > 0 })
         {
             var dynamicLeaves = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
-            dynamicLeaves.UnionWith(stateUpdates.Select(update => update.State).Where(state => state is not null));
+            if (priorDynamic is not null) dynamicLeaves.UnionWith(priorDynamic);
+            if (explicitInput is not null) dynamicLeaves.Add(explicitInput);
+            if (explicitInputs is not null) dynamicLeaves.UnionWith(explicitInputs);
+            if (stateUpdates is not null) dynamicLeaves.UnionWith(stateUpdates.Select(update => update.State).Where(state => state is not null));
             SparseLinearFusionPattern.t_dynamicLeaves = dynamicLeaves;
         }
         try { optimized = compiler.Compile(scope.Nodes); }
@@ -1796,7 +1801,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
 
         // Run CPU-level optimization passes (spectral decomposition, dataflow fusion)
-        var optimizedSteps = hostSpecialize ? RunCpuOptimizationPasses(specializedSteps, engine) : specializedSteps;
+        var optimizedSteps = hostSpecialize ? RunCpuOptimizationPasses(specializedSteps, engine, protectedOutputs) : specializedSteps;
 
         // Clear LazySource on all compiled output tensors to prevent auto-materialization
         // from re-triggering lazy graph execution after compilation
@@ -2070,7 +2075,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// Currently: spectral decomposition (Phase A) and dataflow fusion (Phase B).
     /// Each pass is independently toggleable via TensorCodecOptions.
     /// </summary>
-    private static CompiledStep<T>[] RunCpuOptimizationPasses(CompiledStep<T>[] steps, IEngine engine)
+    private static CompiledStep<T>[] RunCpuOptimizationPasses(CompiledStep<T>[] steps, IEngine engine, List<Tensor<T>> protectedOutputs)
     {
         // A/B testing showed that optimization passes have net NEGATIVE value for small-to-medium
         // inference plans. The raw compiled plan (direct BLAS/SIMD dispatch) is already 300-4500x
@@ -2120,8 +2125,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             if (!pass.IsEnabled) continue;
             if (gpuPlan && pass is not (ConstantFoldingPass or ForwardCSEPass)) continue;
-            var optimized = pass.TryOptimize(current, engine);
-            if (optimized != null)
+            var optimized = pass is PointwiseFusionPass pointwise
+                ? pointwise.TryOptimize(current, engine, protectedOutputs) : pass.TryOptimize(current, engine);
+            if (optimized != null && protectedOutputs.All(output =>
+                    !current.Any(step => ReferenceEquals(step.OutputBuffer, output))
+                    || optimized.Any(step => ReferenceEquals(step.OutputBuffer, output))))
                 current = optimized;
         }
         return current;

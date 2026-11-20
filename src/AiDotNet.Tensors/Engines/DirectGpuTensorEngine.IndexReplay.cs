@@ -13,13 +13,15 @@ public partial class DirectGpuTensorEngine
         internal readonly Tensor<int> Source;
         internal readonly IntPtr Handle;
         internal int UpperBound;
+        internal bool RequireUnique;
 
-        internal HostIndexBinding(HostIndexDeviceCopy copy, Tensor<int> source, int upperBound)
+        internal HostIndexBinding(HostIndexDeviceCopy copy, Tensor<int> source, int upperBound, bool requireUnique)
         {
             Copy = copy;
             Source = source;
             Handle = copy.Buffer!.Handle;
             UpperBound = upperBound;
+            RequireUnique = requireUnique;
         }
     }
 
@@ -60,18 +62,19 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    private void RecordHostIndexBinding(HostIndexDeviceCopy copy, Tensor<int> source, int upperBound)
+    private void RecordHostIndexBinding(HostIndexDeviceCopy copy, Tensor<int> source, int upperBound, bool requireUnique)
     {
         var bindings = t_indexReplayCapture;
         if (bindings is null || !ReferenceEquals(bindings.Engine, this)) return;
         foreach (var binding in bindings.Host)
             if (ReferenceEquals(binding.Copy, copy))
             {
+                binding.RequireUnique |= requireUnique;
                 if (upperBound > 0 && (binding.UpperBound == 0 || upperBound < binding.UpperBound))
                     binding.UpperBound = upperBound;
                 return;
             }
-        bindings.Host.Add(new HostIndexBinding(copy, source, upperBound));
+        bindings.Host.Add(new HostIndexBinding(copy, source, upperBound, requireUnique));
     }
 
     private void RecordResidentIndexBinding(Tensor<int> indices, IntPtr handle)
@@ -93,7 +96,7 @@ public partial class DirectGpuTensorEngine
         {
             if (binding.Copy.Buffer?.Handle != binding.Handle || binding.Handle == IntPtr.Zero)
                 throw new InvalidOperationException("A captured host-index device buffer was released or replaced.");
-            RefreshHostIndexDeviceCopy(backend, binding.Copy, binding.Source, binding.UpperBound);
+            RefreshHostIndexDeviceCopy(backend, binding.Copy, binding.Source, binding.UpperBound, binding.RequireUnique);
         }
         foreach (var binding in bindings.Resident)
             RefreshResidentIndexInPlace(backend, binding.Source, binding.Handle);

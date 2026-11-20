@@ -17,6 +17,52 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 [Collection("DirectGpuSerial")]
 public sealed class CompiledStatefulInferenceTests
 {
+    [Fact]
+    public void ReturnedIntermediateAndStateConsumerRefreshIndependently()
+    {
+        var cpu = new CpuEngine();
+        var x = new Tensor<float>(new[] { 2f }, new[] { 1, 1 });
+        var w = new Tensor<float>(new[] { 3f }, new[] { 1, 1 });
+        var state = new Tensor<float>(new[] { 1f }, new[] { 1, 1 });
+        CompiledInferencePlan<float> plan;
+        using (var scope = GraphMode.EnableInference())
+        {
+            var product = cpu.TensorMatMul(x, w);
+            var next = cpu.Sigmoid(cpu.TensorAdd(product, state));
+            plan = scope.CompileInference(product, new[] { x }, new[] { (state, next) });
+        }
+        using (plan)
+        {
+            Assert.Equal(6f, plan.Execute()[0]);
+            Assert.Equal(1f / (1f + (float)Math.Exp(-7)), state[0], 6);
+            plan.SetInputs(new[] { new Tensor<float>(new[] { -1f }, new[] { 1, 1 }) });
+            Assert.Equal(-3f, plan.Execute()[0]);
+        }
+    }
+
+    [Fact]
+    public void IndexSelectionObservesTopKProducerAfterScoresChange()
+    {
+        var cpu = new CpuEngine();
+        var x = new Tensor<float>(new[] { 1f, 4f }, new[] { 2 });
+        var table = new Tensor<float>(new[] { 10f, 20f }, new[] { 2 });
+        CompiledInferencePlan<float> plan;
+        using (var scope = GraphMode.EnableInference())
+        {
+            var computedTable = cpu.TensorMultiplyScalar(table, 2f);
+            var scores = cpu.TensorMultiplyScalar(x, 3f);
+            cpu.TensorTopK(scores, 1, 0, out var indices);
+            var selected = cpu.TensorIndexSelect(computedTable, indices, 0);
+            plan = scope.CompileInference(selected, new[] { x });
+        }
+        using (plan)
+        {
+            Assert.Equal(40f, plan.Execute()[0]);
+            plan.SetInputs(new[] { new Tensor<float>(new[] { 5f, 1f }, new[] { 2 }) });
+            Assert.Equal(20f, plan.Execute()[0]);
+        }
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -403,6 +449,7 @@ public sealed class CompiledStatefulInferenceTests
             try
             {
                 using (plan)
+                {
                     for (int t = 0; t < steps; t++)
                     {
                         plan.SetInputs(new[] { new Tensor<float>([R, D], new Vector<float>(In(t))) });
@@ -410,6 +457,12 @@ public sealed class CompiledStatefulInferenceTests
                         AssertClose(refLast[t], states[layers - 1].ToArray(), $"step {t} last-layer state");
                         AssertClose(refOut[t], got, $"step {t} output");
                     }
+                    if (capture)
+                    {
+                        var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                        Assert.NotEqual(IntPtr.Zero, (IntPtr)exec.GetValue(plan)!);
+                    }
+                }
             }
             finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
         }

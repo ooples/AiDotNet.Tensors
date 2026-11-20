@@ -43490,7 +43490,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 int capAxis = axis;
                 var outShape = (int[])tensor._shape.Clone();
                 outShape[axis] = indices.Length;
-                return scope.RecordUnary(LazyNodeType.Custom, "TensorIndexSelect", tensor, outShape,
+                var operands = new List<Tensor<T>> { tensor };
+                DependOnProducer(scope, indices, operands);
+                return scope.RecordVariadic(LazyNodeType.Custom, "TensorIndexSelect", operands.ToArray(), outShape,
                     (eng, output) => { var r = eng.TensorIndexSelect(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.IndexSelectBackward, new object[] { capIndices, capAxis });
             }

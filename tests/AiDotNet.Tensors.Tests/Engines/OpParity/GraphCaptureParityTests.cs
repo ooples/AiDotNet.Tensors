@@ -69,12 +69,35 @@ public sealed class GraphCaptureParityTests
 
         GraphMutationProfile mutation = SelectMutation(op, engine, out float[] eagerChanged);
 
+        Tensor<int>[]? tracedIndices = null;
+        int[][]? expectedIndices = null;
+        if (op.RunFloatHeterogeneousOutputs is { } mixed)
+        {
+            var initial = mixed(engine).Integers.Select(index => index.ToArray()).ToArray();
+            foreach (var candidate in MutationProfiles)
+            {
+                using var mutationScope = OpInput.UseGraphMutation(candidate);
+                var changed = mixed(engine);
+                var indices = changed.Integers.Select(index => index.ToArray()).ToArray();
+                if (indices.Where((index, i) => !index.SequenceEqual(initial[i])).Any())
+                {
+                    mutation = candidate;
+                    eagerChanged = changed.Numeric[0].ToArray();
+                    expectedIndices = indices;
+                    break;
+                }
+            }
+            Assert.NotNull(expectedIndices);
+        }
+
         var snapshots = new List<FloatInputSnapshot>();
         CompiledInferencePlan<float> plan;
         using (var graphScope = GraphMode.EnableInference())
         using (OpInput.CaptureFloatInputSnapshots(snapshots))
         {
-            var graphOutput = op.RunFloat(engine);
+            var mixedResult = op.RunFloatHeterogeneousOutputs?.Invoke(engine);
+            tracedIndices = mixedResult?.Integers;
+            var graphOutput = mixedResult?.Numeric[0] ?? op.RunFloat(engine);
             Assert.NotNull(graphOutput.LazySource);
             Assert.NotEmpty(snapshots);
             Assert.Contains(snapshots, snapshot => snapshot.Role == GraphInputRole.MutableValue);
@@ -102,6 +125,12 @@ public sealed class GraphCaptureParityTests
             }
 
             float[] compiledChanged = plan.Execute().ToArray();
+            if (expectedIndices is not null)
+            {
+                Assert.Equal(expectedIndices.Length, tracedIndices!.Length);
+                for (int i = 0; i < expectedIndices.Length; i++)
+                    Assert.Equal(expectedIndices[i], tracedIndices[i].ToArray());
+            }
             Assert.Equal(eagerChanged.Length, compiledChanged.Length);
             Assert.True(
                 ParityMath.Within(compiledChanged, eagerChanged, op.Fwd, out var delta),

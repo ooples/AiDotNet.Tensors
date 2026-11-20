@@ -24,6 +24,9 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
     public bool IsEnabled => TensorCodecOptions.Current.EnablePointwiseFusion;
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
+        => TryOptimize(steps, engine, null);
+
+    internal CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine, List<Tensor<T>>? protectedOutputs)
     {
         if (!IsEnabled || typeof(T) != typeof(float) || steps.Length < 2) return null;
 
@@ -34,6 +37,8 @@ internal sealed class PointwiseFusionPass : ICpuOptimizationPass
         // through one that another step also reads left that step reading a tensor nothing writes any more (measured:
         // Sigmoid -> Tanh fused while a reshape of the Sigmoid output fed the next layer, which then read zeros).
         var readers = new Dictionary<Tensor<T>, int>(ReaderKeyComparer<Tensor<T>>.Instance);
+        if (protectedOutputs is not null)
+            foreach (var output in protectedOutputs) readers[output] = 1;
         foreach (var step in steps)
             foreach (var input in step.Inputs)
                 readers[input] = readers.TryGetValue(input, out var r) ? r + 1 : 1;

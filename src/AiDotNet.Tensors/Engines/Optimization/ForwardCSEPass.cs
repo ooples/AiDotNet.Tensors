@@ -50,7 +50,7 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
                     "CSE_Copy",
                     (eng, output) => AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, src, output),
                     dst,
-                    step.Inputs,
+                    new[] { src },
                     null,
                     null));
                 anyEliminated = true;
