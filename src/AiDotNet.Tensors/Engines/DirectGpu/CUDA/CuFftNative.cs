@@ -38,8 +38,8 @@ internal static class CuFftNative
     {
         if (name != Library) return IntPtr.Zero;
         string[] candidates = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? new[] { "cufft64_11.dll", "cufft64_10.dll" }
-            : new[] { "libcufft.so.11", "libcufft.so.10", "libcufft.so" };
+            ? new[] { "cufft64_12.dll", "cufft64_11.dll", "cufft64_10.dll" }   // cuFFT 12 ships with CUDA 13
+            : new[] { "libcufft.so.12", "libcufft.so.11", "libcufft.so.10", "libcufft.so" };
         foreach (string candidate in candidates)
             if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out var handle)) return handle;
         string? cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
