@@ -4733,6 +4733,26 @@ public partial interface IEngine
         bool silu);
 
     /// <summary>
+    /// Appends one decode position to a fixed-capacity cache with the write position kept ON THE DEVICE:
+    /// <c>cache[b, p, :] = value[b, :]</c> for the current <c>p = position[0]</c>, then <c>position[0] = p + 1</c>, both
+    /// in place, and returns the additive attention mask over the cache's slots (0 for slots <c>0..p</c>, negative
+    /// infinity after). A compiled decode plan therefore replays every step with no host input but the token: the cache
+    /// and the position stay in persistent buffers. Forward only.
+    /// </summary>
+    /// <param name="cache">The cache [batch, capacity, width], contiguous; written in place.</param>
+    /// <param name="position">One value: the number of positions already cached (an integer held in T); incremented in
+    /// place. Start it at zero.</param>
+    /// <param name="value">This position's entry, batch x width values.</param>
+    /// <returns>The additive mask [capacity] for attending over the cache after this append.</returns>
+    /// <exception cref="InvalidOperationException">The host implementation throws when the cache is full. A device
+    /// kernel cannot report it: past capacity it writes nothing, leaves the position at capacity and returns a mask of
+    /// every slot, so callers bound the number of positions themselves.</exception>
+    Tensor<T> KvCacheAppend<T>(
+        Tensor<T> cache,
+        Tensor<T> position,
+        Tensor<T> value);
+
+    /// <summary>
     /// Fused xLSTM (mLSTM) matrix-memory recurrence over a whole sequence as one differentiable op
     /// (forward + analytic BPTT backward); see <c>CpuEngine.XLstmScan.cs</c> (#1464).
     /// </summary>

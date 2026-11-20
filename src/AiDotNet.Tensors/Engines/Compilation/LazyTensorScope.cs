@@ -481,7 +481,6 @@ internal sealed class LazyTensorScope : IDisposable
         }
     }
 
-    /// <summary>Records a variadic operation as a lazy node.</summary>
     /// <summary>
     /// Records an op that returns a new output AND writes <paramref name="inPlaceTarget"/> (one of its inputs) in place,
     /// as one kernel (a recurrent decode step: the output and the advanced state from one pass over the state). The op's
@@ -496,23 +495,43 @@ internal sealed class LazyTensorScope : IDisposable
         int[] outputShape,
         Tensor<T> inPlaceTarget,
         Action<IEngine, Tensor<T>> execute)
+        => RecordVariadicWritingInPlace(opType, opName, inputs, outputShape, new[] { inPlaceTarget }, execute);
+
+    /// <summary>
+    /// <see cref="RecordVariadicWritingInPlace{T}(LazyNodeType, string, Tensor{T}[], int[], Tensor{T}, Action{IEngine, Tensor{T}})"/>
+    /// for an op that writes several of its inputs in place (each gets its own write node, after the op).
+    /// </summary>
+    internal Tensor<T> RecordVariadicWritingInPlace<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T>[] inputs,
+        int[] outputShape,
+        Tensor<T>[] inPlaceTargets,
+        Action<IEngine, Tensor<T>> execute)
     {
-        if (Array.IndexOf(inputs, inPlaceTarget) < 0)
-            throw new ArgumentException("The in-place target must be one of the op's inputs.", nameof(inPlaceTarget));
+        foreach (var target in inPlaceTargets)
+            if (Array.IndexOf(inputs, target) < 0)
+                throw new ArgumentException("Every in-place target must be one of the op's inputs.", nameof(inPlaceTargets));
         var output = RentOutput<T>(outputShape);
         var node = new LazyNode<T>(opType, opName, inputs, output, execute) { RecordedUnderNoGrad = true };
-        // The op itself overwrites the target, so it is ordered after the target's earlier readers (as RecordInPlace orders
-        // its write).
-        long since = inPlaceTarget.LazySource?.RecordOrder ?? 0;
+        // The op itself overwrites the targets, so it is ordered after each target's earlier readers (as RecordInPlace
+        // orders its write).
         var readers = new List<ILazyNode>();
-        for (var scope = this; scope is not null; scope = scope._parent)
-            CollectReadersSince(scope._nodes, inPlaceTarget, since, readers);
+        foreach (var target in inPlaceTargets)
+        {
+            long since = target.LazySource?.RecordOrder ?? 0;
+            for (var scope = this; scope is not null; scope = scope._parent)
+                CollectReadersSince(scope._nodes, target, since, readers);
+        }
         node.SetEarlierReaders(readers.ToArray());
         output.LazySource = node;
         AddNode(node);
-        RecordInPlace<T>(opType, opName + ".StateWrite", inPlaceTarget, new[] { output }, static (_, _) => { });
+        foreach (var target in inPlaceTargets)
+            RecordInPlace<T>(opType, opName + ".StateWrite", target, new[] { output }, static (_, _) => { });
         return output;
     }
+
+    /// <summary>Records a variadic operation as a lazy node.</summary>
 
     internal Tensor<T> RecordVariadic<T>(
         LazyNodeType opType,

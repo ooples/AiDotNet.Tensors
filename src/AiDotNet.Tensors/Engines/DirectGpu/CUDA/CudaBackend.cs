@@ -1384,6 +1384,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // A causal depthwise convolution's decode step (ICausalConv1dStepBackend): output and in-place history shift.
         CompileKernelModule(device, KernelSourceResources.Read("CudaCausalConv1dStep.c"), "conv1d_step_kernels", new[] { "conv1d_step" });
 
+        // A decode cache append at a device-side position (IKvCacheAppendBackend).
+        CompileKernelModule(device, KernelSourceResources.Read("CudaKvCacheAppend.c"), "kv_cache_append_kernels", new[] { "kv_cache_append" });
+
         // The octonion backward and fused-ReLU kernels were defined in CudaOctonionKernels, which nothing compiled, so
         // OctonionLinearBackward{Input,Weights,Biases} and OctonionLinearForwardFusedReLU threw kernel-not-found and
         // ran on the CPU. octonion_linear_forward keeps coming from the specialized module. Optional, like the parity
