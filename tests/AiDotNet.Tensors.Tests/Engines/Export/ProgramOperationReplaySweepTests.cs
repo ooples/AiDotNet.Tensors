@@ -96,10 +96,11 @@ public class ProgramOperationReplaySweepTests : IDisposable
             try
             {
                 var examples = originals.Select(x => Copy(x)).ToArray();
-                // Writable host index arrays and Bit/complex tensors are outside the closed wire format.
-                // Check that these fail explicitly rather than silently freezing their values into a trace.
+                // Writable host index arrays, Bit/complex tensors and host graph structures (a CsrGraph) are outside
+                // the closed wire format. Check that these fail explicitly rather than silently freezing their values
+                // into a trace.
                 bool nonPortable = name is "MaxPool2DWithIndices" or "MaxPool3DWithIndices"
-                    or "NativeSpectralFilter" or "NativeSpectralFilterBatch"
+                    or "NativeSpectralFilter" or "NativeSpectralFilterBatch" or "GraphAttentionCsr"
                     || (name == "ReduceMax" && method.GetParameters().Any(p => p.ParameterType.IsByRef))
                     || args.Any(x => x is Tensor<Bit>);
                 if (nonPortable)
