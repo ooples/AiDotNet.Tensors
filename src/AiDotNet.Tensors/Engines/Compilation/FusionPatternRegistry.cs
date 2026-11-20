@@ -35,6 +35,7 @@ internal static class FusionPatternRegistry
         Register(new SparseLinearFusionPattern());
         Register(new DDIMStepFusionPattern());
         Register(new LinearFusionPattern());
+        Register(new ConvBiasBatchNormFusionPattern());   // before the conv + bias and BatchNorm fusions it subsumes
         Register(new BatchNormAddReluFusionPattern());
         Register(new BatchNormReluFusionPattern());
         Register(new BatchNormRelu6FusionPattern());
@@ -99,6 +100,47 @@ internal static class FusionPatternRegistry
                 if (p.Name != name) next.Add(p);
             _ordered = next;
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Removes a pattern until the returned scope is disposed, then puts it back in the slot it had: a pattern that
+    /// subsumes later ones must keep its priority, and <see cref="Unregister"/> followed by <see cref="Register"/> would
+    /// move it to the end of the order. Null when no such pattern is registered.
+    /// </summary>
+    internal static IDisposable? Suspend(string name)
+    {
+        lock (_orderLock)
+        {
+            int slot = -1;
+            for (int i = 0; i < _ordered.Count; i++)
+                if (_ordered[i].Name == name) { slot = i; break; }
+            if (slot < 0 || !_patterns.TryRemove(name, out var pattern)) return null;
+            var next = new List<IFusionPattern>(_ordered);
+            next.RemoveAt(slot);
+            _ordered = next;
+            return new Restore(pattern, slot);
+        }
+    }
+
+    private sealed class Restore : IDisposable
+    {
+        private IFusionPattern? _pattern;
+        private readonly int _slot;
+
+        public Restore(IFusionPattern pattern, int slot) { _pattern = pattern; _slot = slot; }
+
+        public void Dispose()
+        {
+            var pattern = System.Threading.Interlocked.Exchange(ref _pattern, null);
+            if (pattern is null) return;
+            lock (_orderLock)
+            {
+                if (!_patterns.TryAdd(pattern.Name, pattern)) return;   // re-registered meanwhile: keep that one
+                var next = new List<IFusionPattern>(_ordered);
+                next.Insert(Math.Min(_slot, next.Count), pattern);
+                _ordered = next;
+            }
         }
     }
 
