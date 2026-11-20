@@ -57,7 +57,8 @@ public static partial class WebGpuNativeBindings
     /// Checks if WebGPU is supported in the current browser.
     /// </summary>
     public static bool IsWebGpuSupported()
-        => Host is { } host ? HostValue<bool>(host.Invoke("isWebGpuSupported", Args())) : JsIsWebGpuSupported();
+        => Host is { } host ? HostValue<bool>(host.Invoke("isWebGpuSupported", Args()))
+            : OperatingSystem.IsBrowser() && JsIsWebGpuSupported();
 
     [JSImport("isWebGpuSupported", ModuleName)]
     private static partial bool JsIsWebGpuSupported();
