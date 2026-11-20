@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines;
 /// private to each plan. A checked-out buffer is absent from this broker until its complete step returns it.
 /// All calls are serialized by the engine's CompiledStepLock; nested steps therefore have separate checkouts too.
 /// </summary>
-internal sealed class CompiledTransientWorkspaceBroker
+internal sealed partial class CompiledTransientWorkspaceBroker
 {
     private readonly StepScratchPool _owner;
     private readonly List<(long Key, IDirectGpuBackend Backend, int Thread, IGpuBuffer Buffer)> _free = new();
@@ -18,6 +18,8 @@ internal sealed class CompiledTransientWorkspaceBroker
     internal long ReuseBytes { get; private set; }
     internal long ReturnedBytes { get; private set; }
     internal long RetainedBytes { get; private set; }
+    internal long NativeReturnedForInferenceBytes { get; private set; }
+    internal long NativeReturnedForInferenceCells { get; private set; }
 
     internal CompiledTransientWorkspaceBroker(DirectGpuTensorEngine engine) => _owner = engine.CreateScratchPool();
 
@@ -67,5 +69,46 @@ internal sealed class CompiledTransientWorkspaceBroker
         }
         _free.Clear();
         RetainedBytes = 0;
+    }
+
+    // The caller holds CompiledStepLock, as for ordinary checkouts. Only same-backend, same-thread idle cells are
+    // considered: host serialization does not order OpenCL's independent thread-local native queues.
+    internal long ReturnIncompatibleCellsToNativeAllocator(IDirectGpuBackend backend, long requestedBytes)
+    {
+        if (requestedBytes <= 0) return 0;
+        int thread = Environment.CurrentManagedThreadId;
+        long largest = 0;
+        foreach (var item in _free)
+            if (ReferenceEquals(item.Backend, backend) && item.Thread == thread && item.Buffer.Handle != IntPtr.Zero)
+                largest = Math.Max(largest, item.Buffer.SizeInBytes);
+        if (largest == 0 || requestedBytes <= largest) return 0;
+
+        long returned = 0;
+        int cells = 0;
+        for (int index = _free.Count - 1; index >= 0; index--)
+        {
+            var item = _free[index];
+            if (!ReferenceEquals(item.Backend, backend) || item.Thread != thread
+                || item.Buffer is not IPoolableGpuBuffer native)
+                continue;
+            _free[index] = _free[_free.Count - 1];
+            _free.RemoveAt(_free.Count - 1);
+            _owner.Slots.Remove(item.Key);
+            long bytes = item.Buffer.SizeInBytes;
+            StepScratchPool.Untrack(item.Buffer);
+            RetainedBytes -= bytes;
+            // Release, not Dispose: Dispose would park these undersized cells in the host-side free cache.
+            // This is the same native return contract that each backend's bounded buffer pool uses on eviction.
+            // CUDA preserves capture pins and enqueues cuMemFreeAsync on its owning compute stream; other backends
+            // retain their existing queued-work/native-release semantics. No global pool drain or trim is performed.
+            native.Release();
+            returned += bytes;
+            cells++;
+        }
+        NativeReturnedForInferenceBytes += returned;
+        NativeReturnedForInferenceCells += cells;
+        if (cells > 0 && Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
+            Console.Error.WriteLine($"[WORKSPACE-INFERENCE-RETURN] requested_bytes={requestedBytes} largest_cell_bytes={largest} cells={cells} native_bytes={returned} broker_remaining_bytes={RetainedBytes}");
+        return returned;
     }
 }
