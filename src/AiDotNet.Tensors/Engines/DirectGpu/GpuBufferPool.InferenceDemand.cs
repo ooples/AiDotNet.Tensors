@@ -9,6 +9,9 @@ internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpu
     private long _inferenceRegimeReleasedBuffers, _inferenceRegimeReleasedCapacityBytes;
     internal long InferenceRegimeNativeReleaseRequestedBuffers => Interlocked.Read(ref _inferenceRegimeReleasedBuffers);
     internal long InferenceRegimeNativeReleaseRequestedCapacityBytes => Interlocked.Read(ref _inferenceRegimeReleasedCapacityBytes);
+    private long _compiledBestFitRents, _compiledBestFitCapacityElements;
+    internal long CompiledBestFitRents => Interlocked.Read(ref _compiledBestFitRents);
+    internal long CompiledBestFitCapacityElements => Interlocked.Read(ref _compiledBestFitCapacityElements);
 
     internal bool TryRentForBackend(int size, IDirectGpuBackend? backend, out TBuffer? buffer)
         => TryRentForBackend(size, GpuBufferPoolAffinity.Global, backend, out buffer);
@@ -18,6 +21,13 @@ internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpu
     {
         if (TryRent(size, affinity, out buffer)) return true;
         if (Volatile.Read(ref _disposed) != 0 || size <= 0 || size > _maxSize) return false;
+        if (backend is not null && ReferenceEquals(CompiledNativeCacheScope.Current, backend)
+            && TryRentLargerIdleBuffer(size, affinity, 2, out buffer))
+        {
+            Interlocked.Increment(ref _compiledBestFitRents);
+            Interlocked.Add(ref _compiledBestFitCapacityElements, buffer!.Capacity);
+            return true;
+        }
         if (backend is not null && InferenceWorkspaceDemandScope.TryRentLargerIdleBuffer(
                 backend, this, size, affinity, out buffer)) return true;
         if (backend is not null && InferenceWorkspaceDemandScope.TryReturnIncompatibleIdleCache(backend, this, size, affinity))
@@ -29,12 +39,15 @@ internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpu
     // reusable class without enumerating the pool or allocating a search list. Physical capacity never exceeds
     // four times the logical request, and the existing parked-element budget remains unchanged.
     internal bool TryRentLargerIdleBuffer(int size, GpuBufferPoolAffinity affinity, out TBuffer? buffer)
+        => TryRentLargerIdleBuffer(size, affinity, 4, out buffer);
+
+    private bool TryRentLargerIdleBuffer(int size, GpuBufferPoolAffinity affinity, int maximumCapacityMultiple, out TBuffer? buffer)
     {
         buffer = null;
         if (_exactSizes || size <= 0 || size > _maxSize || Volatile.Read(ref _disposed) != 0) return false;
         int requestedBucket = BucketKey(size);
         if (requestedBucket <= 0) return false; // Power-of-two rounding overflow: preserve the native fallback.
-        long limit = Math.Min((long)size * 4, int.MaxValue);
+        long limit = Math.Min((long)size * maximumCapacityMultiple, int.MaxValue);
         for (long bucket = (long)requestedBucket * 2; bucket <= limit; bucket *= 2)
             if (TryRentFromBucket(size, (int)bucket, affinity, out buffer)) return true;
         return false;

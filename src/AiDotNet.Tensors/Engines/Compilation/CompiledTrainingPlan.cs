@@ -5416,6 +5416,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             leasingPool.ShareBackwardScratch = _shadowShareBackwardScratch && _workspaceSharingBodyAllowed;
         }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
+        using var nativeCacheScope = CompiledNativeCacheScope.Enter(
+            _compiledNativeCacheBestFit && _workspaceSharingBodyAllowed ? backend : null);
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
         _gradientDeferral?.Reset();
         // Restored rather than cleared: this body can run nested inside another plan's on this thread, and clearing
