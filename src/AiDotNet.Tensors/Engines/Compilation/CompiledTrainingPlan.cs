@@ -4705,8 +4705,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (completedWorkspaceStep) ReturnTransientWorkspace(gte, cb);
 
                     var released = new HashSet<Engines.DirectGpu.IGpuBuffer>(ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
-                    gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false, released);
-                    DetachReleasedBindings(released);
+                    var protectedState = BuildStepEvictionProtectSet();
+                    gte.EvictActivationsCreatedAfter(snapshot, protectedState, materializePending: false, released);
+                    DetachReleasedBindings(released, protectedState);
                     gte.ReclaimGpuMemoryUnderPressure();
                     RearmUnreadLossReadback();
                     if (completedWorkspaceStep) RegisterPrivateGradientDemandOwner(gte, cb);
@@ -6395,12 +6396,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 finally
                 {
                     var released = new HashSet<Engines.DirectGpu.IGpuBuffer>(ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
+                    var protectedState = BuildStepEvictionProtectSet();
                     stepActivationEngine.EvictActivationsCreatedAfter(
                         stepActivationSnapshot,
-                        BuildStepEvictionProtectSet(),
+                        protectedState,
                         materializePending: false,
                         released);
-                    DetachReleasedBindings(released);
+                    DetachReleasedBindings(released, protectedState);
                 }
             }
             // Bound cross-step VRAM growth: per-step transient activation buffers are dereferenced
@@ -6419,7 +6421,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// cross-entropy divided by a supervised-row count of 0, and a Born attention by a zeroed denominator, on their
     /// second step. A detached tensor is resolved afresh when it is next written.
     /// </summary>
-    private void DetachReleasedBindings(HashSet<Engines.DirectGpu.IGpuBuffer> released)
+    private void DetachReleasedBindings(HashSet<Engines.DirectGpu.IGpuBuffer> released, HashSet<object> protectedState)
     {
         if (_dataForwardReplay is { } dataReplay)
         {
@@ -6431,8 +6433,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // activation it was written into, and is recomputed next step: it is unbound whatever was released, as the
         // graph step does. In-place state keeps the only current value on the device; the loss was materialized.
         if (_forwardSteps != null)
-            foreach (var step in _forwardSteps.Where(s => !ReferenceEquals(s.OutputBuffer, _lossGradDest) && !IsInPlaceState(s) && !_retainedOutputs.Contains(s.OutputBuffer)))
-                DetachDeviceBinding(step.OutputBuffer);
+            foreach (var step in _forwardSteps)
+            {
+                var output = step.OutputBuffer;
+                // A reshape of a running statistic shares its binding and pending host readback.
+                // Detaching the view would also detach the state subsequent steps read.
+                if (!ReferenceEquals(output, _lossGradDest) && !protectedState.Contains(output.StorageIdentity))
+                    DetachDeviceBinding(output);
+            }
         if (released.Count == 0) return;
         // Everything else by device handle: a binding can be a different buffer object over the same memory.
         var handles = new HashSet<IntPtr>(released.Select(buffer => buffer.Handle).Where(handle => handle != IntPtr.Zero));
@@ -6484,15 +6492,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         AddActivationCacheKeys(protect, _lossGradSeed);
         foreach (var output in _retainedOutputs)
         {
-            AddActivationCacheKeys(protect, output);
-            if (output._gpuBuffer is { } buffer) protect.Add(buffer);
+            ForwardOnlyHeterogeneousReplay.ProtectTensor(protect, output);
         }
         // State an in-place step updates on the device lives across steps.
         if (_forwardSteps != null)
             foreach (var step in _forwardSteps.Where(s => IsInPlaceState(s)))
             {
-                AddActivationCacheKeys(protect, step.OutputBuffer);
-                if (step.OutputBuffer._gpuBuffer is { } buffer) protect.Add(buffer);
+                ForwardOnlyHeterogeneousReplay.ProtectTensor(protect, step.OutputBuffer);
             }
         return protect;
     }
