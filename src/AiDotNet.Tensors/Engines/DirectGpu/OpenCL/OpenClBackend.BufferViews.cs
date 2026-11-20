@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (parent is not DirectOpenClGpuBuffer owner) return null;
             if (elementOffset < 0 || elementCount <= 0 || (long)elementOffset + elementCount > parent.Size) return null;
             var view = DirectOpenClBuffer.TryCreateView(owner.Buffer, elementOffset, elementCount);
-            return view is null ? null : new DirectOpenClGpuBuffer(view);
+            return view is null ? null : new DirectOpenClGpuBuffer(view, viewParent: owner);
         }
     }
 }

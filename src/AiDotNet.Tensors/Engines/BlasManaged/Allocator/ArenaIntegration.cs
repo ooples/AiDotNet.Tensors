@@ -43,6 +43,7 @@ internal static class ArenaIntegration
         var buffer = arena.TryAllocateUninitialized<byte>(bytes);
         if (buffer is null) return Span<byte>.Empty;  // Arena disposed.
 
+        CpuStorageAllocationDiagnostics.Record<byte>("workspace.blas_arena", bytes);
         return buffer.AsSpan(0, bytes);
     }
 

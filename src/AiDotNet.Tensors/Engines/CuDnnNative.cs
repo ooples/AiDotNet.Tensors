@@ -1746,7 +1746,7 @@ public sealed class CuDnnActivation : IDisposable
 /// High-level cuDNN convolution operations helper.
 /// Provides simplified API for neural network convolutional layers.
 /// </summary>
-public sealed class CuDnnConvolution : IDisposable
+public sealed partial class CuDnnConvolution : IDisposable
 {
     private readonly CuDnnContext _context;
     private readonly bool _ownsContext;
@@ -1757,9 +1757,9 @@ public sealed class CuDnnConvolution : IDisposable
     // the pointer in flight inside cudnnConvolutionForward.
     private readonly object _workspaceLock = new();
 
-    // cuDNN's heuristic forward algorithm per (n, c, h, w, k, r, s, pads, strides, dilations, data type, math type).
+    // cuDNN's heuristic forward algorithm per (n, c, h, w, k, r, s, pads, strides, dilations, groups, data type, math type).
     private readonly System.Collections.Concurrent.ConcurrentDictionary<
-        (int, int, int, int, int, int, int, int, int, int, int, int, int, int, int), CuDnnNative.CudnnConvolutionFwdAlgo>
+        (int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int), CuDnnNative.CudnnConvolutionFwdAlgo>
         _heuristicForward = new();
 
     // AIDOTNET_CUDNN_FWD_HEURISTIC=0 restores the fixed implicit-precomp GEMM default. Settable for tests.
@@ -1786,7 +1786,7 @@ public sealed class CuDnnConvolution : IDisposable
             filterDesc.Handle, out int on, out int oc, out int oh, out int ow), "GetConvolution2dForwardOutputDim");
         outputDesc.Set4D(dataType, on, oc, oh, ow);
         return HeuristicForwardAlgorithm(inputDesc.Handle, filterDesc.Handle, convDesc.Handle, outputDesc.Handle, mathType,
-            (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, (int)dataType, (int)mathType));
+            (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, 1, (int)dataType, (int)mathType));
     }
 
     // The bound the backend's convolution slots put on a cuDNN algorithm's workspace (CudnnCandidateMaxWorkspace).
@@ -1799,7 +1799,7 @@ public sealed class CuDnnConvolution : IDisposable
     /// </summary>
     private CuDnnNative.CudnnConvolutionFwdAlgo HeuristicForwardAlgorithm(IntPtr x, IntPtr wDesc, IntPtr conv, IntPtr y,
         CuDnnNative.CudnnMathType mathType,
-        (int, int, int, int, int, int, int, int, int, int, int, int, int, int, int) key)
+        (int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int) key)
     {
         if (!HeuristicForwardEnabled) return CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm;
         if (_heuristicForward.TryGetValue(key, out var cached)) return cached;
@@ -2059,7 +2059,7 @@ public sealed class CuDnnConvolution : IDisposable
         var algo = algorithm >= 0
             ? (CuDnnNative.CudnnConvolutionFwdAlgo)algorithm
             : HeuristicForwardAlgorithm(inputDesc.Handle, filterDesc.Handle, convDesc.Handle, outputDesc.Handle, mathType,
-                (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, (int)dataType, (int)mathType));
+                (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, 1, (int)dataType, (int)mathType));
         ulong workspaceSize;
         status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
             _context.Handle, inputDesc.Handle, filterDesc.Handle,
@@ -2347,6 +2347,7 @@ public sealed class CuDnnConvolution : IDisposable
         {
             throw new InvalidOperationException($"Failed to allocate cuDNN workspace: {result}");
         }
+        DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
 
         // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
         // recorded, so freeing it would have the graph's replays write into memory reused by something else. And a

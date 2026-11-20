@@ -1110,9 +1110,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         try
         {
-            string cacheDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "AiDotNet", "Tensors", "kernel_cache");
+            string? root = Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_CACHE_DIR");
+            string cacheDir = string.IsNullOrWhiteSpace(root)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "AiDotNet", "Tensors", "kernel_cache")
+                : Path.Combine(root, "CUDA", "Nvrtc");
             Directory.CreateDirectory(cacheDir);
             return cacheDir;
         }
@@ -1622,6 +1624,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // IGpuBatchExecution kernels shared with HIP (#1142).
         CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+        CompileKernelModule(device, BatchExecutionCudaKernels.RfftMagnitudeCudaSource, "rfft_magnitude_precise_kernels",
+            BatchExecutionCudaKernels.RfftMagnitudeKernelNames, useFastMath: false);
         // The GRU kernels again, without --use_fast_math; compiled second, so they replace the fast-math entries above.
         CompileKernelModule(device, BatchExecutionCudaKernels.GruPreciseSource, "gru_precise_kernels",
             BatchExecutionCudaKernels.GruKernelNames, useFastMath: false);
@@ -1944,6 +1948,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", BufferAllocationDiagnostics.Primitive32Bytes(data), (this, data),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (Volatile.Read(ref _cublasWarmStarted) == 0) StartCublasWarmup();
@@ -2303,6 +2310,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
@@ -2373,6 +2383,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// <inheritdoc/>
     public IGpuBuffer AllocateBufferUninitialized(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateBufferUninitialized(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (size <= 0)
@@ -2421,6 +2434,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateByteBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)size * sizeof(byte), (this, size),
+                static state => state.Item1.AllocateByteBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
@@ -10207,6 +10223,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("CUDA", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (data is null)
@@ -14322,7 +14341,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
     private static bool IsReleased(IGpuBuffer buffer)
     {
-        while (buffer is IGpuBufferViewSource view) buffer = view.ViewParent;
+        buffer = GpuBufferViewRoot.Of(buffer);
         return buffer.Handle == IntPtr.Zero || (buffer is CudaGpuBuffer cuda && cuda.IsReleased);
     }
 
@@ -19870,6 +19889,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Direct-PTX modules borrow this backend's context and stream. Unload
         // them while both handles are still alive, before pool/stream teardown.
         DisposeDirectPtxRuntime();
+        DisposeRealFftPlans();
 
         // In-flight staged uploads still own pinned slots; wait for them before the pool frees its memory.
         try { DrainStagedUploads(blockAll: true); } catch { }

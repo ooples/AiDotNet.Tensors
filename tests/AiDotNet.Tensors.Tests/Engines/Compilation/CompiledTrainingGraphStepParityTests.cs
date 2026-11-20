@@ -286,10 +286,13 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                         .GetField("_forwardSteps", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
                     var intermediate = steps.Select(st => st.OutputBuffer)
                         .First(o => !ReferenceEquals(o, lossOutput) && o._gpuBuffer is not null);
-                    var key = intermediate.GetBackingArrayForCacheLookupUnsafe()!;
+                    // A GPU training trace records intermediates with deferred host storage: no array yet, so the
+                    // download is keyed by the storage vector, as the plan's own aliasing registers it.
+                    object key = (object?)intermediate.GetBackingArrayForCacheLookupUnsafe() ?? intermediate.DataVector;
                     var released = backend.AllocateBuffer(new float[intermediate.Length]);
-                    AiDotNet.Tensors.Helpers.HostSync.Register(key, arr =>
-                        System.Array.Copy(backend.DownloadBuffer(released), (float[])arr, intermediate.Length));
+                    AiDotNet.Tensors.Helpers.HostSync.Register(key, k =>
+                        System.Array.Copy(backend.DownloadBuffer(released),
+                            k as float[] ?? ((VectorBase<float>)k).GetBackingArrayIdentity()!, intermediate.Length));
                     released.Dispose();
                     run.ReleasedIntermediatePending = AiDotNet.Tensors.Helpers.HostSync.IsPending(key);
                 }

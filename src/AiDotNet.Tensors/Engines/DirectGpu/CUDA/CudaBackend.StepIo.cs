@@ -383,7 +383,7 @@ public sealed partial class CudaBackend
             // Learning rate remains global; each leaf's accepted age comes from integer state plus its offset.
             _backend.MultiTensorAdamImpl(decoupled ? "adamw_multi_tensor_update" : "adam_multi_tensor_update",
                 parameters, gradients, firstMoments, secondMoments, sizes, 0f, beta1, beta2, epsilon, weightDecay, 1,
-                _guard, _dynamicScalars.Handle, _adamTable, _acceptedOffsets?.Handle ?? IntPtr.Zero, _state.Handle);
+                _guard, _dynamicScalars!.Handle, _adamTable, _acceptedOffsets?.Handle ?? IntPtr.Zero, _state!.Handle);
         }
 
         public void PrepareGlobalNormClip()

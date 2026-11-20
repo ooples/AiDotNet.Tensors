@@ -533,6 +533,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("Metal", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateBuffer(state.Item2));
         ThrowIfDisposed();
 
         if (data is null || data.Length == 0)
@@ -553,6 +556,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
     internal IGpuBuffer AllocateBufferCore(int size, bool zeroInitialize)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("Metal", (long)size * sizeof(float), (this, size, zeroInitialize),
+                static state => state.Item1.AllocateBufferCore(state.Item2, state.Item3));
         ThrowIfDisposed();
 
         if (size <= 0)
@@ -696,6 +702,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public IGpuBuffer AllocateByteBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("Metal", (long)size * sizeof(byte), (this, size),
+                static state => state.Item1.AllocateByteBuffer(state.Item2));
         ThrowIfDisposed();
 
         if (size <= 0)
@@ -721,6 +730,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public IGpuBuffer AllocateIntBuffer(int size)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
+            return BufferAllocationDiagnostics.Observe("Metal", (long)size * sizeof(float), (this, size),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         ThrowIfDisposed();
 
         if (size <= 0)
@@ -770,6 +782,9 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
+            return BufferAllocationDiagnostics.Observe("Metal", (long)data.Length * sizeof(float), (this, data),
+                static state => state.Item1.AllocateIntBuffer(state.Item2));
         ThrowIfDisposed();
 
         if (data is null || data.Length == 0)
