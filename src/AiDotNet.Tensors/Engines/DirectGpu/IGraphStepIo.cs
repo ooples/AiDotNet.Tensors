@@ -139,6 +139,20 @@ internal interface IGraphStepIo : IDisposable
     /// </summary>
     bool CapturedGraphReads(IntPtr graphExec, System.Collections.Generic.IReadOnlyList<IGpuBuffer> buffers);
 
+    /// <summary>
+    /// Allocates, before the capture, the scratch of <see cref="CaptureGlobalNormClip"/> (its norm record, coefficient and
+    /// reduction partials). Requires <see cref="PrepareOptimizer"/>: the clip reads the gradient table built there.
+    /// </summary>
+    void PrepareGlobalNormClip();
+
+    /// <summary>
+    /// Records, inside the capture and ahead of the update, a global L2-norm clip of the gradients
+    /// <see cref="PrepareOptimizer"/> named: their norm and the coefficient min(1, maxNorm / norm) computed on the
+    /// device, then every gradient scaled by it, with non-finite gradients handled by <paramref name="policy"/>
+    /// (not <see cref="Gpu.NonFiniteGradientPolicy.Error"/>, which needs a host read).
+    /// </summary>
+    void CaptureGlobalNormClip(float maxNorm, Gpu.NonFiniteGradientPolicy policy);
+
     /// <summary>As <see cref="CaptureSgdUpdate"/> for Adam (or AdamW when <paramref name="decoupled"/>), fp32 moments.</summary>
     void CaptureAdamUpdate(bool decoupled, System.Collections.Generic.IReadOnlyList<IGpuBuffer> parameters,
         System.Collections.Generic.IReadOnlyList<IGpuBuffer> gradients, System.Collections.Generic.IReadOnlyList<IGpuBuffer> firstMoments,

@@ -1103,6 +1103,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public bool[]? ParameterMembership { get; set; }
         public int[]? ActiveIndices { get; set; }
 
+        // ---- global-norm gradient clip captured ahead of the update (ClipNorm 0: none) ----
+        /// <summary>The clip bound the graph applies; the plan's setting when it was captured.</summary>
+        public double ClipNorm { get; set; }
+        /// <summary>The non-finite policy the captured clip applies.</summary>
+        public Engines.Gpu.NonFiniteGradientPolicy ClipPolicy { get; set; }
+
         // ---- ping-pong (null PingPong: the update runs in place in one graph) ----
         /// <summary>Each parameter's second weight buffer; the parity-1 graph reads the weights from these.</summary>
         public Engines.DirectGpu.IGpuBuffer[]? PingPong { get; set; }
@@ -3460,7 +3466,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private void RetireCapturedOptimizerIfIneligible()
     {
-        if (_capturedOptimizer is not null && (_maxGradNorm > 0.0 || _l2Regularization != 0f))
+        if (_capturedOptimizer is { } captured
+            && (_l2Regularization != 0f || captured.ClipNorm != _maxGradNorm
+                || (_maxGradNorm > 0.0 && captured.ClipPolicy != _nonFiniteGradientPolicy)))
             InvalidateCapturedStepGraph();
     }
 
@@ -3589,6 +3597,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         SyncCapturedOptimizerStep();
         _maxGradNorm = source._maxGradNorm;
         _nonFiniteGradientPolicy = source._nonFiniteGradientPolicy;
+        RetireCapturedOptimizerIfIneligible();
         target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
         target.Scalars.DAdaptationEstimate = src.Scalars.DAdaptationEstimate;
         target.Scalars.DAdaptationRAccum = src.Scalars.DAdaptationRAccum;
@@ -3751,6 +3760,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (!Enum.IsDefined(typeof(Engines.Gpu.NonFiniteGradientPolicy), policy))
             throw new ArgumentOutOfRangeException(nameof(policy), policy, "Undefined non-finite gradient policy.");
         _nonFiniteGradientPolicy = policy;
+        RetireCapturedOptimizerIfIneligible();   // a captured clip baked the previous policy in
     }
 
     public void SetMaxGradNorm(double maxNorm)
@@ -8224,8 +8234,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _capturedOptimizerFactory = () =>
         {
             ResolveDeferredFiniteness();
+            // A global-norm clip is captured with the update (its norm, coefficient and scale are device kernels), as
+            // PyTorch's foreach clip_grad_norm_ runs inside a captured step. Refusing it put every clipped model -- a
+            // DCGAN, like PyTorch's twin, clips at 1.0 -- on the eager update after each replay, whose deferred
+            // finiteness read then held the host to one step ahead of the device. Not under the Error policy, which
+            // raises from a host read of the norm record.
+            double clipNorm = _maxGradNorm;
+            var clipPolicy = _nonFiniteGradientPolicy;
             if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
-                || paramCount == 0 || _l2Regularization != 0f || _maxGradNorm > 0.0)
+                || paramCount == 0 || _l2Regularization != 0f)
+                return null;
+            if (clipNorm > 0.0 && (typeof(T) != typeof(float) || clipNorm > float.MaxValue
+                    || clipPolicy == Engines.Gpu.NonFiniteGradientPolicy.Error))
                 return null;
             ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
@@ -8248,15 +8268,23 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 capParams.Add(gp); capGrads.Add(gg); capSizes.Add(lengths[p]);
                 if (adam) { capM.Add(gpuM[p]!); capV.Add(gpuV[p]!); }
             }
-            var pingPong = !adam ? TryAllocatePingPongBuffers(capParams, capSizes, owner) : null;
+            // The ping-pong update prepares its own tables (PrepareSgdPingPong), not the gradient table the clip reads.
+            var pingPong = !adam && clipNorm <= 0.0 ? TryAllocatePingPongBuffers(capParams, capSizes, owner) : null;
+            // The eager clip's kernels (TryClipGradientsGlobalL2Gpu) over the step I/O's own gradient table and scratch,
+            // minus its host bookkeeping: the captured update's guard measures the clipped gradients, which are
+            // non-finite exactly when the originals were unless the policy zeroed their non-finite elements (then the
+            // repaired gradients are what it should measure, as the eager path does).
             var captured = new CapturedOptimizer(lrSchedule, io =>
             {
+                if (clipNorm > 0.0) io.CaptureGlobalNormClip((float)clipNorm, clipPolicy);
                 if (adam) io.CaptureAdamUpdate(optType == OptimizerType.AdamW, capParams, capGrads, capM, capV, capSizes, b1, b2, epsVal, wd);
                 else if (pingPong is not null) io.CaptureSgdPingPongUpdate(0, (float)wd);
                 else io.CaptureSgdUpdate(capParams, capGrads, capSizes, (float)wd);
             });
             captured.ParameterMembership = (bool[])_optimizerGradientMembership.Clone();
             captured.ActiveIndices = capIndices;
+            captured.ClipNorm = clipNorm;
+            captured.ClipPolicy = clipPolicy;
             captured.Prepare = io =>
             {
                 if (pingPong is not null)
@@ -8282,6 +8310,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 var capOffsets = adam ? capIndices.Select(p => _parameterAcceptedUpdates[p] - _optimizerStep).ToArray() : null;
                 io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes, capOffsets);
+                if (clipNorm > 0.0) io.PrepareGlobalNormClip();
             };
             // Binds every parameter to buffer set `set` (0: the plan's own, 1: the ping-pong second buffers) as the
             // authoritative copy everywhere it is looked up; `from` is the set the persistent weight cache names now.
@@ -9663,6 +9692,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _int8MomentBlockSize = checkpoint.Int8MomentBlockSize;
         _int8MinQuantizedLength = checkpoint.Int8MinQuantizedLength;
         _maxGradNorm = checkpoint.MaxGradNorm;
+        RetireCapturedOptimizerIfIneligible();
 
         var schedules = new LrSchedule[checkpoint.Schedules.Length];
         for (int i = 0; i < schedules.Length; i++)
