@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </list>
 /// <para><b>cuDNN Frontend Reference:</b> https://github.com/NVIDIA/cudnn-frontend</para>
 /// </remarks>
-public static class CuDnnNative
+public static partial class CuDnnNative
 {
     // cuDNN library name - try newer version first, fall back to older
     private const string CudnnLibrary = "cudnn64_9.dll";
@@ -1430,11 +1430,16 @@ public sealed class CuDnnFilterDescriptor : IDisposable
 
     /// <summary>Sets the descriptor for a 4D filter (K output channels, C input channels, H, W).</summary>
     public void Set4D(CuDnnNative.CudnnDataType dataType, int k, int c, int h, int w)
+        => Set4D(dataType, k, c, h, w, CuDnnNative.CudnnTensorFormat.NCHW);
+
+    /// <summary>As <see cref="Set4D(CuDnnNative.CudnnDataType, int, int, int, int)"/>, the filter stored in
+    /// <paramref name="format"/> (NHWC: [K, H, W, C]).</summary>
+    internal void Set4D(CuDnnNative.CudnnDataType dataType, int k, int c, int h, int w, CuDnnNative.CudnnTensorFormat format)
     {
         var status = CuDnnNative.cudnnSetFilter4dDescriptor(
             _descriptor,
             dataType,
-            CuDnnNative.CudnnTensorFormat.NCHW,
+            format,
             k, c, h, w);
         CuDnnContext.CheckStatus(status, "SetFilter4dDescriptor");
     }

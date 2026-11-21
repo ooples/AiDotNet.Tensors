@@ -23,9 +23,20 @@ public class CompiledConvChannelEpilogueStepTests : IDisposable
     private readonly IEngine _prior = AiDotNetEngine.Current;
     private readonly ITestOutputHelper _output;
 
-    public CompiledConvChannelEpilogueStepTests(ITestOutputHelper output) => _output = output;
+    private readonly bool _priorChannelsLast = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_channelsLastAtFp32;
 
-    public void Dispose() => AiDotNetEngine.Current = _prior;
+    // Channels-last is off for FP32 plans by default (measured slower); these tests exercise it where cuDNN takes it.
+    public CompiledConvChannelEpilogueStepTests(ITestOutputHelper output)
+    {
+        _output = output;
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_channelsLastAtFp32 = true;
+    }
+
+    public void Dispose()
+    {
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_channelsLastAtFp32 = _priorChannelsLast;
+        AiDotNetEngine.Current = _prior;
+    }
 
     private static Tensor<float> Rand(int[] shape, int seed, float scale, float offset = 0f)
     {
@@ -162,6 +173,8 @@ public class CompiledConvChannelEpilogueStepTests : IDisposable
         {
             var unfusedGpu = TrainUnfused(gpu, onDevice: true, batch, size, chain, transposed);
             Assert.DoesNotContain("ConvChannelEpilogue", unfusedGpu.StepNames);
+            long activationsBefore = ChannelsLastLayoutPass.ChannelsLastActivations;
+            long convolutionsBefore = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.ChannelsLastConvolutions;
             var fused = Train(gpu, onDevice: true, batch, size, chain, transposed);
             _output.WriteLine("steps unfused: " + string.Join(", ", unfusedGpu.StepNames));
             _output.WriteLine("steps fused  : " + string.Join(", ", fused.StepNames));
@@ -171,6 +184,26 @@ public class CompiledConvChannelEpilogueStepTests : IDisposable
             Assert.DoesNotContain("LeakyReLU", fused.StepNames);
             Assert.DoesNotContain("TensorBroadcastMultiply", fused.StepNames);
             AssertTrainsLike(unfusedGpu, fused, "gpu fused vs gpu unfused", 1e-5);
+            // Where the backend prefers channels-last (cuDNN tensor cores), the first layer's output -- read only by the
+            // second convolution -- is channels-last: the layout must engage and train like the all-NCHW fused plan.
+            if (gpu.PrefersChannelsLast)
+            {
+                Assert.True(ChannelsLastLayoutPass.ChannelsLastActivations > activationsBefore,
+                    "the plan kept no activation channels-last");
+                Assert.True(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.ChannelsLastConvolutions > convolutionsBefore,
+                    "no channels-last convolution ran");
+                bool prior = ChannelsLastLayoutPass.s_enabled;
+                ChannelsLastLayoutPass.s_enabled = false;
+                try
+                {
+                    var nchw = Train(gpu, onDevice: true, batch, size, chain, transposed);
+                    AssertTrainsLike(nchw, fused, "gpu channels-last vs gpu NCHW", 1e-5);
+                }
+                finally
+                {
+                    ChannelsLastLayoutPass.s_enabled = prior;
+                }
+            }
             var cpu = TrainUnfused(new CpuEngine(), onDevice: false, batch, size, chain, transposed);
             AssertTrainsLike(cpu, fused, "gpu fused vs cpu unfused", 1e-3);
         }

@@ -93,8 +93,17 @@ internal sealed class ConvChannelEpilogueFusionPattern : IFusionPattern
             absorbed.Add(leaky);
             last = leaky;
         }
-        // Worth a node of its own only past what the convolution's own epilogue fuses (a bias and a ReLU).
-        if (scale is null && shift is null && activation != ChannelEpilogueActivation.LeakyRelu) return false;
+        // Worth a node of its own past what the convolution's own epilogue fuses (a bias and a ReLU), or where the input
+        // comes from a node that can write it channels-last (this node can read it so; ConvBiasFusionPattern's cannot).
+        bool upstreamChannelsLast = ChannelsLastLayoutPass.s_enabled
+            && convInputs[0].LazySource is { } source && ChannelsLastSlot.Of(source) is not null
+            && conv.RecordingEngine.TryGet<DirectGpuTensorEngine>(out var recording) && recording.PrefersChannelsLast;
+        if (scale is null && shift is null && activation != ChannelEpilogueActivation.LeakyRelu && !upstreamChannelsLast)
+            return false;
+        var description = ChannelsLastConvolution.Describe(conv);
+        var slot = description is null ? null : new ChannelsLastSlot(conv, description, convInputs[0], outputEligible: true);
+        var x = convInputs[0];
+        var kernel = convInputs[1];
 
         var inputs = new List<Tensor<float>>(5) { convInputs[0], convInputs[1] };
         int biasIndex = bias is null ? -1 : Add(inputs, bias);
@@ -106,6 +115,20 @@ internal sealed class ConvChannelEpilogueFusionPattern : IFusionPattern
         var node = new LazyNode<float>(LazyNodeType.Custom, Name, inputs.ToArray(), last.Output,
             (eng, result) =>
             {
+                if (slot is { Any: true })
+                {
+                    // Channels-last activations (ChannelsLastLayoutPass): the convolution and the epilogue in the slot's
+                    // layouts. The plan chose them because the backend takes them, so a refusal is a defect.
+                    var device = eng.TryGet<DirectGpuTensorEngine>(out var g) ? g
+                        : throw new System.InvalidOperationException("A channels-last plan step ran on a non-GPU engine.");
+                    var convolved = slot.Convolution.Forward(device, x, kernel, slot.InputNhwc, slot.OutputNhwc)
+                        ?? throw new System.InvalidOperationException("The channels-last convolution did not run.");
+                    DirectGpuTensorEngine.CopyResultInto(eng, convolved, z);
+                    var epilogue = device.TryChannelEpilogue(z, bias, scale, shift, act, sl, slot.OutputNhwc)
+                        ?? throw new System.InvalidOperationException("The channels-last epilogue did not run.");
+                    DirectGpuTensorEngine.CopyResultInto(eng, epilogue, result);
+                    return;
+                }
                 convExecute(eng, z);   // the convolution alone; its epilogue below
                 Tensor<float>? computed = eng.TryGet<DirectGpuTensorEngine>(out var gpu)
                     ? gpu.TryChannelEpilogue(z, bias, scale, shift, act, sl)
@@ -124,7 +147,7 @@ internal sealed class ConvChannelEpilogueFusionPattern : IFusionPattern
                 DirectGpuTensorEngine.CopyResultInto(eng, computed, result);
             },
             BackwardFunctions<float>.ConvChannelEpilogueBackward,
-            new object[] { conv.BackwardFn, conv.SavedState, z, act, (double)sl, biasIndex, scaleIndex, shiftIndex })
+            new object?[] { conv.BackwardFn, conv.SavedState, z, act, (double)sl, biasIndex, scaleIndex, shiftIndex, slot }!)
         {
             RecordingEngine = conv.RecordingEngine,
         };
