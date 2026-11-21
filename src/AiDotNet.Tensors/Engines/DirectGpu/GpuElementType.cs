@@ -127,4 +127,19 @@ internal static class GpuBufferTyping
         retypable.SetElementType(type);
         return buffer;
     }
+
+    /// <summary>
+    /// Declares <paramref name="buffer"/> to hold raw bytes (<see cref="GpuElementType.Unspecified"/>) and returns it:
+    /// for a backend that serves byte buffers from allocations of another element type.
+    /// </summary>
+    public static IGpuBuffer TagRaw(IGpuBuffer buffer)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (buffer.ElementType == GpuElementType.Unspecified) return buffer;
+        if (buffer is not IRetypableGpuBuffer retypable)
+            throw new InvalidOperationException(
+                $"A {buffer.GetType().Name} holds {buffer.ElementType} elements and cannot be declared raw bytes.");
+        retypable.SetElementType(GpuElementType.Unspecified);
+        return buffer;
+    }
 }

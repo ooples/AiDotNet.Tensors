@@ -503,11 +503,14 @@ public sealed unsafe partial class VulkanBackend
     /// For example, <c>AllocateByteBuffer(10)</c> returns a buffer with <c>Size == 3</c>
     /// (3 floats = 12 bytes, enough for the requested 10 bytes).
     /// </remarks>
-    public IGpuBuffer AllocateByteBuffer(int size)
+    // This backend serves byte buffers from its float allocations; the tag says the bytes are raw, not floats.
+    public IGpuBuffer AllocateByteBuffer(int size) => GpuBufferTyping.TagRaw(AllocateByteBufferCore(size));
+
+    private IGpuBuffer AllocateByteBufferCore(int size)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
             return BufferAllocationDiagnostics.Observe("Vulkan", (long)size * sizeof(byte), (this, size),
-                static state => state.Item1.AllocateByteBuffer(state.Item2));
+                static state => state.Item1.AllocateByteBufferCore(state.Item2));
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Byte buffer size must be positive.");

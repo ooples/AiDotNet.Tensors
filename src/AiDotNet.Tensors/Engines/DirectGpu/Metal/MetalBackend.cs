@@ -704,11 +704,14 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// <summary>
     /// Allocates a byte buffer for sparse indices.
     /// </summary>
-    public IGpuBuffer AllocateByteBuffer(int size)
+    // This backend serves byte buffers from its float allocations; the tag says the bytes are raw, not floats.
+    public IGpuBuffer AllocateByteBuffer(int size) => GpuBufferTyping.TagRaw(AllocateByteBufferCore(size));
+
+    private IGpuBuffer AllocateByteBufferCore(int size)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
             return BufferAllocationDiagnostics.Observe("Metal", (long)size * sizeof(byte), (this, size),
-                static state => state.Item1.AllocateByteBuffer(state.Item2));
+                static state => state.Item1.AllocateByteBufferCore(state.Item2));
         ThrowIfDisposed();
 
         if (size <= 0)
