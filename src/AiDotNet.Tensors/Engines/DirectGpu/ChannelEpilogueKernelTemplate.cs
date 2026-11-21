@@ -22,6 +22,7 @@ internal static class ChannelEpilogueKernelTemplate
 {
     internal const string Forward = "channel_epilogue_fwd";
     internal const string Backward = "channel_epilogue_bwd";
+    internal const string Layout = "channel_layout_change";
 
     /// <summary>Every kernel's group size.</summary>
     internal const int GroupSize = 256;
@@ -56,6 +57,31 @@ internal static class ChannelEpilogueKernelTemplate
     }
 ";
 
+    // IChannelsLastBackend.TryChangeLayout: output element i of [n, c, spatial] <-> [n, spatial, c]; mode bit 0 set:
+    // to channels-last (count, channels and spatial as the epilogue's; slopeBits unused).
+    private const string LayoutBody = @"
+    int i = offset + gid;
+    if (gid < count)
+    {
+        int src;
+        if ((mode & 1) != 0)
+        {
+            int c = i % channels;
+            int t = i / channels;
+            int s = t % spatial;
+            src = ((t / spatial) * channels + c) * spatial + s;
+        }
+        else
+        {
+            int s = i % spatial;
+            int t = i / spatial;
+            int c = t % channels;
+            src = ((t / channels) * spatial + s) * channels + c;
+        }
+        lout[i] = lin[src];
+    }
+";
+
     internal static readonly string[] Ints = { "count", "channels", "spatial", "mode", "slopeBits", "offset" };
 
     /// <summary>The kernels, in this template's conventions (binding 1 written, every other binding read).</summary>
@@ -63,9 +89,10 @@ internal static class ChannelEpilogueKernelTemplate
     {
         new(Forward, new[] { "zin", "yout", "bia", "scl", "shf" }, Ints, ForwardBody),
         new(Backward, new[] { "dyin", "dzout", "yin", "scl" }, Ints, BackwardBody),
+        new(Layout, new[] { "lin", "lout" }, Ints, LayoutBody),
     };
 
-    internal static string[] GetKernelNames() => new[] { Forward, Backward };
+    internal static string[] GetKernelNames() => new[] { Forward, Backward, Layout };
 
     /// <summary>The kernels in one OpenCL C, HIP C++ or Metal Shading Language module.</summary>
     internal static string GetModuleSource(WinogradKernelDialect dialect)
@@ -136,6 +163,16 @@ internal static class PortableChannelEpilogue
                 new[] { input, output, bias ?? placeholder!, scale ?? placeholder!, shift ?? placeholder! }, (int)n, channels,
                 spatial, mode, activation == ChannelEpilogueActivation.LeakyRelu ? slope : 0f);
         }
+        return true;
+    }
+
+    /// <summary>As <see cref="IChannelsLastBackend.TryChangeLayout"/>.</summary>
+    internal static bool TryChangeLayout(Launcher launch, IGpuBuffer input, IGpuBuffer output, int batch, int channels,
+        int spatial, bool toChannelsLast)
+    {
+        if (!Shape(batch, channels, spatial, out long n) || input.Size < n || output.Size < n) return false;
+        Run(launch, ChannelEpilogueKernelTemplate.Layout, new[] { input, output }, (int)n, channels, spatial,
+            toChannelsLast ? 1 : 0, 0f);
         return true;
     }
 

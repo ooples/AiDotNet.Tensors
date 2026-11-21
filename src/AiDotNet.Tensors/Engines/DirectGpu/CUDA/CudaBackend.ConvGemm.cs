@@ -85,6 +85,10 @@ public sealed partial class CudaBackend
             _retiredScratch.Clear();
         }
         Release(ref _convNhwcScratch);
+        Release(ref _channelsLastScratchA);
+        Release(ref _channelsLastScratchB);
+        Release(ref _channelsLastScratchC);
+        Release(ref _channelsLastScratchD);
         Release(ref _convColScratch);
         Release(ref _convTransposeXt);
         Release(ref _convTransposeCol);

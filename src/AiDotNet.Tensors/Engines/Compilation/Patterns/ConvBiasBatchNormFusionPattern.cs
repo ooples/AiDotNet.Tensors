@@ -101,9 +101,46 @@ internal sealed class ConvBiasBatchNormFusionPattern : IFusionPattern
         var kernel = convInputs[1];
         var convExecute = conv.Execute;
         var innerExecute = inner.Execute;
+        // Channels-last (ChannelsLastLayoutPass): the BatchNorm over a channels-last z takes ReLU and LeakyReLU (not
+        // ReLU6) and channel counts in fours.
+        int act = activation.OpType == LazyNodeType.ReLU ? 1 : activation.OpName == "LeakyReLU" ? 2 : 0;
+        float actSlope = slope is { } sv ? (float)sv : 0f;
+        var description = ChannelsLastConvolution.Describe(conv);
+        var slot = description is null ? null
+            : new ChannelsLastSlot(conv, description, x, outputEligible: act != 0 && (z.Shape._dims[1] & 3) == 0);
+        var varianceOutputs = new List<Tensor<float>>(statistics.Count);
+        foreach (var statistic in statistics)
+            if (statistic.OpName != "BatchNormBatchMean") varianceOutputs.Add(statistic.Output);
+        double bnEpsilon = epsilon;
         var node = new LazyNode<float>(LazyNodeType.Custom, Name, new[] { x, kernel, bias, gamma, beta }, activation.Output,
             (eng, result) =>
             {
+                if (slot is { Any: true })
+                {
+                    var device = eng.TryGet<DirectGpuTensorEngine>(out var g) ? g
+                        : throw new System.InvalidOperationException("A channels-last plan step ran on a non-GPU engine.");
+                    var convolved = slot.Convolution.Forward(device, x, kernel, slot.InputNhwc, slot.OutputNhwc)
+                        ?? throw new System.InvalidOperationException("The channels-last convolution did not run.");
+                    DirectGpuTensorEngine.CopyResultInto(eng, convolved, z);
+                    if (slot.OutputNhwc)
+                    {
+                        var normalized = device.TryBatchNormChannelsLast(z, gamma, beta, bnEpsilon, act, actSlope,
+                                out var freshMean, out var freshVar)
+                            ?? throw new System.InvalidOperationException("The channels-last BatchNorm did not run.");
+                        DirectGpuTensorEngine.CopyResultInto(eng, normalized, result);
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshMean!, mean);
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshVar!, variance);
+                        foreach (var varianceOutput in varianceOutputs)
+                            DirectGpuTensorEngine.CopyResultInto(eng, variance, varianceOutput);
+                    }
+                    else
+                    {
+                        innerExecute(eng, result);
+                    }
+                    foreach (var meanOutput in meanOutputs)
+                        DirectGpuTensorEngine.CopyResultInto(eng, eng.TensorAdd(mean, bias), meanOutput);
+                    return;
+                }
                 convExecute(eng, z);        // the convolution alone: its bias cancels in the BatchNorm
                 innerExecute(eng, result);  // BatchNorm + activation, writing the batch statistics of z
                 // Out of place: the inner node may have aliased a batch-mean output to the saved mean its backward
@@ -115,7 +152,8 @@ internal sealed class ConvBiasBatchNormFusionPattern : IFusionPattern
                 }
             },
             BackwardFunctions<float>.ConvBiasBatchNormBackward,
-            new object[] { conv.BackwardFn, conv.SavedState, innerBackward, inner.SavedState!, z })
+            new object?[] { conv.BackwardFn, conv.SavedState, innerBackward, inner.SavedState!, z, slot, act,
+                (double)actSlope }!)
         {
             RecordingEngine = conv.RecordingEngine,
         };

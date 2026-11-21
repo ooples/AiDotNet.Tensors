@@ -58,6 +58,9 @@ public enum TunedKernelOp
     ConvTranspose2DBackwardData,
     /// <summary>Transposed 2-D convolution gradient with respect to the filter.</summary>
     ConvTranspose2DBackwardFilter,
+    /// <summary>A 2-D convolution pass (forward, data or filter gradient) with a layout per activation, one of them
+    /// channels-last (IChannelsLastBackend).</summary>
+    ChannelsLastConvolution,
 }
 
 /// <summary>Where a registered candidate came from.</summary>
