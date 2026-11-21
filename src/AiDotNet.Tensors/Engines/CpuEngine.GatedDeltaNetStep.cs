@@ -36,7 +36,7 @@ public partial class CpuEngine
         Tensor<T> alpha, Tensor<T> beta, GatedDeltaRule rule, int rows, int dv, int dk)
     {
         var (keyScale, decayFirst) = GatedDeltaRuleTerms(rule, dk);
-        var scaledKey = keyScale == 1.0 ? key : TensorMultiplyScalar(key, MathHelper.GetNumericOperations<T>().FromDouble(keyScale));
+        var scaledKey = keyScale.Equals(1.0) ? key : TensorMultiplyScalar(key, MathHelper.GetNumericOperations<T>().FromDouble(keyScale));
         var a = Reshape(alpha, new[] { rows, 1, 1 });
         var pred = BatchMatMul(state, Reshape(scaledKey, new[] { rows, dk, 1 }));                 // S k'  [rows, dv, 1]
         if (decayFirst) pred = TensorMultiply(pred, a);                                           // alpha S k'

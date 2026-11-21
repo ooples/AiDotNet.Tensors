@@ -571,9 +571,11 @@ internal sealed class LazyTensorScope : IDisposable
     {
         var root = this;
         while (root._parent is not null) root = root._parent;
-        foreach (var target in targets.Where(t => t.LazySource is null))
+        var bank = root;
+        // Evaluated as the loop advances, so a target listed twice is snapshotted once: the second sees the first's entry.
+        foreach (var target in targets.Where(t => t.LazySource is null
+            && bank._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, t)) != true))
         {
-            if (root._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, target)) == true) continue;
             var snapshot = new Tensor<T>((int[])target._shape.Clone(), new Vector<T>(target.ToArray()));
             (root._traceStateSnapshots ??= new()).Add((node, target, snapshot));
         }

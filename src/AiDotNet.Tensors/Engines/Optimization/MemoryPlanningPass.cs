@@ -75,8 +75,8 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
             ReferenceEqualityComparer<Tensor<T>>.Instance);
         for (int i = 0; i < steps.Length; i++)
         {
-            foreach (var input in steps[i].Inputs)
-                if (!producedHere.Contains(input)) readBeforeProduced.Add(input);
+            foreach (var input in steps[i].Inputs.Where(input => !producedHere.Contains(input)))
+                readBeforeProduced.Add(input);
             if (!readBeforeProduced.Contains(steps[i].OutputBuffer)) producedHere.Add(steps[i].OutputBuffer);
         }
 
