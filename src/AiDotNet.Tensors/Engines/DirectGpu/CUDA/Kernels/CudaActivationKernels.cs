@@ -1365,6 +1365,53 @@ extern ""C"" __global__ __launch_bounds__(256) void conv_epilogue_nhwc_nchw(cons
     }
 }
 
+// A convolution's per-channel epilogue in one pass (IChannelEpilogueBackend): y = act(((z + bias[c]) * scale[c]) +
+// shift[c]) over NCHW, each of bias / scale / shift optional (null skips it). Each step is rounded on its own (__fadd_rn
+// and __fmul_rn: no fused multiply-add), and the activations are the relu (relu_nan_safe) and leaky_relu kernels'
+// expressions, so the values equal the separate conv2d_bias_add, broadcast multiply, broadcast add and activation passes
+// bit for bit. act: 0 none, 1 ReLU, 2 LeakyReLU(slope). Grid (ceil(spatial / 256), min(rows, 65535)), rows = batch *
+// channels; the y blocks stride over rows past the grid.
+extern ""C"" __global__ __launch_bounds__(256) void channel_epilogue_fwd(const float* __restrict__ z,
+    const float* __restrict__ bias, const float* __restrict__ scale, const float* __restrict__ shift,
+    float* __restrict__ y, int rows, int channels, int spatial, int act, float slope)
+{
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial) return;
+    for (int row = blockIdx.y; row < rows; row += gridDim.y)
+    {
+        const int c = row % channels;
+        const long long i = (long long)row * spatial + s;
+        float v = z[i];
+        if (bias != nullptr) v = __fadd_rn(v, __ldg(&bias[c]));
+        if (scale != nullptr) v = __fmul_rn(v, __ldg(&scale[c]));
+        if (shift != nullptr) v = __fadd_rn(v, __ldg(&shift[c]));
+        if (act == 1) v = relu_nan_safe(v);
+        else if (act == 2) v = v > 0.0f ? v : __fmul_rn(slope, v);
+        y[i] = v;
+    }
+}
+
+// The epilogue's backward to z: dz = act'(y) * dy * scale[c], the mask from the forward's output (its input's sign for
+// ReLU and a positive LeakyReLU slope), as relu_backward / leaky_relu_backward and the broadcast multiply's backward
+// compute it. Grid as channel_epilogue_fwd.
+extern ""C"" __global__ __launch_bounds__(256) void channel_epilogue_bwd(const float* __restrict__ dy,
+    const float* __restrict__ y, const float* __restrict__ scale, float* __restrict__ dz, int rows, int channels,
+    int spatial, int act, float slope)
+{
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial) return;
+    for (int row = blockIdx.y; row < rows; row += gridDim.y)
+    {
+        const int c = row % channels;
+        const long long i = (long long)row * spatial + s;
+        float g = dy[i];
+        if (act == 1) g = y[i] > 0.0f ? g : 0.0f;
+        else if (act == 2) g = y[i] > 0.0f ? g : __fmul_rn(slope, g);
+        if (scale != nullptr) g = __fmul_rn(g, __ldg(&scale[c]));
+        dz[i] = g;
+    }
+}
+
 // ===========================================================================
 // TRIGONOMETRIC KERNELS
 // ===========================================================================
@@ -1789,6 +1836,8 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "bias_add_out",
                 "conv2d_bias_add",
                 "conv_epilogue_nhwc_nchw",
+                "channel_epilogue_fwd",
+                "channel_epilogue_bwd",
                 "conv2d_bias_add_out",
                 // Vectorized (float4) unary
                 "relu_vec4",
