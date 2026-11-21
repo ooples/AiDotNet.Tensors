@@ -45,13 +45,41 @@ internal static class GpuDriverCrossPlatformResolver
 
     private static IntPtr Resolve(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
     {
-        foreach (var candidate in LoadOrder(libraryName))
+        var candidates = LoadOrder(libraryName);
+        foreach (var candidate in candidates)
         {
             if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out var handle))
                 return handle;
         }
+
+        if (candidates.Length > 0 && IsCudaToolkitLibrary(libraryName))
+        {
+            bool windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            foreach (var dir in CuBlasNative.GetCudaBinDirectories())
+            {
+                foreach (var candidate in candidates)
+                {
+                    string fileName = windows && !candidate.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                        ? candidate + ".dll"
+                        : candidate;
+                    if (NativeLibrary.TryLoad(System.IO.Path.Combine(dir, fileName), out var handle))
+                        return handle;
+                }
+            }
+        }
+
         return IntPtr.Zero;
     }
+
+    private static bool IsCudaToolkitLibrary(string libraryName) =>
+        IsNvrtc(libraryName) ||
+        libraryName.StartsWith("cudart64_", StringComparison.Ordinal) ||
+        libraryName.StartsWith("libcudart", StringComparison.Ordinal) ||
+        libraryName.Equals("cublasLt", StringComparison.Ordinal) ||
+        libraryName.StartsWith("cublasLt64_", StringComparison.Ordinal) ||
+        libraryName.StartsWith("libcublasLt", StringComparison.Ordinal) ||
+        libraryName.StartsWith("cublas64_", StringComparison.Ordinal) ||
+        libraryName.StartsWith("libcublas", StringComparison.Ordinal);
 
     /// <summary>
     /// The names <see cref="Resolve"/> tries, in order, for a requested library; empty when the name is not one of ours.
