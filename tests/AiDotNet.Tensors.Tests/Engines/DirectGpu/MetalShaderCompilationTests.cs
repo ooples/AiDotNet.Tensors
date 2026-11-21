@@ -95,6 +95,8 @@ public sealed class MetalShaderCompilationTests
         yield return ("ConvDgradS2", () => ConvDgradS2KernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict: false, as MetalBackend.ConvTransposeGemm compiles it (the two-argument overload).
         yield return ("ConvTransposeGemm", () => ConvTransposeGemmKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
+        // Strict: false, as MetalBackend.ChannelEpilogue compiles it.
+        yield return ("ChannelEpilogue", () => ChannelEpilogueKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), false);
         // Strict, as MetalBackend.NumericRecurrence compiles it: the log-domain lattice and the assignment's comparisons.
         yield return ("NumericRecurrence", () => NumericRecurrenceKernelTemplate.GetModuleSource(WinogradKernelDialect.Metal), true);
         // Strict, as MetalBackend.DataTransform compiles it: the exact threshold and rounding comparisons.
