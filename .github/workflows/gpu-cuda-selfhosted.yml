@@ -632,6 +632,9 @@ jobs:
         SUITE_FILTER: ${{ inputs.suite_filter }}
         CUDNN_LOGERR_DBG: '1'
         CUDNN_LOGDEST_DBG: ${{ runner.temp }}/trx/cudnn-errors.log
+        # Why a backend came up unavailable. A CUDA test that skips says only "CUDA is not available"; the backend traces
+        # the cause, and the test assembly appends those lines here (GpuInitializationFailureLog).
+        AIDOTNET_GPU_INIT_FAILURE_LOG: ${{ runner.temp }}/trx/gpu-init-failures.log
         # Blame dumps a test host only when no test starts or finishes for 15 minutes. Two runs on 2026-11-08 sat in
         # this step past two hours without it firing, and the job timeout then cancelled the job, which skips the
         # failure-only stack step below. The watchdog bounds the step instead: past the limit it prints each test
@@ -923,6 +926,15 @@ jobs:
                             @{ Title = 'CUDA (${{ steps.gpu.outputs.sm }}) torch interop'; Trx = 'cuda-torch-interop.trx' })
         if ($env:SUITE_FILTER) {
           $parts = @(@{ Title = 'CUDA (${{ steps.gpu.outputs.sm }}) targeted'; Trx = 'cuda-targeted.trx' })
+        }
+        # The causes behind any "not available" skip below, most frequent first.
+        $initLog = "${{ runner.temp }}/trx/gpu-init-failures.log"
+        if (Test-Path $initLog) {
+          Write-Host 'Backend initialization failures traced during the suites:'
+          Get-Content $initLog | ForEach-Object { ($_ -split ' ', 2)[1] } | Group-Object | Sort-Object Count -Descending |
+            Select-Object -First 20 | ForEach-Object { Write-Host ("  {0}x {1}" -f $_.Count, $_.Name) }
+        } else {
+          Write-Host 'No backend initialization failure was traced during the suites.'
         }
         foreach ($part in $parts) {
           python AiDotNet.Tensors/scripts/ci/summarize-test-skips.py --title $part.Title --fail-on-skip `
