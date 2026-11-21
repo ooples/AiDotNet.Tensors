@@ -137,11 +137,11 @@ jobs:
     # parts at their full watchdogs with the diagnostics between them (about 5 minutes), and the 30-minute reserve:
     # 20 + 15 + 140 + 5 + 90 + 30 = 300 on the slowest cuda-pr runner, 20 + 30 + 130 + 5 + 85 + 30 = 300 on sm75/sm89.
     # A DirectGpu overrun then still leaves the second part its whole watchdog, so it keeps its TRX.
-    # pr-models: setup and the model families (about 18 minutes, bounded at 26).
+    # pr-models: setup (20), the quiet-GPU wait (15), AiDotNet's build (30) and the model families (20): 85.
     # sm86: setup (20), the quiet-GPU wait before the suites (60), the suite parts (115 + 50) with diagnostics (5), torch
-    # interop (5), the model families (26), the quiet-GPU wait before the timings (60) and the nightly ratchet (360):
-    # 701, so 720.
-    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || matrix.arch == 'pr-models' && 60 || 720 }}
+    # interop (5), AiDotNet's build (30), the model families (20), the quiet-GPU wait before the timings (60) and the
+    # nightly ratchet (360): 725, so 750.
+    timeout-minutes: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || matrix.arch == 'pr-models' && 85 || 750 }}
     env:
       # The tests this lane runs. It selects by name, so a GPU test outside these terms never runs on CUDA; the
       # coverage check below fails the lane when a test class that drives the GPU engine is not selected. A term
@@ -652,7 +652,7 @@ jobs:
         SUITE_WATCHDOG_DIRECTGPU_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '115' || matrix.arch == 'pr' && '140' || '130' }}
         SUITE_WATCHDOG_REST_MINUTES: ${{ (matrix.arch == 'sm86' || (matrix.arch == 'pr' && steps.gpu.outputs.sm == 'sm86')) && '50' || matrix.arch == 'pr' && '90' || '85' }}
         # Must equal the job's timeout-minutes.
-        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || 720 }}
+        JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || 750 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
@@ -994,13 +994,12 @@ jobs:
 
 
 
-    - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
+    - name: Build AiDotNet against this checkout
       if: (matrix.arch == 'sm86' || matrix.arch == 'pr-models') && !inputs.ratchets_only && !inputs.suite_filter
-      # About 18 minutes in a passing run (6 of them building AiDotNet); bounded so the job budget above holds.
-      # densenet121's training hung on 2026-11-08 (main) and 2026-11-12 (#1724) and passed in 15 s in between; the step
-      # timeout killed it with nothing printed. A watchdog 20 minutes in prints the GPU's processes and the managed
-      # stacks of the benchmark process, then stops it, leaving the rest of the 26 minutes for the diagnostics.
-      timeout-minutes: 26
+      # Its own step and budget: the build took 6 minutes when the model watchdog was sized and 18 by 2026-11-21, which
+      # left the six families (8 to 20 seconds each) two minutes of a 20-minute watchdog and failed the job on the
+      # build's duration (#1797). A slow build now fails here, named as a build.
+      timeout-minutes: 30
       # Builds AiDotNet against this checkout (UseLocalTensors resolves ../../AiDotNet.Tensors from aidn/src), so the
       # model families exercise exactly this commit's kernels; the families were checked at the start of the job.
       run: |
@@ -1017,15 +1016,23 @@ jobs:
           Write-Output "AiDotNet.Evolution: AiDotNet pins $($pin.Groups[2].Value), this Tensors needs $want; using $want."
           Set-Content $props ($text.Remove($pin.Groups[2].Index, $pin.Groups[2].Length).Insert($pin.Groups[2].Index, $want)) -NoNewline
         }
+        dotnet build aidn/benchmarks/AiDotNet.PyTorchParity -c Release -p:UseLocalTensors=true
+        if ($LASTEXITCODE -ne 0) { Write-Output "::error::AiDotNet did not build against this checkout."; exit 1 }
+
+    - name: AiDotNet model families on CUDA (2 training steps, inference up to batch 128)
+      if: (matrix.arch == 'sm86' || matrix.arch == 'pr-models') && !inputs.ratchets_only && !inputs.suite_filter
+      # A passing run is about two minutes. densenet121's training hung on 2026-11-08 (main) and 2026-11-12 (#1724) and
+      # passed in 15 s in between; the step timeout killed it with nothing printed. A watchdog 14 minutes in prints the
+      # GPU's processes and the managed stacks of the benchmark process, then stops it, leaving the rest of the 20
+      # minutes for the diagnostics.
+      timeout-minutes: 20
+      run: |
         # A process per family releases the CUDA context and every cached allocation before the next model.
         # DenseNet inference stalled at 11.8/12 GiB after nine earlier families in run 43219966801.
-        # Keep one overall deadline, including the first host's build, so isolation cannot multiply the job budget.
-        $modelDeadline = (Get-Date).AddMinutes(20)
-        $firstModel = $true
+        # Keep one overall deadline, so isolation cannot multiply the job budget. The previous step built the project.
+        $modelDeadline = (Get-Date).AddMinutes(14)
         foreach ($model in ($env:MODEL_FAMILIES -split ',')) {
-        $buildOption = if ($firstModel) { '' } else { '--no-build ' }
-        $firstModel = $false
-          $runArgs = 'run -c Release ' + $buildOption + '--project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- ' +
+          $runArgs = 'run -c Release --no-build --project aidn/benchmarks/AiDotNet.PyTorchParity -p:UseLocalTensors=true -- ' +
             "--models $model --device cuda --epochs 1 --train-batches 2 --batch-size 64 " +
             "--inference-iterations 3 --warmup-iterations 1 --output `"${{ runner.temp }}/aidotnet-cuda-$model.json`""
           $remainingMs = [Math]::Max(0, [int]($modelDeadline - (Get-Date)).TotalMilliseconds)
@@ -1038,7 +1045,7 @@ jobs:
             continue
           }
 
-          Write-Output "::error::AiDotNet model family $model was still running at the overall 20-minute watchdog."
+          Write-Output "::error::AiDotNet model family $model was still running at the overall 14-minute watchdog."
           try {
             # This run's processes only: the dotnet host and the benchmark it started (dotnet run builds, then runs it).
             $all = @(Get-CimInstance Win32_Process)

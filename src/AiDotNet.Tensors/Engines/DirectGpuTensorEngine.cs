@@ -29457,7 +29457,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     T IEngine.Sum<T>(Vector<T> v)
     {
         using var __gpuOp = EnterGpuOp();
-        if (TryGetBackend(out var b))
+        // The kernel reduces float buffers; any other T is the CPU engine's (a double vector cast to Vector<float>
+        // threw InvalidCastException once #1203 stopped swallowing faults here).
+        // Validated before the upload dereferences it, as the CPU engine validates its operand.
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        // An empty vector is the CPU engine's to answer (its result or its argument error): a backend cannot allocate
+        // a zero-length buffer.
+        if (typeof(T) == typeof(float) && v.Length > 0 && TryGetBackend(out var b))
         {
             try
             {
@@ -29467,7 +29473,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 b.SumAxis(gi, go, 1, v.Length);
                 return (T)(object)b.DownloadBuffer(go)[0];
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SwishInPlace", capabilityGap); }
+            // An allocation over the device cap is a capacity limit, not a fault: the cap policy decides, and a
+            // null result means the CPU engine computes this call.
+            catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex) { HandleBufferTooLarge<T>(ex, "Sum"); }
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Sum", capabilityGap); }
         }
         return base.Sum(v);
     }
@@ -29475,7 +29484,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     T IEngine.Mean<T>(Vector<T> v)
     {
         using var __gpuOp = EnterGpuOp();
-        if (TryGetBackend(out var b))
+        // Validated before the upload dereferences it, as the CPU engine validates its operand.
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        // An empty vector is the CPU engine's to answer (its result or its argument error): a backend cannot allocate
+        // a zero-length buffer.
+        if (typeof(T) == typeof(float) && v.Length > 0 && TryGetBackend(out var b))
         {
             try
             {
@@ -29485,7 +29498,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 b.ReduceMean(gi, go, v.Length);
                 return (T)(object)b.DownloadBuffer(go)[0];
             }
-            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("SwishInPlace", capabilityGap); }
+            // An allocation over the device cap is a capacity limit, not a fault: the cap policy decides, and a
+            // null result means the CPU engine computes this call.
+            catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex) { HandleBufferTooLarge<T>(ex, "Mean"); }
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("Mean", capabilityGap); }
         }
         return base.Mean(v);
     }
@@ -31779,7 +31795,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     T IEngine.DotProduct<T>(Vector<T> a, Vector<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
-        if (TryGetBackend(out var b))
+        // Float only, as Sum: for any other T the cast below threw on every call and the bare catch hid it.
+        // Validated before the upload dereferences them, as the CPU engine validates its operands.
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b2 is null) throw new ArgumentNullException(nameof(b2));
+        // Unequal or empty operands are the CPU engine's to answer (its argument error or its result): the kernel
+        // would read a.Length elements of both buffers, past the end of a shorter b2.
+        if (typeof(T) == typeof(float) && a.Length == b2.Length && a.Length > 0 && TryGetBackend(out var b))
         {
             try
             {
@@ -31789,7 +31811,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 b.BatchDotProduct(ga, gb, go, 1, a.Length);
                 return (T)(object)b.DownloadBuffer(go)[0];
             }
-            catch { }
+            // An allocation over the device cap is a capacity limit, not a fault: the cap policy decides, and a
+            // null result means the CPU engine computes this call.
+            catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException ex) { HandleBufferTooLarge<T>(ex, "DotProduct"); }
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("DotProduct", capabilityGap); }
         }
         return base.DotProduct(a, b2);
     }
