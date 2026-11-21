@@ -318,8 +318,8 @@ public sealed partial class CudaBackend : IChannelsLastBackend
             || input.Size < n || output.Size < n || gamma.Size < channels || beta.Size < channels
             || saveMean.Size < channels || saveVariance.Size < channels
             || !_kernelCache.TryGetValue("batchnorm_nhwc_stats", out var stats)
-            || !_kernelCache.TryGetValue("batchnorm_nhwc_finalize", out var finalize)
-            || !_kernelCache.TryGetValue("batchnorm_nhwc_apply", out var apply))
+            || !_kernelCache.TryGetValue("batchnorm_nhwc_finalize", out var fwdFinalize)
+            || !_kernelCache.TryGetValue("batchnorm_nhwc_apply", out var fwdApply))
             return false;
         int splits = BatchNormNhwcSplits(rows, channels);
         lock (_batchNormSplitLock)
@@ -336,11 +336,11 @@ public sealed partial class CudaBackend : IChannelsLastBackend
             LaunchKernel2D(stats, (uint)((channels / 4 + 31) / 32), (uint)splits, 1, 32, 8, statArgs);
             void** finArgs = stackalloc void*[6];
             finArgs[0] = &pi; finArgs[1] = &pp; finArgs[2] = &pm; finArgs[3] = &pv; finArgs[4] = &c; finArgs[5] = &sp;
-            LaunchKernel(finalize, (uint)channels, BatchNormNhwcFinalizeThreads(splits), finArgs);
+            LaunchKernel(fwdFinalize, (uint)channels, BatchNormNhwcFinalizeThreads(splits), finArgs);
             void** args = stackalloc void*[11];
             args[0] = &pi; args[1] = &po; args[2] = &pg; args[3] = &pb; args[4] = &pm; args[5] = &pv; args[6] = &quads;
             args[7] = &c; args[8] = &eps; args[9] = &a; args[10] = &sl;
-            LaunchKernel(apply, ElementwiseBlocks(quads), DefaultBlockSize, args);
+            LaunchKernel(fwdApply, ElementwiseBlocks(quads), DefaultBlockSize, args);
         }
         System.Threading.Interlocked.Increment(ref ChannelsLastBatchNorms);
         return true;
@@ -360,8 +360,8 @@ public sealed partial class CudaBackend : IChannelsLastBackend
             || gamma.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
             || gradGamma.Size < channels || gradBeta.Size < channels
             || !_kernelCache.TryGetValue("batchnorm_nhwc_bwd_reduce", out var reduce)
-            || !_kernelCache.TryGetValue("batchnorm_nhwc_bwd_finalize", out var finalize)
-            || !_kernelCache.TryGetValue("batchnorm_nhwc_bwd_apply", out var apply))
+            || !_kernelCache.TryGetValue("batchnorm_nhwc_bwd_finalize", out var bwdFinalize)
+            || !_kernelCache.TryGetValue("batchnorm_nhwc_bwd_apply", out var bwdApply))
             return false;
         int splits = BatchNormNhwcSplits(rows, channels);
         lock (_batchNormSplitLock)
@@ -381,12 +381,12 @@ public sealed partial class CudaBackend : IChannelsLastBackend
             LaunchKernel2D(reduce, (uint)((channels / 4 + 31) / 32), (uint)splits, 1, 32, 8, reduceArgs);
             void** finArgs = stackalloc void*[5];
             finArgs[0] = &pp; finArgs[1] = &pdg; finArgs[2] = &pdb; finArgs[3] = &c; finArgs[4] = &sp;
-            LaunchKernel(finalize, (uint)channels, BatchNormNhwcFinalizeThreads(splits), finArgs);
+            LaunchKernel(bwdFinalize, (uint)channels, BatchNormNhwcFinalizeThreads(splits), finArgs);
             void** args = stackalloc void*[18];
             args[0] = &pdy; args[1] = &pms; args[2] = &pdy2; args[3] = &px; args[4] = &pg; args[5] = &pm; args[6] = &pv;
             args[7] = &pdg; args[8] = &pdb; args[9] = &pdx; args[10] = &quads; args[11] = &c; args[12] = &eps;
             args[13] = &mode; args[14] = &a; args[15] = &sl; args[16] = &acc; args[17] = &invN;
-            LaunchKernel(apply, ElementwiseBlocks(quads), DefaultBlockSize, args);
+            LaunchKernel(bwdApply, ElementwiseBlocks(quads), DefaultBlockSize, args);
         }
         System.Threading.Interlocked.Increment(ref ChannelsLastBatchNorms);
         return true;
@@ -397,7 +397,7 @@ public sealed partial class CudaBackend : IChannelsLastBackend
     {
         long n = (long)batch * channels * spatial;
         if (!IsAvailable || batch <= 0 || channels <= 0 || spatial <= 0 || batch > MaxGridDimY || n > int.MaxValue
-            || input.Size < n || output.Size < n || !_kernelCache.TryGetValue("layout_transpose_tiles", out var kernel))
+            || input.Size < n || output.Size < n || !_kernelCache.TryGetValue("layout_transpose_tiles", out var layoutKernel))
             return false;
         int rows = toChannelsLast ? channels : spatial, cols = toChannelsLast ? spatial : channels;
         if ((rows + 31) / 32 > MaxGridDimY) return false;
@@ -405,7 +405,7 @@ public sealed partial class CudaBackend : IChannelsLastBackend
         IntPtr pi = input.Handle, po = output.Handle;
         void** args = stackalloc void*[4];
         args[0] = &pi; args[1] = &po; args[2] = &rows; args[3] = &cols;
-        LaunchKernel2D(kernel, (uint)((cols + 31) / 32), (uint)((rows + 31) / 32), (uint)batch, 32, 8, args);
+        LaunchKernel2D(layoutKernel, (uint)((cols + 31) / 32), (uint)((rows + 31) / 32), (uint)batch, 32, 8, args);
         return true;
     }
 }
