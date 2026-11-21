@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Double-precision device reductions (<see cref="IGpuFloat64Reductions"/>): the device result must be a double result,
 /// not a float one widened, at every size that crosses a work-group boundary.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class GpuFloat64ReductionTests
 {
     private static readonly int[] Sizes = { 1, 2, 3, 31, 255, 256, 257, 4097, 65_536, 100_003 };
@@ -115,5 +116,73 @@ public class GpuFloat64ReductionTests
         Assert.Throws<ArgumentException>(() => reductions.DotFloat64(doubles, floats, 8));
         Assert.Throws<ArgumentOutOfRangeException>(() => reductions.SumFloat64(doubles, 9));
         Assert.Throws<ArgumentOutOfRangeException>(() => reductions.DotFloat64(doubles, doubles, -1));
+    }
+
+    // Engine level. A vector's values live on the host, so the engine sends a double reduction to the device only from
+    // DirectGpuTensorEngine.Float64ReductionMinLength; either side of it the answer is the CPU engine's.
+    [SkippableTheory]
+    [InlineData(1000)]
+    [InlineData(DirectGpuTensorEngine.Float64ReductionMinLength - 1)]
+    [InlineData(DirectGpuTensorEngine.Float64ReductionMinLength)]
+    [InlineData(DirectGpuTensorEngine.Float64ReductionMinLength + 4097)]
+    public void Engine_DoubleVectorReductions_EqualTheCpuEngine(int length)
+    {
+        Skip.If(AiDotNetEngine.Current is not DirectGpuTensorEngine, "Not a DirectGpu engine.");
+        var gpu = (IEngine)AiDotNetEngine.Current;
+        var cpu = (IEngine)new CpuEngine();
+        var left = new double[length];
+        var right = new double[length];
+        for (int i = 0; i < length; i++)
+        {
+            // Dyadic values whose sums and products are exact in double, so the device's tree order and the CPU's
+            // running order must agree to the last bit.
+            left[i] = ((i * 13 % 257) - 128) / 16.0;
+            right[i] = ((i * 7 % 129) - 64) / 8.0;
+        }
+
+        var a = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(left);
+        var b = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(right);
+        Assert.Equal(cpu.Sum(a), gpu.Sum(a));
+        Assert.Equal(cpu.Mean(a), gpu.Mean(a));
+        Assert.Equal(cpu.DotProduct(a, b), gpu.DotProduct(a, b));
+        Assert.Equal(cpu.DotProduct(a, a), gpu.DotProduct(a, a));
+    }
+
+    [SkippableFact]
+    public void Engine_VectorReductions_OfOtherElementTypes_AnswerAsTheCpuEngine()
+    {
+        Skip.If(AiDotNetEngine.Current is not DirectGpuTensorEngine, "Not a DirectGpu engine.");
+        var gpu = (IEngine)AiDotNetEngine.Current;
+        var cpu = (IEngine)new CpuEngine();
+        var ints = new AiDotNet.Tensors.LinearAlgebra.Vector<int>(new[] { 3, -4, 5, 100 });
+        var longs = new AiDotNet.Tensors.LinearAlgebra.Vector<long>(new[] { 1L << 40, -7L, 9L });
+        var floats = new AiDotNet.Tensors.LinearAlgebra.Vector<float>(new[] { 1.5f, -2.25f, 4f, 0.125f });
+        Assert.Equal(cpu.Sum(ints), gpu.Sum(ints));
+        Assert.Equal(cpu.DotProduct(ints, ints), gpu.DotProduct(ints, ints));
+        Assert.Equal(cpu.Sum(longs), gpu.Sum(longs));
+        Assert.Equal(cpu.Mean(longs), gpu.Mean(longs));
+        Assert.Equal(cpu.Sum(floats), gpu.Sum(floats));
+        Assert.Equal(cpu.DotProduct(floats, floats), gpu.DotProduct(floats, floats));
+        Assert.Throws<ArgumentNullException>(() => gpu.Sum<double>(null!));
+    }
+
+    // The equality tests pass whichever side computes. This one pins the routing: the device answers from the threshold
+    // up (its scalar comes back as a readback) and the CPU answers below it (nothing is read back).
+    [SkippableFact]
+    public void Engine_DoubleVectorSum_RunsOnTheDevice_FromTheThresholdUp_AndOnTheCpuBelowIt()
+    {
+        Skip.If(Device() is null, "No device with double-precision reductions on this host.");
+        var gpu = (IEngine)AiDotNetEngine.Current;
+        var large = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(new double[DirectGpuTensorEngine.Float64ReductionMinLength]);
+        var small = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(new double[DirectGpuTensorEngine.Float64ReductionMinLength - 1]);
+
+        long before = GpuLaunchProbe.Readbacks;
+        gpu.Sum(large);
+        long afterLarge = GpuLaunchProbe.Readbacks;
+        gpu.Sum(small);
+        long afterSmall = GpuLaunchProbe.Readbacks;
+
+        Assert.True(afterLarge > before, "A double sum at the threshold did not read a result back from the device.");
+        Assert.Equal(afterLarge, afterSmall);
     }
 }

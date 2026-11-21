@@ -29457,7 +29457,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     T IEngine.Sum<T>(Vector<T> v)
     {
         using var __gpuOp = EnterGpuOp();
-        if (TryGetBackend(out var b))
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (v is Vector<double> doubles && TrySumFloat64(doubles, out double doubleSum))
+            return (T)(object)doubleSum;
+        // The kernels below are single-precision: every other element type takes the CPU engine.
+        if (typeof(T) == typeof(float) && v.Length > 0 && TryGetBackend(out var b))
         {
             try
             {
@@ -29475,7 +29479,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     T IEngine.Mean<T>(Vector<T> v)
     {
         using var __gpuOp = EnterGpuOp();
-        if (TryGetBackend(out var b))
+        if (v is null) throw new ArgumentNullException(nameof(v));
+        if (v is Vector<double> doubles && TrySumFloat64(doubles, out double doubleSum))
+            return (T)(object)(doubleSum / doubles.Length);
+        if (typeof(T) == typeof(float) && v.Length > 0 && TryGetBackend(out var b))
         {
             try
             {
@@ -31779,7 +31786,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     T IEngine.DotProduct<T>(Vector<T> a, Vector<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
-        if (TryGetBackend(out var b))
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b2 is null) throw new ArgumentNullException(nameof(b2));
+        if (a is Vector<double> leftDoubles && b2 is Vector<double> rightDoubles
+            && TryDotFloat64(leftDoubles, rightDoubles, out double doubleDot))
+            return (T)(object)doubleDot;
+        if (typeof(T) == typeof(float) && a.Length == b2.Length && a.Length > 0
+            && TryGetBackend(out var b))
         {
             try
             {
@@ -31789,7 +31802,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 b.BatchDotProduct(ga, gb, go, 1, a.Length);
                 return (T)(object)b.DownloadBuffer(go)[0];
             }
-            catch { }
+            catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("DotProduct", capabilityGap); }
         }
         return base.DotProduct(a, b2);
     }
