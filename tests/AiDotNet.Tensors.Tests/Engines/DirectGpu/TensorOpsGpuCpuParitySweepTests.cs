@@ -100,6 +100,8 @@ public sealed class TensorOpsGpuCpuParitySweepTests : IClassFixture<DirectGpuTen
         ["TensorGatherClassValues"] = "gathers with class indices of another shape",
         // Compared GPU vs the scalar recurrence in NumericRecurrenceGpuTests.FritschCarlsonLimit_MatchesScalarRecurrence.
         ["TensorFritschCarlsonLimit"] = "its secants are [..., n - 1] against slopes [..., n]",
+        // Compared on the CPU and GPU engines against the same expected rows, position and mask in KvCacheAppendTests.
+        ["KvCacheAppend"] = "takes a [batch, capacity, width] cache, a one-element position and a [batch, width] entry",
     };
 
     private static readonly int[][] Shapes =

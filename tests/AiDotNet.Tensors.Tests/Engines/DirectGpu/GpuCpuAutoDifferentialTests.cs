@@ -645,6 +645,11 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     // TODO(gpu-correctness): add dedicated GPU-vs-CPU tests for these and remove them from the list.
     private static readonly HashSet<string> DedicatedlyCovered = new(StringComparer.Ordinal)
     {
+        // Decode steps writing their state in place, each against a float64 reference on the CPU and GPU engines and
+        // replayed by a captured plan: GatedDeltaNetStepTests, CausalConv1dStepTests, KvCacheAppendTests.
+        "GatedDeltaNetStep(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,GatedDeltaRule)",
+        "CausalConv1dStep(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Boolean)",
+        "KvCacheAppend(Tensor<T>,Tensor<T>,Tensor<T>)",
         // Sparse CSR graph attention (a CsrGraph operand and a stochastic dropout generator):
         // GraphAttentionCsrTests.Gpu_MatchesCpu_ForwardAndBackward, GPU vs CPU forward and backward.
         "GraphAttentionCsr(Tensor<T>,Tensor<T>,CsrGraph,Double,Double,Random)",
@@ -788,6 +793,8 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "AbcScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32,Double)",
         "XLstmScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
         "GatedDeltaNetScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
+        // Both rules, forward and backward, per backend: GatedDeltaNetScanBackwardBackendParityTests.
+        "GatedDeltaNetScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32,GatedDeltaRule)",
         "RgLruScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
         "Rwkv4WkvForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
         "MambaSelectiveScanForward(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",

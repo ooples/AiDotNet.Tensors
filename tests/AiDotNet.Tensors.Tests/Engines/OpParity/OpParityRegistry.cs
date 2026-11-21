@@ -104,7 +104,8 @@ public static class OpParityRegistry
         ParityTol tolerance,
         GraphCaptureExpectation graphCaptureExpectation = GraphCaptureExpectation.HeterogeneousOutput,
         GraphCaptureSignatureConstraint graphCaptureSignatureConstraint = GraphCaptureSignatureConstraint.None,
-        GpuReadbackContract gpuReadbackContract = GpuReadbackContract.None)
+        GpuReadbackContract gpuReadbackContract = GpuReadbackContract.None,
+        bool graphCaptureRecordsMixedSignature = false)
     {
         var op = new OpCase(
             name,
@@ -118,7 +119,8 @@ public static class OpParityRegistry
             RunFloatHeterogeneousOutputs = runFloat,
             RunDoubleHeterogeneousOutputs = runDouble,
             GraphCaptureExpectation = graphCaptureExpectation,
-            GpuReadbackContract = gpuReadbackContract
+            GpuReadbackContract = gpuReadbackContract,
+            GraphCaptureRecordsMixedSignature = graphCaptureRecordsMixedSignature
         };
         if (graphCaptureSignatureConstraint != GraphCaptureSignatureConstraint.None)
             op.GraphCaptureSignatureConstraint = graphCaptureSignatureConstraint;
@@ -954,7 +956,10 @@ public static class OpParityRegistry
             {
                 var result = e.TensorTopK(values.D(), 3, 1, out var indices);
                 return new(new[] { result }, new[] { indices });
-            }, ParityTol.Exact);
+            }, ParityTol.Exact,
+            graphCaptureExpectation: GraphCaptureExpectation.Required,
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousOutput,
+            graphCaptureRecordsMixedSignature: true);
 
         yield return HeterogeneousOutputCase("TopK[all-outputs]", "reduction", "TopK",
             e =>
@@ -4049,7 +4054,8 @@ public static class OpParityRegistry
             graphCaptureExpectation: GraphCaptureExpectation.HeterogeneousInput);
 
         yield return new OpCase("TensorTopK[4,8;k3,ax1]", "reduction", e => { var y = e.TensorTopK(src.F(), 3, 1, out _); return y; }, e => { var y = e.TensorTopK(src.D(), 3, 1, out _); return y; }, ParityTol.Exact, opMethod: "TensorTopK",
-            graphCaptureExpectation: GraphCaptureExpectation.HeterogeneousOutput);
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousOutput)
+        { GraphCaptureRecordsMixedSignature = true };
 
         var a = OpInput.Rand(1310, new[] { 4, 8 }, -4.0, 4.0);
         yield return U("TensorSELU", "activation", (e, t) => e.TensorSELU(t), (e, t) => e.TensorSELU(t), ParityTol.Ulp(64, 1e-6), a);
@@ -4280,7 +4286,8 @@ public static class OpParityRegistry
         yield return new OpCase("TensorIndexSelect[6,8;ax0]", "index",
             e => e.TensorIndexSelect(OpInput.Rand(711, new[] { 6, 8 }).F(), new Tensor<int>(new[] { 0, 2, 5, 1 }, new[] { 4 }), 0),
             e => e.TensorIndexSelect(OpInput.Rand(711, new[] { 6, 8 }).D(), new Tensor<int>(new[] { 0, 2, 5, 1 }, new[] { 4 }), 0), ParityTol.Exact, opMethod: "TensorIndexSelect",
-            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput)
+        { GraphCaptureRecordsMixedSignature = true };
 
         // Losses (reductions → relative tol). BCEWithLogits is the #775 loss itself.
         var pred = OpInput.Rand(720, new[] { 4, 64 });

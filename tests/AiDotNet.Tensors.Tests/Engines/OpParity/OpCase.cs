@@ -517,6 +517,14 @@ public sealed class OpCase
     public GraphCaptureSignatureConstraint GraphCaptureSignatureConstraint { get; internal set; }
 
     /// <summary>
+    /// The IEngine signature mixes element types (<see cref="GraphCaptureSignatureConstraint"/> still classifies it),
+    /// but inference plans record it: its non-T operands are captured as constants (TensorIndexSelect over concrete
+    /// indices) or its non-T outputs are refreshed on every replay (TensorTopK's indices). The capture sweep then
+    /// proves the replay reads live inputs instead of proving the capture fails closed.
+    /// </summary>
+    public bool GraphCaptureRecordsMixedSignature { get; init; }
+
+    /// <summary>
     /// Per-output graph dependency contract. Omitted entries default to
     /// <see cref="GraphOutputDependency.MutableInput"/>.
     /// </summary>

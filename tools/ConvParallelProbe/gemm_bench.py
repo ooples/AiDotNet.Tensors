@@ -88,36 +88,53 @@ def run_probe_once(probe, m, k, n, maxdop, reps, flag):
     return float(match.group(1))
 
 
-def bench(probe, shapes, maxdop, reps, repeat):
+def bench(probe, shapes, maxdop, reps, repeat, tol=None):
     rows = []
     for label, m, k, n in shapes:
-        off = None
-        on = None
-        round_ratios = []
-        # Interleave OFF/ON per repeat (not all-OFF-then-all-ON): slow machine-load drift on a
-        # shared CI runner then biases both flags equally instead of skewing the ON/OFF ratio.
-        for _ in range(repeat):
-            o0 = run_probe_once(probe, m, k, n, maxdop, reps, 0)
-            o1 = run_probe_once(probe, m, k, n, maxdop, reps, 1)
-            if o0 is not None:
-                off = o0 if off is None else min(off, o0)
-            if o1 is not None:
-                on = o1 if on is None else min(on, o1)
-            # Gate on the ratio of the OFF/ON measured back-to-back in the SAME round: their
-            # shared-runner load is ~equal, so drift cancels - which is the whole point of
-            # interleaving. Taking min(ON) / min(OFF) over ALL rounds independently (the previous
-            # behaviour) discarded that pairing: a lucky-fast OFF round could pair against an
-            # unlucky ON round, skewing the ratio. On a 32-core runner medium GEMMs (square-768/
-            # square-1152) have ~30% best-case dispatch variance, so that skew made this gate
-            # flaky - an identical commit read ratio 1.19 one run and 0.94 the next. Each o0/o1 is
-            # already the min over `reps` inner reps.
-            if o0 and o1:
-                round_ratios.append(o1 / o0)
-        # Median of the per-round paired ratios: robust to a single unlucky round while still
-        # catching a real, sustained regression (the median only moves if MOST rounds regress).
+        off, on, round_ratios = measure(probe, m, k, n, maxdop, reps, repeat)
         ratio = statistics.median(round_ratios) if round_ratios else float("nan")
+        # Confirm a suspected regression before failing the gate. Sub-millisecond shapes
+        # (batched-slice is ~0.6 ms) see >12% paired-ratio swings from a single scheduler
+        # hiccup, so a median over only `repeat` rounds can cross the tolerance on an
+        # identical commit. Re-measure with 2x more rounds and gate on the median of ALL
+        # rounds: a real, sustained regression stays above the tolerance; noise does not.
+        if tol is not None and ratio == ratio and ratio > 1.0 + tol:
+            sys.stderr.write(f"{label}: ratio {ratio:.3f} > tol; confirming with {2 * repeat} more rounds\n")
+            off2, on2, extra = measure(probe, m, k, n, maxdop, reps, 2 * repeat)
+            round_ratios += extra
+            off = min((v for v in (off, off2) if v is not None), default=None)
+            on = min((v for v in (on, on2) if v is not None), default=None)
+            ratio = statistics.median(round_ratios) if round_ratios else float("nan")
         rows.append((label, m, k, n, off, on, ratio))
     return rows
+
+
+def measure(probe, m, k, n, maxdop, reps, repeat):
+    off = None
+    on = None
+    round_ratios = []
+    # Interleave OFF/ON per repeat (not all-OFF-then-all-ON): slow machine-load drift on a
+    # shared CI runner then biases both flags equally instead of skewing the ON/OFF ratio.
+    for _ in range(repeat):
+        o0 = run_probe_once(probe, m, k, n, maxdop, reps, 0)
+        o1 = run_probe_once(probe, m, k, n, maxdop, reps, 1)
+        if o0 is not None:
+            off = o0 if off is None else min(off, o0)
+        if o1 is not None:
+            on = o1 if on is None else min(on, o1)
+        # Gate on the ratio of the OFF/ON measured back-to-back in the SAME round: their
+        # shared-runner load is ~equal, so drift cancels - which is the whole point of
+        # interleaving. Taking min(ON) / min(OFF) over ALL rounds independently (the previous
+        # behaviour) discarded that pairing: a lucky-fast OFF round could pair against an
+        # unlucky ON round, skewing the ratio. On a 32-core runner medium GEMMs (square-768/
+        # square-1152) have ~30% best-case dispatch variance, so that skew made this gate
+        # flaky - an identical commit read ratio 1.19 one run and 0.94 the next. Each o0/o1 is
+        # already the min over `reps` inner reps.
+        if o0 and o1:
+            round_ratios.append(o1 / o0)
+    # The caller gates on the median of these per-round paired ratios: robust to a single
+    # unlucky round while still catching a real, sustained regression.
+    return off, on, round_ratios
 
 
 def main():
@@ -130,7 +147,7 @@ def main():
     ap.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     args = ap.parse_args()
 
-    tuned = bench(args.probe, TUNED, args.maxdop, args.reps, args.repeat)
+    tuned = bench(args.probe, TUNED, args.maxdop, args.reps, args.repeat, args.tol)
     smallm = bench(args.probe, SMALLM, args.maxdop, args.reps, args.repeat)
 
     lines = [

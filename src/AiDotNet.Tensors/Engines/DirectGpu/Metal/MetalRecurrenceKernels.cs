@@ -106,7 +106,8 @@ kernel void gated_delta_scan_forward(
     device const float* B [[buffer(4)]], device float* output [[buffer(5)]],
     constant int& batch [[buffer(6)]], constant int& seqLen [[buffer(7)]],
     constant int& modelDim [[buffer(8)]], constant int& numHeads [[buffer(9)]],
-    constant int& headDim [[buffer(10)]], uint gid [[thread_position_in_grid]])
+    constant int& headDim [[buffer(10)]],
+    constant int& keyScaleBits [[buffer(11)]], constant int& decayFirst [[buffer(12)]], uint gid [[thread_position_in_grid]])
 {
     int total = batch * numHeads * headDim;
     if ((int)gid >= total) return;
@@ -114,7 +115,7 @@ kernel void gated_delta_scan_forward(
     int h = ((int)gid / headDim) % numHeads;
     int b = (int)gid / (headDim * numHeads);
     int hOff = h * headDim;
-    float kappa = 1.0f / sqrt((float)headDim);
+    float kappa = as_type<float>(keyScaleBits);
     thread float Srow[REC_MAX_HEADDIM];
     for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
     for (int t = 0; t < seqLen; t++) {
@@ -123,7 +124,7 @@ kernel void gated_delta_scan_forward(
         float a = A[gIdx], bet = B[gIdx];
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) sK += Srow[ki] * (K[baseOff + ki] * kappa);
-        float bd = bet * (V[baseOff + di] - sK);
+        float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
         for (int ki = 0; ki < headDim; ki++)
             Srow[ki] = a * Srow[ki] + bd * (K[baseOff + ki] * kappa);
         float o = 0.0f;
@@ -534,13 +535,14 @@ kernel void gated_delta_scan_recompute(
     device const float* A [[buffer(2)]], device const float* B [[buffer(3)]],
     device float* Straj [[buffer(4)]],
     constant int& batch [[buffer(5)]], constant int& seqLen [[buffer(6)]], constant int& modelDim [[buffer(7)]],
-    constant int& numHeads [[buffer(8)]], constant int& headDim [[buffer(9)]], uint gid [[thread_position_in_grid]])
+    constant int& numHeads [[buffer(8)]], constant int& headDim [[buffer(9)]],
+    constant int& keyScaleBits [[buffer(10)]], constant int& decayFirst [[buffer(11)]], uint gid [[thread_position_in_grid]])
 {
     int total = batch * numHeads * headDim;
     if ((int)gid >= total) return;
     int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
     int hOff = h * headDim; int hh = headDim * headDim;
-    float kappa = 1.0f / sqrt((float)headDim);
+    float kappa = as_type<float>(keyScaleBits);
     float Srow[REC_MAX_HEADDIM];
     for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
     for (int t = 0; t < seqLen; t++) {
@@ -549,7 +551,7 @@ kernel void gated_delta_scan_recompute(
         float a = A[gIdx], bet = B[gIdx];
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) sK += Srow[ki] * (K[baseOff + ki] * kappa);
-        float bd = bet * (V[baseOff + di] - sK);
+        float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
         int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
         for (int ki = 0; ki < headDim; ki++) { float s = a * Srow[ki] + bd * (K[baseOff + ki] * kappa); Srow[ki] = s; Straj[trajBase + ki] = s; }
     }
@@ -562,13 +564,14 @@ kernel void gated_delta_scan_backward(
     device atomic_uint* dQ [[buffer(7)]], device atomic_uint* dK [[buffer(8)]], device float* dV [[buffer(9)]],
     device atomic_uint* dA [[buffer(10)]], device atomic_uint* dB [[buffer(11)]],
     constant int& batch [[buffer(12)]], constant int& seqLen [[buffer(13)]], constant int& modelDim [[buffer(14)]],
-    constant int& numHeads [[buffer(15)]], constant int& headDim [[buffer(16)]], uint gid [[thread_position_in_grid]])
+    constant int& numHeads [[buffer(15)]], constant int& headDim [[buffer(16)]],
+    constant int& keyScaleBits [[buffer(17)]], constant int& decayFirst [[buffer(18)]], uint gid [[thread_position_in_grid]])
 {
     int total = batch * numHeads * headDim;
     if ((int)gid >= total) return;
     int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
     int hOff = h * headDim; int hh = headDim * headDim;
-    float kappa = 1.0f / sqrt((float)headDim);
+    float kappa = as_type<float>(keyScaleBits);
     float dSrow[REC_MAX_HEADDIM];
     for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
     for (int t = seqLen - 1; t >= 0; t--) {
@@ -579,7 +582,9 @@ kernel void gated_delta_scan_backward(
         int sprevBase = (t > 0) ? (((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim) : 0;
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) { float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f; sK += sprev * (K[baseOff + ki] * kappa); }
-        float delta = V[baseOff + di] - sK;
+        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
+        float pa = decayFirst ? a : 1.0f;
+        float delta = V[baseOff + di] - pa * sK;
         float dOutVal = dOut[baseOff + di];
         for (int ki = 0; ki < headDim; ki++) {
             float sval = Straj[trajBase + ki];
@@ -595,6 +600,8 @@ kernel void gated_delta_scan_backward(
             dB_acc += dSt * delta * kScaled;
             dDelta += dSt * bet * kScaled;
         }
+        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
+        if (decayFirst) dA_acc -= dDelta * sK;
         dV[baseOff + di] = dDelta;
         gla_atomic_add_f(dA, gIdx, dA_acc);
         gla_atomic_add_f(dB, gIdx, dB_acc);
@@ -603,9 +610,9 @@ kernel void gated_delta_scan_backward(
             float dSt = dSrow[ki];
             float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
             float kScaled = K[baseOff + ki] * kappa;
-            float dKS = dSt * (bet * delta) + dSk * sprev;
+            float dKS = dSt * (bet * delta) + dSk * pa * sprev;
             gla_atomic_add_f(dK, baseOff + ki, dKS * kappa);
-            dSrow[ki] = dSt * a + dSk * kScaled;
+            dSrow[ki] = dSt * a + dSk * pa * kScaled;
         }
     }
 }
@@ -618,13 +625,14 @@ kernel void gated_delta_scan_backward_det(
     device const float* V [[buffer(3)]], device const float* A [[buffer(4)]], device const float* B [[buffer(5)]],
     device float* Straj [[buffer(6)]], device float* P [[buffer(7)]], device float* dV [[buffer(8)]],
     constant int& batch [[buffer(9)]], constant int& seqLen [[buffer(10)]], constant int& modelDim [[buffer(11)]],
-    constant int& numHeads [[buffer(12)]], constant int& headDim [[buffer(13)]], uint gid [[thread_position_in_grid]])
+    constant int& numHeads [[buffer(12)]], constant int& headDim [[buffer(13)]],
+    constant int& keyScaleBits [[buffer(14)]], constant int& decayFirst [[buffer(15)]], uint gid [[thread_position_in_grid]])
 {
     int total = batch * numHeads * headDim;
     if ((int)gid >= total) return;
     int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
     int hOff = h * headDim; int hh = headDim * headDim;
-    float kappa = 1.0f / sqrt((float)headDim);
+    float kappa = as_type<float>(keyScaleBits);
     float dSrow[REC_MAX_HEADDIM];
     for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
     for (int t = seqLen - 1; t >= 0; t--) {
@@ -635,7 +643,9 @@ kernel void gated_delta_scan_backward_det(
         int sprevBase = (t > 0) ? (((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim) : 0;
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) { float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f; sK += sprev * (K[baseOff + ki] * kappa); }
-        float delta = V[baseOff + di] - sK;
+        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
+        float pa = decayFirst ? a : 1.0f;
+        float delta = V[baseOff + di] - pa * sK;
         float dOutVal = dOut[baseOff + di];
         for (int ki = 0; ki < headDim; ki++) {
             dSrow[ki] += dOutVal * Q[baseOff + ki];
@@ -649,6 +659,8 @@ kernel void gated_delta_scan_backward_det(
             dB_acc += dSt * delta * kScaled;
             dDelta += dSt * bet * kScaled;
         }
+        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
+        if (decayFirst) dA_acc -= dDelta * sK;
         dV[baseOff + di] = dDelta;
         P[gIdx * headDim + di] = dA_acc;
         P[batch * seqLen * modelDim + gIdx * headDim + di] = dB_acc;
@@ -657,9 +669,9 @@ kernel void gated_delta_scan_backward_det(
             float dSt = dSrow[ki];
             float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
             float kScaled = K[baseOff + ki] * kappa;
-            float dKS = dSt * (bet * delta) + dSk * sprev;
+            float dKS = dSt * (bet * delta) + dSk * pa * sprev;
             Straj[trajBase + ki] = dKS * kappa;
-            dSrow[ki] = dSt * a + dSk * kScaled;
+            dSrow[ki] = dSt * a + dSk * pa * kScaled;
         }
     }
 }

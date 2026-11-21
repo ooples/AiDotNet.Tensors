@@ -85,7 +85,7 @@ public partial class CpuEngine
     internal Tensor<T> MoeSwiGlu<T>(Tensor<T> x, Tensor<T> scores, Tensor<T>? bias, Tensor<T> w1, Tensor<T> w3,
         Tensor<T> w2, int topK, int sequences, out Tensor<T> loads)
     {
-        // In a compiled training trace the op is one node that re-runs every step: routing, loads and output follow
+        // In a compiled training or inference trace the op is one node that re-runs every step: routing, loads and output follow
         // each step's inputs and the current selection bias. (Run eagerly at trace time instead, it froze into the
         // plan as a constant - the capture batch's output and loads every step, and no gradient to its inputs.) The
         // node's backward reads the intermediates its own forward kept that step, so it costs no second forward.
@@ -104,7 +104,9 @@ public partial class CpuEngine
                     if (slot.Saved is not { } replaySaved)
                         throw new InvalidOperationException("Compiled MoeSwiGlu backward ran before its forward populated saved intermediates.");
                     AccumulateMoeGradients(gradOutput, x, scores, w1, w3, w2, replaySaved, engine, grads);
-                })
+                },
+                // A decode plan replays it too: the loads node below reads each replay's loads, as in training.
+                inInferenceTrace: true)
             && GraphMode.Current is { } scope)
         {
             // The loads are a node of their own, downstream of the op: a consumer (the selection-bias update) then

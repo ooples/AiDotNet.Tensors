@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 using AiDotNet.Tensors.Helpers.Autotune.TunedKernels;
@@ -77,7 +78,9 @@ internal sealed class CudaTunedKernelHarness<TArgs> : ITunedKernelHarness<TArgs>
     {
         using var _ = GpuLaunchProbe.TuningScope();
         TArgs local = args;
-        return _backend.MeasureTunedKernelMilliseconds(() => candidate.Execute(local), repetitions);
+        // Keyed by candidate and arguments (their buffers and sizes): one session can time the same candidate on other
+        // arguments, as a nested gate (a conv candidate whose launch resolves a GEMM slot) or a second shape does.
+        return _backend.MeasureTunedKernelMilliseconds(() => candidate.Execute(local), repetitions, (candidate, local));
     }
 }
 
@@ -157,6 +160,22 @@ public sealed partial class CudaBackend
 {
     private const double RowOpTolerance = 1e-4;
     private IntPtr _tuneStartEvent, _tuneEndEvent;
+
+    // Timing graphs captured in the current measurement session, by (thread, (candidate, args), repetitions); guarded by
+    // _tuneEventLock. A gate times each candidate about twenty times on the same arguments: capturing, instantiating and
+    // destroying a graph for every one of those samples cost a millisecond or two of host and driver time each, so a
+    // gate took 150-650 ms whatever its kernels' run time, and the process's tuning budget ran out after a dozen shapes
+    // (the shapes a model trains on then all ran untuned). Dropped when the thread's session ends, before its
+    // candidate workspaces (which the graphs read) can be released.
+    private readonly Dictionary<(int Thread, object Candidate, int Repetitions), IntPtr> _sessionTuneGraphs = new();
+    private bool _sessionTuneGraphsHooked;
+
+    /// <summary>Timing graphs captured, and timing samples that replayed an already-captured one (tests).</summary>
+    internal long TuneGraphsCaptured { get; private set; }
+    internal long TuneGraphsReused { get; private set; }
+
+    /// <summary>Timing graphs held for unfinished measurement sessions (tests: zero once every session ended).</summary>
+    internal int SessionTuneGraphCount { get { lock (_tuneEventLock) return _sessionTuneGraphs.Count; } }
     private readonly object _tunedSlotsLock = new();
     private readonly object _tuneEventLock = new();
     private string? _tunedDeviceKey;
@@ -192,7 +211,15 @@ public sealed partial class CudaBackend
     }
 
     /// <summary>Device time of <paramref name="repetitions"/> back-to-back runs, on the backend's stream.</summary>
-    internal double MeasureTunedKernelMilliseconds(Action run, int repetitions)
+    internal double MeasureTunedKernelMilliseconds(Action run, int repetitions) =>
+        MeasureTunedKernelMilliseconds(run, repetitions, cacheKey: null);
+
+    /// <summary>
+    /// <see cref="MeasureTunedKernelMilliseconds(Action, int)"/>, reusing the captured timing graph of an earlier
+    /// sample with the same <paramref name="cacheKey"/> and repetitions in this thread's measurement session. A key is
+    /// only valid while <paramref name="run"/> launches the same work on the same buffers.
+    /// </summary>
+    internal double MeasureTunedKernelMilliseconds(Action run, int repetitions, object? cacheKey)
     {
         using var _ = PushContext();
         // Its own lock: a gate runs under its slot's lock, and slot creation (which may register external
@@ -207,7 +234,7 @@ public sealed partial class CudaBackend
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _tuneStartEvent, 0), "cuEventCreate(tune)");
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _tuneEndEvent, 0), "cuEventCreate(tune)");
             }
-            if (TryMeasureCapturedMilliseconds(run, repetitions, out double captured)) return captured;
+            if (TryMeasureCapturedMilliseconds(run, repetitions, cacheKey, out double captured)) return captured;
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneStartEvent, _stream), "cuEventRecord(tune)");
             for (int i = 0; i < repetitions; i++) run();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneEndEvent, _stream), "cuEventRecord(tune)");
@@ -230,23 +257,40 @@ public sealed partial class CudaBackend
     /// step, so the slot preferred single-kernel candidates that are slower in the step. False (the caller times eagerly)
     /// where capture is unavailable, the stream is already capturing, or the candidate cannot be captured.
     /// </summary>
-    private bool TryMeasureCapturedMilliseconds(Action run, int repetitions, out double milliseconds)
+    private bool TryMeasureCapturedMilliseconds(Action run, int repetitions, object? cacheKey, out double milliseconds)
     {
         milliseconds = 0;
         if (!s_tuneInCapturedGraph || IsStreamCapturing()) return false;
-        IntPtr exec;
+        // Reused only inside a measurement session, which ends (dropping the graph) before its workspaces are released.
+        bool cache = cacheKey is not null && TunedKernelRegistry.MeasuringOnThisThread;
+        var key = (Environment.CurrentManagedThreadId, cacheKey!, repetitions);
+        IntPtr exec = IntPtr.Zero;
+        bool reused = cache && _sessionTuneGraphs.TryGetValue(key, out exec);
+        if (!reused)
+        {
+            try
+            {
+                exec = CaptureGraph(() => { for (int i = 0; i < repetitions; i++) run(); });
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                return false;
+            }
+            if (exec == IntPtr.Zero) return false;
+            TuneGraphsCaptured++;
+        }
+        else
+        {
+            TuneGraphsReused++;
+        }
+        bool keep = false;
         try
         {
-            exec = CaptureGraph(() => { for (int i = 0; i < repetitions; i++) run(); });
-        }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
-        {
-            return false;
-        }
-        if (exec == IntPtr.Zero) return false;
-        try
-        {
-            LaunchCapturedGraph(exec);   // warm: first replay uploads the graph
+            // Warm replay before the timed one, reused or not: the first replay uploads the graph, and queued behind it the
+            // timed replay starts on a busy stream. Timing a reused graph from an idle stream added the launch latency to
+            // every sample, which compressed microsecond kernels' ratios toward 1 (a tiny ConvTranspose2D's FP32
+            // candidate went from Tuned at 1.15x to Inconclusive, and the fallback served a TF32 route).
+            LaunchCapturedGraph(exec);
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneStartEvent, _stream), "cuEventRecord(tune)");
             LaunchCapturedGraph(exec);
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneEndEvent, _stream), "cuEventRecord(tune)");
@@ -254,19 +298,65 @@ public sealed partial class CudaBackend
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuEventElapsedTime(out float ms, _tuneStartEvent, _tuneEndEvent), "cuEventElapsedTime(tune)");
             milliseconds = ms;
+            if (cache && !reused)
+            {
+                if (!_sessionTuneGraphsHooked)
+                {
+                    TunedKernelRegistry.MeasurementSessionEnded += DropSessionTuneGraphs;
+                    _sessionTuneGraphsHooked = true;
+                }
+                _sessionTuneGraphs[key] = exec;
+            }
+            keep = cache;
             return true;
         }
         finally
         {
-            DestroyCapturedGraph(exec);
+            if (!keep)
+            {
+                if (reused) _sessionTuneGraphs.Remove(key);
+                DestroyCapturedGraph(exec);
+            }
+        }
+    }
+
+    // The measuring thread's session ended: destroy the timing graphs it captured.
+    private void DropSessionTuneGraphs()
+    {
+        int thread = Environment.CurrentManagedThreadId;
+        lock (_tuneEventLock)
+        {
+            if (_sessionTuneGraphs.Count == 0) return;
+            var mine = _sessionTuneGraphs.Keys.Where(k => k.Thread == thread).ToList();
+            if (mine.Count == 0) return;
+            using var _ = PushContext();
+            // Tuning's own device work, like the timing itself: not the caller's op crossing to the host.
+            using var tuning = GpuLaunchProbe.TuningScope();
+            foreach (var k in mine)
+            {
+                DestroyCapturedGraph(_sessionTuneGraphs[k]);
+                _sessionTuneGraphs.Remove(k);
+            }
         }
     }
 
     private void DisposeTunedKernelResources()
     {
         DisposeExternalKernelModules();
+        if (_sessionTuneGraphsHooked) TunedKernelRegistry.MeasurementSessionEnded -= DropSessionTuneGraphs;
         lock (_tuneEventLock)
         {
+            foreach (var exec in _sessionTuneGraphs.Values)
+            {
+                // Teardown continues past a graph the driver refuses to destroy (a context already lost): the
+                // remaining graphs and the timing events still have to be released.
+                try { DestroyCapturedGraph(exec); }
+                catch (InvalidOperationException destroyFailed)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"CUDA tuning graph was not destroyed: {destroyFailed}");
+                }
+            }
+            _sessionTuneGraphs.Clear();
             if (_tuneStartEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneStartEvent); } catch { } _tuneStartEvent = IntPtr.Zero; }
             if (_tuneEndEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneEndEvent); } catch { } _tuneEndEvent = IntPtr.Zero; }
         }
