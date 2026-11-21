@@ -407,7 +407,7 @@ public sealed partial class CudaBackend
         {
             if (policy == Gpu.NonFiniteGradientPolicy.Error)
                 throw new ArgumentException("The Error policy raises from a host read, which a captured step cannot make.", nameof(policy));
-            if (!(maxNorm > 0f) || float.IsInfinity(maxNorm))
+            if (float.IsNaN(maxNorm) || maxNorm <= 0f || float.IsInfinity(maxNorm))
                 throw new ArgumentOutOfRangeException(nameof(maxNorm), maxNorm, "The clip bound must be positive and finite.");
             if (_gradientTable is not { } table || _clipRecord is null || _clipScale is null || _clipPartials is null
                 || _clipTicket is null)

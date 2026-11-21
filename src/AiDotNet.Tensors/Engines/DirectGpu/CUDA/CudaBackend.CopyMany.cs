@@ -45,18 +45,28 @@ public sealed partial class CudaBackend : IBatchedCopyBackend
         using var _ = PushContext();
         for (int start = 0; start < sources.Count; start += Slots)
         {
-            int count = Math.Min(Slots, sources.Count - start), longest = 0;
-            for (int k = 0; k < Slots; k++)
-            {
-                int i = start + Math.Min(k, count - 1);
-                handles[k] = sources[i].Handle;
-                handles[Slots + k] = destinations[i].Handle;
-                n[k] = k < count ? lengths[i] : 0;   // unused slots copy nothing
-                longest = Math.Max(longest, n[k]);
-            }
+            int count = Math.Min(Slots, sources.Count - start);
+            int longest = FillCopyGroup(sources, destinations, lengths, start, count, Slots, handles, n);
             if (longest == 0) continue;
             uint blocks = (uint)Math.Min(1024, (longest + Threads - 1) / Threads);
             LaunchKernel2D(kernel, blocks, (uint)count, Threads, 1, args);
         }
+    }
+
+    // Loads one launch's slots: its copies' handles and lengths, unused slots repeating the last copy with length 0.
+    // Returns the longest copy, which sizes the launch.
+    private static unsafe int FillCopyGroup(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations,
+        IReadOnlyList<int> lengths, int start, int count, int slots, IntPtr* handles, int* n)
+    {
+        int longest = 0;
+        for (int k = 0; k < slots; k++)
+        {
+            int i = start + Math.Min(k, count - 1);
+            handles[k] = sources[i].Handle;
+            handles[slots + k] = destinations[i].Handle;
+            n[k] = k < count ? lengths[i] : 0;   // unused slots copy nothing
+            longest = Math.Max(longest, n[k]);
+        }
+        return longest;
     }
 }

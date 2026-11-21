@@ -30,8 +30,10 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         double raw = ops.ToDouble(position.AsSpanUnmarked()[0]);
+        // Checked on the double before the narrowing cast, so NaN, a fraction and an out-of-range value are all refused.
+        if (double.IsNaN(raw) || raw < 0 || raw > int.MaxValue || raw - Math.Floor(raw) > 0)
+            throw new InvalidOperationException($"The cache position must be a non-negative integer; it is {raw}.");
         int p = (int)raw;
-        if (p != raw || p < 0) throw new InvalidOperationException($"The cache position must be a non-negative integer; it is {raw}.");
         if (p >= capacity) throw new InvalidOperationException($"The cache is full: {capacity} positions.");
         if (!value.IsContiguous) value = value.Contiguous();
         using (new KeepAliveScope(cache))

@@ -327,10 +327,8 @@ public sealed partial class CudaBackend
         lock (_tuneEventLock)
         {
             if (_sessionTuneGraphs.Count == 0) return;
-            List<(int, object, int)>? mine = null;
-            foreach (var k in _sessionTuneGraphs.Keys)
-                if (k.Thread == thread) (mine ??= new()).Add(k);
-            if (mine is null) return;
+            var mine = _sessionTuneGraphs.Keys.Where(k => k.Thread == thread).ToList();
+            if (mine.Count == 0) return;
             using var _ = PushContext();
             // Tuning's own device work, like the timing itself: not the caller's op crossing to the host.
             using var tuning = GpuLaunchProbe.TuningScope();
@@ -348,7 +346,16 @@ public sealed partial class CudaBackend
         if (_sessionTuneGraphsHooked) TunedKernelRegistry.MeasurementSessionEnded -= DropSessionTuneGraphs;
         lock (_tuneEventLock)
         {
-            foreach (var exec in _sessionTuneGraphs.Values) { try { DestroyCapturedGraph(exec); } catch { } }
+            foreach (var exec in _sessionTuneGraphs.Values)
+            {
+                // Teardown continues past a graph the driver refuses to destroy (a context already lost): the
+                // remaining graphs and the timing events still have to be released.
+                try { DestroyCapturedGraph(exec); }
+                catch (InvalidOperationException destroyFailed)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"CUDA tuning graph was not destroyed: {destroyFailed}");
+                }
+            }
             _sessionTuneGraphs.Clear();
             if (_tuneStartEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneStartEvent); } catch { } _tuneStartEvent = IntPtr.Zero; }
             if (_tuneEndEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneEndEvent); } catch { } _tuneEndEvent = IntPtr.Zero; }

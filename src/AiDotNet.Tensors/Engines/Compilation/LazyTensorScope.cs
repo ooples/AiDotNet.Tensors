@@ -563,9 +563,8 @@ internal sealed class LazyTensorScope : IDisposable
     {
         var root = this;
         while (root._parent is not null) root = root._parent;
-        foreach (var target in targets)
+        foreach (var target in targets.Where(t => t.LazySource is null))
         {
-            if (target.LazySource is not null) continue;
             if (root._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, target)) == true) continue;
             var snapshot = new Tensor<T>((int[])target._shape.Clone(), new Vector<T>(target.ToArray()));
             (root._traceStateSnapshots ??= new()).Add((node, target, snapshot));

@@ -168,12 +168,10 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
-        try
-        {
-            if (!TryGetBackend(out var backend)) throw new InvalidOperationException("No GPU backend.");
-            backend.Copy(snapshot, buffer, length);
-        }
-        finally { snapshot.Dispose(); }
+        // Freed on every path, including a failed copy: the caller handed the snapshot over.
+        using var owned = snapshot;
+        if (!TryGetBackend(out var backend)) throw new InvalidOperationException("No GPU backend.");
+        backend.Copy(owned, buffer, length);
     }
 
     /// <summary>

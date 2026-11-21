@@ -3507,7 +3507,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void RetireCapturedOptimizerIfIneligible()
     {
         if (_capturedOptimizer is { } captured
-            && (_l2Regularization != 0f || captured.ClipNorm != _maxGradNorm
+            && (!_l2Regularization.Equals(0f) || !captured.ClipNorm.Equals(_maxGradNorm)
                 || (_maxGradNorm > 0.0 && captured.ClipPolicy != _nonFiniteGradientPolicy)))
             InvalidateCapturedStepGraph();
     }

@@ -1293,7 +1293,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 throw new InvalidOperationException(
                     $"Captured-graph input {i} resident buffer (size {buf.Size}) is smaller than its host data " +
                     $"({data.Length}); cannot refresh in place.");
-            var host = (float[])(object)data;
+            if (data is not float[] host)
+                throw new InvalidOperationException($"Captured-graph input {i} is not a float tensor; cannot refresh in place.");
             if (_uploadedInputs.Length != inputs.Length)
             {
                 _uploadedInputs = new float[]?[inputs.Length];
