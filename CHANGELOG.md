@@ -1,5 +1,98 @@
 # Changelog
 
+## [0.152.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.151.2...v0.152.0) (2026-11-21)
+
+
+### Features
+
+* **compilation:** public CompiledModelCache.CompileStatefulInference ([42ace3b](https://github.com/ooples/AiDotNet.Tensors/commit/42ace3be5220e9e9c3c4a8cf76c179aba299afdd))
+* **compilation:** stateful compiled inference plans (state leaves advanced in place, CUDA-graph replayable) ([5ce5253](https://github.com/ooples/AiDotNet.Tensors/commit/5ce525381711d0cea2f52eec1e06d21a8a670b71))
+* **engines:** consolidate weight normalization, real FFTs and workspace ownership ([d1f3faa](https://github.com/ooples/AiDotNet.Tensors/commit/d1f3faae0e75c0c62b4b1172f043dfac47cb09c9))
+* **gpu:** implement CSR graph attention across all GPU backends ([4d373fe](https://github.com/ooples/AiDotNet.Tensors/commit/4d373fe4c4ebb85abbe9b968ff46acab2e6a21e4))
+
+
+### Bug Fixes
+
+* address [#1793](https://github.com/ooples/AiDotNet.Tensors/issues/1793) review on cuDNN workspace, WeightNorm backward precision and console trace ([426455d](https://github.com/ooples/AiDotNet.Tensors/commit/426455d4b6c86ac873f85891d8b4d2c304988557))
+* **api:** declare the Vulkan and WebGPU fused CE position shaders (RS0016) ([dbb4607](https://github.com/ooples/AiDotNet.Tensors/commit/dbb46079949a0aa5fdfe56b8c67d11161de06986))
+* **autodiff:** classify TensorWeightNorm, keep its first-order backward closure-free, GAT create-graph ([9d596ef](https://github.com/ooples/AiDotNet.Tensors/commit/9d596efd0f77ebfdee90e261b4a1f38bc28d0e4f))
+* **autodiff:** clear post-[#1766](https://github.com/ooples/AiDotNet.Tensors/issues/1766) audit findings ([#1768](https://github.com/ooples/AiDotNet.Tensors/issues/1768)) ([011b677](https://github.com/ooples/AiDotNet.Tensors/commit/011b6776a223d4016b6bff4e0faff5ee699eaad2))
+* **compilation:** add a lower-rank broadcast operand's gradient from the live output gradient ([6bce717](https://github.com/ooples/AiDotNet.Tensors/commit/6bce71758edc6eb3d2a5e71cb2aa6c64e7845be8))
+* **compilation:** count scratch lent to the shared workspace in the step scratch bytes ([0c447f9](https://github.com/ooples/AiDotNet.Tensors/commit/0c447f9dec7c5008cb25a70399fb9a76ba940045))
+* **compilation:** keep the captured step graph when the device rewrites an input ([fc48548](https://github.com/ooples/AiDotNet.Tensors/commit/fc48548eee15a64ca7e8be1c739297fe25f97139))
+* **compilation:** preserve shared GPU state bindings during step eviction ([e0e00f9](https://github.com/ooples/AiDotNet.Tensors/commit/e0e00f905e3330a2617dac9adce119182e08c960))
+* **compilation:** publish running-state writes after GPU graph replay ([1c0725e](https://github.com/ooples/AiDotNet.Tensors/commit/1c0725ed1b77216aafd4801e8ee098c05e6ef2ae))
+* **compilation:** restore traced running statistics into the bound device buffer ([2d96ad5](https://github.com/ooples/AiDotNet.Tensors/commit/2d96ad53870dd8ad99312e6bfb7ba7ade2c758d2))
+* **compiled:** a host write to any device-resident Tensor&lt;int&gt; reaches the compiled step and its replays ([3182283](https://github.com/ooples/AiDotNet.Tensors/commit/3182283305cc02f9a88d7875bc84f7a1b16ddb4f))
+* **compiled:** a host write to device-resident fused CE labels reaches the compiled step and its replays ([639ce33](https://github.com/ooples/AiDotNet.Tensors/commit/639ce33a2c877935738eed56c936bf22251e7da1))
+* **compiled:** an out-of-range device label throws at the finiteness check instead of being skipped ([8ef59cc](https://github.com/ooples/AiDotNet.Tensors/commit/8ef59cc6a480def5e03473204a1ce42451f32535))
+* **compiled:** capture the fused linear cross-entropy with per-step host labels ([c6d0d66](https://github.com/ooples/AiDotNet.Tensors/commit/c6d0d662a72b2a7266a20ebd992cf3e26165370b))
+* **compiled:** check a captured ids tensor's baked buffer before the version gate ([36bf7b7](https://github.com/ooples/AiDotNet.Tensors/commit/36bf7b7a48af138ace4c255a509027adb402936e))
+* **compiled:** convert device-resident float embedding ids on the device (captured replays used last step's computed ids) ([e8bdac3](https://github.com/ooples/AiDotNet.Tensors/commit/e8bdac306242996c2662e66dbe35962190bc7206))
+* **compiled:** create the fused CE labels' device copy before the capture ([4afa484](https://github.com/ooples/AiDotNet.Tensors/commit/4afa484ed928702355c7485662f918b0bd88d146))
+* **compiled:** detect an out-of-range device label with a finite count, not NaN semantics ([c607329](https://github.com/ooples/AiDotNet.Tensors/commit/c60732995fc60ba6e4597e90964284cbac0576d8))
+* **compiled:** host Tensor&lt;int&gt; ids get a persistent device copy on the resident step (index ops can be captured) ([bec5879](https://github.com/ooples/AiDotNet.Tensors/commit/bec58792fb53b5e35e1ac3cd9bdbed839306cb7c))
+* **compiled:** normalize resident float embedding index values ([df27d20](https://github.com/ooples/AiDotNet.Tensors/commit/df27d20ffb43d45e5db652c79a2ba907e11274fd))
+* **compiled:** per-plan label-error check, cleared every step, reported on dispose ([e616da7](https://github.com/ooples/AiDotNet.Tensors/commit/e616da7ec42b6b367f878fd8b3bf1775d94ff560))
+* **compiled:** resident int refresh for whole-vector tensors only; keep the captured handle ([45995dc](https://github.com/ooples/AiDotNet.Tensors/commit/45995dc54c331edb0a09a8632de4d32e88ae8958))
+* **compiled:** retire finalized index bindings and validate replayed embedding IDs ([8b8b77e](https://github.com/ooples/AiDotNet.Tensors/commit/8b8b77e53236a71f57e57e0b75f887f199000b27))
+* **compiled:** review fixes for the captured fused cross-entropy ([e9d9849](https://github.com/ooples/AiDotNet.Tensors/commit/e9d984945a85722c2d11bf3b2b422cdfeac0d01a))
+* **compiled:** scope index replay bindings and validate labels before updates ([749f0bd](https://github.com/ooples/AiDotNet.Tensors/commit/749f0bd64ac02d4dbca89e43aa1061f6912d72ff))
+* **cuda:** keep the cuBLAS prewarm and context syncs out of open captures ([591cc2c](https://github.com/ooples/AiDotNet.Tensors/commit/591cc2c6060a1fa1e59a2c9c9e1895fcb635b48f))
+* **cuda:** share GLA tile launch contract constants ([38f7540](https://github.com/ooples/AiDotNet.Tensors/commit/38f7540ee7864d9177761212735f5b694aa797e4))
+* **curand:** probe the library, not a device generator; resolve it from the CUDA install ([0501fe9](https://github.com/ooples/AiDotNet.Tensors/commit/0501fe971a8b851fea79139d5e7369ff6e3eb945))
+* **embedding:** bound resident gathers and atomic gradient writes ([098e0a1](https://github.com/ooples/AiDotNet.Tensors/commit/098e0a1279b9fb3264006e65f076ebd772474102))
+* **engines:** preserve replayed gradients and support odd-length device FFTs ([2c6452f](https://github.com/ooples/AiDotNet.Tensors/commit/2c6452fe4ac602c3cb06b6c6c26a18d095f30970))
+* **forecasting:** clarify erfc replay and index-add ownership states ([0bd9ba4](https://github.com/ooples/AiDotNet.Tensors/commit/0bd9ba47c5f3b242fc0e55d46efc0c373792f099))
+* **gpu:** address consolidated replay, sparse attention and workspace review ([3031c07](https://github.com/ooples/AiDotNet.Tensors/commit/3031c0754578661f46fba970826151eeb14074d6))
+* **gpu:** bound arg-reduce traversal and strengthen edge parity ([97428e3](https://github.com/ooples/AiDotNet.Tensors/commit/97428e34db133c4c4f98458eb00f6b9478db37fb))
+* **gpu:** fused CE target positions on every backend (HIP, OpenCL, Metal, Vulkan, WebGPU) ([eab0ac0](https://github.com/ooples/AiDotNet.Tensors/commit/eab0ac043b7d9f06fed312debc476afa96d736e6))
+* **gpu:** keep the host value when a resident mirror has no live reader ([94dedd9](https://github.com/ooples/AiDotNet.Tensors/commit/94dedd9a44d3e450c00e7f69ad782dd78f0a47aa))
+* **gpu:** preserve grouped gradients and validate WebGPU output bindings ([a250616](https://github.com/ooples/AiDotNet.Tensors/commit/a25061625e2ecc7682f9a5c157aa2d0288bcc7f7))
+* **gpu:** run a real fft magnitude of unsupported length on the host engine ([131dfcb](https://github.com/ooples/AiDotNet.Tensors/commit/131dfcbc817cfcd7507e9228869a9c464118f18a))
+* **gpu:** run non-power-of-two real FFTs on the device Bluestein path without cuFFT ([05c5874](https://github.com/ooples/AiDotNet.Tensors/commit/05c58745c3bde91ed862a6d062d3f3656275c0ae))
+* **gpu:** use ties-to-even rounding in CUDA and HIP tensor kernels ([9820645](https://github.com/ooples/AiDotNet.Tensors/commit/9820645c57d55067e72f721255759562a49d2e95))
+* **graph:** validate sparse attention and own device patterns per engine ([f1fecd0](https://github.com/ooples/AiDotNet.Tensors/commit/f1fecd06f62f038e36b3d81f0747ca0c5472e79e))
+* **inference:** preserve state across graph failures and host updates ([fb19523](https://github.com/ooples/AiDotNet.Tensors/commit/fb195237b9abd27ed089f3b126f30633a366714d))
+* **metal:** count compute dispatches in the launch probe ([3a95951](https://github.com/ooples/AiDotNet.Tensors/commit/3a95951bc21d9eaa20339c34db6df61f73337e36))
+* **opencl:** compute dgn_to_double's sticky bit with masks so POCL 6 / LLVM 18 compiles it ([43de363](https://github.com/ooples/AiDotNet.Tensors/commit/43de36337eb4b4f2089ceb1dfd592c1fe317d297))
+* **opencl:** drop the quotes from the kernel comment that ended the C# string early ([b29c807](https://github.com/ooples/AiDotNet.Tensors/commit/b29c807fcee40e7ca039312690b66dea1c83c518))
+* **opencl:** two more POCL 6 / LLVM 18 instcombine aborts (dgn_roundshift, top-k model ops) ([8572e70](https://github.com/ooples/AiDotNet.Tensors/commit/8572e706e41b88dc94d220e6348d07aee9994096))
+* **tensors:** preserve gradient accuracy, buffer ownership and workspace bounds ([37b3651](https://github.com/ooples/AiDotNet.Tensors/commit/37b365190a89edd09d36e5f20b4bd0c18c11b8b7))
+* **tests:** measure weight norm allocations on desktop CLR ([46d3098](https://github.com/ooples/AiDotNet.Tensors/commit/46d3098cbf9ea5421f4aeaf07bf18e90f4434980))
+* **webgpu:** fused CE positions kernel built a constant NaN, which Tint rejects ([9be5170](https://github.com/ooples/AiDotNet.Tensors/commit/9be51702fdc64f9fb43ecb2f77e15ea5130859cf))
+
+
+### Performance
+
+* **#2561:** bound grouped convolution and fuse six-backend epilogues ([#1782](https://github.com/ooples/AiDotNet.Tensors/issues/1782)) ([fe44c79](https://github.com/ooples/AiDotNet.Tensors/commit/fe44c79eae58a12c2a24c98107d919627d2a336d))
+* accelerate grouped convolution and reduce HiFi-GAN gradient storage ([9c7dd5f](https://github.com/ooples/AiDotNet.Tensors/commit/9c7dd5fb1e8e816af9ab9c3f6cfa66a39f610f76))
+* **cpu:** pack waveform convolutions directly into GEMM microtiles ([b8afe80](https://github.com/ooples/AiDotNet.Tensors/commit/b8afe806b68b2b2c9eb3bc44c12fd71237412a3f))
+* **cpu:** reuse packed convolution panels across waveform tiles ([428c648](https://github.com/ooples/AiDotNet.Tensors/commit/428c648ee4b86af431b1bfa9f77e0c32a07ae1f6))
+* **cuda,hip:** block-per-row argmax/argmin for wide rows (49,152-wide row: ~3.5 ms -&gt; 36 us) ([eba5f84](https://github.com/ooples/AiDotNet.Tensors/commit/eba5f84066894a90c12091cfe2285f9c10180160))
+* **cuda:** GLA scan backward on 1024-thread tiles, no atomics (v2 shape 14.5 ms -&gt; 2.15 ms) ([6f9d894](https://github.com/ooples/AiDotNet.Tensors/commit/6f9d894ab80fd46e8ec58424cd0ccfcd070ca83e))
+* **forecasting:** reuse CPU replay buffers and accelerate GPU index-add ([3855357](https://github.com/ooples/AiDotNet.Tensors/commit/385535792dce400f9a18135db4fc23a2b89fa350))
+* fuse inference convolution bias and residual output stores ([a9866a3](https://github.com/ooples/AiDotNet.Tensors/commit/a9866a3fc8ddb8dad4fe75600b8dc926fff3294c))
+* **gpu:** commit device parameters and run first-order backwards without allocating ([2a1f1de](https://github.com/ooples/AiDotNet.Tensors/commit/2a1f1deeb979d1c427d8cd3466f7c2e20582f64b))
+* hand idle compiled workspace to the allocator cache for prediction ([cdf065a](https://github.com/ooples/AiDotNet.Tensors/commit/cdf065ab9eccf5491cfb0bd8d496e7c67c292c3c))
+* pack compiled gradient banks by size and lifetime ([3175ecb](https://github.com/ooples/AiDotNet.Tensors/commit/3175ecb1d22930d298dd1c4f36dc871b2181346d))
+* retire incompatible idle GPU cache cells on larger inference misses ([613ecff](https://github.com/ooples/AiDotNet.Tensors/commit/613ecffc6bd14220a95ee0aa45e16187e06f05bb))
+* reuse compiled training storage on CPU and GPU for HiFi-GAN ([9db10d0](https://github.com/ooples/AiDotNet.Tensors/commit/9db10d047477b99599b334e9d3dca0c5dfb93e67))
+* reuse plan-owned leaf uploads after input rebinding ([ad4f249](https://github.com/ooples/AiDotNet.Tensors/commit/ad4f2499b581dac1e0ff81c4112590deae5c3cd3))
+* run the module-init gpu detection on the first read of the engine ([0600e6e](https://github.com/ooples/AiDotNet.Tensors/commit/0600e6e2cf62dea213d0873eeeffd126bf3ac304))
+
+
+### Refactoring
+
+* **blas:** release the packed b buffer without a redundant null check ([f29f2ba](https://github.com/ooples/AiDotNet.Tensors/commit/f29f2bae6b2352d06fa62372e62a155a59725a92))
+* **compilation:** read typed tensors without an object round trip and lock a private gate ([dcf5dae](https://github.com/ooples/AiDotNet.Tensors/commit/dcf5dae7d15bb2b24b613e609c94b3ba64fe6523))
+* **engine:** move the locked engine assignment out of the property setter ([dc020ae](https://github.com/ooples/AiDotNet.Tensors/commit/dc020ae20124e96a2865da19b168ff6f033796a4))
+
+
+### Documentation
+
+* **compiled:** only a compiled Step() reaches the device-id label check ([20f1573](https://github.com/ooples/AiDotNet.Tensors/commit/20f15731622933b1d91b1bf1ae5f10f7e7ce44a1))
+
 ## [0.151.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.151.1...v0.151.2) (2026-11-17)
 
 
