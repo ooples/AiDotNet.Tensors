@@ -2,6 +2,7 @@
 
 #if NET5_0_OR_GREATER
 using System;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -55,14 +56,19 @@ internal static class GpuDriverCrossPlatformResolver
         if (candidates.Length > 0 && IsCudaToolkitLibrary(libraryName))
         {
             bool windows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            // A rooted candidate would make Path.Combine discard the toolkit directory, so only bare file names are probed
+            // there; a rooted one was already tried as given above.
+            var fileNames = candidates
+                .Select(candidate => windows && !candidate.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                    ? candidate + ".dll"
+                    : candidate)
+                .Where(fileName => !System.IO.Path.IsPathRooted(fileName))
+                .ToArray();
             foreach (var dir in CuBlasNative.GetCudaBinDirectories())
             {
-                foreach (var candidate in candidates)
+                foreach (var path in fileNames.Select(fileName => System.IO.Path.Combine(dir, fileName)))
                 {
-                    string fileName = windows && !candidate.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
-                        ? candidate + ".dll"
-                        : candidate;
-                    if (NativeLibrary.TryLoad(System.IO.Path.Combine(dir, fileName), out var handle))
+                    if (NativeLibrary.TryLoad(path, out var handle))
                         return handle;
                 }
             }
