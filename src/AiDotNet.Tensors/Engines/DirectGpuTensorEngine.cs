@@ -29220,7 +29220,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // threw InvalidCastException once #1203 stopped swallowing faults here).
         // Validated before the upload dereferences it, as the CPU engine validates its operand.
         if (v is null) throw new ArgumentNullException(nameof(v));
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        // An empty vector is the CPU engine's to answer (its result or its argument error): a backend cannot allocate
+        // a zero-length buffer.
+        if (typeof(T) == typeof(float) && v.Length > 0 && TryGetBackend(out var b))
         {
             try
             {
@@ -29243,7 +29245,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         // Validated before the upload dereferences it, as the CPU engine validates its operand.
         if (v is null) throw new ArgumentNullException(nameof(v));
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        // An empty vector is the CPU engine's to answer (its result or its argument error): a backend cannot allocate
+        // a zero-length buffer.
+        if (typeof(T) == typeof(float) && v.Length > 0 && TryGetBackend(out var b))
         {
             try
             {
@@ -31524,7 +31528,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Validated before the upload dereferences them, as the CPU engine validates its operands.
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b2 is null) throw new ArgumentNullException(nameof(b2));
-        if (typeof(T) == typeof(float) && TryGetBackend(out var b))
+        // Unequal or empty operands are the CPU engine's to answer (its argument error or its result): the kernel
+        // would read a.Length elements of both buffers, past the end of a shorter b2.
+        if (typeof(T) == typeof(float) && a.Length == b2.Length && a.Length > 0 && TryGetBackend(out var b))
         {
             try
             {

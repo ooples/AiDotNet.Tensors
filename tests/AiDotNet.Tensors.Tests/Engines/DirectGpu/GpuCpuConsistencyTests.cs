@@ -204,6 +204,27 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableFact]
+    public void VectorReductions_OfEmptyOrMismatchedFloatOperands_AnswerAsTheCpuEngineDoes()
+    {
+        // No backend allocates a zero-length buffer, and the dot kernel reads a.Length elements of both operands.
+        SkipIfNoDirectGpu();
+        var gpu = (IEngine)Gpu;
+        var cpu = (IEngine)new CpuEngine();
+        var empty = new Vector<float>(0);
+        var three = new Vector<float>([1f, 2f, 3f]);
+        var five = new Vector<float>([1f, 2f, 3f, 4f, 5f]);
+
+        Assert.Equal(cpu.Sum(empty), gpu.Sum(empty));
+        Assert.Equal(cpu.DotProduct(empty, empty), gpu.DotProduct(empty, empty));
+        Assert.Equal(Assert.Throws<ArgumentException>(() => cpu.Mean(empty)).Message,
+            Assert.Throws<ArgumentException>(() => gpu.Mean(empty)).Message);
+        Assert.Equal(Assert.Throws<ArgumentException>(() => cpu.DotProduct(five, three)).Message,
+            Assert.Throws<ArgumentException>(() => gpu.DotProduct(five, three)).Message);
+        Assert.Equal(Assert.Throws<ArgumentException>(() => cpu.DotProduct(three, five)).Message,
+            Assert.Throws<ArgumentException>(() => gpu.DotProduct(three, five)).Message);
+    }
+
+    [SkippableFact]
     public void EagerResidentBinary_ReuploadsVersionBumpedInput()
     {
         SkipIfNoDirectGpu();
