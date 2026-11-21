@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// This implements the Decorator pattern, allowing transparent interception of GPU operations
 /// without modifying the underlying backend implementations.
 /// </remarks>
-public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend
+public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend, DirectGpu.IGatedDeltaRuleForwardBackend
 {
     /// <summary>
     /// The inner backend that performs actual GPU operations.
@@ -1856,6 +1856,16 @@ public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
         => Inner.GatedDeltaNetScanForward(q, k, v, alpha, beta, output, batch, seqLen, modelDim, numHeads, headDim);
+
+    // The rule-aware scan forward (internal capability) passes through to the wrapped backend like the public one.
+    void DirectGpu.IGatedDeltaRuleForwardBackend.GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
+    {
+        if (Inner is not DirectGpu.IGatedDeltaRuleForwardBackend inner)
+            throw new NotSupportedException("The wrapped GPU backend has no rule-aware Gated DeltaNet scan.");
+        inner.GatedDeltaNetScanForward(q, k, v, alpha, beta, output, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst);
+    }
 
     /// <inheritdoc/>
     public virtual void RgLruScanForward(

@@ -10,9 +10,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 internal interface IGatedDeltaNetStepBackend
 {
     /// <summary>
-    /// <c>S &lt;- alpha S + beta (v - S k) k^T</c> in place and <c>o = S q</c>, for <paramref name="rows"/> rows of a
+    /// With <c>k' = keyScale k</c> and <c>d = alpha</c> when <paramref name="decayFirst"/> (else 1):
+    /// <c>S &lt;- alpha S + beta (v - d S k') k'^T</c> in place and <c>o = S q</c>, for <paramref name="rows"/> rows of a
     /// [rows, dv, dk] state; q and k are [rows, dk], v and o [rows, dv], alpha and beta [rows].
     /// </summary>
     void GatedDeltaNetStep(IGpuBuffer state, IGpuBuffer query, IGpuBuffer key, IGpuBuffer value, IGpuBuffer alpha,
-        IGpuBuffer beta, IGpuBuffer output, int rows, int dv, int dk);
+        IGpuBuffer beta, IGpuBuffer output, int rows, int dv, int dk, float keyScale, bool decayFirst);
 }

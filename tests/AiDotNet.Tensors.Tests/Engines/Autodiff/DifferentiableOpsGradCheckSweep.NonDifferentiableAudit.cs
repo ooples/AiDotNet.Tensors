@@ -192,7 +192,7 @@ public partial class DifferentiableOpsGradCheckSweep
     {
         // state [rows, valueDim, keyDim], then this position's query, key, value, decay and write strength.
         cases["GatedDeltaNetStep"] = r =>
-            [SafeTensor([2, 3, 4], r), SafeTensor([2, 4], r), SafeTensor([2, 4], r), SafeTensor([2, 3], r), SafeTensor([2], r), SafeTensor([2], r)];
+            [SafeTensor([2, 3, 4], r), SafeTensor([2, 4], r), SafeTensor([2, 4], r), SafeTensor([2, 3], r), SafeTensor([2], r), SafeTensor([2], r), GatedDeltaRule.Standard];
         // history [K - 1, batch, channels], input [batch, channels], taps [channels, K], bias [channels].
         cases["CausalConv1dStep"] = r =>
             [SafeTensor([2, 2, 3], r), SafeTensor([2, 3], r), SafeTensor([3, 3], r), SafeTensor([3], r), true];

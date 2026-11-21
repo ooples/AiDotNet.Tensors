@@ -43,13 +43,13 @@ __device__ __forceinline__ float gdn_allsum(float v)
     int b = (int)(w / ((long)headDim * numHeads));                                               \
     int hOff = h * headDim;                                                                      \
     long bh = (long)b * numHeads + h;                                                            \
-    float kappa = 1.0f / sqrtf((float)headDim);
+    float kappa = keyScale;
 
 template <int R>
 __device__ __forceinline__ void gdn_forward(
     const float* __restrict__ Q, const float* __restrict__ K, const float* __restrict__ V,
     const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ output, float* __restrict__ Straj,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
 {
     GDN_ROW_PROLOGUE
     float S[R];
@@ -70,7 +70,8 @@ __device__ __forceinline__ void gdn_forward(
             sK += S[j] * kk[j];
         }
         sK = gdn_allsum(sK);
-        float bd = bet * (V[baseOff + di] - sK);
+        // decayFirst (the paper's rule): the prediction reads the decayed state a S_{t-1}.
+        float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
         float o = 0.0f;
         long row = ((bh * seqLen + t) * headDim + di) * headDim;
 #pragma unroll
@@ -102,7 +103,7 @@ __device__ __forceinline__ void gdn_backward(
     const float* __restrict__ dOut, const float* __restrict__ Q, const float* __restrict__ K,
     const float* __restrict__ V, const float* __restrict__ A, const float* __restrict__ B, float* Straj,
     float* dQ, float* dK, float* __restrict__ dV, float* dA, float* dB,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim, int det)
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, int det, float keyScale, int decayFirst)
 {
     GDN_ROW_PROLOGUE
     float dS[R];
@@ -128,7 +129,9 @@ __device__ __forceinline__ void gdn_backward(
             sK += sp[j] * kk[j];
         }
         sK = gdn_allsum(sK);
-        float delta = V[baseOff + di] - sK;
+        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
+        float pa = decayFirst ? a : 1.0f;
+        float delta = V[baseOff + di] - pa * sK;
         float dOutVal = dOut[baseOff + di];
 
         float dAp = 0.0f, dBp = 0.0f, dDp = 0.0f;
@@ -148,6 +151,8 @@ __device__ __forceinline__ void gdn_backward(
         float dA_acc = gdn_allsum(dAp);
         float dB_acc = gdn_allsum(dBp);
         float dDelta = gdn_allsum(dDp);
+        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
+        if (decayFirst) dA_acc -= dDelta * sK;
         if (lane == 0)
         {
             dV[baseOff + di] = dDelta;
@@ -168,13 +173,13 @@ __device__ __forceinline__ void gdn_backward(
         for (int j = 0; j < R; j++)
         {
             int ki = lane + 32 * j;
-            float dKS = dS[j] * (bet * delta) + dSk * sp[j];
+            float dKS = dS[j] * (bet * delta) + dSk * pa * sp[j];
             if (ki < headDim)
             {
                 if (det) Straj[row + ki] = dKS * kappa;
                 else atomicAdd(&dK[baseOff + ki], dKS * kappa);
             }
-            dS[j] = dS[j] * a + dSk * kk[j];
+            dS[j] = dS[j] * a + dSk * pa * kk[j];
         }
     }
 }
@@ -266,17 +271,18 @@ __device__ __forceinline__ void gdn_reduce(
 #define GDN_VARIANTS(R)                                                                                              \
 extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_forward_r##R(                                   \
     const float* Q, const float* K, const float* V, const float* A, const float* B, float* output,                   \
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)                                                  \
-{ gdn_forward<R>(Q, K, V, A, B, output, nullptr, batch, seqLen, modelDim, numHeads, headDim); }                     \
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)                  \
+{ gdn_forward<R>(Q, K, V, A, B, output, nullptr, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); } \
 extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_recompute_r##R(                                 \
     const float* K, const float* V, const float* A, const float* B, float* Straj,                                   \
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)                                                  \
-{ gdn_forward<R>(nullptr, K, V, A, B, nullptr, Straj, batch, seqLen, modelDim, numHeads, headDim); }                \
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)                  \
+{ gdn_forward<R>(nullptr, K, V, A, B, nullptr, Straj, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); } \
 extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_backward_r##R(                                  \
     const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,              \
     float* Straj, float* dQ, float* dK, float* dV, float* dA, float* dB,                                            \
-    int batch, int seqLen, int modelDim, int numHeads, int headDim, int det)                                         \
-{ gdn_backward<R>(dOut, Q, K, V, A, B, Straj, dQ, dK, dV, dA, dB, batch, seqLen, modelDim, numHeads, headDim, det); } \
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, int det, float keyScale, int decayFirst)          \
+{ gdn_backward<R>(dOut, Q, K, V, A, B, Straj, dQ, dK, dV, dA, dB, batch, seqLen, modelDim, numHeads, headDim, det,    \
+    keyScale, decayFirst); }                                                                                         \
 extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_dq_r##R(                                        \
     const float* dOut, const float* Straj, float* dQ, int batch, int seqLen, int modelDim, int numHeads, int headDim) \
 { gdn_dq<R>(dOut, Straj, dQ, batch, seqLen, modelDim, numHeads, headDim); }                                         \

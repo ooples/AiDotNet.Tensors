@@ -14262,7 +14262,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// dAlpha/dBeta [batch, seqLen, numHeads] via <see cref="DirectGpu.IGatedDeltaNetBackwardBackend"/>.
     /// Returns null when the GPU backward path is unavailable so the caller falls back to the managed backward.
     /// </summary>
-    internal Tensor<T>[]? GatedDeltaNetScanBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads)
+    internal Tensor<T>[]? GatedDeltaNetScanBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads,
+        GatedDeltaRule rule = GatedDeltaRule.ScaledKeys)
     {
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
@@ -14300,11 +14301,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 gradBuffers[allocated] = AllocateFullyWrittenOutputBuffer(backend, allocated < 3 ? n : ng);
             // No fill: the backend zeroes the gradients its atomic path accumulates into, and the deterministic path writes
             // every element (poison-mode HreLm runs give the same loss with and without these fills).
+            var (keyScale, decayFirst) = CpuEngine.GatedDeltaRuleTerms(rule, headDim);
             gdnBackend.GatedDeltaNetScanBackward(
                 dOut.Buffer, qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer,
                 gradBuffers[0].Buffer, gradBuffers[1].Buffer, gradBuffers[2].Buffer,
                 gradBuffers[3].Buffer, gradBuffers[4].Buffer,
-                batch, seqLen, modelDim, numHeads, headDim);
+                batch, seqLen, modelDim, numHeads, headDim, (float)keyScale, decayFirst);
             var result = new Tensor<T>[5];
             for (int i = 0; i < 5; i++)
             {
@@ -14331,6 +14333,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // when the backend implements IGatedDeltaNetBackwardBackend (CUDA/HIP); falls back cleanly otherwise.
     public override Tensor<T> GatedDeltaNetScanForward<T>(
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
+        => GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, GatedDeltaRule.ScaledKeys);
+
+    /// <inheritdoc />
+    public override Tensor<T> GatedDeltaNetScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads,
+        GatedDeltaRule rule)
     {
         using var __gpuOp = EnterGpuOp();
         if (qProj is null) throw new ArgumentNullException(nameof(qProj));
@@ -14341,9 +14349,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (Compilation.GraphMode.IsActive ||
             typeof(T) != typeof(float) || !TryGetBackend(out var backend) ||
             (IsTapeActive<T>() && Engines.DirectGpu.GatedDeltaNetBackwardResolver.Resolve(backend) is null))
-            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, rule);
+        // A backend without the rule-aware forward still runs the original rule through IDirectGpuBackend.
+        var ruleBackend = backend as Engines.DirectGpu.IGatedDeltaRuleForwardBackend;
+        if (ruleBackend is null && rule != GatedDeltaRule.ScaledKeys)
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, rule);
         if (qProj.Rank != 3 || numHeads < 1)
-            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, rule);
 
         int batch = qProj.Shape._dims[0];
         int seqLen = qProj.Shape._dims[1];
@@ -14351,16 +14363,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (kProj.Rank != 3 || vProj.Rank != 3 ||
             kProj.Shape._dims[0] != batch || kProj.Shape._dims[1] != seqLen || kProj.Shape._dims[2] != modelDim ||
             vProj.Shape._dims[0] != batch || vProj.Shape._dims[1] != seqLen || vProj.Shape._dims[2] != modelDim)
-            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, rule);
         if (modelDim % numHeads != 0)
-            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, rule);
         int headDim = modelDim / numHeads;
         // alpha/beta are per-head gates [batch, seqLen, numHeads].
         if (headDim > Engines.DirectGpu.GatedDeltaNetBackwardResolver.MaxHeadDim ||
             alpha.Rank != 3 || beta.Rank != 3 ||
             alpha.Shape._dims[0] != batch || alpha.Shape._dims[1] != seqLen || alpha.Shape._dims[2] != numHeads ||
             beta.Shape._dims[0] != batch || beta.Shape._dims[1] != seqLen || beta.Shape._dims[2] != numHeads)
-            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, rule);
 
         try
         {
@@ -14371,8 +14383,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bB = GetOrAllocateBuffer(backend, beta);
             using var outB = AllocateOutputBuffer(backend, batch * seqLen * modelDim);
 
-            backend.GatedDeltaNetScanForward(qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer, outB.Buffer,
-                batch, seqLen, modelDim, numHeads, headDim);
+            var (keyScale, decayFirst) = CpuEngine.GatedDeltaRuleTerms(rule, headDim);
+            if (ruleBackend is not null)
+                ruleBackend.GatedDeltaNetScanForward(qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer, outB.Buffer,
+                    batch, seqLen, modelDim, numHeads, headDim, (float)keyScale, decayFirst);
+            else
+                backend.GatedDeltaNetScanForward(qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer, outB.Buffer,
+                    batch, seqLen, modelDim, numHeads, headDim);
 
             var result = DeferTensorResult<T>(backend, outB.Buffer, batch * seqLen * modelDim,
                 new[] { batch, seqLen, modelDim });
@@ -14382,11 +14399,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Autodiff.DifferentiableOps.RecordIfActive<T>(
                 "GatedDeltaNetScan", result, new[] { qProj, kProj, vProj, alpha, beta },
                 CpuEngine.GatedDeltaNetScanBackward,
-                savedState: new object[] { numHeads });
+                savedState: new object[] { numHeads, rule });
             return result;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("GatedDeltaNetScanForward", capabilityGap);
-            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads);
+            return base.GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, rule);
         }
     }
 

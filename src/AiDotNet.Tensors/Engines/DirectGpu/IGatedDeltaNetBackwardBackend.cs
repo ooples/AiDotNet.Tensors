@@ -26,7 +26,22 @@ internal interface IGatedDeltaNetBackwardBackend
         int seqLen,
         int modelDim,
         int numHeads,
-        int headDim);
+        int headDim,
+        float keyScale,
+        bool decayFirst);
+}
+
+/// <summary>
+/// Internal capability interface of GPU backends whose fused Gated DeltaNet scan forward takes the rule terms:
+/// <paramref name="keyScale"/> multiplies every key, and <paramref name="decayFirst"/> makes the prediction read the
+/// decayed state (<see cref="GatedDeltaRule.Standard"/>); <see cref="IDirectGpuBackend.GatedDeltaNetScanForward"/> is
+/// the original rule, keys scaled by 1/sqrt(headDim) and the prediction read before the decay.
+/// </summary>
+internal interface IGatedDeltaRuleForwardBackend
+{
+    void GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst);
 }
 
 internal static class GatedDeltaNetBackwardResolver
@@ -36,6 +51,9 @@ internal static class GatedDeltaNetBackwardResolver
 
     /// <summary>The physical backend's fused backward, or null when it has none or may not launch it now.</summary>
     public static IGatedDeltaNetBackwardBackend? Resolve(IDirectGpuBackend backend)
+        => Physical(backend) as IGatedDeltaNetBackwardBackend;
+
+    private static IDirectGpuBackend? Physical(IDirectGpuBackend backend)
     {
         while (backend is Gpu.DelegatingGpuBackend wrapper)
         {
@@ -46,8 +64,14 @@ internal static class GatedDeltaNetBackwardResolver
                 return null;
             backend = wrapper.InnerBackend;
         }
-        return backend as IGatedDeltaNetBackwardBackend;
+        return backend;
     }
+
+    /// <summary>The kernels' terms of the original rule: keys scaled by 1/sqrt(headDim), prediction before the decay.</summary>
+    public static float OriginalKeyScale(int headDim) => (float)(1.0 / Math.Sqrt(headDim));
+
+    /// <summary>A float's bit pattern, for backends whose kernel scalars are ints (the kernel bit-casts it back).</summary>
+    public static int FloatBits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
 
     /// <summary>
     /// Rejects buffers smaller than the scan's shapes before any kernel reads or writes them: dOut, q, k, v, dQ, dK

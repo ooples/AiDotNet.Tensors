@@ -45,7 +45,7 @@ public class DecodeStepCpuPlanTests
         using (new EngineScope(cpu))
         using (var scope = GraphMode.EnableInference())
         {
-            var y = cpu.TensorMultiplyScalar(cpu.GatedDeltaNetStep(state, q, k, v, a, b), 2f);
+            var y = cpu.TensorMultiplyScalar(cpu.GatedDeltaNetStep(state, q, k, v, a, b, GatedDeltaRule.ScaledKeys), 2f);
             plan = scope.CompileInference(y, new[] { q, k, v, a, b }, Array.Empty<(Tensor<float>, Tensor<float>)>());
         }
         using (plan)
@@ -58,7 +58,7 @@ public class DecodeStepCpuPlanTests
                 };
                 plan.SetInputs(x);
                 var y = plan.Execute().ToArray();
-                var expect = cpu.GatedDeltaNetStep(reference, x[0], x[1], x[2], x[3], x[4]).ToArray().Select(e => 2 * e).ToArray();
+                var expect = cpu.GatedDeltaNetStep(reference, x[0], x[1], x[2], x[3], x[4], GatedDeltaRule.ScaledKeys).ToArray().Select(e => 2 * e).ToArray();
                 Close(expect, y, $"t{t} y");
                 Close(reference.ToArray(), state.ToArray(), $"t{t} state");
             }
@@ -205,11 +205,11 @@ public class DecodeStepCpuPlanTests
         var cpu = new CpuEngine();
         var s = new Tensor<float>([2, 3, 4]);
         Tensor<float> Z(params int[] shape) => new(shape);
-        Assert.Throws<ArgumentNullException>(() => cpu.GatedDeltaNetStep(null!, Z(2, 4), Z(2, 4), Z(2, 3), Z(2), Z(2)));
-        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(Z(6, 4), Z(2, 4), Z(2, 4), Z(2, 3), Z(2), Z(2)));
-        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(s, Z(2, 5), Z(2, 4), Z(2, 3), Z(2), Z(2)));
-        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(s, Z(2, 4), Z(2, 4), Z(2, 4), Z(2), Z(2)));
-        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(s, Z(2, 4), Z(2, 4), Z(2, 3), Z(3), Z(2)));
+        Assert.Throws<ArgumentNullException>(() => cpu.GatedDeltaNetStep(null!, Z(2, 4), Z(2, 4), Z(2, 3), Z(2), Z(2), GatedDeltaRule.ScaledKeys));
+        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(Z(6, 4), Z(2, 4), Z(2, 4), Z(2, 3), Z(2), Z(2), GatedDeltaRule.ScaledKeys));
+        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(s, Z(2, 5), Z(2, 4), Z(2, 3), Z(2), Z(2), GatedDeltaRule.ScaledKeys));
+        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(s, Z(2, 4), Z(2, 4), Z(2, 4), Z(2), Z(2), GatedDeltaRule.ScaledKeys));
+        Assert.Throws<ArgumentException>(() => cpu.GatedDeltaNetStep(s, Z(2, 4), Z(2, 4), Z(2, 3), Z(3), Z(2), GatedDeltaRule.ScaledKeys));
 
         var h = new Tensor<float>([2, 1, 4]);
         Assert.Throws<ArgumentException>(() => cpu.CausalConv1dStep(Z(2, 4), Z(1, 4), Z(4, 3), null, false));

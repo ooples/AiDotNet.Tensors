@@ -19,7 +19,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -18985,9 +18985,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private static uint GatedDeltaNetWarpGrid(long warps) => (uint)checked((warps * 32 + DefaultBlockSize - 1) / DefaultBlockSize);
 
     // ── Fused Gated DeltaNet scan forward (#1464) ──────────────────────────────────────────
-    public unsafe void GatedDeltaNetScanForward(
+    public void GatedDeltaNetScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => ((IGatedDeltaRuleForwardBackend)this).GatedDeltaNetScanForward(q, k, v, alpha, beta, output,
+            batch, seqLen, modelDim, numHeads, headDim, GatedDeltaNetBackwardResolver.OriginalKeyScale(headDim), false);
+
+    unsafe void IGatedDeltaRuleForwardBackend.GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
     {
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
@@ -19002,16 +19008,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         using var _ = PushContext();
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, pout = output.Handle;
-        void** args = stackalloc void*[11];
+        int decay = decayFirst ? 1 : 0;
+        void** args = stackalloc void*[13];
         args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pa; args[4] = &pb; args[5] = &pout;
         args[6] = &batch; args[7] = &seqLen; args[8] = &modelDim; args[9] = &numHeads; args[10] = &headDim;
+        args[11] = &keyScale; args[12] = &decay;
         LaunchKernel(kernel, GatedDeltaNetWarpGrid((long)batch * numHeads * headDim), (uint)DefaultBlockSize, args);
     }
 
     unsafe void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
     {
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
@@ -19054,9 +19062,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         uint grid = GatedDeltaNetWarpGrid((long)batch * numHeads * headDim);
 
         IntPtr pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, ptr = trajBuf.Handle;
-        void** ra = stackalloc void*[10];
+        int decay = decayFirst ? 1 : 0;
+        void** ra = stackalloc void*[12];
         ra[0] = &pk; ra[1] = &pv; ra[2] = &pa; ra[3] = &pb; ra[4] = &ptr;
         ra[5] = &batch; ra[6] = &seqLen; ra[7] = &modelDim; ra[8] = &numHeads; ra[9] = &headDim;
+        ra[10] = &keyScale; ra[11] = &decay;
         LaunchKernel(recompute, grid, (uint)DefaultBlockSize, ra);
 
         IntPtr pdo = dOut.Handle, pq = q.Handle;
@@ -19074,11 +19084,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         IntPtr pslot = det ? pp : pdq;
         int detFlag = det ? 1 : 0;
-        void** ba = stackalloc void*[18];
+        void** ba = stackalloc void*[20];
         ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pa; ba[5] = &pb; ba[6] = &ptr;
         ba[7] = &pslot; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
         ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
-        ba[17] = &detFlag;
+        ba[17] = &detFlag; ba[18] = &keyScale; ba[19] = &decay;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
 
         if (det)
