@@ -61,6 +61,18 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
         using var biased = engine.TensorChannelBiasAdd(convolution, bias);
         using var expected = engine.TensorAdd(biased, residual);
         using var expectedActivated = engine.LeakyReLU(expected, .1f);
+        // Both arms sum the same channels * 3 products in their own order (and, under TF32, from the same rounded
+        // operands), so an output may differ by the summation's rounding: a multiple of sum |x * w| + |bias| +
+        // |residual|, which on a cancelling element is far above a bound relative to the result itself (an element of
+        // 0.043 whose terms sum to several units differed by 1.7e-6). LeakyReLU is 1-Lipschitz, so the bound holds for
+        // the activated output too.
+        var cpu = new CpuEngine();
+        var magnitude = cpu.TensorAdd(cpu.TensorChannelBiasAdd(
+                cpu.Conv2D(Abs(inputValues, input.Shape.ToArray()), Abs(kernelValues, kernel.Shape.ToArray()),
+                    new[] { 1, 1 }, new[] { 0, 1 }, new[] { 1, 1 }),
+                Abs(biasValues, new[] { channels })),
+            Abs(residualValues, input.Shape.ToArray())).ToArray();
+        double rounding = (channels * 3 + 2) * Math.Pow(2, -24);
         long before = backend.ConvBiasResidualVendorLaunchCount;
         Assert.True(engine.TryConvBiasResidualInference(input, kernel, bias, residual, 1, 1, 0, 1, 1, 1,
             .1f, activate, out var actual, out var activated));
@@ -68,13 +80,13 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
         using (activated)
         {
             Assert.Equal(before + 1, backend.ConvBiasResidualVendorLaunchCount);
-            Close(expected.ToArray(), actual.ToArray());
+            Close(expected.ToArray(), actual.ToArray(), magnitude, rounding);
             if (activate)
             {
                 Assert.NotNull(activated);
                 Assert.False(actual.SharesStorageWith(activated));
                 var saved = activated.ToArray();
-                Close(expectedActivated.ToArray(), saved);
+                Close(expectedActivated.ToArray(), saved, magnitude, rounding);
                 engine.TensorAddInPlace(actual, actual);
                 Assert.Equal(saved, activated.ToArray());
             }
@@ -168,13 +180,15 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
         foreach (Type type in types) Assert.True(typeof(IConvBiasResidualBackend).IsAssignableFrom(type), type.FullName);
     }
 
-    private static void Close(float[] expected, float[] actual)
+    private static void Close(float[] expected, float[] actual, float[]? magnitude = null, double rounding = 0)
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-6f + 1e-5f * Math.Abs(expected[i]),
-                $"Output mismatch at {i}: expected {expected[i]:R}, actual {actual[i]:R}.");
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-6f + 1e-5f * Math.Abs(expected[i]) + rounding * (magnitude?[i] ?? 0),
+                $"Output mismatch at {i}: expected {expected[i]:R}, actual {actual[i]:R}, sum of |terms| {magnitude?[i] ?? 0:R}.");
     }
+
+    private static Tensor<float> Abs(float[] values, int[] shape) => new(values.Select(Math.Abs).ToArray(), shape);
 
     private sealed class FakeBuffer : IGpuBuffer
     {

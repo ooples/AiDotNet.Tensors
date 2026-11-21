@@ -401,6 +401,7 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
     public static Task DispatchComputeAsync(int pipelineId, int bindGroupId, int workgroupsX, int workgroupsY, int workgroupsZ)
     {
+        GpuLaunchProbe.OnLaunch();   // each dispatch is one kernel launch, as every other backend counts it
         if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, -1, workgroupsX);
         if (Host is not { } host) return JsDispatchComputeAsync(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchCompute", Args(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ));
@@ -421,6 +422,7 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
     public static Task DispatchComputeWithUniformsAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroupsX, int workgroupsY, int workgroupsZ)
     {
+        GpuLaunchProbe.OnLaunch();
         if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX);
         if (Host is not { } host) return JsDispatchComputeWithUniformsAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchComputeWithUniforms", Args(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ));
@@ -440,6 +442,7 @@ public static partial class WebGpuNativeBindings
             throw new ArgumentException("Every dispatch needs a pipeline, a bind group, a uniform buffer and a workgroup count.");
         foreach (int x in workgroupsX)
             if (NeedsFold(x, 1, 1)) return DispatchChainOneByOneAsync(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX);
+        for (int i = 0; i < pipelineIds.Length; i++) GpuLaunchProbe.OnLaunch();   // one pass, still a launch per dispatch
         if (Host is not { } host)
             return JsDispatchComputeChainWithUniformsAsync(ToDoubles(pipelineIds), ToDoubles(bindGroupIds), ToDoubles(uniformBufferIds), ToDoubles(workgroupsX));
         host.Invoke("dispatchComputeChainWithUniforms", Args(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX));

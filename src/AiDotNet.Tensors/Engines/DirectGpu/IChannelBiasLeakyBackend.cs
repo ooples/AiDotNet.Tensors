@@ -23,12 +23,8 @@ internal static class ChannelBiasLeakyGeometry
         if (input.Size < total || output.Size < total || bias.Size < channels
             || input.SizeInBytes < total * sizeof(float) || output.SizeInBytes < total * sizeof(float)
             || bias.SizeInBytes < (long)channels * sizeof(float)) return false;
-        var destinationRoot = GpuBufferViewRoot.Of(output);
-        var inputRoot = GpuBufferViewRoot.Of(input);
-        var biasRoot = GpuBufferViewRoot.Of(bias);
-        if (destinationRoot.Handle == IntPtr.Zero || inputRoot.Handle == IntPtr.Zero || biasRoot.Handle == IntPtr.Zero
-            || ReferenceEquals(destinationRoot, inputRoot) || destinationRoot.Handle == inputRoot.Handle
-            || ReferenceEquals(destinationRoot, biasRoot) || destinationRoot.Handle == biasRoot.Handle) return false;
+        if (!GpuBufferViewRoot.IsBacked(output) || !GpuBufferViewRoot.IsBacked(input) || !GpuBufferViewRoot.IsBacked(bias)
+            || GpuBufferViewRoot.SameAllocation(output, input) || GpuBufferViewRoot.SameAllocation(output, bias)) return false;
         count = (int)total;
         return true;
     }

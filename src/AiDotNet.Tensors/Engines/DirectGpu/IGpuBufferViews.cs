@@ -18,6 +18,38 @@ internal static class GpuBufferViewRoot
         while (buffer is IGpuBufferViewSource { ViewParent: { } parent }) buffer = parent;
         return buffer;
     }
+
+    /// <summary>
+    /// Whether <paramref name="buffer"/>'s memory is live: its root has a native handle, or is a WebGPU buffer (whose
+    /// handles live on the JavaScript side, so <see cref="IGpuBuffer.Handle"/> is always zero) that is still valid.
+    /// </summary>
+    public static bool IsBacked(IGpuBuffer buffer)
+    {
+        var root = Of(buffer);
+        if (root.Handle != IntPtr.Zero) return true;
+#if NET7_0_OR_GREATER
+        return root is WebGpu.WebGpuBuffer { IsValid: true };
+#else
+        return false;
+#endif
+    }
+
+    /// <summary>
+    /// Whether two buffers address the same allocation: the same root, the same native handle, or (WebGPU, where every
+    /// handle is zero) the same device buffer id. Two handle-less buffers are not the same merely for sharing zero.
+    /// </summary>
+    public static bool SameAllocation(IGpuBuffer left, IGpuBuffer right)
+    {
+        var a = Of(left);
+        var b = Of(right);
+        if (ReferenceEquals(a, b)) return true;
+        if (a.Handle != IntPtr.Zero) return a.Handle == b.Handle;
+#if NET7_0_OR_GREATER
+        return a is WebGpu.WebGpuBuffer wa && b is WebGpu.WebGpuBuffer wb && wa.BufferId == wb.BufferId;
+#else
+        return false;
+#endif
+    }
 }
 
 /// <summary>
