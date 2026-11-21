@@ -64,6 +64,8 @@ internal sealed class MockBackendState
     public string DeviceVendor { get; set; } = "Mock";
     public List<int> AllocationSizes { get; } = new();
     public List<MockGpuBuffer> AllocatedBuffers { get; } = new();
+    public int FailIntAllocationAt { get; set; }
+    public int IntAllocationCalls { get; set; }
     public int DownloadBufferCalls { get; set; }
     public int ClassifyFloatCalls { get; set; }
     public int FillCalls { get; set; }
@@ -75,6 +77,9 @@ internal sealed class MockBackendState
     public int EqualsCalls { get; set; }
     public int NotEqualsCalls { get; set; }
     public int WhereCalls { get; set; }
+    public bool Capturing { get; set; }
+    public long NextGraph { get; set; }
+    public int GraphLaunches { get; set; }
     public List<string> OptimizerCalls { get; } = new();
 }
 
@@ -94,6 +99,13 @@ public class MockDirectGpuBackend : DispatchProxy
         var proxy = (MockDirectGpuBackend)Create<IDirectGpuBackend, MockDirectGpuBackend>();
         proxy._state = state;
         return (IDirectGpuBackend)(object)proxy;
+    }
+
+    internal static IGpuGraphCapture CreateGraphCapture(MockBackendState state)
+    {
+        var proxy = (MockDirectGpuBackend)Create<IGpuGraphCapture, MockDirectGpuBackend>();
+        proxy._state = state;
+        return (IGpuGraphCapture)(object)proxy;
     }
 
     internal static IMultiTensorGpuOptimizerBackend CreateMultiTensor(MockBackendState state)
@@ -120,10 +132,30 @@ public class MockDirectGpuBackend : DispatchProxy
     protected override object Invoke(MethodInfo targetMethod, object[] args)
     {
         if (_state.ThrowOnCall.TryGetValue(targetMethod.Name, out var injected)) throw injected;
+        if (targetMethod.Name == "AllocateIntBuffer" && ++_state.IntAllocationCalls == _state.FailIntAllocationAt)
+            throw new InvalidOperationException("Injected integer allocation failure.");
         switch (targetMethod.Name)
         {
             // ── Identity / device info — implemented ──
             case "get_IsAvailable": return true;
+            case "get_SupportsGraphCapture": return true;
+            case "get_ContextIsLive": return true;
+            case "IsStreamCapturing": return _state.Capturing;
+            case "StreamCaptureStatusRaw": return _state.Capturing ? 1 : 0;
+            case "get_LastCaptureFailure":
+            case "get_LastCaptureNodeCounts":
+            case "CreateStepIo": return null;
+            case "CaptureGraph":
+                _state.Capturing = true;
+                try
+                {
+                    ((Action)args[0])();
+                    return new IntPtr(++_state.NextGraph);
+                }
+                finally { _state.Capturing = false; }
+            case "LaunchCapturedGraph":
+            case "EnqueueCapturedGraph": _state.GraphLaunches++; return null;
+            case "DestroyCapturedGraph": return null;
             case "get_BackendName": return "Mock";
             case "get_DeviceType": return TensorDevice.OpenCL; // any value works
             case "get_DeviceName": return _state.DeviceName;
@@ -188,6 +220,12 @@ public class MockDirectGpuBackend : DispatchProxy
                 Array.Copy(uploadSrc, uploadDst.Data, uploadSrc.Length);
                 object none = null;
                 return none;
+            }
+            case "UploadIntBufferInPlace":
+            {
+                var ids = (int[])args[0];
+                Buffer.BlockCopy(ids, 0, ((MockGpuBuffer)args[1]).Data, 0, ids.Length * sizeof(int));
+                return null;
             }
             case "AllocateIntBuffer" when args.Length == 1 && args[0] is int intSize:
             {

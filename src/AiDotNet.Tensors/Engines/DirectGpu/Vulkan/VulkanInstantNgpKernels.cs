@@ -364,6 +364,22 @@ void main() {
 }
 ";
 
+    public static string FusedCeTargetPositions => @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Ids { int ids[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float positionBits[]; };
+layout(push_constant) uniform P { int rows; int chunk; int vocab; };
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= rows) return;
+    int raw = ids[gid];
+    int id = clamp(raw, 0, vocab - 1);
+    positionBits[gid] = intBitsToFloat((gid % chunk) * vocab + id);
+    positionBits[rows + gid] = raw == id ? 0.0 : intBitsToFloat(0x7fc00000);
+    positionBits[2 * rows + gid] = raw == id ? 0.0 : 1.0;
+}
+";
+
     public static string ConvertIndicesToInt32 => @"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Input { float input_[]; };

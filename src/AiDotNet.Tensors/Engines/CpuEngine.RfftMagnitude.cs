@@ -111,6 +111,14 @@ public partial class CpuEngine : IRfftMagnitudeEngine
     {
         if (rows == 0) return;
         int scratchLength = checked(2 * length);
+        if (stridedDestination is null && TryMklRfftMagnitudeRows(source, upstream, destination,
+                rows, length, bins, epsilon, backward, accumulate)) return;
+        if (stridedDestination is null && typeof(T) == typeof(float) && length >= 2 && (length & (length - 1)) == 0)
+        {
+            RfftMagnitudeFloatRows(AsFloatReadOnlyMemory(source), backward ? AsFloatReadOnlyMemory(upstream) : default,
+                AsFloatMemory(destination), rows, length, bins, (float)epsilon, backward, accumulate);
+            return;
+        }
         // Logical tensor writes can privatize COW storage on their first write. Keep that rare strided
         // path serial; contiguous destinations were privatized before entering the parallel region.
         int workers = stridedDestination is null ? Math.Max(1, Math.Min(rows, CpuParallelSettings.MaxDegreeOfParallelism)) : 1;

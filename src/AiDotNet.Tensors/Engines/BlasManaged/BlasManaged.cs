@@ -631,6 +631,7 @@ public static partial class BlasManaged
                 PackingMode = evolved.PackingMode,
                 Epilogue = options.Epilogue,
                 Workspace = options.Workspace,
+                ConvPacking = options.ConvPacking,
                 PackedA = options.PackedA,
                 PackedB = options.PackedB,
                 NumThreads = evolved.ThreadCount,
@@ -692,6 +693,7 @@ public static partial class BlasManaged
                     PackingMode = options.PackingMode,
                     Epilogue = options.Epilogue,
                     Workspace = options.Workspace,
+                    ConvPacking = options.ConvPacking,
                     PackedA = options.PackedA,
                     PackedB = null,
                     NumThreads = options.NumThreads,
@@ -882,18 +884,7 @@ public static partial class BlasManaged
             && (options.NumThreads == 0 || deterministicGoto)
             && (options.PackingMode == PackingMode.Auto
                 || (options.PackingMode == PackingMode.DisableAutotune && (!deterministic || deterministicGoto)))
-            && (GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
-                || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget)
-                // #653: an M PackBoth would tail-split (to Streaming on a many-core host), at any thread budget.
-                || GotoGemmFp32.PackBothNeedsTailSplit(m)
-                // #653: on one thread PackBoth re-packs the whole A operand every call; the Goto tile loop measured
-                // 22% faster on a 256x256x2304 conv GEMM (4.4 -> 3.4 ms) and 14% on 256x3072x768 (18.2 -> 15.8 ms).
-                || gotoThreadBudget == 1)
-            && (long)m * n * k >= GotoGemmFp32.ParallelMinWork
-            // BeatsPackBoth cedes thin-M wide-N to PackBoth's N-axis path because that path shares A across threads; on
-            // one thread nothing is shared, and Goto measured 2x on the implicit conv's 64x2048x576 (7.5 -> 3.8 ms) and
-            // 32x4096x288 (3.9 -> 2.1 ms) (#653).
-            && (gotoThreadBudget == 1 || GotoGemmFp32.BeatsPackBoth(m, n, k))
+            && GotoGemmFp32.PreferShape(m, n, k, gotoThreadBudget)
             && GotoGemmFp32.IsAvailable)
         {
             // The fp32 GotoGemm routes (per-tile RunTile, CCX RunTilePackedB / RunMacroPanelStep) are write-first:
@@ -1168,6 +1159,7 @@ public static partial class BlasManaged
                 // Keep the outer plan when DisableAutotune resolves before tail splitting.
                 PackingMode = options.PackingMode == PackingMode.DisableAutotune ? strategy : options.PackingMode,
                 Workspace = options.Workspace,
+                ConvPacking = options.ConvPacking,
                 PackedA = options.PackedA,
                 PackedB = options.PackedB,
                 NumThreads = options.NumThreads,

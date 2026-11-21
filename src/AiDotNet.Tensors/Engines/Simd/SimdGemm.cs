@@ -223,22 +223,42 @@ internal static partial class SimdGemm
     internal static bool TryGemmSmallJit(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
     {
+        float[]? destination = c;
+        return TryGemmSmallJitCore(a, lda, transA, b, ldb, transB, ref destination, m, k, n, useScratch: false);
+    }
+
+    // Compiled accumulating gradients need a product buffer only when the overwrite-only kernel accepts the shape.
+    internal static bool TryGemmSmallJitWithScratch(
+        float[] a, int lda, bool transA, float[] b, int ldb, bool transB, ref float[]? scratch, int m, int k, int n)
+        => TryGemmSmallJitCore(a, lda, transA, b, ldb, transB, ref scratch, m, k, n, useScratch: true);
+
+    private static bool TryGemmSmallJitCore(
+        float[] a, int lda, bool transA, float[] b, int ldb, bool transB, ref float[]? destination,
+        int m, int k, int n, bool useScratch)
+    {
 #if NETCOREAPP
         if (!_jitSmallK || !JitGemmAvx2.Available || m <= 0 || n <= 0 || k <= 0) return false;
         // Same operand contract as every other entry here: the paths below slice, index and hand raw spans to the
         // native kernel, so a short buffer must be rejected before any of that.
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
-        if (c is null) throw new ArgumentNullException(nameof(c));
-        ValidateGemmOperands(a.Length, lda, transA, b.Length, ldb, transB, c.Length, m, k, n);
+        if (!useScratch && destination is null) throw new ArgumentNullException("c");
+        ValidateGemmOperands(a.Length, lda, transA, b.Length, ldb, transB,
+            useScratch ? int.MaxValue : destination!.Length, m, k, n);
         if (!transA && !transB)
-            return lda == k && ldb == n && TryJitSmallK(a.AsSpan(0, m * k), b.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
+        {
+            if (lda != k || ldb != n || !InJitSmallKBand(m, n, k, transB: false)) return false;
+            var c = GetSmallJitDestination(ref destination, m, n);
+            JitGemmAvx2.RunJit(a.AsSpan(0, m * k), b.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
+            return true;
+        }
 
         if (!transA && transB)
         {
             // B is stored [n, k]; Bᵀ [k, n] is the small operand.
             if (lda != k || ldb != k || (long)k * n > SmallJitMaxTransposeElements || !InJitSmallKBand(m, n, k, transB: true))
                 return false;
+            var c = GetSmallJitDestination(ref destination, m, n);
             var bt = System.Buffers.ArrayPool<float>.Shared.Rent(k * n);
             try
             {
@@ -261,6 +281,7 @@ internal static partial class SimdGemm
             int chunkRows = Math.Min(JitSmallKMaxK, k);
             int chunks = (k + chunkRows - 1) / chunkRows;
             if (chunks < 2) return false;
+            var c = GetSmallJitDestination(ref destination, m, n);
             var pool = System.Buffers.ArrayPool<float>.Shared;
             var partial = pool.Rent(chunks * mPad * n);
             try
@@ -301,7 +322,12 @@ internal static partial class SimdGemm
         return false;
     }
 
-
+    private static float[] GetSmallJitDestination(ref float[]? destination, int rows, int cols)
+    {
+        int length = checked(rows * cols);
+        if (destination is null || destination.Length < length) destination = new float[length];
+        return destination;
+    }
 
     /// <summary>Shapes the small-K panel kernel wins at: shallow k, enough rows to parallelize, and either total work
     /// under <see cref="JitSmallKMaxWork"/> or B re-read traffic under <see cref="JitSmallKMaxBTrafficBytes"/> -- less

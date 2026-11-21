@@ -897,6 +897,9 @@ internal static class DifferentiableOps
         Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, Tensor<T> target)
     {
         MarkWrittenThisStep(target);
+        // A direct kernel can acquire a leased forward slot just as an adopted
+        // contribution can. Keep its accumulator live beyond the current action.
+        NoteAdoptedAccumulator(target);
         int idx = tensor._gradIndex;
         var indexedGrads = _indexedGrads;
         if (indexedGrads is not null && idx >= 0 && idx < indexedGrads.Length) indexedGrads[idx] = target;

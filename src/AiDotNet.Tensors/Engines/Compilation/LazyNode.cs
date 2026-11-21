@@ -425,7 +425,13 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
             try { copy = target.Clone(); }
             finally { target.LazySource = source; }
             var engine = RecordingEngine;
-            restores.Add(() => DirectGpuTensorEngine.CopyResultInto(engine, copy, target));
+            restores.Add(() =>
+            {
+                // Another training plan may already replay into this running statistic. Restoring its
+                // pre-trace value must also restore the contents at that plan's captured address.
+                if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryRestoreResidentState(copy, target)) return;
+                DirectGpuTensorEngine.CopyResultInto(engine, copy, target);
+            });
         }
         return true;
     }

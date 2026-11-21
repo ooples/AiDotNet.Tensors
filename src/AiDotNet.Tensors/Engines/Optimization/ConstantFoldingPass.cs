@@ -25,23 +25,20 @@ internal sealed class ConstantFoldingPass : ICpuOptimizationPass
     {
         if (!IsEnabled || steps.Length == 0) return null;
 
-        // Build set of all tensors produced by some step's output.
-        // Any tensor that appears as a step input but is NOT produced by any step
-        // is a graph input (model input, weight, etc.) and must be treated as dynamic.
-        var producedByStep = new HashSet<object>();
-        foreach (var step in steps)
-            producedByStep.Add(step.OutputBuffer);
-
+        // Any tensor a step reads before an EARLIER step produced it is a graph input (model input, weight, etc.)
+        // and must be treated as dynamic. That includes a tensor a LATER step writes: a loop-carried value, such as
+        // the state a stateful plan's trailing state write updates for the next execution. Folding its reader to
+        // run-once would freeze it at its first value.
+        var producedSoFar = new HashSet<object>();
         var dynamicTensors = new HashSet<object>();
         foreach (var step in steps)
         {
             foreach (var inp in step.Inputs)
             {
-                // If this input is not produced by any step, it's a graph-level input
-                // (model input or a mutable weight) — treat it as dynamic.
-                if (!producedByStep.Contains(inp))
+                if (!producedSoFar.Contains(inp))
                     dynamicTensors.Add(inp);
             }
+            producedSoFar.Add(step.OutputBuffer);
         }
 
         // Propagate: any op with at least one dynamic input produces a dynamic output

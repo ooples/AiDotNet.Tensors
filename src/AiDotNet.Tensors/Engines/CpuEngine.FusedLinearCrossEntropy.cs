@@ -93,9 +93,10 @@ public partial class CpuEngine
             var capturedBias = bias;
             var capturedTargetIds = targetIds;
             var readoutGuard = new ReadoutMutationGuard<T>(weight, bias);
+            // [6] = the id tensor itself: a captured backward reads its per-replay device ids, not [0]'s host copy.
             var compiledSavedState = new object[]
             {
-                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, readoutGuard
+                (int[])ids.Clone(), vocab, weight, bias, computeReadoutGrads, readoutGuard, targetIds
             };
             if (!computeReadoutGrads)
             {
@@ -432,7 +433,8 @@ public partial class CpuEngine
 
         if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
                 gradOutput, hidden, weight, bias, ids, null, needHidden, needWeight, needBias,
-                out var deviceHidden, out var deviceWeight, out var deviceBias))
+                out var deviceHidden, out var deviceWeight, out var deviceBias,
+                savedState.Length > 6 ? savedState[6] as Tensor<int> : null))
         {
             if (needHidden) DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
             if (needWeight) DifferentiableOps.AccumulateGrad(grads, weight, deviceWeight, engine);

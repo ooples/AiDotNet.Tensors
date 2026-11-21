@@ -145,6 +145,11 @@ internal sealed class LazyTensorScope : IDisposable
     internal static bool DeferGpuTrainingOutputs { get; set; } =
         Environment.GetEnvironmentVariable("AIDOTNET_GPU_DEFER_TRACE_OUTPUTS") != "0";
 
+    // CPU tracing can postpone primal allocation until a value is actually used.
+    // Kept opt-in while the complete training and lifetime controls are evaluated.
+    internal static bool DeferCpuTrainingOutputs { get; set; } =
+        Environment.GetEnvironmentVariable("AIDOTNET_CPU_DEFER_TRACE_OUTPUTS") == "1";
+
     /// <summary>Number of lazy operations recorded.</summary>
     internal int NodeCount => _nodes.Count;
 
@@ -169,7 +174,10 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     private Tensor<TOut> RentOutput<TOut>(int[] outputShape)
         => _isProbe ? Tensor<TOut>.CreateDeferred(outputShape)
-            : DeferGpuTrainingOutputs && _traceKind == GraphTraceKind.Training && _engine.Is<DirectGpuTensorEngine>()
+            : _traceKind == GraphTraceKind.Training
+                && ((DeferGpuTrainingOutputs && _engine.Is<DirectGpuTensorEngine>())
+                    || (DeferCpuTrainingOutputs && _engine.Is<CpuEngine>()
+                        && ReferenceEquals(_engine, _engine.Unwrap())))
                 ? Tensor<TOut>.CreateHostDeferred(outputShape)
                 : TensorAllocator.RentUninitialized<TOut>(outputShape);
 
@@ -621,6 +629,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal void ReleaseStorageLeases() => _storageLeases.Dispose();
 
+    internal bool OwnsStorageLease(object identity) => _storageLeases.ContainsStorage(identity);
+
     /// <summary>
     /// Compiles the lazy graph into an inference plan for zero-overhead replay.
     /// Call this instead of Realize() when you want to cache and replay the plan.
@@ -679,6 +689,19 @@ internal sealed class LazyTensorScope : IDisposable
     {
         return CompilePlan(
             () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputs));
+    }
+
+    /// <summary>
+    /// Compiles a stateful inference plan: as the multi-input compile, plus <paramref name="stateUpdates"/>, pairs of
+    /// a traced leaf and the value the graph computes to replace it. Each execution ends by writing every next value
+    /// into its state's storage, so a recurrent or KV-cached decode step advances its state on every replay
+    /// (CompiledInferencePlan's CUDA graph included) without host work.
+    /// </summary>
+    internal CompiledInferencePlan<T> CompileInference<T>(Tensor<T> explicitOutput, Tensor<T>[] inputs,
+        IReadOnlyList<(Tensor<T> State, Tensor<T> Next)> stateUpdates)
+    {
+        return CompilePlan(
+            () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputs, stateUpdates));
     }
 
     /// <summary>
