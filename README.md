@@ -33,6 +33,8 @@ A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kerne
 > custom net471 SIMD path to replace `System.Numerics.Vector<T>` there is on the
 > roadmap as Phase 5.
 
+Compare end-to-end training and inference against Python PyTorch on CPU or CUDA. The 11-family suite includes exact source revisions, a runner, and individual reports for both frameworks. [Run the model benchmarks](parity/model-families/README.md)
+
 ## Features
 
 - **Zero Allocations**: In-place operations with `ArrayPool<T>` and `Span<T>` for hot paths
