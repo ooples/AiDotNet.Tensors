@@ -52,7 +52,8 @@ public class GpuPinnedLifetimeTests
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
             Skip.If(!HasCoherentPinnedMapping(),
-                "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
             var p = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
             var g = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
             try
@@ -113,7 +114,8 @@ public class GpuPinnedLifetimeTests
         // loop" from "may swap to host for large-model memory pressure").
         Skip.If(WeightRegistry.OffloadAllocator is null
             || !WeightRegistry.OffloadAllocator.IsAvailable,
-            "CPU-only host; fallback path is covered by RentPinnedOnGpu_CpuOnlyHost_FallsBackToCpuPinned_NotThrowing.");
+            "CPU-only host; fallback path is covered by RentPinnedOnGpu_CpuOnlyHost_FallsBackToCpuPinned_NotThrowing: "
+            + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
         // PR #345 review: tighten assertion to require GpuPinned exactly.
         // Permitting `Default` masked regressions in the new tagging
@@ -226,13 +228,15 @@ public class GpuPinnedLifetimeTests
                     || g.TryGetGpuBuffer() is null
                     || m.TryGetGpuBuffer() is null
                     || v.TryGetGpuBuffer() is null,
-                    "Pinned tensors did not bind to GPU buffers on this host.");
+                    "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
                 Skip.If(!HasCoherentPinnedMapping(),
-                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 // Initialize values via flat-data span.
                 var pData = p.GetDataArray();
@@ -310,7 +314,8 @@ public class GpuPinnedLifetimeTests
                     || g.TryGetGpuBuffer() is null
                     || m.TryGetGpuBuffer() is null
                     || v.TryGetGpuBuffer() is null)
-                    Skip.If(true, "Pinned tensors did not bind to GPU buffers on this host.");
+                    Skip.If(true, "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 int pVersion = p.Version;
                 int mVersion = m.Version;
@@ -379,13 +384,15 @@ public class GpuPinnedLifetimeTests
             try
             {
                 Skip.If(p.TryGetGpuBuffer() is null || g.TryGetGpuBuffer() is null,
-                    "Pinned tensors did not bind to GPU buffers on this host.");
+                    "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
                 Skip.If(!HasCoherentPinnedMapping(),
-                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 var pData = p.GetDataArray();
                 var gData = g.GetDataArray();
@@ -440,13 +447,15 @@ public class GpuPinnedLifetimeTests
                     || g.TryGetGpuBuffer() is null
                     || m.TryGetGpuBuffer() is null
                     || v.TryGetGpuBuffer() is null,
-                    "Pinned tensors did not bind to GPU buffers on this host.");
+                    "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
                 Skip.If(!HasCoherentPinnedMapping(),
-                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 var pData = p.GetDataArray();
                 var initial = new float[] { 1.0f, 2.0f, 3.0f, 4.0f };

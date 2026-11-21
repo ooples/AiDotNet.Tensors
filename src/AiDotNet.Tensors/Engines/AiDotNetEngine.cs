@@ -460,6 +460,21 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
+    /// Why a tensor rented with <c>RentPinnedOnGpu</c> would not be device-resident right now, or "usable". The offload
+    /// allocator is process-wide state with several ways to be out of service; a caller that only sees the CPU fallback
+    /// cannot tell which.
+    /// </summary>
+    internal static string DescribeGpuOffloadAllocatorState()
+    {
+        var allocator = LinearAlgebra.WeightRegistry.OffloadAllocator;
+        if (allocator is null) return "no offload allocator is registered";
+        if (GpuCircuitBroken) return "the GPU circuit breaker is open";
+        string kind = allocator.GetType().Name;
+        if (allocator is not DirectGpu.IGpuDevicePointerWrapper) return kind + " cannot wrap a device pointer";
+        return allocator.IsAvailable ? "usable (" + kind + ")" : kind + " reports unavailable (disposed, or its context is no longer live)";
+    }
+
+    /// <summary>
     /// Auto-registers the GPU offload allocator that matches the adopted backend
     /// so weights/optimizer-moments tagged <see cref="LinearAlgebra.WeightLifetime.GpuPinned"/>
     /// (via <c>TensorAllocator.RentPinnedOnGpu</c>) actually become GPU-resident.
