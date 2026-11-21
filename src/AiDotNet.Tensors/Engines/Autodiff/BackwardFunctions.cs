@@ -2197,6 +2197,14 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (typeof(T) == typeof(float) && savedState.Length > 5
+            && savedState[5] is Compilation.ChannelsLastSlot { Any: true } channelsLast)
+        {
+            Compilation.ChannelsLastBackward.ConvBiasBatchNorm((Tensor<float>)(object)gradOutput,
+                (Tensor<float>[])(object)inputs, (Tensor<float>)(object)output, savedState, channelsLast, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads);
+            return;
+        }
         var convBackward = (BackwardFunction<T>)savedState[0];
         var convSaved = (object[])savedState[1];
         var innerBackward = (BackwardFunction<T>)savedState[2];
@@ -2225,6 +2233,14 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (typeof(T) == typeof(float) && savedState.Length > 8
+            && savedState[8] is Compilation.ChannelsLastSlot { Any: true } channelsLast)
+        {
+            Compilation.ChannelsLastBackward.ConvChannelEpilogue((Tensor<float>)(object)gradOutput,
+                (Tensor<float>[])(object)inputs, (Tensor<float>)(object)output, savedState, channelsLast, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads);
+            return;
+        }
         var convBackward = (BackwardFunction<T>)savedState[0];
         var convSaved = (object[])savedState[1];
         var z = (Tensor<T>)savedState[2];

@@ -1338,6 +1338,61 @@ extern ""C"" __global__ __launch_bounds__(256) void channel_epilogue_bwd(const f
     }
 }
 
+// The epilogue over a flat index, for a small spatial extent (a channels-last activation is [rows, C] with spatial 1):
+// element i is in channel (i / spatial) % channels, the same arithmetic as channel_epilogue_fwd / _bwd.
+extern ""C"" __global__ __launch_bounds__(256) void channel_epilogue_flat_fwd(const float* __restrict__ z,
+    const float* __restrict__ bias, const float* __restrict__ scale, const float* __restrict__ shift,
+    float* __restrict__ y, long long count, int channels, int spatial, int act, float slope)
+{
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (long long)gridDim.x * blockDim.x)
+    {
+        const int c = (int)((i / spatial) % channels);
+        float v = z[i];
+        if (bias != nullptr) v = __fadd_rn(v, __ldg(&bias[c]));
+        if (scale != nullptr) v = __fmul_rn(v, __ldg(&scale[c]));
+        if (shift != nullptr) v = __fadd_rn(v, __ldg(&shift[c]));
+        if (act == 1) v = relu_nan_safe(v);
+        else if (act == 2) v = v > 0.0f ? v : __fmul_rn(slope, v);
+        y[i] = v;
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void channel_epilogue_flat_bwd(const float* __restrict__ dy,
+    const float* __restrict__ y, const float* __restrict__ scale, float* __restrict__ dz, long long count, int channels,
+    int spatial, int act, float slope)
+{
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (long long)gridDim.x * blockDim.x)
+    {
+        const int c = (int)((i / spatial) % channels);
+        float g = dy[i];
+        if (act == 1) g = y[i] > 0.0f ? g : 0.0f;
+        else if (act == 2) g = y[i] > 0.0f ? g : __fmul_rn(slope, g);
+        if (scale != nullptr) g = __fmul_rn(g, __ldg(&scale[c]));
+        dz[i] = g;
+    }
+}
+
+// The layout change of each sample's [rows, cols] matrix to [cols, rows] through a 32 x 33 shared tile (grid: col
+// tiles, row tiles, samples; 32 x 8 threads): NCHW -> NHWC with rows = C, cols = H*W, and back with them swapped.
+extern ""C"" __global__ __launch_bounds__(256) void layout_transpose_tiles(const float* __restrict__ input,
+    float* __restrict__ output, int rows, int cols)
+{
+    __shared__ float tile[32][33];
+    const long long sample = (long long)blockIdx.z * rows * cols;
+    const int c0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+    for (int j = threadIdx.y; j < 32; j += 8)
+    {
+        const int r = r0 + j, c = c0 + threadIdx.x;
+        if (r < rows && c < cols) tile[j][threadIdx.x] = input[sample + (long long)r * cols + c];
+    }
+    __syncthreads();
+    for (int j = threadIdx.y; j < 32; j += 8)
+    {
+        const int c = c0 + j, r = r0 + threadIdx.x;
+        if (r < rows && c < cols) output[sample + (long long)c * rows + r] = tile[threadIdx.x][j];
+    }
+}
+
 // ===========================================================================
 // TRIGONOMETRIC KERNELS
 // ===========================================================================
@@ -1746,6 +1801,9 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "conv_epilogue_nhwc_nchw",
                 "channel_epilogue_fwd",
                 "channel_epilogue_bwd",
+                "channel_epilogue_flat_fwd",
+                "channel_epilogue_flat_bwd",
+                "layout_transpose_tiles",
                 "conv2d_bias_add_out",
                 // Vectorized (float4) unary
                 "relu_vec4",

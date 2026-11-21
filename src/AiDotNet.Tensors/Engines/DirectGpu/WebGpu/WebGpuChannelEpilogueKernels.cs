@@ -61,9 +61,37 @@ fn " + ChannelEpilogueKernelTemplate.Backward + @"(@builtin(global_invocation_id
 }
 ";
 
+    private static readonly string LayoutSource = @"
+@group(0) @binding(0) var<storage, read> lin: array<f32>;
+@group(0) @binding(1) var<storage, read_write> lout: array<f32>;
+" + ParamsDecl + @"
+@group(0) @binding(2) var<uniform> pm: Params;
+@compute @workgroup_size(256)
+fn " + ChannelEpilogueKernelTemplate.Layout + @"(@builtin(global_invocation_id) gidv: vec3<u32>) {
+    let gid = i32(gidv.x);
+    if (gid < pm.count) {
+        let i = pm.offset + gid;
+        var src: i32;
+        if ((pm.mode & 1) != 0) {
+            let c = i % pm.channels;
+            let t = i / pm.channels;
+            let s = t % pm.spatial;
+            src = ((t / pm.spatial) * pm.channels + c) * pm.spatial + s;
+        } else {
+            let s = i % pm.spatial;
+            let t = i / pm.spatial;
+            let c = t % pm.channels;
+            src = ((t / pm.channels) * pm.spatial + s) * pm.channels + c;
+        }
+        lout[i] = lin[src];
+    }
+}
+";
+
     /// <summary>The WGSL module of one <see cref="ChannelEpilogueKernelTemplate"/> kernel.</summary>
     internal static string SourceFor(string name) => name == ChannelEpilogueKernelTemplate.Forward ? ForwardSource
         : name == ChannelEpilogueKernelTemplate.Backward ? BackwardSource
+        : name == ChannelEpilogueKernelTemplate.Layout ? LayoutSource
         : throw new System.Collections.Generic.KeyNotFoundException(name);
 
     /// <summary>The uniform words every kernel's Params struct holds (its six ints, padded to 16 bytes).</summary>
