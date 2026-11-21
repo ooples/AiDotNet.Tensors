@@ -38,9 +38,11 @@ internal static class GpuInitializationFailureLog
             if (message is null || message.IndexOf("initialization failed", StringComparison.OrdinalIgnoreCase) < 0) return;
             try
             {
+                // One failure is one record: a compiler log arrives with line breaks, and the lane counts lines.
+                string record = message.Replace("\r\n", " | ").Replace('\n', '|').Replace('\r', '|');
                 lock (_gate)
                 {
-                    File.AppendAllText(_path, $"{DateTime.UtcNow:O} {message}{Environment.NewLine}");
+                    File.AppendAllText(_path, $"{DateTime.UtcNow:O} {record}{Environment.NewLine}");
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
