@@ -183,6 +183,27 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableFact]
+    public void VectorReductions_OfNullFloatOperands_FailAsTheCpuEngineDoes()
+    {
+        // The float GPU branch dereferenced its operands before any validation; a null one must fail as the CPU
+        // engine's does, not surface as a NullReferenceException from the upload.
+        SkipIfNoDirectGpu();
+        var gpu = (IEngine)Gpu;
+        var cpu = (IEngine)new CpuEngine();
+        var v = new Vector<float>([1f, 2f, 3f]);
+        Vector<float>? missing = null;
+
+        Assert.Throws<ArgumentNullException>(() => cpu.Sum(missing));
+        Assert.Throws<ArgumentNullException>(() => gpu.Sum(missing));
+        Assert.Throws<ArgumentNullException>(() => cpu.Mean(missing));
+        Assert.Throws<ArgumentNullException>(() => gpu.Mean(missing));
+        Assert.Throws<ArgumentNullException>(() => cpu.DotProduct(missing, v));
+        Assert.Throws<ArgumentNullException>(() => gpu.DotProduct(missing, v));
+        Assert.Throws<ArgumentNullException>(() => cpu.DotProduct(v, missing));
+        Assert.Throws<ArgumentNullException>(() => gpu.DotProduct(v, missing));
+    }
+
+    [SkippableFact]
     public void EagerResidentBinary_ReuploadsVersionBumpedInput()
     {
         SkipIfNoDirectGpu();
