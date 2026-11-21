@@ -3873,6 +3873,12 @@ public interface IGpuBuffer : IDisposable
     long SizeInBytes { get; }
 
     /// <summary>
+    /// Gets the element type the buffer holds. <see cref="Size"/> counts elements of this type;
+    /// <see cref="GpuElementType.Unspecified"/> marks raw bytes whose reader decides the interpretation.
+    /// </summary>
+    GpuElementType ElementType { get; }
+
+    /// <summary>
     /// Gets the native handle (IntPtr to OpenCL cl_mem or CUDA CUdeviceptr).
     /// </summary>
     IntPtr Handle { get; }

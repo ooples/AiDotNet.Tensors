@@ -25,6 +25,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 internal sealed class MockGpuBuffer : IGpuBuffer
 {
     public float[] Data { get; }
+    public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
     public int Size => Data.Length;
     public long SizeInBytes => (long)Data.Length * sizeof(float);
     public IntPtr Handle { get; }

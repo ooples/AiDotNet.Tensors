@@ -97,6 +97,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     }
 
     /// <inheritdoc/>
+    public GpuElementType ElementType => GpuElementType.Float32;
     public int Size { get; }
 
     /// <inheritdoc/>

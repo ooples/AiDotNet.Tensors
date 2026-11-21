@@ -155,6 +155,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
     /// <summary>
     /// Gets the number of elements in the buffer (IGpuBuffer implementation).
     /// </summary>
+    public GpuElementType ElementType => GpuElementType.Float32;
     public int Size => _elementCount;
 
     /// <summary>

@@ -249,6 +249,7 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
             _release = release;
         }
 
+        public GpuElementType ElementType => GpuElementType.Float32;
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle => Volatile.Read(ref _handle);

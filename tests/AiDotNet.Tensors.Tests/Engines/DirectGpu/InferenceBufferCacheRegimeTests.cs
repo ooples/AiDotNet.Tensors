@@ -20,6 +20,7 @@ public sealed class InferenceBufferCacheRegimeTests
         internal int Releases;
         public Cell(int capacity) { _capacity = capacity; Size = capacity; Handle = (IntPtr)Interlocked.Increment(ref s_next); }
         public int Capacity { get { Interlocked.Exchange(ref OnCapacityRead, null)?.Invoke(); return _capacity; } }
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size { get; private set; }
         public long SizeInBytes => (long)Size * sizeof(float);
         public IntPtr Handle { get; private set; }

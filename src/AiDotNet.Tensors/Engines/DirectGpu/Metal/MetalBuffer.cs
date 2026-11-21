@@ -121,6 +121,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     /// <summary>
     /// Gets the number of float elements in the buffer.
     /// </summary>
+    public GpuElementType ElementType => GpuElementType.Float32;
     public int Size { get; }
 
     /// <summary>

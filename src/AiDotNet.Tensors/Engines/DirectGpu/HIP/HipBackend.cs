@@ -12927,6 +12927,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     private long TakeReclaimEpoch() => Interlocked.Exchange(ref ReclaimEpoch, -1);
     public IntPtr Handle { get; }
     private int _size;
+    public GpuElementType ElementType => GpuElementType.Float32;
     public int Size => Volatile.Read(ref _size);
     public int Capacity { get; }
     public long SizeInBytes => (long)Size * sizeof(float);
@@ -13239,6 +13240,7 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 internal sealed class HipGpuByteBuffer : IGpuBuffer
 {
     public IntPtr Handle { get; }
+    public GpuElementType ElementType => GpuElementType.Unspecified;
     public int Size { get; }
     public long SizeInBytes => Size;
     private int _disposed;

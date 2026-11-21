@@ -14827,6 +14827,7 @@ KERNEL VARIANTS (A/B testing):
         internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
         private int _size;
 
+        public GpuElementType ElementType => GpuElementType.Float32;
         public int Size => Volatile.Read(ref _size);
         public int Capacity => Buffer.Length;
         public long SizeInBytes => (long)Size * sizeof(float);
@@ -15081,6 +15082,7 @@ KERNEL VARIANTS (A/B testing):
         internal readonly DirectOpenClByteBuffer Buffer;
         private int _disposed;
 
+        public GpuElementType ElementType => GpuElementType.Unspecified;
         public int Size => Buffer.Length;
         public long SizeInBytes => Buffer.Length;
         public IntPtr Handle => Buffer.Handle;

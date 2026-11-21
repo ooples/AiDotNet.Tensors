@@ -107,6 +107,7 @@ public sealed class PersistentCacheOwnershipTests
     {
         private readonly MockGpuBuffer _inner;
         internal ThrowingDisposalBuffer(MockGpuBuffer inner) => _inner = inner;
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => _inner.Size;
         public long SizeInBytes => _inner.SizeInBytes;
         public IntPtr Handle => _inner.Handle;

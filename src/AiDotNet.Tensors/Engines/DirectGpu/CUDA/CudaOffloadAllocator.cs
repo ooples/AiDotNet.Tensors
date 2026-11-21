@@ -247,6 +247,7 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     private sealed class CudaNonOwningBuffer : IGpuBuffer
     {
         public IntPtr Handle { get; }
+        public GpuElementType ElementType => GpuElementType.Float32;
         public int Size { get; }
         public long SizeInBytes { get; }
 

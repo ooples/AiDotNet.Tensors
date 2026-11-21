@@ -30,6 +30,7 @@ public sealed partial class CudaBackend : IGpuBufferViews
             Size = elementCount;
         }
 
+        public GpuElementType ElementType => _parent.ElementType;
         public int Size { get; }
         public long SizeInBytes => (long)Size * sizeof(float);
         IGpuBuffer IGpuBufferViewSource.ViewParent => _parent;

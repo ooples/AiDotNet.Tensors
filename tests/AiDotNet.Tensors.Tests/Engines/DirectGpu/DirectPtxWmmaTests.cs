@@ -4944,6 +4944,7 @@ public partial class DirectPtxWmmaTests
             SizeInBytes = bytes;
         }
 
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => checked((int)(SizeInBytes / sizeof(float)));
         public long SizeInBytes { get; }
         public IntPtr Handle { get; }

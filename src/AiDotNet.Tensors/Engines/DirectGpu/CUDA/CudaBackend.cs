@@ -21370,6 +21370,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CompleteCudaBufferReclaimOrFinalizer(charge, _reclaimEpoch, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         }
 
+        public GpuElementType ElementType => GpuElementType.Float32;
         public int Size => Volatile.Read(ref _size);
         public int Capacity { get; }
         public long SizeInBytes => (long)Size * sizeof(float);
@@ -21616,6 +21617,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private readonly bool _allocatedDuringCapture; // see CudaGpuBuffer
         private readonly long _contextGeneration = 0; // see CudaGpuBuffer
 
+        public GpuElementType ElementType => GpuElementType.Unspecified;
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle
