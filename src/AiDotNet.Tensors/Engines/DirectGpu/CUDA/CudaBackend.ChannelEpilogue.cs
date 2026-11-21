@@ -21,21 +21,21 @@ public sealed partial class CudaBackend : IChannelEpilogueBackend
             || spatial <= 0 || (long)batch * channels > int.MaxValue || input.Size < n || output.Size < n
             || (bias is not null && bias.Size < channels) || (scale is not null && scale.Size < channels)
             || (shift is not null && shift.Size < channels)
-            || !_kernelCache.TryGetValue("channel_epilogue_fwd", out var kernel))
+            || !_kernelCache.TryGetValue("channel_epilogue_fwd", out var fwdKernel))
             return false;
         using var _ = PushContext();
         int rows = batch * channels, c = channels, s = spatial, act = activation;
         float sl = activation == ChannelEpilogueActivation.LeakyRelu ? slope : 0f;
-        if (spatial < FlatEpilogueSpatial && _kernelCache.TryGetValue("channel_epilogue_flat_fwd", out var flat))
+        if (spatial < FlatEpilogueSpatial && _kernelCache.TryGetValue("channel_epilogue_flat_fwd", out var fwdFlat))
         {
-            // A small spatial extent (a channels-last [rows, C] activation is spatial 1): one flat grid, not a block per row.
+            // A small spatial extent (a channels-last [rows, C] activation is spatial 1): one fwdFlat grid, not a block per row.
             IntPtr fz = input.Handle, fy = output.Handle;
             IntPtr fb = bias?.Handle ?? IntPtr.Zero, fsc = scale?.Handle ?? IntPtr.Zero, fsh = shift?.Handle ?? IntPtr.Zero;
             long count = n;
             void** fargs = stackalloc void*[10];
             fargs[0] = &fz; fargs[1] = &fb; fargs[2] = &fsc; fargs[3] = &fsh; fargs[4] = &fy;
             fargs[5] = &count; fargs[6] = &c; fargs[7] = &s; fargs[8] = &act; fargs[9] = &sl;
-            LaunchKernel(flat, FlatEpilogueBlocks(n), DefaultBlockSize, fargs);
+            LaunchKernel(fwdFlat, FlatEpilogueBlocks(n), DefaultBlockSize, fargs);
             return true;
         }
         IntPtr zPtr = input.Handle, yPtr = output.Handle;
@@ -43,7 +43,7 @@ public sealed partial class CudaBackend : IChannelEpilogueBackend
         void** args = stackalloc void*[10];
         args[0] = &zPtr; args[1] = &bPtr; args[2] = &scPtr; args[3] = &shPtr; args[4] = &yPtr;
         args[5] = &rows; args[6] = &c; args[7] = &s; args[8] = &act; args[9] = &sl;
-        LaunchKernel2D(kernel, (uint)((spatial + DefaultBlockSize - 1) / DefaultBlockSize),
+        LaunchKernel2D(fwdKernel, (uint)((spatial + DefaultBlockSize - 1) / DefaultBlockSize),
             (uint)Math.Min(rows, MaxGridDimY), DefaultBlockSize, 1, args);
         return true;
     }
@@ -55,19 +55,19 @@ public sealed partial class CudaBackend : IChannelEpilogueBackend
         if (!IsAvailable || !ChannelEpilogueActivation.Accepts(activation, slope) || batch <= 0 || channels <= 0
             || spatial <= 0 || (long)batch * channels > int.MaxValue || gradOutput.Size < n || output.Size < n
             || gradInput.Size < n || (scale is not null && scale.Size < channels)
-            || !_kernelCache.TryGetValue("channel_epilogue_bwd", out var kernel))
+            || !_kernelCache.TryGetValue("channel_epilogue_bwd", out var bwdKernel))
             return false;
         using var _ = PushContext();
         int rows = batch * channels, c = channels, s = spatial, act = activation;
         float sl = activation == ChannelEpilogueActivation.LeakyRelu ? slope : 0f;
-        if (spatial < FlatEpilogueSpatial && _kernelCache.TryGetValue("channel_epilogue_flat_bwd", out var flat))
+        if (spatial < FlatEpilogueSpatial && _kernelCache.TryGetValue("channel_epilogue_flat_bwd", out var bwdFlat))
         {
             IntPtr fdy = gradOutput.Handle, fy = output.Handle, fdz = gradInput.Handle, fsc = scale?.Handle ?? IntPtr.Zero;
             long count = n;
             void** fargs = stackalloc void*[9];
             fargs[0] = &fdy; fargs[1] = &fy; fargs[2] = &fsc; fargs[3] = &fdz;
             fargs[4] = &count; fargs[5] = &c; fargs[6] = &s; fargs[7] = &act; fargs[8] = &sl;
-            LaunchKernel(flat, FlatEpilogueBlocks(n), DefaultBlockSize, fargs);
+            LaunchKernel(bwdFlat, FlatEpilogueBlocks(n), DefaultBlockSize, fargs);
             return true;
         }
         IntPtr dyPtr = gradOutput.Handle, yPtr = output.Handle, dzPtr = gradInput.Handle;
@@ -75,7 +75,7 @@ public sealed partial class CudaBackend : IChannelEpilogueBackend
         void** args = stackalloc void*[9];
         args[0] = &dyPtr; args[1] = &yPtr; args[2] = &scPtr; args[3] = &dzPtr;
         args[4] = &rows; args[5] = &c; args[6] = &s; args[7] = &act; args[8] = &sl;
-        LaunchKernel2D(kernel, (uint)((spatial + DefaultBlockSize - 1) / DefaultBlockSize),
+        LaunchKernel2D(bwdKernel, (uint)((spatial + DefaultBlockSize - 1) / DefaultBlockSize),
             (uint)Math.Min(rows, MaxGridDimY), DefaultBlockSize, 1, args);
         return true;
     }
