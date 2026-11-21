@@ -66,7 +66,7 @@ internal static class GpuDriverCrossPlatformResolver
                 .ToArray();
             foreach (var dir in CuBlasNative.GetCudaBinDirectories())
             {
-                foreach (var path in fileNames.Select(fileName => System.IO.Path.Combine(dir, fileName)))
+                foreach (var path in fileNames.Select(fileName => System.IO.Path.Join(dir, fileName)))
                 {
                     if (NativeLibrary.TryLoad(path, out var handle))
                         return handle;
