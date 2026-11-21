@@ -1,0 +1,7 @@
+original/* -text
+evidence/ai/* -text
+evidence/torch/* -text
+*.safetensors binary
+*.mp4 binary
+*.webm binary
+*.bundle binary
