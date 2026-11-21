@@ -136,6 +136,9 @@ fn csr_spmm_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
     // expm1 and log1p accurate for a small x: AdditionalUnarySource's exp(x) - 1.0 and log(1.0 + x) keep only a few of its
     // digits (that source is a public constant, so these live here). WGSL's log is too coarse near 1 for Kahan's
     // correction, so a small x takes a series: Taylor for expm1, 2 atanh(x / (2 + x)) for log1p (both below 1e-9 relative).
+    // log2 and log10 likewise: WGSL bounds log2 and log only in absolute error (2^-21) on [0.5, 2], which near x = 1 is
+    // most of the answer's digits, so a finite positive x is split as m 2^e (m in [sqrt(1/2), sqrt(2))) and log m taken
+    // as the same series, 2 atanh((m - 1) / (m + 1)), whose m - 1 is exact.
     private const string AccurateExpLogSource = @"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read_write> B: array<f32>;
@@ -168,6 +171,40 @@ fn log1p_accurate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (x == -1.0) { y = wgsl_f32_bits(0xff800000u); }        // log1p(-1) = -inf
     if (x < -1.0) { y = wgsl_f32_bits(0x7fc00000u); }         // outside the domain (and -inf): NaN
+    B[i] = y;
+}
+
+// (e, log m) for a normal positive x = m 2^e, m in [sqrt(1/2), sqrt(2)), read from x's bits.
+fn log_parts_accurate(x: f32) -> vec2<f32> {
+    let bits = bitcast<u32>(x);
+    var e = f32(i32((bits >> 23u) & 0xffu) - 127);
+    var m = bitcast<f32>((bits & 0x007fffffu) | 0x3f800000u);   // [1, 2)
+    if (m > 1.41421356) { m = m * 0.5; e = e + 1.0; }
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    return vec2<f32>(e, 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 / 11.0))))));
+}
+
+// Normal, positive and finite: a subnormal (which a device may flush), zero, a negative, inf or NaN keeps the builtin.
+fn normal_positive(x: f32) -> bool { let b = bitcast<u32>(x); return b >= 0x00800000u && b < 0x7f800000u; }
+
+@compute @workgroup_size(256)
+fn log2_accurate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.size) { return; }
+    let x = A[i];
+    var y = log2(x);
+    if (normal_positive(x)) { let p = log_parts_accurate(x); y = p.x + p.y * 1.4426950408889634; }
+    B[i] = y;
+}
+
+@compute @workgroup_size(256)
+fn log10_accurate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.size) { return; }
+    let x = A[i];
+    var y = log(x) * 0.4342944819;
+    if (normal_positive(x)) { let p = log_parts_accurate(x); y = p.x * 0.30102999566398120 + p.y * 0.43429448190325182; }
     B[i] = y;
 }
 ";
@@ -234,6 +271,20 @@ fn mel_filterbank(@builtin(global_invocation_id) gid: vec3<u32>) {
     {
         if (size <= 0) return;
         Dispatch2BufferAsync(FusedCompositesModuleName + ".ExpLog", AccurateExpLogSource, "expm1_accurate", A, B,
+            MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
+    public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        if (size <= 0) return;
+        Dispatch2BufferAsync(FusedCompositesModuleName + ".ExpLog", AccurateExpLogSource, "log2_accurate", A, B,
+            MakeUniform1(size), size).GetAwaiter().GetResult();
+    }
+
+    public void Log10(IGpuBuffer A, IGpuBuffer B, int size)
+    {
+        if (size <= 0) return;
+        Dispatch2BufferAsync(FusedCompositesModuleName + ".ExpLog", AccurateExpLogSource, "log10_accurate", A, B,
             MakeUniform1(size), size).GetAwaiter().GetResult();
     }
 

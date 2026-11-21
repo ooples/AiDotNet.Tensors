@@ -236,6 +236,9 @@ for await (const line of rl) {
             throw new InvalidOperationException($"No WGSL port for {name}.");
         string code = WebGpuShaderPrelude.Prepare(source ?? "");
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnLaunch();   // device work, as a backend's own launch counts it
+        // Moving the operands from the host backend to Dawn and the results back is this harness's, not the op's: a
+        // WebGPU backend's buffers already live on its device, so residency checks must not see these transfers.
+        using var harness = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.HarnessScope();
         var writable = new HashSet<int>();
         foreach (Match m in Binding.Matches(code))
             if (m.Groups[2].Value == "read_write") writable.Add(int.Parse(m.Groups[1].Value));

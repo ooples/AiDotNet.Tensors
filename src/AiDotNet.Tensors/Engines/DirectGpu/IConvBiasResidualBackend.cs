@@ -58,12 +58,8 @@ internal readonly struct ConvBiasResidualArgs
     }
 
     private static bool Fits(IGpuBuffer buffer, long count)
-        => buffer is not null && buffer.Handle != IntPtr.Zero && buffer.Size >= count && buffer.SizeInBytes >= count * sizeof(float);
-    private static bool Aliases(IGpuBuffer left, IGpuBuffer right)
-    {
-        var a = GpuBufferViewRoot.Of(left); var b = GpuBufferViewRoot.Of(right);
-        return ReferenceEquals(a, b) || a.Handle == b.Handle;
-    }
+        => buffer is not null && GpuBufferViewRoot.IsBacked(buffer) && buffer.Size >= count && buffer.SizeInBytes >= count * sizeof(float);
+    private static bool Aliases(IGpuBuffer left, IGpuBuffer right) => GpuBufferViewRoot.SameAllocation(left, right);
 }
 
 internal static class ConvBiasResidualComposition

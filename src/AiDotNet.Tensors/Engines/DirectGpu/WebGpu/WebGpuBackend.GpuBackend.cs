@@ -491,8 +491,6 @@ public sealed partial class WebGpuBackend
     public void Exp10(IGpuBuffer A, IGpuBuffer B, int size)
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "exp10_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Log(IGpuBuffer A, IGpuBuffer B, int size) => LogAsync(A, B, size).GetAwaiter().GetResult();
-    public void Log2(IGpuBuffer A, IGpuBuffer B, int size)
-        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log2_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Sqrt(IGpuBuffer A, IGpuBuffer B, int size) => SqrtAsync(A, B, size).GetAwaiter().GetResult();
     public void Sign(IGpuBuffer A, IGpuBuffer B, int size) => SignAsync(A, B, size).GetAwaiter().GetResult();
     public void Relu(IGpuBuffer A, IGpuBuffer B, int size) => ReLUAsync(A, B, size).GetAwaiter().GetResult();
@@ -690,8 +688,6 @@ public sealed partial class WebGpuBackend
         => DispatchUnaryOpAsync("reciprocal_op", A, B, size).GetAwaiter().GetResult();
     public void Cbrt(IGpuBuffer A, IGpuBuffer B, int size)
         => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "cbrt_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
-    public void Log10(IGpuBuffer A, IGpuBuffer B, int size)
-        => Dispatch2BufferAsync("AdditionalUnary", WebGpuKernels.AdditionalUnarySource, "log10_op", A, B, MakeUniform1(size), size).GetAwaiter().GetResult();
     public void Negate(IGpuBuffer A, IGpuBuffer B, int size) => NegAsync(A, B, size).GetAwaiter().GetResult();
     public void Floor(IGpuBuffer A, IGpuBuffer B, int size)
         => DispatchUnaryOpAsync("floor_op", A, B, size).GetAwaiter().GetResult();
