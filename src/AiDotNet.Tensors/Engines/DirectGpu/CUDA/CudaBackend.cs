@@ -10219,13 +10219,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int size) => GpuBufferTyping.Tag(AllocateIntBufferCore(size), GpuElementType.Int32);
 
-    public IGpuBuffer AllocateIntBuffer(int[] data)
+    private IGpuBuffer AllocateIntBufferCore(int size) => AllocateBuffer(size);
+
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int[] data) => GpuBufferTyping.Tag(AllocateIntBufferCore(data), GpuElementType.Int32);
+
+    private IGpuBuffer AllocateIntBufferCore(int[] data)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
             return BufferAllocationDiagnostics.Observe("CUDA", (long)data.Length * sizeof(float), (this, data),
-                static state => state.Item1.AllocateIntBuffer(state.Item2));
+                static state => state.Item1.AllocateIntBufferCore(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (data is null)
@@ -21335,7 +21341,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             PendingFinalizerFrees.Enqueue((finalizerPtr, context, contextGeneration, asyncFreeStream));
     }
 
-    internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
+    internal sealed class CudaGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IRetypableGpuBuffer
     {
         private IntPtr _context;
         private IntPtr _devicePtr;
@@ -21370,7 +21376,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CompleteCudaBufferReclaimOrFinalizer(charge, _reclaimEpoch, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
         }
 
-        public GpuElementType ElementType => GpuElementType.Float32;
+        private int _elementType = (int)GpuElementType.Float32;
+        public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
+        void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
         public int Size => Volatile.Read(ref _size);
         public int Capacity { get; }
         public long SizeInBytes => (long)Size * sizeof(float);
@@ -21444,6 +21452,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         public void MarkRented(int size)
         {
+            // A recycled allocation is a float buffer again until its new owner says otherwise.
+            Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
             if (size <= 0 || size > Capacity)
                 throw new ArgumentOutOfRangeException(nameof(size));
             Volatile.Write(ref _size, size);

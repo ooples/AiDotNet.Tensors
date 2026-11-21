@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Wraps a Vulkan device-local storage buffer and host-visible staging buffer
 /// as an <see cref="IGpuBuffer"/> for use with <see cref="IDirectGpuBackend"/> operations.
 /// </summary>
-public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
+public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer
 {
     internal readonly VulkanBuffer Storage;
     internal readonly VulkanBuffer Staging;
@@ -63,6 +63,8 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     /// </remarks>
     void IPoolableGpuBuffer.MarkRented(int size)
     {
+        // A recycled allocation is a float buffer again until its new owner says otherwise.
+        Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
     }
 
     /// <inheritdoc/>
@@ -97,7 +99,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     }
 
     /// <inheritdoc/>
-    public GpuElementType ElementType => GpuElementType.Float32;
+    private int _elementType = (int)GpuElementType.Float32;
+    public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
+    void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
     public int Size { get; }
 
     /// <inheritdoc/>

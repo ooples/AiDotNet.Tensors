@@ -5942,7 +5942,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         Synchronize();
     }
 
-    public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int size) => GpuBufferTyping.Tag(AllocateIntBufferCore(size), GpuElementType.Int32);
+
+    private IGpuBuffer AllocateIntBufferCore(int size) => AllocateBuffer(size);
 
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
@@ -5995,11 +5998,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         }
     }
 
-    public unsafe IGpuBuffer AllocateIntBuffer(int[] data)
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int[] data) => GpuBufferTyping.Tag(AllocateIntBufferCore(data), GpuElementType.Int32);
+
+    private unsafe IGpuBuffer AllocateIntBufferCore(int[] data)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
             return BufferAllocationDiagnostics.Observe("HIP", (long)data.Length * sizeof(float), (this, data),
-                static state => state.Item1.AllocateIntBuffer(state.Item2));
+                static state => state.Item1.AllocateIntBufferCore(state.Item2));
         if (data is null) throw new ArgumentNullException(nameof(data));
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
@@ -12917,7 +12923,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 /// <summary>
 /// HIP GPU buffer wrapper implementing IGpuBuffer.
 /// </summary>
-internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
+internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer
 {
     // The DeviceMemoryReclaim epoch of this buffer's current charge (set at each allocation or pool hit).
     internal long ReclaimEpoch = -1;
@@ -12927,7 +12933,9 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     private long TakeReclaimEpoch() => Interlocked.Exchange(ref ReclaimEpoch, -1);
     public IntPtr Handle { get; }
     private int _size;
-    public GpuElementType ElementType => GpuElementType.Float32;
+    private int _elementType = (int)GpuElementType.Float32;
+    public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
+    void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
     public int Size => Volatile.Read(ref _size);
     public int Capacity { get; }
     public long SizeInBytes => (long)Size * sizeof(float);
@@ -13093,6 +13101,8 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
     public void MarkRented(int size)
     {
+        // A recycled allocation is a float buffer again until its new owner says otherwise.
+        Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
         if (size <= 0 || size > Capacity)
             throw new ArgumentOutOfRangeException(nameof(size));
         Volatile.Write(ref _size, size);

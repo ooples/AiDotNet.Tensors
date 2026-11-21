@@ -9212,7 +9212,10 @@ KERNEL VARIANTS (A/B testing):
             k.Execute2D(embeddingDim, numIndices, localX, localY);
         }
 
-        public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
+        // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+        public IGpuBuffer AllocateIntBuffer(int size) => GpuBufferTyping.Tag(AllocateIntBufferCore(size), GpuElementType.Int32);
+
+        private IGpuBuffer AllocateIntBufferCore(int size) => AllocateBuffer(size);
 
         /// <inheritdoc/>
         public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
@@ -9274,11 +9277,14 @@ KERNEL VARIANTS (A/B testing):
             }
         }
 
-        public IGpuBuffer AllocateIntBuffer(int[] data)
+        // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+        public IGpuBuffer AllocateIntBuffer(int[] data) => GpuBufferTyping.Tag(AllocateIntBufferCore(data), GpuElementType.Int32);
+
+        private IGpuBuffer AllocateIntBufferCore(int[] data)
         {
             if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
                 return BufferAllocationDiagnostics.Observe("OpenCL", (long)data.Length * sizeof(float), (this, data),
-                    static state => state.Item1.AllocateIntBuffer(state.Item2));
+                    static state => state.Item1.AllocateIntBufferCore(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (data is null)
@@ -14817,7 +14823,7 @@ KERNEL VARIANTS (A/B testing):
     /// OpenCL GPU buffer wrapper implementing IGpuBuffer.
     /// Uses pure P/Invoke with no managed GPU runtime dependency.
     /// </summary>
-    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
+    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer
     {
         internal readonly DirectOpenClBuffer Buffer;
         private readonly IGpuBuffer? _viewParent;
@@ -14827,7 +14833,9 @@ KERNEL VARIANTS (A/B testing):
         internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
         private int _size;
 
-        public GpuElementType ElementType => GpuElementType.Float32;
+        private int _elementType = (int)GpuElementType.Float32;
+        public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
+        void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
         public int Size => Volatile.Read(ref _size);
         public int Capacity => Buffer.Length;
         public long SizeInBytes => (long)Size * sizeof(float);
@@ -14907,6 +14915,8 @@ KERNEL VARIANTS (A/B testing):
 
         public void MarkRented(int size)
         {
+            // A recycled allocation is a float buffer again until its new owner says otherwise.
+            Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
             if (size <= 0 || size > Capacity)
                 throw new ArgumentOutOfRangeException(nameof(size));
             Volatile.Write(ref _size, size);

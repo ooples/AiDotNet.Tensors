@@ -100,3 +100,31 @@ public static class GpuElementTypes
         return true;
     }
 }
+
+/// <summary>A buffer whose allocation is shared between element types of one width, so its type is set per use.</summary>
+internal interface IRetypableGpuBuffer
+{
+    /// <summary>Declares what the buffer's elements are from now on.</summary>
+    void SetElementType(GpuElementType type);
+}
+
+internal static class GpuBufferTyping
+{
+    /// <summary>
+    /// Declares <paramref name="buffer"/> to hold <paramref name="type"/> and returns it. The type must have the width
+    /// the buffer was allocated for: a tag never changes how many bytes an element occupies.
+    /// </summary>
+    public static IGpuBuffer Tag(IGpuBuffer buffer, GpuElementType type)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (buffer.ElementType == type) return buffer;
+        if (buffer is not IRetypableGpuBuffer retypable)
+            throw new InvalidOperationException(
+                $"A {buffer.GetType().Name} holds {buffer.ElementType} elements and cannot be declared {type}.");
+        if (GpuElementTypes.SizeInBytes(type) != GpuElementTypes.SizeInBytes(buffer.ElementType))
+            throw new InvalidOperationException(
+                $"A buffer of {buffer.ElementType} elements cannot be declared {type}: the element widths differ.");
+        retypable.SetElementType(type);
+        return buffer;
+    }
+}

@@ -732,11 +732,14 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// <summary>
     /// Allocates an integer buffer.
     /// </summary>
-    public IGpuBuffer AllocateIntBuffer(int size)
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int size) => GpuBufferTyping.Tag(AllocateIntBufferCore(size), GpuElementType.Int32);
+
+    private IGpuBuffer AllocateIntBufferCore(int size)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
             return BufferAllocationDiagnostics.Observe("Metal", (long)size * sizeof(float), (this, size),
-                static state => state.Item1.AllocateIntBuffer(state.Item2));
+                static state => state.Item1.AllocateIntBufferCore(state.Item2));
         ThrowIfDisposed();
 
         if (size <= 0)
@@ -784,11 +787,14 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         metalBuffer.CopyFrom(data, 0, data.Length);
     }
 
-    public IGpuBuffer AllocateIntBuffer(int[] data)
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int[] data) => GpuBufferTyping.Tag(AllocateIntBufferCore(data), GpuElementType.Int32);
+
+    private IGpuBuffer AllocateIntBufferCore(int[] data)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
             return BufferAllocationDiagnostics.Observe("Metal", (long)data.Length * sizeof(float), (this, data),
-                static state => state.Item1.AllocateIntBuffer(state.Item2));
+                static state => state.Item1.AllocateIntBufferCore(state.Item2));
         ThrowIfDisposed();
 
         if (data is null || data.Length == 0)

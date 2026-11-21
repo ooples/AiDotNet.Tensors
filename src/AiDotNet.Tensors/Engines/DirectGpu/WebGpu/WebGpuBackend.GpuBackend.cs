@@ -135,11 +135,14 @@ public sealed partial class WebGpuBackend
         return AllocateBufferCore(checked((int)floatCountLong), zeroInitialize: true);
     }
 
-    public IGpuBuffer AllocateIntBuffer(int size)
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int size) => GpuBufferTyping.Tag(AllocateIntBufferCore(size), GpuElementType.Int32);
+
+    private IGpuBuffer AllocateIntBufferCore(int size)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
             return BufferAllocationDiagnostics.Observe("WebGPU", (long)size * sizeof(float), (this, size),
-                static state => state.Item1.AllocateIntBuffer(state.Item2));
+                static state => state.Item1.AllocateIntBufferCore(state.Item2));
         EnsureInitialized();
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Int buffer size must be positive.");
@@ -147,11 +150,14 @@ public sealed partial class WebGpuBackend
         return AllocateBufferCore(size, zeroInitialize: true);
     }
 
-    public IGpuBuffer AllocateIntBuffer(int[] data)
+    // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+    public IGpuBuffer AllocateIntBuffer(int[] data) => GpuBufferTyping.Tag(AllocateIntBufferCore(data), GpuElementType.Int32);
+
+    private IGpuBuffer AllocateIntBufferCore(int[] data)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
             return BufferAllocationDiagnostics.Observe("WebGPU", (long)data.Length * sizeof(float), (this, data),
-                static state => state.Item1.AllocateIntBuffer(state.Item2));
+                static state => state.Item1.AllocateIntBufferCore(state.Item2));
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));

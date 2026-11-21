@@ -82,6 +82,37 @@ public class GpuElementTypeTests
         Assert.Equal(GpuElementType.Unspecified, bytes.ElementType);
     }
 
+    [SkippableFact]
+    public void IntBuffers_ReportInt32_AndARecycledAllocationIsAFloatBufferAgain()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        // An odd size nothing else in the suite pools, so the float rents below can only be served by these buffers.
+        const int Size = 7919;
+        using (var sized = backend.AllocateIntBuffer(Size))
+            Assert.Equal(GpuElementType.Int32, sized.ElementType);
+        using (var uploaded = backend.AllocateIntBuffer(new int[Size]))
+            Assert.Equal(GpuElementType.Int32, uploaded.ElementType);
+        // Int and float buffers share one pool: whichever allocation comes back, it must not still say Int32.
+        for (int i = 0; i < 4; i++)
+        {
+            using var floats = backend.AllocateBuffer(Size);
+            Assert.Equal(GpuElementType.Float32, floats.ElementType);
+        }
+    }
+
+    [Fact]
+    public void Tag_RefusesAnElementTypeOfAnotherWidth()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        if (gpu?.GetBackend() is not { } backend) return;
+        using var floats = backend.AllocateBuffer(16);
+        Assert.Throws<InvalidOperationException>(() => GpuBufferTyping.Tag(floats, GpuElementType.Float64));
+        Assert.Equal(GpuElementType.Float32, floats.ElementType);
+    }
+
     private static void AssertMaps<T>(GpuElementType expected)
     {
         Assert.True(GpuElementTypes.TryFromClrType<T>(out var type));
