@@ -55,32 +55,15 @@ public sealed partial class HipBackend : IGpuFloat64Reductions
         bool writeA = true;
         bool first = true;
         uint sharedBytes = Float64ReductionBlock * sizeof(double);
-        void** args = stackalloc void*[4];
         while (currentSize > 1 || first)
         {
             int partialCount = (currentSize + Float64ReductionBlock - 1) / Float64ReductionBlock;
             IGpuBuffer next = writeA ? temporaryA : temporaryB;
-            IntPtr inputPtr = current.Handle;
-            IntPtr outputPtr = next.Handle;
-            int n = currentSize;
             if (first && multiplier is not null)
-            {
-                IntPtr multiplierPtr = multiplier.Handle;
-                args[0] = &inputPtr;
-                args[1] = &multiplierPtr;
-                args[2] = &outputPtr;
-                args[3] = &n;
-                LaunchKernel(dotKernel, (uint)partialCount, Float64ReductionBlock, args, sharedBytes);
-                Synchronize();
-            }
+                LaunchFloat64Dot(dotKernel, current, multiplier, next, currentSize, (uint)partialCount, sharedBytes);
             else
-            {
-                args[0] = &inputPtr;
-                args[1] = &outputPtr;
-                args[2] = &n;
-                LaunchKernel(sumKernel, (uint)partialCount, Float64ReductionBlock, args, sharedBytes);
-                Synchronize();
-            }
+                LaunchFloat64Sum(sumKernel, current, next, currentSize, (uint)partialCount, sharedBytes);
+            Synchronize();
 
             current = next;
             currentSize = partialCount;
@@ -91,5 +74,33 @@ public sealed partial class HipBackend : IGpuFloat64Reductions
         double scalar = BitConverter.ToDouble(DownloadByteBuffer(current, sizeof(double)), 0);
         GpuLaunchProbe.OnReadback(sizeof(double), GpuBackendType.Hip);
         return scalar;
+    }
+
+    // Each launch fills exactly its kernel's parameters: reduce_sum_f64(input, output, size).
+    private unsafe void LaunchFloat64Sum(IntPtr sumKernel, IGpuBuffer input, IGpuBuffer output, int size, uint grid, uint sharedBytes)
+    {
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &inputPtr;
+        args[1] = &outputPtr;
+        args[2] = &n;
+        LaunchKernel(sumKernel, grid, Float64ReductionBlock, args, sharedBytes);
+    }
+
+    // reduce_dot_f64(a, b, output, size).
+    private unsafe void LaunchFloat64Dot(IntPtr dotKernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, uint grid, uint sharedBytes)
+    {
+        IntPtr aPtr = a.Handle;
+        IntPtr bPtr = b.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &outputPtr;
+        args[3] = &n;
+        LaunchKernel(dotKernel, grid, Float64ReductionBlock, args, sharedBytes);
     }
 }
