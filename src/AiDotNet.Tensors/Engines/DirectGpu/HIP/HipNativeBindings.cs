@@ -176,7 +176,10 @@ internal static class HipNativeBindings
 #endif
 
     private static bool _isAvailable;
-    private static bool _availabilityChecked;
+    // Published only after _isAvailable is set, under _availabilityLock, so a concurrent first caller cannot read
+    // "checked" before the probe has finished and report HIP missing.
+    private static volatile bool _availabilityChecked;
+    private static readonly object _availabilityLock = new object();
     private static bool _dllPathInitialized;
     internal static string? RocmBinPath { get; private set; }
     public static bool EnableDiagnostics { get; set; }
@@ -332,9 +335,9 @@ internal static class HipNativeBindings
         get
         {
             if (!_availabilityChecked)
+            lock (_availabilityLock)
+            if (!_availabilityChecked)
             {
-                _availabilityChecked = true;
-
                 // Initialize DLL search path before any P/Invoke calls
                 InitializeDllSearchPath();
 
@@ -363,6 +366,7 @@ internal static class HipNativeBindings
                     LogDiagnostic($"[HIP Diagnostics] Exception during availability check: {ex.GetType().Name}: {ex.Message}");
                     _isAvailable = false;
                 }
+                _availabilityChecked = true;
             }
             return _isAvailable;
         }

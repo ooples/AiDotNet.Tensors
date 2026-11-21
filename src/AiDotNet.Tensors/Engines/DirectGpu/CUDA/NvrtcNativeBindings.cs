@@ -28,8 +28,11 @@ public enum NvrtcResult
 
 internal static class NvrtcNativeBindings
 {
-    private static bool _availabilityChecked;
+    // Published only after _api is resolved, under _initLock. Setting the flag first let a concurrent caller (xUnit
+    // starts test classes in parallel) see "checked" with _api still null and report NVRTC missing for good.
+    private static volatile bool _availabilityChecked;
     private static INvrtcApi? _api;
+    private static readonly object _initLock = new object();
 
     public static bool IsAvailable
     {
@@ -45,9 +48,14 @@ internal static class NvrtcNativeBindings
         if (_availabilityChecked)
             return;
 
-        _availabilityChecked = true;
-        EnsureCudaOnPath();
-        _api = ResolveApi();
+        lock (_initLock)
+        {
+            if (_availabilityChecked)
+                return;
+            EnsureCudaOnPath();
+            _api = ResolveApi();
+            _availabilityChecked = true;
+        }
     }
 
     /// <summary>
