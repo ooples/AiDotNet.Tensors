@@ -686,6 +686,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _categoricalKernelReady = false;
                 }
 
+                try
+                {
+                    // SafeMathFlags: the reductions accumulate in a fixed tree order, which fast-math may reassociate.
+                    var float64Program = CompileOrLoadCached(
+                        Kernels.Float64ReductionKernels.GetSource(),
+                        OpenClBuildOptions.SafeMathFlags,
+                        "Double-precision reduction kernels");
+                    _programs.Add(float64Program);
+                    foreach (var name in Kernels.Float64ReductionKernels.GetKernelNames())
+                    {
+                        _kernelCache[name] = new DirectOpenClKernel(_context, float64Program, name);
+                    }
+
+                    _float64ReductionsReady = true;
+                }
+                catch (Exception float64Failure)
+                {
+                    // No fp64, or the device rejected the program: double reductions stay on the CPU.
+                    _float64ReductionsReady = false;
+                    System.Diagnostics.Trace.TraceWarning(
+                        "OpenCL double-precision reduction kernels are unavailable: {0}", float64Failure);
+                }
+
                 // Compile specialized kernels (hyperbolic geometry, octonion algebra, quantum computing)
                 var specializedProgram = CompileOrLoadCached(SpecializedKernels.GetSource(), optimizationFlags, "Specialized kernels");
                 _programs.Add(specializedProgram);
