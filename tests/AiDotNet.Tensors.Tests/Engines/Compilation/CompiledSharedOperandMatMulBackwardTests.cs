@@ -154,6 +154,55 @@ public sealed class CompiledSharedOperandMatMulBackwardTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(false, true, 33, 7, 1)]
+    [InlineData(true, false, 7, 1, 541)]
+    public void AccumulatingFallbackUpdatesGradientWithoutAcquiringProductScratch(
+        bool transA, bool transB, int rows, int inner, int cols)
+    {
+        var a = Enumerable.Range(0, rows * inner).Select(i => (float)(i % 7 - 3)).ToArray();
+        var b = Enumerable.Range(0, inner * cols).Select(i => (float)(i % 5 - 2)).ToArray();
+        var gradient = Enumerable.Range(0, rows * cols).Select(i => (float)(i % 3)).ToArray();
+        var expected = (float[])gradient.Clone();
+        int lda = transA ? rows : inner, ldb = transB ? inner : cols;
+        float[]? scratch = null;
+        for (int step = 0; step < 2; step++)
+        {
+            for (int i = 0; i < rows; i++)
+                for (int j = 0; j < cols; j++)
+                    for (int k = 0; k < inner; k++)
+                        expected[i * cols + j] += a[transA ? k * lda + i : i * lda + k]
+                            * b[transB ? j * ldb + k : k * ldb + j];
+
+            CompiledTrainingPlan<float>.SharedOperandGemm(a, lda, transA, b, ldb, transB,
+                gradient, rows, inner, cols, accumulate: true, ref scratch);
+
+            Assert.Null(scratch);
+            Assert.Equal(expected, gradient);
+        }
+    }
+
+    [Fact]
+    public void AccumulatingPanelReusesItsProductAcrossStepsWhenAvailable()
+    {
+        const int rows = 2048, inner = 128, cols = 64;
+        var a = Enumerable.Repeat(1f, rows * inner).ToArray();
+        var b = Enumerable.Repeat(1f, inner * cols).ToArray();
+        var gradient = new float[rows * cols];
+        bool panelAvailable = AiDotNet.Tensors.Engines.Simd.SimdGemm.TryGemmSmallJit(
+            a, inner, false, b, inner, true, gradient, rows, inner, cols);
+        Array.Clear(gradient, 0, gradient.Length);
+        float[]? scratch = null;
+        CompiledTrainingPlan<float>.SharedOperandGemm(a, inner, false, b, inner, true,
+            gradient, rows, inner, cols, accumulate: true, ref scratch);
+        Assert.Equal(panelAvailable, scratch is not null);
+        var firstProduct = scratch;
+        CompiledTrainingPlan<float>.SharedOperandGemm(a, inner, false, b, inner, true,
+            gradient, rows, inner, cols, accumulate: true, ref scratch);
+        Assert.Same(firstProduct, scratch);
+        Assert.DoesNotContain(gradient, value => value != 2f * inner);
+    }
+
     [Fact]
     public void NBeatsStack_Float_GradientsMatchEagerTape()
     {

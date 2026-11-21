@@ -528,13 +528,13 @@ public partial class CpuEngine
         bool perChunkProjection = numChunks > 1;
 
         // The whole-batch Wx buffer exists only without a fan-out.
-        var wxBuf = perChunkProjection ? System.Array.Empty<float>() : pool.Rent(totalRows * gateRows);
+        var wxBuf = perChunkProjection ? System.Array.Empty<float>() : CpuStorageAllocationDiagnostics.RentWorkspace<float>(totalRows * gateRows, "workspace.lstm_forward_pool");
         // #477: pool the transposed hidden weight too. It used to be `new float[]` per
         // call (64 KB at the AIsEval shape) because SgemmWithCachedB keyed its pre-pack
         // cache on the array identity. Now the recurrent GEMM is SgemmSequential (no
         // identity cache), so wHhT can come from the pool — removing the single biggest
         // per-call allocation (the main GC-churn / p95 source).
-        var wHhTBuf = pool.Rent(hidden * gateRows);
+        var wHhTBuf = CpuStorageAllocationDiagnostics.RentWorkspace<float>(hidden * gateRows, "workspace.lstm_forward_pool");
         float[]? wIhT = null;   // [in, gateRows], rented only for the per-chunk projection
 
         // Output buffer comes from AutoTensorCache so we don't pay an allocation.
@@ -562,7 +562,7 @@ public partial class CpuEngine
             if (perChunkProjection)
             {
                 // [gateRows, in] -> [in, gateRows]: the [K, N] row-major layout SgemmSequential takes.
-                wIhT = pool.Rent(inFeatures * gateRows);
+                wIhT = CpuStorageAllocationDiagnostics.RentWorkspace<float>(inFeatures * gateRows, "workspace.lstm_forward_pool");
                 for (int g = 0; g < gateRows; g++)
                     for (int f = 0; f < inFeatures; f++)
                         wIhT[f * gateRows + g] = wIhData[g * inFeatures + f];
@@ -607,11 +607,11 @@ public partial class CpuEngine
             if (numChunks <= 1)
             {
                 // Serial: one chunk covering the full batch, reusing pooled scratch.
-                var hPrevBuf = pool.Rent(batch * hidden);
-                var hCurrBuf = pool.Rent(batch * hidden);
-                var cPrevBuf = pool.Rent(batch * hidden);
-                var cCurrBuf = pool.Rent(batch * hidden);
-                var hhBuf = pool.Rent(batch * gateRows);
+                var hPrevBuf = CpuStorageAllocationDiagnostics.RentWorkspace<float>(batch * hidden, "workspace.lstm_forward_pool");
+                var hCurrBuf = CpuStorageAllocationDiagnostics.RentWorkspace<float>(batch * hidden, "workspace.lstm_forward_pool");
+                var cPrevBuf = CpuStorageAllocationDiagnostics.RentWorkspace<float>(batch * hidden, "workspace.lstm_forward_pool");
+                var cCurrBuf = CpuStorageAllocationDiagnostics.RentWorkspace<float>(batch * hidden, "workspace.lstm_forward_pool");
+                var hhBuf = CpuStorageAllocationDiagnostics.RentWorkspace<float>(batch * gateRows, "workspace.lstm_forward_pool");
                 try
                 {
                     RunLstmRecurrenceRange(
@@ -638,12 +638,12 @@ public partial class CpuEngine
                     int r0 = chunk * chunkRows;
                     if (r0 >= batch) return;
                     int rows = Math.Min(chunkRows, batch - r0);
-                    var hPrevL = pool.Rent(rows * hidden);
-                    var hCurrL = pool.Rent(rows * hidden);
-                    var cPrevL = pool.Rent(rows * hidden);
-                    var cCurrL = pool.Rent(rows * hidden);
-                    var hhL = pool.Rent(rows * gateRows);
-                    var wxL = pool.Rent(rows * seqLen * gateRows);
+                    var hPrevL = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rows * hidden, "workspace.lstm_forward_pool");
+                    var hCurrL = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rows * hidden, "workspace.lstm_forward_pool");
+                    var cPrevL = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rows * hidden, "workspace.lstm_forward_pool");
+                    var cCurrL = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rows * hidden, "workspace.lstm_forward_pool");
+                    var hhL = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rows * gateRows, "workspace.lstm_forward_pool");
+                    var wxL = CpuStorageAllocationDiagnostics.RentWorkspace<float>(rows * seqLen * gateRows, "workspace.lstm_forward_pool");
                     try
                     {
                         // This chunk's input projection: its [rows*seq, in] input rows @ wIhT, plus bIh.
@@ -877,8 +877,8 @@ public partial class CpuEngine
         // (returned in the finally with the per-step buffers). Mirrors the float fast path's wxBuf.
         var lstmPool = ArrayPool<T>.Shared;
         int wxRows = batch * seqLen;
-        var wIhT = lstmPool.Rent(inFeatures * gateRows);
-        var wxBuf = lstmPool.Rent(wxRows * gateRows);
+        var wIhT = CpuStorageAllocationDiagnostics.RentWorkspace<T>(inFeatures * gateRows, "workspace.lstm_forward_pool");
+        var wxBuf = CpuStorageAllocationDiagnostics.RentWorkspace<T>(wxRows * gateRows, "workspace.lstm_forward_pool");
         {
             var wIhSrc = wIh.GetFlattenedData().AsSpan();
             for (int g = 0; g < gateRows; g++)
@@ -932,8 +932,8 @@ public partial class CpuEngine
         // wHh once into a rented buffer and MultiplyBlocked into ONE reused hh buffer, mirroring the
         // float fast path's wHhT + hhBuf — so the recurrence loop allocates nothing per step. This is
         // the dominant remaining allocation after the ping-pong state buffers above.
-        var wHhT = lstmPool.Rent(hidden * gateRows);
-        var hhBuf = lstmPool.Rent(batch * gateRows);
+        var wHhT = CpuStorageAllocationDiagnostics.RentWorkspace<T>(hidden * gateRows, "workspace.lstm_forward_pool");
+        var hhBuf = CpuStorageAllocationDiagnostics.RentWorkspace<T>(batch * gateRows, "workspace.lstm_forward_pool");
         {
             var wHhSrc = wHh.GetFlattenedData().AsSpan();
             for (int g = 0; g < gateRows; g++)

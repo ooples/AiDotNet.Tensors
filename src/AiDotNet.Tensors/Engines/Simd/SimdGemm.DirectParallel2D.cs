@@ -70,12 +70,33 @@ internal static partial class SimdGemm
 
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
-            IntPtr ipA = (IntPtr)pAroot, ipB = (IntPtr)pBroot, ipC = (IntPtr)pCroot;
-            int mCap = m, kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb;
-            int colChunksCap = colChunks, rowChunksCap = rowChunks, rowBlocksCap = rowBlocks, colStripsCap = colStrips, stripCap = strip;
-
-            Action<int> body = item =>
+            var work = new Direct2DWork
             {
+                ipA = (IntPtr)pAroot, ipB = (IntPtr)pBroot, ipC = (IntPtr)pCroot,
+                mCap = m, kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb,
+                colChunksCap = colChunks, rowChunksCap = rowChunks, rowBlocksCap = rowBlocks,
+                colStripsCap = colStrips, stripCap = strip
+            };
+            if (items <= 1) work.Invoke(0);
+            else DispatchDirect2D(work, items);
+        }
+        t_directParallel2DRuns++;
+        return true;
+    }
+
+    // Keep delegate creation outside the serial entry. The pinned matrices remain
+    // alive until the synchronous executor joins every participant.
+    private static void DispatchDirect2D(Direct2DWork work, int items)
+        => PersistentParallelExecutor.Instance.Execute(items, work.Invoke);
+
+    private unsafe struct Direct2DWork
+    {
+        internal IntPtr ipA, ipB, ipC;
+        internal int mCap, kCap, nCap, ldaCap, ldbCap;
+        internal int colChunksCap, rowChunksCap, rowBlocksCap, colStripsCap, stripCap;
+
+        internal void Invoke(int item)
+        {
                 int rc = item / colChunksCap, cc = item % colChunksCap;
                 // Balanced split of whole row blocks / column strips: every chunk gets floor or ceil of the share.
                 int rb0 = (int)((long)rc * rowBlocksCap / rowChunksCap), rb1 = (int)((long)(rc + 1) * rowBlocksCap / rowChunksCap);
@@ -157,12 +178,7 @@ internal static partial class SimdGemm
                         }
                     }
                 }
-            };
-            if (items <= 1) body(0);
-            else PersistentParallelExecutor.Instance.Execute(items, body);
         }
-        t_directParallel2DRuns++;
-        return true;
     }
 }
 #endif
