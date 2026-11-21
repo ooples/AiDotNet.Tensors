@@ -1610,6 +1610,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount) { ReclaimEpoch = reclaimEpoch };
         }
 
+        /// <inheritdoc/>
+        // OpenCL C has every element type but double, which is the cl_khr_fp64 extension. Half is stored and loaded with
+        // the core vload_half / vstore_half whatever cl_khr_fp16 says.
+        public bool SupportsElementType(GpuElementType type)
+            => (type != GpuElementType.Unspecified && Enum.IsDefined(typeof(GpuElementType), type))
+                && (type != GpuElementType.Float64 || (_context?.Extensions.Contains("cl_khr_fp64") ?? false));
+
+        /// <inheritdoc/>
+        public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
+
         public IGpuBuffer AllocateBuffer(int size)
         {
             if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
@@ -1717,8 +1727,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
             if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
                 throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
-            if (byteCount > byteBuffer.Size)
-                throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({byteBuffer.Size}).", nameof(byteCount));
+            if (byteCount > byteBuffer.SizeInBytes)
+                throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({byteBuffer.SizeInBytes}).", nameof(byteCount));
             GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.OpenCl);
 
             var result = new byte[byteCount];
@@ -1736,8 +1746,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentNullException(nameof(data));
             if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
                 throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
-            if (data.Length > byteBuffer.Size)
-                throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({byteBuffer.Size} bytes).", nameof(data));
+            if (data.Length > byteBuffer.SizeInBytes)
+                throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({byteBuffer.SizeInBytes} bytes).", nameof(data));
             GpuLaunchProbe.OnUpload(data, sizeof(byte), GpuBackendType.OpenCl);
 
             byteBuffer.Upload(data);
@@ -15087,13 +15097,21 @@ KERNEL VARIANTS (A/B testing):
     /// OpenCL byte buffer wrapper implementing IGpuBuffer.
     /// Used for sparse matrix indices (1 byte per group of 4 elements).
     /// </summary>
-    internal sealed class DirectOpenClGpuByteBuffer : IGpuBuffer
+    internal sealed class DirectOpenClGpuByteBuffer : IGpuBuffer, IElementTypedByteBuffer
     {
         internal readonly DirectOpenClByteBuffer Buffer;
         private int _disposed;
 
-        public GpuElementType ElementType => GpuElementType.Unspecified;
-        public int Size => Buffer.Length;
+        public GpuElementType ElementType { get; private set; } = GpuElementType.Unspecified;
+        public int Size => _elementCount >= 0 ? _elementCount : Buffer.Length;
+        private int _elementCount = -1; // set once the bytes are declared elements of a type
+        void IElementTypedByteBuffer.DeclareElements(GpuElementType type, int count)
+        {
+            if (count < 0 || (long)count * GpuElementTypes.SizeInBytes(type) > SizeInBytes)
+                throw new ArgumentOutOfRangeException(nameof(count), $"{count} {type} elements do not fit in {SizeInBytes} bytes.");
+            ElementType = type;
+            _elementCount = count;
+        }
         public long SizeInBytes => Buffer.Length;
         public IntPtr Handle => Buffer.Handle;
 

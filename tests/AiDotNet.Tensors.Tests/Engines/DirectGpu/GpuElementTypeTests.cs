@@ -113,6 +113,63 @@ public class GpuElementTypeTests
         Assert.Equal(GpuElementType.Float32, floats.ElementType);
     }
 
+    [SkippableFact]
+    public void TypedBuffers_RoundTripEveryElementTypeTheBackendHolds()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+
+        // Every type has storage on CUDA, HIP and OpenCL (double where the device has it); a backend that reports a type
+        // must round-trip it bit for bit, and one that does not must refuse the allocation.
+        RoundTrip(backend, GpuElementType.Float32, new[] { 1.5f, -2.25f, float.MaxValue, float.Epsilon, 0f });
+        RoundTrip(backend, GpuElementType.Float64, new[] { 1.5, -2.25, double.MaxValue, double.Epsilon, 1e-300 });
+        RoundTrip(backend, GpuElementType.Int32, new[] { 1, -2, int.MaxValue, int.MinValue, 0 });
+        RoundTrip(backend, GpuElementType.Int64, new[] { 1L, -2L, long.MaxValue, long.MinValue, 1L << 40 });
+        RoundTrip(backend, GpuElementType.Int16, new short[] { 1, -2, short.MaxValue, short.MinValue, 0 });
+        RoundTrip(backend, GpuElementType.Int8, new sbyte[] { 1, -2, sbyte.MaxValue, sbyte.MinValue, 0 });
+        RoundTrip(backend, GpuElementType.UInt8, new byte[] { 1, 2, byte.MaxValue, 0, 128 });
+        RoundTrip(backend, GpuElementType.Bool, new[] { true, false, true, true, false });
+        RoundTrip(backend, GpuElementType.Float16, new[] { (Half)1.5f, (Half)(-2.25f), Half.MaxValue, Half.Epsilon, (Half)0f });
+        RoundTrip(backend, GpuElementType.BFloat16, new[] { (BFloat16)1.5f, (BFloat16)(-2.25f), (BFloat16)3f, (BFloat16)0f, (BFloat16)100f });
+    }
+
+    [SkippableFact]
+    public void TypedTransfer_RefusesAHostTypeThatIsNotTheBuffersElementType()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        using var floats = backend.AllocateBuffer(4, GpuElementType.Float32);
+        Assert.Throws<ArgumentException>(() => backend.UploadBuffer<int>(floats, new int[4]));
+        Assert.Throws<ArgumentException>(() => backend.DownloadBuffer<double>(floats, new double[4]));
+        Assert.Throws<ArgumentException>(() => backend.UploadBuffer<float>(floats, new float[5]));
+        Assert.Throws<NotSupportedException>(() => backend.AllocateBuffer(4, GpuElementType.Unspecified));
+        Assert.False(backend.SupportsElementType(GpuElementType.Unspecified));
+        Assert.True(backend.SupportsElementType(GpuElementType.Float32));
+    }
+
+    private static void RoundTrip<T>(IDirectGpuBackend backend, GpuElementType type, T[] values) where T : unmanaged
+    {
+        if (!backend.SupportsElementType(type))
+        {
+            Assert.Throws<NotSupportedException>(() => backend.AllocateBuffer(values.Length, type));
+            return;
+        }
+        using var buffer = backend.AllocateBuffer(values.Length, type);
+        Assert.Equal(type, buffer.ElementType);
+        Assert.Equal(values.Length, buffer.Size);
+        Assert.True(buffer.SizeInBytes >= (long)values.Length * GpuElementTypes.SizeInBytes(type));
+        backend.UploadBuffer<T>(buffer, values);
+        var back = new T[values.Length];
+        backend.DownloadBuffer<T>(buffer, back);
+        // Bitwise: a transfer must not round, reorder or reinterpret.
+        Assert.True(System.Runtime.InteropServices.MemoryMarshal.AsBytes(values.AsSpan())
+            .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.AsBytes(back.AsSpan())), $"{type} did not round-trip.");
+    }
+
     private static void AssertMaps<T>(GpuElementType expected)
     {
         Assert.True(GpuElementTypes.TryFromClrType<T>(out var type));

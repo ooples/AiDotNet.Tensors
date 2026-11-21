@@ -753,3 +753,20 @@ static AiDotNet.Tensors.Engines.DirectGpu.GpuElementTypes.IsInteger(AiDotNet.Ten
 static AiDotNet.Tensors.Engines.DirectGpu.GpuElementTypes.SizeInBytes(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> int
 static AiDotNet.Tensors.Engines.DirectGpu.GpuElementTypes.TryFromClrType(System.Type! clrType, out AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
 static AiDotNet.Tensors.Engines.DirectGpu.GpuElementTypes.TryFromClrType<T>(out AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.GpuTypedBufferExtensions
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+static AiDotNet.Tensors.Engines.DirectGpu.GpuTypedBufferExtensions.DownloadBuffer<T>(this AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! buffer, System.Span<T> destination) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.GpuTypedBufferExtensions.UploadBuffer<T>(this AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! buffer, System.ReadOnlySpan<T> data) -> void
+virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool

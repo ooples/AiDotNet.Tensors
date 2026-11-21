@@ -1659,6 +1659,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         return result;
     }
 
+    /// <inheritdoc/>
+    // Every element type has a device representation here: HIP C has all of them natively.
+    public bool SupportsElementType(GpuElementType type)
+        => type != GpuElementType.Unspecified && Enum.IsDefined(typeof(GpuElementType), type);
+
+    /// <inheritdoc/>
+    public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
+
     public IGpuBuffer AllocateBuffer(int size)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
@@ -13247,12 +13255,21 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 /// HIP GPU byte buffer wrapper implementing IGpuBuffer.
 /// Used for sparse matrix indices (1 byte per group of 4 elements).
 /// </summary>
-internal sealed class HipGpuByteBuffer : IGpuBuffer
+internal sealed class HipGpuByteBuffer : IGpuBuffer, IElementTypedByteBuffer
 {
     public IntPtr Handle { get; }
-    public GpuElementType ElementType => GpuElementType.Unspecified;
-    public int Size { get; }
-    public long SizeInBytes => Size;
+    public GpuElementType ElementType { get; private set; } = GpuElementType.Unspecified;
+    public int Size => _elementCount >= 0 ? _elementCount : _byteCount;
+    private int _elementCount = -1; // set once the bytes are declared elements of a type
+    void IElementTypedByteBuffer.DeclareElements(GpuElementType type, int count)
+    {
+        if (count < 0 || (long)count * GpuElementTypes.SizeInBytes(type) > SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(count), $"{count} {type} elements do not fit in {SizeInBytes} bytes.");
+        ElementType = type;
+        _elementCount = count;
+    }
+    public long SizeInBytes => _byteCount;
+    private readonly int _byteCount;
     private int _disposed;
     private DeviceMemoryHold _memory; // see HipGpuBuffer
     // The epoch HipMallocReclaiming charged this allocation in, credited back on release (see HipGpuBuffer).
@@ -13261,7 +13278,7 @@ internal sealed class HipGpuByteBuffer : IGpuBuffer
     public HipGpuByteBuffer(IntPtr handle, int size, DeviceMemoryAccount? account = null)
     {
         Handle = handle;
-        Size = size;
+        _byteCount = size;
         _memory.OnAllocated(account, size);
     }
 

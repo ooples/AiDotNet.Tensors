@@ -2304,6 +2304,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return devicePtr;
     }
 
+    /// <inheritdoc/>
+    // Every element type has a device representation here: CUDA C has all of them natively.
+    public bool SupportsElementType(GpuElementType type)
+        => type != GpuElementType.Unspecified && Enum.IsDefined(typeof(GpuElementType), type);
+
+    /// <inheritdoc/>
+    public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
+
     public IGpuBuffer AllocateBuffer(int size)
     {
         if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
@@ -21619,7 +21627,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
     }
 
-    internal sealed class CudaGpuByteBuffer : IGpuBuffer
+    internal sealed class CudaGpuByteBuffer : IGpuBuffer, IElementTypedByteBuffer
     {
         private IntPtr _context;
         private IntPtr _devicePtr;
@@ -21627,8 +21635,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         private readonly bool _allocatedDuringCapture; // see CudaGpuBuffer
         private readonly long _contextGeneration = 0; // see CudaGpuBuffer
 
-        public GpuElementType ElementType => GpuElementType.Unspecified;
-        public int Size { get; }
+        public GpuElementType ElementType { get; private set; } = GpuElementType.Unspecified;
+        public int Size => _elementCount >= 0 ? _elementCount : checked((int)SizeInBytes);
+        private int _elementCount = -1; // set once the bytes are declared elements of a type
+        void IElementTypedByteBuffer.DeclareElements(GpuElementType type, int count)
+        {
+            if (count < 0 || (long)count * GpuElementTypes.SizeInBytes(type) > SizeInBytes)
+                throw new ArgumentOutOfRangeException(nameof(count), $"{count} {type} elements do not fit in {SizeInBytes} bytes.");
+            ElementType = type;
+            _elementCount = count;
+        }
         public long SizeInBytes { get; }
         public IntPtr Handle
         {
@@ -21664,7 +21680,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _memory.OnAllocated(account, size, countReserved: asyncFreeStream == IntPtr.Zero);
             _context = context;
             _devicePtr = devicePtr;
-            Size = size;
             SizeInBytes = size;
             _asyncFreeStream = asyncFreeStream;
             CaptureMemoryPool.Current?.Pin(ref _capturePins, this);

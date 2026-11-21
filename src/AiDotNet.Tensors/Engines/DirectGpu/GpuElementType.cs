@@ -143,3 +143,90 @@ internal static class GpuBufferTyping
         return buffer;
     }
 }
+
+/// <summary>A byte allocation that can be declared a buffer of typed elements.</summary>
+internal interface IElementTypedByteBuffer
+{
+    /// <summary>Declares the allocation <paramref name="count"/> elements of <paramref name="type"/>.</summary>
+    void DeclareElements(GpuElementType type, int count);
+}
+
+/// <summary>The one implementation of <see cref="IDirectGpuBackend.AllocateBuffer(int, GpuElementType)"/>.</summary>
+internal static class GpuTypedAllocation
+{
+    public static IGpuBuffer Allocate(IDirectGpuBackend backend, int size, GpuElementType type)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), size, "Buffer size must be positive.");
+        if (!backend.SupportsElementType(type))
+            throw new NotSupportedException($"{backend.BackendName} cannot hold {type} buffers on {backend.DeviceName}.");
+        // The 4-byte types keep their pooled allocation paths.
+        if (type == GpuElementType.Float32) return backend.AllocateBuffer(size);
+        if (type == GpuElementType.Int32) return backend.AllocateIntBuffer(size);
+        long bytes = (long)size * GpuElementTypes.SizeInBytes(type);
+        if (bytes > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(size), size, $"{size} {type} elements exceed a single allocation.");
+        var buffer = backend.AllocateByteBuffer((int)bytes);
+        if (buffer is not IElementTypedByteBuffer typed)
+        {
+            buffer.Dispose();
+            throw new NotSupportedException($"{backend.BackendName} reports {type} storage but its byte buffers carry no element type.");
+        }
+        typed.DeclareElements(type, size);
+        return buffer;
+    }
+}
+
+/// <summary>Typed host transfers for device buffers of any element type.</summary>
+public static class GpuTypedBufferExtensions
+{
+    /// <summary>Copies <paramref name="data"/> into the start of <paramref name="buffer"/>.</summary>
+    /// <exception cref="ArgumentException">
+    /// <typeparamref name="T"/> is not the buffer's element type, or the data is longer than the buffer.
+    /// </exception>
+    public static void UploadBuffer<T>(this IDirectGpuBackend backend, IGpuBuffer buffer, ReadOnlySpan<T> data) where T : unmanaged
+    {
+        Validate<T>(backend, buffer, data.Length);
+        if (data.Length == 0) return;
+        if (buffer.ElementType == GpuElementType.Float32)
+            backend.UploadBufferInPlace(System.Runtime.InteropServices.MemoryMarshal.Cast<T, float>(data).ToArray(), buffer);
+        else if (buffer.ElementType == GpuElementType.Int32)
+            backend.UploadIntBufferInPlace(System.Runtime.InteropServices.MemoryMarshal.Cast<T, int>(data).ToArray(), buffer);
+        else
+            backend.UploadByteBuffer(buffer, System.Runtime.InteropServices.MemoryMarshal.AsBytes(data).ToArray());
+    }
+
+    /// <summary>Copies the first <paramref name="destination"/>.Length elements of <paramref name="buffer"/> to the host.</summary>
+    /// <exception cref="ArgumentException">
+    /// <typeparamref name="T"/> is not the buffer's element type, or the destination is longer than the buffer.
+    /// </exception>
+    public static void DownloadBuffer<T>(this IDirectGpuBackend backend, IGpuBuffer buffer, Span<T> destination) where T : unmanaged
+    {
+        Validate<T>(backend, buffer, destination.Length);
+        if (destination.Length == 0) return;
+        if (buffer.ElementType is GpuElementType.Float32 or GpuElementType.Int32)
+        {
+            // The 4-byte types live in the float allocation paths; their bits come back through the float download.
+            var floats = backend.DownloadBuffer(buffer);
+            System.Runtime.InteropServices.MemoryMarshal.Cast<float, T>(floats.AsSpan()).Slice(0, destination.Length).CopyTo(destination);
+            return;
+        }
+        int bytes = destination.Length * GpuElementTypes.SizeInBytes(buffer.ElementType);
+        System.Runtime.InteropServices.MemoryMarshal.Cast<byte, T>(backend.DownloadByteBuffer(buffer, bytes).AsSpan())
+            .Slice(0, destination.Length).CopyTo(destination);
+    }
+
+    private static void Validate<T>(IDirectGpuBackend backend, IGpuBuffer buffer, int length) where T : unmanaged
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (!GpuElementTypes.TryFromClrType<T>(out var hostType) || hostType != buffer.ElementType)
+            throw new ArgumentException($"A buffer of {buffer.ElementType} elements cannot be transferred as {typeof(T).Name}.", nameof(buffer));
+        // The transfer reinterprets host memory, so the host type must have the device layout (the Half shim on
+        // frameworks without System.Half is wider than two bytes).
+        if (System.Runtime.CompilerServices.Unsafe.SizeOf<T>() != GpuElementTypes.SizeInBytes(hostType))
+            throw new NotSupportedException($"{typeof(T).Name} does not have the {hostType} device layout on this framework.");
+        if (length > buffer.Size)
+            throw new ArgumentException($"{length} elements exceed the buffer's {buffer.Size}.", nameof(buffer));
+    }
+}
