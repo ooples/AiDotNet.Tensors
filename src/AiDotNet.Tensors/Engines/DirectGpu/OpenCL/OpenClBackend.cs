@@ -701,7 +701,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                     _float64ReductionsReady = true;
                 }
-                catch (Exception float64Failure)
+                catch (InvalidOperationException float64Failure)
                 {
                     // No fp64, or the device rejected the program: double reductions stay on the CPU.
                     _float64ReductionsReady = false;
