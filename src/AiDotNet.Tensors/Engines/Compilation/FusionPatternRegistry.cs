@@ -40,6 +40,7 @@ internal static class FusionPatternRegistry
         Register(new BatchNormReluFusionPattern());
         Register(new BatchNormRelu6FusionPattern());
         Register(new BatchNormLeakyReluFusionPattern());
+        Register(new ConvChannelEpilogueFusionPattern());   // before ConvBias: a conv whose bias feeds more steps
         Register(new ConvBiasFusionPattern());
         Register(new ConvTransposeBiasFusionPattern());
         Register(new DepthwiseConvBiasFusionPattern());
