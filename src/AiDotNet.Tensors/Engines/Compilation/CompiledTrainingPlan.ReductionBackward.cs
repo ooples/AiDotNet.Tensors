@@ -54,15 +54,15 @@ internal sealed partial class CompiledTrainingPlan<T>
             bool accumulate = AccumulatesInto(gradIn, shared);
             if (typeof(T) == typeof(float))
             {
-                var source = ((Tensor<float>)(object)gradOut).GetCpuBackingForStridedRead(out int sourceOffset);
-                var destination = ((Tensor<float>)(object)gradIn).GetCpuBackingForContiguousWrite(out int destinationOffset);
+                var source = ElementTyped<float>(gradOut).GetCpuBackingForStridedRead(out int sourceOffset);
+                var destination = ElementTyped<float>(gradIn).GetCpuBackingForContiguousWrite(out int destinationOffset);
                 if (source is null || destination is null) throw new InvalidOperationException("Reduced gradient lost its contiguous CPU backing.");
                 BroadcastReducedInto(source, sourceOffset, destination, destinationOffset, gradIn.Length, repeats, inner, accumulate);
             }
             else
             {
-                var source = ((Tensor<double>)(object)gradOut).GetCpuBackingForStridedRead(out int sourceOffset);
-                var destination = ((Tensor<double>)(object)gradIn).GetCpuBackingForContiguousWrite(out int destinationOffset);
+                var source = ElementTyped<double>(gradOut).GetCpuBackingForStridedRead(out int sourceOffset);
+                var destination = ElementTyped<double>(gradIn).GetCpuBackingForContiguousWrite(out int destinationOffset);
                 if (source is null || destination is null) throw new InvalidOperationException("Reduced gradient lost its contiguous CPU backing.");
                 BroadcastReducedInto(source, sourceOffset, destination, destinationOffset, gradIn.Length, repeats, inner, accumulate);
             }

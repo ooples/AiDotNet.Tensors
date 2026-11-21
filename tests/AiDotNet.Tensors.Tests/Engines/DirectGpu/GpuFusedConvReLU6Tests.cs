@@ -32,20 +32,28 @@ public class GpuFusedConvReLU6Tests
             return;
         }
         Skip.IfNot(gpu.IsGpuAvailable, "No GPU device.");
-        using (gpu)
+        // Compare in FP32: by default a CUDA convolution may run TF32 (~3e-3 relative), above this tolerance. The test
+        // passed only when an earlier test in the run happened to leave reduced-precision convolution off.
+        bool priorConvTF32 = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32;
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = false;
+        try
         {
-            // Large values so the clamp at 6 is exercised as well as the one at 0.
-            var input = Filled(new[] { 2, 3, 9, 9 }, 1, 8f);
-            var kernel = Filled(new[] { 5, 3, 3, 3 }, 2, 2f);
-            var bias = Filled(new[] { 5 }, 3, 4f);
-            var expected = new CpuEngine().FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU6).ToArray();
-            var actual = gpu.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU6).ToArray();
+            using (gpu)
+            {
+                // Large values so the clamp at 6 is exercised as well as the one at 0.
+                var input = Filled(new[] { 2, 3, 9, 9 }, 1, 8f);
+                var kernel = Filled(new[] { 5, 3, 3, 3 }, 2, 2f);
+                var bias = Filled(new[] { 5 }, 3, 4f);
+                var expected = new CpuEngine().FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU6).ToArray();
+                var actual = gpu.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU6).ToArray();
 
-            Assert.Contains(expected, v => v == 6f);
-            Assert.Contains(expected, v => v == 0f);
-            Assert.Equal(expected.Length, actual.Length);
-            for (int i = 0; i < expected.Length; i++)
-                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-3f * (1f + Math.Abs(expected[i])), $"[{i}]: cpu {expected[i]}, gpu {actual[i]}");
+                Assert.Contains(expected, v => v == 6f);
+                Assert.Contains(expected, v => v == 0f);
+                Assert.Equal(expected.Length, actual.Length);
+                for (int i = 0; i < expected.Length; i++)
+                    Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-3f * (1f + Math.Abs(expected[i])), $"[{i}]: cpu {expected[i]}, gpu {actual[i]}");
+            }
         }
+        finally { AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = priorConvTF32; }
     }
 }

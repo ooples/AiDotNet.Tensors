@@ -250,6 +250,14 @@ public partial class DifferentiableOpsGradCheckSweep
         ["Fold"] = r => [SafeTensor([1, 2 * 2 * 2, 9], r), new[] { 4, 4 }, new[] { 2, 2 },
                          new[] { 1, 1 }, new[] { 0, 0 }],
 
+        // --- sparse graph attention: transformed is [batch, nodes, heads, features], attention [heads, 2 * features];
+        // every node of the 3-node graph has an edge (dropout off: rate 0 ignores the generator) ---
+        ["GraphAttentionCsr|T,T,CsrGraph,double,double,Random"] = r =>
+        [
+            SafeTensor([1, 3, 2, 2], r), SafeTensor([2, 4], r),
+            new CsrGraph(3, new[] { 0, 2, 4, 6 }, new[] { 0, 1, 1, 2, 0, 2 }), 0.2, 0.0, new Random(7),
+        ],
+
         // --- sampling grids: grid is [N, H, W, 2] for 2-D, theta is [N, 2, 3] ---
         ["GridSample|T,T"] = r => [SafeTensor([1, 2, 4, 4], r), SafeTensor([1, 3, 3, 2], r)],
         ["ForwardSplat|T,T,bool"] = r =>

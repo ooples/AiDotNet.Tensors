@@ -390,6 +390,23 @@ fn mode_equal(left: f32, right: f32) -> bool {
 }
 ";
 
+    public static string FusedCeTargetPositions => @"
+@group(0) @binding(0) var<storage, read> ids : array<i32>;
+@group(0) @binding(1) var<storage, read_write> positionBits : array<f32>;
+struct PositionsP { rows: i32, chunk: i32, vocab: i32, pad: i32 };
+@group(0) @binding(2) var<uniform> p : PositionsP;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    if (gid >= p.rows) { return; }
+    let raw = ids[gid];
+    let tid = clamp(raw, 0, p.vocab - 1);
+    positionBits[gid] = bitcast<f32>((gid % p.chunk) * p.vocab + tid);
+    // Select the bits, then bitcast: a constant NaN (bitcast<f32>(0x7fc00000u)) is a shader-creation error in Tint.
+    positionBits[p.rows + gid] = bitcast<f32>(select(0x7fc00000u, 0u, raw == tid));
+    positionBits[2 * p.rows + gid] = select(1.0, 0.0, raw == tid);
+}
+";
+
     public static string ConvertIndicesToInt32 => @"
 @group(0) @binding(0) var<storage, read> input_ : array<f32>;
 @group(0) @binding(1) var<storage, read_write> output_ : array<i32>;

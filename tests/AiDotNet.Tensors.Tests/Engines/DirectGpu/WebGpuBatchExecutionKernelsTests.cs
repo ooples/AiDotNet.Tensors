@@ -21,6 +21,15 @@ public sealed class WebGpuBatchExecutionKernelsTests
     public static IEnumerable<object[]> KernelNames()
         => BatchExecutionCudaKernels.GetKernelNames().Select(n => new object[] { n });
 
+    [Fact]
+    public void Residual_only_shader_binds_one_writable_output()
+    {
+        var shader = WebGpuBatchExecutionKernels.ByKernelName[WebGpuBatchExecutionKernels.ChannelBiasResidualOnlyName];
+        Assert.Equal(1, Regex.Matches(shader, @"var<storage, read_write>", RegexOptions.None, RegexTimeout).Count);
+        Assert.Contains("outp[i] = value", shader);
+        Assert.DoesNotContain("activated", shader);
+    }
+
     [Theory]
     [MemberData(nameof(KernelNames))]
     public void Port_MirrorsTheCudaSignature(string name)
@@ -54,11 +63,14 @@ public sealed class WebGpuBatchExecutionKernelsTests
         Assert.Equal(expectedAccess, bindings.Select(m => m.Groups[2].Value).ToList());
         Assert.Equal(Enumerable.Range(0, expectedAccess.Count).Select(i => i.ToString()),
             bindings.Select(m => m.Groups[1].Value));
-        Assert.Contains($"@binding({expectedAccess.Count}) var<uniform> p : P;", wgsl);
+        var uniform = Regex.Match(wgsl, $@"@binding\({expectedAccess.Count}\)\s+var<uniform>\s+\w+\s*:\s*(\w+)\s*;",
+            RegexOptions.None, RegexTimeout);
+        Assert.True(uniform.Success, $"{name} declares no uniform after its storage buffers.");
 
-        Match fields = Regex.Match(wgsl, @"struct P \{([^}]*)\}", RegexOptions.None, RegexTimeout);
+        Match fields = Regex.Match(wgsl, $@"struct\s+{Regex.Escape(uniform.Groups[1].Value)}\s*\{{([^}}]*)\}}",
+            RegexOptions.None, RegexTimeout);
         Assert.True(fields.Success, $"{name} declares no parameter struct.");
-        var actualFields = fields.Groups[1].Value.Split(',')
+        var actualFields = fields.Groups[1].Value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(f => f.Split(':')[1].Trim()).ToList();
         Assert.Equal(expectedFields, actualFields);
     }

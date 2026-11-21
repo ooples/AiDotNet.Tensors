@@ -91,6 +91,15 @@ public partial class CpuEngine
             || kernel._shape[1] != input._shape[1] || bias._shape[0] != kernel._shape[0]
             || output._shape[0] != input._shape[0] || output._shape[1] != kernel._shape[0])
             throw new ArgumentException("Conv2DBiasActivationInto needs input [N, C, H, W], kernel [O, C, kH, kW], bias [O] and output [N, O, oH, oW].");
+        if (!relu && SingleOutputConvBiasEnabled
+            && TrySingleOutputConvBiasInto(output, input, kernel, bias, stride, padding, dilation))
+            return;
+#if NET5_0_OR_GREATER
+        if (!relu && SingleOutputConvBiasEnabled
+            && TryWaveformConvBiasInto(output, input, kernel, bias, stride, padding, dilation))
+            return;
+#endif
+
 
 #if NETCOREAPP
         int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1];

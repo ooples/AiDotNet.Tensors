@@ -8,6 +8,13 @@ internal static partial class BatchExecutionCudaKernels
     internal const string WeightNormDirectionGrad = "bx_weight_norm_dv";
     internal const string WeightNormGainGrad = "bx_weight_norm_dg";
 
+    /// <summary>The backward kernels, compiled by CUDA without --use_fast_math like the precise forward. Fast math
+    /// flushes subnormal directions to zero and approximates 1/sqrt, so with a tiny direction the stats kernel would see a
+    /// zero row the precise forward preserved and the gain gradient would collapse to zero.</summary>
+    internal static readonly string[] WeightNormBackwardKernelNames = { WeightNormStats, WeightNormDirectionGrad, WeightNormGainGrad };
+    internal const string WeightNormBackwardPreciseSource =
+        "__device__ __forceinline__ int bx_gid() { return blockIdx.x * blockDim.x + threadIdx.x; }\n" + WeightNormSource;
+
     // One workgroup owns a row. No weight-sized intermediate is allocated: the
     // backward's only scratch is [rows, 2] (inverse norm and upstream dot product).
     // Keep dV and dG separate: tied targets have an explicit complete-dV-before-dG

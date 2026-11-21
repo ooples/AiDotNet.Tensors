@@ -1,7 +1,10 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
-public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, IFusedCrossEntropyPositionsBackend, IOneHotIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend, IGraphAttentionBackend
 {
+    private PortableGraphAttention? _graphAttention;
+    private PortableGraphAttention GraphAttention => _graphAttention ??= new(LaunchModelOp);
+
     private DirectOpenClKernel GetInstantNgpKernel(string name)
     {
         if (!_kernelCache.TryGetValue(name, out var kernel))
@@ -184,6 +187,19 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
         kernel.Execute1D(length, CalculateOptimalWorkGroupSize1D(length));
     }
 
+    void IFusedCrossEntropyPositionsBackend.FusedCrossEntropyTargetPositions(
+        IGpuBuffer int32Ids, IGpuBuffer positionBits, int rows, int chunk, int vocab)
+    {
+        if (rows <= 0) return;
+        var kernel = GetInstantNgpKernel("fused_ce_target_positions");
+        kernel.SetArg(0, InstantNgpHandle(int32Ids));
+        kernel.SetArg(1, InstantNgpHandle(positionBits));
+        kernel.SetArg(2, rows);
+        kernel.SetArg(3, chunk);
+        kernel.SetArg(4, vocab);
+        kernel.Execute1D(rows, CalculateOptimalWorkGroupSize1D(rows));
+    }
+
     public void OneHotInt32(IGpuBuffer int32Indices, IGpuBuffer output, int rows, int depth)
     {
         int total = checked(rows * depth);
@@ -328,4 +344,32 @@ public sealed partial class OpenClBackend : IInstantNgpBackend, IFrexpBackend, I
         kernel.SetArg(6, numVertices); kernel.SetArg(7, numFaces); kernel.SetArg(8, spiralLength);
         kernel.Execute1D(1, 1);
     }
+
+    void IGraphAttentionBackend.GraphAttentionScores(IGpuBuffer wh, IGpuBuffer attention, IGpuBuffer selfScore, IGpuBuffer neighScore,
+        int rows, int heads, int features)
+        => GraphAttention.Scores(wh, attention, selfScore, neighScore,
+            rows, heads, features);
+
+    void IGraphAttentionBackend.GraphAttentionForward(IGpuBuffer wh, IGpuBuffer selfScore, IGpuBuffer neighScore, IGpuBuffer rowPtr,
+        IGpuBuffer col, IGpuBuffer output, int batch, int nodes, int heads, int features, int edges,
+        double slope, uint cutoff, float keep, uint seed)
+        => GraphAttention.Forward(wh, selfScore, neighScore, rowPtr, col, output,
+            batch, nodes, heads, features, edges, slope, cutoff, keep, seed);
+
+    void IGraphAttentionBackend.GraphAttentionBackwardRows(IGpuBuffer wh, IGpuBuffer gradOutput, IGpuBuffer selfScore, IGpuBuffer neighScore,
+        IGpuBuffer rowPtr, IGpuBuffer col, IGpuBuffer gz, IGpuBuffer cp, IGpuBuffer gSelf,
+        int batch, int nodes, int heads, int features, int edges, double slope, uint cutoff, float keep, uint seed)
+        => GraphAttention.BackwardRows(wh, gradOutput, selfScore, neighScore, rowPtr, col, gz, cp, gSelf,
+            batch, nodes, heads, features, edges, slope, cutoff, keep, seed);
+
+    void IGraphAttentionBackend.GraphAttentionBackwardCols(IGpuBuffer gradOutput, IGpuBuffer attention, IGpuBuffer gz, IGpuBuffer cp,
+        IGpuBuffer gSelf, IGpuBuffer colPtr, IGpuBuffer tRow, IGpuBuffer tEdge, IGpuBuffer gNeigh, IGpuBuffer gradWh,
+        int batch, int nodes, int heads, int features, int edges)
+        => GraphAttention.BackwardCols(gradOutput, attention, gz, cp, gSelf, colPtr, tRow, tEdge, gNeigh, gradWh,
+            batch, nodes, heads, features, edges);
+
+    void IGraphAttentionBackend.GraphAttentionAttentionGrad(IGpuBuffer wh, IGpuBuffer gSelf, IGpuBuffer gNeigh, IGpuBuffer gradAttention,
+        int rows, int heads, int features)
+        => GraphAttention.AttentionGrad(wh, gSelf, gNeigh, gradAttention,
+            rows, heads, features);
 }

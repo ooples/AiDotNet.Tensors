@@ -355,6 +355,23 @@ kernel void resident_mode(
     output[1] = float(bestCount);
 }
 
+kernel void fused_ce_target_positions(
+    device const int* ids [[buffer(0)]],
+    device float* positionBits [[buffer(1)]],
+    constant int& rows [[buffer(2)]],
+    constant int& chunk [[buffer(3)]],
+    constant int& vocab [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int r = int(gid);
+    if (r >= rows) return;
+    int raw = ids[r];
+    int id = clamp(raw, 0, vocab - 1);
+    positionBits[r] = as_type<float>((r % chunk) * vocab + id);
+    positionBits[rows + r] = raw == id ? 0.0f : as_type<float>(0x7fc00000);
+    positionBits[2 * rows + r] = raw == id ? 0.0f : 1.0f;
+}
+
 kernel void resident_indices_to_int32(
     device const float* input [[buffer(0)]],
     device int* output [[buffer(1)]],
