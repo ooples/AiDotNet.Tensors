@@ -104,6 +104,9 @@ internal static class ResultBufferTracker
     private static readonly Dictionary<List<Entry>, long> s_groupAsked = new();
     private static long s_askTick;
     private static int s_count;
+    // The smallest array, in bytes, the tracker has ever tracked. Find skips its lock for anything smaller: such an
+    // array cannot be in s_byArray. Only ever lowered, so a stale read errs toward taking the lock.
+    private static long s_minTrackedBytes = long.MaxValue;
     private static int s_parked;
     private static long s_trackedBytes;
 
@@ -224,6 +227,7 @@ internal static class ResultBufferTracker
             group.Add(entry);
             s_byArray[array] = entry;
             s_trackedBytes += bytes;
+            if (bytes < s_minTrackedBytes) Volatile.Write(ref s_minTrackedBytes, bytes);
             s_count++;
         }
         return owner;
@@ -237,13 +241,22 @@ internal static class ResultBufferTracker
     internal static ResultBufferOwner? Find<T>(ReadOnlyMemory<T> memory)
     {
         if (Volatile.Read(ref s_count) == 0) return null;
-        return MemoryMarshal.TryGetArray(memory, out var segment) && segment.Array is { } array ? Find(array) : null;
+        // TryGetArray yields the T[] the memory was built over, so its byte size is Length * sizeof(T).
+        return MemoryMarshal.TryGetArray(memory, out var segment) && segment.Array is { } array
+            ? Find(array, (long)array.Length * Unsafe.SizeOf<T>())
+            : null;
     }
 
     /// <summary>The owner of a tracked <paramref name="array"/>; null when untracked.</summary>
-    internal static ResultBufferOwner? Find(Array array)
+    internal static ResultBufferOwner? Find(Array array) => Find(array, long.MaxValue);
+
+    /// <summary>
+    /// The owner of a tracked <paramref name="array"/> of <paramref name="bytes"/> bytes; null when untracked. Wraps of
+    /// arrays smaller than any tracked one (nearly every wrap) return before the process-wide lock.
+    /// </summary>
+    private static ResultBufferOwner? Find(Array array, long bytes)
     {
-        if (Volatile.Read(ref s_count) == 0) return null;
+        if (Volatile.Read(ref s_count) == 0 || bytes < Volatile.Read(ref s_minTrackedBytes)) return null;
         lock (s_lock)
         {
             if (!s_byArray.TryGetValue(array, out var entry)) return null;
