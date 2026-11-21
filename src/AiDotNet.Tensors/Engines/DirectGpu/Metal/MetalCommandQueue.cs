@@ -409,6 +409,9 @@ public sealed class MetalCommandQueue : IDisposable
             GpuKernelDiagnostics.ValidateLaunch(DescribeBoundPipeline(), handleIsValid: true, stagedArgCount: 0,
                 declaredArgCount: -1, globalSize: global, localSize: local);
         GpuKernelDiagnostics.RecordLaunchByHandle(_boundPipeline, global, local, 0);
+        // Every Metal compute dispatch goes through here or DispatchThreads: count it, as the other backends count
+        // theirs at their launch choke point (the launch and residency probes read this).
+        GpuLaunchProbe.OnLaunch();
 
         SendMessageDispatch(encoder, Selectors.DispatchThreadgroups, threadgroups, threadsPerThreadgroup);
     }
@@ -428,6 +431,7 @@ public sealed class MetalCommandQueue : IDisposable
 
         GpuKernelDiagnostics.RecordLaunchByHandle(_boundPipeline, (long)(threads.Width * threads.Height * threads.Depth),
             (long)(threadsPerThreadgroup.Width * threadsPerThreadgroup.Height * threadsPerThreadgroup.Depth), 0);
+        GpuLaunchProbe.OnLaunch();
         SendMessageDispatch(encoder, Selectors.DispatchThreads, threads, threadsPerThreadgroup);
     }
 

@@ -475,7 +475,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
     {
         if (_backendStreamCaptureActive || _mainStream == IntPtr.Zero) return null;
-        return _bufferPool.TryRent(size, AsyncPoolAffinity, out var pooled) ? pooled : null;
+        return _bufferPool.TryRentForBackend(size, AsyncPoolAffinity, this, out var pooled) ? pooled : null;
     }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
     // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
@@ -1612,6 +1612,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // IGpuBatchExecution kernels shared with HIP (#1142).
         CompileKernelModule(device, BatchExecutionCudaKernels.GetSource(), "batch_execution_kernels", BatchExecutionCudaKernels.GetKernelNames());
+        // WeightNorm's row scale and reduction use explicit FP32 arithmetic; keep subnormals and sqrt/div semantics.
+        CompileKernelModule(device, BatchExecutionCudaKernels.WeightNormPreciseSource, "weight_norm_precise_kernels",
+            new[] { BatchExecutionCudaKernels.WeightNorm }, useFastMath: false);
+        CompileKernelModule(device, BatchExecutionCudaKernels.WeightNormBackwardPreciseSource, "weight_norm_backward_precise_kernels",
+            BatchExecutionCudaKernels.WeightNormBackwardKernelNames, useFastMath: false);
+
         CompileKernelModule(device, BatchExecutionCudaKernels.RfftMagnitudeCudaSource, "rfft_magnitude_precise_kernels",
             BatchExecutionCudaKernels.RfftMagnitudeKernelNames, useFastMath: false);
         // The GRU kernels again, without --use_fast_math; compiled second, so they replace the fast-math entries above.
@@ -1941,6 +1947,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 static state => state.Item1.AllocateBuffer(state.Item2));
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        if (Volatile.Read(ref _cublasWarmStarted) == 0) StartCublasWarmup();
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Cuda);
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
         LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
@@ -1951,6 +1958,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ulong byteSize = (ulong)size * sizeof(float);
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)byteSize, MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)byteSize));
         DrainFinalizedFreesBeforeAllocation();
 
@@ -2006,7 +2015,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             catch { target.Dispose(); throw; }
             return target;
         }
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             unsafe
             {
@@ -2307,6 +2316,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         // Issue #285: per-allocation cap check before cuMemAlloc.
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
         DrainFinalizedFreesBeforeAllocation();
 
@@ -2351,7 +2362,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "cuMemsetD8Async");
             return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
         }
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
@@ -2378,6 +2389,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
         GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
         RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
         DrainFinalizedFreesBeforeAllocation();
         // Only the stream-ordered allocator skips the fill: the legacy path's pooled buffers are recycled across
@@ -6817,6 +6830,44 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // the GC has finalized that ThreadLocal (its Values then throws), and its handles still have to be destroyed.
     private readonly ConcurrentQueue<ThreadCublas> _allThreadCublas = new();
 
+    // The first cuBLAS handle loads cublas64/cublasLt64 (hundreds of MB, ~50 ms) and initializes the library; done
+    // lazily, that lands inside the first training step's graph capture. The first host upload of an adopted GPU
+    // engine (weights, the first batch) starts a throwaway handle on a pool thread so the load overlaps model setup;
+    // the per-thread handle created later then only pays cublasCreate. Gated on the engine being current so a process
+    // that auto-detected the GPU but runs on the CPU engine never maps cuBLAS. AIDOTNET_CUBLAS_PREWARM=0 disables it.
+    private int _cublasWarmStarted;
+    private System.Threading.Tasks.Task? _cublasWarmup;
+    private readonly object _cublasWarmLock = new();
+    private bool _cublasWarmClosing;
+
+    private void StartCublasWarmup()
+    {
+        if (!AiDotNetEngine.Current.Is<DirectGpuTensorEngine>()) return;
+        lock (_cublasWarmLock)
+        {
+            if (_cublasWarmClosing || _disposed) return;
+            if (Interlocked.Exchange(ref _cublasWarmStarted, 1) != 0) return;
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_PREWARM") == "0") return;
+            _cublasWarmup = System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    // Creation and destruction both synchronize the device: neither may overlap a capture.
+                    lock (CaptureGateFor(_cudaContext))
+                    {
+                        using var _ = PushContext();
+                        if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                    }
+                }
+                catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException
+                    or InvalidOperationException or TypeInitializationException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[CUDA] cuBLAS prewarm failed: {ex}");
+                }
+            });
+        }
+    }
+
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
     // cuMemFree) from the GC finalizer thread races with op threads' driver entry and faults with an
     // uncatchable 0xC0000005 under the heavy GC the full test suite produces (DirectGpu-only, with low
@@ -10158,12 +10209,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         args[0] = &gradOutPtr;
         args[1] = &idxPtr;
         args[2] = &gradEmbPtr;
         args[3] = &numIndices;
         args[4] = &embeddingDim;
+        args[5] = &vocabSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -10232,7 +10284,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return target;
         }
 
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null)
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null)
         {
             unsafe
             {
@@ -13867,12 +13919,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: embedding_backward");
 
         uint grid = (uint)((sourceSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** args = stackalloc void*[5];
+        void** args = stackalloc void*[6];
         args[0] = &srcPtr;
         args[1] = &idxPtr;
         args[2] = &dstPtr;
         args[3] = &sourceSize;
         args[4] = &embDim;
+        args[5] = &destSize;
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
@@ -14549,8 +14602,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // Rows at least this wide reduce with one block per row (arg_extreme_axis_rows); narrower rows keep one thread per
+    // row, which is already coalesced across rows and pays no shared-memory reduction.
+    internal const int ArgExtremeRowKernelMinWidth = 512;
+    private long _argExtremeRowLaunches;
+    internal long ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
+
+
+    private unsafe bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
+    {
+        if (reduceSize < ArgExtremeRowKernelMinWidth || outerSize <= 0
+            || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var kernel))
+            return false;
+        using var _ = PushContext();
+        IntPtr inputPtr = A.Handle;
+        IntPtr indicesPtr = indices.Handle;
+        int outerSizeVal = outerSize, reduceSizeVal = reduceSize, findMinVal = findMin;
+        void** args = stackalloc void*[5];
+        args[0] = &inputPtr;
+        args[1] = &indicesPtr;
+        args[2] = &outerSizeVal;
+        args[3] = &reduceSizeVal;
+        args[4] = &findMinVal;
+        LaunchKernel(kernel, (uint)outerSize, DefaultBlockSize, args);
+        System.Threading.Interlocked.Increment(ref _argExtremeRowLaunches);
+        return true;
+    }
+
     public unsafe void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
@@ -14568,6 +14649,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public unsafe void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 1)) return;
         if (!_kernelCache.TryGetValue("argmin_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmin_axis");
 
@@ -14991,42 +15073,63 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     private MultiTensorTable? _adamTable;
+    private readonly List<MultiTensorTable> _retainedAdamTables = new();
 
     // Guards _adamTable from lookup through launch, as _gradientTableSync does for the gradient table.
     private readonly object _adamTableSync = new object();
 
-    /// <summary>
-    /// The multi-tensor Adam kernel's four pointer arrays (parameters, gradients, first and second moments, stored
-    /// back to back in one buffer), size table and chunk table, kept across calls. A compiled plan's optimizer
-    /// buffers are stable from step to step; rebuilding the tables per call cost seven synchronous allocations,
-    /// uploads and frees every step -- measured as the largest host cost of a CUDA-graph training step.
-    /// </summary>
-    private MultiTensorTable GetAdamTable(
+    // Table identity includes every operand pointer and size, not only tensor count or parameter identity.
+    private static bool AdamTableMatches(MultiTensorTable table,
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes)
     {
         int n = parameters.Count;
-        if (_adamTable is { } cached && cached.Handles.Length == 4 * n)
+        if (table.Handles.Length != 4 * n || table.Sizes.Length != n) return false;
+        for (int t = 0; t < n; t++)
+            if (table.Handles[t] != parameters[t].Handle || table.Handles[n + t] != gradients[t].Handle
+                || table.Handles[2 * n + t] != firstMoments[t].Handle
+                || table.Handles[3 * n + t] != secondMoments[t].Handle || table.Sizes[t] != sizes[t]) return false;
+        return true;
+    }
+
+    private MultiTensorTable GetAdamTable(
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
+        IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
+        IReadOnlyList<int> sizes)
+    {
+        if (_adamTable is { } cached && AdamTableMatches(cached, parameters, gradients, firstMoments, secondMoments, sizes))
+            return cached;
+        for (int i = 0; i < _retainedAdamTables.Count; i++)
         {
-            bool same = true;
-            for (int t = 0; t < n && same; t++)
-            {
-                same = cached.Handles[t] == parameters[t].Handle
-                    && cached.Handles[n + t] == gradients[t].Handle
-                    && cached.Handles[2 * n + t] == firstMoments[t].Handle
-                    && cached.Handles[3 * n + t] == secondMoments[t].Handle
-                    && cached.Sizes[t] == sizes[t];
-            }
-            if (same) return cached;
+            var retained = _retainedAdamTables[i];
+            if (!AdamTableMatches(retained, parameters, gradients, firstMoments, secondMoments, sizes)) continue;
+            _retainedAdamTables.RemoveAt(i);
+            _retainedAdamTables.Add(retained);
+            _adamTable = retained;
+            return retained;
         }
         if (IsStreamCapturing())
             throw new InvalidOperationException(
                 "The multi-tensor Adam table must be built before stream capture; run an eager step first.");
         var built = BuildAdamTable(parameters, gradients, firstMoments, secondMoments, sizes);
-        _adamTable?.Dispose();
+        RetainMultiTensorTable(_retainedAdamTables, built);
         _adamTable = built;
         return built;
+    }
+
+    // Preserve a bounded working set of independent plans; alternating plans must not evict each other every step.
+    // Captured graphs use caller-owned tables from StepIo and are independent of this ordinary-call cache.
+    private const int MultiTensorTableCacheCapacity = 8;
+    private static void RetainMultiTensorTable(List<MultiTensorTable> tables, MultiTensorTable table)
+    {
+        if (tables.Count == MultiTensorTableCacheCapacity)
+        {
+            var retired = tables[0];
+            tables.RemoveAt(0);
+            retired.Dispose();
+        }
+        tables.Add(table);
     }
 
     /// <summary>A new multi-tensor Adam table the caller owns (see <see cref="BuildGradientTable"/>).</summary>
@@ -15207,9 +15310,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     private MultiTensorTable? _gradientTable;
+    private readonly List<MultiTensorTable> _retainedGradientTables = new();
 
-    // Guards _gradientTable from lookup through launch: a caller rebuilding it disposes the previous table, which
-    // another caller may hold between GetGradientTable and its kernel launch.
+    // Guards retained-table lookup, eviction and launch so another thread cannot retire a table still being launched.
     private readonly object _gradientTableSync = new object();
 
     // Upper bound on the multi-tensor reduction's grid: enough blocks to fill the device, few enough that the one
@@ -15230,13 +15333,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
         if (_gradientTable is { } cached && cached.Matches(tensors, sizes))
             return cached;
-        // A rebuild uploads the address table and disposes the cached one, neither of which a stream capture can
-        // record; fail before touching either. The table is built by the eager steps that precede capture.
+        for (int i = 0; i < _retainedGradientTables.Count; i++)
+        {
+            var retained = _retainedGradientTables[i];
+            if (!retained.Matches(tensors, sizes)) continue;
+            _retainedGradientTables.RemoveAt(i);
+            _retainedGradientTables.Add(retained);
+            _gradientTable = retained;
+            return retained;
+        }
+        // A miss allocates/uploads and may evict an old table: never do either during stream capture.
         if (IsStreamCapturing())
             throw new InvalidOperationException(
                 "The multi-tensor gradient table must be built before stream capture; run an eager step first.");
         var table = BuildGradientTable(tensors, sizes);
-        _gradientTable?.Dispose();
+        RetainMultiTensorTable(_retainedGradientTables, table);
         _gradientTable = table;
         return table;
     }
@@ -17378,6 +17489,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if ((long)outerSize * reduceSize > A.Size)
             throw new ArgumentOutOfRangeException(nameof(outerSize), $"outerSize*reduceSize ({(long)outerSize * reduceSize}) exceeds buffer A length ({A.Size}).");
 
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
         if (!_kernelCache.TryGetValue("argmax_axis", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: argmax_axis");
 
@@ -18810,6 +18922,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_backward_ckpt");
 
         using var _ = PushContext();
+        if (TryGlaScanBackwardTiled(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim))
+            return;
         // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
         // method is self-contained and correct even if the caller reuses dirty buffers.
         Fill(dQ, 0f, batch * seqLen * modelDim);
@@ -18832,6 +18946,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
         ba[16] = &chunk;
         LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+    }
+
+    // gla_scan_backward_tiled: one 1024-thread block per (batch, head), up to 12 state elements per thread (headDim*headDim <= 12,288),
+    // reductions through a shared [headDim][headDim|1] tile (deterministic, no atomics). Used while the tile fits the
+    // default 48 KB per block (headDim <= 108); wider heads keep gla_scan_backward_ckpt.
+    internal static int GlaTiledSharedBytes(int headDim) => (headDim * (headDim | 1) + 4 * headDim + Kernels.CudaGlaKernels.TileWarpPartials) * sizeof(float);
+
+    private unsafe bool TryGlaScanBackwardTiled(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int shared = GlaTiledSharedBytes(headDim);
+        if (headDim * headDim > Kernels.CudaGlaKernels.TileElementsPerThread * Kernels.CudaGlaKernels.TileThreads
+            || shared > Kernels.CudaGlaKernels.TileSharedMemoryLimitBytes
+            || !_kernelCache.TryGetValue("gla_scan_backward_tiled", out var kernel))
+            return false;
+        var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        using var ckptBuf = AllocateBuffer(ckptLen);
+        using var scratchBuf = AllocateBuffer(scratchLen);
+        IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle;
+        IntPtr pck = ckptBuf.Handle, psc = scratchBuf.Handle;
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pdg = dG.Handle;
+        void** ba = stackalloc void*[17];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg; ba[5] = &pck; ba[6] = &psc;
+        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pdg;
+        ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
+        ba[16] = &chunk;
+        LaunchKernelWithSharedMem(kernel, (uint)(batch * numHeads), (uint)Kernels.CudaGlaKernels.TileThreads, (uint)shared, ba);
+        return true;
     }
 
     // ── Fused xLSTM (mLSTM) scan forward (#1464) ───────────────────────────────────────────
@@ -19610,6 +19754,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public void Dispose()
     {
+        System.Threading.Tasks.Task? warmup;
+        lock (_cublasWarmLock)
+        {
+            _cublasWarmClosing = true;
+            warmup = _cublasWarmup;
+        }
+        try { warmup?.Wait(); }
+        catch (AggregateException ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[CUDA] cuBLAS prewarm worker failed during disposal: {ex}");
+        }
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
     }
@@ -19684,7 +19839,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             lock (_gradientTableSync)
             {
-                _gradientTable?.Dispose();
+                foreach (var table in _retainedGradientTables) table.Dispose();
+                _retainedGradientTables.Clear();
                 _gradientTable = null;
                 _normPartials?.Dispose();
                 _normPartials = null;
@@ -19693,7 +19849,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             }
             lock (_adamTableSync)
             {
-                _adamTable?.Dispose();
+                foreach (var table in _retainedAdamTables) table.Dispose();
+                _retainedAdamTables.Clear();
                 _adamTable = null;
             }
         }

@@ -394,25 +394,13 @@ internal sealed partial class StepScratchPool
     }
 
     /// <summary>
-    /// After a whole executed run: drops the free buffers that run leased none of (the first run leases a buffer for
-    /// every backward output, and the slots it then redirects into their accumulators never lease again). Like
-    /// <see cref="Forget"/>, a dropped buffer is freed by its finalizer once nothing references it. Returns their bytes.
+    /// Return idle, unescaped backward leases unused by a completed run. Redirected gradient writes
+    /// can permanently reduce the set of work buffers following the first backward pass.
     /// </summary>
-    internal long TrimUnleased()
+    internal void TrimUnleased(IDirectGpuBackend backend)
     {
-        long dropped = 0;
-        for (int i = _free.Count - 1; i >= 0; i--)
-        {
-            var buffer = _free[i];
-            if (_leasedThisRun.Contains(buffer)) continue;
-            Keys.Remove(buffer);
-            Untrack(buffer);
-            dropped += buffer.SizeInBytes;
-            _free[i] = _free[_free.Count - 1];
-            _free.RemoveAt(_free.Count - 1);
-        }
+        ReturnFreeLeases(backend, unusedOnly: true);
         _leasedThisRun.Clear();
-        return dropped;
     }
 
     /// <summary>Frees every buffer now. Only for a caller that knows no captured graph or tensor still uses them.</summary>

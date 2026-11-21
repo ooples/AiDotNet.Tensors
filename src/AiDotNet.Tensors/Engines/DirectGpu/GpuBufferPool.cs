@@ -39,7 +39,7 @@ internal readonly struct GpuBufferPoolAffinity : IEquatable<GpuBufferPoolAffinit
     public override int GetHashCode() => _value.GetHashCode();
 }
 
-internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
+internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
 {
     private sealed class Bucket
     {
@@ -151,7 +151,12 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             DrainMeasurementParked();
 
         // Use power-of-two bucket key for higher cache hit rate
-        int bucketKey = BucketKey(size);
+        return TryRentFromBucket(size, BucketKey(size), affinity, out buffer);
+    }
+
+    private bool TryRentFromBucket(int size, int bucketKey, GpuBufferPoolAffinity affinity, out TBuffer? buffer)
+    {
+        buffer = null;
         if (_buckets.TryGetValue(bucketKey, out var bucket)
             && bucket.Buffers.TryGetValue(affinity, out var affinityBuffers))
         {

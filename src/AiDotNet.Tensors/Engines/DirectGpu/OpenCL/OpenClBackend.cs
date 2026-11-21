@@ -527,7 +527,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
 
                 // Compile neural network kernels (activation gradients, loss, optimizers)
-                var nnProgram = CompileOrLoadCached(NeuralNetKernels.GetSource(), optimizationFlags, "Neural network kernels");
+                // The fused channel bias and leaky activation inherits the scalar kernels' denormal policy.
+                var nnProgram = CompileOrLoadCached(NeuralNetKernels.GetSource() + BatchExecutionKernels.GetChannelBiasLeakySource(),
+                    optimizationFlags, "Neural network kernels");
                 _programs.Add(nnProgram);
                 foreach (var name in NeuralNetKernels.GetKernelNames())
                 {
@@ -957,7 +959,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 var batchExecutionProgram = CompileOrLoadCached(BatchExecutionKernels.GetSource(), OpenClBuildOptions.SafeMathFlags, "Batch execution kernels");
                 _programs.Add(batchExecutionProgram);
                 foreach (var name in BatchExecutionKernels.GetKernelNames())
-                    _kernelCache[name] = new DirectOpenClKernel(_context, batchExecutionProgram, name);
+                {
+                    var program = name == BatchExecutionCudaKernels.ChannelBiasLeaky ? nnProgram : batchExecutionProgram;
+                    _kernelCache[name] = new DirectOpenClKernel(_context, program, name);
+                }
                 // Compile split-buffer complex kernels for native Tensor<Complex<T>> operations
                 var complexProgram = CompileOrLoadCached(ComplexKernels.GetSource(), optimizationFlags, "Complex kernels");
                 _programs.Add(complexProgram);
@@ -1577,10 +1582,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
+            InferenceWorkspaceDemandScope.BeforeAllocation(this, data.Length);
+
             DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
-            if (_bufferPool.TryRent(data.Length, affinity, out var pooled) && pooled != null)
+            if (_bufferPool.TryRentForBackend(data.Length, affinity, this, out var pooled) && pooled != null)
             {
                 pooled.Buffer.CopyFromHost(data);
                 pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
@@ -1589,7 +1596,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (DeviceMemoryReclaim.CollectOnPoolMiss())
             {
                 DirectOpenClGpuBuffer.PendingFrees.Drain();
-                if (_bufferPool.TryRent(data.Length, affinity, out pooled) && pooled != null)
+                if (_bufferPool.TryRentForBackend(data.Length, affinity, this, out pooled) && pooled != null)
                 {
                     pooled.Buffer.CopyFromHost(data);
                     pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
@@ -1610,10 +1617,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     static state => state.Item1.AllocateBuffer(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            InferenceWorkspaceDemandScope.BeforeAllocation(this, size);
+
             DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
-            if (_bufferPool.TryRent(size, affinity, out var pooled) && pooled != null)
+            if (_bufferPool.TryRentForBackend(size, affinity, this, out var pooled) && pooled != null)
             {
                 pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
                 return pooled;
@@ -1624,7 +1633,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (DeviceMemoryReclaim.CollectOnPoolMiss())
             {
                 DirectOpenClGpuBuffer.PendingFrees.Drain();
-                if (_bufferPool.TryRent(size, affinity, out pooled) && pooled != null)
+                if (_bufferPool.TryRentForBackend(size, affinity, this, out pooled) && pooled != null)
                 {
                     pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
                     return pooled;
@@ -7490,6 +7499,11 @@ KERNEL VARIANTS (A/B testing):
             int strideH, int strideW, int padH, int padW,
             int outputPadH, int outputPadW)
         {
+            // One GEMM per batch chunk and an overlap-add (PortableConvTransposeGemm) where the kernels built; the
+            // one-thread-per-output conv_transpose2d kernel below re-reads every input channel and tap per output.
+            if (TryConvTranspose2DGemm(input, kernel, output, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW))
+                return;
             var k = _kernelCache["conv_transpose2d"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
@@ -9278,7 +9292,7 @@ KERNEL VARIANTS (A/B testing):
                 Buffer.BlockCopy(data, 0, floatData, 0, checked(data.Length * sizeof(int)));
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
-            if (_bufferPool.TryRent(floatData.Length, affinity, out var pooled) && pooled != null)
+            if (_bufferPool.TryRentForBackend(floatData.Length, affinity, this, out var pooled) && pooled != null)
             {
                 pooled.Buffer.CopyFromHost(floatData);
                 pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)floatData.Length * sizeof(int));
@@ -9287,7 +9301,7 @@ KERNEL VARIANTS (A/B testing):
             if (DeviceMemoryReclaim.CollectOnPoolMiss())
             {
                 DirectOpenClGpuBuffer.PendingFrees.Drain();
-                if (_bufferPool.TryRent(floatData.Length, affinity, out pooled) && pooled != null)
+                if (_bufferPool.TryRentForBackend(floatData.Length, affinity, this, out pooled) && pooled != null)
                 {
                     pooled.Buffer.CopyFromHost(floatData);
                     pooled.ReclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)floatData.Length * sizeof(int));

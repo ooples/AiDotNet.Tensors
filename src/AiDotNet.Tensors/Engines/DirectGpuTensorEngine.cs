@@ -604,7 +604,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void BeginGraphLifetime()
     {
-        System.Threading.Interlocked.Increment(ref _liveCapturedGraphs);
+        lock (_graphLifetimeLock) System.Threading.Interlocked.Increment(ref _liveCapturedGraphs);
         _evictionSuspendDepth.Enter();
     }
 
@@ -614,12 +614,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _evictionSuspendDepth.Exit();
         int live = System.Threading.Interlocked.Decrement(ref _liveCapturedGraphs);
         if (live < 0) { System.Threading.Interlocked.Increment(ref _liveCapturedGraphs); live = 0; }
+        lock (_graphLifetimeLock)
+        {
+            if (_liveCapturedGraphs == 0 && _pendingActivationClear)
+                ClearActivationCache();
+        }
         if (live == 0 && System.Threading.Interlocked.Exchange(ref _pendingWeightCacheInvalidation, 0) == 1)
             InvalidateAllWeightCaches();
     }
 
     // Set when InvalidateAllWeightCaches is called while a captured graph is alive (see there).
     private int _pendingWeightCacheInvalidation;
+    private readonly object _graphLifetimeLock = new();
+    private bool _pendingActivationClear;
 
     // ───────────────────────────────────────────────────────────────────────────────────────────
     // #1650 PUBLIC inference CUDA-graph capture API. ForwardUNet (the diffusion eager GPU forward to
@@ -647,7 +654,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         // Reject API misuse here rather than letting a null delegate surface as a backend-side failure.
         if (forward is null) throw new System.ArgumentNullException(nameof(forward));
-        return GetBackend() is IGpuGraphCapture capture ? capture.CaptureGraph(forward) : System.IntPtr.Zero;
+        return GetBackend() is IGpuGraphCapture capture ? CaptureGraphWithIndexBindings(capture, forward) : System.IntPtr.Zero;
     }
 
     /// <summary>Replays a graph captured by <see cref="CaptureGpuGraph"/> as a single cuGraphLaunch. Refresh
@@ -656,7 +663,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         if (graphExec != System.IntPtr.Zero && GetBackend() is IGpuGraphCapture capture)
+        {
+            RefreshHostIndexDeviceCopiesNow(graphExec);
             capture.LaunchCapturedGraph(graphExec);
+        }
     }
 
     /// <summary>Blocks until all work on the backend's compute stream completes. Used to separate GPU-compute
@@ -671,6 +681,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public void DestroyGpuGraph(System.IntPtr graphExec)
     {
         using var __gpuOp = EnterGpuOp();
+        RetireIndexGraphBindings(graphExec);
         if (graphExec != System.IntPtr.Zero && GetBackend() is IGpuGraphCapture capture)
             capture.DestroyCapturedGraph(graphExec);
     }
@@ -731,6 +742,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || t is null) return;
         if (!TryGetBackend(out var cb)) return;
+        // Unless a device copy rewrote it in its bound buffer since (a dropout mask redrawn on the device): then the
+        // buffer holds the value and the host array only a pending download of it, so dropping that download and
+        // uploading the host would put the previous step's value back.
+        if (ReferenceEquals(t._gpuBackend, cb) && ResidentInputHoldsDeviceWrite(t))
+        {
+            t._gpuBufferVersion = t.GpuCacheVersion;
+            return;
+        }
         // The host is authoritative for an external input (callers write batches through a host span). A device op on
         // a view sharing its array (the backward's Reshape or Transpose of the batch) can have armed a download into
         // it; materializing that would read back data the host already holds.
@@ -742,6 +761,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             cb.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
+            NoteResidentInputBinding(t, existing);
             return;
         }
         // Release the previous allocation before overwriting it. The reuse branch above already returned for a
@@ -753,6 +773,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBuffer = buf;
         t._gpuBackend = cb;
         t._gpuBufferVersion = t.GpuCacheVersion;
+        NoteResidentInputBinding(t, buf);
     }
 
     /// <summary>Downloads <paramref name="t"/>'s resident GPU buffer (which a replayed graph just wrote) into a
@@ -2133,6 +2154,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // is the LIVE data regardless of the host Version snapshot — accept it. Clearing it on a version
             // mismatch (the path below) would orphan a deferred materializer registered by BindResidentBuffer →
             // a later host read fires it on a recycled buffer = #226 "buffer released before materialization".
+            // A device-resident int tensor (ids, labels) written on the host after it went to the device: the compiled
+            // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
+            // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
+            // get the same from the plan's input refresh (RefreshGraphInputInPlace).
+            if (ResidentStepActive && IsLiveDeviceBuffer(tensor._gpuBuffer) && tensor is Tensor<int> residentInts
+                && residentInts.CoversWholeVector)
+                PrepareResidentIndexForCompiledStep(backend, residentInts);
             if (IsLiveDeviceBuffer(tensor._gpuBuffer)
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
@@ -2591,6 +2619,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
+            // A device-resident int tensor (ids, labels) written on the host after it went to the device: the compiled
+            // step accepts its buffer without the version check, and a replay reads it through a baked pointer, so
+            // bring the host write into that buffer now and have the plan repeat it before every replay. Float leaves
+            // get the same from the plan's input refresh (RefreshGraphInputInPlace).
+            if (ResidentStepActive && IsLiveDeviceBuffer(tensor._gpuBuffer) && tensor is Tensor<int> residentInts
+                && residentInts.CoversWholeVector)
+                PrepareResidentIndexForCompiledStep(backend, residentInts);
             if (IsLiveDeviceBuffer(tensor._gpuBuffer)
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases
@@ -2768,7 +2803,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int hostVersion = 0)
         => CacheActivation((object)resultData, buffer, shape, backend, hostVersion: hostVersion);
 
-    private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
+    private bool CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
         bool isFp16 = false, int elementCount = 0, int hostVersion = 0)
     {
         // Approximate managed footprint of the key array (product(shape) * 4 bytes).
@@ -2784,7 +2819,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // vector over it share one -- or an earlier result). That entry keeps its buffer; this buffer stays owned by
         // whoever holds it (the result tensor, its pending download) and is freed with them. Disposing it here, as the
         // old cache did, could free a buffer a pending download still reads.
-        if (_activationCache.TryAdd(cacheKey, entry)) LogRecentActivationKey(cacheKey);
+        if (!_activationCache.TryAdd(cacheKey, entry)) return false;
+        LogRecentActivationKey(cacheKey);
+        return true;
     }
 
     /// <summary>
@@ -3361,6 +3398,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void ClearActivationCache()
     {
+        lock (_graphLifetimeLock)
+        {
+            if (_liveCapturedGraphs != 0 && !IsDisposed)
+            {
+                _pendingActivationClear = true;
+                return;
+            }
+            _pendingActivationClear = false;
+            ClearActivationCacheCore();
+        }
+    }
+
+    private void ClearActivationCacheCore()
+    {
         // Snapshot the (key, entry) pairs this cache owns, then clear.
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
@@ -3409,6 +3460,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// frees the GPU buffers and removes the (now-moot) materializers directly.
     /// </summary>
     public void DropActivationCache()
+    {
+        lock (_graphLifetimeLock)
+        {
+            if (_liveCapturedGraphs != 0)
+            {
+                // A live graph can still write these entries. Preserve its last writes on eventual release.
+                _pendingActivationClear = true;
+                return;
+            }
+            DropActivationCacheCore();
+        }
+    }
+
+    private void DropActivationCacheCore()
     {
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
@@ -4250,6 +4315,112 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return owned.Buffer;
     }
 
+    // Tensors whose bound device buffer holds their current value while the host copy may lag: parameters an optimizer
+    // updated in place (CommitParameterUpdatedOnDevice) and the in-place state a compiled plan keeps on the device (a
+    // BatchNorm running statistic). Keyed by tensor, with that buffer; weak, so an entry goes with its tensor. The
+    // buffer sits in a slot rewritten in place: an optimizer commits every parameter every step, and replacing the
+    // table entry (remove, then add) allocated on each of those commits.
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, System.Runtime.CompilerServices.StrongBox<IGpuBuffer?>> _deviceAuthoritativeParameters = new();
+
+    // The buffer EnsureResidentInput bound to a compiled plan's external leaf, and the leaf version a device copy last
+    // wrote into it (-1 after a host upload). A captured graph reads that buffer through a baked pointer, so a device
+    // write into the leaf (a dropout mask redrawn on the device between replays) must land in it rather than in a
+    // fresh buffer, which retired the graph: the plan saw its leaf rebound and trained eagerly from then on.
+    private sealed class ResidentInputBinding
+    {
+        internal IGpuBuffer? Buffer;
+        internal int DeviceWrittenVersion = -1;
+    }
+
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, ResidentInputBinding> _residentInputBindings = new();
+
+    private void NoteResidentInputBinding(object tensor, IGpuBuffer buffer)
+    {
+        var binding = _residentInputBindings.GetValue(tensor, static _ => new ResidentInputBinding());
+        binding.Buffer = buffer;
+        binding.DeviceWrittenVersion = -1;
+    }
+
+    internal bool TryRestoreResidentState<T>(Tensor<T> snapshot, Tensor<T> target)
+    {
+        using var operation = EnterGpuOp();
+        if (typeof(T) != typeof(float) || !target.CoversWholeVector || target.IsView || target.Length == 0
+            || !snapshot.CoversWholeVector || snapshot.Length != target.Length || InferenceCaptureActive
+            || !_residentInputBindings.TryGetValue(target, out var binding) || binding.Buffer is not { } buffer
+            || !ReferenceEquals(target._gpuBuffer, buffer) || !IsBoundDeviceAuthoritative(target)
+            || !TryGetBackend(out var backend) || !ReferenceEquals(target._gpuBackend, backend)
+            || buffer.SizeInBytes < (long)target.Length * sizeof(float)
+            || backend is IGpuGraphCapture capture && capture.IsStreamCapturing())
+            return false;
+
+        using var saved = snapshot.LeaseArray();
+        target.PrepareForInPlaceWrite();
+        if (!ReferenceEquals(target._gpuBuffer, buffer) || saved.Array.Length != target.Length
+            || target.GetBackingArrayForCacheLookupUnsafe() is not T[] host || host.Length < target.Length)
+            return false;
+
+        // The snapshot owns the complete logical value. Update both copies, including the host array a
+        // caller may already hold. BindResidentBuffer removes any pending download of the speculative write.
+        try { backend.UploadBufferInPlace((float[])(object)saved.Array, buffer); }
+        catch (NotSupportedException unavailable)
+        {
+            GpuLaunchProbe.OnFallback(nameof(TryRestoreResidentState), unavailable);
+            return false;
+        }
+        Array.Copy(saved.Array, host, target.Length);
+        target.IncrementVersion();
+        BindResidentBuffer(target, buffer, backend, isDeviceModified: false);
+        base.InvalidatePersistentTensor(target);
+        return true;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="tensor"/>'s value is the one a device copy last wrote into the buffer
+    /// <see cref="EnsureResidentInput{T}"/> bound to it: no version change and no host write since (a host write
+    /// materializes the pending download first, which clears it). Uploading its host array into that buffer would then
+    /// download the device value only to write it back.
+    /// </summary>
+    internal bool ResidentInputHoldsDeviceWrite<T>(Tensor<T> tensor)
+    {
+        if (tensor is null || !_residentInputBindings.TryGetValue(tensor, out var binding)
+            || binding.Buffer is not { } buffer || !ReferenceEquals(buffer, tensor._gpuBuffer)
+            || buffer.Handle == IntPtr.Zero || binding.DeviceWrittenVersion != tensor.GpuCacheVersion)
+            return false;
+        var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
+        return Helpers.HostSync.IsPending(key);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="tensor"/> is still bound to a device buffer its owner updates on the device (see
+    /// <see cref="NoteBoundDeviceAuthoritative"/>): the device copy is the authoritative one and the host copy may be
+    /// stale. Another compiled plan that reads such a tensor (a GAN generator's step reading the discriminator's
+    /// weights and running statistics) must read that buffer, not upload the tensor's host copy into one of its own.
+    /// </summary>
+    internal bool IsBoundDeviceAuthoritative<T>(Tensor<T> tensor)
+    {
+        // Buffer identity only, on every backend: a handle is no liveness test there (a WebGPU buffer's Handle is always
+        // zero). Reading the bound buffer is what any eager op on the tensor does; a captured graph, which bakes the
+        // pointer in, re-checks the handle before each replay (CompiledTrainingPlan.ForeignParametersStillBound).
+        if (tensor._gpuBuffer is not { } bound) return false;
+        lock (_deviceAuthoritativeParameters)
+            return _deviceAuthoritativeParameters.TryGetValue(tensor, out var committed) && ReferenceEquals(committed.Value, bound);
+    }
+
+    /// <summary>Records that <paramref name="tensor"/>'s current value lives in <paramref name="buffer"/>, its binding,
+    /// which its owner updates on the device.</summary>
+    internal void NoteBoundDeviceAuthoritative(object tensor, IGpuBuffer buffer)
+    {
+        lock (_deviceAuthoritativeParameters)
+        {
+            if (!_deviceAuthoritativeParameters.TryGetValue(tensor, out var committed))
+            {
+                committed = new System.Runtime.CompilerServices.StrongBox<IGpuBuffer?>();
+                _deviceAuthoritativeParameters.Add(tensor, committed);
+            }
+            committed.Value = buffer;
+        }
+    }
+
     /// <summary>
     /// Records that an optimizer updated <paramref name="param"/>'s device buffer in place (PyTorch-style: the
     /// weights live on the device). The device copy becomes authoritative: forwards read it (the persistent-cache
@@ -4297,6 +4468,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = param.GetBackingArrayForCacheLookupUnsafe();
         param._gpuBuffer = buffer;
         param._gpuBackend = backend;
+        NoteBoundDeviceAuthoritative(param, buffer);
         if (arr is not null)
         {
             Helpers.HostSync.Remove(arr);
@@ -6166,7 +6338,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // A view that does not cover its whole storage (a slice or strided view). Pooled tensors whose backing array is
     // longer than their length are not views and keep the resident fast paths.
-    private static bool IsPartialView<T>(Tensor<T> tensor)
+    internal static bool IsPartialView<T>(Tensor<T> tensor)
         => tensor.IsView && (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor._storage.Length != tensor.Length);
 
     private static bool IsCanonicalDenseAllocation<T>(Tensor<T> tensor)
@@ -6575,6 +6747,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void BindResidentBuffer<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend, bool isDeviceModified)
     {
         int hostVersion = t.GpuCacheVersion;
+        if (isDeviceModified && _residentInputBindings.TryGetValue(t, out var inputBinding)
+            && ReferenceEquals(inputBinding.Buffer, buf))
+            inputBinding.DeviceWrittenVersion = hostVersion;
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = hostVersion;
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null)
@@ -6855,7 +7030,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the compiled plan calls it from the not-capturing pre-pass so capture/replay only memset + accumulate in place.
     /// Returns null if no backend or non-float (the resident paths are float-only).</summary>
     internal IGpuBuffer? EnsureResidentBuffer<T>(Tensor<T> t)
+        => EnsureResidentBufferWithAllocationInfo(t, out _);
+
+    internal IGpuBuffer? EnsureResidentBufferWithAllocationInfo<T>(Tensor<T> t, out bool allocated)
     {
+        allocated = false;
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
         int need = t.Length;
@@ -6870,6 +7049,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var buf = backend.AllocateBuffer(need);
             if (buf is null || buf.Handle == System.IntPtr.Zero) return null;
             BindResidentBuffer(t, buf, backend);
+            allocated = true;
             return buf;
         }
         catch (NotSupportedException ex) { GpuLaunchProbe.OnFallback("EnsureResidentBuffer", ex); AliasDiag($"EnsureResidentBuffer FELLBACK len={need}: {ex.GetType().Name}: {ex.Message}"); return null; }
@@ -7297,13 +7477,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // (non-managed) pass. The index upload (the only HtoD) thus never happens INSIDE the capture (= the 906).
             // The lookup's own slot, keyed by its float-index tensor (the backward's savedState[0]), so a second lookup
             // in the step cannot overwrite these ids before this lookup's backward scatters through them.
-            var capIdx = floatIndices; var capN = numIndices;
-            RegisterEmbIndexRefresh(floatIndices, () => UploadEmbeddingIndices(capIdx, capN, capIdx));
-            if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices, floatIndices);
-            if (!TryGetEmbeddingIndexBuffer(floatIndices, numIndices, out var idxBuf)) return false;
+            IGpuBuffer? idxBuf;
+            if (!IsPartialView(floatIndices) && backend is IResidentIndexBackend converter
+                && ResolveResidentBufferNoUpload(backend, floatIndices, numIndices) is { } deviceIds)
+            {
+                // Ids already on the device - the caller's ids (a plan input, refreshed in place before every replay)
+                // or ids an earlier node of this step computed (an address gathered from a table, as a factored
+                // embedding does): convert them into the lookup's slot on the device, in the step's stream order.
+                // Refreshing the slot from the host before a replay uploaded computed ids one step late (the host copy
+                // holds the previous replay's), and reading them on the host is a download a capture cannot contain.
+                // Match the host lookup's round-to-nearest, ties-to-even contract before the truncating cast.
+                idxBuf = EnsureEmbeddingIndexSlotBuffer(backend, floatIndices, numIndices, refresh: null);
+                var rounded = AllocateTransientScratch(backend, numIndices, fullyWritten: true);
+                try
+                {
+                    backend.Round(deviceIds, rounded.Buffer, numIndices);
+                    converter.ConvertIndicesToInt32(rounded.Buffer, idxBuf, numIndices);
+                }
+                finally
+                {
+                    rounded.DisposeAfterQueuedUse(backend);
+                }
+            }
+            else
+            {
+                var capIdx = floatIndices; var capN = numIndices;
+                RegisterEmbIndexRefresh(floatIndices, () => UploadEmbeddingIndices(capIdx, capN, capIdx));
+                if (!EmbeddingIndexExternallyManaged) UploadEmbeddingIndices(floatIndices, numIndices, floatIndices);
+                if (!TryGetEmbeddingIndexBuffer(floatIndices, numIndices, out idxBuf)) return false;
+            }
             if (s_residentSyncDebug) AliasDiag($"EMB-BUFS n={numIndices} dim={embeddingDim} needOut={(long)numIndices*embeddingDim} "
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={idxBuf.Size} impliedV={tableBuf.Size/embeddingDim}");
-            backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
+            if (backend is IResidentIndexBackend bounded)
+                bounded.IndexSelect(tableBuf, idxBuf, outBuf, 1, embeddings.Shape._dims[0], numIndices, embeddingDim);
+            else
+                backend.Embedding(idxBuf, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
             // A device write must re-arm host synchronization as well as publishing its resident buffer.
             BindResidentBuffer(output, outBuf, backend);
@@ -14589,7 +14797,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Recording under a tape reads the ids on the host too (they are the backward's saved state), and that read
         // would synchronize the capturing stream, so a taped call is refused the same way.
         bool capturing = backend is IGpuGraphCapture capture && capture.IsStreamCapturing();
-        if (capturing && !HasResidentIndexStorage(targetIds))
+        if (capturing && !HasResidentIndexStorage(targetIds) && !ResidentStepActive)
             throw new NotSupportedException(
                 "FusedLinearCrossEntropyWithLogits cannot be captured with host-backed target ids: replay would reuse " +
                 "the labels of the captured batch. Keep the ids resident on the device to capture this step.");
@@ -14617,10 +14825,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var wB = GetOrAllocateBuffer(backend, weight);
             using var bB = GetOrAllocateBuffer(backend, bias);
             using var loss = AllocateOutputBuffer(backend, 1);
-            // The chunked forward builds its gather positions on the host, so it never runs inside a capture (the upload
-            // would be baked into the graph). An eager call has already read the ids for validation above.
+            // An eager call builds the chunked forward's gather positions on the host (it has already read the ids for
+            // validation above). On a resident (compiled) step, captured or not, the positions come from device ids:
+            // host ids' per-step device copy (validated on every upload; RefreshHostIndexDeviceCopiesNow runs before each
+            // replay), or resident ids' own buffer, so a replay uses that step's labels. The uncaptured resident steps
+            // before the capture create the copy: one first created inside the capture was not the buffer the replayed
+            // graph read, so every replay kept the captured batch's labels (losses stale at lr 1e-12 with fed labels).
             bool chunked = false;
-            if (!capturing)
+            if (capturing || ResidentStepActive)
+            {
+                if (TryFusedCeCapturedIds(backend, targetIds, vocab, out var capturedIds))
+                    using (capturedIds)
+                        chunked = TryFusedLinearCrossEntropyIndexForwardChunked(backend, hB.Buffer, wB.Buffer, bB.Buffer,
+                            null, loss.Buffer, n, d, vocab, capturedIds.Buffer);
+            }
+            else
             {
                 try
                 {
@@ -14666,7 +14885,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch
         {
-            if (ThrowOnGpuKernelFallback) throw;
+            if (capturing || ThrowOnGpuKernelFallback) throw;
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds, computeReadoutGrads);
         }
     }
@@ -19942,18 +20161,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         foreach (var refresh in refreshes) refresh?.Invoke();
     }
 
-    /// <summary>Convert any-typed token indices to int and upload them into the stable index buffer (allocated once,
-    /// refreshed in place — no per-step cuMemAlloc). Used inline on the eager path and via the registered action on
-    /// the managed (graph) path.</summary>
-    internal void UploadEmbeddingIndices<TIndex>(Tensor<TIndex> indices, int n, object lookupKey)
+    /// <summary>
+    /// The lookup's stable device index buffer, holding at least <paramref name="n"/> ids (allocated, with its host
+    /// staging, only when missing or too small), with <paramref name="refresh"/> as the slot's pre-replay refresh. A
+    /// lookup whose ids the step computes on the device passes null: nothing on the host is newer than them.
+    /// </summary>
+    private IGpuBuffer EnsureEmbeddingIndexSlotBuffer(IDirectGpuBackend backend, object lookupKey, int n, System.Action? refresh)
     {
-        using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend)) return;
         var slot = GetEmbeddingIndexSlot(lookupKey);
-        IGpuBuffer target;
-        int[] host;
         lock (_embIndexLock)
         {
+            slot.Refresh = refresh;
             if (slot.Buffer is null || slot.Capacity < n)
             {
                 // Both allocated before either is published: a staging array that failed to allocate left the slot with
@@ -19970,7 +20188,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 slot.Capacity = n;
                 slot.Host = staging;
             }
-            target = slot.Buffer;
+            return slot.Buffer;
+        }
+    }
+
+    /// <summary>Convert any-typed token indices to int and upload them into the stable index buffer (allocated once,
+    /// refreshed in place — no per-step cuMemAlloc). Used inline on the eager path and via the registered action on
+    /// the managed (graph) path.</summary>
+    internal void UploadEmbeddingIndices<TIndex>(Tensor<TIndex> indices, int n, object lookupKey)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend)) return;
+        var slot = GetEmbeddingIndexSlot(lookupKey);
+        IGpuBuffer target;
+        int[] host;
+        lock (_embIndexLock)
+        {
+            target = EnsureEmbeddingIndexSlotBuffer(backend, lookupKey, n, slot.Refresh);
             host = slot.Host;
         }
         using var rawLease = indices.LeaseArray();
@@ -25287,7 +25521,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // A destination with no device buffer yet gets one: the copy overwrites every element, so it needs no
                 // upload of its stale host values. Falling back to the host copy here downloaded the source, which
                 // inside a captured training step is a host read that aborts CUDA graph capture.
-                var destinationBuffer = ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false);
+                // A compiled plan's input buffer is the destination's own (the copy overwrites every element, so its
+                // contents do not matter): a captured graph reads it through a baked pointer.
+                var destinationBuffer = _residentInputBindings.TryGetValue(destination, out var inputBinding)
+                    && inputBinding.Buffer is { } inputBuffer && ReferenceEquals(inputBuffer, destination._gpuBuffer)
+                    && ReferenceEquals(destination._gpuBackend, backend) && inputBuffer.Handle != IntPtr.Zero
+                    && inputBuffer.Size >= destination.Length
+                    ? inputBuffer
+                    : ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false);
                 if (destinationBuffer is null || destinationBuffer.Handle == IntPtr.Zero)
                     destinationBuffer = GetOrCreateResidentBuffer(backend, destination, destination.Length, fullyWritten: true);
                 using var sourceBuffer = GetOrAllocateBuffer(backend, source);
@@ -30258,17 +30499,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         OwnedBuffer inputLease = default;
         IGpuBuffer? output = null;
+        OwnedBuffer outputLease = default;
+        bool outputLeaseActive = false;
         bool handedOff = false;
         try
         {
             inputLease = GetOrAllocateBuffer(backend, tensor);
             var input = inputLease.Buffer;
-            output = AllocateDeviceBufferUninitialized(backend, total);   // every route below writes all of it
+            // Compiled forward/backward actions reuse their declared scratch lifetime, as the other device outputs do.
+            // Ordinary slicing retains its existing allocation/reclamation behavior.
+            if (ScratchPoolingActive)
+            {
+                outputLease = AllocateFullyWrittenOutputBuffer(backend, total);
+                outputLeaseActive = true;
+                output = outputLease.Buffer;
+            }
+            else output = AllocateDeviceBufferUninitialized(backend, total); // All routes write the whole output.
             int segment = length[tensor.Rank - 1];
             int rows = total / segment;
             if (TryLastAxisOnlySlice(backend, input, output, tensor, start, length, rows, segment))
             {
                 var fast = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                if (outputLeaseActive) outputLease.RelinquishOwnership();
                 handedOff = true;
                 return fast;
             }
@@ -30279,6 +30531,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 rect.RectSlice(input, output, tensor.Shape._dims, start, length, scatter: false);
                 var single = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                if (outputLeaseActive) outputLease.RelinquishOwnership();
                 handedOff = true;
                 return single;
             }
@@ -30301,6 +30554,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             var result = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+            if (outputLeaseActive) outputLease.RelinquishOwnership();
             handedOff = true;
             return result;
         }
@@ -30313,7 +30567,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         finally
         {
             inputLease.DisposeAfterQueuedUse(backend);
-            if (!handedOff && output is not null) DisposeBufferAfterQueuedUse(backend, output);
+            if (!handedOff)
+            {
+                if (outputLeaseActive) outputLease.DisposeAfterQueuedUse(backend);
+                else if (output is not null) DisposeBufferAfterQueuedUse(backend, output);
+            }
         }
     }
 
@@ -31097,9 +31355,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Results callers still hold keep their values: each live one downloads (if its host copy is stale) and lets
         // go of its device buffer while the backend can still do both. Only when this engine frees the backend; a
         // shared backend keeps serving them.
+        ReleaseIndexReplayBindings();
         if (_ownsDirectGpu) _ownedResults.EvacuateAll();
         _compiledWorkspaceBroker?.Release();
         _compiledWorkspaceBroker = null;
+
+        ReleaseGraphAttentionGraphs();
 
         // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these
         // buffers: their host arrays download before the buffers are freed.
@@ -31239,9 +31500,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var gi = UploadTensorRaw(b, input);
-                var go = b.AllocateBuffer(input.Length);
-                b.PowScalar(gi, go, Convert.ToSingle(exponent), input.Length);
-                return DeferTensorResult<T>(b, go, input.Length, input.Shape.ToArray());
+                // Pow fully overwrites its output. Reuse the compiled action's scratch just like other unary ops.
+                var outputLease = AllocateFullyWrittenOutputBuffer(b, input.Length);
+                try
+                {
+                    b.PowScalar(gi, outputLease.Buffer, Convert.ToSingle(exponent), input.Length);
+                    var result = DeferTensorResult<T>(b, outputLease.Buffer, input.Length, input.Shape.ToArray());
+                    outputLease.RelinquishOwnership();
+                    return result;
+                }
+                finally
+                {
+                    outputLease.DisposeAfterQueuedUse(b);
+                }
             }
             catch { }
         }

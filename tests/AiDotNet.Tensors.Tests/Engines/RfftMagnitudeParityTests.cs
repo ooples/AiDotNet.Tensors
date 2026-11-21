@@ -17,6 +17,8 @@ public sealed class RfftMagnitudeParityTests
     [InlineData(7)]
     [InlineData(8)]
     [InlineData(17)]
+    [InlineData(32)]
+    [InlineData(64)]
     public void FloatAndDoubleMatchIndependentDftAndAdjoint(int n)
     {
         CheckDft<float>(new CpuEngine(), n, 3e-6);
@@ -297,5 +299,33 @@ public sealed class RfftMagnitudeParityTests
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.InRange(Math.Abs(actual[i] - expected[i]), 0, tolerance * Math.Max(1, Math.Abs(expected[i])));
+    }
+
+    [Fact]
+    public void FloatAudioFramesSeparateDcAndNyquistAndAccumulateTheirAdjoints()
+    {
+        const int n = 1024, bins = n / 2 + 1;
+        var engine = new CpuEngine();
+        var samples = Enumerable.Range(0, n).Select(i => 1f + (i % 2 == 0 ? .25f : -.25f)).ToArray();
+        using var input = new Tensor<float>(samples, new[] { 1, n });
+        using var output = engine.TensorRfftMagnitude(input, .25);
+        var frequency = output.ToArray();
+        float dc = (float)Math.Sqrt(n * n + .25);
+        float nyquist = (float)Math.Sqrt(n * n / 16 + .25);
+        Assert.Equal(dc, frequency[0]);
+        Assert.Equal(nyquist, frequency[bins - 1]);
+        Assert.All(frequency.Skip(1).Take(bins - 2), value => Assert.Equal(.5f, value));
+
+        using var seed = new Tensor<float>(new[] { 1, bins });
+        seed[0] = .5f;
+        seed[bins - 1] = -.25f;
+        using var gradient = new Tensor<float>(Enumerable.Repeat(2f, n).ToArray(), new[] { 1, n });
+        engine.TensorRfftMagnitudeBackwardInto(seed, input, gradient, .25, accumulate: true);
+        var actual = gradient.ToArray();
+        for (int i = 0; i < n; i++)
+        {
+            double expected = 2 + .5 * n / dc - (i % 2 == 0 ? 1 : -1) * .25 * (n / 4) / nyquist;
+            Assert.InRange(Math.Abs(actual[i] - expected), 0, 2e-6);
+        }
     }
 }

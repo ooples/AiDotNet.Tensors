@@ -388,3 +388,49 @@ CE_DGRAD_KERNEL(conv2d_dgrad_ce128_tf32, 128, false, 2)
 CE_DGRAD_KERNEL(conv2d_dgrad_ce64_tf32, 64, false, 2)
 CE_DGRAD_KERNEL(conv2d_dgrad_ce128_phase_tf32, 128, true, 2)
 CE_DGRAD_KERNEL(conv2d_dgrad_ce64_phase_tf32, 64, true, 2)
+
+// Transposed convolution as one GEMM: the input [B, C, L] regrouped to [C, B*L] so the batch joins the GEMM's N
+// dimension (a strided-batched GEMM per sample has N = L, 16 at the DCGAN generator's 4x4 stem), then
+// col [C_out*kH*kW, B*L] = W^T x, and the overlap-add below.
+extern "C" __global__ __launch_bounds__(256) void nchw_to_cnhw(
+    const float* __restrict__ input, float* __restrict__ output, int batch, int channels, int L)
+{
+    long long total = (long long)batch * channels * L;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int l = (int)(idx % L);
+    long long rest = idx / L;
+    int c = (int)(rest % channels);
+    int b = (int)(rest / channels);
+    output[((long long)c * batch + b) * L + l] = input[idx];
+}
+
+// Overlap-add of the transposed convolution's columns, one thread per output element (a gather: no atomics):
+// out[b, c, oh, ow] = bias[c] + the sum over the taps (kh, kw) whose input position ih = (oh + pH - kh) / sH,
+// iw = (ow + pW - kw) / sW is whole and in range, of col[(c*kH + kh)*kW + kw, (b*inH + ih)*inW + iw].
+extern "C" __global__ __launch_bounds__(256) void col2im_cnhw_bias(
+    const float* __restrict__ col, const float* __restrict__ bias, float* __restrict__ output,
+    int batch, int channels, int outH, int outW, int kH, int kW, int sH, int sW, int pH, int pW, int inH, int inW)
+{
+    long long total = (long long)batch * channels * outH * outW;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int ow = (int)(idx % outW);
+    long long r = idx / outW;
+    int oh = (int)(r % outH); r /= outH;
+    int c = (int)(r % channels);
+    int b = (int)(r / channels);
+    long long n = (long long)batch * inH * inW;
+    float sum = bias != nullptr ? bias[c] : 0.0f;
+    // Only the taps congruent to (oh + pH) modulo the stride contribute.
+    for (int kh = (oh + pH) % sH; kh < kH; kh += sH) {
+        int ih = (oh + pH - kh) / sH;
+        if (ih < 0 || ih >= inH) continue;
+        for (int kw = (ow + pW) % sW; kw < kW; kw += sW) {
+            int iw = (ow + pW - kw) / sW;
+            if (iw < 0 || iw >= inW) continue;
+            sum += col[((long long)(c * kH + kh) * kW + kw) * n + ((long long)b * inH + ih) * inW + iw];
+        }
+    }
+    output[idx] = sum;
+}

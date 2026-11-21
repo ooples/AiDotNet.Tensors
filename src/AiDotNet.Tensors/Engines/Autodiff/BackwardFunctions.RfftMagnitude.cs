@@ -6,13 +6,22 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 
 internal static partial class BackwardFunctions<T>
 {
+    // The create-graph path in its own method: its lambda captures the operand, and a closure declared in the backward
+    // itself would be allocated on every first-order call too.
+    private static bool RfftMagnitudeBackwardCreateGraph(Tensor<T> gradOutput, Tensor<T>[] inputs, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads, double epsilon)
+    {
+        var input = inputs[0];
+        return TryCompositeBackwardFor(gradOutput, inputs, engine, grads, FirstInput,
+            e => RfftMagnitudeHigherOrder(e, input, epsilon));
+    }
+
     internal static void RfftMagnitudeBackward(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var input = inputs[0];
         double epsilon = (double)savedState[0];
-        if (CreatesGraph && TryRfftMagnitudeHigherOrder(gradOutput, inputs, engine, grads, epsilon))
-            return;
+        if (CreatesGraph && RfftMagnitudeBackwardCreateGraph(gradOutput, inputs, engine, grads, epsilon)) return;
         if (!DifferentiableOps.IsGradientRequired(input)) return;
         var target = DifferentiableOps.PeekDirectDeviceGradTarget(grads, input, engine, out bool add);
         if (target is null && grads.TryGetValue(input, out target))
@@ -26,11 +35,6 @@ internal static partial class BackwardFunctions<T>
         engine.TensorRfftMagnitudeBackwardInto(gradOutput, input, target, epsilon, add);
         DifferentiableOps.CommitDirectGradWrite(grads, input, target);
     }
-
-    private static bool TryRfftMagnitudeHigherOrder(Tensor<T> gradOutput, Tensor<T>[] inputs,
-        IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads, double epsilon)
-        => TryCompositeBackwardFor(gradOutput, inputs, engine, grads, FirstInput,
-            e => RfftMagnitudeHigherOrder(e, inputs[0], epsilon));
 
     // The first-order operator uses a native FFT and an analytic adjoint. Explicit
     // higher-order requests retain a graph of resident primitive operations.
