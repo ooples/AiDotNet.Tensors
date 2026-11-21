@@ -2213,6 +2213,63 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Backward of a convolution and its per-channel epilogue fused by the compiled plan
+    /// (<see cref="Compilation.ConvChannelEpilogueFusionPattern"/>): y = act(((z + bias) * scale) + shift), z the
+    /// convolution's output. inputs = x, kernel, then the bias, scale and shift that are present (their indices in
+    /// savedState); savedState = the convolution's backward and saved state, z, the activation code, its slope and the
+    /// three indices (-1: absent). One pass gives z's gradient act'(y) * dy * scale where no epilogue parameter needs its
+    /// own; the scale's and shift's gradients (the sum of the pre-activation gradient times the scaled input, and of the
+    /// pre-activation gradient) and the bias's (the sum of z's gradient) are reduced per channel only where required.
+    /// </summary>
+    internal static void ConvChannelEpilogueBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var convBackward = (BackwardFunction<T>)savedState[0];
+        var convSaved = (object[])savedState[1];
+        var z = (Tensor<T>)savedState[2];
+        int activation = (int)savedState[3];
+        double slope = (double)savedState[4];
+        int biasIndex = (int)savedState[5], scaleIndex = (int)savedState[6], shiftIndex = (int)savedState[7];
+        var bias = biasIndex >= 0 ? inputs[biasIndex] : null;
+        var scale = scaleIndex >= 0 ? inputs[scaleIndex] : null;
+        var shift = shiftIndex >= 0 ? inputs[shiftIndex] : null;
+        bool scaleGrad = scale is not null && DifferentiableOps.IsGradientRequired(scale);
+        bool shiftGrad = shift is not null && DifferentiableOps.IsGradientRequired(shift);
+        var channelAxes = new[] { 0, 2, 3 };
+
+        Tensor<T>? gradZ = null;
+        // One pass to z's gradient when no epilogue parameter needs the pre-activation gradient itself.
+        if (typeof(T) == typeof(float) && !scaleGrad && !shiftGrad && engine.TryGet<DirectGpuTensorEngine>(out var gpu))
+            gradZ = (Tensor<T>?)(object?)gpu.TryChannelEpilogueBackward((Tensor<float>)(object)gradOutput,
+                (Tensor<float>)(object)output, (Tensor<float>?)(object?)scale, activation, (float)slope);
+        if (gradZ is null)
+        {
+            var gradPre = activation == Engines.DirectGpu.ChannelEpilogueActivation.Relu
+                ? engine.ReluBackward(gradOutput, output)
+                : activation == Engines.DirectGpu.ChannelEpilogueActivation.LeakyRelu
+                    ? engine.LeakyReluBackward(gradOutput, output, slope)
+                    : gradOutput;
+            if (shiftGrad)
+                DifferentiableOps.AccumulateGrad(grads, shift!,
+                    engine.Reshape(engine.ReduceSum(gradPre, channelAxes, keepDims: false), shift!._shape), engine);
+            if (scaleGrad)
+            {
+                var scaledInput = bias is null ? z : engine.TensorChannelBiasAdd(z, bias);
+                DifferentiableOps.AccumulateGrad(grads, scale!,
+                    engine.Reshape(engine.ReduceSum(engine.TensorMultiply(gradPre, scaledInput), channelAxes, keepDims: false),
+                        scale!._shape), engine);
+            }
+            gradZ = scale is null ? gradPre
+                : engine.TryGet<CpuEngine>(out var host) ? host.TensorBroadcastMultiply(gradPre, scale)
+                : throw new System.NotSupportedException("ConvChannelEpilogue backward needs a CpuEngine-derived engine.");
+        }
+        if (bias is not null && DifferentiableOps.IsGradientRequired(bias))
+            DifferentiableOps.AccumulateGrad(grads, bias, engine.ReduceSum(gradZ, channelAxes, keepDims: false), engine);
+        convBackward(gradZ, new[] { inputs[0], inputs[1] }, z, convSaved, engine, grads);
+    }
+
+    /// <summary>
     /// Backward of a training BatchNorm whose output feeds a ReLU6 -- fused by the compiled plan
     /// (<see cref="Compilation.BatchNormRelu6FusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is the
     /// ReLU6's output. Its mask comes from the output: 0 &lt; ReLU6(z) &lt; 6 exactly when 0 &lt; z &lt; 6, so the
