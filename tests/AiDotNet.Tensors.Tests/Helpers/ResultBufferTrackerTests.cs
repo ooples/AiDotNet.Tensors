@@ -130,6 +130,26 @@ public sealed class ResultBufferTrackerTests
         GC.KeepAlive(view);
     }
 
+    [Fact]
+    public void SmallArrayWraps_FindNoOwner_WhileALargeResultIsTracked_AndLargeWrapsStillDo()
+    {
+        // A tracked large result makes the tracker non-empty, the state in which every wrap used to take its lock.
+        var source = Source();
+        var large = source.Multiply(3.0);
+        var largeView = Vector<double>.FromMemory(new Memory<double>(large.AsSpanUnmarkedArray()));
+        Assert.NotNull(largeView.ResultOwner);
+
+        // Arrays below the smallest tracked size cannot be tracked, so their wraps have no owner, from any thread.
+        var owners = new System.Collections.Concurrent.ConcurrentBag<object?>();
+        System.Threading.Tasks.Parallel.For(0, 64, _ =>
+        {
+            for (int i = 0; i < 1000; i++)
+                owners.Add(Vector<double>.FromMemory(new Memory<double>(new double[16])).ResultOwner);
+        });
+        Assert.All(owners, Assert.Null);
+        GC.KeepAlive(large);
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static Vector<double> MakeViewOfDroppedResult(Matrix<double> source)
     {

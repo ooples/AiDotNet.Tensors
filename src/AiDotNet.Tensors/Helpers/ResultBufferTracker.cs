@@ -130,6 +130,9 @@ internal static class ResultBufferTracker
     private static readonly Dictionary<List<Entry>, long> s_groupAsked = new();
     private static long s_askTick;
     private static int s_count;
+    // The smallest array, in bytes, the tracker has ever tracked. Find skips its lock for anything smaller: such an
+    // array cannot be in s_byArray. Only ever lowered, so a stale read errs toward taking the lock.
+    private static long s_minTrackedBytes = long.MaxValue;
     private static int s_parked;
     private static long s_trackedBytes;
 
@@ -250,6 +253,7 @@ internal static class ResultBufferTracker
             group.Add(entry);
             s_byArray[array] = entry;
             s_trackedBytes += bytes;
+            if (bytes < s_minTrackedBytes) Volatile.Write(ref s_minTrackedBytes, bytes);
             s_count++;
         }
         return owner;
@@ -263,11 +267,24 @@ internal static class ResultBufferTracker
     internal static ResultBufferOwner? Find<T>(ReadOnlyMemory<T> memory)
     {
         if (!s_privateOwnershipSeen && Volatile.Read(ref s_count) == 0) return null;
-        return MemoryMarshal.TryGetArray(memory, out var segment) && segment.Array is { } array ? Find(array) : null;
+        // TryGetArray yields the T[] the memory was built over, so its byte size is Length * sizeof(T).
+        return MemoryMarshal.TryGetArray(memory, out var segment) && segment.Array is { } array
+            ? Find(array, (long)array.Length * Unsafe.SizeOf<T>())
+            : null;
     }
 
     /// <summary>The owner of a tracked <paramref name="array"/>; null when untracked.</summary>
-    internal static ResultBufferOwner? Find(Array array)
+    internal static ResultBufferOwner? Find(Array array) => Find(array, long.MaxValue);
+
+    /// <summary>
+    /// The owner of a tracked <paramref name="array"/> of <paramref name="bytes"/> bytes; null when untracked.
+    /// </summary>
+    /// <remarks>
+    /// Every vector and matrix built over memory asks this, almost always for an array too small to be tracked. Those
+    /// return before the lock: under parallel training (HistGradientBoosting builds a histogram per feature per node
+    /// on every core) one process-wide lock per wrap serialized the threads, 18-71x slower fits on a 64-core host.
+    /// </remarks>
+    private static ResultBufferOwner? Find(Array array, long bytes)
     {
         if (s_privateOwnershipSeen && s_privateOwners.TryGetValue(array, out var privateEntry)
             && privateEntry.TryGetTarget(out var privateOwner))
@@ -275,7 +292,7 @@ internal static class ResultBufferTracker
             Interlocked.Increment(ref privateOwner.State.Wrappers);
             return privateOwner;
         }
-        if (Volatile.Read(ref s_count) == 0) return null;
+        if (Volatile.Read(ref s_count) == 0 || bytes < Volatile.Read(ref s_minTrackedBytes)) return null;
         lock (s_lock)
         {
             if (!s_byArray.TryGetValue(array, out var entry)) return null;
