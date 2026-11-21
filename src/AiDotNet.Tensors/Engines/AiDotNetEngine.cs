@@ -463,12 +463,13 @@ public static class AiDotNetEngine
     /// Registers the GPU offload allocator for <paramref name="gpuEngine"/> when the registry has none. Adoption does this
     /// once; <c>WeightRegistry.Reset</c> or a <c>Configure</c> without an allocator removes it for the rest of the
     /// process, after which pinned tensors silently stay on the host. A caller that needs device-resident weights again
-    /// asks for it here. An allocator that is already registered is left alone.
+    /// asks for it here. A usable allocator that is already registered is left alone; one whose context has gone away
+    /// (it shared the context of an engine that was since disposed) is replaced, since it can serve nothing.
     /// </summary>
     internal static void EnsureGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine)
     {
         if (gpuEngine is null) throw new ArgumentNullException(nameof(gpuEngine));
-        TryRegisterGpuOffloadAllocator(gpuEngine, verbose: false);
+        TryRegisterGpuOffloadAllocator(gpuEngine, verbose: false, replaceUnusable: true);
     }
 
     /// <summary>
@@ -508,12 +509,12 @@ public static class AiDotNetEngine
     /// Best-effort: any failure leaves the registry unconfigured and GPU compute still works.
     /// </para>
     /// </remarks>
-    private static void TryRegisterGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine, bool verbose)
+    private static void TryRegisterGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine, bool verbose, bool replaceUnusable = false)
     {
         try
         {
-            // Respect an allocator a caller already configured — don't stomp it.
-            if (LinearAlgebra.WeightRegistry.OffloadAllocator is not null)
+            // Respect an allocator a caller already configured — don't stomp it. A dead one is only replaced on request.
+            if (LinearAlgebra.WeightRegistry.OffloadAllocator is { } existing && (!replaceUnusable || existing.IsAvailable))
                 return;
 
             var directGpu = ((IEngine)gpuEngine).DirectGpu;
