@@ -460,6 +460,18 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
+    /// Registers the GPU offload allocator for <paramref name="gpuEngine"/> when the registry has none. Adoption does this
+    /// once; <c>WeightRegistry.Reset</c> or a <c>Configure</c> without an allocator removes it for the rest of the
+    /// process, after which pinned tensors silently stay on the host. A caller that needs device-resident weights again
+    /// asks for it here. An allocator that is already registered is left alone.
+    /// </summary>
+    internal static void EnsureGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine)
+    {
+        if (gpuEngine is null) throw new ArgumentNullException(nameof(gpuEngine));
+        TryRegisterGpuOffloadAllocator(gpuEngine, verbose: false);
+    }
+
+    /// <summary>
     /// Why a tensor rented with <c>RentPinnedOnGpu</c> would not be device-resident right now, or "usable". The offload
     /// allocator is process-wide state with several ways to be out of service; a caller that only sees the CPU fallback
     /// cannot tell which.

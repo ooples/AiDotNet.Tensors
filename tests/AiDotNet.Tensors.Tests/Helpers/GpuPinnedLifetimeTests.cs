@@ -48,6 +48,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -112,6 +114,9 @@ public class GpuPinnedLifetimeTests
         // comes back tagged GpuPinned (not GpuOffload — issue #336 uses
         // the new lifetime tag to distinguish "lives on GPU for the train
         // loop" from "may swap to host for large-model memory pressure").
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        if (AiDotNet.Tensors.Engines.AiDotNetEngine.Current is AiDotNet.Tensors.Engines.DirectGpuTensorEngine currentGpu)
+            AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(currentGpu);
         Skip.If(WeightRegistry.OffloadAllocator is null
             || !WeightRegistry.OffloadAllocator.IsAvailable,
             "CPU-only host; fallback path is covered by RentPinnedOnGpu_CpuOnlyHost_FallsBackToCpuPinned_NotThrowing: "
@@ -207,6 +212,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -300,6 +307,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -376,6 +385,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -434,6 +445,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
