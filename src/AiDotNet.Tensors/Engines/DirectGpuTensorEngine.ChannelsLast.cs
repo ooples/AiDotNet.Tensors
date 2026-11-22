@@ -9,10 +9,13 @@ public partial class DirectGpuTensorEngine
     /// <summary>
     /// Whether this engine's backend runs convolutions faster on channels-last activations
     /// (<see cref="IChannelsLastBackend.PrefersChannelsLast"/>): a compiled plan then keeps a convolution stack's
-    /// activations channels-last between its layers.
+    /// activations channels-last between its layers. Under an FP16/BF16 autocast scope whose convolutions run
+    /// channels-last (cuDNN's 16-bit tensor-core kernels read NHWC natively) it does too: a channels-last activation then
+    /// needs only a cast at each convolution, not a cast and a transpose.
     /// </summary>
     internal bool PrefersChannelsLast
-        => TryGetBackend(out var backend) && backend is IChannelsLastBackend channelsLast && channelsLast.PrefersChannelsLast;
+        => TryGetBackend(out var backend) && backend is IChannelsLastBackend channelsLast
+           && (channelsLast.PrefersChannelsLast || AutocastRunsChannelsLast(backend));
 
     /// <summary>Whether the backend takes a channels-last convolution stack of these channel counts.</summary>
     internal bool AcceptsChannelsLast(int channels, int outChannels)
@@ -38,6 +41,11 @@ public partial class DirectGpuTensorEngine
         using var bufA = GetOrAllocateBuffer(backend, a);
         using var bufB = GetOrAllocateBuffer(backend, b);
         var bufC = AllocateFullyWrittenOutputBuffer(backend, (int)length);
+        // Under autocast the pass runs in 16 bits, its activations cast in their layout (no transpose for a
+        // channels-last one); a pass the 16-bit route declines runs the FP32 channels-last pass below.
+        if (TryAutocastConvolutionChannelsLast(backend, pass, bufA.Buffer, bufB.Buffer, bufC.Buffer, g, inputNhwc,
+                outputNhwc))
+            return DeferTensorResult<float>(backend, bufC.Buffer, (int)length, outputShape);
         if (!channelsLast.TryConvolutionChannelsLast(pass, bufA.Buffer, bufB.Buffer, bufC.Buffer, g.Batch, g.Channels,
                 g.Height, g.Width, g.OutChannels, g.KernelH, g.KernelW, g.OutHeight, g.OutWidth, g.PadH, g.PadW, g.StrideH,
                 g.StrideW, g.DilationH, g.DilationW, inputNhwc, outputNhwc))

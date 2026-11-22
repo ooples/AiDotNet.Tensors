@@ -34,6 +34,14 @@ public static partial class CuDnnNative
         IntPtr dyDesc, IntPtr dy, IntPtr convDesc, IntPtr dxDesc, IntPtr dx, int requestedAlgoCount,
         out int returnedAlgoCount, IntPtr perfResults, IntPtr workSpace, ulong workSpaceSizeInBytes);
 
+    [DllImport(CudnnLibrary, EntryPoint = "cudnnGetConvolutionBackwardDataAlgorithm_v7")]
+    internal static extern CudnnStatus cudnnGetConvolutionBackwardDataAlgorithm_v7(IntPtr handle, IntPtr wDesc,
+        IntPtr dyDesc, IntPtr convDesc, IntPtr dxDesc, int requestedAlgoCount, out int returnedAlgoCount, IntPtr perfResults);
+
+    [DllImport(CudnnLibrary, EntryPoint = "cudnnGetConvolutionBackwardFilterAlgorithm_v7")]
+    internal static extern CudnnStatus cudnnGetConvolutionBackwardFilterAlgorithm_v7(IntPtr handle, IntPtr xDesc,
+        IntPtr dyDesc, IntPtr convDesc, IntPtr dwDesc, int requestedAlgoCount, out int returnedAlgoCount, IntPtr perfResults);
+
     [DllImport(CudnnLibrary, EntryPoint = "cudnnFindConvolutionBackwardFilterAlgorithmEx")]
     internal static extern CudnnStatus cudnnFindConvolutionBackwardFilterAlgorithmEx(IntPtr handle, IntPtr xDesc, IntPtr x,
         IntPtr dyDesc, IntPtr dy, IntPtr convDesc, IntPtr dwDesc, IntPtr dw, int requestedAlgoCount,
@@ -99,7 +107,10 @@ public sealed partial class CuDnnConvolution
     /// is set (cuDNN computes no FP32 filter gradient of channels-last activations into a [k, c, r, s] one). The algorithm is cuDNN's fastest for the
     /// pass measured on its first call (cudnnFind*Ex, as PyTorch's benchmark mode), within
     /// <see cref="ChannelsLastMaxWorkspace"/> and, when <paramref name="deterministic"/>, one without atomics; during a
-    /// stream capture, which cannot measure, the first call takes cuDNN's implicit-GEMM default. False -- nothing
+    /// stream capture, which cannot measure, the call takes cuDNN's ranked heuristic (the v7 queries, host-side) within
+    /// the workspace already allocated, and the implicit-GEMM default only where the heuristic offers nothing. A fixed
+    /// default baked into a captured graph ran cuDNN's generic engine (about 1 ms) for some BF16 passes on every replay.
+    /// False -- nothing
     /// launched -- when cuDNN supports no algorithm for the pass in these formats.
     /// </summary>
     internal bool ConvolutionChannelsLast(int pass, IntPtr a, IntPtr b, IntPtr c, int n, int channels, int h, int w,
@@ -121,9 +132,12 @@ public sealed partial class CuDnnConvolution
             {
                 plan = BuildChannelsLastPlan(n, channels, h, w, k, filterH, filterW, outputHeight, outputWidth, padH,
                     padW, strideH, strideW, dilationH, dilationW, inputNhwc, outputNhwc, filterNhwc, mathType, dataType);
-                // Inside a capture no search can run: the pass takes a fixed algorithm, for this call only.
-                int algorithm = capturing ? -1 : FindChannelsLast(pass, a, b, c, plan.Input.Handle, plan.Output.Handle,
-                    plan.Filter.Handle, plan.Convolution.Handle, mathType, deterministic);
+                // Inside a capture no search can run: the pass takes the heuristic's choice, for this call only.
+                int algorithm = capturing
+                    ? HeuristicChannelsLast(pass, plan.Input.Handle, plan.Output.Handle, plan.Filter.Handle,
+                        plan.Convolution.Handle, mathType, deterministic)
+                    : FindChannelsLast(pass, a, b, c, plan.Input.Handle, plan.Output.Handle,
+                        plan.Filter.Handle, plan.Convolution.Handle, mathType, deterministic);
                 if (algorithm < 0 && !capturing)
                 {
                     // The search measured every algorithm and none runs these formats: remembered, so the caller's
@@ -226,6 +240,60 @@ public sealed partial class CuDnnConvolution
     // cudnnFind*Ex over the real buffers (it writes the pass's output, which the launch after it overwrites) with a
     // workspace of its own, freed after: the fastest supported algorithm within the bound and the determinism asked for,
     // preferring among those within 3% of it the one needing the least workspace. -1 when none qualifies.
+    /// <summary>Passes a capture ran on the heuristic's algorithm (tests, diagnostics).</summary>
+    internal static long ChannelsLastHeuristicChoices;
+
+    // cuDNN's ranked heuristic for a pass met inside a capture: the first supported result in the math type, without
+    // atomics when deterministic, whose workspace the one already allocated holds (a capture cannot grow it). -1: none.
+    private int HeuristicChannelsLast(int pass, IntPtr x, IntPtr y, IntPtr wd, IntPtr cd,
+        CuDnnNative.CudnnMathType mathType, bool deterministic)
+    {
+        const int requested = 16;
+        int size = Marshal.SizeOf<CuDnnNative.CudnnConvolutionAlgoPerf>();
+        IntPtr results = Marshal.AllocHGlobal(size * requested);
+        try
+        {
+            CuDnnNative.CudnnStatus status;
+            int returned;
+            lock (_context.StreamBindingLock)
+            {
+                status = pass switch
+                {
+                    0 => CuDnnNative.cudnnGetConvolutionForwardAlgorithm_v7(_context.Handle, x, wd, cd, y, requested,
+                        out returned, results),
+                    1 => CuDnnNative.cudnnGetConvolutionBackwardDataAlgorithm_v7(_context.Handle, wd, y, cd, x, requested,
+                        out returned, results),
+                    _ => CuDnnNative.cudnnGetConvolutionBackwardFilterAlgorithm_v7(_context.Handle, x, y, cd, wd, requested,
+                        out returned, results),
+                };
+            }
+            if (status != CuDnnNative.CudnnStatus.Success) return -1;
+            bool tensorOpAllowed = mathType is CuDnnNative.CudnnMathType.TensorOp
+                or CuDnnNative.CudnnMathType.TensorOpAllowConversion;
+            for (int i = 0; i < Math.Min(returned, requested); i++)
+            {
+                var perf = Marshal.PtrToStructure<CuDnnNative.CudnnConvolutionAlgoPerf>(results + i * size);
+                if (perf.Status != CuDnnNative.CudnnStatus.Success) continue;
+                if ((ulong)perf.Memory > _workspaceSize) continue;
+                if (deterministic && perf.Determinism == 0) continue;
+                bool tensorOp = perf.MathType is CuDnnNative.CudnnMathType.TensorOp
+                    or CuDnnNative.CudnnMathType.TensorOpAllowConversion;
+                if (tensorOp && !tensorOpAllowed) continue;
+                System.Threading.Interlocked.Increment(ref ChannelsLastHeuristicChoices);
+                return perf.Algo;
+            }
+            return -1;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return -1;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(results);
+        }
+    }
+
     private int FindChannelsLast(int pass, IntPtr a, IntPtr b, IntPtr c, IntPtr x, IntPtr y, IntPtr wd, IntPtr cd,
         CuDnnNative.CudnnMathType mathType, bool deterministic)
     {
@@ -241,40 +309,54 @@ public sealed partial class CuDnnConvolution
                 scratch = IntPtr.Zero;
                 scratchSize = 0;
             }
-            CuDnnNative.CudnnStatus status;
-            int returned;
-            lock (_context.StreamBindingLock)
-            {
-                status = pass switch
-                {
-                    0 => CuDnnNative.cudnnFindConvolutionForwardAlgorithmEx(_context.Handle, x, a, wd, b, cd, y, c,
-                        requested, out returned, results, scratch, scratchSize),
-                    1 => CuDnnNative.cudnnFindConvolutionBackwardDataAlgorithmEx(_context.Handle, wd, a, y, b, cd, x, c,
-                        requested, out returned, results, scratch, scratchSize),
-                    _ => CuDnnNative.cudnnFindConvolutionBackwardFilterAlgorithmEx(_context.Handle, x, a, y, b, cd, wd, c,
-                        requested, out returned, results, scratch, scratchSize),
-                };
-            }
-            System.Threading.Interlocked.Increment(ref ChannelsLastSearches);
-            if (status != CuDnnNative.CudnnStatus.Success) return -1;
             bool tensorOpAllowed = mathType is CuDnnNative.CudnnMathType.TensorOp
                 or CuDnnNative.CudnnMathType.TensorOpAllowConversion;
+            // Each search times every algorithm once, so one stall on a shared GPU can make the slowest win (cuDNN's
+            // generic engine, ~1 ms against 0.03-0.3 ms, kept for the whole run). Each (algorithm, math type) keeps its
+            // fastest time over a few searches; the choice is made from those.
+            const int searches = 3;
+            var fastest = new System.Collections.Generic.Dictionary<(int, int), CuDnnNative.CudnnConvolutionAlgoPerf>();
+            for (int search = 0; search < searches; search++)
+            {
+                CuDnnNative.CudnnStatus status;
+                int returned;
+                lock (_context.StreamBindingLock)
+                {
+                    status = pass switch
+                    {
+                        0 => CuDnnNative.cudnnFindConvolutionForwardAlgorithmEx(_context.Handle, x, a, wd, b, cd, y, c,
+                            requested, out returned, results, scratch, scratchSize),
+                        1 => CuDnnNative.cudnnFindConvolutionBackwardDataAlgorithmEx(_context.Handle, wd, a, y, b, cd, x, c,
+                            requested, out returned, results, scratch, scratchSize),
+                        _ => CuDnnNative.cudnnFindConvolutionBackwardFilterAlgorithmEx(_context.Handle, x, a, y, b, cd, wd, c,
+                            requested, out returned, results, scratch, scratchSize),
+                    };
+                }
+                System.Threading.Interlocked.Increment(ref ChannelsLastSearches);
+                if (status != CuDnnNative.CudnnStatus.Success)
+                {
+                    if (search == 0) return -1;
+                    break;
+                }
+                for (int i = 0; i < Math.Min(returned, requested); i++)
+                {
+                    var perf = Marshal.PtrToStructure<CuDnnNative.CudnnConvolutionAlgoPerf>(results + i * size);
+                    if (perf.Status != CuDnnNative.CudnnStatus.Success || perf.Time < 0) continue;
+                    if ((ulong)perf.Memory > ChannelsLastMaxWorkspace) continue;
+                    if (deterministic && perf.Determinism == 0) continue;
+                    bool tensorOp = perf.MathType is CuDnnNative.CudnnMathType.TensorOp
+                        or CuDnnNative.CudnnMathType.TensorOpAllowConversion;
+                    if (tensorOp && !tensorOpAllowed) continue;
+                    var id = (perf.Algo, (int)perf.MathType);
+                    if (!fastest.TryGetValue(id, out var seen) || perf.Time < seen.Time) fastest[id] = perf;
+                }
+            }
             int best = -1;
             float bestTime = float.MaxValue;
             ulong bestMemory = 0;
-            var candidates = new System.Collections.Generic.List<CuDnnNative.CudnnConvolutionAlgoPerf>();
-            for (int i = 0; i < Math.Min(returned, requested); i++)
-            {
-                var perf = Marshal.PtrToStructure<CuDnnNative.CudnnConvolutionAlgoPerf>(results + i * size);
-                if (perf.Status != CuDnnNative.CudnnStatus.Success || perf.Time < 0) continue;
-                if ((ulong)perf.Memory > ChannelsLastMaxWorkspace) continue;
-                if (deterministic && perf.Determinism == 0) continue;
-                bool tensorOp = perf.MathType is CuDnnNative.CudnnMathType.TensorOp
-                    or CuDnnNative.CudnnMathType.TensorOpAllowConversion;
-                if (tensorOp && !tensorOpAllowed) continue;
-                candidates.Add(perf);
+            var candidates = new System.Collections.Generic.List<CuDnnNative.CudnnConvolutionAlgoPerf>(fastest.Values);
+            foreach (var perf in candidates)
                 if (perf.Time < bestTime) bestTime = perf.Time;
-            }
             foreach (var perf in candidates)
             {
                 if (perf.Time > bestTime * 1.03f) continue;

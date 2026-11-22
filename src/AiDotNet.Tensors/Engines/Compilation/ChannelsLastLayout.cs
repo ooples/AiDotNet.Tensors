@@ -140,6 +140,9 @@ internal sealed class ChannelsLastConvolution
     internal void Backward(DirectGpuTensorEngine gpu, Tensor<float> gradZ, Tensor<float> x, Tensor<float> w,
         ChannelsLastSlot slot, IEngine engine, Dictionary<Tensor<float>, Tensor<float>> grads)
     {
+        // Both passes read dY: under autocast the second reads the 16-bit copy the first narrowed (one backward function
+        // is one compiled action, so the copy cannot go stale or be overwritten inside it).
+        using var share = new DirectGpuTensorEngine.BackwardConvPrecisionScope(null, shareNarrowedOperands: true);
         if (DifferentiableOps.IsGradientRequired(x))
             DifferentiableOps.AccumulateGrad(grads, x,
                 InputGradient(gpu, gradZ, w, slot.InputNhwc, slot.OutputNhwc)
