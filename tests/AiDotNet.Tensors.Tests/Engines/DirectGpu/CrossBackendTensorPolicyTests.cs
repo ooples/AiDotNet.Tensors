@@ -683,4 +683,59 @@ public sealed class CrossBackendTensorPolicyTests
         }
         finally { AiDotNetEngine.CrossBackendPolicy = previous; }
     }
+
+#if NETCOREAPP
+    // The policy on two backends that are not devices at all (the mock is a DispatchProxy): the paths below need no
+    // GPU, so they are measured where the unit lane runs.
+    private static Tensor<float> PlacedOnMock(IDirectGpuBackend owner, params float[] values)
+        => Tensor<float>.FromGpuBuffer(owner, new MockGpuBuffer(values), new[] { values.Length });
+
+    [Fact]
+    public void Throw_names_a_backend_that_cannot_name_itself_by_its_type()
+    {
+        var ownerState = new MockBackendState();
+        ownerState.ThrowOnCall["get_BackendName"] = new InvalidOperationException("the device is gone");
+        var owner = MockDirectGpuBackend.Create(ownerState);
+        var consumer = MockDirectGpuBackend.Create(new MockBackendState());
+        var tensor = PlacedOnMock(owner, 1f, 2f);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Throw);
+
+        var error = Assert.Throws<CrossBackendTensorException>(() => CrossBackendTensors.Resolve(tensor, owner, consumer));
+        Assert.Contains("A tensor of shape [2] is on the ", error.Message);
+        Assert.DoesNotContain("the device is gone", error.Message);
+        Assert.Same(owner, tensor._gpuBackend);
+    }
+
+    [Fact]
+    public void A_tensor_asked_for_inside_another_backends_op_leaves_its_owner()
+    {
+        var owner = MockDirectGpuBackend.Create(new MockBackendState());
+        var consumer = MockDirectGpuBackend.Create(new MockBackendState());
+        var tensor = PlacedOnMock(owner, 1f, 2f);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var gate = new GpuOpGate();
+        using (gate.Enter(consumer))
+        {
+            var buffer = tensor.TryGetGpuBuffer();
+            Assert.NotSame(owner, tensor._gpuBackend);
+            Assert.True(buffer is null || ReferenceEquals(tensor._gpuBackend, consumer));
+        }
+        Assert.Equal(new[] { 1f, 2f }, tensor.ToArray());
+    }
+
+    [Fact]
+    public void A_read_back_the_owner_fails_is_reported_as_the_migration_failing()
+    {
+        var ownerState = new MockBackendState();
+        ownerState.ThrowOnCall["DownloadBuffer"] = new InvalidOperationException("device lost");
+        var owner = MockDirectGpuBackend.Create(ownerState);
+        var consumer = MockDirectGpuBackend.Create(new MockBackendState());
+        var tensor = PlacedOnMock(owner, 1f, 2f);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+
+        var error = Assert.Throws<InvalidOperationException>(() => CrossBackendTensors.Resolve(tensor, owner, consumer));
+        Assert.Contains("Could not read this tensor back", error.Message);
+        Assert.IsType<InvalidOperationException>(error.InnerException);
+    }
+#endif
 }

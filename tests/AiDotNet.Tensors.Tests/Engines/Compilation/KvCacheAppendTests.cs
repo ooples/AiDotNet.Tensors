@@ -163,6 +163,10 @@ public class KvCacheAppendTests
                         new Tensor<float>([1, (1 << 24) + 1, 1]), new Tensor<float>([1]), new Tensor<float>([1, 1])));
                     Assert.Throws<NotSupportedException>(() => engine.KvCacheAppend(
                         new Tensor<int>([1, 4, 1]), new Tensor<int>([1]), new Tensor<int>([1, 1])));
+                    // A type whose conversion from negative infinity throws is refused the same way, by name.
+                    var refused = Assert.Throws<NotSupportedException>(() => engine.KvCacheAppend(
+                        new Tensor<decimal>([1, 4, 1]), new Tensor<decimal>([1]), new Tensor<decimal>([1, 1])));
+                    Assert.Contains("negative infinity", refused.Message);
                 }
             }
         }
