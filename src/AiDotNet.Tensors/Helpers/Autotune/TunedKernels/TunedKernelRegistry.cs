@@ -375,8 +375,9 @@ public static class TunedKernelPolicy
     public const string ModeEnvironmentVariable = "AIDOTNET_KERNEL_REGISTRY";
 
     /// <summary>
-    /// Environment variable for the per-process online tuning budget in milliseconds (default 15000; first runs are not
-    /// charged, and decisions persist, so it is spent once per device and shape set).
+    /// Environment variable for the per-process online tuning budget in milliseconds (default 2000; first runs are not
+    /// charged). A host that wants more shapes tuned in one process opts in with a larger value (a DCGAN's full tune
+    /// charges about 11-14 s); decisions persist, so a larger budget is spent once per device and shape set.
     /// </summary>
     public const string BudgetEnvironmentVariable = "AIDOTNET_KERNEL_TUNE_BUDGET_MS";
 
@@ -442,13 +443,11 @@ public static class TunedKernelPolicy
     };
 
     /// <summary>
-    /// Default per-process tuning budget, in milliseconds of measurement (first runs are not charged). Decisions persist,
-    /// so it is spent once per device and shape set. 2000 covered about a dozen shapes, all from a model's warm-up: a
-    /// DCGAN's full tune charges 11.1 s with its own kernels and 13.6 s with cuDNN candidates (RTX 3090), and at 2000 it
-    /// trained at 17.7-18.0 ms/step against 15.7 tuned (14.8-16.0 against 12.7 with cuDNN) until later runs filled the
-    /// cache in.
+    /// Default per-process tuning budget, in milliseconds of measurement (first runs are not charged). Kept small so a
+    /// process that did not ask for tuning does not spend seconds measuring: 2000 covers about a dozen shapes. A larger
+    /// budget is opted into through <see cref="BudgetEnvironmentVariable"/> or <see cref="BudgetMilliseconds"/>.
     /// </summary>
-    internal const double DefaultBudgetMilliseconds = 15_000;
+    internal const double DefaultBudgetMilliseconds = 2_000;
 
     private static double ParseBudget(string? value) =>
         double.TryParse(value, System.Globalization.NumberStyles.Float,
