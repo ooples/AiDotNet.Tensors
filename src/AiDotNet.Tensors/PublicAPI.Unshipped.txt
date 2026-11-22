@@ -855,3 +855,21 @@ AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Elementwise.ScalarFloat64(AiDotNet
 AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Elementwise.UnaryFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64UnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.ScalarFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, double scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.UnaryFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64UnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapabilities
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.ElementType.get -> AiDotNet.Tensors.Engines.DirectGpu.GpuElementType
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.Equals(AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability other) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.Family.get -> AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.GpuOperationCapability() -> void
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.GpuOperationCapability(AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily family, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType elementType, bool isNative) -> void
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.IsNative.get -> bool
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily.Elementwise = 1 -> AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily.MatrixMultiply = 3 -> AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily.Reduction = 2 -> AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily
+AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily.Storage = 0 -> AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily
+override AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.Equals(object? obj) -> bool
+override AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.GetHashCode() -> int
+override AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability.ToString() -> string!
+static AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapabilities.DescribeOperations(this AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend) -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapability>!
+static AiDotNet.Tensors.Engines.DirectGpu.GpuOperationCapabilities.SupportsOperation(this AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, AiDotNet.Tensors.Engines.DirectGpu.GpuOperationFamily family, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType elementType) -> bool
