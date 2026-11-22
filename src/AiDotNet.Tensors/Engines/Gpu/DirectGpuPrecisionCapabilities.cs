@@ -19,7 +19,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA
                 fp32MultiplyType: UsesTensorFloat32(operation)
                     ? GpuScalarType.TensorFloat32
                     : GpuScalarType.Float32,
-                supportsTensorFloat32: UsesTensorFloat32(operation));
+                supportsTensorFloat32: UsesTensorFloat32(operation),
+                supportsFloat64: SupportsFloat64(operation));
+
+        // Double add, subtract, multiply and divide have native kernels over double buffers on this backend, and
+        // matrix multiply has a double routine.
+        private bool SupportsFloat64(GpuPrecisionOperation operation) => operation switch
+        {
+            GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
+                or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
+            GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            _ => false,
+        };
 
         private bool SupportsFp16(GpuPrecisionOperation operation) => operation switch
         {
@@ -68,7 +79,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
                 fp16MultiplyType: IsFp16Elementwise(operation) ? GpuScalarType.Float32 : GpuScalarType.Float16,
                 fp32Implementation: IsGemm(operation)
                     ? GpuPrecisionImplementation.VendorLibrary
-                    : GpuPrecisionImplementation.Native);
+                    : GpuPrecisionImplementation.Native,
+                supportsFloat64: SupportsFloat64(operation));
+
+        // Double add, subtract, multiply and divide have native kernels over double buffers on this backend, and
+        // matrix multiply has a double routine.
+        private bool SupportsFloat64(GpuPrecisionOperation operation) => operation switch
+        {
+            GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
+                or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
+            GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            _ => false,
+        };
 
         private bool SupportsFp16(GpuPrecisionOperation operation) => operation switch
         {
@@ -137,7 +159,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 GpuPrecisionImplementation.Packed,
                 fp16ReducesStorageBytes: true,
                 fp16OutputStorage: IsFp16Elementwise(operation) ? GpuScalarType.Float16 : GpuScalarType.Float32,
-                fp16MultiplyType: GpuScalarType.Float32);
+                fp16MultiplyType: GpuScalarType.Float32,
+                supportsFloat64: SupportsFloat64(operation));
+
+        // Double add, subtract, multiply and divide have native kernels over double buffers on this backend, and
+        // matrix multiply has a double routine.
+        private bool SupportsFloat64(GpuPrecisionOperation operation) => operation switch
+        {
+            GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
+                or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
+            GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            _ => false,
+        };
 
         private bool SupportsFp16(GpuPrecisionOperation operation) => operation switch
         {

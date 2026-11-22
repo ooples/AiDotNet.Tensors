@@ -43,6 +43,7 @@ public class DropTransientActivationsRingTests
     private sealed class TrackingGpuBuffer : IGpuBuffer
     {
         public int DisposeCount;
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => 4;
         public long SizeInBytes => 16;
         public IntPtr Handle => IntPtr.Zero;

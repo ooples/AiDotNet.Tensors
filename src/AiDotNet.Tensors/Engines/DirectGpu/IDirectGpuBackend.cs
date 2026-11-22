@@ -131,6 +131,18 @@ public interface IDirectGpuBackend : IDisposable
     IGpuBuffer AllocateBuffer(int size);
 
     /// <summary>
+    /// Whether this backend can hold buffers of <paramref name="type"/> on this device. It says nothing about which
+    /// operations compute in that type: an operation without a kernel for it still reports its own fallback.
+    /// </summary>
+    bool SupportsElementType(GpuElementType type);
+
+    /// <summary>Allocates a buffer of <paramref name="size"/> elements of <paramref name="type"/>.</summary>
+    /// <param name="size">Number of elements.</param>
+    /// <param name="type">The element type; the buffer reports it as <see cref="IGpuBuffer.ElementType"/>.</param>
+    /// <exception cref="NotSupportedException">The backend cannot hold <paramref name="type"/> (<see cref="SupportsElementType"/>).</exception>
+    IGpuBuffer AllocateBuffer(int size, GpuElementType type);
+
+    /// <summary>
     /// Downloads GPU buffer contents to CPU.
     /// </summary>
     /// <param name="buffer">GPU buffer to download.</param>
@@ -3871,6 +3883,12 @@ public interface IGpuBuffer : IDisposable
     /// For FP16 buffers: Size * 2.
     /// </summary>
     long SizeInBytes { get; }
+
+    /// <summary>
+    /// Gets the element type the buffer holds. <see cref="Size"/> counts elements of this type;
+    /// <see cref="GpuElementType.Unspecified"/> marks raw bytes whose reader decides the interpretation.
+    /// </summary>
+    GpuElementType ElementType { get; }
 
     /// <summary>
     /// Gets the native handle (IntPtr to OpenCL cl_mem or CUDA CUdeviceptr).

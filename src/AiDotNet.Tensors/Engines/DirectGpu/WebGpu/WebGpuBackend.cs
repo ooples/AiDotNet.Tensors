@@ -198,6 +198,15 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <summary>Allocates a zero-initialized device buffer of float elements.</summary>
     /// <param name="elementCount">Number of float elements.</param>
     /// <returns>A new zero-initialized GPU buffer.</returns>
+    /// <inheritdoc/>
+    // Not yet: this backend serves every buffer from 4-byte float allocations, so only the 4-byte types have storage.
+    // WGSL has no 64-bit float at all.
+    public bool SupportsElementType(GpuElementType type)
+        => type is GpuElementType.Float32 or GpuElementType.Int32;
+
+    /// <inheritdoc/>
+    public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
+
     public IGpuBuffer AllocateBuffer(int elementCount) => AllocateBufferCore(elementCount, zeroInitialize: true);
 
     internal IGpuBuffer AllocateBufferCore(int elementCount, bool zeroInitialize)

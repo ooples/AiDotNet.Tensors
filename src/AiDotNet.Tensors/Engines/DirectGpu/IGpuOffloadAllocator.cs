@@ -34,6 +34,18 @@ public interface IGpuOffloadAllocator : IDisposable
 }
 
 /// <summary>
+/// An <see cref="IGpuDevicePointerWrapper"/> that is told what the pointer's elements are, so the buffer it returns
+/// reports the tensor's element type (a width alone cannot tell <c>Float32</c> from <c>Int32</c>) and typed transfers
+/// accept it.
+/// </summary>
+internal interface IGpuTypedDevicePointerWrapper
+{
+    /// <summary>A non-owning buffer of <paramref name="elementCount"/> <paramref name="elementType"/> elements at
+    /// <paramref name="devicePointer"/>, or null when the pointer is not this allocator's.</summary>
+    IGpuBuffer? WrapDevicePointerAsBuffer(IntPtr devicePointer, int elementCount, GpuElementType elementType);
+}
+
+/// <summary>
 /// Issue #336: optional capability — allocators that implement this can
 /// wrap a previously-allocated device pointer as a non-owning
 /// <see cref="IGpuBuffer"/>. Used by

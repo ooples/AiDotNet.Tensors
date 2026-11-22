@@ -259,6 +259,7 @@ public sealed class GpuBufferPoolAffinityTests
             _size = size;
             Capacity = size;
         }
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => Volatile.Read(ref _size);
         public int Capacity { get; }
         public long SizeInBytes => (long)Size * sizeof(float);

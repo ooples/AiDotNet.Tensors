@@ -40,6 +40,7 @@ public sealed class ExecutionGraphSoftmaxActivationTests
     private sealed class FakeBuffer : IGpuBuffer
     {
         public FakeBuffer(int size) { Size = size; }
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size { get; }
         public long SizeInBytes => Size * 4L;
         public IntPtr Handle => IntPtr.Zero;

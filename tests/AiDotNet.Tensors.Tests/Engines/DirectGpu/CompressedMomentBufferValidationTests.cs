@@ -9,6 +9,7 @@ public class CompressedMomentBufferValidationTests
     private sealed class Buffer : IGpuBuffer
     {
         internal Buffer(long bytes) => SizeInBytes = bytes;
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => 1024; // Element count must never stand in for byte capacity.
         public long SizeInBytes { get; }
         public IntPtr Handle => IntPtr.Zero;

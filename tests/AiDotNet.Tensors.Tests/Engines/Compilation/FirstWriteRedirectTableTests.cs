@@ -14,6 +14,7 @@ public class FirstWriteRedirectTableTests
 {
     private sealed class Buffer : IGpuBuffer
     {
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => 64;
         public long SizeInBytes => 256;
         public IntPtr Handle { get; } = new(1);

@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// 3. Read data by copying to MAP_READ buffer, then mapping
 /// </para>
 /// </remarks>
-public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, IGpuBufferViewSource
+public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, IGpuBufferViewSource, IRetypableGpuBuffer
 {
     internal const WebGpuBufferUsage DefaultStorageUsage =
         WebGpuBufferUsage.Storage | WebGpuBufferUsage.CopySrc | WebGpuBufferUsage.CopyDst;
@@ -76,6 +76,8 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
     /// <inheritdoc/>
     void IPoolableGpuBuffer.MarkRented(int size)
     {
+        // A recycled allocation is a float buffer again until its new owner says otherwise.
+        Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
         // The pool is exact-size (a WebGPU buffer has no logical size below its allocation), so a rent is always for this
         // buffer's whole capacity and nothing about the wrapper changes; anything else would hand out a wrong-sized buffer.
         if (size != _elementCount)
@@ -155,6 +157,9 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
     /// <summary>
     /// Gets the number of elements in the buffer (IGpuBuffer implementation).
     /// </summary>
+    private int _elementType = (int)GpuElementType.Float32;
+    public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
+    void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
     public int Size => _elementCount;
 
     /// <summary>

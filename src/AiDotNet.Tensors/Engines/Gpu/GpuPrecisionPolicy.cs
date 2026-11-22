@@ -96,6 +96,12 @@ public enum GpuPrecisionOperation
     Convolution,
     /// <summary>Reduction or numerically-sensitive normalization.</summary>
     Reduction,
+    /// <summary>Element-wise subtraction.</summary>
+    Subtract,
+    /// <summary>Element-wise multiplication.</summary>
+    Multiply,
+    /// <summary>Element-wise division.</summary>
+    Divide,
 }
 
 /// <summary>How a backend realizes a reported precision capability.</summary>
@@ -648,7 +654,8 @@ internal static class GpuPrecisionCapabilityCatalog
         GpuScalarType fp16MultiplyType = GpuScalarType.Float16,
         GpuPrecisionImplementation fp32Implementation = GpuPrecisionImplementation.Native,
         GpuScalarType fp32MultiplyType = GpuScalarType.Float32,
-        bool supportsTensorFloat32 = false)
+        bool supportsTensorFloat32 = false,
+        bool supportsFloat64 = false)
     {
         var capabilities = new List<GpuPrecisionCapability>(supportsFp16 && supportsTensorFloat32 ? 3 : 2)
         {
@@ -682,6 +689,18 @@ internal static class GpuPrecisionCapabilityCatalog
                 fp16Implementation,
                 fp16ReducesStorageBytes,
                 GpuScalarType.Float16));
+        }
+        if (supportsFloat64)
+        {
+            // Native double kernels over double buffers: nothing is narrowed, so PreserveInputType accepts it.
+            capabilities.Add(new GpuPrecisionCapability(
+                GpuScalarType.Float64,
+                GpuScalarType.Float64,
+                GpuScalarType.Float64,
+                GpuScalarType.Float64,
+                GpuPrecisionImplementation.Native,
+                false,
+                GpuScalarType.Float64));
         }
         return capabilities;
     }

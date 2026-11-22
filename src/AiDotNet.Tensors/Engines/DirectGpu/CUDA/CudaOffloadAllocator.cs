@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <c>cuMemAllocHost</c> (mapped + portable); Managed-scheme uses
 /// <c>cuMemAllocManaged</c> with <c>CU_MEM_ATTACH_GLOBAL</c>.
 /// </summary>
-public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePointerWrapper
+public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePointerWrapper, IGpuTypedDevicePointerWrapper
 {
     private readonly ConcurrentDictionary<IntPtr, GpuOffloadHandle> _live = new();
     private readonly object _lifecycleLock = new();
@@ -235,7 +235,18 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
             // have used the same allocator that produced the pointer.
             return null;
         }
-        return new CudaNonOwningBuffer(devicePointer, elementCount, (long)elementCount * elementByteSize);
+        // A width is all this overload is told: four bytes are the float words the engine has always wrapped, and
+        // any other width is reported untyped rather than as a type it may not be.
+        return new CudaNonOwningBuffer(devicePointer, elementCount, (long)elementCount * elementByteSize,
+            elementByteSize == sizeof(float) ? GpuElementType.Float32 : GpuElementType.Unspecified);
+    }
+
+    IGpuBuffer? IGpuTypedDevicePointerWrapper.WrapDevicePointerAsBuffer(IntPtr devicePointer, int elementCount, GpuElementType elementType)
+    {
+        if (devicePointer == IntPtr.Zero || elementCount <= 0 || elementType == GpuElementType.Unspecified) return null;
+        if (!_live.ContainsKey(devicePointer)) return null;
+        return new CudaNonOwningBuffer(devicePointer, elementCount,
+            (long)elementCount * GpuElementTypes.SizeInBytes(elementType), elementType);
     }
 
     /// <summary>
@@ -247,14 +258,16 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     private sealed class CudaNonOwningBuffer : IGpuBuffer
     {
         public IntPtr Handle { get; }
+        public GpuElementType ElementType { get; }
         public int Size { get; }
         public long SizeInBytes { get; }
 
-        public CudaNonOwningBuffer(IntPtr handle, int size, long sizeInBytes)
+        public CudaNonOwningBuffer(IntPtr handle, int size, long sizeInBytes, GpuElementType elementType)
         {
             Handle = handle;
             Size = size;
             SizeInBytes = sizeInBytes;
+            ElementType = elementType;
         }
 
         public void Dispose() { /* non-owning */ }

@@ -50,6 +50,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
     private sealed class TrackingGpuBuffer : IGpuBuffer
     {
         public int DisposeCount;
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size { get; }
         public long SizeInBytes => Size * sizeof(float);
         public IntPtr Handle => IntPtr.Zero;

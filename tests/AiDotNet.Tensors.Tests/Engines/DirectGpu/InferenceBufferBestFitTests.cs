@@ -123,6 +123,7 @@ public sealed class InferenceBufferBestFitTests
     {
         public Cell(int capacity) { Capacity = Size = capacity; }
         public int Capacity { get; }
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size { get; private set; }
         public long SizeInBytes => (long)Size * sizeof(float);
         public IntPtr Handle => Releases == 0 ? new IntPtr(1) : IntPtr.Zero;
