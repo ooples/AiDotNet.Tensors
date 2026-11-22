@@ -178,6 +178,7 @@ jobs:
         FullyQualifiedName~.EmptyBroadcastTests.|
         FullyQualifiedName~.MixtureOfExpertsTests.|
         FullyQualifiedName~.DeviceResultRegistryTests.|
+        FullyQualifiedName~.CausalAttentionCapture|
         FullyQualifiedName~.GpuPinnedLifetimeTests.|
         FullyQualifiedName~.Interop.DLPack|
         FullyQualifiedName~.EmptyBroadcastGpuTests.|
