@@ -15,6 +15,39 @@ public sealed class IndexGraphBindingTests
     private static int First(IGpuBuffer buffer)
         => BitConverter.ToInt32(BitConverter.GetBytes(((MockGpuBuffer)buffer).Data[0]), 0);
 
+    // A destination table with a repeat is refused at first use (the pre-capture and capture runs) exactly as every later
+    // replay refuses it, so no graph is built that only fails when replayed.
+    [Fact]
+    public void DuplicateDestinations_AreRejectedOnFirstUse_NotOnlyOnReplay()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        using var direct = new DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct);
+        var unique = (IGpuBuffer)typeof(DirectGpuTensorEngine).GetMethod("GetHostIndexDeviceCopy", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(engine, new object[] { backend, new Tensor<int>(new[] { 2, 0, 1 }, new[] { 3 }), 3, true })!;
+        Assert.NotNull(unique);
+        var ex = Assert.Throws<TargetInvocationException>(() => typeof(DirectGpuTensorEngine)
+            .GetMethod("GetHostIndexDeviceCopy", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(engine, new object[] { backend, new Tensor<int>(new[] { 2, 0, 2 }, new[] { 3 }), 3, true }));
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+    }
+
+    [Theory]
+    [InlineData(new int[0], true)]
+    [InlineData(new[] { 5 }, true)]
+    [InlineData(new[] { 3, 1, 2, 0 }, true)]
+    [InlineData(new[] { 3, 1, 3, 0 }, false)]
+    [InlineData(new[] { -4, 7, -4 }, false)]
+    [InlineData(new[] { int.MinValue, 0, int.MaxValue }, true)]
+    [InlineData(new[] { int.MinValue, 0, int.MaxValue, 0 }, false)]
+    [InlineData(new[] { 0, 1 << 30, 5 << 20 }, true)]
+    public void DistinctDestinationCheck_MatchesASet(int[] ids, bool distinct)
+    {
+        Assert.Equal(distinct, DirectGpuTensorEngine.AllDistinct(ids));
+        Assert.Equal(new System.Collections.Generic.HashSet<int>(ids).Count == ids.Length, DirectGpuTensorEngine.AllDistinct(ids));
+    }
+
     [Fact]
     public void FailedInitialUpload_IsNotPublished_AndRetryUploadsVersionZero()
     {
