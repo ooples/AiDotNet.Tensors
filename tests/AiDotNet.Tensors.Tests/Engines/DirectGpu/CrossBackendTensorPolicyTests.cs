@@ -414,8 +414,67 @@ public sealed class CrossBackendTensorPolicyTests
                 }
                 outer.Execute();
                 Assert.Equal(new[] { 0.5f, 0.5f }, recorded.ToArray());
-                // Executed: the result now migrates like any other tensor.
-                Assert.Equal(2, engines.Consumer.TensorSigmoid(recorded).ToArray().Length);
+                // Executed: the result now migrates like any other tensor, with its values (sigmoid(0.5)).
+                var migrated = engines.Consumer.TensorSigmoid(recorded).ToArray();
+                Assert.Equal(2, migrated.Length);
+                Assert.All(migrated, value => Assert.Equal(0.62245935f, value, 5));
+            }
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
+    // The graph Compile returns can be run by the caller: a successful run writes the recorded results too.
+    [SkippableFact]
+    public void A_compiled_graph_run_by_the_caller_marks_its_results_executed()
+    {
+        using var engines = CreateEngines();
+        var input = new Tensor<float>(new[] { 0f, 0f }, new[] { 2 });
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try
+        {
+            var scope = engines.Placer.BeginDeferredScope();
+            Skip.If(scope is null, "Backend has no deferred execution");
+            using (scope)
+            {
+                var recorded = engines.Placer.TensorSigmoid(input);
+                var buffer = recorded._gpuBuffer;
+                Skip.If(buffer is null, "The op did not record a device result.");
+                var graph = scope.Compile();
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(buffer));
+                graph.Execute(engines.Placer.QueryBackend!);
+                Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(buffer));
+                Assert.Equal(new[] { 0.5f, 0.5f }, recorded.ToArray());
+            }
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
+    // Clearing the builder discards what was recorded: those results never run, whatever is recorded and run after.
+    [SkippableFact]
+    public void A_result_discarded_by_clearing_the_builder_stays_unexecuted()
+    {
+        using var engines = CreateEngines();
+        var input = new Tensor<float>(new[] { 0f, 0f }, new[] { 2 });
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try
+        {
+            var scope = engines.Placer.BeginDeferredScope() as AiDotNet.Tensors.Engines.Gpu.DeferredScope;
+            Skip.If(scope is null, "Backend has no deferred execution");
+            using (scope)
+            {
+                var discarded = engines.Placer.TensorSigmoid(input);
+                var discardedBuffer = discarded._gpuBuffer;
+                Skip.If(discardedBuffer is null, "The op did not record a device result.");
+                scope.GraphBuilder.Clear();
+                var kept = engines.Placer.TensorSigmoid(input);
+                var keptBuffer = kept._gpuBuffer;
+                Skip.If(keptBuffer is null, "The op did not record a device result.");
+                scope.Execute();
+                Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(keptBuffer));
+                Assert.True(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(discardedBuffer));
+                Assert.Equal(new[] { 0.5f, 0.5f }, kept.ToArray());
             }
         }
         finally { AiDotNetEngine.Current = previous; }
@@ -428,7 +487,7 @@ public sealed class CrossBackendTensorPolicyTests
         using var engines = CreateEngines();
         var whole = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
         var middle = whole.Slice(0, 1, 3);                  // [2, 3]
-        Skip.If(middle.CoversWholeVector, "The slice is not a partial view here.");
+        Assert.False(middle.CoversWholeVector);
         PlaceOn(engines.Placer, middle);                    // packed upload of [2, 3]
         var last = middle.Slice(0, 1, 2);                   // [3]
         using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);

@@ -184,6 +184,47 @@ fn f(x: f32) -> f32 { return log(1.0) + tanh(x) + log2(x); }";
         Assert.DoesNotContain("fn wgsl_log(", prepared);
     }
 
+    // A module function named like a builtin the helper calls would be called by the helper too.
+    [Fact]
+    public void A_helper_is_not_used_when_the_source_hides_a_builtin_it_calls()
+    {
+        const string source = @"
+fn exp(x: f32) -> f32 { return 0.0; }
+fn f(x: f32) -> f32 { return tanh(x) + log2(x); }";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.Contains("return tanh(x) + wgsl_log2(x);", prepared);
+        Assert.DoesNotContain("fn wgsl_tanh(", prepared);
+    }
+
+    // One index into a matrix is a column vector; a second index or a single component of it is a scalar.
+    [Fact]
+    public void A_matrix_column_is_a_vector_and_its_element_a_scalar()
+    {
+        const string source = @"
+fn f(m: mat2x2<f32>) -> vec2<f32> {
+    let n = m;
+    let c = tanh(m[0]) + tanh(n[1]);
+    let s = tanh(m[0][0]) + tanh(n[1].x);
+    return c * s;
+}";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.Contains("let c = tanh(m[0]) + tanh(n[1]);", prepared);
+        Assert.Contains("let s = wgsl_tanh(m[0][0]) + wgsl_tanh(n[1].x);", prepared);
+    }
+
+    // A module function named like a scalar-valued builtin has the result it declares, not the builtin's.
+    [Fact]
+    public void A_module_function_named_like_a_scalar_builtin_has_its_declared_result()
+    {
+        const string source = @"
+fn length(v: vec2<f32>) -> vec2<f32> { return v; }
+fn f(v: vec2<f32>) -> vec2<f32> { return tanh(length(v)); }
+fn g(v: vec2<f32>) -> f32 { return tanh(dot(v, v)); }";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.Contains("return tanh(length(v));", prepared);
+        Assert.Contains("return wgsl_tanh(dot(v, v));", prepared);
+    }
+
     // Parameters are function-scoped: `a` is a vector in one function and an array of vectors in another.
     [Fact]
     public void A_name_is_typed_by_the_function_that_declares_it()

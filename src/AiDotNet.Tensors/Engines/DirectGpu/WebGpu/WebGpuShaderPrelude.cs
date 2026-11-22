@@ -95,6 +95,19 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
     // A declaration whose type is inferred from its initializer (let u = v;).
     private static readonly Regex InferredDeclaration = new(
         @"(?:let|var)\s+(\w+)\s*=\s*([^;]+);", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+    // Names declared as matrices: one index into a matrix is a column vector, two are a scalar.
+    private static readonly Regex MatrixNames = new(
+        @"(\w+)\s*:\s*mat[234]x[234]|(?:let|var)\s+(\w+)\s*=\s*mat[234]x[234]",
+        RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+    // A declaration at module scope other than a function: it hides a builtin of the same name as a function does.
+    private static readonly Regex ModuleDeclaration = new(
+        @"\b(?:const|override|alias|struct)\s+(\w+)|\bvar\s*(?:<[^>]*>)?\s*(\w+)",
+        RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+    // The builtins and predeclared types each helper's body uses. A module declaration of one of these names hides
+    // it inside the helper as well, so the helper would compute something else: the builtin call is kept instead.
+    // (The one builtin each log helper falls back to is its own name, which is checked with it.)
+    private static readonly string[] TanhDependencies = { "abs", "select", "exp" };
+    private static readonly string[] LogDependencies = { "frexp", "bitcast", "f32", "u32", "bool", "vec2" };
     // Builtins that reduce vectors to a scalar, and the scalar conversions.
     private static readonly string[] ScalarBuiltins =
         { "dot", "length", "distance", "determinant", "f32", "i32", "u32", "bool", "wgsl_tanh", "wgsl_log", "wgsl_log2" };
@@ -104,10 +117,11 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
     {
         public HashSet<string> Vectors { get; } = new(StringComparer.Ordinal);
         public HashSet<string> VectorArrays { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> Matrices { get; } = new(StringComparer.Ordinal);
         public HashSet<string> ScalarFunctions { get; } = new(ScalarBuiltins, StringComparer.Ordinal);
     }
     private static readonly Regex Identifier = new(@"[A-Za-z_]\w*", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
-    private static readonly Regex VectorSyntax = new(@"\bvec[234]|\.[xyzwrgba]{2,4}\b", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+    private static readonly Regex VectorSyntax = new(@"\bvec[234]|\bmat[234]x[234]|\.[xyzwrgba]{2,4}\b", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
     private static readonly Regex SingleComponent = new(@"\G\.[xyzwrgba]\b", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
 
     public static string Prepare(string source)
@@ -118,9 +132,9 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
         DirectivesEnd(source, out bool enablesF16);
         if (!enablesF16)
         {
-            if (!source.Contains("fn wgsl_tanh(")) source = Rewrite(source, BuiltinTanh, "tanh", "wgsl_tanh(");
-            if (!source.Contains("fn wgsl_log2(")) source = Rewrite(source, BuiltinLog2, "log2", "wgsl_log2(");
-            if (!source.Contains("fn wgsl_log(")) source = Rewrite(source, BuiltinLog, "log", "wgsl_log(");
+            if (!source.Contains("fn wgsl_tanh(")) source = Rewrite(source, BuiltinTanh, "tanh", "wgsl_tanh(", TanhDependencies);
+            if (!source.Contains("fn wgsl_log2(")) source = Rewrite(source, BuiltinLog2, "log2", "wgsl_log2(", LogDependencies);
+            if (!source.Contains("fn wgsl_log(")) source = Rewrite(source, BuiltinLog, "log", "wgsl_log(", LogDependencies);
         }
         string helpers = "";
         if (source.Contains("wgsl_f32_bits(") && !source.Contains("fn wgsl_f32_bits(")) helpers += F32Bits;
@@ -213,6 +227,12 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
             for (int g = 1; g <= 3; g++)
                 if (m.Groups[g].Success) types.Vectors.Add(m.Groups[g].Value);
         foreach (Match m in VectorArrayNames.Matches(code)) types.VectorArrays.Add(m.Groups[1].Value);
+        foreach (Match m in MatrixNames.Matches(code))
+            types.Matrices.Add(m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value);
+        // A module function hides the builtin of its name (fn length(v) -> vec2f): the builtin's scalar result no
+        // longer describes it. Its own declared result does - a scalar one is added back just below, a vector one
+        // is among the vector names.
+        foreach (Match m in FunctionHeader.Matches(code)) types.ScalarFunctions.Remove(m.Groups[1].Value);
         foreach (Match m in ScalarFunctionNames.Matches(code)) types.ScalarFunctions.Add(m.Groups[1].Value);
         // Inferred declarations take their initializer's type (let u = v;), which may itself be inferred: to a fixed
         // point. Each pass adds at least one name or ends the loop, and there are finitely many declarations.
@@ -221,10 +241,14 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
         while (added)
         {
             added = false;
+            // A declaration initialized from a matrix name is a matrix (let n = m;), not a vector: n[0] is a column.
             foreach (var declaration in inferred.Where(d => !types.Vectors.Contains(d.Groups[1].Value)
-                                                            && IsVector(d.Groups[2].Value, types)))
+                                                            && !types.Matrices.Contains(d.Groups[1].Value)
+                                                            && (types.Matrices.Contains(d.Groups[2].Value.Trim())
+                                                                || IsVector(d.Groups[2].Value, types))))
             {
-                types.Vectors.Add(declaration.Groups[1].Value);
+                var kind = types.Matrices.Contains(declaration.Groups[2].Value.Trim()) ? types.Matrices : types.Vectors;
+                kind.Add(declaration.Groups[1].Value);
                 added = true;
             }
         }
@@ -287,14 +311,27 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
             if (text[k] != '\n') text[k] = ' ';
     }
 
-    private static string Rewrite(string source, Regex builtin, string name, string helper)
+    // The names the module declares at module scope: its functions, and its const, override, var, alias and struct
+    // declarations outside every function body.
+    private static HashSet<string> ModuleNames(string code, List<FunctionSpan> functions)
+    {
+        var names = new HashSet<string>(functions.Select(function => function.Name), StringComparer.Ordinal);
+        foreach (Match declaration in ModuleDeclaration.Matches(code).Cast<Match>().Where(declaration =>
+                     !functions.Exists(function => function.ParametersOpen < declaration.Index && declaration.Index < function.BodyClose)))
+            names.Add(declaration.Groups[1].Success ? declaration.Groups[1].Value : declaration.Groups[2].Value);
+        return names;
+    }
+
+    private static string Rewrite(string source, Regex builtin, string name, string helper, string[] dependencies)
     {
         string code = MaskComments(source);
         var calls = builtin.Matches(code);
         if (calls.Count == 0) return source;
         var functions = ReadFunctions(code);
-        // WGSL lets a module function hide a builtin: calls to that name are calls to the module's function.
-        if (functions.Exists(function => function.Name == name)) return source;
+        // WGSL lets a module declaration hide a builtin. Hiding this one makes its calls the module's own; hiding one
+        // the helper's body uses would change what the helper computes, so the builtin call is kept then too.
+        var declared = ModuleNames(code, functions);
+        if (declared.Contains(name) || dependencies.Any(declared.Contains)) return source;
         var typesByFunction = new SourceTypes?[functions.Count];
         var result = new System.Text.StringBuilder(source.Length + calls.Count * 5);
         int copied = 0;
@@ -418,7 +455,8 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
 
     // Whether an argument's VALUE is a vector. Calls with a scalar result (dot, length, a function declared -> f32)
     // are scalars whatever they are given, so they are set aside first; what is left is a vector when it holds a
-    // vector constructor, a swizzle of two or more components, an element of an array of vectors, or a name the
+    // vector or matrix constructor, a swizzle of two or more components, an element of an array of vectors, a
+    // matrix or one column of it, or a name the
     // source declares (or infers) as a vector - unless that name is indexed or takes a single component (v.x, v[i]).
     private static bool IsVector(string argument, SourceTypes types)
     {
@@ -433,8 +471,15 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
                     && (argument[after] == '[' || SingleComponent.IsMatch(argument, after));
                 if (!component) return true;
             }
-            else if (types.VectorArrays.Contains(name.Value) && after < argument.Length && argument[after] == '[')
+            else if (types.Matrices.Contains(name.Value) && (after >= argument.Length || argument[after] != '['))
             {
+                return true;   // a whole matrix is no scalar either
+            }
+            else if ((types.VectorArrays.Contains(name.Value) || types.Matrices.Contains(name.Value))
+                     && after < argument.Length && argument[after] == '[')
+            {
+                // One index gives a vector (an array's element, a matrix's column); a second index or a single
+                // component of that is a scalar.
                 int close = Matching(argument, after, '[', ']');
                 if (close < 0) continue;
                 int next = SkipTrivia(argument, close + 1);

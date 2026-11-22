@@ -77,6 +77,13 @@ public sealed class ExecutionGraph : IDisposable
     }
 
     /// <summary>
+    /// Run after a complete execution of this graph succeeded: its recorded outputs now hold their results. Set by
+    /// the builder that recorded the nodes. A failed or cancelled run does not reach it, and neither does
+    /// <see cref="ExecuteComputeKernelsNoSync"/>, which runs a subset and, under graph capture, runs nothing yet.
+    /// </summary>
+    internal Action? Executed { get; set; }
+
+    /// <summary>
     /// Executes the graph synchronously on the default stream.
     /// </summary>
     /// <param name="backend">The GPU backend to use.</param>
@@ -97,6 +104,7 @@ public sealed class ExecutionGraph : IDisposable
 
         // Final synchronization
         backend.Synchronize();
+        Executed?.Invoke();
     }
 
     /// <summary>
@@ -163,6 +171,7 @@ public sealed class ExecutionGraph : IDisposable
 
             // Final synchronization
             streamPool.SynchronizeAll();
+            Executed?.Invoke();
         }
         finally
         {
@@ -216,6 +225,7 @@ public sealed class ExecutionGraph : IDisposable
 
             // Final synchronization
             streamPool.SynchronizeAll();
+            Executed?.Invoke();
         }
         finally
         {

@@ -233,7 +233,8 @@ public sealed class ExecutionGraphBuilder : IDisposable
         ValidateGraph();
 
         _isBuilt = true;
-        return new ExecutionGraph(_nodes.ToList());
+        var writes = _writes;
+        return new ExecutionGraph(_nodes.ToList()) { Executed = () => writes.Ran = true };
     }
 
     /// <summary>
@@ -267,6 +268,10 @@ public sealed class ExecutionGraphBuilder : IDisposable
         var (optimizedGraph, statistics) = compiler.CompileWithStatistics(_nodes.ToList(), backend);
 
         _isBuilt = true;
+        // The graph marks the writes of the generation it was built from, however it is run (the scope's Execute or a
+        // caller's own Execute on the graph Compile returned).
+        var writes = _writes;
+        optimizedGraph.Executed = () => writes.Ran = true;
         return (optimizedGraph, statistics);
     }
 
@@ -279,6 +284,9 @@ public sealed class ExecutionGraphBuilder : IDisposable
         _lastWriteNode.Clear();
         _bufferDependents.Clear();
         _isBuilt = false;
+        // A new recording generation: the nodes just discarded will never run, so the buffers they wrote keep the old
+        // state (unexecuted for good) while what is recorded from here on is marked by the next graph alone.
+        _writes = new WriteState { Ran = _runsWhileRecording };
     }
 
     private void TrackBufferDependencies(ExecutionNode node)
@@ -328,17 +336,19 @@ public sealed class ExecutionGraphBuilder : IDisposable
         internal volatile bool Ran;
     }
 
-    private readonly WriteState _writes = new();
+    private WriteState _writes = new();
+    private bool _runsWhileRecording;
 
     // Buffers a recorded, not yet executed node writes, for every builder in the process: weak on the buffer, so an
     // entry lives exactly as long as the buffer whose contents it describes.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IGpuBuffer, WriteState> s_recordedWrites = new();
 
     /// <summary>The recorder runs each op as it records it (trace by execution): recorded outputs hold real data.</summary>
-    internal void MarkWritesRunWhileRecording() => _writes.Ran = true;
-
-    /// <summary>The graph executed: every recorded output now holds its result.</summary>
-    internal void MarkWritesExecuted() => _writes.Ran = true;
+    internal void MarkWritesRunWhileRecording()
+    {
+        _runsWhileRecording = true;
+        _writes.Ran = true;
+    }
 
     /// <summary>
     /// Whether <paramref name="buffer"/> is the output of a node some deferred scope recorded and has not run: its

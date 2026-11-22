@@ -175,7 +175,7 @@ public sealed class DeferredScope : IDeferredScope
             }
 
             RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
-            GraphBuilder.MarkWritesExecuted();
+            graph.Executed?.Invoke();
             IsExecuted = true;
         }
         finally
@@ -235,7 +235,7 @@ public sealed class DeferredScope : IDeferredScope
             }
 
             RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
-            GraphBuilder.MarkWritesExecuted();
+            graph.Executed?.Invoke();
             IsExecuted = true;
         }
         finally
