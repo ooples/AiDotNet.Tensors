@@ -77,6 +77,12 @@ public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend, 
     public virtual IGpuBuffer AllocateBuffer(int size) => Inner.AllocateBuffer(size);
 
     /// <inheritdoc/>
+    public virtual bool SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) => Inner.SupportsElementType(type);
+
+    /// <inheritdoc/>
+    public virtual IGpuBuffer AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) => Inner.AllocateBuffer(size, type);
+
+    /// <inheritdoc/>
     public virtual float[] DownloadBuffer(IGpuBuffer buffer) => Inner.DownloadBuffer(buffer);
 
     /// <inheritdoc/>

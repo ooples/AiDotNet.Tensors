@@ -145,6 +145,7 @@ public sealed class InferenceWorkspaceHandoffTests
     {
         private static int s_next;
         internal Cell(int size) { Size = size; Handle = new IntPtr(Interlocked.Increment(ref s_next)); }
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size { get; }
         public int Capacity => Size;
         public long SizeInBytes => (long)Size * sizeof(float);

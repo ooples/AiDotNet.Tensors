@@ -14,6 +14,7 @@ public sealed class ChannelBiasLeakyGeometryTests
     private sealed class Buffer : IGpuBuffer
     {
         internal Buffer(int size, int handle, int bytesPerElement = 4) { Size = size; Handle = new IntPtr(handle); SizeInBytes = (long)size * bytesPerElement; }
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size { get; }
         public long SizeInBytes { get; }
         public IntPtr Handle { get; }

@@ -29,7 +29,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// <item><b>Managed</b>: Metal manages synchronization (macOS only).</item>
 /// </list>
 /// </remarks>
-public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
+public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer
 {
     private const long MinimumReclaimCharge = 128 * 1024;
 
@@ -90,6 +90,8 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     /// <inheritdoc/>
     void IPoolableGpuBuffer.MarkRented(int size)
     {
+        // A recycled allocation is a float buffer again until its new owner says otherwise.
+        Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
         // The pool is exact-size (MetalDevice.BufferPool), so a rent is always for this buffer's whole capacity and nothing
         // about the wrapper changes; anything else would hand out a wrong-sized buffer.
         if (size != Size)
@@ -121,6 +123,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     /// <summary>
     /// Gets the number of float elements in the buffer.
     /// </summary>
+    private int _elementType = (int)GpuElementType.Float32;
+    public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
+    void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
     public int Size { get; }
 
     /// <summary>
@@ -372,6 +377,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         _buffer = parent.Handle;
         _device = parent._device;
         _viewParent = parent;
+        _elementType = (int)parent.ElementType;   // the view is the parent's memory, so it is the parent's elements
         _byteOffset = parent._byteOffset + (long)elementOffset * sizeof(float);
         Size = elementCount;
         StorageMode = parent.StorageMode;

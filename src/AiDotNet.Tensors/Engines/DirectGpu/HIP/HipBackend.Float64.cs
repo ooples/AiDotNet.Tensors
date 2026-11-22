@@ -1,0 +1,245 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
+
+using System;
+using AiDotNet.Tensors.Engines.Gpu;
+
+namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
+
+public sealed partial class HipBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply
+{
+    private const int Float64ReductionBlock = 256;
+
+    /// <inheritdoc/>
+    public bool SupportsFloat64Reductions
+        => IsAvailable && _kernelCache.ContainsKey("reduce_sum_f64") && _kernelCache.ContainsKey("reduce_dot_f64");
+
+    /// <inheritdoc/>
+    public double SumFloat64(IGpuBuffer a, int size)
+    {
+        CheckFloat64Operand(a, size, nameof(a));
+        return size == 0 ? 0.0 : ReduceFloat64(a, null, size);
+    }
+
+    /// <inheritdoc/>
+    public double DotFloat64(IGpuBuffer a, IGpuBuffer b, int size)
+    {
+        CheckFloat64Operand(a, size, nameof(a));
+        CheckFloat64Operand(b, size, nameof(b));
+        return size == 0 ? 0.0 : ReduceFloat64(a, b, size);
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsFloat64Elementwise => IsAvailable && Float64ElementwiseKernelsLoaded();
+
+    private bool Float64ElementwiseKernelsLoaded()
+    {
+        foreach (var name in Float64ElementwiseKernelNames)
+            if (!_kernelCache.ContainsKey(name)) return false;
+        return true;
+    }
+
+    private static readonly string[] Float64ElementwiseKernelNames =
+    {
+        "add_f64", "subtract_f64", "multiply_f64", "divide_f64",
+        "negate_f64", "abs_f64", "sqrt_f64", "exp_f64", "log_f64", "tanh_f64",
+        "sigmoid_f64", "relu_f64", "add_scalar_f64", "subtract_scalar_f64", "multiply_scalar_f64", "divide_scalar_f64",
+    };
+
+    /// <inheritdoc/>
+    public unsafe void BinaryFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        if (!SupportsFloat64Elementwise)
+            throw new GpuCapabilityUnavailableException("Double-precision element-wise kernels are not available on this device.");
+        CheckFloat64Operand(a, size, nameof(a));
+        CheckFloat64Operand(b, size, nameof(b));
+        CheckFloat64Operand(output, size, nameof(output));
+        if (size == 0) return;
+        IntPtr kernel = _kernelCache[operation switch
+        {
+            GpuFloat64BinaryOperation.Add => "add_f64",
+            GpuFloat64BinaryOperation.Subtract => "subtract_f64",
+            GpuFloat64BinaryOperation.Multiply => "multiply_f64",
+            GpuFloat64BinaryOperation.Divide => "divide_f64",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+        }];
+        // Every element-wise double kernel takes (a, b, output, size).
+        IntPtr aPtr = a.Handle;
+        IntPtr bPtr = b.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &outputPtr;
+        args[3] = &n;
+        LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void UnaryFloat64(GpuFloat64UnaryOperation operation, IGpuBuffer a, IGpuBuffer output, int size)
+    {
+        if (!SupportsFloat64Elementwise)
+            throw new GpuCapabilityUnavailableException("Double-precision element-wise kernels are not available on this device.");
+        CheckFloat64Operand(a, size, nameof(a));
+        CheckFloat64Operand(output, size, nameof(output));
+        if (size == 0) return;
+        IntPtr kernel = _kernelCache[operation switch
+        {
+            GpuFloat64UnaryOperation.Negate => "negate_f64",
+            GpuFloat64UnaryOperation.Abs => "abs_f64",
+            GpuFloat64UnaryOperation.Sqrt => "sqrt_f64",
+            GpuFloat64UnaryOperation.Exp => "exp_f64",
+            GpuFloat64UnaryOperation.Log => "log_f64",
+            GpuFloat64UnaryOperation.Tanh => "tanh_f64",
+            GpuFloat64UnaryOperation.Sigmoid => "sigmoid_f64",
+            GpuFloat64UnaryOperation.Relu => "relu_f64",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+        }];
+        // Every unary double kernel takes (a, output, size).
+        IntPtr aPtr = a.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &aPtr;
+        args[1] = &outputPtr;
+        args[2] = &n;
+        LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ScalarFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, double scalar, IGpuBuffer output, int size)
+    {
+        if (!SupportsFloat64Elementwise)
+            throw new GpuCapabilityUnavailableException("Double-precision element-wise kernels are not available on this device.");
+        CheckFloat64Operand(a, size, nameof(a));
+        CheckFloat64Operand(output, size, nameof(output));
+        if (size == 0) return;
+        IntPtr kernel = _kernelCache[operation switch
+        {
+            GpuFloat64BinaryOperation.Add => "add_scalar_f64",
+            GpuFloat64BinaryOperation.Subtract => "subtract_scalar_f64",
+            GpuFloat64BinaryOperation.Multiply => "multiply_scalar_f64",
+            GpuFloat64BinaryOperation.Divide => "divide_scalar_f64",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+        }];
+        // Every scalar double kernel takes (a, output, y, size).
+        IntPtr aPtr = a.Handle;
+        IntPtr outputPtr = output.Handle;
+        double y = scalar;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr;
+        args[1] = &outputPtr;
+        args[2] = &y;
+        args[3] = &n;
+        LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsFloat64MatrixMultiply => IsAvailable && HipBlasReady && SupportsFloat64Reductions;
+
+    /// <inheritdoc/>
+    public void MatrixMultiplyFloat64(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+    {
+        if (!HipBlasReady)
+            throw new GpuCapabilityUnavailableException("Double-precision matrix multiply needs hipBLAS, which is not loaded.");
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), m, "Matrix dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), n, "Matrix dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), k, "Matrix dimensions must be positive.");
+        CheckFloat64Operand(a, checked(m * k), nameof(a));
+        CheckFloat64Operand(b, checked(k * n), nameof(b));
+        CheckFloat64Operand(c, checked(m * n), nameof(c));
+        if (ReferenceEquals(c, a) || ReferenceEquals(c, b))
+            throw new ArgumentException("The product buffer must not be one of the operands.", nameof(c));
+        double alpha = 1.0;
+        double beta = 0.0;
+        // hipBLAS is column-major: for row-major operands compute C^T = B^T * A^T, which swaps the operands and M/N.
+        var status = HipBlasNative.hipblasDgemm(
+            _hipblasHandle,
+            HipBlasNative.HipBlasOperation.None,
+            HipBlasNative.HipBlasOperation.None,
+            n, m, k,
+            ref alpha,
+            b.Handle, n,
+            a.Handle, k,
+            ref beta,
+            c.Handle, n); // lgtm[cs/call-to-unmanaged-code] HIP BLAS uses native bindings.
+        if (status != HipBlasNative.HipBlasStatus.Success)
+            throw new InvalidOperationException($"hipblasDgemm failed: {status}");
+    }
+
+    private void CheckFloat64Operand(IGpuBuffer buffer, int size, string name)
+    {
+        if (!SupportsFloat64Reductions)
+            throw new GpuCapabilityUnavailableException("Double-precision reductions are not available on this HIP device.");
+        if (buffer is null) throw new ArgumentNullException(name);
+        if (buffer.ElementType != GpuElementType.Float64)
+            throw new ArgumentException($"Expected a {GpuElementType.Float64} buffer, got {buffer.ElementType}.", name);
+        if (size < 0 || size > buffer.Size)
+            throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) is outside the buffer's {buffer.Size} elements.");
+    }
+
+    // Reduces to one partial per block until one value is left. The first pass multiplies by `multiplier` when it is
+    // given (the dot product); every later pass sums partials. A single element still takes one pass, so the product is
+    // formed and the result lands in a buffer this method owns.
+    private unsafe double ReduceFloat64(IGpuBuffer input, IGpuBuffer? multiplier, int size)
+    {
+        IntPtr sumKernel = _kernelCache["reduce_sum_f64"];
+        IntPtr dotKernel = _kernelCache["reduce_dot_f64"];
+
+        int maximumPartials = (size + Float64ReductionBlock - 1) / Float64ReductionBlock;
+        using var temporaryA = AllocateBuffer(maximumPartials, GpuElementType.Float64);
+        using var temporaryB = AllocateBuffer(maximumPartials, GpuElementType.Float64);
+        IGpuBuffer current = input;
+        int currentSize = size;
+        bool writeA = true;
+        bool first = true;
+        uint sharedBytes = Float64ReductionBlock * sizeof(double);
+        while (currentSize > 1 || first)
+        {
+            int partialCount = (currentSize + Float64ReductionBlock - 1) / Float64ReductionBlock;
+            IGpuBuffer next = writeA ? temporaryA : temporaryB;
+            if (first && multiplier is not null)
+                LaunchFloat64Dot(dotKernel, current, multiplier, next, currentSize, (uint)partialCount, sharedBytes);
+            else
+                LaunchFloat64Sum(sumKernel, current, next, currentSize, (uint)partialCount, sharedBytes);
+            Synchronize();
+
+            current = next;
+            currentSize = partialCount;
+            writeA = !writeA;
+            first = false;
+        }
+
+        // DownloadByteBuffer counts the readback.
+        return BitConverter.ToDouble(DownloadByteBuffer(current, sizeof(double)), 0);
+    }
+
+    // Each launch fills exactly its kernel's parameters: reduce_sum_f64(input, output, size).
+    private unsafe void LaunchFloat64Sum(IntPtr sumKernel, IGpuBuffer input, IGpuBuffer output, int size, uint grid, uint sharedBytes)
+    {
+        IntPtr inputPtr = input.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &inputPtr;
+        args[1] = &outputPtr;
+        args[2] = &n;
+        LaunchKernel(sumKernel, grid, Float64ReductionBlock, args, sharedBytes);
+    }
+
+    // reduce_dot_f64(a, b, output, size).
+    private unsafe void LaunchFloat64Dot(IntPtr dotKernel, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size, uint grid, uint sharedBytes)
+    {
+        IntPtr aPtr = a.Handle;
+        IntPtr bPtr = b.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &outputPtr;
+        args[3] = &n;
+        LaunchKernel(dotKernel, grid, Float64ReductionBlock, args, sharedBytes);
+    }
+}

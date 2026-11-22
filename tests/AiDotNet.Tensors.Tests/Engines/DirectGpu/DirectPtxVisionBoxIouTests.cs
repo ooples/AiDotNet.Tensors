@@ -912,6 +912,7 @@ public sealed class DirectPtxVisionBoxIouTests
 
     private sealed class FakeGpuBuffer(IntPtr handle, long sizeInBytes) : IGpuBuffer
     {
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => checked((int)(sizeInBytes / 4));
         public long SizeInBytes { get; } = sizeInBytes;
         public IntPtr Handle { get; } = handle;

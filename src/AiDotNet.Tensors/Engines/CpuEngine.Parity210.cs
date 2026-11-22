@@ -1094,12 +1094,20 @@ public partial class CpuEngine
         }
 
         var outShape = new int[rank];
-        int outTotal = 1;
+        // Counted in 64 bits and refused by name: the product of two operands' sizes overflows an int long before
+        // either operand is large, and the raw OverflowException said nothing about which op or how big.
+        long outElements = 1;
         for (int k = 0; k < rank; k++)
         {
-            outShape[k] = aShape[k] * bShape[k];
-            outTotal *= outShape[k];
+            long axis = (long)aShape[k] * bShape[k];
+            outElements = axis > int.MaxValue || outElements > int.MaxValue ? long.MaxValue : outElements * axis;
+            if (outElements > int.MaxValue)
+                throw new InvalidOperationException(
+                    $"TensorKron of shapes [{string.Join(",", a._shape)}] and [{string.Join(",", b._shape)}] has more than "
+                    + $"{int.MaxValue} elements; a tensor holds at most that many.");
+            outShape[k] = (int)axis;
         }
+        int outTotal = (int)outElements;
 
         var ops = MathHelper.GetNumericOperations<T>();
         if (!a.IsContiguous) a = a.Contiguous();

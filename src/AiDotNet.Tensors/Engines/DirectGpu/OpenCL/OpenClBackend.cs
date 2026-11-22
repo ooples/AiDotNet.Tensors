@@ -686,6 +686,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _categoricalKernelReady = false;
                 }
 
+                try
+                {
+                    // SafeMathFlags: the reductions accumulate in a fixed tree order, which fast-math may reassociate.
+                    var float64Program = CompileOrLoadCached(
+                        Kernels.Float64Kernels.GetSource(),
+                        OpenClBuildOptions.SafeMathFlags,
+                        "Double-precision kernels");
+                    _programs.Add(float64Program);
+                    foreach (var name in Kernels.Float64Kernels.GetKernelNames())
+                    {
+                        _kernelCache[name] = new DirectOpenClKernel(_context, float64Program, name);
+                    }
+
+                    _float64ReductionsReady = true;
+                }
+                catch (InvalidOperationException float64Failure)
+                {
+                    // No fp64, or the device rejected the program: double tensors stay on the CPU.
+                    _float64ReductionsReady = false;
+                    System.Diagnostics.Trace.TraceWarning(
+                        "OpenCL double-precision kernels are unavailable: {0}", float64Failure);
+                }
+
                 // Compile specialized kernels (hyperbolic geometry, octonion algebra, quantum computing)
                 var specializedProgram = CompileOrLoadCached(SpecializedKernels.GetSource(), optimizationFlags, "Specialized kernels");
                 _programs.Add(specializedProgram);
@@ -1610,6 +1633,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool, _memoryAccount) { ReclaimEpoch = reclaimEpoch };
         }
 
+        /// <inheritdoc/>
+        // OpenCL C has every element type but double, which is the cl_khr_fp64 extension. Half is stored and loaded with
+        // the core vload_half / vstore_half whatever cl_khr_fp16 says.
+        public bool SupportsElementType(GpuElementType type)
+            => (type != GpuElementType.Unspecified && Enum.IsDefined(typeof(GpuElementType), type))
+                && (type != GpuElementType.Float64 || (_context?.Extensions.Contains("cl_khr_fp64") ?? false));
+
+        /// <inheritdoc/>
+        public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
+
         public IGpuBuffer AllocateBuffer(int size)
         {
             if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest)
@@ -1715,10 +1748,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (byteCount < 0)
                 throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+            if (buffer is DirectOpenClGpuBuffer wordBuffer)
+            {
+                // A float or int buffer: its bytes are its 4-byte elements, read back unconverted (the read is a
+                // memory copy, so an int's bits survive the float array). CUDA and HIP read any buffer by handle.
+                if (byteCount > wordBuffer.SizeInBytes)
+                    throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({wordBuffer.SizeInBytes}).", nameof(byteCount));
+                var bytes = new byte[byteCount];
+                if (byteCount == 0) return bytes;
+                // Only the words that cover the request: a few bytes of a large buffer must not cost its whole read.
+                int words = (int)(((long)byteCount + sizeof(float) - 1) / sizeof(float));
+                GpuLaunchProbe.OnReadback((long)words * sizeof(float), GpuBackendType.OpenCl);
+                Buffer.BlockCopy(wordBuffer.Buffer.ToArray(words), 0, bytes, 0, byteCount);
+                return bytes;
+            }
+
             if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
-                throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
-            if (byteCount > byteBuffer.Size)
-                throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({byteBuffer.Size}).", nameof(byteCount));
+                throw new ArgumentException("Buffer must be an OpenCL buffer of this backend.", nameof(buffer));
+            if (byteCount > byteBuffer.SizeInBytes)
+                throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({byteBuffer.SizeInBytes}).", nameof(byteCount));
             GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.OpenCl);
 
             var result = new byte[byteCount];
@@ -1736,8 +1784,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentNullException(nameof(data));
             if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
                 throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
-            if (data.Length > byteBuffer.Size)
-                throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({byteBuffer.Size} bytes).", nameof(data));
+            if (data.Length > byteBuffer.SizeInBytes)
+                throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({byteBuffer.SizeInBytes} bytes).", nameof(data));
             GpuLaunchProbe.OnUpload(data, sizeof(byte), GpuBackendType.OpenCl);
 
             byteBuffer.Upload(data);
@@ -9212,7 +9260,10 @@ KERNEL VARIANTS (A/B testing):
             k.Execute2D(embeddingDim, numIndices, localX, localY);
         }
 
-        public IGpuBuffer AllocateIntBuffer(int size) => AllocateBuffer(size);
+        // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+        public IGpuBuffer AllocateIntBuffer(int size) => GpuBufferTyping.Tag(AllocateIntBufferCore(size), GpuElementType.Int32);
+
+        private IGpuBuffer AllocateIntBufferCore(int size) => AllocateBuffer(size);
 
         /// <inheritdoc/>
         public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
@@ -9274,11 +9325,14 @@ KERNEL VARIANTS (A/B testing):
             }
         }
 
-        public IGpuBuffer AllocateIntBuffer(int[] data)
+        // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.
+        public IGpuBuffer AllocateIntBuffer(int[] data) => GpuBufferTyping.Tag(AllocateIntBufferCore(data), GpuElementType.Int32);
+
+        private IGpuBuffer AllocateIntBufferCore(int[] data)
         {
             if (BufferAllocationDiagnostics.Enabled && !BufferAllocationDiagnostics.IsInsideRequest && data is not null)
                 return BufferAllocationDiagnostics.Observe("OpenCL", (long)data.Length * sizeof(float), (this, data),
-                    static state => state.Item1.AllocateIntBuffer(state.Item2));
+                    static state => state.Item1.AllocateIntBufferCore(state.Item2));
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
             if (data is null)
@@ -14829,7 +14883,7 @@ KERNEL VARIANTS (A/B testing):
     /// OpenCL GPU buffer wrapper implementing IGpuBuffer.
     /// Uses pure P/Invoke with no managed GPU runtime dependency.
     /// </summary>
-    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource
+    internal sealed class DirectOpenClGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer
     {
         internal readonly DirectOpenClBuffer Buffer;
         private readonly IGpuBuffer? _viewParent;
@@ -14839,6 +14893,9 @@ KERNEL VARIANTS (A/B testing):
         internal bool IsReleased => Volatile.Read(ref _poolState) != 0;
         private int _size;
 
+        private int _elementType = (int)GpuElementType.Float32;
+        public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
+        void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
         public int Size => Volatile.Read(ref _size);
         public int Capacity => Buffer.Length;
         public long SizeInBytes => (long)Size * sizeof(float);
@@ -14918,6 +14975,8 @@ KERNEL VARIANTS (A/B testing):
 
         public void MarkRented(int size)
         {
+            // A recycled allocation is a float buffer again until its new owner says otherwise.
+            Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
             if (size <= 0 || size > Capacity)
                 throw new ArgumentOutOfRangeException(nameof(size));
             Volatile.Write(ref _size, size);
@@ -15088,12 +15147,21 @@ KERNEL VARIANTS (A/B testing):
     /// OpenCL byte buffer wrapper implementing IGpuBuffer.
     /// Used for sparse matrix indices (1 byte per group of 4 elements).
     /// </summary>
-    internal sealed class DirectOpenClGpuByteBuffer : IGpuBuffer
+    internal sealed class DirectOpenClGpuByteBuffer : IGpuBuffer, IElementTypedByteBuffer
     {
         internal readonly DirectOpenClByteBuffer Buffer;
         private int _disposed;
 
-        public int Size => Buffer.Length;
+        public GpuElementType ElementType { get; private set; } = GpuElementType.Unspecified;
+        public int Size => _elementCount >= 0 ? _elementCount : Buffer.Length;
+        private int _elementCount = -1; // set once the bytes are declared elements of a type
+        void IElementTypedByteBuffer.DeclareElements(GpuElementType type, int count)
+        {
+            if (count < 0 || (long)count * GpuElementTypes.SizeInBytes(type) > SizeInBytes)
+                throw new ArgumentOutOfRangeException(nameof(count), $"{count} {type} elements do not fit in {SizeInBytes} bytes.");
+            ElementType = type;
+            _elementCount = count;
+        }
         public long SizeInBytes => Buffer.Length;
         public IntPtr Handle => Buffer.Handle;
 

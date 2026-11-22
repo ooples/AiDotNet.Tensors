@@ -1629,6 +1629,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                     return null;
                 }
                 UploadHostToOffload();
+                // By element type where the allocator takes one: the buffer then reports what the tensor holds
+                // (double, int, ...) and a typed transfer of it is accepted.
+                if (allocator is Engines.DirectGpu.IGpuTypedDevicePointerWrapper typed
+                    && Engines.DirectGpu.GpuElementTypes.TryFromClrType<T>(out var elementType)
+                    && Engines.DirectGpu.GpuElementTypes.SizeInBytes(elementType) == ElementByteSize())
+                    return typed.WrapDevicePointerAsBuffer(OffloadDevicePointer, Length, elementType);
                 return wrapper.WrapDevicePointerAsBuffer(
                     OffloadDevicePointer, Length, ElementByteSize());
             }

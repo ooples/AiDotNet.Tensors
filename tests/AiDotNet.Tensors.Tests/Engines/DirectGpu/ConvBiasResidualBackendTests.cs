@@ -184,6 +184,7 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
 
     private sealed class FakeBuffer : IGpuBuffer
     {
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => int.MaxValue;
         public long SizeInBytes => (long)int.MaxValue * sizeof(float);
         public IntPtr Handle => new IntPtr(1);

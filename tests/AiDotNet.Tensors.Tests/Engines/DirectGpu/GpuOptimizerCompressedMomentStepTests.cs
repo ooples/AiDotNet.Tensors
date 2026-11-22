@@ -25,6 +25,7 @@ public class GpuOptimizerCompressedMomentStepTests
     {
         public CapacityOnlyBuffer(long bytes) => SizeInBytes = bytes;
         public long SizeInBytes { get; }
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => 1024;
         public IntPtr Handle => IntPtr.Zero;
         public void Dispose() { }
@@ -33,6 +34,7 @@ public class GpuOptimizerCompressedMomentStepTests
     private sealed class NoAccessBuffer : IGpuBuffer
     {
         public long SizeInBytes => throw new InvalidOperationException("Empty steps must not access buffers.");
+        public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
         public int Size => throw new InvalidOperationException("Empty steps must not access buffers.");
         public IntPtr Handle => throw new InvalidOperationException("Empty steps must not access buffers.");
         public void Dispose() { }

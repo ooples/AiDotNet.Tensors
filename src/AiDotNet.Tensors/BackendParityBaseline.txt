@@ -4,6 +4,9 @@
 
 
 
+capability IGpuFloat64Reductions MetalBackend #1799
+capability IGpuFloat64Reductions VulkanBackend #1799
+capability IGpuFloat64Reductions WebGpuBackend #1799
 capability IConvPreActivationBackend HipBackend #1749
 capability IConvPreActivationBackend MetalBackend #1749
 capability IConvPreActivationBackend OpenClBackend #1749
@@ -14,3 +17,9 @@ capability IRowConcatBackend MetalBackend #1749
 capability IRowConcatBackend OpenClBackend #1749
 capability IRowConcatBackend VulkanBackend #1749
 capability IRowConcatBackend WebGpuBackend #1749
+capability IGpuFloat64Elementwise MetalBackend #1799
+capability IGpuFloat64Elementwise VulkanBackend #1799
+capability IGpuFloat64Elementwise WebGpuBackend #1799
+capability IGpuFloat64MatrixMultiply MetalBackend #1799
+capability IGpuFloat64MatrixMultiply VulkanBackend #1799
+capability IGpuFloat64MatrixMultiply WebGpuBackend #1799

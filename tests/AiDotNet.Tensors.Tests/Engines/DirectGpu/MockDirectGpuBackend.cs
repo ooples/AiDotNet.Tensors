@@ -25,6 +25,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 internal sealed class MockGpuBuffer : IGpuBuffer
 {
     public float[] Data { get; }
+    public AiDotNet.Tensors.Engines.DirectGpu.GpuElementType ElementType => AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32;
     public int Size => Data.Length;
     public long SizeInBytes => (long)Data.Length * sizeof(float);
     public IntPtr Handle { get; }
@@ -182,6 +183,15 @@ public class MockDirectGpuBackend : DispatchProxy
                 var copy = new float[arr.Length];
                 Array.Copy(arr, copy, arr.Length);
                 var buffer = new MockGpuBuffer(copy);
+                _state.AllocatedBuffers.Add(buffer);
+                return buffer;
+            }
+            case "SupportsElementType":
+                return args[0] is GpuElementType.Float32;
+            case "AllocateBuffer" when args.Length == 2 && args[0] is int typedSize && args[1] is GpuElementType.Float32:
+            {
+                _state.AllocationSizes.Add(typedSize);
+                var buffer = new MockGpuBuffer(new float[typedSize]);
                 _state.AllocatedBuffers.Add(buffer);
                 return buffer;
             }

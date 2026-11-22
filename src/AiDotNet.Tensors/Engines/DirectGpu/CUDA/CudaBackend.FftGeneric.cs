@@ -393,6 +393,7 @@ public sealed partial class CudaBackend : IGenericFftBackend
         private IGpuBuffer Buffer => _buffer ??
             throw new ObjectDisposedException(nameof(DeferredFftScratchBuffer));
 
+        public GpuElementType ElementType => Buffer.ElementType;
         public int Size => Buffer.Size;
         public long SizeInBytes => Buffer.SizeInBytes;
         public IntPtr Handle => Buffer.Handle;

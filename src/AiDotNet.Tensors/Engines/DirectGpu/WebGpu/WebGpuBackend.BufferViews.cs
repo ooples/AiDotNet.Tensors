@@ -20,9 +20,15 @@ public sealed partial class WebGpuBackend : IGpuBufferViews
     IGpuBuffer? IGpuBufferViews.TryCreateView(IGpuBuffer parent, int elementOffset, int elementCount)
     {
         if (parent is not WebGpuBuffer owner || !owner.IsValid) return null;
+        // Offsets below are counted in 4-byte words: a parent of another element width has no such view.
+        if (!GpuElementTypes.IsWordAddressed(owner.ElementType)) return null;
         if (elementOffset < 0 || elementCount <= 0 || (long)elementOffset + elementCount > owner.Size) return null;
         if ((owner.OffsetBytes + (long)elementOffset * sizeof(float)) % ViewOffsetAlignment != 0) return null;
-        return new WebGpuBuffer(owner, elementOffset, elementCount);
+        var view = new WebGpuBuffer(owner, elementOffset, elementCount);
+        // The view is the parent's memory, so it is the parent's elements (SetElementType, not Tag: an untyped parent
+        // has no element size for Tag to compare).
+        ((IRetypableGpuBuffer)view).SetElementType(owner.ElementType);
+        return view;
     }
 }
 #endif

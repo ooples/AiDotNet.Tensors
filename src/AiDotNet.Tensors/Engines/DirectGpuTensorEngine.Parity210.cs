@@ -24,7 +24,7 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return null;
-        if (backend is not IParity210Backend p210)
+        if (backend is not IParity210Backend p210 || !DeviceKeepsPrecision<T>(backend, "Parity210"))
             return null;
 
         using var inBuf = GetOrAllocateBuffer(backend, input);
@@ -52,7 +52,7 @@ public partial class DirectGpuTensorEngine
         using var __gpuOp = EnterGpuOp();
         if (!TryGetBackend(out var backend))
             return null;
-        if (backend is not IParity210Backend p210)
+        if (backend is not IParity210Backend p210 || !DeviceKeepsPrecision<T>(backend, "Parity210"))
             return null;
         if (a.Length != b.Length)
             return null;
