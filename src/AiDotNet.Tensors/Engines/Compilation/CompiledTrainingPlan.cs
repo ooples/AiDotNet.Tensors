@@ -17204,6 +17204,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool accumBias = gradWriterCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
             // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
             bool needInputGrad = requiresGrad.Contains(x);
+            // A frozen kernel (a GAN discriminator read by the generator's step) needs no weight gradient either.
+            bool needKernelGrad = requiresGrad.Contains(kernel);
             var xShape = (int[])x._shape.Clone();
             var kShape = (int[])kernel._shape.Clone();
             var convOutF = (Tensor<float>)(object)convOut;
@@ -17253,8 +17255,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (needInputGrad)
                         cpu.Conv2DBackwardInputInto(gradX, gradConvOut, kernel, xShape,
                             capStride, capPadding, capDilation, accumX);
-                    cpu.Conv2DBackwardKernelInto(gradKernel, gradConvOut, x, kShape,
-                        capStride, capPadding, capDilation, accumKernel);
+                    if (needKernelGrad)
+                        cpu.Conv2DBackwardKernelInto(gradKernel, gradConvOut, x, kShape,
+                            capStride, capPadding, capDilation, accumKernel);
                 }
                 else
                 {
@@ -17263,7 +17266,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         + eng.GetType().Name + ".");
                 }
                 if (needInputGrad) x.Grad = gradX;
-                kernel.Grad = gradKernel;
+                if (needKernelGrad) kernel.Grad = gradKernel;
                 bias.Grad = gradBias;
             };
             consumed.Add(convIdx);
