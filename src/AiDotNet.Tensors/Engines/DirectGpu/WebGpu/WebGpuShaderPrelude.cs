@@ -451,17 +451,21 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
     {
         System.Text.StringBuilder? result = null;
         int copied = 0;
-        // Names of scalar-valued functions that are not members (x.length is a field, not a call).
-        foreach (Match name in Identifier.Matches(argument).Cast<Match>().Where(name =>
-                     types.ScalarFunctions.Contains(name.Value) && (name.Index == 0 || argument[name.Index - 1] != '.')))
+        // Calls to scalar-valued functions that are not members (x.length is a field, not a call), each with the
+        // extent of its argument list.
+        var calls = Identifier.Matches(argument).Cast<Match>()
+            .Where(name => types.ScalarFunctions.Contains(name.Value) && (name.Index == 0 || argument[name.Index - 1] != '.'))
+            .Select(name => (Start: name.Index, Open: SkipTrivia(argument, name.Index + name.Length)))
+            .Where(call => call.Open < argument.Length && argument[call.Open] == '(')
+            .Select(call => (call.Start, Close: Matching(argument, call.Open, '(', ')')))
+            .Where(call => call.Close >= 0)
+            .ToList();
+        for (int c = 0; c < calls.Count; c++)
         {
-            if (name.Index < copied) continue;   // inside a call already replaced
-            int open = SkipTrivia(argument, name.Index + name.Length);
-            if (open >= argument.Length || argument[open] != '(') continue;
-            int close = Matching(argument, open, '(', ')');
-            if (close < 0) continue;
+            var (start, close) = calls[c];
+            if (start < copied) continue;   // inside a call already replaced
             result ??= new System.Text.StringBuilder(argument.Length);
-            result.Append(argument, copied, name.Index - copied).Append("0.0");
+            result.Append(argument, copied, start - copied).Append("0.0");
             copied = close + 1;
         }
         return result is null ? argument : result.Append(argument, copied, argument.Length - copied).ToString();
