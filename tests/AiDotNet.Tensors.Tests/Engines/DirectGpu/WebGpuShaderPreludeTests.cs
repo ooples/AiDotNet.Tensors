@@ -95,6 +95,82 @@ fn tanh_derivative(t: f32) -> f32 { return 1.0 - t * t; }
         Assert.Contains("fn wgsl_tanh(", WebGpuShaderPrelude.Prepare(directives + Kernel));
     }
 
+    // A let or var takes its initializer's type, an element of an array of vectors is a vector, and neither may reach
+    // the scalar helper.
+    [Fact]
+    public void Inferred_vectors_and_vector_array_elements_keep_the_builtin()
+    {
+        const string source = @"
+fn f(v: vec2<f32>, a: array<vec3<f32>, 4>) -> f32 {
+    let u = v;
+    var w = u * 2.0;
+    let t = tanh(u) + tanh(w);
+    let e = tanh(a[1]);
+    return tanh(u.x) + tanh(a[1].y) + tanh(a[2][0]) + t.x + e.x;
+}";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        foreach (var kept in new[] { "tanh(u) ", "tanh(w)", "= tanh(a[1]);" })
+            Assert.Contains(kept, prepared);
+        foreach (var rewritten in new[] { "wgsl_tanh(u.x)", "wgsl_tanh(a[1].y)", "wgsl_tanh(a[2][0])" })
+            Assert.Contains(rewritten, prepared);
+    }
+
+    // dot and length reduce their vector operands to a scalar, as does a function declared with a scalar result: the
+    // accurate path must apply to them.
+    [Fact]
+    public void Scalar_results_of_vector_operands_are_rewritten()
+    {
+        const string source = @"
+fn norm(v: vec3<f32>) -> f32 { return v.x; }
+fn f(v: vec3<f32>) -> f32 {
+    return tanh(dot(v, v)) + log(length(v)) + log2(norm(v)) + tanh(v).x;
+}";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.Contains("wgsl_tanh(dot(v, v))", prepared);
+        Assert.Contains("wgsl_log(length(v))", prepared);
+        Assert.Contains("wgsl_log2(norm(v))", prepared);
+        Assert.Contains(" tanh(v).x", prepared);
+    }
+
+    // A ';' inside a comment does not end the directive: the helpers must land after the real one.
+    [Fact]
+    public void A_semicolon_inside_a_comment_does_not_end_a_directive()
+    {
+        const string source = "enable /* ; */ subgroups;\nfn f(x: f32) -> f32 { return tanh(x); }";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        int directive = prepared.IndexOf("subgroups;", System.StringComparison.Ordinal);
+        int helper = prepared.IndexOf("fn wgsl_tanh(", System.StringComparison.Ordinal);
+        Assert.True(helper > directive, "The helper was inserted before the directive ended.");
+        Assert.Contains("return wgsl_tanh(x);", prepared);
+        Assert.StartsWith("enable /* ; */ subgroups;", prepared);
+        // An extension named only inside a comment is not enabled.
+        Assert.Contains("fn wgsl_tanh(", WebGpuShaderPrelude.Prepare("enable /* f16, */ subgroups;\n" + Kernel));
+    }
+
+    // Module-scope initializers, attributes and array counts need const-expressions; a helper call is not one.
+    [Fact]
+    public void Calls_that_must_be_evaluated_early_keep_the_builtin()
+    {
+        const string source = @"
+var<private> scale: f32 = log(2.0);
+const half: f32 = log2(1.5);
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@compute @workgroup_size(u32(log2(64.0)))
+fn main() {
+    var local: array<f32, u32(log2(16.0))>;
+    const c = tanh(0.5);
+    data[0] = log(data[1]) + tanh(data[2]) + local[0] + c + scale + half;
+}";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        foreach (var kept in new[]
+                 {
+                     "scale: f32 = log(2.0);", "half: f32 = log2(1.5);", "@workgroup_size(u32(log2(64.0)))",
+                     "array<f32, u32(log2(16.0))>", "const c = tanh(0.5);",
+                 })
+            Assert.Contains(kept, prepared);
+        Assert.Contains("wgsl_log(data[1]) + wgsl_tanh(data[2])", prepared);
+    }
+
     [Fact]
     public void Mentioning_f16_in_a_comment_does_not_turn_the_rewrite_off()
     {
