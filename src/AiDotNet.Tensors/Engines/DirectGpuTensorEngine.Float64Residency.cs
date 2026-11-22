@@ -36,9 +36,11 @@ public partial class DirectGpuTensorEngine
 {
     private sealed class Float64Resident
     {
-        public Float64Resident(object key, IGpuBuffer buffer, IDirectGpuBackend backend, int length, int hostVersion, long stamp)
+        public Float64Resident(object key, IGpuBuffer buffer, IDirectGpuBackend backend, int length, int hostVersion, long stamp,
+            object? registration = null)
         {
             Key = new WeakReference<object>(key);
+            Registration = registration is null ? null : new WeakReference<object>(registration);
             Buffer = buffer;
             Backend = backend;
             Length = length;
@@ -48,6 +50,9 @@ public partial class DirectGpuTensorEngine
 
         /// <summary>The tensor's data vector, which every view of it shares.</summary>
         public WeakReference<object> Key { get; }
+        /// <summary>The registered persistent array this is a kept upload of (null for a device result): what
+        /// invalidation names, and what any number of tensors over that array share.</summary>
+        public WeakReference<object>? Registration { get; }
         public IGpuBuffer Buffer { get; }
         public IDirectGpuBackend Backend { get; }
         public int Length { get; }
@@ -122,6 +127,9 @@ public partial class DirectGpuTensorEngine
         if (Float64BinaryOperationFor(callerName) is not { } operation) return null;
         int length = left.Length;
         if (length < Float64ElementwiseMinLength || right.Length != length) return null;
+        // Element i of one operand meets element i of the other in storage order: operands laid out differently are the
+        // CPU engine's, which reorders them.
+        if (left.Layout != right.Layout) return null;
         // A compiled step replays launches through baked buffer addresses; these buffers are not part of its plan.
         if (ResidentStepActive || !IsGpuPrecisionSafe(left, right) || !TryGetBackend(out var backend)) return null;
         if (backend is not IGpuFloat64Elementwise { SupportsFloat64Elementwise: true } elementwise) return null;
@@ -149,6 +157,7 @@ public partial class DirectGpuTensorEngine
             {
                 elementwise.BinaryFloat64(operation, a.Buffer, b.Buffer, output, length);
                 var result = RegisterFloat64Result(backend, output, length, left.Shape.ToArray());
+                result.Layout = left.Layout;
                 GpuPrecisionDiagnostics.Publish(plan);
                 return result;
             }
@@ -219,7 +228,11 @@ public partial class DirectGpuTensorEngine
             try
             {
                 launch(elementwise, a.Buffer, output, length);
-                return RegisterFloat64Result(backend, output, length, input.Shape.ToArray());
+                var result = RegisterFloat64Result(backend, output, length, input.Shape.ToArray());
+                // The kernel maps the elements in storage order, so the result is laid out as its input is (a packed
+                // NCHWc tensor stays packed), as the CPU engine's elementwise ops leave it.
+                result.Layout = input.Layout;
+                return result;
             }
             catch (NotSupportedException capabilityGap)
             {
@@ -250,6 +263,16 @@ public partial class DirectGpuTensorEngine
     // 110 ms at 2048 cubed) while a vendor dgemm on a workstation GPU beats the CPU several times over. So the first
     // multiply of each size class runs both and the faster one is used from then on.
     private readonly Dictionary<(int WorkLog2, bool Uploads), bool> _float64MatMulDeviceWins = new();
+
+    /// <summary>How many size classes this engine has measured (both routes timed) so far. Diagnostic.</summary>
+    internal long Float64MatMulMeasurements => Interlocked.Read(ref _float64MatMulMeasurements);
+    private long _float64MatMulMeasurements;
+
+    /// <summary>Forgets every measured matrix-multiply route, so the next multiply of each size class measures again.</summary>
+    internal void ResetFloat64MatMulDecisions()
+    {
+        lock (_float64Lock) _float64MatMulDeviceWins.Clear();
+    }
 
     /// <summary>
     /// <c>a · b</c> for double operands, computed by whichever of the device and the CPU engine is faster for this size
@@ -289,6 +312,7 @@ public partial class DirectGpuTensorEngine
 
                 // First multiply of this size class: run both, twice each (the first run of either pays one-time
                 // costs), and keep the faster. Its product is returned, so nothing is computed a third time.
+                Interlocked.Increment(ref _float64MatMulMeasurements);
                 var clock = new System.Diagnostics.Stopwatch();
                 var warmUp = MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
                 backend.Synchronize();
@@ -360,7 +384,7 @@ public partial class DirectGpuTensorEngine
     {
         sum = 0.0;
         int length = tensor.Length;
-        if (length == 0 || ResidentStepActive || !TryGetBackend(out var backend)) return false;
+        if (length == 0 || ResidentStepActive || !IsGpuPrecisionSafe(tensor) || !TryGetBackend(out var backend)) return false;
         if (backend is not IGpuFloat64Reductions { SupportsFloat64Reductions: true } reductions
             || !backend.SupportsElementType(GpuElementType.Float64))
             return false;
@@ -380,6 +404,12 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap)
         {
             GpuLaunchProbe.OnFallback("TensorSumFloat64", capabilityGap);
+            return false;
+        }
+        catch (GpuBufferTooLargeException tooLarge)
+        {
+            // The CPU engine's under the default chunking policy; rethrown under fail-fast, as the float path does.
+            HandleBufferTooLarge<double>(tooLarge, "TensorSumFloat64");
             return false;
         }
     }
@@ -412,6 +442,13 @@ public partial class DirectGpuTensorEngine
         lock (_float64Lock)
         {
             if (_float64ByVector.TryGetValue(tensor.DataVector, out var resident)) ReleaseFloat64Resident(resident, bringToHost: true);
+            // The registration is the ARRAY: another tensor wrapping the same array through its own vector has its own
+            // kept upload of it, which the host write made just as stale.
+            if (tensor.GetBackingArrayForCacheLookupUnsafe() is not { } registered) return;
+            var sameArray = _float64All
+                .Where(other => other.Registration is { } weak && weak.TryGetTarget(out var array) && ReferenceEquals(array, registered))
+                .ToList();
+            foreach (var other in sameArray) ReleaseFloat64Resident(other, bringToHost: false);
         }
     }
 
@@ -461,7 +498,8 @@ public partial class DirectGpuTensorEngine
         if (keep)
         {
             // Registered persistent: this upload is kept and reused until the host writes the tensor.
-            AddFloat64Resident(new Float64Resident(tensor.DataVector, upload, backend, tensor.Length, tensor.GpuCacheVersion, ++_float64Stamp));
+            AddFloat64Resident(new Float64Resident(tensor.DataVector, upload, backend, tensor.Length, tensor.GpuCacheVersion, ++_float64Stamp,
+                registration: tensor.GetBackingArrayForCacheLookupUnsafe()));
             return new OwnedBuffer(upload, ownsBuffer: false);
         }
 
@@ -536,8 +574,17 @@ public partial class DirectGpuTensorEngine
                 // Still over with every dropped result reclaimed: the rest are reachable, so the oldest come down.
                 if (_float64ResidentBytes + bytes > budget)
                 {
-                    DisposeFloat64Pool();
-                    EvictFloat64Residents(budget - bytes, left, right);
+                    // The buffer is this method's until it is returned: nothing else can free it if making room throws.
+                    try
+                    {
+                        DisposeFloat64Pool();
+                        EvictFloat64Residents(budget - bytes, left, right);
+                    }
+                    catch
+                    {
+                        pooled.Dispose();
+                        throw;
+                    }
                 }
 
                 return pooled;
@@ -578,22 +625,15 @@ public partial class DirectGpuTensorEngine
         while (stack.Count > 0)
         {
             var candidate = stack.Pop();
-            bool taken = false;
-            try
-            {
-                _float64PoolBytes -= (long)length * sizeof(double);
-                taken = IsLiveDeviceBuffer(candidate) && ReferenceEquals(_float64PoolBackend, backend);
-            }
-            finally
-            {
-                if (!taken) candidate.Dispose();
-            }
-
-            if (taken)
+            _float64PoolBytes -= (long)length * sizeof(double);
+            if (IsLiveDeviceBuffer(candidate) && ReferenceEquals(_float64PoolBackend, backend))
             {
                 buffer = candidate;
                 return true;
             }
+
+            // A buffer of a backend that is gone, or already released: only its wrapper is left to dispose.
+            candidate.Dispose();
         }
 
         return false;
@@ -626,7 +666,18 @@ public partial class DirectGpuTensorEngine
             if (_float64ResidentBytes + _float64PoolBytes <= targetBytes) break;
             if (resident.Key.TryGetTarget(out var key) && (ReferenceEquals(key, keepLeft) || ReferenceEquals(key, keepRight)))
                 continue;
-            ReleaseFloat64Resident(resident, bringToHost: true);
+            try
+            {
+                ReleaseFloat64Resident(resident, bringToHost: true);
+            }
+            catch (InvalidOperationException downloadFailure)
+            {
+                // Its values could not be brought down, so it keeps its buffer (a later read retries the download)
+                // and the room is made from the next oldest instead.
+                System.Diagnostics.Trace.TraceWarning(
+                    "[AiDotNet] A resident double tensor could not be brought back to the host and stays on the device: {0}",
+                    downloadFailure);
+            }
         }
     }
 
@@ -635,18 +686,18 @@ public partial class DirectGpuTensorEngine
     private void ReleaseFloat64Resident(Float64Resident resident, bool bringToHost, bool toPool = false)
     {
         if (resident.Released) return;
+        resident.Key.TryGetTarget(out var key);
+        // Before anything is given up: the pending download reads this buffer, and a failed one stays pending for a
+        // retry, so a throw here leaves the resident registered with its buffer. Decided under the storage's lock,
+        // which also waits for a download another thread is running on this buffer.
+        if (bringToHost && key is not null) Helpers.HostSync.Settle(key);
         resident.Released = true;
         _float64All.Remove(resident);
         _float64ResidentBytes -= resident.Bytes;
         bool pooled = false;
         try
         {
-            if (resident.Key.TryGetTarget(out var key))
-            {
-                _float64ByVector.Remove(key);
-                // Also waits for a download another thread is running on this buffer.
-                if (bringToHost && Helpers.HostSync.IsPending(key)) Helpers.HostSync.TryMaterialize(key);
-            }
+            if (key is not null) _float64ByVector.Remove(key);
 
             if (toPool && IsLiveDeviceBuffer(resident.Buffer)
                 && (_float64PoolBackend is null || ReferenceEquals(_float64PoolBackend, resident.Backend)))
@@ -679,9 +730,14 @@ public partial class DirectGpuTensorEngine
                 catch (InvalidOperationException downloadFailure)
                 {
                     // The device is already gone (teardown after a lost context): the values cannot be recovered, and
-                    // the remaining buffers still have to be freed.
+                    // the buffer still has to be freed. The result is marked unavailable, so a later host read reports
+                    // that instead of running a download against the freed buffer.
                     System.Diagnostics.Trace.TraceWarning(
                         "[AiDotNet] A resident double tensor could not be brought back to the host: {0}", downloadFailure);
+                    if (resident.Key.TryGetTarget(out var lost))
+                        Helpers.HostSync.Release(lost,
+                            "This tensor's values were on a GPU device that was released before they could be downloaded.");
+                    ReleaseFloat64Resident(resident, bringToHost: false);
                 }
             }
 

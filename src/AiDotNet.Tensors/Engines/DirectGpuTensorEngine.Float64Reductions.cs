@@ -30,7 +30,7 @@ public partial class DirectGpuTensorEngine
     private bool TryGetFloat64Reductions(int length, out IDirectGpuBackend backend, out IGpuFloat64Reductions reductions)
     {
         reductions = null!;
-        if (length < Float64ReductionMinLength || !TryGetBackend(out backend))
+        if (length < Float64ReductionMinLength || DirectGpuEngine.StrictFp64Fallback || !TryGetBackend(out backend))
         {
             backend = null!;
             return false;
@@ -62,6 +62,12 @@ public partial class DirectGpuTensorEngine
             GpuLaunchProbe.OnFallback("SumFloat64", capabilityGap);
             return false;
         }
+        catch (GpuBufferTooLargeException tooLarge)
+        {
+            // The CPU engine's under the default chunking policy; rethrown under fail-fast, as the float path does.
+            HandleBufferTooLarge<double>(tooLarge, "SumFloat64");
+            return false;
+        }
     }
 
     private bool TryDotFloat64(Vector<double> a, Vector<double> b, out double dot)
@@ -87,6 +93,12 @@ public partial class DirectGpuTensorEngine
         catch (NotSupportedException capabilityGap)
         {
             GpuLaunchProbe.OnFallback("DotFloat64", capabilityGap);
+            return false;
+        }
+        catch (GpuBufferTooLargeException tooLarge)
+        {
+            // The CPU engine's under the default chunking policy; rethrown under fail-fast, as the float path does.
+            HandleBufferTooLarge<double>(tooLarge, "DotFloat64");
             return false;
         }
     }

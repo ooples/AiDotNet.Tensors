@@ -11533,7 +11533,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // record nothing, so the inputs got no gradient at all under a tape.
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
             return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
-        if (!TryGetBackend(out var backend))
+        // (and a double the policy preserves: its operands are fetched outside any try, so the refusal is decided here)
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.FusedConv3D(input, kernel, bias, strideD, strideH, strideW, padD, padH, padW, dilationD, dilationH, dilationW, activation);
 
         // Expected input shape: [batch, inChannels, depth, height, width]
@@ -12386,7 +12387,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> DepthwiseConv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend))
+        // A double the policy preserves is the CPU engine's: the operands below are fetched outside any try.
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.DepthwiseConv2D(input, kernel, stride, padding);
 
         // Expected input shape: [batch, channels, height, width]
@@ -27662,7 +27664,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
         using var __gpuOp = EnterGpuOp();
-        if (Compilation.GraphMode.IsActive)
+        // (A double the policy preserves is the CPU engine's too: the operands below are fetched outside any try.)
+        if (Compilation.GraphMode.IsActive || RefusesDoubleNarrowing<T>())
             return base.Dropout(input, dropoutRate, training, out mask);
         if (!TryGetBackend(out var backend))
             return base.Dropout(input, dropoutRate, training, out mask);

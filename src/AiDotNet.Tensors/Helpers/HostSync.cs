@@ -185,6 +185,22 @@ internal sealed class HostSync
         return sync is not null && sync.MakeHostCurrent();
     }
 
+    /// <summary>
+    /// Leaves <paramref name="key"/> with no download pending or running: runs the pending one, and waits for one
+    /// another thread is running. For a caller about to free the device buffer the download reads; unlike
+    /// <see cref="IsPending"/> followed by <see cref="TryMaterialize"/> it decides under the storage lock, so a
+    /// download cannot start between the check and the free. Throws what the download throws (it stays pending).
+    /// </summary>
+    internal static void Settle(object key)
+    {
+        var sync = Find(key);
+        if (sync is null) return;
+        lock (sync._lock)
+        {
+            if (sync._pending is not null) sync.MakeHostCurrent();
+        }
+    }
+
     /// <summary>Downloads the device copy into the host array if it is pending (see <see cref="TryMaterialize"/>).</summary>
     internal bool MakeHostCurrent()
     {
@@ -203,9 +219,11 @@ internal sealed class HostSync
             var key = _pendingKey!;
             // A host read of an intermediate a probe run quarantined: retain its producer (AutoRetainProbe).
             if (Engines.Autodiff.AutoRetainProbe.Active) Engines.Autodiff.AutoRetainProbe.NoteAccess(key);
+            // In this order: IsPending reads both fields without the lock, and must never see "nothing pending, nothing
+            // running" while this download is about to read the device buffer (a caller would then free that buffer).
+            _downloading = true;
             _pending = null;
             _pendingKey = null;
-            _downloading = true;
             Interlocked.Increment(ref s_materializeCount);
             try
             {
