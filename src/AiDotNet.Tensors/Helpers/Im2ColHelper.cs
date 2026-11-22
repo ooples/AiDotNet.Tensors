@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 #if NET5_0_OR_GREATER
@@ -1787,12 +1787,26 @@ internal static class Im2ColHelper
         int hw = inputHeight * inputWidth;
         int kmkn = outChannels * kernelH * kernelW;
         int outPlane = outputHeight * outputWidth;
-        int chunk = (int)Math.Max(1, Math.Min(batch, Math.Min(ConvTransposeColCap, int.MaxValue) / Math.Max(1L, (long)kmkn * hw)));
         var pool = ArrayPool<float>.Shared;
+        if (ConvTransposePerImage(batch, hw, kmkn))
+        {
+            ConvTranspose2DPerImageGemm(input, kernel, output, batch, inChannels, inputHeight, inputWidth, outChannels,
+                kernelH, kernelW, strideH, strideW, padH, padW, outputHeight, outputWidth);
+            return;
+        }
+        int chunk = (int)Math.Max(1, Math.Min(batch, Math.Min(ConvTransposeColCap, int.MaxValue) / Math.Max(1L, (long)kmkn * hw)));
         float[] xt = pool.Rent(checked(inChannels * chunk * hw));
         float[] col = pool.Rent(checked(kmkn * chunk * hw));
+        // W^T once per call: the contiguous no-transpose GEMM below packs both operands. The transposed-A form ran a
+        // no-B-pack strategy whose micro-kernel strode n floats per k step: 30-40 ms for DCGAN's 512->256 at 4x4.
+        float[] wt = pool.Rent(checked(kmkn * inChannels));
         try
         {
+            CpuParallelSettings.ParallelForOrSerial(0, kmkn, (long)kmkn * inChannels, j =>
+            {
+                int dst = j * inChannels;
+                for (int ci = 0; ci < inChannels; ci++) wt[dst + ci] = kernel[ci * kmkn + j];
+            }, deterministicSafe: true);
             for (int b0 = 0; b0 < batch; b0 += chunk)
             {
                 int nb = Math.Min(chunk, batch - b0);
@@ -1804,51 +1818,122 @@ internal static class Im2ColHelper
                         Array.Copy(input, ((first + b) * inChannels + ci) * hw, xt, ci * n + b * hw, hw);
                 });
 
-                BlasManaged.Gemm<float>(
-                    a: kernel.AsSpan(0, inChannels * kmkn), lda: kmkn, transA: true,
-                    b: xt.AsSpan(0, inChannels * n), ldb: n, transB: false,
-                    c: col.AsSpan(0, kmkn * n), ldc: n,
-                    m: kmkn, n: n, k: inChannels);
+                Engines.Simd.SimdGemm.Sgemm(
+                    new ReadOnlySpan<float>(wt, 0, kmkn * inChannels), inChannels, false,
+                    new ReadOnlySpan<float>(xt, 0, inChannels * n), n, false,
+                    new Span<float>(col, 0, kmkn * n),
+                    kmkn, inChannels, n);
 
-                // Overlap-add as a gather that keeps the per-sample output plane hot: each output row sums, in kh then kw
-                // order (the order the per-element gather used, so the result is bitwise the same), the column rows that
-                // land on it. For a fixed (oh, kh, kw) the contributing input columns are contiguous and their outputs are
-                // sW apart, so the inner loop has no division, modulo or bounds test.
+                // Overlap-add as a gather that keeps the per-sample output plane hot (see GatherConvTransposePlane).
                 CpuParallelSettings.ParallelForOrSerial(0, nb * outChannels, (long)nb * outChannels * outPlane, idx =>
                 {
                     int b = idx / outChannels, oc = idx - b * outChannels;
-                    int outBase = ((first + b) * outChannels + oc) * outPlane;
-                    int colSample = b * hw;
-                    Array.Clear(output, outBase, outPlane);
-                    for (int oh = 0; oh < outputHeight; oh++)
-                    {
-                        int rowBase = outBase + oh * outputWidth;
-                        for (int kh = (oh + padH) % strideH; kh < kernelH; kh += strideH)
-                        {
-                            int ih = (oh + padH - kh) / strideH;
-                            if ((uint)ih >= (uint)inputHeight) continue;
-                            for (int kw = 0; kw < kernelW; kw++)
-                            {
-                                int lead = padW - kw;
-                                int iwStart = lead <= 0 ? 0 : (lead + strideW - 1) / strideW;
-                                int tail = outputWidth - 1 + padW - kw;
-                                if (tail < 0) continue;
-                                int iwEnd = Math.Min(inputWidth - 1, tail / strideW);
-                                int colRow = ((oc * kernelH + kh) * kernelW + kw) * n + colSample + ih * inputWidth;
-                                int o = rowBase + iwStart * strideW - padW + kw;
-                                for (int iw = iwStart; iw <= iwEnd; iw++, o += strideW)
-                                    output[o] += col[colRow + iw];
-                            }
-                        }
-                    }
+                    GatherConvTransposePlane(col, n, b * hw, oc, output, ((first + b) * outChannels + oc) * outPlane,
+                        inputHeight, inputWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputHeight, outputWidth);
                 });
             }
         }
         finally
         {
+            pool.Return(wt);
             pool.Return(col);
             pool.Return(xt);
         }
+    }
+
+    // Each output row sums, in kh then kw order (the order the per-element gather used, so the result is bitwise the
+    // same), the column rows that land on it. For a fixed (oh, kh, kw) the contributing input columns are contiguous and
+    // their outputs are sW apart, so the inner loop has no division, modulo or bounds test. col is [kmkn, colStride];
+    // this image's columns start at colSample.
+    [MethodImpl(Hot)]
+    private static void GatherConvTransposePlane(float[] col, int colStride, int colSample, int oc,
+        float[] output, int outBase, int inputHeight, int inputWidth, int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+    {
+        Array.Clear(output, outBase, outputHeight * outputWidth);
+        for (int oh = 0; oh < outputHeight; oh++)
+        {
+            int rowBase = outBase + oh * outputWidth;
+            for (int kh = (oh + padH) % strideH; kh < kernelH; kh += strideH)
+            {
+                int ih = (oh + padH - kh) / strideH;
+                if ((uint)ih >= (uint)inputHeight) continue;
+                for (int kw = 0; kw < kernelW; kw++)
+                {
+                    int lead = padW - kw;
+                    int iwStart = lead <= 0 ? 0 : (lead + strideW - 1) / strideW;
+                    int tail = outputWidth - 1 + padW - kw;
+                    if (tail < 0) continue;
+                    int iwEnd = Math.Min(inputWidth - 1, tail / strideW);
+                    int colRow = ((oc * kernelH + kh) * kernelW + kw) * colStride + colSample + ih * inputWidth;
+                    int o = rowBase + iwStart * strideW - padW + kw;
+                    for (int iw = iwStart; iw <= iwEnd; iw++, o += strideW)
+                        output[o] += col[colRow + iw];
+                }
+            }
+        }
+    }
+
+    // A plane of at least 64 input positions with at least one image per worker: one GEMM per image has a full-width N
+    // and reads the image in place (DCGAN 256->128 at 8x8: 60-112 ms -> 10-14 ms; at 4x4 it measured no better). The batch-wide GEMM's B was [Cin, batch * hw] with no B pack, so each k step of its
+    // micro-kernel jumped batch * hw floats (256 KB at DCGAN's last layer): 7 GFLOP/s there.
+    private const int ConvTransposePerImageMinPositions = 64;
+    private const long ConvTransposePerImageMaxCol = 1L << 18;
+
+    private static bool ConvTransposePerImage(int batch, int hw, int kmkn)
+        => hw >= ConvTransposePerImageMinPositions
+           && (long)kmkn * hw <= ConvTransposePerImageMaxCol
+           && batch >= CpuParallelSettings.MaxDegreeOfParallelism;
+
+    /// <summary>Transposed convolutions that took the per-image GEMM route (tests).</summary>
+    internal static long ConvTransposePerImageForwards;
+
+    // One worker per image: col[kmkn, hw] = W^T x_b with a sequential GEMM (an L2-sized block), then the image's
+    // overlap-add gather. W^T is materialized once per call, so every GEMM is the contiguous no-transpose form. Each
+    // output element comes from one image's GEMM and gather, in the same order at any thread count.
+    private static void ConvTranspose2DPerImageGemm(
+        float[] input, float[] kernel, float[] output,
+        int batch, int inChannels, int inputHeight, int inputWidth, int outChannels,
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+    {
+        int hw = inputHeight * inputWidth;
+        int kmkn = outChannels * kernelH * kernelW;
+        int outPlane = outputHeight * outputWidth;
+        var pool = ArrayPool<float>.Shared;
+        float[] wt = pool.Rent(kmkn * inChannels);
+        try
+        {
+            // kernel is [Cin, kmkn]; wt = kernel^T, [kmkn, Cin].
+            for (int ci = 0; ci < inChannels; ci++)
+            {
+                int row = ci * kmkn;
+                for (int j = 0; j < kmkn; j++) wt[j * inChannels + ci] = kernel[row + j];
+            }
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * kmkn * inChannels * hw, b =>
+            {
+                float[] col = pool.Rent(kmkn * hw);
+                try
+                {
+                    Engines.Simd.SimdGemm.SgemmForAutotune(
+                        new ReadOnlySpan<float>(wt, 0, kmkn * inChannels),
+                        new ReadOnlySpan<float>(input, b * inChannels * hw, inChannels * hw),
+                        new Span<float>(col, 0, kmkn * hw),
+                        kmkn, inChannels, hw, Engines.Simd.SgemmExecutionMode.Sequential);
+                    for (int oc = 0; oc < outChannels; oc++)
+                        GatherConvTransposePlane(col, hw, 0, oc, output, (b * outChannels + oc) * outPlane,
+                            inputHeight, inputWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputHeight, outputWidth);
+                }
+                finally
+                {
+                    pool.Return(col);
+                }
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            pool.Return(wt);
+        }
+        System.Threading.Interlocked.Increment(ref ConvTransposePerImageForwards);
     }
 
     /// <summary>
