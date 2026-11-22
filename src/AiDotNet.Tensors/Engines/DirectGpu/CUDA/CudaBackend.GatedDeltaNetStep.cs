@@ -12,6 +12,19 @@ public sealed partial class CudaBackend : IGatedDeltaNetStepBackend
         float keyScale, bool decayFirst)
     {
         if (rows <= 0 || dv <= 0 || dk <= 0) throw new ArgumentOutOfRangeException(nameof(rows), "rows, dv and dk must be positive.");
+        long warps = (long)rows * dv;
+        GpuBufferCapacity.Require(state, warps * dk, nameof(state));
+        GpuBufferCapacity.Require(query, (long)rows * dk, nameof(query));
+        GpuBufferCapacity.Require(key, (long)rows * dk, nameof(key));
+        GpuBufferCapacity.Require(value, warps, nameof(value));
+        GpuBufferCapacity.Require(alpha, rows, nameof(alpha));
+        GpuBufferCapacity.Require(beta, rows, nameof(beta));
+        GpuBufferCapacity.Require(output, warps, nameof(output));
+        const int Threads = 256;
+        // A warp per state row; the kernel indexes rows and threads in 64 bits, the grid is bounded by gridDim.x.
+        long blocks = (warps * 32 + Threads - 1) / Threads;
+        if (blocks > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(rows), $"{rows} x {dv} state rows exceed one launch's grid.");
         if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         if (!_kernelCache.TryGetValue("gdn_step", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: gdn_step");
@@ -21,8 +34,6 @@ public sealed partial class CudaBackend : IGatedDeltaNetStepBackend
         void** args = stackalloc void*[12];
         args[0] = &s; args[1] = &q; args[2] = &k; args[3] = &v; args[4] = &a; args[5] = &b; args[6] = &o;
         args[7] = &r; args[8] = &vd; args[9] = &kd; args[10] = &keyScale; args[11] = &decay;
-        const int Threads = 256;
-        long warps = (long)rows * dv;
-        LaunchKernel(kernel, (uint)((warps * 32 + Threads - 1) / Threads), Threads, args);
+        LaunchKernel(kernel, (uint)blocks, Threads, args);
     }
 }

@@ -5,10 +5,11 @@ extern "C" __global__ __launch_bounds__(256) void conv1d_step(
     float* __restrict__ h, const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ bias,
     float* __restrict__ y, int taps, int batch, int channels, int silu)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= batch * channels) return;
-    int c = i % channels, K = taps + 1;
+    // 64-bit: batch * channels can pass int range.
     long long plane = (long long)batch * channels;
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= plane) return;
+    int c = (int)(i % channels), K = taps + 1;
     float xv = x[i], acc = xv * w[(long long)c * K];
     float past[15];
     for (int m = 1; m <= taps; m++)
