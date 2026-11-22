@@ -99,6 +99,13 @@ public class KvCacheAppendTests
         position.IncrementVersion();
     }
 
+    // StrictGpuLeases asserts every backend lookup holds a GPU op lease, the test's own lookups included.
+    private static AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend? BackendOf(DirectGpuTensorEngine gpu)
+    {
+        using var op = gpu.EnterGpuOp();
+        return gpu.GetBackend();
+    }
+
     private static DirectGpuTensorEngine? TryGpu()
     {
         DirectGpuTensorEngine? gpu = null;
@@ -241,7 +248,7 @@ public class KvCacheAppendTests
                         CheckCache(cache.ToArray(), t);
                         Assert.Equal(t + 1, position.ToArray()[0]);
                     }
-                    if (capture && gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda)
+                    if (capture && BackendOf(gpu!) is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda)
                     {
                         var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
                         Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
