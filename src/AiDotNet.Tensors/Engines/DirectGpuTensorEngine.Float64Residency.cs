@@ -85,9 +85,8 @@ public partial class DirectGpuTensorEngine
     private readonly ConditionalWeakTable<object, Float64Resident> _float64ByVector = new();
     private readonly List<Float64Resident> _float64All = new();
     // Buffers of results nothing can read any more, by element count, ready for the next result of that size.
-    private readonly Dictionary<int, Stack<IGpuBuffer>> _float64Pool = new();
+    private readonly GpuTypedBufferPool _float64Pool = new(IsLiveDeviceBuffer);
     private long _float64ResidentBytes;
-    private long _float64PoolBytes;
     private long _float64Stamp;
 
     /// <summary>Device bytes currently held by resident double tensors.</summary>
@@ -99,7 +98,7 @@ public partial class DirectGpuTensorEngine
     /// <summary>Device bytes held by pooled buffers of results nothing can read any more.</summary>
     internal long Float64PooledBytes
     {
-        get { lock (_float64Lock) return _float64PoolBytes; }
+        get { lock (_float64Lock) return _float64Pool.Bytes; }
     }
 
     /// <summary>Whether <paramref name="tensor"/>'s current values are in a Float64 buffer on the device.</summary>
@@ -555,7 +554,7 @@ public partial class DirectGpuTensorEngine
         long budget = Float64ResidentBudget(backend);
         // The fast path: a pooled buffer, while the results on the device fit the budget with it. Past the budget the
         // dropped results are reclaimed first, pooled buffer or not; they would otherwise be held until the pool ran dry.
-        if (_float64ResidentBytes + bytes <= budget && TryTakePooledFloat64(backend, length, out var ready)) return ready;
+        if (_float64ResidentBytes + bytes <= budget && _float64Pool.TryTake(backend, GpuElementType.Float64, length, out var ready)) return ready;
         // Results a chain has dropped are reclaimed only once the collector has noticed them, and it
         // cannot see the device memory they hold: after enough new device memory, ask the cheap generations (a result
         // tensor is a small young object), so a loop reuses its buffers long before it reaches the budget.
@@ -569,7 +568,7 @@ public partial class DirectGpuTensorEngine
 
         for (int attempt = 0; ; attempt++)
         {
-            if (TryTakePooledFloat64(backend, length, out var pooled))
+            if (_float64Pool.TryTake(backend, GpuElementType.Float64, length, out var pooled))
             {
                 // Still over with every dropped result reclaimed: the rest are reachable, so the oldest come down.
                 if (_float64ResidentBytes + bytes > budget)
@@ -577,7 +576,7 @@ public partial class DirectGpuTensorEngine
                     // The buffer is this method's until it is returned: nothing else can free it if making room throws.
                     try
                     {
-                        DisposeFloat64Pool();
+                        _float64Pool.Trim();
                         EvictFloat64Residents(budget - bytes, left, right);
                     }
                     catch
@@ -590,18 +589,18 @@ public partial class DirectGpuTensorEngine
                 return pooled;
             }
 
-            if (_float64ResidentBytes + _float64PoolBytes + bytes <= budget) break;
+            if (_float64ResidentBytes + _float64Pool.Bytes + bytes <= budget) break;
             if (attempt == 0)
             {
                 // Pooled buffers of other sizes are only memory now.
-                DisposeFloat64Pool();
+                _float64Pool.Trim();
             }
             else if (attempt == 1)
             {
                 // Over budget: a full collection finds the dropped results the cheap ones could not (old tensors).
                 GC.Collect();
                 SweepFloat64Residents();
-                DisposeFloat64Pool(exceptLength: length);
+                _float64Pool.Trim(GpuElementType.Float64, length);
             }
             else
             {
@@ -618,50 +617,6 @@ public partial class DirectGpuTensorEngine
     private long _float64AllocatedSinceCollect;
 
     // Callers hold _float64Lock.
-    private bool TryTakePooledFloat64(IDirectGpuBackend backend, int length,
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IGpuBuffer? buffer)
-    {
-        buffer = null;
-        if (!_float64Pool.TryGetValue(length, out var stack)) return false;
-        bool sameBackend = ReferenceEquals(_float64PoolBackend, backend);
-        while (stack.Count > 0)
-        {
-            // Judged while the pool still holds it: a liveness check that throws leaves the buffer pooled, not adrift
-            // between the pop and a dispose. Only then does it leave the pool, to the caller or to its disposal (a
-            // buffer of a backend that is gone, or already released, has only its wrapper left to dispose).
-            bool usable = sameBackend && IsLiveDeviceBuffer(stack.Peek());
-            _float64PoolBytes -= (long)length * sizeof(double);
-            if (usable)
-            {
-                buffer = stack.Pop();
-                return true;
-            }
-
-            using (stack.Pop())
-            {
-                // Disposed as it leaves the pool.
-            }
-        }
-
-        return false;
-    }
-
-    private IDirectGpuBackend? _float64PoolBackend;
-
-    // Callers hold _float64Lock.
-    private void DisposeFloat64Pool(int exceptLength = -1)
-    {
-        foreach (var entry in _float64Pool.Where(pooled => pooled.Key != exceptLength))
-        {
-            while (entry.Value.Count > 0)
-            {
-                entry.Value.Pop().Dispose();
-                _float64PoolBytes -= (long)entry.Key * sizeof(double);
-            }
-        }
-    }
-
-    // Callers hold _float64Lock.
     private void EvictFloat64Residents(long targetBytes, Tensor<double> left, Tensor<double> right)
     {
         object keepLeft = left.DataVector;
@@ -670,7 +625,7 @@ public partial class DirectGpuTensorEngine
         oldestFirst.Sort(static (x, y) => x.Stamp.CompareTo(y.Stamp));
         foreach (var resident in oldestFirst)
         {
-            if (_float64ResidentBytes + _float64PoolBytes <= targetBytes) break;
+            if (_float64ResidentBytes + _float64Pool.Bytes <= targetBytes) break;
             if (resident.Key.TryGetTarget(out var key) && (ReferenceEquals(key, keepLeft) || ReferenceEquals(key, keepRight)))
                 continue;
             try
@@ -706,16 +661,7 @@ public partial class DirectGpuTensorEngine
         {
             if (key is not null) _float64ByVector.Remove(key);
 
-            if (toPool && IsLiveDeviceBuffer(resident.Buffer)
-                && (_float64PoolBackend is null || ReferenceEquals(_float64PoolBackend, resident.Backend)))
-            {
-                _float64PoolBackend = resident.Backend;
-                if (!_float64Pool.TryGetValue(resident.Length, out var stack))
-                    _float64Pool[resident.Length] = stack = new Stack<IGpuBuffer>();
-                stack.Push(resident.Buffer);
-                _float64PoolBytes += resident.Bytes;
-                pooled = true;
-            }
+            pooled = toPool && _float64Pool.TryReturn(resident.Backend, resident.Buffer);
         }
         finally
         {
@@ -748,8 +694,7 @@ public partial class DirectGpuTensorEngine
                 }
             }
 
-            DisposeFloat64Pool();
-            _float64PoolBackend = null;
+            _float64Pool.Clear();
         }
     }
 }
