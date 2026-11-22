@@ -1103,6 +1103,32 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Tensor<T>[]? _inPlaceStateTensors;
 
     /// <summary>
+    /// Re-arms the host download of every in-place state tensor whose current value the plan keeps on the device
+    /// (bound device-authoritative in the resident pre-pass), after each step.
+    /// </summary>
+    /// <remarks>
+    /// A graph replay runs no host code, so the device update of such a state (a router's selection bias nudged from
+    /// its loads, a running statistic) never re-armed its host copy. The first host read after the state went
+    /// device-resident downloaded it once; every later read returned that value while the device copy kept moving.
+    /// Measured on a GDN/MLA + MoE language model: a checkpoint written at step 100 after one at step 50 saved every
+    /// router bias at its step-50 value, so a resume from it diverged from the uninterrupted run at the first resumed
+    /// step. Only device-authoritative bindings are re-armed: a state an eager step updates on the host keeps its
+    /// host value.
+    /// </remarks>
+    private void RearmInPlaceStateDownloads()
+    {
+        if (_forwardSteps is null || !_engine.TryGet<Engines.DirectGpuTensorEngine>(out var de)) return;
+        foreach (var state in InPlaceStateTensors())
+        {
+            if (state._gpuBuffer is not { } buffer || state._gpuBackend is not { } backend) continue;
+            // Parameters have their own post-update re-binding (CommitDeviceParameterUpdate).
+            if (Array.Exists(_parameters, p => ReferenceEquals(p, state))) continue;
+            if (!de.IsBoundDeviceAuthoritative(state)) continue;
+            de.BindResidentBuffer(state, buffer, backend);
+        }
+    }
+
+    /// <summary>
     /// Writes <see cref="SnapshotInPlaceState"/>'s values back. A state the pre-pass left bound to a device buffer gets
     /// them in that same buffer (the graph about to be captured bakes in its address, and the host copy reads through it);
     /// one left on the host gets them on the host.
@@ -4525,6 +4551,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (_retainedOutputs.Count > 0 && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var outputEngine))
                 foreach (var output in _retainedOutputs.Where(output => output._gpuBuffer is not null && output._gpuBackend is not null))
                     outputEngine.BindResidentBuffer(output, output._gpuBuffer!, output._gpuBackend!);
+            RearmInPlaceStateDownloads();
             if (_namedRetainedOutputs.Count > 0 || RetainedOutputCapture<T>.IsActive)
             {
                 // Device-guarded optimizers may return before their skip verdict is read back.
