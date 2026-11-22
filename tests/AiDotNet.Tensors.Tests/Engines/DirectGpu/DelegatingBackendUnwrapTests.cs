@@ -84,16 +84,22 @@ public class DelegatingBackendUnwrapTests
     [Fact]
     public void Outputs_of_a_builder_that_runs_while_recording_are_never_unexecuted()
     {
+        // The two flags DeferredScope sets for ExecuteEagerlyWhileRecording: the recorder runs each op on the wrapped
+        // backend as it records it, and the builder is told its writes have run.
         var physical = MockDirectGpuBackend.Create(new MockBackendState());
-        var recording = new RecordingGpuBackend(physical) { ExecuteWhileRecording = false };
+        var recording = new RecordingGpuBackend(physical) { ExecuteWhileRecording = true };
         using var builder = new AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder();
         builder.MarkWritesRunWhileRecording();
         recording.BeginRecording(builder);
         try
         {
-            Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(RecordAdd(recording, 1f, 2f)));
+            var first = RecordAdd(recording, 1f, 2f);
+            Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(first));
+            Assert.Equal(new[] { 3f, 3f }, first.Data);
             builder.Clear();
-            Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(RecordAdd(recording, 1f, 2f)));
+            var second = RecordAdd(recording, 5f, 6f);
+            Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(second));
+            Assert.Equal(new[] { 11f, 11f }, second.Data);
         }
         finally { recording.EndRecording(); }
     }

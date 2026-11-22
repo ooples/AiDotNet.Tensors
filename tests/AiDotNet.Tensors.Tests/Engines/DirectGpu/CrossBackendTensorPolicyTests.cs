@@ -438,8 +438,8 @@ public sealed class CrossBackendTensorPolicyTests
             using (scope)
             {
                 var recorded = engines.Placer.TensorSigmoid(input);
-                var buffer = recorded._gpuBuffer;
-                Skip.If(buffer is null, "The op did not record a device result.");
+                var buffer = recorded._gpuBuffer
+                    ?? throw new Xunit.Sdk.XunitException("The op did not record a device result.");
                 var graph = scope.Compile();
                 Assert.True(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(buffer));
                 graph.Execute(engines.Placer.QueryBackend!);
@@ -465,18 +465,78 @@ public sealed class CrossBackendTensorPolicyTests
             using (scope)
             {
                 var discarded = engines.Placer.TensorSigmoid(input);
-                var discardedBuffer = discarded._gpuBuffer;
-                Skip.If(discardedBuffer is null, "The op did not record a device result.");
+                var discardedBuffer = discarded._gpuBuffer
+                    ?? throw new Xunit.Sdk.XunitException("The op did not record a device result.");
                 scope.GraphBuilder.Clear();
                 var kept = engines.Placer.TensorSigmoid(input);
-                var keptBuffer = kept._gpuBuffer;
-                Skip.If(keptBuffer is null, "The op did not record a device result.");
+                var keptBuffer = kept._gpuBuffer
+                    ?? throw new Xunit.Sdk.XunitException("The op did not record a device result.");
                 scope.Execute();
                 Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(keptBuffer));
                 Assert.True(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(discardedBuffer));
                 Assert.Equal(new[] { 0.5f, 0.5f }, kept.ToArray());
             }
         }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
+    // The optimizer drops recorded nodes nothing in the graph reads. A result is either written by the run or still
+    // marked unexecuted - never certified with the buffer left as it was allocated.
+    [SkippableFact]
+    public void A_result_the_optimizer_dropped_is_not_marked_executed()
+    {
+        using var engines = CreateEngines();
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try
+        {
+            var scope = engines.Placer.BeginDeferredScope();
+            Skip.If(scope is null, "Backend has no deferred execution");
+            using (scope)
+            {
+                var results = Enumerable.Range(0, 6)
+                    .Select(_ => engines.Placer.TensorSigmoid(new Tensor<float>(new[] { 0f, 0f }, new[] { 2 })))
+                    .ToList();
+                var buffers = results.Select(result => result._gpuBuffer
+                    ?? throw new Xunit.Sdk.XunitException("The op did not record a device result.")).ToList();
+                scope.Execute();
+                Assert.False(AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(buffers[5]));
+                for (int i = 0; i < results.Count; i++)
+                {
+                    if (AiDotNet.Tensors.Engines.Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(buffers[i])) continue;
+                    Assert.Equal(new[] { 0.5f, 0.5f }, results[i].ToArray());
+                }
+            }
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
+    // A view borrows its storage's buffer. When the whole tensor migrates, that buffer is freed: the view must not go
+    // on naming it.
+    [SkippableFact]
+    public void A_view_stops_naming_a_buffer_its_storage_gave_up()
+    {
+        using var engines = CreateEngines();
+        var whole = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, new[] { 2, 4 });
+        Tensor<float> produced;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try { produced = engines.Placer.TensorAdd(whole, whole); }
+        finally { AiDotNetEngine.Current = previous; }
+        var view = produced.Slice(1);
+        Assert.NotNull(view._gpuBuffer);
+        Assert.Same(produced._gpuBuffer, view._gpuBuffer);
+
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zeros = new Tensor<float>(new float[8], new[] { 2, 4 });
+        Assert.Equal(new[] { 2f, 4f, 6f, 8f, 10f, 12f, 14f, 16f }, engines.Consumer.TensorAdd(produced, zeros).ToArray());
+
+        Assert.Null(view._gpuBuffer);
+        Assert.Null(view.TryGetGpuBuffer());
+        Assert.Equal(new[] { 10f, 12f, 14f, 16f }, view.ToArray());
+        // And the old backend can still use the view: it uploads the host values instead of the freed buffer.
+        AiDotNetEngine.Current = engines.Placer;
+        try { Assert.Equal(new[] { 20f, 24f, 28f, 32f }, engines.Placer.TensorAdd(view, view).ToArray()); }
         finally { AiDotNetEngine.Current = previous; }
     }
 
