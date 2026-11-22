@@ -905,7 +905,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                     replayed = RefreshFinalOutputFromResident(); // fresh DtoH into _finalOutput's host storage
                 }
                 catch (InvalidOperationException ex) { replayError = ex; }
-                if (replayed) return _finalOutput;
+                if (replayed)
+                {
+                    // A captured cache append that met a bad position wrote nothing and left a fault record; raised
+                    // here as the eager append raises it. The graph stays: the replay itself succeeded.
+                    ThrowIfAppendFaulted(cb);
+                    return _finalOutput;
+                }
 
                 // Fail closed: an input could not be refreshed in place, or the output could not be downloaded
                 // — discard the captured graph and run this call eagerly so we never serve a result computed
@@ -1035,6 +1041,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 if (!RefreshFinalOutputFromResident())
                                     throw new InvalidOperationException(
                                         "Captured-graph output is not resident-downloadable; abandoning capture.");
+                                ThrowIfAppendFaulted(cb);
                                 return _finalOutput;
                             }
                         }
@@ -1120,6 +1127,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // An abandoned capture leaves the plan eager: its input slots, pinned to buffers only a graph replay refreshes,
     // must go back to the engine's ordinary upload path (SetInputs writes the host copy only).
     // An in-place step writes the tensor it also reads (see CompiledTrainingPlan.IsInPlaceState).
+    private static void ThrowIfAppendFaulted(Engines.DirectGpu.IGpuGraphCapture cb)
+    {
+        if (cb is Engines.DirectGpu.IKvCacheAppendBackend append) append.ThrowIfAppendFaulted();
+    }
+
     private static bool IsInPlaceStep(CompiledStep<T> step)
     {
         foreach (var input in step.Inputs)

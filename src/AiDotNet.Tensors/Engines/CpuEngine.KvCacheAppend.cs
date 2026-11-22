@@ -52,7 +52,7 @@ public partial class CpuEngine
         var mask = new Tensor<T>(new[] { capacity });
         var m = mask.AsWritableSpanUnmarked();
         m.Slice(0, p + 1).Fill(ops.Zero);
-        m.Slice(p + 1).Fill(ops.FromDouble(double.NegativeInfinity));
+        m.Slice(p + 1).Fill(ops.FromDouble(double.NegativeInfinity));   // a floating T (RequireExactPositions)
         return mask;
     }
 
@@ -69,6 +69,28 @@ public partial class CpuEngine
         int batch = cache.Shape[0], capacity = cache.Shape[1], width = cache.Shape[2];
         if (capacity <= 0 || width <= 0 || batch <= 0) throw new ArgumentException("cache dimensions must be positive.", nameof(cache));
         if (value.Length != batch * width) throw new ArgumentException($"value must hold batch x width = {batch * width} values.", nameof(value));
+        RequireExactPositions<T>(capacity);
         return (batch, capacity, width);
+    }
+
+    // The position is counted in T and the mask holds negative infinity: T must be a floating-point type that holds
+    // every integer 0..capacity exactly (Half stops at 2048, BFloat16 at 256, float at 2^24), or a position past that
+    // range would round onto a neighbouring slot and skip or overwrite it.
+    private static void RequireExactPositions<T>(int capacity)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        bool floating;
+        try { floating = double.IsNegativeInfinity(ops.ToDouble(ops.FromDouble(double.NegativeInfinity))); }
+        catch (Exception ex) when (ex is OverflowException or ArgumentException or InvalidCastException or NotSupportedException)
+        {
+            floating = false;
+        }
+        if (!floating)
+            throw new NotSupportedException(
+                $"KvCacheAppend's mask holds negative infinity, which {typeof(T).Name} cannot represent; use a floating-point element type.");
+        // For a binary floating-point type, capacity and capacity - 1 both exact means every integer up to capacity is.
+        if (ops.ToDouble(ops.FromDouble(capacity)) != capacity || ops.ToDouble(ops.FromDouble(capacity - 1)) != capacity - 1)
+            throw new NotSupportedException(
+                $"A {typeof(T).Name} position cannot count {capacity} cache slots exactly; use a wider element type or a smaller capacity.");
     }
 }

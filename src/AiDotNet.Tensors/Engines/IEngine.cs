@@ -4781,9 +4781,12 @@ public partial interface IEngine
     /// place. Start it at zero.</param>
     /// <param name="value">This position's entry, batch x width values.</param>
     /// <returns>The additive mask [capacity] for attending over the cache after this append.</returns>
-    /// <exception cref="InvalidOperationException">The host implementation throws when the cache is full. A device
-    /// kernel cannot report it: past capacity it writes nothing, leaves the position at capacity and returns a mask of
-    /// every slot, so callers bound the number of positions themselves.</exception>
+    /// <exception cref="InvalidOperationException">The cache is full, or the position is not a non-negative integer
+    /// (NaN, an infinity, a negative or fractional value). Every backend writes neither the cache nor the position then.
+    /// An eager call throws before returning; a compiled plan replaying a captured graph throws from the
+    /// <c>Execute</c> that met it (the device kernel records the fault and fills that execution's mask with NaN).</exception>
+    /// <exception cref="NotSupportedException">T is not a floating-point type (the mask holds negative infinity), or
+    /// it cannot count every position up to capacity exactly (Half past 2048 slots, BFloat16 past 256).</exception>
     Tensor<T> KvCacheAppend<T>(
         Tensor<T> cache,
         Tensor<T> position,

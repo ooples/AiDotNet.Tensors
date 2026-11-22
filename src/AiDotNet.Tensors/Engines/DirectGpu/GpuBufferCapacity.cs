@@ -20,11 +20,11 @@ internal static class GpuBufferCapacity
     }
 
     /// <summary>Throws when <paramref name="buffer"/> holds fewer than <paramref name="count"/> 4-byte elements.</summary>
-    internal static void Require(IGpuBuffer buffer, int count, string name)
+    internal static void Require(IGpuBuffer buffer, long count, string name)
     {
         if (buffer is null) throw new ArgumentNullException(name);
         if (count < 0) throw new ArgumentOutOfRangeException(nameof(count), $"The element count {count} is negative.");
-        if (buffer.SizeInBytes < (long)count * sizeof(float))
+        if (count > long.MaxValue / sizeof(float) || buffer.SizeInBytes < count * sizeof(float))
             throw new ArgumentException(
                 $"{name} holds {buffer.SizeInBytes / sizeof(float)} 4-byte elements; the launch needs {count}.", name);
     }

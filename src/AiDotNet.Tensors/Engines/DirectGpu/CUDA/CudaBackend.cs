@@ -19953,6 +19953,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _streamOrderEvent = IntPtr.Zero;
         }
         DisposeTunedKernelResources();
+        DisposeKvFaultRecord();
         // The convolution scratch slots hold device buffers for the process's life once a shape has used them; they
         // have to go back before the pool they came from does.
         DisposeConvScratch();

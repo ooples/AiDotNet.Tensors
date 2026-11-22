@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
@@ -41,7 +42,7 @@ public class KvCacheAppendTests
             Assert.Equal(s <= t ? 0f : float.NegativeInfinity, mask[s]);
     }
 
-    private static void RunEager(IEngine engine, bool hostOverflowThrows)
+    private static void RunEager(IEngine engine)
     {
         var cache = new Tensor<float>([Batch, Capacity, Width]);
         var position = new Tensor<float>([1]);
@@ -54,38 +55,111 @@ public class KvCacheAppendTests
                 CheckCache(cache.ToArray(), t);
                 Assert.Equal(t + 1, position.ToArray()[0]);
             }
+            // Every backend refuses a full cache, leaving the cache and the position as they were.
             var extra = new Tensor<float>([Batch, Width], new Vector<float>(Row(Capacity)));
-            if (hostOverflowThrows)
-                Assert.Throws<InvalidOperationException>(() => engine.KvCacheAppend(cache, position, extra));
-            else
+            var full = Assert.Throws<InvalidOperationException>(() => engine.KvCacheAppend(cache, position, extra));
+            Assert.Contains("full", full.Message);
+            CheckCache(cache.ToArray(), Capacity - 1);
+            Assert.Equal(Capacity, position.ToArray()[0]);
+        }
+    }
+
+    // A position that is not a non-negative integer is refused by every backend before anything is written: slot 0
+    // keeps its row (a NaN converted to 0 would overwrite it), nothing before the cache is written (a negative
+    // position), and a fractional position is not truncated onto a slot.
+    private static void RunBadPositions(IEngine engine)
+    {
+        using (new EngineScope(engine))
+        {
+            foreach (float bad in new[] { -1f, -0.5f, float.NaN, 1.5f, float.PositiveInfinity, float.NegativeInfinity, 1e9f })
             {
-                // A device kernel past capacity writes nothing, keeps the position and masks nothing.
+                var cache = new Tensor<float>([Batch, Capacity, Width]);
+                var position = new Tensor<float>([1]);
+                engine.KvCacheAppend(cache, position, new Tensor<float>([Batch, Width], new Vector<float>(Row(0))));
+                SetPosition(position, bad);
+                var extra = new Tensor<float>([Batch, Width], new Vector<float>(Row(1)));
+                var ex = Assert.Throws<InvalidOperationException>(() => engine.KvCacheAppend(cache, position, extra));
+                Assert.Contains(bad == 1e9f ? "full" : "non-negative integer", ex.Message);
+                CheckCache(cache.ToArray(), 0);
+                float after = position.ToArray()[0];
+                Assert.True(after.Equals(bad), $"position {bad} became {after}");
+                // The next append from a valid position still works.
+                SetPosition(position, 1f);
                 var mask = engine.KvCacheAppend(cache, position, extra);
-                Assert.All(mask.ToArray(), m => Assert.Equal(0f, m));
-                CheckCache(cache.ToArray(), Capacity - 1);
-                Assert.Equal(Capacity, position.ToArray()[0]);
+                CheckMask(mask.ToArray(), 1);
+                CheckCache(cache.ToArray(), 1);
+                Assert.Equal(2f, position.ToArray()[0]);
             }
         }
     }
 
-    [Fact]
-    public void The_cpu_append_writes_the_row_advances_the_position_and_masks_later_slots()
-        => RunEager(new CpuEngine(), hostOverflowThrows: true);
+    private static void SetPosition(Tensor<float> position, float value)
+    {
+        position[0] = value;
+        position.IncrementVersion();
+    }
 
-    [SkippableFact]
-    public void The_gpu_append_writes_the_row_advances_the_position_and_masks_later_slots()
+    private static DirectGpuTensorEngine? TryGpu()
     {
         DirectGpuTensorEngine? gpu = null;
         try { gpu = new DirectGpuTensorEngine(); }
         catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
-        if (gpu is null) return;
-        using (gpu)
+        if (gpu is not null && !gpu.IsGpuAvailable) { gpu.Dispose(); gpu = null; }
+        if (gpu is not null) gpu.StrictGpuLeases = true;
+        return gpu;
+    }
+
+    [Fact]
+    public void The_cpu_append_writes_the_row_advances_the_position_and_masks_later_slots()
+        => RunEager(new CpuEngine());
+
+    [SkippableFact]
+    public void The_gpu_append_writes_the_row_advances_the_position_and_masks_later_slots()
+    {
+        var gpu = TryGpu();
+        Skip.If(gpu is null, "GPU backend did not resolve.");
+        using (gpu) RunEager(gpu!);
+    }
+
+    [Fact]
+    public void The_cpu_append_refuses_a_negative_nan_fractional_or_huge_position()
+        => RunBadPositions(new CpuEngine());
+
+    [SkippableFact]
+    public void The_gpu_append_refuses_a_negative_nan_fractional_or_huge_position()
+    {
+        var gpu = TryGpu();
+        Skip.If(gpu is null, "GPU backend did not resolve.");
+        using (gpu) RunBadPositions(gpu!);
+    }
+
+    // The position is counted in T: a type that cannot hold every position up to capacity exactly, or the mask's
+    // negative infinity, is refused on every engine rather than rounding positions onto neighbouring slots.
+    [Fact]
+    public void An_element_type_that_cannot_count_every_position_is_refused()
+    {
+        var engines = new List<IEngine> { new CpuEngine() };
+        var gpu = TryGpu();
+        if (gpu is not null) engines.Add(gpu);
+        try
         {
-            bool isCuda = gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
-            gpu.StrictGpuLeases = true;
-            RunEager(gpu, hostOverflowThrows: !isCuda);
+            foreach (var engine in engines)
+            {
+                using (new EngineScope(engine))
+                {
+                    Assert.Throws<NotSupportedException>(() => engine.KvCacheAppend(
+                        new Tensor<Half>([1, 2049, 1]), new Tensor<Half>([1]), new Tensor<Half>([1, 1])));
+                    var ok = engine.KvCacheAppend(new Tensor<Half>([1, 2048, 1]), new Tensor<Half>([1]), new Tensor<Half>([1, 1]));
+                    Assert.Equal(0.0, (double)ok.ToArray()[0]);
+                    Assert.True(Half.IsNegativeInfinity(ok.ToArray()[1]));
+                    Assert.Throws<NotSupportedException>(() => engine.KvCacheAppend(
+                        new Tensor<float>([1, (1 << 24) + 1, 1]), new Tensor<float>([1]), new Tensor<float>([1, 1])));
+                    Assert.Throws<NotSupportedException>(() => engine.KvCacheAppend(
+                        new Tensor<int>([1, 4, 1]), new Tensor<int>([1]), new Tensor<int>([1, 1])));
+                }
+            }
         }
+        finally { gpu?.Dispose(); }
     }
 
     [Fact]
@@ -124,53 +198,6 @@ public class KvCacheAppendTests
         }
     }
 
-    [SkippableTheory]
-    [InlineData(-1f)]
-    [InlineData(1.5f)]
-    [InlineData(float.NaN)]
-    [InlineData(float.PositiveInfinity)]
-    public void Invalid_positions_do_not_corrupt_the_cache_or_advance_the_position(float badPosition)
-    {
-        var cpu = new CpuEngine();
-        var cpuCache = new Tensor<float>([Batch, Capacity, Width]);
-        var cpuPosition = new Tensor<float>(new[] { badPosition }, new[] { 1 });
-        var value = new Tensor<float>([Batch, Width], new Vector<float>(Row(0)));
-        Assert.Throws<InvalidOperationException>(() => cpu.KvCacheAppend(cpuCache, cpuPosition, value));
-
-        DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
-        if (gpu is null) return;
-        using (gpu)
-        {
-            bool isCuda = gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
-            gpu.StrictGpuLeases = true;
-            var sentinel = Enumerable.Repeat(7f, Batch * Capacity * Width).ToArray();
-            var cache = new Tensor<float>([Batch, Capacity, Width], new Vector<float>(sentinel));
-            var position = new Tensor<float>(new[] { badPosition }, new[] { 1 });
-            if (isCuda)
-            {
-                var mask = gpu.KvCacheAppend(cache, position, value);
-                Assert.All(mask.ToArray(), m => Assert.True(float.IsNegativeInfinity(m)));
-                Assert.All(cache.ToArray(), c => Assert.Equal(7f, c));
-                float observedPosition = position.ToArray()[0];
-                if (float.IsNaN(badPosition))
-                {
-                    Assert.True(float.IsNaN(observedPosition));
-                }
-                else
-                {
-                    Assert.Equal(badPosition, observedPosition);
-                }
-            }
-            else
-            {
-                Assert.Throws<InvalidOperationException>(() => gpu.KvCacheAppend(cache, position, value));
-            }
-        }
-    }
-
     // A compiled plan appending each step's input: the position advances on the device once per execution (the capture
     // call included), the mask follows it, and the captured graph copies nothing.
     // With realizeInTrace an RMSNorm downstream of the append computes its graph-mode value eagerly, which runs the
@@ -182,10 +209,8 @@ public class KvCacheAppendTests
     [InlineData(false, true)]
     public void A_compiled_plan_appends_once_per_execution_from_a_device_position(bool capture, bool realizeInTrace)
     {
-        DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        var gpu = TryGpu();
+        Skip.If(gpu is null, "GPU backend did not resolve.");
         using (gpu)
         {
             var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
@@ -222,6 +247,13 @@ public class KvCacheAppendTests
                         Assert.True(exec.GetValue(plan) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
                         Assert.Equal(0, cuda.LastCaptureMemcpyNodeCount);
                     }
+                    // One execution past capacity: the plan, captured or not, throws as the eager append does, and the
+                    // cache and the position are left as they were.
+                    plan.SetInputs(new[] { new Tensor<float>([Batch, Width], new Vector<float>(Row(Capacity))) });
+                    var full = Assert.Throws<InvalidOperationException>(() => plan.Execute());
+                    Assert.Contains("full", full.Message);
+                    CheckCache(cache.ToArray(), Capacity - 1);
+                    Assert.Equal(Capacity, position.ToArray()[0]);
                 }
             }
             finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
