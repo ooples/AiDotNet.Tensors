@@ -774,8 +774,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // same-backend buffer big enough; reaching here means the old buffer is too small or on another backend,
         // so dropping the reference without freeing would leak VRAM across recaptures / shape changes.
         if (t._gpuBuffer is { } stale && AiDotNet.Tensors.Engines.DirectGpu.GpuBufferViewRoot.IsLive(AiDotNet.Tensors.Engines.DirectGpu.GpuBufferViewRoot.Of(stale)))
-            stale.Dispose();
+            t.ReleaseStaleGpuBinding(stale);
         var buf = cb.AllocateBuffer((float[])(object)data); // sync upload — OK in the non-capturing pre-pass
+        t.AdoptReplacementGpuBuffer(buf);
         t._gpuBuffer = buf;
         t._gpuBackend = cb;
         t._gpuBufferVersion = t.GpuCacheVersion;
@@ -1221,6 +1222,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // Backends an engine that owned them has torn down: their buffers can be neither read nor freed any more.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend, object> s_retiredBackends = new();
+    private static readonly object s_retiredMarker = new();
 
     /// <summary>Whether the engine that owned <paramref name="backend"/> was disposed, freeing it.</summary>
     internal static bool IsRetiredBackend(IDirectGpuBackend? backend)
@@ -1241,7 +1243,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>Whether this engine handed <paramref name="vector"/> out as a result whose device buffer it owns.</summary>
-    internal bool OwnsDeviceResult(IDeviceResultStorage vector) => _ownsDirectGpu && _ownedResults.Contains(vector);
+    internal bool OwnsDeviceResult(IDeviceResultStorage vector, IDirectGpuBackend backend)
+        => _ownsDirectGpu && _ownedResults.Contains(vector, backend);
 
     /// <summary>The newest live engine that placed data on <paramref name="backend"/>, or null.</summary>
     internal static DirectGpuTensorEngine? EngineOwning(IDirectGpuBackend? backend)
@@ -31476,7 +31479,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Helpers.PooledArrayRecycling.Unregister(this);
         // An owned backend is freed below: a tensor still bound to it must not be read or freed through it later.
         if (_ownsDirectGpu && _registeredBackend is { } retiring)
-            lock (s_engineByBackendLock) s_retiredBackends.AddOrUpdate(retiring, this);
+            // Remove + Add, not AddOrUpdate (absent on net471/net462/netstandard2.0); a sentinel value, so the table
+            // does not keep this disposed engine alive for as long as a tensor still references the backend.
+            lock (s_engineByBackendLock)
+            {
+                s_retiredBackends.Remove(retiring);
+                s_retiredBackends.Add(retiring, s_retiredMarker);
+            }
         UnregisterAsBackendOwner();
         // Clear activation cache to free GPU memory from cached activations
         ClearActivationCache();

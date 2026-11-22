@@ -141,7 +141,7 @@ internal static class CrossBackendTensors
                     + $"cannot be moved to the operation on {Describe(consumer)}.");
             // A storage the owning engine handed out as its result owns its buffer whichever alias asks.
             bool storageOwned = ownerLive && ownerEngine is not null && tensor.CoversWholeVector
-                                && ownerEngine.OwnsDeviceResult(tensor.DataVector);
+                                && ownerEngine.OwnsDeviceResult(tensor.DataVector, Unwrap(owner));
             // An owner mid-teardown (or gone) frees its own memory with its context: the buffer is detached, not freed.
             tensor.ReleaseForeignGpuBinding(readBack, free: ownerLive, storageOwned);
         }
@@ -149,7 +149,10 @@ internal static class CrossBackendTensors
         // resident parameter stays resident: left host-only, an on-device optimizer would update a buffer the forward
         // never reads and training would stall. Placed on the real backend, never on a recording wrapper. An external
         // input is not: its caller uploads the host data into a binding of its own next.
-        if (wasResident && (!hostAuthoritative || rePlaceFromHost)) tensor.PlaceOn(Unwrap(consumer), DirectGpuTensorEngine.EngineOwning(Unwrap(consumer)));
+        // Re-placed with PlaceOn's one-float-per-element encoding, which a complex tensor's split planes are not: it
+        // stays on the host, and the consumer uploads it in its own layout.
+        bool complex = typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(AiDotNet.Tensors.LinearAlgebra.Complex<>);
+        if (wasResident && !complex && (!hostAuthoritative || rePlaceFromHost)) tensor.PlaceOn(Unwrap(consumer), DirectGpuTensorEngine.EngineOwning(Unwrap(consumer)));
         Interlocked.Increment(ref s_migrations);
         if (policy == CrossBackendTensorPolicy.MigrateWarn && FirstReport(tensor.StorageIdentity, owner, consumer))
             AiDotNetEngine.LogDiagnostic(

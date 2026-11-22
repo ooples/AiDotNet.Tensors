@@ -342,29 +342,120 @@ public sealed class CrossBackendTensorPolicyTests
         }
     }
 
+    // A result on an engine that owns its backend (it registers its results as owning their buffers).
+    private static Tensor<float> OwnedResult(DirectGpuTensorEngine owner)
+    {
+        var a = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        var b = new Tensor<float>(new[] { 10f, 20f, 30f, 40f }, new[] { 4 });
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = owner;
+        try
+        {
+            var produced = owner.TensorAdd(a, b);
+            _ = produced.ToArray();
+            return produced;
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
     [SkippableFact]
     public void Migrating_through_a_non_owning_view_frees_the_result_buffer_it_leaves()
     {
         using var engines = CreateEngines();
-        // An engine that owns its backend registers its results as owning their buffers.
         using var owner = new DirectGpuTensorEngine(new DirectGpuEngine(new OpenClBackend()), ownsDirectGpu: true);
-        var a = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
-        var b = new Tensor<float>(new[] { 10f, 20f, 30f, 40f }, new[] { 4 });
-        Tensor<float> produced;
-        var previous = AiDotNetEngine.Current;
-        AiDotNetEngine.Current = owner;
-        try { produced = owner.TensorAdd(a, b); _ = produced.ToArray(); }
-        finally { AiDotNetEngine.Current = previous; }
+        var produced = OwnedResult(owner);
         var old = produced._gpuBuffer;
         Assert.NotNull(old);
-        Assert.True(owner.OwnsDeviceResult(produced.DataVector));
+        Assert.True(owner.OwnsDeviceResult(produced.DataVector, owner.QueryBackend!));
         var view = produced.Reshape(2, 2);   // shares the result's storage, owns nothing itself
         Assert.False(view._ownsGpuBuffer);
         using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
         var zeros = new Tensor<float>(new float[4], new[] { 2, 2 });
         Assert.Equal(new[] { 11f, 22f, 33f, 44f }, engines.Consumer.TensorAdd(view, zeros).ToArray());
-        Assert.Equal(System.IntPtr.Zero, old!.Handle);   // freed, not leaked to the finalizer
+        // Whole-vector aliases share one binding: the result moved with the view, so nothing still reads the old
+        // buffer, and it is freed rather than leaked to the finalizer.
+        Assert.Same(view._gpuBuffer, produced._gpuBuffer);
+        Assert.Equal(System.IntPtr.Zero, old!.Handle);
         Assert.Equal(new[] { 11f, 22f, 33f, 44f }, produced.ToArray());
+        produced.Dispose();   // the storage owns the new buffer: this alias must not free it under the view
+        Assert.Equal(new[] { 11f, 22f, 33f, 44f }, view.ToArray());
+    }
+
+    [SkippableFact]
+    public void Migrating_the_last_alias_of_a_result_frees_its_buffer()
+    {
+        using var engines = CreateEngines();
+        using var owner = new DirectGpuTensorEngine(new DirectGpuEngine(new OpenClBackend()), ownsDirectGpu: true);
+        var produced = OwnedResult(owner);
+        var old = produced._gpuBuffer;
+        Assert.NotNull(old);
+        Assert.True(owner.OwnsDeviceResult(produced.DataVector, owner.QueryBackend!));
+        var view = produced.Reshape(2, 2);
+        Assert.False(view._ownsGpuBuffer);
+        produced.Dispose();   // the view is now the storage's only alias, still bound to the result's buffer
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zeros = new Tensor<float>(new float[4], new[] { 2, 2 });
+        Assert.Equal(new[] { 11f, 22f, 33f, 44f }, engines.Consumer.TensorAdd(view, zeros).ToArray());
+        Assert.Equal(System.IntPtr.Zero, old!.Handle);   // freed, not leaked to the finalizer
+    }
+
+    [SkippableFact]
+    public void Placing_again_after_coming_home_frees_the_buffer_it_replaces()
+    {
+        using var engines = CreateEngines();
+        var t = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        PlaceOn(engines.Placer, t);
+        var first = t._gpuBuffer;
+        Assert.NotNull(first);
+        t.Cpu();
+        PlaceOn(engines.Placer, t);
+        Assert.NotSame(first, t._gpuBuffer);
+        Assert.Equal(System.IntPtr.Zero, first!.Handle);   // before the fix: still owned, every round trip leaked one
+        Assert.Equal(new[] { 1f, 2f, 3f, 4f }, t.ToArray());
+    }
+
+    [SkippableFact]
+    public void Indices_rewritten_through_the_host_reach_the_consumer_as_written()
+    {
+        using var engines = CreateEngines();
+        var indices = new Tensor<int>(new[] { 0, 1, 2, 3 }, new[] { 4 });
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try { indices.Gpu(); }
+        finally { AiDotNetEngine.Current = previous; }
+        Assert.Same(engines.Placer.QueryBackend, indices._gpuBackend);
+        // The next batch, written through the host span as a data loader does (the version does not move).
+        var span = indices.AsWritableSpan();
+        span[0] = 3; span[1] = 2; span[2] = 1; span[3] = 0;
+        var source = new Tensor<float>(new[] { 10f, 20f, 30f, 40f }, new[] { 4 });
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        Assert.Equal(new[] { 40f, 30f, 20f, 10f }, engines.Consumer.TensorTake(source, indices).ToArray());
+    }
+
+    [SkippableFact]
+    public void A_complex_result_placed_elsewhere_keeps_its_imaginary_parts()
+    {
+        using var engines = CreateEngines();
+        var signal = new Tensor<float>(new[] { 1f, 2f, 0f, -1f, 3f, 0.5f, -2f, 1f }, new[] { 8 });
+        var reference = new CpuEngine().NativeComplexFFT(signal).ToArray();
+        Tensor<Complex<float>> spectrum;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try { spectrum = engines.Placer.NativeComplexFFT(signal); }
+        finally { AiDotNetEngine.Current = previous; }
+        Skip.IfNot(spectrum._gpuBufferIsSplitComplex, "The placer did not keep the spectrum resident.");
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        // The consumer reads it as split planes (an inverse would do; the forward of the spectrum is as good a reader).
+        var again = engines.Consumer.NativeComplexFFTComplex(spectrum).ToArray();
+        var expected = new CpuEngine().NativeComplexFFTComplex(new Tensor<Complex<float>>(reference, new[] { 8 })).ToArray();
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.Equal(expected[i].Real, again[i].Real, 3);
+            Assert.Equal(expected[i].Imaginary, again[i].Imaginary, 3);
+        }
+        spectrum.Cpu();   // a read-back from wherever it is resident now (before the fix: real-only floats over the host)
+        var back = spectrum.ToArray();
+        for (int i = 0; i < reference.Length; i++) Assert.Equal(reference[i].Imaginary, back[i].Imaginary, 4);
     }
 
     [SkippableFact]

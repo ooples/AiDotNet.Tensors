@@ -4690,8 +4690,10 @@ public partial class DirectGpuTensorEngine
     {
         // A binding another backend placed is migrated first: the migration brings the values home and re-uploads
         // them in the plain encoding, so the raw-int32 marker read below must describe the binding after it.
-        CrossBackendTensors.ResolveIfForeign(indices, backend);
-        if (originalIndices is not null) CrossBackendTensors.ResolveIfForeign(originalIndices, backend);
+        // Index inputs are written by their callers through the host (a span write does not bump the version): the
+        // host copy is authoritative, a device copy read back only while a device write is still pending.
+        CrossBackendTensors.ResolveIfForeign(indices, backend, hostAuthoritative: true);
+        if (originalIndices is not null) CrossBackendTensors.ResolveIfForeign(originalIndices, backend, hostAuthoritative: true);
         if (ResidentStepActive && originalIndices is not null && !HasResidentIndexStorage(originalIndices))
             indices = originalIndices;
         if (!HasResidentIndexStorage(indices))
@@ -4751,7 +4753,7 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private OwnedBuffer GetOrAllocateNumericIndexBuffer(IDirectGpuBackend backend, Tensor<int> indices)
     {
-        CrossBackendTensors.ResolveIfForeign(indices, backend);   // before the encoding marker is read
+        CrossBackendTensors.ResolveIfForeign(indices, backend, hostAuthoritative: true);   // before the encoding marker is read
         if (!indices._gpuBufferContainsRawInt32 || !HasResidentIndexStorage(indices))
             return GetOrAllocateBuffer(backend, indices);
         // The capability is resolved before anything is allocated, so a backend without it costs no buffer; a conversion

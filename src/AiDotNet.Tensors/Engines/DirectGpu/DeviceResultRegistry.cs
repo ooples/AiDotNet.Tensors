@@ -103,22 +103,23 @@ internal sealed class DeviceResultRegistry
         shard.CompactAt = Math.Max(MinCompactAt, live * 2);
     }
 
-    /// <summary>The live entries across every thread's shard (a diagnostic for tests).</summary>
-    /// <summary>Whether <paramref name="storage"/> is registered here (a linear scan: for the rare cross-backend
-    /// migration, never an op's hot path).</summary>
-    internal bool Contains(IDeviceResultStorage storage)
+    /// <summary>Whether <paramref name="storage"/> is registered here as a result on <paramref name="backend"/> (a
+    /// linear scan: for the rare cross-backend migration, never an op's hot path).</summary>
+    internal bool Contains(IDeviceResultStorage storage, IDirectGpuBackend backend)
     {
         foreach (var shard in _shards.Values)
         {
             lock (shard)
             {
                 for (int i = 0; i < shard.Count; i++)
-                    if (ReferenceEquals(shard.Handles[i].Target, storage)) return true;
+                    if (ReferenceEquals(shard.Handles[i].Target, storage) && ReferenceEquals(shard.Backends[i], backend))
+                        return true;
             }
         }
         return false;
     }
 
+    /// <summary>The live entries across every thread's shard (a diagnostic for tests).</summary>
     internal int CountLive()
     {
         int live = 0;

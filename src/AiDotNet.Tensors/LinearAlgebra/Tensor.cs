@@ -5237,10 +5237,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         var placed = backend.AllocateBuffer(floatData);
+        var previous = _gpuBuffer;
+        var previousBackend = _gpuBackend;
+        if (!CoversWholeVector) _ownsGpuBuffer = true;
+        else AdoptReplacementGpuBuffer(placed, previous, previousBackend);
         _gpuBuffer = placed;
         _gpuBackend = backend;
-        if (!CoversWholeVector) _ownsGpuBuffer = true;
-        else if (!_storage.HasGpuBufferOwner) _storage.AttachGpuBufferOwner(placed);
         // Both layout markers describe the buffer being ATTACHED, so state them rather than letting
         // whatever the previous buffer was carry over. ToFloatArray above is the ordinary
         // one-float-per-element encoding, NOT raw int32 bits: for a Tensor<int> that came from
@@ -5281,6 +5283,47 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// shared by every alias, a partial view's its own - and the buffer freed when this tensor owns it and
     /// <paramref name="free"/> (false while the owner is tearing down: its context reclaims the memory).
     /// </summary>
+    /// <summary>
+    /// Makes the storage own <paramref name="placed"/>, a new whole-storage buffer replacing <paramref name="previous"/>
+    /// (a re-placement after Cpu(), a resident input re-uploaded at a new size). A buffer the storage owned before is
+    /// freed, through its backend unless that backend is gone: the binding every whole-vector alias resolves is being
+    /// replaced, so none of them reads the old one after this. A previous buffer the storage did not own is not this
+    /// call's to free; the new one is then this alias's own.
+    /// </summary>
+    internal void AdoptReplacementGpuBuffer(Engines.DirectGpu.IGpuBuffer placed, Engines.DirectGpu.IGpuBuffer? previous = null,
+        Engines.DirectGpu.IDirectGpuBackend? previousBackend = null)
+    {
+        if (!CoversWholeVector) return;
+        if (!_storage.HasGpuBufferOwner)
+        {
+            _storage.AttachGpuBufferOwner(placed);
+            return;
+        }
+        if (_storage.OwnsGpuBuffer(placed)) return;
+        if (previous is not null && _storage.OwnsGpuBuffer(previous))
+        {
+            bool backendGone = Engines.DirectGpuTensorEngine.IsRetiredBackend(previousBackend);
+            _storage.DisposeGpuBufferOwner(owner => { if (!backendGone) owner.Dispose(); });
+            _storage.AttachGpuBufferOwner(placed);
+            return;
+        }
+        _ownsGpuBuffer = true;
+    }
+
+    /// <summary>
+    /// Frees <paramref name="stale"/>, a binding about to be replaced (EnsureResidentInput): through the storage when it
+    /// owns it, so its last reference does not free it again; directly otherwise.
+    /// </summary>
+    internal void ReleaseStaleGpuBinding(Engines.DirectGpu.IGpuBuffer stale)
+    {
+        if (CoversWholeVector && _storage.OwnsGpuBuffer(stale))
+        {
+            _storage.DisposeGpuBufferOwner(static owner => owner.Dispose());
+            return;
+        }
+        stale.Dispose();
+    }
+
     internal void ReleaseForeignGpuBinding(bool readBack, bool free, bool storageOwned = false)
     {
         var owner = _gpuBackend;
@@ -5308,6 +5351,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // migration may be a non-owning reshape of the result that owns it. It is owned when this alias says so, when
         // the storage holds it as its GPU buffer owner (a placement, FromGpuBuffer), or when the owning engine
         // registered the storage as its result (storageOwned).
+        // Every whole-vector alias resolves its binding through the vector's shared device state, so detaching it here
+        // detaches it for all of them (a partial view keeps its own): no alias is left holding the buffer freed below.
         bool wholeStorage = CoversWholeVector;
         bool storageHoldsIt = wholeStorage && buffer is not null && _storage.OwnsGpuBuffer(buffer);
         bool owned = _ownsGpuBuffer || storageHoldsIt || (wholeStorage && storageOwned);
@@ -5429,7 +5474,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var ops = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < values.Length; i++)
         {
-            int v = BitConverter.SingleToInt32Bits(words[i]);
+            int v = Engines.DirectGpu.CUDA.Ptx.PtxCompat.SingleToInt32Bits(words[i]);
             values[i] = typeof(T) == typeof(int) ? (T)(object)v : ops.FromDouble(v);
         }
         return values;
@@ -5443,8 +5488,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var ops = MathHelper.GetNumericOperations<T>();
         for (int i = 0; i < values.Length; i++)
         {
-            long v = (uint)BitConverter.SingleToInt32Bits(words[2 * i])
-                     | ((long)BitConverter.SingleToInt32Bits(words[2 * i + 1]) << 32);
+            long v = (uint)Engines.DirectGpu.CUDA.Ptx.PtxCompat.SingleToInt32Bits(words[2 * i])
+                     | ((long)Engines.DirectGpu.CUDA.Ptx.PtxCompat.SingleToInt32Bits(words[2 * i + 1]) << 32);
             values[i] = typeof(T) == typeof(long) ? (T)(object)v
                 : typeof(T) == typeof(int) ? (T)(object)(int)v
                 : ops.FromDouble(v);
