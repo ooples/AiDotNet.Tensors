@@ -40,12 +40,18 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private Tensor<T>[] _stateTensors = Array.Empty<Tensor<T>>();
     // The device buffers a capture recorded the states at (the replays write there).
     private Engines.DirectGpu.IGpuBuffer[] _capturedStateBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
-    // Leaves the steps write in place (a static decode cache updated by an in-place op, no declared state), their
-    // captured device buffers, and the versions the last execution left them at.
+    // Leaves the steps write in place (a static decode cache updated by an in-place op, no declared state, no input
+    // slot) and their captured device buffers.
     private Tensor<T>[] _inPlaceLeaves = Array.Empty<Tensor<T>>();
     private Engines.DirectGpu.IGpuBuffer[] _capturedInPlaceBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
-    private int[] _capturedInPlaceVersions = Array.Empty<int>();
-    private int[] _capturedStateVersions = Array.Empty<int>();
+    // Every tensor a captured graph writes: the in-place leaves, the input slots an in-place step writes (a KV cache fed
+    // as an input), and the states. Each keeps the device buffer the capture recorded it at and the version the last
+    // launch left it at; a replay first re-uploads any the caller changed in between (a cache reset between sequences).
+    private Tensor<T>[] _writtenTargets = Array.Empty<Tensor<T>>();
+    private Engines.DirectGpu.IGpuBuffer[] _writtenTargetBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
+    private int[] _writtenTargetVersions = Array.Empty<int>();
+    // Per input slot: an in-place step writes it, so the graph, not the caller's host copy, holds its current value.
+    private bool[] _inPlaceInputs = Array.Empty<bool>();
     // The host data each captured-graph input buffer last received (bitwise), the buffer it went to and the input's
     // cache version then: a replay whose input still matches all three skips the upload (a decode step re-feeding
     // the same id, a constant flag input).
@@ -97,6 +103,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private DirectGpuTensorEngine? _graphEngine;
     private int _graphWarmupCalls;
     private bool _graphCaptureDisabled;
+    // Replays that failed and dropped their graph. A failed replay recaptures on the next call; only after this many
+    // does the plan stay eager (a fault that recurs on every capture).
+    private int _graphReplayFailures;
+    private const int MaxGraphReplayFailures = 3;
     // Eviction is suspended for the captured graph's LIFETIME (resumed in Dispose): the captured kernels
     // reference resident intermediate buffers in the activation cache that must not be freed before replay.
     private bool _graphEvictionSuspended;
@@ -892,14 +902,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 InvalidOperationException? replayError = null;
                 try
                 {
-                    for (int i = 0; i < _stateTensors.Length; i++)
-                        if (_stateTensors[i].GpuCacheVersion != _capturedStateVersions[i])
-                            throw new InvalidOperationException("A captured state was modified outside the plan.");
-                    for (int i = 0; i < _inPlaceLeaves.Length; i++)
-                        if (_inPlaceLeaves[i].GpuCacheVersion != _capturedInPlaceVersions[i])
-                            throw new InvalidOperationException("A tensor the captured graph writes in place was modified outside the plan.");
+                    // A state, cache or position the caller changed since the last launch (a reset between sequences,
+                    // by an engine op or a host write) goes into the buffer the graph reads before it runs.
+                    RefreshWrittenTargets(cb);
                     RefreshInferenceInputsInPlace(cb);
-                    stateLaunchAttempted = _stateTensors.Length != 0 || _inPlaceLeaves.Length != 0;
+                    stateLaunchAttempted = _writtenTargets.Length != 0;
                     cb.LaunchCapturedGraph(_graphExec);
                     RearmStates();
                     replayed = RefreshFinalOutputFromResident(); // fresh DtoH into _finalOutput's host storage
@@ -915,14 +922,28 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
                 // Fail closed: an input could not be refreshed in place, or the output could not be downloaded
                 // — discard the captured graph and run this call eagerly so we never serve a result computed
-                // from stale device inputs or read from a stale host buffer. Capture stays disabled afterward.
+                // from stale device inputs or read from a stale host buffer. The next call captures again; only a
+                // replay that keeps failing leaves the plan eager for good.
+                if (replayError is not null)
+                    TraceGraphTeardownFailure(++_graphReplayFailures >= MaxGraphReplayFailures
+                        ? "replay the captured inference graph; this plan now runs eagerly"
+                        : "replay the captured inference graph; it is captured again on the next call", replayError);
+                else
+                    ++_graphReplayFailures;
                 if (_graphExec != IntPtr.Zero) { var failedExec = _graphExec; BestEffortTeardown(() => cb.DestroyCapturedGraph(failedExec), "destroy the captured graph after a failed replay"); _graphExec = IntPtr.Zero; }
                 _graphBackend = null;
-                _graphCaptureDisabled = true;
-                if (_graphEvictionSuspended && _graphEngine is not null)
+                if (_graphReplayFailures >= MaxGraphReplayFailures) _graphCaptureDisabled = true;
+                else _graphWarmupCalls = InferenceGraphWarmup - 1;
+                if (_graphEngine is { } failedEngine)
                 {
-                    var replayEngine = _graphEngine; BestEffortTeardown(() => replayEngine.EndGraphLifetime(), "end the graph lifetime after a failed replay");
-                    _graphEvictionSuspended = false;
+                    // The slots go back to the ordinary upload path until the recapture pins them again.
+                    if (!stateLaunchAttempted)
+                        BestEffortTeardown(() => UnpinInputs(failedEngine), "return the input slots to the upload path after a failed replay");
+                    if (_graphEvictionSuspended)
+                    {
+                        BestEffortTeardown(() => failedEngine.EndGraphLifetime(), "end the graph lifetime after a failed replay");
+                        _graphEvictionSuspended = false;
+                    }
                 }
                 _graphEngine = null;
                 if (stateLaunchAttempted)
@@ -955,8 +976,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // Every input slot gets its own persistent device buffer first: the replay refreshes
                             // inputs in place, so each must have a bound address (an input read only through the
                             // engine's transient upload path would otherwise have none).
-                            foreach (var input in _compiledInputTensors.Where(input => input is not null))
-                                gte.PinInputResident(input);
+                            var inputBuffers = new Engines.DirectGpu.IGpuBuffer?[_compiledInputTensors.Length];
+                            for (int i = 0; i < inputBuffers.Length; i++)
+                                if (_compiledInputTensors[i] is { } input)
+                                    inputBuffers[i] = gte.PinInputResident(input);
                             // And every other leaf the steps read (constants, weights): read through the transient
                             // upload path they would be re-uploaded inside the capture.
                             var producedHere = new HashSet<Tensor<T>>(steps.Select(step => step.OutputBuffer),
@@ -965,12 +988,17 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // produces: persistent state the plan advances every execution (a static decode cache).
                             var producedOutOfPlace = new HashSet<Tensor<T>>(steps.Where(step => !IsInPlaceStep(step)).Select(step => step.OutputBuffer),
                                 ReferenceEqualityComparer<Tensor<T>>.Instance);
-                            _inPlaceLeaves = steps.Where(IsInPlaceStep).Select(step => step.OutputBuffer)
-                                .Where(t => !producedOutOfPlace.Contains(t) && Array.IndexOf(_compiledInputTensors, t) < 0 && Array.IndexOf(_stateTensors, t) < 0)
+                            // Everything an in-place step writes, input slots and states included: the pre-residency pass
+                            // below advances each of them, so each is snapshotted around it.
+                            var writtenInPlace = steps.Where(IsInPlaceStep).Select(step => step.OutputBuffer)
+                                .Where(t => !producedOutOfPlace.Contains(t))
                                 .Distinct(ReferenceEqualityComparer<Tensor<T>>.Instance).ToArray();
+                            _inPlaceLeaves = writtenInPlace
+                                .Where(t => Array.IndexOf(_compiledInputTensors, t) < 0 && Array.IndexOf(_stateTensors, t) < 0)
+                                .ToArray();
+                            _inPlaceInputs = _compiledInputTensors.Select(input => input is not null && Array.IndexOf(writtenInPlace, input) >= 0).ToArray();
                             _capturedInPlaceBuffers = _inPlaceLeaves.Select(t => gte.PinInputResident(t)
                                 ?? throw new InvalidOperationException("A tensor written in place could not be made device-resident.")).ToArray();
-                            _capturedInPlaceVersions = new int[_inPlaceLeaves.Length];
                             foreach (var leaf in steps.SelectMany(step => step.Inputs).Where(leaf => !producedHere.Contains(leaf)
                                          && Array.IndexOf(_compiledInputTensors, leaf) < 0 && Array.IndexOf(_stateTensors, leaf) < 0))
                                 gte.PinLeafResident(leaf);
@@ -981,23 +1009,39 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 stateBuffers[i] = gte.PinInputResident(_stateTensors[i])
                                     ?? throw new InvalidOperationException("A plan state could not be made device-resident.");
                             _capturedStateBuffers = stateBuffers;
-                            _capturedStateVersions = new int[stateBuffers.Length];
+                            // Every tensor the graph writes, with the buffer the capture records it at.
+                            var targets = new List<Tensor<T>>(_inPlaceLeaves);
+                            var targetBuffers = new List<Engines.DirectGpu.IGpuBuffer>(_capturedInPlaceBuffers);
+                            for (int i = 0; i < _compiledInputTensors.Length; i++)
+                            {
+                                if (!_inPlaceInputs[i]) continue;
+                                targets.Add(_compiledInputTensors[i]);
+                                targetBuffers.Add(inputBuffers[i]
+                                    ?? throw new InvalidOperationException("An input slot written in place could not be made device-resident."));
+                            }
+                            targets.AddRange(_stateTensors);
+                            targetBuffers.AddRange(stateBuffers);
+                            _writtenTargets = targets.ToArray();
+                            _writtenTargetBuffers = targetBuffers.ToArray();
+                            _writtenTargetVersions = new int[_writtenTargets.Length];
                             // A stateful plan's trailing state writes are left out: the launch below performs
                             // this call's one state advance, and the state buffers already exist (the eager
                             // warmup calls wrote them).
-                            // The pre-residency pass would advance every in-place leaf once more than this call does
-                            // (the launch below is this call's advance): snapshot them on the device and restore after.
-                            var snapshots = new Engines.DirectGpu.IGpuBuffer?[_inPlaceLeaves.Length];
+                            // The pre-residency pass would advance every tensor an in-place step writes (a leaf, an
+                            // input slot or a state) once more than this call does (the launch below is this call's
+                            // advance): snapshot them on the device and restore after.
+                            var snapshots = new Engines.DirectGpu.IGpuBuffer?[_writtenTargets.Length];
                             try
                             {
                                 for (int i = 0; i < snapshots.Length; i++)
-                                    snapshots[i] = gte.TakeDeviceSnapshot(_capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+                                    if (Array.IndexOf(writtenInPlace, _writtenTargets[i]) >= 0)
+                                        snapshots[i] = gte.TakeDeviceSnapshot(_writtenTargetBuffers[i], _writtenTargets[i].Length);
                                 RunStepsPooled(gte, engine, steps, steps.Length - _stateTensors.Length);
                             }
                             catch
                             {
-                                // A step that threw may follow one that already advanced a leaf. The eager fallback
-                                // advances every leaf once itself, so the leaves go back to their snapshots first; if
+                                // A step that threw may follow one that already advanced a target. The eager fallback
+                                // advances every target once itself, so the targets go back to their snapshots first; if
                                 // that cannot be done the call fails instead of running the plan on advanced state.
                                 try
                                 {
@@ -1016,11 +1060,13 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             }
                             catch
                             {
-                                // The leaves hold this pass's extra advance and cannot be put back.
+                                // The targets hold this pass's extra advance and cannot be put back.
                                 stateLaunchAttempted = true;
                                 throw;
                             }
 
+                            // A recapture after a failed replay starts the upload bookkeeping afresh.
+                            _uploadedInputs = Array.Empty<float[]?>();
                             // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
                             // capture is non-capturable), then record the step launches. Capture RECORDS
                             // but does not execute, so launch once afterwards to produce this call's output.
@@ -1032,7 +1078,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 _graphBackend = cb;
                                 _graphEngine = gte;
                                 _capturedOutputBuffer = _finalOutput._gpuBuffer;
-                                stateLaunchAttempted = _stateTensors.Length != 0 || _inPlaceLeaves.Length != 0;
+                                stateLaunchAttempted = _writtenTargets.Length != 0;
                                 cb.LaunchCapturedGraph(exec);
                                 RearmStates();
                                 // Force a fresh DtoH into _finalOutput's host storage (else the returned tensor
@@ -1098,7 +1144,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return _finalOutput;
     }
 
-    // Writes each acquired pre-residency snapshot back into its in-place leaf and releases it. On any failure the
+    // Writes each acquired pre-residency snapshot back into its written target and releases it. On any failure the
     // snapshots not yet released are disposed before the error propagates, so none outlives the call.
     private void RestoreInPlaceLeaves(DirectGpuTensorEngine gte, Engines.DirectGpu.IGpuBuffer?[] snapshots)
     {
@@ -1107,10 +1153,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             for (int i = 0; i < snapshots.Length; i++)
             {
                 if (snapshots[i] is not { } snapshot) continue;
-                if (!ReferenceEquals(_inPlaceLeaves[i]._gpuBuffer, _capturedInPlaceBuffers[i]))
+                if (!ReferenceEquals(_writtenTargets[i]._gpuBuffer, _writtenTargetBuffers[i]))
                     throw new InvalidOperationException("An in-place write moved its tensor to another device buffer; the graph cannot replay it.");
                 snapshots[i] = null;
-                gte.RestoreDeviceSnapshot(snapshot, _capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+                gte.RestoreDeviceSnapshot(snapshot, _writtenTargetBuffers[i], _writtenTargets[i].Length);
             }
         }
         finally
@@ -1141,8 +1187,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
     private void UnpinInputs(DirectGpuTensorEngine gte)
     {
-        foreach (var input in _compiledInputTensors.Where(input => input is not null))
+        for (int i = 0; i < _compiledInputTensors.Length; i++)
+        {
+            if (_compiledInputTensors[i] is not { } input) continue;
+            // A slot an in-place step writes holds its current value on the device only: bring it to the host before
+            // its binding is dropped, or the eager path would read the stale host copy.
+            if (i < _inPlaceInputs.Length && _inPlaceInputs[i]) input.GetReadOnlyDataArray();
             gte.UnpinInput(input);
+        }
     }
 
     // Runs the first count steps with this plan's scratch pool current, each step its own pool action, so a step's
@@ -1187,16 +1239,37 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private void RearmStates()
     {
         if (_graphEngine is not { } gte) return;
-        for (int i = 0; i < _inPlaceLeaves.Length; i++)
+        for (int i = 0; i < _writtenTargets.Length; i++)
         {
-            gte.RearmStateAfterReplay(_inPlaceLeaves[i], _capturedInPlaceBuffers[i]);
-            _capturedInPlaceVersions[i] = _inPlaceLeaves[i].GpuCacheVersion;
+            gte.RearmStateAfterReplay(_writtenTargets[i], _writtenTargetBuffers[i]);
+            _writtenTargetVersions[i] = _writtenTargets[i].GpuCacheVersion;
         }
-        if (_capturedStateBuffers.Length == 0) return;
-        for (int i = 0; i < _stateTensors.Length; i++)
+    }
+
+    // Before a replay: each tensor the graph writes holds the last launch's value in its captured buffer. One the caller
+    // changed since (its version moved or its binding left that buffer: an engine op or a host write reset it between
+    // sequences) is uploaded there first. One whose host copy was made current since the launch may have been written
+    // through a path that does not advance the version, so its host data is compared with the device's and uploaded
+    // when they differ; one whose download is still pending cannot have been touched on the host.
+    private void RefreshWrittenTargets(Engines.DirectGpu.IGpuGraphCapture cb)
+    {
+        if (_writtenTargets.Length == 0) return;
+        var gte = _graphEngine ?? throw new InvalidOperationException("The captured graph has no engine.");
+        for (int i = 0; i < _writtenTargets.Length; i++)
         {
-            gte.RearmStateAfterReplay(_stateTensors[i], _capturedStateBuffers[i]);
-            _capturedStateVersions[i] = _stateTensors[i].GpuCacheVersion;
+            var target = _writtenTargets[i];
+            var buffer = _writtenTargetBuffers[i];
+            bool changed = target.GpuCacheVersion != _writtenTargetVersions[i] || !ReferenceEquals(target._gpuBuffer, buffer);
+            if (!changed && !DirectGpuTensorEngine.HostMayDifferFromDevice(target)) continue;
+            if (target.GetReadOnlyDataArray() is not float[] host || host.Length != target.Length || buffer.Size < host.Length)
+                throw new InvalidOperationException("A tensor the captured graph writes cannot be refreshed in place.");
+            if (!changed && gte.DownloadCapturedBuffer(buffer, host.Length) is { } device
+                && System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(host.AsSpan())
+                    .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(device.AsSpan())))
+                continue;
+            cb.UploadBufferInPlace(host, buffer);
+            gte.RearmStateAfterReplay(target, buffer);
+            _writtenTargetVersions[i] = target.GpuCacheVersion;
         }
     }
 
@@ -1293,6 +1366,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         {
             var inT = inputs[i];
             if (inT is null) continue;
+            // A slot an in-place step writes is one of the written targets (RefreshWrittenTargets): its device value is
+            // the current one, and its host copy is not re-uploaded over it.
+            if (i < _inPlaceInputs.Length && _inPlaceInputs[i]) continue;
             // Fail closed (the captured graph reads fixed resident input addresses): if a buffer is missing,
             // belongs to another backend, or is too small, refreshing in place is impossible, so the replay
             // would consume this call's inputs from STALE device memory. Throw so the caller abandons the
@@ -2056,6 +2132,14 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var leaves = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         foreach (var leaf in EnumerateLeafInputs(steps))
             leaves.Add(leaf);
+        // A persistent tensor an in-place step writes (a KV cache a decode op appends to) is read by the graph directly
+        // too: the step that writes it reads it first. Its only producers are those in-place writes, so it is a slot
+        // whose value the caller supplies and every execution advances, not a computed intermediate.
+        var producedOutOfPlace = new HashSet<Tensor<T>>(steps.Where(step => !IsInPlaceStep(step)).Select(step => step.OutputBuffer),
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var step in steps)
+            if (IsInPlaceStep(step) && !producedOutOfPlace.Contains(step.OutputBuffer))
+                leaves.Add(step.OutputBuffer);
 
         for (int i = 0; i < explicitInputs.Length; i++)
         {

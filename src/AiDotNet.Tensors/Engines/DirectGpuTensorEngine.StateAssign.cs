@@ -262,6 +262,17 @@ public partial class DirectGpuTensorEngine
     /// capture recorded), re-binds it there device-resident, so a host read downloads this replay's value (a replay runs
     /// no host bookkeeping, and host reads between replays may have moved the tensor's binding).
     /// </summary>
+    /// <summary>
+    /// Whether <paramref name="tensor"/>'s host copy may hold something its device buffer does not: false while its
+    /// device download is still pending (nothing on the host has read or written it since the device wrote it), true
+    /// once the host copy was made current (a host write after that need not advance the version).
+    /// </summary>
+    internal static bool HostMayDifferFromDevice<T>(Tensor<T> tensor)
+    {
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not { } array) return false;
+        return !Helpers.HostSync.IsPending(array) && !Helpers.HostSync.IsPending(tensor.DataVector);
+    }
+
     internal void RearmStateAfterReplay<T>(Tensor<T> state, IGpuBuffer capturedBuffer)
     {
         using var __gpuOp = EnterGpuOp();
