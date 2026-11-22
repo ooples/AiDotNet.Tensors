@@ -629,17 +629,18 @@ public partial class DirectGpuTensorEngine
             // Judged while the pool still holds it: a liveness check that throws leaves the buffer pooled, not adrift
             // between the pop and a dispose. Only then does it leave the pool, to the caller or to its disposal (a
             // buffer of a backend that is gone, or already released, has only its wrapper left to dispose).
-            var candidate = stack.Peek();
-            bool usable = sameBackend && IsLiveDeviceBuffer(candidate);
-            stack.Pop();
+            bool usable = sameBackend && IsLiveDeviceBuffer(stack.Peek());
             _float64PoolBytes -= (long)length * sizeof(double);
             if (usable)
             {
-                buffer = candidate;
+                buffer = stack.Pop();
                 return true;
             }
 
-            candidate.Dispose();
+            using (stack.Pop())
+            {
+                // Disposed as it leaves the pool.
+            }
         }
 
         return false;
