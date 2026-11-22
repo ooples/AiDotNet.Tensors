@@ -78,6 +78,7 @@ public sealed class DeferredScope : IDeferredScope
         {
             ExecuteWhileRecording = options.ExecuteEagerlyWhileRecording
         };
+        if (options.ExecuteEagerlyWhileRecording) GraphBuilder.MarkWritesRunWhileRecording();
         _recordingBackend.BeginRecording(GraphBuilder);
 
         // #642: defer buffer releases for the lifetime of this scope. Ops allocate buffers
@@ -174,6 +175,7 @@ public sealed class DeferredScope : IDeferredScope
             }
 
             RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
+            graph.Executed?.Invoke();
             IsExecuted = true;
         }
         finally
@@ -233,6 +235,7 @@ public sealed class DeferredScope : IDeferredScope
             }
 
             RecordStatistics(graph, compilationTimer.Elapsed, executionTimer.Elapsed);
+            graph.Executed?.Invoke();
             IsExecuted = true;
         }
         finally

@@ -199,6 +199,144 @@ public class DecodeStepCpuPlanTests
             }
     }
 
+    // A trace that realizes a state-writing decode op (a host read of its output) and then throws is abandoned by its
+    // scope's Dispose: the trace's write must be undone there too, as compiling undoes it, so the cache, position and
+    // state leave the failed trace as it found them.
+    [Fact]
+    public void An_abandoned_trace_restores_the_state_its_decode_ops_wrote()
+    {
+        var cpu = new CpuEngine();
+        var cache = T([1, 3, 2], i => 0.5f * i);
+        var position = T([1], _ => 1f);
+        var state = T([1, 2, 2], i => 0.25f * (i + 1));
+        var cacheBefore = cache.ToArray();
+        var stateBefore = state.ToArray();
+        var x = T([1, 2], i => 9f + i);
+        var q = T([1, 2], i => 0.3f + i); var k = T([1, 2], i => 0.7f - i); var v = T([1, 2], i => 0.1f * i);
+        var a = T([1], _ => 0.9f); var b = T([1], _ => 0.5f);
+        using (new EngineScope(cpu))
+        {
+            // The deliberate failure only: a decode op that threw on its own would leave the state untouched and
+            // pass the checks below without exercising the restore.
+            Assert.Throws<DeliberateFailure>((Action)(() =>
+            {
+                using var scope = GraphMode.EnableInference();
+                var w = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                var o = cpu.GatedDeltaNetStep(state, q, k, v, a, b, GatedDeltaRule.ScaledKeys);
+                // Host reads realize both ops while the trace is still recording.
+                Assert.Equal(3, w.ToArray().Length);
+                Assert.Equal(2, o.ToArray().Length);
+                Assert.Equal(2f, position.ToArray()[0]);
+                throw new DeliberateFailure();
+            }));
+        }
+        Assert.Equal(1f, position.ToArray()[0]);
+        Assert.Equal(cacheBefore, cache.ToArray());
+        Assert.Equal(stateBefore, state.ToArray());
+    }
+
+    private sealed class DeliberateFailure : Exception
+    {
+        public DeliberateFailure() : base("the model failed after the decode step") { }
+    }
+
+    // A nested scope registers the cache as a state target and is abandoned before its op ever runs. The outer trace
+    // then writes the same cache, realizes it and fails: its abandonment must still find the pre-trace state.
+    [Fact]
+    public void An_abandoned_nested_scope_does_not_cost_the_outer_trace_its_snapshot()
+    {
+        var cpu = new CpuEngine();
+        var cache = T([1, 3, 2], i => 0.5f * i);
+        var position = T([1], _ => 1f);
+        var cacheBefore = cache.ToArray();
+        var x = T([1, 2], i => 9f + i);
+        using (new EngineScope(cpu))
+        {
+            Assert.Throws<DeliberateFailure>((Action)(() =>
+            {
+                using var outer = GraphMode.EnableInference();
+                try
+                {
+                    using var inner = GraphMode.EnableInference();
+                    cpu.KvCacheAppend(cache, position, x);   // recorded, never realized
+                    throw new DeliberateFailure();
+                }
+                catch (DeliberateFailure)
+                {
+                    // The inner trace is abandoned; the outer one goes on.
+                }
+                Assert.Equal(1f, position.ToArray()[0]);
+                var w = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                Assert.Equal(3, w.ToArray().Length);          // realizes the outer append
+                Assert.Equal(2f, position.ToArray()[0]);
+                throw new DeliberateFailure();
+            }));
+        }
+        Assert.Equal(1f, position.ToArray()[0]);
+        Assert.Equal(cacheBefore, cache.ToArray());
+    }
+
+    // The outer trace realizes an append (position 1 -> 2), then a nested scope realizes another (2 -> 3) and is
+    // abandoned: the nested write alone is undone (back to 2), and the outer trace's own abandonment undoes the rest.
+    [Fact]
+    public void An_abandoned_nested_scope_rolls_back_only_its_own_realized_write()
+    {
+        var cpu = new CpuEngine();
+        var cache = T([1, 4, 2], i => 0.5f * i);
+        var position = T([1], _ => 1f);
+        var cacheBefore = cache.ToArray();
+        var x = T([1, 2], i => 9f + i);
+        using (new EngineScope(cpu))
+        {
+            Assert.Throws<DeliberateFailure>((Action)(() =>
+            {
+                using var outer = GraphMode.EnableInference();
+                var first = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                Assert.Equal(4, first.ToArray().Length);      // realizes the outer append
+                Assert.Equal(2f, position.ToArray()[0]);
+                var afterOuter = cache.ToArray();
+                try
+                {
+                    using var inner = GraphMode.EnableInference();
+                    var second = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                    Assert.Equal(4, second.ToArray().Length);  // realizes the nested append
+                    Assert.Equal(3f, position.ToArray()[0]);
+                    throw new DeliberateFailure();
+                }
+                catch (DeliberateFailure)
+                {
+                    // The inner trace is abandoned; the outer one goes on.
+                }
+                Assert.Equal(2f, position.ToArray()[0]);
+                Assert.Equal(afterOuter, cache.ToArray());
+                throw new DeliberateFailure();
+            }));
+        }
+        Assert.Equal(1f, position.ToArray()[0]);
+        Assert.Equal(cacheBefore, cache.ToArray());
+    }
+
+    // A trace that never realizes its decode op takes no snapshot of the op's state (a KV cache can be large).
+    [Fact]
+    public void A_trace_that_never_realizes_its_decode_op_copies_no_state()
+    {
+        var cpu = new CpuEngine();
+        var cache = new Tensor<float>([1, 4, 2]);
+        var position = new Tensor<float>([1]);
+        var x = new Tensor<float>([1, 2]);
+        using (new EngineScope(cpu))
+        using (var scope = GraphMode.EnableInference())
+        {
+            cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+            var field = typeof(LazyTensorScope).GetField("_traceStateSnapshots",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var entries = ((System.Collections.IEnumerable)field.GetValue(scope)!).Cast<object>().ToArray();
+            Assert.Equal(2, entries.Length);
+            var snapshot = entries[0].GetType().GetField("Snapshot", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            Assert.All(entries, e => Assert.Null(snapshot.GetValue(e)));
+        }
+    }
+
     [Fact]
     public void Malformed_decode_step_arguments_are_rejected()
     {

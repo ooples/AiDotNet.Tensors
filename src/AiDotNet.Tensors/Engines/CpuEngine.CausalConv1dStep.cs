@@ -10,6 +10,8 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <inheritdoc />
+    /// <remarks>The kernel is NEWEST-FIRST: <c>weight[:, 0]</c> weights the current input, the reverse of
+    /// PyTorch/HF conv1d and <see cref="IEngine.DepthwiseConv1D{T}"/>; to use their weights, reverse the tap axis.</remarks>
     public virtual Tensor<T> CausalConv1dStep<T>(Tensor<T> history, Tensor<T> input, Tensor<T> weight, Tensor<T>? bias, bool silu)
     {
         var (taps, batch, channels) = ValidateCausalConv1dStep(history, input, weight, bias);

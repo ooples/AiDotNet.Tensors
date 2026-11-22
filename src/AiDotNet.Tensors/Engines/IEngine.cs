@@ -4724,11 +4724,11 @@ public partial interface IEngine
     /// output and the new state come from one pass over the state. Forward only (decoding).
     /// </summary>
     /// <param name="state">The memory [rows, valueDim, keyDim], contiguous; written in place.</param>
-    /// <param name="query">This position's queries, rows x keyDim values.</param>
-    /// <param name="key">This position's keys, rows x keyDim values.</param>
-    /// <param name="value">This position's values, rows x valueDim values.</param>
-    /// <param name="alpha">The decay per row (rows values).</param>
-    /// <param name="beta">The write strength per row (rows values).</param>
+    /// <param name="query">This position's queries [rows, keyDim], or [..., keyDim] with leading dimensions multiplying to rows.</param>
+    /// <param name="key">This position's keys, the query's shape.</param>
+    /// <param name="value">This position's values, the query's leading shape with valueDim last.</param>
+    /// <param name="alpha">The decay per row: [rows] or the query's leading shape, optionally with a trailing 1.</param>
+    /// <param name="beta">The write strength per row, shaped as <paramref name="alpha"/>.</param>
     /// <param name="rule">The state update, as the scan's.</param>
     /// <returns>The output <c>o</c> [rows, valueDim].</returns>
     Tensor<T> GatedDeltaNetStep<T>(
@@ -4746,9 +4746,19 @@ public partial interface IEngine
     /// <paramref name="silu"/>), and the history shifted IN PLACE (<c>history[m] = history[m - 1]</c>,
     /// <c>history[0] = x</c>). A zero history is the sequence start (the full convolution's zero padding). Forward only.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Kernel orientation: NEWEST-FIRST.</b> <c>weight[:, 0]</c> weights the CURRENT input and
+    /// <c>weight[:, m]</c> the input m positions back. This is the REVERSE of PyTorch <c>nn.Conv1d</c> /
+    /// HuggingFace / Mamba <c>causal_conv1d</c> and of this library's <see cref="DepthwiseConv1D{T}"/>, where the
+    /// current input is weighted by the LAST tap <c>w[:, K - 1]</c>. To use PyTorch/HF or
+    /// <see cref="DepthwiseConv1D{T}"/> weights, reverse the tap axis: <c>weight[c, m] = torchWeight[c, 0, K - 1 - m]</c>.
+    /// With that reversal, stepping a zero history over a sequence equals <see cref="DepthwiseConv1D{T}"/> with
+    /// padding K - 1 truncated to the first seqLen outputs.</para>
+    /// </remarks>
     /// <param name="history">The previous inputs [K - 1, batch, channels], most recent first; written in place.</param>
     /// <param name="input">This position's input, batch x channels values.</param>
-    /// <param name="weight">The taps [channels, K]: column 0 weights this position, column m the input m positions back.</param>
+    /// <param name="weight">The taps [channels, K], newest-first: column 0 weights this position, column m the input m positions
+    /// back (the reverse of PyTorch / <see cref="DepthwiseConv1D{T}"/>; reverse the tap axis to use their weights).</param>
     /// <param name="bias">Per-channel bias [channels], or null.</param>
     /// <param name="silu">Apply SiLU (x sigmoid(x)) to the output.</param>
     /// <returns>The output [batch, channels].</returns>
@@ -4771,9 +4781,12 @@ public partial interface IEngine
     /// place. Start it at zero.</param>
     /// <param name="value">This position's entry, batch x width values.</param>
     /// <returns>The additive mask [capacity] for attending over the cache after this append.</returns>
-    /// <exception cref="InvalidOperationException">The host implementation throws when the cache is full. A device
-    /// kernel cannot report it: past capacity it writes nothing, leaves the position at capacity and returns a mask of
-    /// every slot, so callers bound the number of positions themselves.</exception>
+    /// <exception cref="InvalidOperationException">The cache is full, or the position is not a non-negative integer
+    /// (NaN, an infinity, a negative or fractional value). Every backend writes neither the cache nor the position then.
+    /// An eager call throws before returning; a compiled plan replaying a captured graph throws from the
+    /// <c>Execute</c> that met it (the device kernel records the fault and fills that execution's mask with NaN).</exception>
+    /// <exception cref="NotSupportedException">T is not a floating-point type (the mask holds negative infinity), or
+    /// it cannot count every position up to capacity exactly (Half past 2048 slots, BFloat16 past 256).</exception>
     Tensor<T> KvCacheAppend<T>(
         Tensor<T> cache,
         Tensor<T> position,

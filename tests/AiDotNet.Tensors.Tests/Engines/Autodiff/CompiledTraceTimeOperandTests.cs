@@ -184,4 +184,27 @@ public class CompiledTraceTimeOperandTests
             AiDotNetEngine.Current = prior;
         }
     }
+
+    // An op with no tensor operand and no auxiliary producer declines to record and runs its eager path on the same
+    // closure. Declining must leave that closure untouched: replacing its captured array with a copy before declining
+    // sent the eager write into the copy, and the caller's array never received it.
+    [Fact]
+    public void DecliningToRecord_LeavesTheCallersCapturedArrays()
+    {
+        var engine = new CpuEngine();
+        var original = new float[3];
+        var written = original;
+        Func<IEngine, Tensor<float>> forward = _ =>
+        {
+            written[1] = 7f;
+            return new Tensor<float>(new[] { 1 }, new Vector<float>(new[] { written[1] }));
+        };
+        using (GraphMode.EnableTraining(Array.Empty<Tensor<float>>()))
+        {
+            Assert.False(engine.TryRecordCompiledOp("NoOperands", Array.Empty<Tensor<float>?>(), forward, out _));
+            Assert.Same(original, written);
+            forward(engine);
+        }
+        Assert.Equal(7f, original[1]);
+    }
 }

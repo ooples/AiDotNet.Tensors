@@ -40,7 +40,12 @@ internal static class GpuLaunchProbe
     public static long Count => Interlocked.Read(ref _count);
 
     /// <summary>Called once per GPU kernel dispatch. Cheap; safe to call from any thread.</summary>
-    public static void OnLaunch() { Interlocked.Increment(ref _count); Interlocked.Increment(ref _totalEver); }
+    public static void OnLaunch()
+    {
+        if (_detectionDepth > 0) return;   // GPU detection's own probe (see DetectionScope), not the op's
+        Interlocked.Increment(ref _count);
+        Interlocked.Increment(ref _totalEver);
+    }
 
     /// <summary>DIAGNOSTIC: launches since process start; <see cref="Reset"/> does NOT clear it.</summary>
     public static long TotalEver => Interlocked.Read(ref _totalEver);
@@ -223,6 +228,28 @@ internal static class GpuLaunchProbe
     internal readonly struct TuningAttribution : System.IDisposable
     {
         public void Dispose() => _tuningDepth--;
+    }
+
+    // GPU auto-detection runs once per process from whichever op first resolves AiDotNetEngine.Current, and its
+    // known-answer probe (a small matmul read back) is the detection's, not that op's: inside a detection scope its
+    // launches are not counted and its transfers count as one-time evidence, as a tuning scope's do.
+    [System.ThreadStatic] private static int _detectionDepth;
+
+    /// <summary>Attributes this thread's launches and transfers to GPU detection until disposed.</summary>
+    internal static DetectionAttribution DetectionScope()
+    {
+        _detectionDepth++;
+        _tuningDepth++;
+        return default;
+    }
+
+    internal readonly struct DetectionAttribution : System.IDisposable
+    {
+        public void Dispose()
+        {
+            _tuningDepth--;
+            _detectionDepth--;
+        }
     }
 
     public static void OnReadback(long byteCount, GpuBackendType backend)

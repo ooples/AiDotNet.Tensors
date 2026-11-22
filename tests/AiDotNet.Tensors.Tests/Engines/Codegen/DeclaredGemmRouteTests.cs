@@ -159,7 +159,7 @@ public class DeclaredGemmRouteTests
         double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
-        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.BudgetMilliseconds = TunedKernelPolicy.SpentMilliseconds + 60_000;   // the budget is per process: headroom past what earlier tests spent
         try
         {
             var family = FamilyOf(layout);

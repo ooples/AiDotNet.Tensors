@@ -280,6 +280,23 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private void ShareGpuStateWith(Tensor<T> view)
     {
+        // A partial view that was uploaded on its own holds ITS elements, packed in logical order. A view of it with
+        // other elements (a slice of the slice) would find its own at an offset inside that packed buffer, which
+        // nothing records: read as the child's logical upload, the buffer's first elements landed where the child's
+        // belong. Such a child is not lent the buffer. The packed copy is brought home first when it is the current
+        // one, so the host-backed child reads current values; a view with the same elements (a reshape) still borrows.
+        bool packedOwnCopy = !CoversWholeVector && _gpuBuffer is not null && !_viewGpuBufferIsStorageOrder;
+        bool sameElements = IsContiguous && view.IsContiguous && view._storageOffset == _storageOffset && view.Length == Length;
+        if (packedOwnCopy && !sameElements)
+        {
+            if (_device != TensorDevice.CPU && _gpuBufferVersion == GpuCacheVersion)
+            {
+                if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
+                Helpers.HostSync.TryMaterialize(DataVector);
+                DownloadBoundBufferIntoHost();
+            }
+            return;
+        }
         view._device = _device;
         view._gpuDeviceIndex = _gpuDeviceIndex;
         view._gpuBuffer = _gpuBuffer;
@@ -293,6 +310,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         view._gpuMaterializerKey = _gpuMaterializerKey;
         view.IsDirty = IsDirty;
         view.Layout = Layout;
+        // After the buffer assignment above, which resets it: a partial view of a whole-storage tensor (or of a view
+        // that itself borrows) holds the storage's buffer, in storage order.
+        if (!view.CoversWholeVector && _gpuBuffer is not null)
+            view._viewGpuBufferIsStorageOrder = CoversWholeVector || _viewGpuBufferIsStorageOrder;
     }
 
     /// <summary>
@@ -5222,6 +5243,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 return this;
             backend = directGpu.Backend;
         }
+        return PlaceOn(backend);
+    }
+
+    /// <summary>
+    /// Uploads this tensor to <paramref name="backend"/> and binds it there as its resident device copy: the body of
+    /// <see cref="Gpu()"/>, also used to rehome a tensor another backend held (CrossBackendTensors).
+    /// </summary>
+    internal Tensor<T> PlaceOn(Engines.DirectGpu.IDirectGpuBackend backend)
+    {
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
@@ -5246,9 +5276,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // path for the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS != 0), so it silently mistrained on GPU.
         _gpuBufferVersion = GpuCacheVersion;
         _device = backend.DeviceType;   // the backend's typed device, not a match on its name
-        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight.
-        if (Engines.AiDotNetEngine.Current.TryGet<Engines.DirectGpuTensorEngine>(out var owner)
-            && ReferenceEquals(owner.PlacementBackend, backend))
+        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight. The engine that
+        // owns the backend, not Current: a migration places from inside another engine's op, where reading Current
+        // could run a deferred GPU detection, and that engine is the one whose cache holds the copy.
+        if (Engines.DirectGpuTensorEngine.EngineOwning(backend) is { } owner)
             owner.DropPersistentCopy(this);
         // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
         Helpers.ResidentHostMirror.Attach(this);
@@ -5257,11 +5288,113 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
+    /// Releases this tensor's binding to the backend that owns its GPU buffer (CrossBackendTensors), so the next
+    /// engine op places it on its own backend. <paramref name="readBack"/> first brings the owner's values home (a
+    /// pending deferred download included). The binding is then detached - a whole-storage tensor's is its storage's,
+    /// shared by every alias, a partial view's its own - and the buffer freed when this tensor owns it and
+    /// <paramref name="free"/> (false while the owner is tearing down: its context reclaims the memory).
+    /// </summary>
+    /// <param name="downloadBound">Download the bound buffer even when the tensor is not marked GPU-resident: a
+    /// host-backed tensor its owner updates in place on the device (a running statistic) holds its current value there
+    /// with no pending download to say so.</param>
+    internal void ReleaseForeignGpuBinding(bool readBack, bool free, bool downloadBound = false)
+    {
+        var owner = _gpuBackend;
+        if (readBack)
+        {
+            // The owner's backend is the one whose buffer this reads: nothing inside is foreign to anything.
+            using var ownerWork = Engines.DirectGpu.GpuOpGate.SuspendOpBackend();
+            try
+            {
+                // A pending deferred download (an intermediate whose host copy has not been materialized yet) must land
+                // before the buffer goes: Cpu() alone returns early for a tensor that is not marked GPU-resident.
+                // A partial view's own copy that is older than its storage (the host, or the parent's device copy on
+                // another backend, was written since) holds nothing the host lacks: the pending download below brings
+                // the storage's CURRENT values home, and this superseded copy must not then be written over them.
+                bool supersededView = !CoversWholeVector && !downloadBound && _gpuBufferVersion != GpuCacheVersion;
+                if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
+                Helpers.HostSync.TryMaterialize(DataVector);
+                if (downloadBound && !IsGpuResident) DownloadBoundBufferIntoHost();
+                if (!supersededView) Cpu();
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                throw new InvalidOperationException(
+                    $"Could not read this tensor back from the {owner?.BackendName ?? "unknown"} backend that owns its GPU "
+                    + "buffer, so it cannot be moved to the running operation's backend.", ex);
+            }
+        }
+        var buffer = _gpuBuffer;
+        bool owned = _ownsGpuBuffer;
+        // Without a read-back the host is authoritative (an external input its caller writes): drop the pending
+        // download so a later host read cannot materialize the abandoned device copy over it.
+        if (!readBack && GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
+        Helpers.ResidentHostMirror.Detach(this);
+        _gpuBuffer = null;
+        _gpuBackend = null;
+        _gpuBufferVersion = -1;
+        _ownsGpuBuffer = false;
+        _gpuBufferIsSplitComplex = false;
+        _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
+        _device = TensorDevice.CPU;
+        if (free && owned && buffer is { } disposable)
+        {
+            // The tensor has already left the buffer: a backend that cannot free it now (gone, or failing) costs that
+            // allocation until its context goes, never the consumer's op.
+            try { disposable.Dispose(); }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"[AiDotNet] Freeing a migrated tensor's buffer on {owner?.BackendName ?? "its old backend"} failed: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
     /// Ensures this tensor's data is on the CPU. If the tensor has a pending deferred GPU download,
     /// materializes it now. Equivalent to PyTorch's <c>tensor.cpu()</c>.
     /// </summary>
     /// <returns>This tensor with CPU data synchronized.</returns>
     [MethodImpl(Hot)]
+    /// <summary>
+    /// Copies the bound device buffer's float values into the host storage. Nothing for a buffer whose words are raw
+    /// int32 / int64: their own materializer decodes them (it ran as the pending download), and reading the words as
+    /// floats would overwrite the decoded integers with numeric conversions of their bit patterns.
+    /// </summary>
+    private void DownloadBoundBufferIntoHost()
+    {
+        if (_gpuBuffer is not { } buffer || _gpuBackend is not { } backend) return;
+        if (_gpuBufferContainsRawInt32 || _gpuBufferContainsRawInt64) return;
+        // A partial view taken of a placed tensor carries that tensor's buffer: the WHOLE storage in storage order,
+        // not this view's elements. Decided by the provenance recorded when the buffer was lent, never by ownership
+        // or length (a transposed view uploaded on its own is as long as the storage and is in LOGICAL order).
+        if (!CoversWholeVector && _viewGpuBufferIsStorageOrder)
+        {
+            // Still the storage's binding: the download is the storage, and lands on all of it. No longer (the parent
+            // moved to another backend, or came home, since the view was taken): the storage's current values were
+            // brought to the host by its own pending download, and this superseded copy must not overwrite them.
+            if (ReferenceEquals(_data._deviceState?.Buffer, buffer))
+                Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(backend.DownloadBuffer(buffer)).AsSpan()
+                    .CopyTo(_data.AsWritableSpanUnmarked());
+            return;
+        }
+        float[] floatData = backend.DownloadBuffer(buffer);
+        var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
+        if (IsContiguous)
+        {
+            var dst = AsWritableSpan();
+            converted.AsSpan(0, Math.Min(converted.Length, dst.Length)).CopyTo(dst);
+        }
+        else
+        {
+            // Non-contiguous view: fall back to the element-wise setter,
+            // which routes through the storage offset/stride correctly.
+            int n = Math.Min(converted.Length, Length);
+            for (int i = 0; i < n; i++) SetFlatIndexValue(i, converted[i]);
+        }
+    }
+
     public Tensor<T> Cpu()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
@@ -5307,23 +5440,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // the buffer changed, but Cpu()/host reads still saw the pre-step value.
         // AsWritableSpan() hands back the real backing span (offset/length
         // aware), matching the engine's own DownloadIntoTensor helper.
-        if (_gpuBuffer is not null && _gpuBackend is not null && _device != TensorDevice.CPU)
-        {
-            float[] floatData = _gpuBackend.DownloadBuffer(_gpuBuffer);
-            var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
-            if (IsContiguous)
-            {
-                var dst = AsWritableSpan();
-                converted.AsSpan(0, Math.Min(converted.Length, dst.Length)).CopyTo(dst);
-            }
-            else
-            {
-                // Non-contiguous view: fall back to the element-wise setter,
-                // which routes through the storage offset/stride correctly.
-                int n = Math.Min(converted.Length, Length);
-                for (int i = 0; i < n; i++) SetFlatIndexValue(i, converted[i]);
-            }
-        }
+        if (_device != TensorDevice.CPU) DownloadBoundBufferIntoHost();
 
         // The host is authoritative again and the buffer above is no longer the source of truth, so
         // the markers that described its encoding must not survive into the next upload.

@@ -296,7 +296,7 @@ public sealed class CudaTunedKernelTests
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
         TunedKernelPolicy.IgnoreProfiles = true;
-        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.BudgetMilliseconds = TunedKernelPolicy.SpentMilliseconds + 60_000;   // the budget is per process: headroom past what earlier tests spent
         try
         {
             const int rows = 4096, n = 64;
@@ -328,6 +328,47 @@ public sealed class CudaTunedKernelTests
         }
     }
 
+    // A held timing graph is keyed by (candidate, arguments), which says nothing of the workspaces the candidate's
+    // launch reads or the kernels nested slots chose for it: a workspace released or a decision settled since the
+    // capture must not be replayed.
+    [SkippableFact]
+    public void HeldTimingGraphs_AreDropped_WhenAWorkspaceIsReleasedOrADecisionSettles()
+    {
+        using var backend = RequireBackend();
+        const int count = 2048;
+        using var output = backend.AllocateBuffer(count);
+        var key = new object();
+        void Sample() => backend.MeasureTunedKernelMilliseconds(() => backend.Fill(output, 1f, count), 2, key);
+        TunedKernelRegistry.BeginMeasurement();
+        try
+        {
+            long captured = backend.TuneGraphsCaptured, reused = backend.TuneGraphsReused, dropped = backend.TuneGraphsInvalidated;
+            // Skipped only where capture is opted out or the driver has no graphs: where it is on, a first sample that
+            // captures nothing is a capture regression and fails here instead of skipping every assertion below.
+            Skip.IfNot(CudaBackend.TimingGraphCaptureEnabled, "timing graphs are not captured on this device");
+            Sample();
+            Assert.Equal(captured + 1, backend.TuneGraphsCaptured);
+            Sample();
+            Assert.Equal(reused + 1, backend.TuneGraphsReused);   // same key, nothing changed: replayed
+
+            CudaBackend.NoteTunedWorkspaceReleased();
+            Sample();
+            Assert.Equal(captured + 2, backend.TuneGraphsCaptured);   // recaptured after the workspace changed
+            Assert.Equal(dropped + 1, backend.TuneGraphsInvalidated);
+
+            TunedKernelRegistry.Record(new TunedKernelDecision(TunedKernelOp.Softmax, "test", default, "reference",
+                TunedKernelOrigin.Builtin, TunedKernelDecisionReason.ReferenceWon, "reference"));
+            Sample();
+            Assert.Equal(captured + 3, backend.TuneGraphsCaptured);   // recaptured after a decision settled
+            Assert.Equal(reused + 1, backend.TuneGraphsReused);
+        }
+        finally
+        {
+            TunedKernelRegistry.EndMeasurement();
+        }
+        Assert.Equal(0, backend.SessionTuneGraphCount);
+    }
+
     [SkippableFact]
     public void PublicSoftmax_ThroughTheRegistry_MatchesTheReferenceAndCachesADecision()
     {
@@ -340,7 +381,7 @@ public sealed class CudaTunedKernelTests
         double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
-        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.BudgetMilliseconds = TunedKernelPolicy.SpentMilliseconds + 60_000;   // the budget is per process: headroom past what earlier tests spent
         try
         {
             const int rows = 8192, n = 32;

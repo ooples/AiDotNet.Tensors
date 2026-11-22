@@ -2,8 +2,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
 /// The gated delta rule's decode step behind <see cref="IEngine.GatedDeltaNetStep{T}"/> as one kernel: a warp per state
-/// row reads the row once, updates it in place and reduces the output. A backend without it runs CpuEngine's
-/// implementation.
+/// row reads the row once, updates it in place and reduces the output. A backend without it composes the step from the
+/// engine's own ops through GatedDeltaNetStepHost: on a GPU engine, the backend's batched GEMMs and elementwise ops.
 /// </summary>
 [BackendSpecificRoute("CUDA one-kernel gated delta rule decode step (state read once and updated in place); every backend composes it natively from batched GEMMs and elementwise ops",
     nameof(IDirectGpuBackend.BatchedGemm), nameof(IDirectGpuBackend.Multiply), nameof(IDirectGpuBackend.Subtract), nameof(IDirectGpuBackend.Add))]

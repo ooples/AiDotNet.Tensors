@@ -237,6 +237,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         internal long OffloadRegistryHandle = -1;
         internal double? UniformFillValue;
         internal Engines.DirectGpu.IGpuBuffer? ViewGpuBuffer;
+        // The view buffer is its parent storage's shared buffer (whole storage, storage order), not a copy of the view.
+        internal bool ViewGpuBufferIsStorageOrder;
         internal Engines.DirectGpu.IDirectGpuBackend? ViewGpuBackend;
         internal int ViewGpuBufferVersion = -1;
         internal bool ViewGpuBufferIsSplitComplex;
@@ -1261,12 +1263,54 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
     {
-        get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
+        get
+        {
+            if (CoversWholeVector) return _data._deviceState?.Buffer;
+            var view = _viewGpuBuffer;
+            // A buffer the storage lent this view is the view's only while the storage still holds it. The owner frees
+            // it when it migrates to another backend, is released or is uploaded afresh, and nothing else tells the
+            // view: checked here, where every use of the binding starts, so no op reaches a freed handle through it.
+            if (view is not null && _viewGpuBufferIsStorageOrder && !ReferenceEquals(view, _data?._deviceState?.Buffer))
+            {
+                DropLentViewBinding();
+                return null;
+            }
+            return view;
+        }
         set
         {
             if (CoversWholeVector) _data.DeviceState.Buffer = value;
-            else _viewGpuBuffer = value;
+            else
+            {
+                _viewGpuBuffer = value;
+                // Any new binding is the view's own until the path that lent it says otherwise (ShareGpuStateWith).
+                _viewGpuBufferIsStorageOrder = false;
+            }
         }
+    }
+
+    // Forgets a lent buffer the storage no longer holds. Never freed here: the view did not own it, and its owner
+    // brought the data home (or replaced it) before letting the buffer go.
+    private void DropLentViewBinding()
+    {
+        _viewGpuBuffer = null;
+        _viewGpuBufferIsStorageOrder = false;
+        _viewGpuBackend = null;
+        _viewGpuBufferVersion = -1;
+        _viewGpuBufferIsSplitComplex = false;
+        _viewGpuBufferContainsRawInt32 = false;
+        _viewGpuBufferContainsRawInt64 = false;
+    }
+
+    /// <summary>
+    /// Whether this partial view's buffer was lent by the tensor it views: the WHOLE storage in storage order, not this
+    /// view's elements in logical order. Provenance recorded when the buffer is lent, because nothing about the buffer
+    /// itself tells the two apart (a transposed view uploaded on its own is as long as the storage).
+    /// </summary>
+    internal bool _viewGpuBufferIsStorageOrder
+    {
+        get => _cold?.ViewGpuBufferIsStorageOrder ?? false;
+        set { if (!value && _cold is null) return; Cold().ViewGpuBufferIsStorageOrder = value; }
     }
 
     // A strided/offset view's own contiguous device copy. Such a view does not share the vector's layout, so its
@@ -1530,6 +1574,22 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     public Engines.DirectGpu.IGpuBuffer? TryGetGpuBuffer()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
+        // A buffer another backend placed is not an address the running op's backend may dereference (an OpenCL
+        // handle read as a CUDA pointer is a sticky illegal-address fault). Apply the cross-backend policy - the tensor
+        // migrates (its foreign binding is dropped and, if it was resident, it is placed on the op's backend) or the op
+        // throws - before the handle test below: a WebGPU buffer's native handle is always zero.
+        // Foreign implies both an owner and a running op's backend; the patterns state it for the compiler.
+        if (_gpuBuffer is not null && _gpuBackend is { } owner && Engines.CrossBackendTensors.IsForeign(owner)
+            && Engines.DirectGpu.GpuOpGate.CurrentOpBackend is { } opBackend)
+        {
+            if (this is not Tensor<T> tensor)
+                throw new InvalidOperationException(
+                    "This tensor's GPU buffer belongs to a different backend than the running operation.");
+            Engines.CrossBackendTensors.Resolve(tensor, owner, opBackend);
+            if (_gpuBuffer is not null && Engines.CrossBackendTensors.IsForeign(_gpuBackend))
+                throw new InvalidOperationException(
+                    "A tensor's GPU buffer is still bound to another backend after the cross-backend migration.");
+        }
         if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero)
         {
             // A released step intermediate still names its old buffer object, which the pool may have re-rented to
@@ -1554,6 +1614,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // until they wire their own non-owning buffer types.
             if (allocator is Engines.DirectGpu.IGpuDevicePointerWrapper wrapper)
             {
+                // The pointer is an address in the allocator's device context. An op on a backend that cannot
+                // dereference it follows the cross-backend policy: refused, or served from the host copy (null here,
+                // so the op uploads it to its own backend; the offload allocation itself stays where it is).
+                if (Engines.DirectGpu.GpuOpGate.CurrentOpBackend is { } consumer
+                    && allocator is Engines.DirectGpu.IGpuOffloadBackendAffinity affinity
+                    && !affinity.PointersUsableBy(Engines.CrossBackendTensors.Unwrap(consumer)))
+                {
+                    if (Engines.AiDotNetEngine.CrossBackendPolicy == Engines.CrossBackendTensorPolicy.Throw)
+                        throw Engines.CrossBackendTensors.Reject(
+                            $"A {Lifetime} tensor's device memory belongs to {allocator.GetType().Name}, which the operation's "
+                            + $"backend ({consumer.BackendName}) cannot address. Run it on the allocator's backend, or set "
+                            + "AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn to serve it from the host copy.");
+                    return null;
+                }
                 UploadHostToOffload();
                 // By element type where the allocator takes one: the buffer then reports what the tensor holds
                 // (double, int, ...) and a typed transfer of it is accepted.
@@ -1748,6 +1822,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // (_gpuBuffer, _gpuBackend, ...) address the vector's shared device state, which describes the same bytes in the
         // same layout and belongs to the source too: clearing through them stripped the source's buffer.
         _viewGpuBuffer = null;
+        _viewGpuBufferIsStorageOrder = false;
         _viewGpuBackend = null;
         _viewGpuBufferVersion = -1;
         _viewGpuBufferIsSplitComplex = false;

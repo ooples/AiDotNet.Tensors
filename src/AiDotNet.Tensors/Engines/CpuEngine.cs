@@ -44741,9 +44741,13 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     // TopK heap: the root is the WORST kept element. "Better" = larger (smaller when !largest) value, ties to the lower index.
+    // NaN ranks above every number, as in torch.topk and the GPU engine's TopK (its NaN-aware row sort and small-row
+    // kernel): first for the largest, last for the smallest. A plain CompareTo put it below every number.
     private static bool TopKBetter<T>(T v, int i, T w, int j, INumericOperations<T> ops, bool largest)
     {
-        int c = ops.Compare(v, w);
+        bool vNaN = ops.IsNaN(v), wNaN = ops.IsNaN(w);
+        if (vNaN != wNaN) return largest ? vNaN : wNaN;
+        int c = vNaN ? 0 : ops.Compare(v, w);
         if (c != 0) return largest ? c > 0 : c < 0;
         return i < j;
     }

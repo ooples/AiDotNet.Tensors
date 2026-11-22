@@ -143,9 +143,15 @@ public class ArenaWithheldGradientsTests
         // itself issued are withheld, and whether it issues one depends on process-wide pool state that tests running
         // in parallel change, so an early step can withhold fewer (measured [1, 0, 2, 2, 2, 2] under a full run). The
         // leak this guards (AiDotNet#2322) adds a set per step: [2, 4, 6, ...].
-        // A tape-owned arena also keeps the step's pooled forward buffers until they are collected: one step's worth
-        // (the steady count from the second step on), which must not grow.
-        int gradientsPerStep = callerArenaPerStep ? 2 : (counts is { Length: > 1 } ? counts[1] : 0);
+        // A tape-owned arena also keeps the step's pooled forward buffers until they are collected: one step's worth,
+        // which must not grow. That steady count is the most any of the first three steps holds, not the second
+        // step's: the same process-wide pool state that lets the first step retain fewer can do so for the second
+        // (CI measured [5, 6, 7, 7, 7, 7] under a full parallel run - flat from the third step, no leak - which a
+        // bound taken from the second step alone reported as growth). The leak still fails: it adds a set every step,
+        // so the fourth step exceeds whatever the first three held.
+        int gradientsPerStep = callerArenaPerStep
+            ? 2
+            : (counts is { Length: > 2 } ? Math.Max(counts[0], Math.Max(counts[1], counts[2])) : 0);
         Assert.NotNull(counts);
         if (counts is null) return;
         // Not vacuous: a run that never withheld anything would pass the bound without testing it. The steady state

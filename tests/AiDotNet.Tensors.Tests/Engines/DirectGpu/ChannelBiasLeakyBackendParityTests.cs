@@ -102,10 +102,13 @@ public sealed class ChannelBiasLeakyBackendParityTests
     { var backend = VulkanBackend.Instance; Skip.IfNot(backend.Initialize() && backend.IsGlslCompilerAvailable, "Vulkan unavailable."); Verify(backend); }
 #if NET7_0_OR_GREATER
     [SkippableFact]
-    public async Task WebGpu_matches_separate_bias_then_leaky_in_one_launch()
+    public void WebGpu_matches_separate_bias_then_leaky_in_one_launch()
     {
-        using var backend = new AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend();
-        Skip.IfNot(await backend.InitializeAsync(), "WebGPU unavailable."); Verify(backend);
+        // The Dawn-hosted backend the other WebGPU tests share: a bare WebGpuBackend initializes only when some earlier
+        // test happened to start that host, so this test ran or skipped depending on the order.
+        var backend = DawnHostedWebGpu.BackendOrNull();
+        Skip.If(backend is null || !backend.IsAvailable, "Dawn is not set up (AIDOTNET_WEBGPU_NODE_DIR).");
+        Verify(backend!);
     }
 #endif
 }

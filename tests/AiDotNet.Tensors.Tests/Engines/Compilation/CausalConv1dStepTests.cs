@@ -75,6 +75,68 @@ public class CausalConv1dStepTests
     public void The_cpu_step_matches_the_causal_convolution(int K, int batch, int channels, bool withBias, bool silu)
         => RunEager(new CpuEngine(), K, batch, channels, withBias, silu);
 
+    // The orientation cross-check against an independent op: CausalConv1dStep's kernel is newest-first (w[:, 0] weights
+    // the current input) while DepthwiseConv1D, like PyTorch conv1d, weights it by w[:, K - 1]. Stepping a zero history
+    // over a whole sequence with the tap-reversed kernel must equal DepthwiseConv1D with padding K - 1 truncated to the
+    // first seqLen outputs; the unreversed kernel must not (the reference above uses the step's own orientation, so it
+    // cannot catch a flipped layout).
+    private static void RunAgainstDepthwiseConv1D(IEngine engine, int K, int batch, int channels, int seqLen)
+    {
+        var rng = new Random(K * 131 + channels * 7 + seqLen);
+        var torchW = R(rng, channels * K);                                   // [channels, 1, K], oldest-first
+        var x = R(rng, batch * channels * seqLen);                           // [batch, channels, seqLen]
+        var stepW = new float[channels * K];                                 // [channels, K], newest-first
+        for (int c = 0; c < channels; c++)
+            for (int m = 0; m < K; m++) stepW[c * K + m] = torchW[c * K + (K - 1 - m)];
+
+        var full = new CpuEngine().DepthwiseConv1D(new Tensor<float>([batch, channels, seqLen], new Vector<float>(x)),
+            new Tensor<float>([channels, 1, K], new Vector<float>(torchW)), 1, K - 1);
+        Assert.Equal(new[] { batch, channels, seqLen + K - 1 }, full.Shape.ToArray());
+        var f = full.ToArray();
+        int fullLen = seqLen + K - 1;
+
+        var history = new Tensor<float>([K - 1, batch, channels]);
+        var unreversedHistory = new Tensor<float>([K - 1, batch, channels]);
+        var weight = new Tensor<float>([channels, K], new Vector<float>(stepW));
+        var unreversed = new Tensor<float>([channels, K], new Vector<float>(torchW));
+        double maxUnreversedGap = 0;
+        using (new EngineScope(engine))
+            for (int t = 0; t < seqLen; t++)
+            {
+                var xt = new float[batch * channels];
+                for (int b = 0; b < batch; b++)
+                    for (int c = 0; c < channels; c++) xt[b * channels + c] = x[(b * channels + c) * seqLen + t];
+                var y = engine.CausalConv1dStep(history, new Tensor<float>([batch, channels], new Vector<float>(xt)), weight, null, false).ToArray();
+                var yu = engine.CausalConv1dStep(unreversedHistory, new Tensor<float>([batch, channels], new Vector<float>(xt)), unreversed, null, false).ToArray();
+                var expect = new double[batch * channels];
+                for (int b = 0; b < batch; b++)
+                    for (int c = 0; c < channels; c++) expect[b * channels + c] = f[(b * channels + c) * fullLen + t];
+                Close(expect, y, $"t{t} reversed-kernel step vs DepthwiseConv1D");
+                for (int i = 0; i < yu.Length; i++) maxUnreversedGap = Math.Max(maxUnreversedGap, Math.Abs(yu[i] - expect[i]));
+            }
+        if (K > 1) Assert.True(maxUnreversedGap > 1e-3, $"the unreversed kernel also matched DepthwiseConv1D (gap {maxUnreversedGap})");
+    }
+
+    [Theory]
+    [InlineData(4, 2, 5, 9)]
+    [InlineData(1, 3, 4, 6)]
+    [InlineData(17, 1, 3, 20)]
+    public void The_cpu_step_with_a_reversed_kernel_matches_DepthwiseConv1D(int K, int batch, int channels, int seqLen)
+        => RunAgainstDepthwiseConv1D(new CpuEngine(), K, batch, channels, seqLen);
+
+    [SkippableTheory]
+    [InlineData(4, 2, 5, 9)]
+    [InlineData(16, 2, 33, 20)]
+    [InlineData(17, 1, 3, 20)]
+    public void The_gpu_step_with_a_reversed_kernel_matches_DepthwiseConv1D(int K, int batch, int channels, int seqLen)
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu) RunAgainstDepthwiseConv1D(gpu!, K, batch, channels, seqLen);
+    }
+
     // K = 17 exceeds the kernel's register history and takes the composed path.
     [SkippableTheory]
     [InlineData(4, 2, 5, true, true)]

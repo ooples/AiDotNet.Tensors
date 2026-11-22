@@ -51,9 +51,16 @@ public partial class CpuEngine
         // No tensor operands of the element type is allowed when the closure reads another node's auxiliary output
         // (a one-hot of TopK's indices): BindCaptures makes that node's output an operand, so the op is ordered after it.
         if (BeginCompiledRecord(inputs, out var operands, inInferenceTrace, allowNoOperands: true) is not { } scope) return false;
-        BindCaptures(scope, forward, operands);
-        if (operands.Count == 0) return false;
-        if (backwardForward is not null) BindCaptures(scope, backwardForward, operands);
+        // Look for auxiliary producers first without touching the closure: declining here runs the caller's eager path on
+        // the same closure, which must still hold the caller's arrays (a clone would take the eager writes).
+        if (operands.Count == 0)
+        {
+            BindCaptures(scope, forward, operands, privatizeArrays: false);
+            if (backwardForward is not null) BindCaptures(scope, backwardForward, operands, privatizeArrays: false);
+            if (operands.Count == 0) return false;
+        }
+        BindCaptures(scope, forward, operands, privatizeArrays: true);
+        if (backwardForward is not null) BindCaptures(scope, backwardForward, operands, privatizeArrays: true);
 
         Tensor<T> traced;
         var position = scope.NodeCount;
@@ -191,7 +198,7 @@ public partial class CpuEngine
         result = null;
         aux = default;
         if (BeginCompiledRecord(inputs, out var operands, inInferenceTrace) is not { } scope) return false;
-        BindCaptures(scope, forward, operands);
+        BindCaptures(scope, forward, operands, privatizeArrays: true);
 
         Tensor<T> traced;
         TAux tracedAux;
@@ -266,14 +273,18 @@ public partial class CpuEngine
     /// MaxUnpool) could run before the refresh and read the previous step's winners.
     /// </para>
     /// </remarks>
-    private static void BindCaptures<T>(LazyTensorScope scope, Delegate closure, List<Tensor<T>> operands)
+    // Makes every auxiliary output the closure reads an operand (so the node is ordered after its producer). With
+    // privatizeArrays, also replaces each captured array with a copy, so a caller reusing the array after the trace does
+    // not change what the plan replays; only once the op is certain to be recorded, since the closure then belongs to
+    // the plan.
+    private static void BindCaptures<T>(LazyTensorScope scope, Delegate closure, List<Tensor<T>> operands, bool privatizeArrays)
     {
         if (closure.Target is { } target
             && target.GetType().IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
-            BindCaptures(scope, target, operands, depth: 0);
+            BindCaptures(scope, target, operands, privatizeArrays, depth: 0);
     }
 
-    private static void BindCaptures<T>(LazyTensorScope scope, object closure, List<Tensor<T>> operands, int depth)
+    private static void BindCaptures<T>(LazyTensorScope scope, object closure, List<Tensor<T>> operands, bool privatizeArrays, int depth)
     {
         const System.Reflection.BindingFlags fields =
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
@@ -286,12 +297,12 @@ public partial class CpuEngine
                 if (array.GetType().GetElementType() is { IsValueType: false })
                     foreach (var element in array.OfType<object>())
                         DependOnProducer(scope, element, operands);
-                field.SetValue(closure, array.Clone());
+                if (privatizeArrays) field.SetValue(closure, array.Clone());
             }
             else if (depth < 4 && field.FieldType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
             {
                 // A closure over variables of an enclosing scope holds that scope's closure object.
-                BindCaptures(scope, value, operands, depth + 1);
+                BindCaptures(scope, value, operands, privatizeArrays, depth + 1);
             }
         }
     }

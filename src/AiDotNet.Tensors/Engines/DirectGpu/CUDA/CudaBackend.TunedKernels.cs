@@ -170,6 +170,35 @@ public sealed partial class CudaBackend
     private readonly Dictionary<(int Thread, object Candidate, int Repetitions), IntPtr> _sessionTuneGraphs = new();
     private bool _sessionTuneGraphsHooked;
 
+    // The key names the candidate and its arguments, not what the candidate's launch reads besides them: the backend's
+    // scratch workspaces (TryConvScratch, the cuBLAS workspace) and the kernels nested slots chose. A held graph is
+    // valid only while those are unchanged, so every held graph is dropped when this generation moves: a workspace was
+    // released or regrown (s_tuneWorkspaceGeneration), a measurement session ended (pool buffers it returned may be
+    // released) or a slot settled a decision (a nested gate now launches another kernel).
+    private (long Workspaces, long Measurements, long Decisions) _sessionTuneGraphsGeneration;
+    private static long s_tuneWorkspaceGeneration;
+
+    /// <summary>Called when a workspace a captured launch may have baked is released or replaced.</summary>
+    internal static void NoteTunedWorkspaceReleased() => System.Threading.Interlocked.Increment(ref s_tuneWorkspaceGeneration);
+
+    private static (long, long, long) CurrentTuneGraphGeneration() => (System.Threading.Interlocked.Read(ref s_tuneWorkspaceGeneration),
+        TunedKernelRegistry.MeasurementGeneration, TunedKernelRegistry.DecisionGeneration);
+
+    // Under _tuneEventLock: destroys every held timing graph when what they read may have changed since their capture.
+    private void DropStaleSessionTuneGraphs()
+    {
+        var now = CurrentTuneGraphGeneration();
+        if (now == _sessionTuneGraphsGeneration) return;
+        _sessionTuneGraphsGeneration = now;
+        if (_sessionTuneGraphs.Count == 0) return;
+        foreach (var exec in _sessionTuneGraphs.Values) DestroyCapturedGraph(exec);
+        _sessionTuneGraphs.Clear();
+        TuneGraphsInvalidated++;
+    }
+
+    /// <summary>Times the held timing graphs were all dropped because a workspace or a nested decision changed (tests).</summary>
+    internal long TuneGraphsInvalidated { get; private set; }
+
     /// <summary>Timing graphs captured, and timing samples that replayed an already-captured one (tests).</summary>
     internal long TuneGraphsCaptured { get; private set; }
     internal long TuneGraphsReused { get; private set; }
@@ -249,6 +278,9 @@ public sealed partial class CudaBackend
     private static readonly bool s_tuneInCapturedGraph =
         Environment.GetEnvironmentVariable("AIDOTNET_TUNE_CAPTURED") != "0";
 
+    /// <summary>Whether candidates are timed in a captured graph here: not opted out, and the driver has graphs (tests).</summary>
+    internal static bool TimingGraphCaptureEnabled => s_tuneInCapturedGraph && CudaNativeBindings.SupportsGraphCapture;
+
     /// <summary>
     /// The candidate's repetitions captured into one CUDA graph and timed as a single replay (after one warm replay):
     /// device time with no per-launch host cost between the candidate's kernels, as a compiled training step's captured
@@ -263,6 +295,7 @@ public sealed partial class CudaBackend
         if (!s_tuneInCapturedGraph || IsStreamCapturing()) return false;
         // Reused only inside a measurement session, which ends (dropping the graph) before its workspaces are released.
         bool cache = cacheKey is not null && TunedKernelRegistry.MeasuringOnThisThread;
+        if (cache) DropStaleSessionTuneGraphs();
         var key = (Environment.CurrentManagedThreadId, cacheKey!, repetitions);
         IntPtr exec = IntPtr.Zero;
         bool reused = cache && _sessionTuneGraphs.TryGetValue(key, out exec);

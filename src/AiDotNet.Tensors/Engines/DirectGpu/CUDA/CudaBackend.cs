@@ -212,6 +212,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     internal bool HasWhereSelectKernel => _kernelCache.ContainsKey("where_select");
     private IntPtr _cudaContext;
+    /// <summary>The CUDA context this backend runs in (zero once disposed).</summary>
+    internal IntPtr ContextHandle => _cudaContext;
     private int _cuDevice;   // the CUdevice whose primary context this backend holds
     private long _contextGeneration; // this context's LiveContexts registration (see LiveContexts, AddContextHolder)
 
@@ -6783,6 +6785,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
         if ((int)status != 0)
         {
+            NoteTunedWorkspaceReleased();   // a held timing graph may read it
             workspace.Dispose();
             tc.Workspace = null;
         }
@@ -6862,7 +6865,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private void StartCublasWarmup()
     {
-        if (!AiDotNetEngine.Current.Is<DirectGpuTensorEngine>()) return;
+        // Peek, not Current: reading Current would complete a deferred GPU detection - a device probe with its own
+        // readback - inside the first GEMM. Until something resolves it the warmup waits (this runs per GEMM until
+        // it starts).
+        if (!AiDotNetEngine.PeekCurrent().Is<DirectGpuTensorEngine>()) return;
         lock (_cublasWarmLock)
         {
             if (_cublasWarmClosing || _disposed) return;
@@ -19967,6 +19973,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _streamOrderEvent = IntPtr.Zero;
         }
         DisposeTunedKernelResources();
+        DisposeKvFaultRecord();
         // The convolution scratch slots hold device buffers for the process's life once a shape has used them; they
         // have to go back before the pool they came from does.
         DisposeConvScratch();
