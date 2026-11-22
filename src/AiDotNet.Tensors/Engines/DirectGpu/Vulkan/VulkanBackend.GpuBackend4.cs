@@ -5,7 +5,7 @@ using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
+public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
 {
     #region Optimizer Operations
 
@@ -823,14 +823,21 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
     public void GatedDeltaNetScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => ((IGatedDeltaRuleForwardBackend)this).GatedDeltaNetScanForward(q, k, v, alpha, beta, output,
+            batch, seqLen, modelDim, numHeads, headDim, GatedDeltaNetBackwardResolver.OriginalKeyScale(headDim), false);
+
+    void IGatedDeltaRuleForwardBackend.GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
         => GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaScan, new[] { q, k, v, alpha, beta, output },
             batch * numHeads * headDim,
-            new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim });
+            new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim,
+                (uint)GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1u : 0u });
 
     void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
     {
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
@@ -854,7 +861,10 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
         try
         {
             var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
-            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaRecompute, new[] { k, v, alpha, beta, traj }, total, pc);
+            // The rule kernels (recompute, backward) also take the key scale's bits and the decay-first flag.
+            var rulePc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim,
+                (uint)GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1u : 0u };
+            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaRecompute, new[] { k, v, alpha, beta, traj }, total, rulePc);
             if (GpuDeterminism.IsActive)
             {
                 // Fixed-order reduction instead of CAS accumulation (see GatedDeltaBackwardDeterministic); every
@@ -862,7 +872,7 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
                 partials = AllocateBuffer(checked(2 * n));
                 GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaDq, new[] { dOut, traj, dQ }, n, pc);
                 GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackwardDeterministic,
-                    new[] { dOut, q, k, v, alpha, beta, traj, partials, dV }, total, pc);
+                    new[] { dOut, q, k, v, alpha, beta, traj, partials, dV }, total, rulePc);
                 GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaReduce, new[] { traj, partials, dK, dAlpha, dBeta }, n, pc);
                 return;
             }
@@ -871,7 +881,7 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
             Fill(dAlpha, 0f, batch * seqLen * numHeads);
             Fill(dBeta, 0f, batch * seqLen * numHeads);
             GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackward,
-                new[] { dOut, q, k, v, alpha, beta, traj, dQ, dK, dV, dAlpha, dBeta }, total, pc);
+                new[] { dOut, q, k, v, alpha, beta, traj, dQ, dK, dV, dAlpha, dBeta }, total, rulePc);
         }
         finally
         {

@@ -501,7 +501,96 @@ internal sealed class LazyTensorScope : IDisposable
         }
     }
 
+    /// <summary>
+    /// Records an op that returns a new output AND writes <paramref name="inPlaceTarget"/> (one of its inputs) in place,
+    /// as one kernel (a recurrent decode step: the output and the advanced state from one pass over the state). The op's
+    /// node runs after every node that read the target before it; a no-op in-place node on the target, after the op,
+    /// becomes the target's producer, so later readers see the written value and a compiled plan sees the target as a
+    /// leaf written in place. Forward only.
+    /// </summary>
+    internal Tensor<T> RecordVariadicWritingInPlace<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T>[] inputs,
+        int[] outputShape,
+        Tensor<T> inPlaceTarget,
+        Action<IEngine, Tensor<T>> execute)
+        => RecordVariadicWritingInPlace(opType, opName, inputs, outputShape, new[] { inPlaceTarget }, execute);
+
+    /// <summary>
+    /// <see cref="RecordVariadicWritingInPlace{T}(LazyNodeType, string, Tensor{T}[], int[], Tensor{T}, Action{IEngine, Tensor{T}})"/>
+    /// for an op that writes several of its inputs in place (each gets its own write node, after the op).
+    /// </summary>
+    internal Tensor<T> RecordVariadicWritingInPlace<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T>[] inputs,
+        int[] outputShape,
+        Tensor<T>[] inPlaceTargets,
+        Action<IEngine, Tensor<T>> execute)
+    {
+        foreach (var target in inPlaceTargets)
+            if (Array.IndexOf(inputs, target) < 0)
+                throw new ArgumentException("Every in-place target must be one of the op's inputs.", nameof(inPlaceTargets));
+        // These ops are forward only (decoding) and record no backward. A training trace that still expects a gradient
+        // here would compile a plan that silently drops it for every input, so the trace is refused instead; inside a
+        // no-grad scope nothing is expected and the op records as usual.
+        if (_traceKind == GraphTraceKind.Training && !RecordsWithoutGradient<T>())
+            throw new NotSupportedException(
+                $"{opName} is forward only and records no gradient, so it cannot be part of a training trace. "
+                + "Run it inside a no-grad scope, or train through the eager tape.");
+        var output = RentOutput<T>(outputShape);
+        var node = new LazyNode<T>(opType, opName, inputs, output, execute) { RecordedUnderNoGrad = true };
+        SnapshotTraceStateTargets(node, inPlaceTargets);
+        // The op itself overwrites the targets, so it is ordered after each target's earlier readers (as RecordInPlace
+        // orders its write).
+        var readers = new List<ILazyNode>();
+        foreach (var target in inPlaceTargets)
+        {
+            long since = target.LazySource?.RecordOrder ?? 0;
+            for (var scope = this; scope is not null; scope = scope._parent)
+                CollectReadersSince(scope._nodes, target, since, readers);
+        }
+        node.SetEarlierReaders(readers.ToArray());
+        output.LazySource = node;
+        AddNode(node);
+        foreach (var target in inPlaceTargets)
+            RecordInPlace<T>(opType, opName + ".StateWrite", target, new[] { output }, static (_, _) => { });
+        return output;
+    }
+
+    // A trace may realize part of its graph while it is still being recorded: an op whose graph-mode path computes its
+    // value eagerly (to capture its outputs) reads its input, which runs every node upstream of it, including a
+    // state-writing decode op, whose state would then be advanced by the trace itself and once more by every execution.
+    // So each such op's targets are snapshotted when it is recorded (only a target's first write in the trace: that
+    // snapshot is the pre-trace state), and compiling or abandoning the trace writes the snapshot back into any target
+    // the trace advanced. Kept on the root scope, which is the one that compiles.
+    private List<(ILazyNode Node, ISignatureTensor Target, ISignatureTensor Snapshot)>? _traceStateSnapshots;
+
+    private void SnapshotTraceStateTargets<T>(ILazyNode node, Tensor<T>[] targets)
+    {
+        var root = this;
+        while (root._parent is not null) root = root._parent;
+        var bank = root;
+        // Evaluated as the loop advances, so a target listed twice is snapshotted once: the second sees the first's entry.
+        foreach (var target in targets.Where(t => t.LazySource is null
+            && bank._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, t)) != true))
+        {
+            var snapshot = new Tensor<T>((int[])target._shape.Clone(), new Vector<T>(target.ToArray()));
+            (root._traceStateSnapshots ??= new()).Add((node, target, snapshot));
+        }
+    }
+
+    private void RestoreTraceStateTargets()
+    {
+        if (_traceStateSnapshots is not { } snapshots) return;
+        _traceStateSnapshots = null;
+        foreach (var (node, target, snapshot) in snapshots)
+            if (node.IsRealized) target.CopyLeafFrom(snapshot);
+    }
+
     /// <summary>Records a variadic operation as a lazy node.</summary>
+
     internal Tensor<T> RecordVariadic<T>(
         LazyNodeType opType,
         string opName,
@@ -751,6 +840,10 @@ internal sealed class LazyTensorScope : IDisposable
         {
             Abandon();
             throw;
+        }
+        finally
+        {
+            RestoreTraceStateTargets();
         }
     }
 

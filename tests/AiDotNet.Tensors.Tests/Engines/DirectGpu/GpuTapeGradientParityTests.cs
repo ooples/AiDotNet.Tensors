@@ -31,8 +31,23 @@ public class GpuTapeGradientParityTests : IDisposable
     private readonly ITestOutputHelper _out;
     private readonly IEngine _prior = AiDotNetEngine.Current;
 
-    public GpuTapeGradientParityTests(ITestOutputHelper output) => _out = output;
-    public void Dispose() => AiDotNetEngine.Current = _prior;
+    // FP32 convolutions are pinned: these gradients are compared with the CPU at 1e-4, and the TF32 default (as PyTorch's
+    // cuDNN convolutions) rounds each product to 10 mantissa bits. With it, whichever of the TF32 reference and the FP32
+    // candidate a fresh tune measured faster decided the result: ConvTranspose2D's input gradient came out 0 or 3.2e-4
+    // off, run to run.
+    private readonly bool _priorConvTF32 = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32;
+
+    public GpuTapeGradientParityTests(ITestOutputHelper output)
+    {
+        _out = output;
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = false;
+    }
+
+    public void Dispose()
+    {
+        AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaDispatchPolicy.ConvReducedPrecisionTF32 = _priorConvTF32;
+        AiDotNetEngine.Current = _prior;
+    }
 
     private static bool TryGpu(out DirectGpuTensorEngine? engine)
     {

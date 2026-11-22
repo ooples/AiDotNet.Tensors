@@ -282,6 +282,9 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Decode steps that write their state in place (forward only, recorded under no-grad): the gated delta rule,
+        // the causal convolution's history shift, and the decode cache append at a device-side position.
+        "GatedDeltaNetStep", "CausalConv1dStep", "KvCacheAppend",
         // Numeric recurrences without a gradient: the branch-selected Fritsch-Carlson limiter, the CTC lattice variables
         // and posteriors (the CTC loss's own backward consumes the posteriors), and the discrete assignment
         "TensorFritschCarlsonLimit", "TensorCTCForwardBackward", "TensorCTCLabelPosteriors", "TensorLinearSumAssignment",

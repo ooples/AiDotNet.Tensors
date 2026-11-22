@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
 
@@ -13,6 +15,43 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// </summary>
 public class CudaBackendInitializationTests
 {
+    [Fact]
+    public void ApiProbe_PublishesSingleInitializedInstanceToEveryConcurrentCaller()
+    {
+        const int workerCount = 16;
+        using var ready = new CountdownEvent(workerCount);
+        using var start = new ManualResetEventSlim(false);
+        int probeCount = 0;
+        var expected = new object();
+        var lazy = NvrtcNativeBindings.CreateApiProbe<object?>(() =>
+        {
+            Interlocked.Increment(ref probeCount);
+            Thread.Sleep(50);
+            return expected;
+        });
+
+        var tasks = new Task<object?>[workerCount];
+        for (int i = 0; i < workerCount; i++)
+        {
+            tasks[i] = Task.Run(() =>
+            {
+                ready.Signal();
+                start.Wait();
+                return lazy.Value;
+            });
+        }
+
+        ready.Wait();
+        start.Set();
+        Task.WaitAll(tasks);
+
+        Assert.Equal(1, probeCount);
+        foreach (var task in tasks)
+        {
+            Assert.Same(expected, task.Result);
+        }
+    }
+
     [SkippableFact]
     public void Backend_IsAvailable_WhereTheDriverHasADeviceAndNvrtcLoads()
     {

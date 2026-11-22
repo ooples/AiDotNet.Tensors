@@ -86,7 +86,8 @@ public sealed class CudaGatedDeltaNetHeadSizeTests
                     try
                     {
                         ((IGatedDeltaNetBackwardBackend)backend).GatedDeltaNetScanBackward(dOutB, bufs[0], bufs[1], bufs[2], bufs[3], bufs[4],
-                            gradBufs[0], gradBufs[1], gradBufs[2], gradBufs[3], gradBufs[4], Batch, SeqLen, modelDim, NumHeads, headDim);
+                            gradBufs[0], gradBufs[1], gradBufs[2], gradBufs[3], gradBufs[4], Batch, SeqLen, modelDim, NumHeads, headDim,
+                            GatedDeltaNetBackwardResolver.OriginalKeyScale(headDim), false);
                         string[] names = { "dQ", "dK", "dV", "dAlpha", "dBeta" };
                         var results = gradBufs.Select(backend.DownloadBuffer).ToArray();
                         for (int g = 0; g < 5; g++) AssertClose(expected[g], results[g], $"{names[g]} (det {det})");

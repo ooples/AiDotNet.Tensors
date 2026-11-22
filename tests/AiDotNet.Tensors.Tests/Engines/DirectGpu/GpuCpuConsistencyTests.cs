@@ -160,6 +160,71 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableFact]
+    public void VectorReductions_OfDouble_UseTheCpuEngine_AndOfFloat_MatchIt()
+    {
+        // Sum and Mean cast every Vector<T> to Vector<float> for the kernel; for double that threw
+        // InvalidCastException out of the engine (AiDotNet DecisionTreeRegression feature importances), and
+        // DotProduct threw and swallowed it on every call.
+        SkipIfNoDirectGpu();
+        var gpu = (IEngine)Gpu;
+        var cpu = new CpuEngine();
+        var a = new Vector<double>([0.1, 2.5, -3.75, 1e-3, 7.0]);
+        var b = new Vector<double>([1.5, -0.5, 2.0, 4.0, 0.25]);
+
+        Assert.Equal(cpu.Sum(a), gpu.Sum(a));
+        Assert.Equal(cpu.Mean(a), gpu.Mean(a));
+        Assert.Equal(cpu.DotProduct(a, b), gpu.DotProduct(a, b));
+
+        var af = new Vector<float>([0.1f, 2.5f, -3.75f, 1e-3f, 7.0f]);
+        var bf = new Vector<float>([1.5f, -0.5f, 2.0f, 4.0f, 0.25f]);
+        Assert.Equal(cpu.Sum(af), gpu.Sum(af), 4);
+        Assert.Equal(cpu.Mean(af), gpu.Mean(af), 4);
+        Assert.Equal(cpu.DotProduct(af, bf), gpu.DotProduct(af, bf), 4);
+    }
+
+    [SkippableFact]
+    public void VectorReductions_OfNullFloatOperands_FailAsTheCpuEngineDoes()
+    {
+        // The float GPU branch dereferenced its operands before any validation; a null one must fail as the CPU
+        // engine's does, not surface as a NullReferenceException from the upload.
+        SkipIfNoDirectGpu();
+        var gpu = (IEngine)Gpu;
+        var cpu = (IEngine)new CpuEngine();
+        var v = new Vector<float>([1f, 2f, 3f]);
+        Vector<float>? missing = null;
+
+        Assert.Throws<ArgumentNullException>(() => cpu.Sum(missing));
+        Assert.Throws<ArgumentNullException>(() => gpu.Sum(missing));
+        Assert.Throws<ArgumentNullException>(() => cpu.Mean(missing));
+        Assert.Throws<ArgumentNullException>(() => gpu.Mean(missing));
+        Assert.Throws<ArgumentNullException>(() => cpu.DotProduct(missing, v));
+        Assert.Throws<ArgumentNullException>(() => gpu.DotProduct(missing, v));
+        Assert.Throws<ArgumentNullException>(() => cpu.DotProduct(v, missing));
+        Assert.Throws<ArgumentNullException>(() => gpu.DotProduct(v, missing));
+    }
+
+    [SkippableFact]
+    public void VectorReductions_OfEmptyOrMismatchedFloatOperands_AnswerAsTheCpuEngineDoes()
+    {
+        // No backend allocates a zero-length buffer, and the dot kernel reads a.Length elements of both operands.
+        SkipIfNoDirectGpu();
+        var gpu = (IEngine)Gpu;
+        var cpu = (IEngine)new CpuEngine();
+        var empty = new Vector<float>(0);
+        var three = new Vector<float>([1f, 2f, 3f]);
+        var five = new Vector<float>([1f, 2f, 3f, 4f, 5f]);
+
+        Assert.Equal(cpu.Sum(empty), gpu.Sum(empty));
+        Assert.Equal(cpu.DotProduct(empty, empty), gpu.DotProduct(empty, empty));
+        Assert.Equal(Assert.Throws<ArgumentException>(() => cpu.Mean(empty)).Message,
+            Assert.Throws<ArgumentException>(() => gpu.Mean(empty)).Message);
+        Assert.Equal(Assert.Throws<ArgumentException>(() => cpu.DotProduct(five, three)).Message,
+            Assert.Throws<ArgumentException>(() => gpu.DotProduct(five, three)).Message);
+        Assert.Equal(Assert.Throws<ArgumentException>(() => cpu.DotProduct(three, five)).Message,
+            Assert.Throws<ArgumentException>(() => gpu.DotProduct(three, five)).Message);
+    }
+
+    [SkippableFact]
     public void EagerResidentBinary_ReuploadsVersionBumpedInput()
     {
         SkipIfNoDirectGpu();

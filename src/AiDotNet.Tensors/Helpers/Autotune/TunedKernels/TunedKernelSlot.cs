@@ -34,6 +34,11 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
 {
     private const int ControlPairs = 7;
     private const int CandidatePairs = 9;
+    // A candidate whose first AbandonAfterPairs pairs all ran under AbandonSpeedup of the reference stops being timed:
+    // the remaining pairs could not lift its median to MinimumSpeedup. Timing every losing candidate's nine pairs was
+    // most of a conv gate's cost (the slow direct and im2col routes of a batch-64 conv take milliseconds a call).
+    private const int AbandonAfterPairs = 3;
+    private const double AbandonSpeedup = 0.5;
     private const double MinimumSpeedup = 1.02;
     private const double TargetSampleMilliseconds = 0.25;
     private const int MaximumRepetitions = 64;
@@ -245,6 +250,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             }
 
             long start = Stopwatch.GetTimestamp();
+            _uncharged = 0;
             TunedKernelRegistry.BeginMeasurement();
             try
             {
@@ -280,7 +286,11 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             }
             finally
             {
-                TunedKernelPolicy.Charge(Stopwatch.GetTimestamp() - start);
+                // Only the timing counts against the budget: a candidate's first run (its correctness check) compiles or
+                // loads its kernel and builds its workspace, a one-time cost shared by every later shape. Charging it
+                // spent the whole budget on the first few shapes a process met (a model's two-sample warm-up), so the
+                // shapes it trains on all ran untuned.
+                TunedKernelPolicy.Charge(Math.Max(0, Stopwatch.GetTimestamp() - start - _uncharged));
                 TunedKernelRegistry.EndMeasurement();
             }
         }
@@ -346,6 +356,9 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
     }
 
     // lost, when given, collects the candidates whose median timing was slower than the reference's.
+    // Stopwatch ticks of the current measurement not charged to the tuning budget (first runs); guarded by _sync.
+    private long _uncharged;
+
     private (ITunedKernelCandidate<TArgs> Chosen, TunedKernelDecision? Decision) Gate(in TunedShape shape, in TArgs args,
         ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected,
         ISet<string>? lost = null)
@@ -353,9 +366,11 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         // The correctness runs below are the registry's evidence, like its snapshots and timings: TryExecute runs the
         // chosen candidate again for the caller's result. Their transfers (an im2col candidate's shape-table upload)
         // were charged to the op, so a residency check failed whenever a shape class was tuned in-process.
+        long firstRun = Stopwatch.GetTimestamp();
         using (Engines.DirectGpu.GpuLaunchProbe.TuningScope())
             reference.Execute(args);
         float[] expected = _harness.SnapshotOutput(args);
+        _uncharged += Stopwatch.GetTimestamp() - firstRun;
         double scale = 0;
         for (int i = 0; i < expected.Length; i++)
         {
@@ -391,9 +406,11 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             try
             {
                 _harness.PoisonOutput(args);
+                long candidateFirstRun = Stopwatch.GetTimestamp();
                 using (Engines.DirectGpu.GpuLaunchProbe.TuningScope())
                     c.Execute(args);
                 float[] actual = _harness.SnapshotOutput(args);
+                _uncharged += Stopwatch.GetTimestamp() - candidateFirstRun;
                 error = MaxRelativeError(expected, actual, scale);
             }
             catch (Exception ex)
@@ -414,8 +431,15 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             {
                 if (!remeasured) _harness.MeasureMilliseconds(c, args, reps); // warm caches, module loads and workspaces
                 var pairs = new List<KernelTuningPairedSample>(CandidatePairs);
+                bool abandoned = false;
                 for (int i = 0; i < CandidatePairs; i++)
                 {
+                    if (i == AbandonAfterPairs && !remeasured && pairs.TrueForAll(p =>
+                            p.Incumbent.TotalMilliseconds < AbandonSpeedup * p.Candidate.TotalMilliseconds))
+                    {
+                        abandoned = true;
+                        break;
+                    }
                     double tc, tr;
                     if ((i & 1) == 0)
                     {
@@ -428,6 +452,12 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
                         tc = _harness.MeasureMilliseconds(c, args, reps);
                     }
                     pairs.Add(new KernelTuningPairedSample(Span(tc), Span(tr)));
+                }
+                if (abandoned)
+                {
+                    lost?.Add(c.Id);
+                    rejected.Add($"{c.Id}: abandoned after {AbandonAfterPairs} pairs, each under {AbandonSpeedup:F1}x");
+                    continue;
                 }
                 evidence = new KernelTuningPairedEvidence(pairs, noise);
             }

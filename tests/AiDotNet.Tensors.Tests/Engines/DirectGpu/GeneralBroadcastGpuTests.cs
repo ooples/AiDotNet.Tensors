@@ -69,4 +69,71 @@ public sealed class GeneralBroadcastGpuTests : IClassFixture<DirectGpuTensorEngi
                     $"{name} {string.Join("x", shapeA)} op {string.Join("x", shapeB)} [{i}]: cpu {e[i]}, gpu {g[i]}");
         }
     }
+
+    // Multiply broadcasts with one kernel and no scratch: a per-row scale over a leading prefix ([B, H, dk, dv] by
+    // [B, H, 1, 1]) and a tile repeated over leading axes ([B, S, M] by [1, M], [B, H, D] by [H, D]), either operand
+    // first. They must match the CPU engine both eagerly and replayed from a captured inference graph.
+    public static IEnumerable<object[]> SingleKernelMultiplyShapes() =>
+    [
+        [new[] { 2, 3, 5, 4 }, new[] { 2, 3, 1, 1 }],
+        [new[] { 2, 3, 1, 1 }, new[] { 2, 3, 5, 4 }],
+        [new[] { 1, 4, 6, 6 }, new[] { 1, 4, 1, 1 }],
+        [new[] { 4, 7, 7 }, new[] { 4, 1, 1 }],
+        [new[] { 2, 3, 8 }, new[] { 1, 8 }],
+        [new[] { 1, 8 }, new[] { 2, 3, 8 }],
+        [new[] { 2, 3, 4 }, new[] { 3, 4 }],
+        [new[] { 2, 3, 4 }, new[] { 1, 3, 4 }],
+        [new[] { 5, 2, 8, 1 }, new[] { 8, 1 }],
+        [new[] { 1, 8 }, new[] { 1, 1 }],
+        [new[] { 1, 1 }, new[] { 3, 8 }],
+    ];
+
+    [SkippableTheory]
+    [MemberData(nameof(SingleKernelMultiplyShapes))]
+    public void SingleKernelBroadcastMultiply_RecordsIntoACapturedInferenceGraph(int[] shapeA, int[] shapeB)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+        var a = Rand(shapeA, 3);
+        var b = Rand(shapeB, 4, positive: true);
+        var cpu = new CpuEngine();
+
+        AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float> plan;
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+        using (var scope = AiDotNet.Tensors.Engines.Compilation.GraphMode.EnableInference())
+        {
+            var traced = gpu.TensorAdd(gpu.TensorBroadcastMultiply(a, b), a.Length >= b.Length ? a : b);
+            plan = scope.CompileInference(traced, new[] { a });
+        }
+        }
+        finally { AiDotNetEngine.Current = priorEngine; }
+        var prior = AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+        AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float>.InferenceCudaGraphOverride = true;
+        try
+        {
+            using (plan)
+            {
+                for (int call = 0; call < 4; call++)
+                {
+                    var input = Rand(shapeA, 10 + call);
+                    var expected = cpu.TensorAdd(cpu.TensorBroadcastMultiply(input, b), input.Length >= b.Length ? input : b).ToArray();
+                    plan.SetInputs(new[] { input });
+                    var g = plan.Execute().ToArray();
+                    Assert.Equal(expected.Length, g.Length);
+                    for (int i = 0; i < g.Length; i++)
+                        Assert.True(Math.Abs(expected[i] - g[i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[i])),
+                            $"call {call} {string.Join("x", shapeA)} * {string.Join("x", shapeB)} [{i}]: cpu {expected[i]}, gpu {g[i]}");
+                }
+                var exec = typeof(AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float>)
+                    .GetField("_graphExec", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                Assert.True((IntPtr)exec.GetValue(plan)! != IntPtr.Zero,
+                    $"{string.Join("x", shapeA)} * {string.Join("x", shapeB)} was not captured into a CUDA graph.");
+            }
+        }
+        finally { AiDotNet.Tensors.Engines.Compilation.CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+    }
 }

@@ -65,7 +65,18 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
         // readers, and a fused node that replaced one (recorded at order 0, so it resolved the target's producer to the
         // later write) ran after the write and read the updated value. Patterns skip every node in the set they are
         // handed, so the blocked nodes start in it and are told apart from fused-away ones below.
-        var blocked = _observableOutputs is null ? new HashSet<ILazyNode>() : new HashSet<ILazyNode>(_observableOutputs);
+        // An observable output is read after the plan runs. Inference: count that read as one more consumer - every
+        // pattern refuses to absorb an interior node with another consumer, so an observable node can still END a fused
+        // chain (the fused node writes the chain's last output tensor, the one the caller observes) but is never fused
+        // away. Training keeps every observable node out of fusion: a retained output that ends a fused linear chain
+        // is not left holding the step's values there.
+        var blocked = new HashSet<ILazyNode>();
+        if (_observableOutputs is not null)
+            foreach (var observable in _observableOutputs)
+            {
+                if (_forTraining) blocked.Add(observable);
+                else consumerCounts[observable] = consumerCounts.TryGetValue(observable, out int readers) ? readers + 1 : 1;
+            }
         foreach (var node in nodes)
         {
             // Already run (a nested scope's write realized it as its earlier reader): a fused replacement would be a new,

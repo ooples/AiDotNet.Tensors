@@ -1,0 +1,33 @@
+{
+  "tracks": {
+    "torch": {
+      "raw": "torch/raw.webm",
+      "trim": 0.56,
+      "seconds": 15.00123750000057,
+      "correct": 301,
+      "initial": {
+        "parameters": 25482,
+        "initial": 37,
+        "firstLoss": 2.304720401763916,
+        "device": "NVIDIA GeForce GTX 1660 Ti",
+        "version": "2.14.1+cu126"
+      },
+      "checkpoints": 65
+    },
+    "ai": {
+      "raw": "ai/raw.webm",
+      "trim": 0.56,
+      "seconds": 2.5996422,
+      "correct": 302,
+      "initial": {
+        "parameters": 25482,
+        "initial": 37,
+        "firstLoss": 2.3047204,
+        "device": "Direct GPU Engine (CUDA NVIDIA GeForce GTX 1660 Ti)"
+      },
+      "checkpoints": 65
+    }
+  },
+  "videoSeconds": 17.00123750000057,
+  "video": "original.mp4"
+}
