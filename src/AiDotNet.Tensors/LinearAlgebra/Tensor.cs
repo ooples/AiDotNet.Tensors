@@ -5222,6 +5222,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 return this;
             backend = directGpu.Backend;
         }
+        return PlaceOn(backend);
+    }
+
+    /// <summary>
+    /// Uploads this tensor to <paramref name="backend"/> and binds it there as its resident device copy: the body of
+    /// <see cref="Gpu()"/>, also used to rehome a tensor another backend held (CrossBackendTensors).
+    /// </summary>
+    internal Tensor<T> PlaceOn(Engines.DirectGpu.IDirectGpuBackend backend)
+    {
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);

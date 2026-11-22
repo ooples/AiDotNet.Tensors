@@ -55,8 +55,12 @@ internal static class CrossBackendTensors
     internal static bool IsForeign(IDirectGpuBackend? owner)
     {
         var consumer = GpuOpGate.CurrentOpBackend;
-        return owner is not null && consumer is not null && !ReferenceEquals(owner, consumer);
+        return owner is not null && consumer is not null && !ReferenceEquals(owner, consumer) && !Shares(owner, consumer);
     }
+
+    // Two backend instances on one address space (CUDA backends on the same live primary context) are not foreign.
+    private static bool Shares(IDirectGpuBackend owner, IDirectGpuBackend consumer)
+        => owner is IGpuSharedAddressSpace shared && shared.SharesAddressSpaceWith(consumer);
 
     /// <summary>
     /// Applies the policy to a tensor whose buffer belongs to <paramref name="owner"/> while an op on
@@ -74,7 +78,12 @@ internal static class CrossBackendTensors
                 + "engine as AiDotNetEngine.Current), or set AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn.");
 
         long bytes = (long)tensor.Length * sizeof(float);
+        bool wasResident = tensor.IsGpuResident;
         tensor.ReleaseForeignGpuBinding();
+        // Re-place it on the op's backend exactly as Tensor.Gpu() would have (version-tagged, host-mirrored), so a
+        // resident parameter stays resident: left host-only, an on-device optimizer would update a buffer the forward
+        // never reads and training would stall.
+        if (wasResident) tensor.PlaceOn(consumer);
         Interlocked.Increment(ref s_migrations);
         if (policy == CrossBackendTensorPolicy.MigrateWarn && FirstReport(tensor.StorageIdentity, owner, consumer))
             AiDotNetEngine.LogDiagnostic(
@@ -93,7 +102,7 @@ internal static class CrossBackendTensors
     internal static void ResolveIfForeign<T>(Tensor<T> tensor, IDirectGpuBackend consumer)
     {
         var owner = tensor._gpuBackend;
-        if (tensor._gpuBuffer is null || owner is null || ReferenceEquals(owner, consumer)) return;
+        if (tensor._gpuBuffer is null || owner is null || ReferenceEquals(owner, consumer) || Shares(owner, consumer)) return;
         Resolve(tensor, owner, consumer);
     }
 
