@@ -49,12 +49,17 @@ public partial class DirectGpuTensorEngine
         if (states is null) throw new ArgumentNullException(nameof(states));
         if (nexts is null) throw new ArgumentNullException(nameof(nexts));
         if (nexts.Count != states.Count) throw new ArgumentException("One next value per state.", nameof(nexts));
-        if (states.Count < 2 || typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IBatchedCopyBackend batched)
+        if (states.Count < 2 || typeof(T) != typeof(float))
         {
             for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
             return;
         }
         using var lease = EnterGpuOp();
+        if (!TryGetBackend(out var backend) || backend is not IBatchedCopyBackend batched)
+        {
+            for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
+            return;
+        }
         var destinations = new IGpuBuffer[states.Count];
         var sources = new OwnedBuffer[states.Count];
         var lengths = new int[states.Count];
@@ -131,7 +136,9 @@ public partial class DirectGpuTensorEngine
     private IGpuBuffer? PinResident<T>(Tensor<T> tensor, bool deviceAuthoritative)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (!tensor.IsContiguous || IsPartialView(tensor) || !TryGetBackend(out var backend)) return null;
+        if (!tensor.IsContiguous || IsPartialView(tensor)) return null;
+        using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend)) return null;
         if (tensor._gpuBuffer is { } bound && bound.Handle != IntPtr.Zero && bound.Size >= tensor.Length
             && ReferenceEquals(tensor._gpuBackend, backend) && tensor._gpuBufferVersion == tensor.GpuCacheVersion) return bound;
         var buffer = PersistentBufferFor(backend, tensor);
@@ -234,6 +241,7 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal void RearmStateAfterReplay<T>(Tensor<T> state, IGpuBuffer capturedBuffer)
     {
+        using var __gpuOp = EnterGpuOp();
         if (TryGetBackend(out var backend))
         {
             state.IncrementVersion();

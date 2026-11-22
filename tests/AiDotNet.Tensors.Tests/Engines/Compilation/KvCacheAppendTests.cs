@@ -79,7 +79,96 @@ public class KvCacheAppendTests
         try { gpu = new DirectGpuTensorEngine(); }
         catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
         Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
-        using (gpu) RunEager(gpu!, hostOverflowThrows: gpu!.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend);
+        if (gpu is null) return;
+        using (gpu)
+        {
+            bool isCuda = gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            gpu.StrictGpuLeases = true;
+            RunEager(gpu, hostOverflowThrows: !isCuda);
+        }
+    }
+
+    [Fact]
+    public void Strict_gpu_leases_cover_kv_cache_append_and_state_residency_helpers()
+    {
+        var backend = DirectGpu.MockDirectGpuBackend.Create(new DirectGpu.MockBackendState());
+        using var direct = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(backend);
+        using var engine = new DirectGpuTensorEngine(direct) { StrictGpuLeases = true };
+
+        var cache = new Tensor<float>([Batch, Capacity, Width]);
+        var position = new Tensor<float>([1]);
+        var row0 = new Tensor<float>([Batch, Width], new Vector<float>(Row(0)));
+        var mask = engine.KvCacheAppend(cache, position, row0);
+        CheckMask(mask.ToArray(), 0);
+        CheckCache(cache.ToArray(), 0);
+        Assert.Equal(1f, position.ToArray()[0]);
+
+        var state0 = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        var state1 = new Tensor<float>(new[] { 3f, 4f }, new[] { 2 });
+        var leaf = new Tensor<float>(new[] { 5f, 6f }, new[] { 2 });
+        var next0 = new Tensor<float>(new[] { 10f, 20f }, new[] { 2 });
+        var next1 = new Tensor<float>(new[] { 30f, 40f }, new[] { 2 });
+
+        var pinnedState = engine.PinInputResident(state0);
+        var pinnedLeaf = engine.PinLeafResident(leaf);
+        Assert.NotNull(pinnedState);
+        Assert.NotNull(pinnedLeaf);
+
+        engine.AssignStatesInPlace(new[] { state0, state1 }, new[] { next0, next1 });
+        Assert.Equal(new[] { 10f, 20f }, state0.ToArray());
+        Assert.Equal(new[] { 30f, 40f }, state1.ToArray());
+
+        if (pinnedState is not null)
+        {
+            engine.RearmStateAfterReplay(state0, pinnedState);
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(-1f)]
+    [InlineData(1.5f)]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    public void Invalid_positions_do_not_corrupt_the_cache_or_advance_the_position(float badPosition)
+    {
+        var cpu = new CpuEngine();
+        var cpuCache = new Tensor<float>([Batch, Capacity, Width]);
+        var cpuPosition = new Tensor<float>(new[] { badPosition }, new[] { 1 });
+        var value = new Tensor<float>([Batch, Width], new Vector<float>(Row(0)));
+        Assert.Throws<InvalidOperationException>(() => cpu.KvCacheAppend(cpuCache, cpuPosition, value));
+
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        if (gpu is null) return;
+        using (gpu)
+        {
+            bool isCuda = gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            gpu.StrictGpuLeases = true;
+            var sentinel = Enumerable.Repeat(7f, Batch * Capacity * Width).ToArray();
+            var cache = new Tensor<float>([Batch, Capacity, Width], new Vector<float>(sentinel));
+            var position = new Tensor<float>(new[] { badPosition }, new[] { 1 });
+            if (isCuda)
+            {
+                var mask = gpu.KvCacheAppend(cache, position, value);
+                Assert.All(mask.ToArray(), m => Assert.True(float.IsNegativeInfinity(m)));
+                Assert.All(cache.ToArray(), c => Assert.Equal(7f, c));
+                float observedPosition = position.ToArray()[0];
+                if (float.IsNaN(badPosition))
+                {
+                    Assert.True(float.IsNaN(observedPosition));
+                }
+                else
+                {
+                    Assert.Equal(badPosition, observedPosition);
+                }
+            }
+            else
+            {
+                Assert.Throws<InvalidOperationException>(() => gpu.KvCacheAppend(cache, position, value));
+            }
+        }
     }
 
     // A compiled plan appending each step's input: the position advances on the device once per execution (the capture

@@ -12,10 +12,12 @@ public partial class DirectGpuTensorEngine
     {
         if (GraphMode.IsActive) return base.KvCacheAppend(cache, position, value);
         var (batch, capacity, width) = ValidateKvCacheAppend(cache, position, value);
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IKvCacheAppendBackend append
-            || IsPartialView(cache) || IsPartialView(position))
+        if (typeof(T) != typeof(float) || IsPartialView(cache) || IsPartialView(position))
             return base.KvCacheAppend(cache, position, value);
+        // The lease comes before the backend lookup: strict lease checking asserts it on TryGetBackend.
         using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend) || backend is not IKvCacheAppendBackend append)
+            return base.KvCacheAppend(cache, position, value);
         // The cache's and the position's own persistent buffers, holding their current values: written in place.
         var cacheBuffer = PinInputResident(cache) ?? throw new InvalidOperationException("The cache could not be made device-resident.");
         var positionBuffer = PinInputResident(position) ?? throw new InvalidOperationException("The position could not be made device-resident.");
