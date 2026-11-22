@@ -2091,9 +2091,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private static readonly bool s_staleDropTrace = System.Environment.GetEnvironmentVariable("AIDOTNET_STALE_DROP_TRACE") == "1";
 
+    /// <summary>
+    /// The float buffers below hold a double tensor only by narrowing it. Under the type-preserving policy (the default
+    /// for double) that is refused here, at the one place every float kernel fetches its operands, so an op with no
+    /// precision plan of its own falls back to the CPU engine instead of silently returning float-accurate doubles.
+    /// </summary>
+    private static void ThrowIfNarrowingDouble<T>()
+    {
+        if (typeof(T) != typeof(double) || Gpu.AutocastScope.IsEnabled) return;
+        if (Gpu.GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AccuracyMode == Gpu.GpuAccuracyMode.PreserveInputType)
+            throw new NotSupportedException(
+                "This GPU kernel computes in single precision; the precision policy preserves double, so the op runs on the CPU engine.");
+    }
+
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
         ThrowIfReleased(tensor);
+        ThrowIfNarrowingDouble<T>();
         // A device read of an intermediate a probe run quarantined: retain its producer (AutoRetainProbe).
         if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
@@ -2518,6 +2532,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, T[] data)
     {
+        ThrowIfNarrowingDouble<T>();
         // First check persistent tensor cache (for weights/biases)
         var cached = TryGetCachedBuffer(data);
         if (cached != null)
@@ -2568,6 +2583,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, ReadOnlyMemory<T> memory)
     {
+        ThrowIfNarrowingDouble<T>();
         // Try to get the underlying array for cache lookup
         if (MemoryMarshal.TryGetArray(memory, out ArraySegment<T> segment) &&
             segment.Offset == 0 && segment.Count == segment.Array!.Length)
@@ -2702,6 +2718,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private IGpuBuffer UploadTensorRaw<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        ThrowIfNarrowingDouble<T>();
         // The fresh-upload branch below caches the buffer under the tensor's backing array. A strided view
         // shares that array with its source, so caching the view's layout there would poison the source's
         // entry. Upload a dense copy instead: it has its own array, which keeps the cached buffer alive and
@@ -5641,7 +5658,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         // Double operands already on the device stay there, computed in double.
         if (input is Tensor<double> doubles && TryUnaryFloat64(doubles, callerName) is { } doubleResult)
-            return (Tensor<T>)(object)doubleResult;
+            return DoublesAs<T>(doubleResult);
         if (!IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend))
             return null;
         var precisionOperation = PrecisionOperationForUnary(callerName);
@@ -9444,7 +9461,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         // Element types without a float device representation (e.g. Complex<T>) belong to the base implementation.
         // Gradient accumulation for complex tensors reached the host path below and threw converting to float.
-        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend))
+        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend) || !DeviceKeepsPrecision<T>(backend, "InPlace"))
             return false;
 
         // GPU-RESIDENT compiled-step path (PR #638 A2): the dominant backward host-traffic is grad accumulation
@@ -9612,7 +9629,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool TryRunUnaryInPlace<T>(Tensor<T> tensor, Action<IDirectGpuBackend, IGpuBuffer, int> op)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend))
+        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend) || !DeviceKeepsPrecision<T>(backend, "InPlace"))
             return false;
 
         // Same correctness problem as TryRunBinaryInPlace: GetDataArray() hands back a DETACHED COPY for a
@@ -23709,7 +23726,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Double operands have their own kernels and their own device buffers; `kernel` is the float one.
         if (a is Tensor<double> leftDoubles && b is Tensor<double> rightDoubles)
             return ShapesMatch(a.Shape._dims, b.Shape._dims)
-                ? (Tensor<T>?)(object?)TryBinaryFloat64(leftDoubles, rightDoubles, callerName)
+                ? TryBinaryFloat64(leftDoubles, rightDoubles, callerName) as Tensor<T>
                 : null;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
@@ -25201,7 +25218,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor is Tensor<double> doubles && scalar is double doubleScalar
             && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Multiply, nameof(TensorMultiplyScalar)) is { } doubleResult)
         {
-            var onDevice = (Tensor<T>)(object)doubleResult;
+            var onDevice = DoublesAs<T>(doubleResult);
             Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", onDevice, tensor,
                 Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { doubleScalar });
             return onDevice;
@@ -28878,7 +28895,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor is Tensor<double> doubles && scalar is double doubleScalar
             && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Add, nameof(TensorAddScalar)) is { } doubleResult)
         {
-            var onDevice = (Tensor<T>)(object)doubleResult;
+            var onDevice = DoublesAs<T>(doubleResult);
             Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
             return onDevice;
         }
@@ -28921,7 +28938,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor is Tensor<double> doubles && scalar is double doubleScalar
             && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Subtract, nameof(TensorSubtractScalar)) is { } doubleResult)
         {
-            var onDevice = (Tensor<T>)(object)doubleResult;
+            var onDevice = DoublesAs<T>(doubleResult);
             Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
             return onDevice;
         }
@@ -28964,7 +28981,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor is Tensor<double> doubles && scalar is double doubleScalar
             && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Divide, nameof(TensorDivideScalar)) is { } doubleResult)
         {
-            var onDevice = (Tensor<T>)(object)doubleResult;
+            var onDevice = DoublesAs<T>(doubleResult);
             Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", onDevice, tensor,
                 Autodiff.BackwardFunctions<T>.DivideScalarBackward, new object[] { doubleScalar });
             return onDevice;

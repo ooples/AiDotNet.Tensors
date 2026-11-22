@@ -802,6 +802,7 @@ void XgemmDirectTT(const int kSizeM, const int kSizeN, const int kSizeK,
 // End of the C++11 raw string literal
 """;
 
+        /// <summary>The OpenCL source of the direct GEMM kernels for one set of tuned parameters and one precision.</summary>
         /// <param name="parameters">The tuned kernel parameters.</param>
         /// <param name="doublePrecision">Builds the kernels over <c>double</c> (needs fp64) instead of <c>float</c>.</param>
         public static string BuildSource(ClBlastXgemmDirectParameters parameters, bool doublePrecision = false)

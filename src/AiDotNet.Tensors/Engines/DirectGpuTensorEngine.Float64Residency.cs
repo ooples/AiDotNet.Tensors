@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -278,21 +279,23 @@ public partial class DirectGpuTensorEngine
                 }
 
                 if (Float64MatMulForceDevice == true)
-                    return (Tensor<T>)(object)MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
+                    return DoublesAs<T>(MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape));
 
                 int workLog2 = 0;
                 for (long remaining = work; remaining > 1; remaining >>= 1) workLog2++;
                 var sizeClass = (workLog2, uploads > 0);
                 if (_float64MatMulDeviceWins.TryGetValue(sizeClass, out bool deviceWins))
-                    return deviceWins ? (Tensor<T>)(object)MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape) : null;
+                    return deviceWins ? DoublesAs<T>(MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape)) : null;
 
                 // First multiply of this size class: run both, twice each (the first run of either pays one-time
                 // costs), and keep the faster. Its product is returned, so nothing is computed a third time.
                 var clock = new System.Diagnostics.Stopwatch();
-                Tensor<double> deviceProduct = MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
+                var warmUp = MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
                 backend.Synchronize();
+                // Nothing reads the warm-up product: its buffer goes back for the timed run.
+                PoolFloat64Result(warmUp);
                 clock.Restart();
-                deviceProduct = MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
+                var deviceProduct = MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
                 backend.Synchronize();
                 long deviceTicks = clock.ElapsedTicks;
 
@@ -301,7 +304,7 @@ public partial class DirectGpuTensorEngine
                 // Not recorded: the caller records the one product it returns.
                 using (Autodiff.GradientTape<double>.NoGrad())
                 {
-                    hostProduct = base.TensorMatMul(left, right);
+                    _ = base.TensorMatMul(left, right);
                     clock.Restart();
                     hostProduct = base.TensorMatMul(left, right);
                     hostTicks = clock.ElapsedTicks;
@@ -309,7 +312,9 @@ public partial class DirectGpuTensorEngine
 
                 deviceWins = deviceTicks < hostTicks;
                 _float64MatMulDeviceWins[sizeClass] = deviceWins;
-                return (Tensor<T>)(object)(deviceWins ? deviceProduct : hostProduct);
+                if (deviceWins) return DoublesAs<T>(deviceProduct);
+                PoolFloat64Result(deviceProduct);
+                return DoublesAs<T>(hostProduct);
             }
         }
         catch (NotSupportedException capabilityGap)
@@ -317,6 +322,17 @@ public partial class DirectGpuTensorEngine
             GpuLaunchProbe.OnFallback("TensorMatMulFloat64", capabilityGap);
             return null;
         }
+    }
+
+    /// <summary>A double tensor as the <c>Tensor&lt;T&gt;</c> it is when <typeparamref name="T"/> is double.</summary>
+    internal static Tensor<T> DoublesAs<T>(Tensor<double> tensor)
+        => tensor as Tensor<T> ?? throw new InvalidCastException($"A double tensor is not a Tensor<{typeof(T).Name}>.");
+
+    // Callers hold _float64Lock. Returns the buffer of a device result that no caller will ever see to the pool.
+    private void PoolFloat64Result(Tensor<double> unseen)
+    {
+        if (_float64ByVector.TryGetValue(unseen.DataVector, out var resident))
+            ReleaseFloat64Resident(resident, bringToHost: false, toPool: true);
     }
 
     // Callers hold _float64Lock.
@@ -427,7 +443,7 @@ public partial class DirectGpuTensorEngine
         if (FindFloat64Resident(tensor) is { } resident && ReferenceEquals(resident.Backend, backend))
             return new OwnedBuffer(resident.Buffer, ownsBuffer: false);
 
-        var contiguous = !tensor.IsContiguous || tensor._storageOffset != 0 ? (Tensor<double>)tensor.Contiguous() : tensor;
+        var contiguous = !tensor.IsContiguous || tensor._storageOffset != 0 ? tensor.Contiguous() : tensor;
         // The read-only accessor brings a pending device result down first, so the upload sees current values.
         var host = contiguous.GetReadOnlyDataArray();
         bool keep = ReferenceEquals(contiguous, tensor) && IsPersistentFloat64(tensor) && !_float64ByVector.TryGetValue(tensor.DataVector, out _);
@@ -562,14 +578,22 @@ public partial class DirectGpuTensorEngine
         while (stack.Count > 0)
         {
             var candidate = stack.Pop();
-            _float64PoolBytes -= (long)length * sizeof(double);
-            if (IsLiveDeviceBuffer(candidate) && ReferenceEquals(_float64PoolBackend, backend))
+            bool taken = false;
+            try
+            {
+                _float64PoolBytes -= (long)length * sizeof(double);
+                taken = IsLiveDeviceBuffer(candidate) && ReferenceEquals(_float64PoolBackend, backend);
+            }
+            finally
+            {
+                if (!taken) candidate.Dispose();
+            }
+
+            if (taken)
             {
                 buffer = candidate;
                 return true;
             }
-
-            candidate.Dispose();
         }
 
         return false;
@@ -580,9 +604,8 @@ public partial class DirectGpuTensorEngine
     // Callers hold _float64Lock.
     private void DisposeFloat64Pool(int exceptLength = -1)
     {
-        foreach (var entry in _float64Pool)
+        foreach (var entry in _float64Pool.Where(pooled => pooled.Key != exceptLength))
         {
-            if (entry.Key == exceptLength) continue;
             while (entry.Value.Count > 0)
             {
                 entry.Value.Pop().Dispose();
