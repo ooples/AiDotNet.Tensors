@@ -77,7 +77,7 @@ public sealed class SmallTopKRowsGpuTests : IClassFixture<DirectGpuTensorEngineT
         Assert.Equal(before + 1, gpu.TopKSmallRowsCompleted);
 
         Assert.Equal(cpuIdx.ToArray(), gpuIdx.ToArray());
-        Assert.Equal(cpuTop.ToArray().Select(BitConverter.SingleToInt32Bits).ToArray(),
-            gpuTop.ToArray().Select(BitConverter.SingleToInt32Bits).ToArray());
+        Assert.Equal(cpuTop.ToArray().Select(TestHelpers.MathCompat.SingleToInt32Bits).ToArray(),
+            gpuTop.ToArray().Select(TestHelpers.MathCompat.SingleToInt32Bits).ToArray());
     }
 }
