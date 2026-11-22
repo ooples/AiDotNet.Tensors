@@ -118,43 +118,75 @@ public partial class CpuEngine
         public int KeyLimit(int i) => Causal ? Math.Max(0, Math.Min(SeqK, i + 1 + SeqK - SeqQ)) : SeqK;
     }
 
-    /// <summary>The same function through the recorded primitives (per-head permutes and SDPA).</summary>
+    /// <summary>The same function through recorded primitives: per-head permutes, batched matmuls and a row softmax,
+    /// with causality applied as a same-typed additive bias so an inference capture can record every op.</summary>
     private Tensor<T> MultiHeadAttentionCoreDecomposed<T>(
         Tensor<T> query, Tensor<T> key, Tensor<T> value, AttentionCoreShape s)
     {
+        // softmax(scale * q k^T [+ causal bias]) v through batched matmuls and a row softmax: primitives every engine
+        // keeps on its own device under the tape. ScaledDotProductAttention with its weights output runs on the host
+        // on a GPU engine (and its boolean-mask overload cannot be captured in an inference graph, its inputs mixing
+        // element types), so neither the training nor the inference path goes through it.
         var q4 = TensorPermute(Reshape(query, new[] { s.Batch, s.SeqQ, s.Heads, s.HeadDim }), new[] { 0, 2, 1, 3 });
         var k4 = TensorPermute(Reshape(key, new[] { s.Batch, s.SeqK, s.Heads, s.HeadDim }), new[] { 0, 2, 1, 3 });
         var v4 = TensorPermute(Reshape(value, new[] { s.Batch, s.SeqK, s.Heads, s.ValueDim }), new[] { 0, 2, 1, 3 });
-        if (!s.Causal)
+        int bh = s.Batch * s.Heads;
+        var q3 = Reshape(q4, new[] { bh, s.SeqQ, s.HeadDim });
+        var k3 = Reshape(k4, new[] { bh, s.SeqK, s.HeadDim });
+        var v3 = Reshape(v4, new[] { bh, s.SeqK, s.ValueDim });
+        var weighted = AttentionPrimitiveChain(q3, k3, v3, s.SeqQ, s.SeqK, s.Scale, softcap: 0.0,
+            s.Causal ? s.KeyLimit : null);
+        return Reshape(
+            TensorPermute(Reshape(weighted, new[] { s.Batch, s.Heads, s.SeqQ, s.ValueDim }), new[] { 0, 2, 1, 3 }),
+            new[] { s.Batch, s.SeqQ, s.ValueWidth });
+    }
+
+    /// <summary>
+    /// softmax(scale * q k^T) v over [batchHeads, seq, dim] operands through BatchMatMul, scalar multiplies, Softmax and
+    /// trailing broadcasts, all in the operands' own element type. When <paramref name="keyLimit"/> is given, query row
+    /// i sees keys j &lt; keyLimit(i): an additive [seqQ, seqK] bias (0 allowed, a large negative finite value blocked)
+    /// broadcast over the batch-heads axis does the masking, and a row that sees no key gets a 0/1 keep mask on its
+    /// probabilities so it outputs zeros and passes zero (not NaN) gradient, as the fused kernels do.
+    /// </summary>
+    private Tensor<T> AttentionPrimitiveChain<T>(
+        Tensor<T> q3, Tensor<T> k3, Tensor<T> v3, int seqQ, int seqK, double scale, double softcap,
+        Func<int, int>? keyLimit)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var scores = TensorMultiplyScalar(BatchMatMul(q3, TensorPermute(k3, new[] { 0, 2, 1 })), ops.FromDouble(scale));
+        if (softcap > 0.0)
+            scores = TensorMultiplyScalar(TensorTanh(TensorMultiplyScalar(scores, ops.FromDouble(1.0 / softcap))),
+                ops.FromDouble(softcap));
+
+        Tensor<T>? keep = null;
+        if (keyLimit is not null)
         {
-            // softmax(scale * q k^T) v through batched matmuls and a row softmax: primitives every engine keeps on its
-            // own device under the tape. ScaledDotProductAttention with its weights output runs on the host on a GPU
-            // engine, so a GPU training step through it crossed the device boundary on every call.
-            int bh = s.Batch * s.Heads;
-            var q3 = Reshape(q4, new[] { bh, s.SeqQ, s.HeadDim });
-            var k3 = Reshape(k4, new[] { bh, s.SeqK, s.HeadDim });
-            var v3 = Reshape(v4, new[] { bh, s.SeqK, s.ValueDim });
-            var scores = TensorMultiplyScalar(BatchMatMul(q3, TensorPermute(k3, new[] { 0, 2, 1 })),
-                MathHelper.GetNumericOperations<T>().FromDouble(s.Scale));
-            var weighted = BatchMatMul(Softmax(scores, -1), v3);
-            return Reshape(
-                TensorPermute(Reshape(weighted, new[] { s.Batch, s.Heads, s.SeqQ, s.ValueDim }), new[] { 0, 2, 1, 3 }),
-                new[] { s.Batch, s.SeqQ, s.ValueWidth });
+            // Finite, so a fully blocked row stays a finite softmax (zeroed by the keep mask below); large enough that
+            // exp(blocked - rowMax) underflows to exactly zero in the element type. Half tops out at 65504.
+            T blocked = ops.FromDouble(typeof(T) == typeof(Half) ? -30000.0 : -1e9);
+            var bias = new T[seqQ * seqK];
+            T[]? keepData = null;
+            for (int i = 0; i < seqQ; i++)
+            {
+                int limit = keyLimit(i), row = i * seqK;
+                for (int j = 0; j < seqK; j++) bias[row + j] = j < limit ? ops.Zero : blocked;
+                if (limit == 0) keepData ??= new T[seqQ * seqK];
+            }
+            if (keepData is not null)
+            {
+                for (int i = 0; i < seqQ; i++)
+                {
+                    int limit = keyLimit(i), row = i * seqK;
+                    for (int j = 0; j < seqK; j++) keepData[row + j] = j < limit ? ops.One : ops.Zero;
+                }
+                keep = new Tensor<T>(keepData, new[] { seqQ, seqK });
+            }
+            scores = TensorBroadcastAdd(scores, new Tensor<T>(bias, new[] { seqQ, seqK }));
         }
 
-        Tensor<bool>? mask = null;
-        {
-            var allowed = new bool[s.Batch * s.Heads * s.SeqQ * s.SeqK];
-            for (int bh = 0; bh < s.Batch * s.Heads; bh++)
-                for (int i = 0; i < s.SeqQ; i++)
-                {
-                    int limit = s.KeyLimit(i), row = (bh * s.SeqQ + i) * s.SeqK;
-                    for (int j = 0; j < limit; j++) allowed[row + j] = true;
-                }
-            mask = new Tensor<bool>(allowed, new[] { s.Batch, s.Heads, s.SeqQ, s.SeqK });
-        }
-        var context = ScaledDotProductAttention(q4, k4, v4, mask, s.Scale, out _);
-        return Reshape(TensorPermute(context, new[] { 0, 2, 1, 3 }), new[] { s.Batch, s.SeqQ, s.ValueWidth });
+        var probabilities = Softmax(scores, -1);
+        if (keep is not null) probabilities = TensorBroadcastMultiply(probabilities, keep);
+        return BatchMatMul(probabilities, v3);
     }
 
     // Query rows and key columns per tile. A tile's score block, its Q rows and the transposed K block stay in L1/L2

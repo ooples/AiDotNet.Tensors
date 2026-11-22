@@ -94,14 +94,26 @@ public partial class CpuEngine
     }
 
     /// <summary>
-    /// The same function through recorded primitives (any element type, any engine): the mask (causal and supplied,
-    /// broadcast) is expanded once and handed to the materialising attention, whose backward the tape already knows.
+    /// The same function through recorded primitives (any element type, any engine). Causal alone runs the capturable
+    /// primitive chain; a supplied mask (with causal folded in, broadcast) is expanded once and handed to the
+    /// materialising attention, whose backward the tape already knows.
     /// </summary>
     private Tensor<T> FusedAttentionDecomposed<T>(
         Tensor<T> query, Tensor<T> key, Tensor<T> value, Tensor<bool>? mask, double scale, bool isCausal, double softcap)
     {
         int batch = query._shape[0], heads = query._shape[1], seqQ = query._shape[2], seqK = key._shape[2];
         int valueDim = value._shape[3];
+        if (mask is null && isCausal)
+        {
+            // Causal alone needs no boolean mask: the primitive chain applies it as a same-typed additive bias, so an
+            // inference capture records it (a boolean mask is a heterogeneous input it rejects). Top-left aligned.
+            int bh = batch * heads, headDim = query._shape[3];
+            var weighted = AttentionPrimitiveChain(
+                Reshape(query, new[] { bh, seqQ, headDim }), Reshape(key, new[] { bh, seqK, headDim }),
+                Reshape(value, new[] { bh, seqK, valueDim }), seqQ, seqK, scale, softcap,
+                i => Math.Min(seqK, i + 1));
+            return Reshape(weighted, new[] { batch, heads, seqQ, valueDim });
+        }
         Tensor<bool>? full = null;
         bool[]? emptyRows = null;
         if (mask is not null || isCausal)
