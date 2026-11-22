@@ -467,7 +467,7 @@ public static class AiDotNetEngine
     private static bool GpuPassesCorrectnessProbe(DirectGpuTensorEngine gpuEngine)
     {
         // Detection runs from whichever op first resolves Current: its transfers are the detection's, not that op's.
-        using var detection = DirectGpu.GpuLaunchProbe.TuningScope();
+        using var detection = DirectGpu.GpuLaunchProbe.DetectionScope();
         try
         {
             // [[1,2],[3,4]] @ [[5,6],[7,8]] == [[19,22],[43,50]]

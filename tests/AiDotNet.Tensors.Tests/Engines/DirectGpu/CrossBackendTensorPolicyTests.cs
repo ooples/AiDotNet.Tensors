@@ -227,6 +227,39 @@ public sealed class CrossBackendTensorPolicyTests
     }
 
     [SkippableFact]
+    public void Partial_view_placed_elsewhere_migrates_instead_of_recursing()
+    {
+        using var engines = CreateEngines();
+        var whole = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, new[] { 2, 4 });
+        var view = whole.Slice(1);
+        Assert.False(view.CoversWholeVector);   // the view's binding is its own, not its storage's
+        PlaceOn(engines.Placer, view);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zeros = new Tensor<float>(new float[4], new[] { 4 });
+        // Before the fix the kept view binding was judged foreign again on every lookup: a stack overflow.
+        Assert.Equal(new[] { 5f, 6f, 7f, 8f }, engines.Consumer.TensorAdd(view, zeros).ToArray());
+        Assert.NotSame(engines.Placer.QueryBackend, view._gpuBackend);
+    }
+
+    [SkippableFact]
+    public void Compile_keeps_host_writes_to_an_input_another_backend_placed()
+    {
+        using var engines = CreateEngines();
+        var input = Seeded(4, 3, 1);
+        var w1 = Seeded(3, 5, 2);
+        var w2 = Seeded(5, 2, 3);
+        PlaceOn(engines.Placer, input);
+        // The next batch, written through the host after the placement: the stale device copy must not come back.
+        var span = input.AsWritableSpan();
+        for (int i = 0; i < span.Length; i++) span[i] = 0.5f + i;
+        var expected = span.ToArray();
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        using var plan = Compile(engines.Consumer, input, w1, w2);
+        Assert.Equal(expected, input.ToArray());
+        Assert.NotSame(engines.Placer.QueryBackend, input._gpuBackend);
+    }
+
+    [SkippableFact]
     public void A_wrapper_around_the_op_backend_is_not_foreign()
     {
         using var engines = CreateEngines();

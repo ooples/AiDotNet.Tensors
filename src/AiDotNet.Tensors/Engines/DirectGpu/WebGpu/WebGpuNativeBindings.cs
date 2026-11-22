@@ -239,6 +239,7 @@ public static partial class WebGpuNativeBindings
     /// </summary>
     public static void CopyBufferToBuffer(int srcBufferId, int srcOffset, int dstBufferId, int dstOffset, int sizeBytes)
     {
+        GpuLaunchProbe.OnLaunch();   // a device-to-device copy is a GPU dispatch (GpuLaunchProbe's contract)
         if (Host is { } host) host.Invoke("copyBufferToBuffer", Args(srcBufferId, srcOffset, dstBufferId, dstOffset, sizeBytes));
         else JsCopyBufferToBuffer(srcBufferId, srcOffset, dstBufferId, dstOffset, sizeBytes);
     }

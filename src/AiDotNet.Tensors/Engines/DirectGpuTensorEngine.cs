@@ -761,7 +761,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         using var dataLease = t.LeaseArray();
         var data = dataLease.Array;
-        if (t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
+        // The same backend seen through a wrapper (a deferred scope's recording backend) reuses the binding too.
+        if (t._gpuBuffer is { } existing && t._gpuBackend is { } bound && CrossBackendTensors.SameAddressSpace(bound, cb)
             && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
         {
             cb.UploadBufferInPlace((float[])(object)data, existing);

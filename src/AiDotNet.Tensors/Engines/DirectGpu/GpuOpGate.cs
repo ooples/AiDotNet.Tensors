@@ -86,6 +86,13 @@ internal sealed class GpuOpGate
     // The backend of the innermost engine op running on this thread (null outside every op), with the lease counter
     // that holds it. Tensor.TryGetGpuBuffer compares a tensor's owning backend against it, so a buffer another backend
     // placed is never handed to this op's kernels as a raw device address (see CrossBackendTensors).
+    //
+    // Thread-static rather than AsyncLocal on purpose: an engine op is synchronous from EnterGpuOp to its lease's
+    // Dispose (no DirectGpuTensorEngine method awaits; a backend's asynchronous work completes inside the backend call,
+    // after its buffers were resolved), so the op never resumes on another thread with buffers still to resolve, and
+    // the hot path pays a field read instead of an ExecutionContext lookup and copy-on-write per op. An engine op that
+    // ever awaits mid-op must resolve its tensors before the await, or against an explicit backend
+    // (CrossBackendTensors.ResolveIfForeign).
     [ThreadStatic] private static IDirectGpuBackend? t_opBackend;
     [ThreadStatic] private static Counter? t_opCounter;
 

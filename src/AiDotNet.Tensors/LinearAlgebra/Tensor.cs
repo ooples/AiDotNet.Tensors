@@ -5255,9 +5255,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // path for the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS != 0), so it silently mistrained on GPU.
         _gpuBufferVersion = GpuCacheVersion;
         _device = backend.DeviceType;   // the backend's typed device, not a match on its name
-        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight.
-        if (Engines.AiDotNetEngine.Current.TryGet<Engines.DirectGpuTensorEngine>(out var owner)
-            && ReferenceEquals(owner.PlacementBackend, backend))
+        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight. The engine that
+        // owns the backend, not Current: a migration places from inside another engine's op, where reading Current
+        // could run a deferred GPU detection, and that engine is the one whose cache holds the copy.
+        if (Engines.DirectGpuTensorEngine.EngineOwning(backend) is { } owner)
             owner.DropPersistentCopy(this);
         // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
         Helpers.ResidentHostMirror.Attach(this);
@@ -5266,13 +5267,13 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
-    /// Releases this tensor's binding to the backend that owns its GPU buffer (CrossBackendTensors).
-    /// <paramref name="readBack"/> first brings the owner's values home (a pending deferred download included);
-    /// <paramref name="dropBinding"/> then detaches and frees the buffer when this tensor owns it (a storage-owned
-    /// buffer is freed with the storage), so the next engine op places the tensor on its own backend. A partial view
-    /// keeps its binding: the caller reads it back without splitting it from its sibling views.
+    /// Releases this tensor's binding to the backend that owns its GPU buffer (CrossBackendTensors), so the next
+    /// engine op places it on its own backend. <paramref name="readBack"/> first brings the owner's values home (a
+    /// pending deferred download included). The binding is then detached - a whole-storage tensor's is its storage's,
+    /// shared by every alias, a partial view's its own - and the buffer freed when this tensor owns it and
+    /// <paramref name="free"/> (false while the owner is tearing down: its context reclaims the memory).
     /// </summary>
-    internal void ReleaseForeignGpuBinding(bool readBack, bool dropBinding)
+    internal void ReleaseForeignGpuBinding(bool readBack, bool free)
     {
         var owner = _gpuBackend;
         if (readBack)
@@ -5294,7 +5295,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                     + "buffer, so it cannot be moved to the running operation's backend.", ex);
             }
         }
-        if (!dropBinding) return;
         var buffer = _gpuBuffer;
         bool owned = _ownsGpuBuffer;
         // Without a read-back the host is authoritative (an external input its caller writes): drop the pending
@@ -5309,10 +5309,16 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         _gpuBufferContainsRawInt32 = false;
         _gpuBufferContainsRawInt64 = false;
         _device = TensorDevice.CPU;
-        if (owned && buffer is IDisposable disposable)
+        if (free && owned && buffer is IDisposable disposable)
         {
+            // The tensor has already left the buffer: a backend that cannot free it now (gone, or failing) costs that
+            // allocation until its context goes, never the consumer's op.
             try { disposable.Dispose(); }
-            catch (ObjectDisposedException) { /* its backend is already gone */ }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"[AiDotNet] Freeing a migrated tensor's buffer on {owner?.BackendName ?? "its old backend"} failed: {ex.Message}");
+            }
         }
     }
 

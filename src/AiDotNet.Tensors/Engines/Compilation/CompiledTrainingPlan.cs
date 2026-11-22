@@ -10500,17 +10500,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (!engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return;
         using var operation = gpuEngine.EnterGpuOp();
         if (!operation.Held) return;
-        foreach (var parameter in parameters) Probe(parameter);
+        if (DirectGpu.GpuOpGate.CurrentOpBackend is not { } consumer) return;
+        var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var parameter in parameters) CrossBackendTensors.ResolveIfForeign(parameter, consumer);
+        // A graph input that is not a parameter is an external batch its caller writes through the host: its host copy
+        // is authoritative and the step's pre-pass uploads it (EnsureResidentInput), so it is only detached here.
         foreach (var node in scope.Nodes.OfType<LazyNode<T>>())
             foreach (var input in node.GetInputsArray())
-                if (input is not null && input.LazySource is null) Probe(input);
-
-        static void Probe(Tensor<T> tensor)
-        {
-            // Only a buffer bound on another backend is touched; TryGetGpuBuffer applies the policy to it.
-            if (tensor._gpuBuffer is null || !CrossBackendTensors.IsForeign(tensor._gpuBackend)) return;
-            _ = tensor.TryGetGpuBuffer();
-        }
+                if (input is not null && input.LazySource is null && !parameterSet.Contains(input))
+                    CrossBackendTensors.ResolveIfForeign(input, consumer, hostAuthoritative: true);
     }
 
     private static CompiledTrainingPlan<T> CompileCore(
