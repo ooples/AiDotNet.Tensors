@@ -2098,11 +2098,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private static void ThrowIfNarrowingDouble<T>()
     {
-        if (typeof(T) != typeof(double) || Gpu.AutocastScope.IsEnabled) return;
-        if (Gpu.GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AccuracyMode == Gpu.GpuAccuracyMode.PreserveInputType)
+        if (RefusesDoubleNarrowing<T>())
             throw new NotSupportedException(
                 "This GPU kernel computes in single precision; the precision policy preserves double, so the op runs on the CPU engine.");
     }
+
+    /// <summary>
+    /// Whether <see cref="ThrowIfNarrowingDouble{T}"/> would refuse a float upload of a <typeparamref name="T"/>
+    /// operand. An override with no try/catch around its float kernel checks this up front and returns its base
+    /// (CPU) implementation, so the refusal is a fallback rather than an exception escaping to the caller.
+    /// </summary>
+    private static bool RefusesDoubleNarrowing<T>()
+        => typeof(T) == typeof(double) && !Gpu.AutocastScope.IsEnabled
+           && Gpu.GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AccuracyMode == Gpu.GpuAccuracyMode.PreserveInputType;
 
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
@@ -11894,7 +11902,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return taped.Result;
         }
 
-        if (!TryGetBackend(out var backend))
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.MaxPool2D(input, poolSize, stride, padding);
 
         // Expected input shape: [batch, channels, height, width]
@@ -11950,7 +11958,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> MaxPool2DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,] maxIndices)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend))
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.MaxPool2DWithIndices(input, poolSize, stride, out maxIndices);
 
         if (input.Rank != 4 || poolSize.Length != 2 || stride.Length != 2)
@@ -12075,7 +12083,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> input, int[] poolSize, int[] stride, int padding)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || input.Rank != 4 || padding < 0
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend) || input.Rank != 4 || padding < 0
             || poolSize is not { Length: 2 } || stride is not { Length: 2 }
             || padding >= poolSize[0] || padding >= poolSize[1])
             return null;
@@ -12122,7 +12130,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> MaxPool2DBackward<T>(Tensor<T> gradOutput, int[,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend))
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.MaxPool2DBackward(gradOutput, maxIndices, inputShape, poolSize, stride);
 
         if (gradOutput.Rank != 4 || inputShape.Length != 4)
@@ -12207,7 +12215,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (stride == 0) stride = poolSize;
 
-        if (!TryGetBackend(out var backend))
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
 
         // Expected input shape: [batch, channels, height, width]
@@ -12270,7 +12278,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // The 0xC0000005 launch crash AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient surfaced was the
         // CudaBackend kernel-arg mismatch fixed in AvgPool2DBackward (see its remarks), so a tape no longer needs
         // to route around this kernel.
-        if (!TryGetBackend(out var backend))
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride);
 
         if (input.Rank != 4 || poolSize.Length != 2 || stride.Length != 2)
@@ -12334,7 +12342,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         var pad = padding ?? new[] { 0, 0 };
-        if (!TryGetBackend(out var backend))
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend))
             return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride, padding, countIncludePad);
 
         if (gradOutput.Rank != 4 || inputShape.Length != 4 || pad.Length != 2)
@@ -17886,7 +17894,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || gradOutput.Rank != 4
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend) || gradOutput.Rank != 4
             || inputShape is not { Length: 4 } || maxIndices.Length != gradOutput.Length)
             return base.MaxPool2DBackwardWithTensorIndices(
                 gradOutput, maxIndices, inputShape, poolSize, stride);
@@ -27807,7 +27815,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         // Under GraphMode the input is a lazy placeholder with no buffer yet: base records the lazy node, whose
         // replay closure calls back into this method with GraphMode off and so runs the kernel below.
-        if (Compilation.GraphMode.IsActive || !TryGetBackend(out var backend) || input.Rank != 4)
+        if (Compilation.GraphMode.IsActive || RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend) || input.Rank != 4)
             return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
 
         try
@@ -28248,7 +28256,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         if (IsTapeActive<T>()) return base.TensorAvgPool1D(input, kernelSize, stride);
-        if (!TryGetBackend(out var backend) || input.Rank != 3)
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend) || input.Rank != 3)
             return base.TensorAvgPool1D(input, kernelSize, stride);
         try
         {
@@ -28267,7 +28275,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var __gpuOp = EnterGpuOp();
         if (IsTapeActive<T>()) return base.TensorMaxPool1D(input, kernelSize, stride);
-        if (!TryGetBackend(out var backend) || input.Rank != 3)
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend) || input.Rank != 3)
             return base.TensorMaxPool1D(input, kernelSize, stride);
         try
         {
@@ -29597,7 +29605,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorAdaptiveMaxPool2D<T>(Tensor<T> input, int[] outputSize)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || input.Rank != 4)
+        if (RefusesDoubleNarrowing<T>() || !TryGetBackend(out var backend) || input.Rank != 4)
             return base.TensorAdaptiveMaxPool2D(input, outputSize);
 
         try
