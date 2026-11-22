@@ -60,6 +60,14 @@ public static class GpuElementTypes
         _ => throw new ArgumentOutOfRangeException(nameof(type), type, "The element type has no element size."),
     };
 
+    /// <summary>
+    /// Whether a buffer of <paramref name="type"/> is addressed in 4-byte words: the float and int types, and an
+    /// untyped (<see cref="GpuElementType.Unspecified"/>) buffer, which the float paths have always treated as words.
+    /// A view whose offsets are counted in floats is only valid over such a parent.
+    /// </summary>
+    internal static bool IsWordAddressed(GpuElementType type)
+        => type is GpuElementType.Unspecified or GpuElementType.Float32 or GpuElementType.Int32;
+
     /// <summary>Whether <paramref name="type"/> is a floating-point type.</summary>
     public static bool IsFloatingPoint(GpuElementType type)
         => type is GpuElementType.Float32 or GpuElementType.Float64 or GpuElementType.Float16 or GpuElementType.BFloat16;

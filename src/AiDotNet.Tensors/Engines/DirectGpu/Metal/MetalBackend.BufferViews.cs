@@ -20,6 +20,8 @@ public sealed partial class MetalBackend : IGpuBufferViews
     IGpuBuffer? IGpuBufferViews.TryCreateView(IGpuBuffer parent, int elementOffset, int elementCount)
     {
         if (parent is not MetalGpuBuffer owner || owner.IsDisposed) return null;
+        // Offsets below are counted in 4-byte words: a parent of another element width has no such view.
+        if (!GpuElementTypes.IsWordAddressed(owner.ElementType)) return null;
         if (elementOffset < 0 || elementCount <= 0 || (long)elementOffset + elementCount > owner.Size) return null;
         if ((owner.ByteOffset + (long)elementOffset * sizeof(float)) % ViewOffsetAlignment != 0) return null;
         return new MetalGpuBuffer(owner, elementOffset, elementCount);

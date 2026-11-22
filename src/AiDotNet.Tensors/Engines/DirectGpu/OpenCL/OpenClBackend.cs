@@ -1755,7 +1755,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (byteCount > wordBuffer.SizeInBytes)
                     throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({wordBuffer.SizeInBytes}).", nameof(byteCount));
                 var bytes = new byte[byteCount];
-                if (byteCount > 0) Buffer.BlockCopy(DownloadBuffer(buffer), 0, bytes, 0, byteCount);
+                if (byteCount == 0) return bytes;
+                // Only the words that cover the request: a few bytes of a large buffer must not cost its whole read.
+                int words = (int)(((long)byteCount + sizeof(float) - 1) / sizeof(float));
+                GpuLaunchProbe.OnReadback((long)words * sizeof(float), GpuBackendType.OpenCl);
+                Buffer.BlockCopy(wordBuffer.Buffer.ToArray(words), 0, bytes, 0, byteCount);
                 return bytes;
             }
 

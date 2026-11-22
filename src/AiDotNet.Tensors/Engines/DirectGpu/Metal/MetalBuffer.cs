@@ -377,6 +377,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         _buffer = parent.Handle;
         _device = parent._device;
         _viewParent = parent;
+        _elementType = (int)parent.ElementType;   // the view is the parent's memory, so it is the parent's elements
         _byteOffset = parent._byteOffset + (long)elementOffset * sizeof(float);
         Size = elementCount;
         StorageMode = parent.StorageMode;
