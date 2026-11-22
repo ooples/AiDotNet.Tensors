@@ -108,6 +108,28 @@ public class GatedDeltaNetStepTests
         Assert.Equal(before, state.ToArray());
     }
 
+    // A leading shape that itself ends in 1 ([2, 3, 1] rows of a [2, 3, 1, dk] query): the gate's last dimension is
+    // part of that shape, not the optional trailing singleton.
+    [Fact]
+    public void A_gate_matching_a_leading_shape_that_ends_in_one_is_accepted()
+    {
+        const int dv = 2, dk = 4, rows = 6;
+        var engine = new CpuEngine();
+        var x = Draw(new Random(13), rows, dv, dk);
+        int[] lead = [2, 3, 1];
+        Tensor<float> Of(float[] data, params int[] tail) => new([.. lead, .. tail], new Vector<float>(data));
+        var flatState = new Tensor<float>([rows, dv, dk]);
+        var batchedState = new Tensor<float>([rows, dv, dk]);
+        var flat = engine.GatedDeltaNetStep(flatState, new Tensor<float>([rows, dk], new Vector<float>(x.Q)), new Tensor<float>([rows, dk], new Vector<float>(x.K)),
+            new Tensor<float>([rows, dv], new Vector<float>(x.V)), new Tensor<float>([rows], new Vector<float>(x.A)), new Tensor<float>([rows], new Vector<float>(x.B)),
+            GatedDeltaRule.Standard).ToArray();
+        // alpha is exactly the leading shape; beta carries the optional trailing 1 on top of it.
+        var batched = engine.GatedDeltaNetStep(batchedState, Of(x.Q, dk), Of(x.K, dk), Of(x.V, dv), Of(x.A), Of(x.B, 1),
+            GatedDeltaRule.Standard).ToArray();
+        Assert.Equal(flat, batched);
+        Assert.Equal(flatState.ToArray(), batchedState.ToArray());
+    }
+
     [Fact]
     public void Batched_leading_dimensions_that_flatten_to_the_rows_are_accepted()
     {

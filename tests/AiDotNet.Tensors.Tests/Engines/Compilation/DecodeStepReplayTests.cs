@@ -157,6 +157,14 @@ public class DecodeStepReplayTests
     // Steady-state replay with nothing reading the cache, position, state or counter on the host: the pre-replay check
     // must neither download a written target to compare it nor re-upload one. A host read then costs one compare (and
     // no upload, the data being unchanged); a reset costs uploads.
+    // Under the op lease: a backend lookup outside one fails the strict-lease run (AIDOTNET_GPU_LEASE_STRICT=1).
+    private static bool IsCuda(DirectGpuTensorEngine? gpu)
+    {
+        if (gpu is null) return false;
+        using (gpu.EnterGpuOp())
+            return gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+    }
+
     [SkippableFact]
     public void A_steady_state_replay_with_no_host_reads_downloads_and_compares_nothing()
     {
@@ -166,7 +174,7 @@ public class DecodeStepReplayTests
         Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
         using (gpu)
         {
-            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            Skip.IfNot(IsCuda(gpu), "Inference graph capture is CUDA-only.");
             var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
             CompiledInferencePlan<float>.InferenceCudaGraphOverride = true;
             try
@@ -229,7 +237,7 @@ public class DecodeStepReplayTests
             CompiledInferencePlan<float>.InferenceCudaGraphOverride = capture;
             try
             {
-                Run(gpu!, capture && gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, sequences);
+                Run(gpu!, capture && IsCuda(gpu), sequences);
             }
             finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
         }

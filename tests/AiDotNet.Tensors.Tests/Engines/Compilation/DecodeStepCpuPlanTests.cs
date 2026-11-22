@@ -216,7 +216,9 @@ public class DecodeStepCpuPlanTests
         var a = T([1], _ => 0.9f); var b = T([1], _ => 0.5f);
         using (new EngineScope(cpu))
         {
-            Assert.Throws<InvalidOperationException>((Action)(() =>
+            // The deliberate failure only: a decode op that threw on its own would leave the state untouched and
+            // pass the checks below without exercising the restore.
+            Assert.Throws<DeliberateFailure>((Action)(() =>
             {
                 using var scope = GraphMode.EnableInference();
                 var w = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
@@ -225,12 +227,53 @@ public class DecodeStepCpuPlanTests
                 Assert.Equal(3, w.ToArray().Length);
                 Assert.Equal(2, o.ToArray().Length);
                 Assert.Equal(2f, position.ToArray()[0]);
-                throw new InvalidOperationException("the model failed after the decode step");
+                throw new DeliberateFailure();
             }));
         }
         Assert.Equal(1f, position.ToArray()[0]);
         Assert.Equal(cacheBefore, cache.ToArray());
         Assert.Equal(stateBefore, state.ToArray());
+    }
+
+    private sealed class DeliberateFailure : Exception
+    {
+        public DeliberateFailure() : base("the model failed after the decode step") { }
+    }
+
+    // A nested scope registers the cache as a state target and is abandoned before its op ever runs. The outer trace
+    // then writes the same cache, realizes it and fails: its abandonment must still find the pre-trace state.
+    [Fact]
+    public void An_abandoned_nested_scope_does_not_cost_the_outer_trace_its_snapshot()
+    {
+        var cpu = new CpuEngine();
+        var cache = T([1, 3, 2], i => 0.5f * i);
+        var position = T([1], _ => 1f);
+        var cacheBefore = cache.ToArray();
+        var x = T([1, 2], i => 9f + i);
+        using (new EngineScope(cpu))
+        {
+            Assert.Throws<DeliberateFailure>((Action)(() =>
+            {
+                using var outer = GraphMode.EnableInference();
+                try
+                {
+                    using var inner = GraphMode.EnableInference();
+                    cpu.KvCacheAppend(cache, position, x);   // recorded, never realized
+                    throw new DeliberateFailure();
+                }
+                catch (DeliberateFailure)
+                {
+                    // The inner trace is abandoned; the outer one goes on.
+                }
+                Assert.Equal(1f, position.ToArray()[0]);
+                var w = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                Assert.Equal(3, w.ToArray().Length);          // realizes the outer append
+                Assert.Equal(2f, position.ToArray()[0]);
+                throw new DeliberateFailure();
+            }));
+        }
+        Assert.Equal(1f, position.ToArray()[0]);
+        Assert.Equal(cacheBefore, cache.ToArray());
     }
 
     // A trace that never realizes its decode op takes no snapshot of the op's state (a KV cache can be large).

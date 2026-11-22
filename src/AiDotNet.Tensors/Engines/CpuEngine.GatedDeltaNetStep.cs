@@ -95,10 +95,19 @@ public partial class CpuEngine
     // A per-row gate is [rows], the query's leading shape, or either with a trailing singleton dimension.
     private static void ValidateRowGate<T>(Tensor<T> g, int rows, int[] lead, string name)
     {
-        int rank = g.Rank > 1 && g.Shape[g.Rank - 1] == 1 ? g.Rank - 1 : g.Rank;
-        bool flat = rank == 1 && g.Shape[0] == rows;
-        bool matchesLead = rank == lead.Length;
-        for (int i = 0; matchesLead && i < lead.Length; i++) matchesLead = g.Shape[i] == lead[i];
+        // The whole shape first, then the shape with one trailing singleton removed: a lead that itself ends in 1
+        // ([2, 3, 1]) must match as it stands, not have that dimension taken for the optional one.
+        bool Matches(int rank, int[] expected)
+        {
+            if (rank != expected.Length) return false;
+            for (int i = 0; i < rank; i++) if (g.Shape[i] != expected[i]) return false;
+            return true;
+        }
+
+        bool trailingOne = g.Rank > 1 && g.Shape[g.Rank - 1] == 1;
+        var flatShape = new[] { rows };
+        bool flat = Matches(g.Rank, flatShape) || (trailingOne && Matches(g.Rank - 1, flatShape));
+        bool matchesLead = Matches(g.Rank, lead) || (trailingOne && Matches(g.Rank - 1, lead));
         if (!flat && !matchesLead)
             throw new ArgumentException(
                 $"{name} must hold one value per row: [{rows}] or [{string.Join(", ", lead)}] (optionally with a trailing 1); got [{string.Join(", ", g.Shape.ToArray())}].", name);

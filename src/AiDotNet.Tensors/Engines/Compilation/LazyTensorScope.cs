@@ -569,41 +569,78 @@ internal sealed class LazyTensorScope : IDisposable
     // compiles.
     private sealed class TraceStateSnapshot
     {
-        internal TraceStateSnapshot(ISignatureTensor target) => Target = target;
+        internal TraceStateSnapshot(ISignatureTensor target, LazyTensorScope owner)
+        {
+            Target = target;
+            Owner = owner;
+        }
+
         internal readonly ISignatureTensor Target;
+        // The scope whose op registered the target: its compile, abandon or eager realization settles the entry.
+        internal readonly LazyTensorScope Owner;
         internal ISignatureTensor? Snapshot;
-        // False once the trace has been compiled, abandoned or realized for good: a later run is not the trace's.
+        // False once the owning trace has been compiled, abandoned or realized for good: a later run is not the trace's.
         internal bool Live = true;
     }
 
     private List<TraceStateSnapshot>? _traceStateSnapshots;
 
-    private void SnapshotTraceStateTargets<T>(LazyNode<T> node, Tensor<T>[] targets)
+    private LazyTensorScope RootScope()
     {
         var root = this;
         while (root._parent is not null) root = root._parent;
-        List<(TraceStateSnapshot Entry, Tensor<T> Target)>? registered = null;
-        // Evaluated as the loop advances, so a target listed twice is registered once: the second sees the first's entry.
-        foreach (var target in targets.Where(t => t.LazySource is null
-            && root._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, t)) != true))
+        return root;
+    }
+
+    private void SnapshotTraceStateTargets<T>(LazyNode<T> node, Tensor<T>[] targets)
+    {
+        var root = RootScope();
+        // The snapshot belongs to the TARGET, and every op that writes it can take it: whichever of them the trace
+        // realizes first sees the pre-trace state. Tied to the first registering op alone, a nested scope that
+        // registered a target and was abandoned before its op ran left an entry with no snapshot that kept a later
+        // writer from taking one, and the outer trace's abandonment then restored nothing.
+        var entries = new List<(TraceStateSnapshot Entry, Tensor<T> Target)>();
+        foreach (var target in targets.Where(t => t.LazySource is null))
         {
-            var entry = new TraceStateSnapshot(target);
-            (root._traceStateSnapshots ??= new()).Add(entry);
-            (registered ??= new()).Add((entry, target));
+            var entry = root._traceStateSnapshots?.Find(s => ReferenceEquals(s.Target, target));
+            if (entry is null)
+            {
+                entry = new TraceStateSnapshot(target, this);
+                (root._traceStateSnapshots ??= new()).Add(entry);
+            }
+            if (!entries.Exists(e => ReferenceEquals(e.Entry, entry))) entries.Add((entry, target));
         }
-        if (registered is null) return;
+        if (entries.Count == 0) return;
         node.BeforeTraceExecute = () =>
         {
-            foreach (var (entry, target) in registered)
+            foreach (var (entry, target) in entries)
                 if (entry.Live && entry.Snapshot is null)
                     entry.Snapshot = new Tensor<T>((int[])target._shape.Clone(), new Vector<T>(target.ToArray()));
         };
     }
 
+    // The entries this scope settles: all of them for the root (it owns the list), and for a nested scope the ones
+    // its own ops registered, which leave the root's list with it - a later writer of the same target then registers
+    // afresh against whatever scope is live.
+    private List<TraceStateSnapshot>? TakeTraceStateTargets()
+    {
+        if (_parent is null)
+        {
+            var all = _traceStateSnapshots;
+            _traceStateSnapshots = null;
+            return all;
+        }
+        var root = RootScope();
+        if (root._traceStateSnapshots is not { } shared) return null;
+        var mine = shared.FindAll(entry => ReferenceEquals(entry.Owner, this));
+        if (mine.Count == 0) return null;
+        shared.RemoveAll(entry => ReferenceEquals(entry.Owner, this));
+        return mine;
+    }
+
     private void RestoreTraceStateTargets()
     {
-        if (_traceStateSnapshots is not { } snapshots) return;
-        _traceStateSnapshots = null;
+        if (TakeTraceStateTargets() is not { } snapshots) return;
         foreach (var entry in snapshots)
         {
             entry.Live = false;
@@ -616,8 +653,7 @@ internal sealed class LazyTensorScope : IDisposable
     // is restored, and no snapshot is taken from here on.
     private void DiscardTraceStateTargets()
     {
-        if (_traceStateSnapshots is not { } snapshots) return;
-        _traceStateSnapshots = null;
+        if (TakeTraceStateTargets() is not { } snapshots) return;
         foreach (var entry in snapshots)
         {
             entry.Live = false;

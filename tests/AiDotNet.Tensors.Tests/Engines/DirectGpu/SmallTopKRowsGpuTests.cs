@@ -19,6 +19,13 @@ public sealed class SmallTopKRowsGpuTests : IClassFixture<DirectGpuTensorEngineT
 
     public SmallTopKRowsGpuTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
 
+    // Under the op lease: a backend lookup outside one fails the strict-lease run (AIDOTNET_GPU_LEASE_STRICT=1).
+    private static bool HasSmallTopK(DirectGpuTensorEngine gpu)
+    {
+        using (gpu.EnterGpuOp())
+            return gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.ISmallTopKRowsBackend;
+    }
+
     [SkippableTheory]
     [InlineData(37, 8, 1)]
     [InlineData(37, 8, 2)]
@@ -29,7 +36,7 @@ public sealed class SmallTopKRowsGpuTests : IClassFixture<DirectGpuTensorEngineT
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.ISmallTopKRowsBackend, "Backend has no small-row TopK kernel.");
+        Skip.IfNot(HasSmallTopK(gpu), "Backend has no small-row TopK kernel.");
         var rng = new Random(rows * 31 + cols * 7 + k);
         var x = new Tensor<float>([rows, cols]);
         // Values on a coarse grid so most rows hold ties.
@@ -55,7 +62,7 @@ public sealed class SmallTopKRowsGpuTests : IClassFixture<DirectGpuTensorEngineT
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var gpu = _fixture.Engine!;
-        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.ISmallTopKRowsBackend, "Backend has no small-row TopK kernel.");
+        Skip.IfNot(HasSmallTopK(gpu), "Backend has no small-row TopK kernel.");
         float nan = float.NaN, nz = -0f;
         float[][] rows =
         {
