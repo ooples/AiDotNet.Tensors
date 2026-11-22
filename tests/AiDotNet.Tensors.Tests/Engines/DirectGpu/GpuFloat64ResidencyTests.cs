@@ -118,7 +118,7 @@ public class GpuFloat64ResidencyTests
         foreach (var operation in new[]
                  {
                      GpuPrecisionOperation.Add, GpuPrecisionOperation.Subtract, GpuPrecisionOperation.Multiply,
-                     GpuPrecisionOperation.Divide,
+                     GpuPrecisionOperation.Divide, GpuPrecisionOperation.MatMul,
                  })
         {
             var plan = GpuPrecisionPlanner.CreatePlan<double>(backend, operation, "probe");
@@ -130,8 +130,9 @@ public class GpuFloat64ResidencyTests
         // No double kernel exists for these, so the default (preserving) policy must keep them exact on the CPU.
         foreach (var operation in new[]
                  {
-                     GpuPrecisionOperation.Elementwise, GpuPrecisionOperation.Relu, GpuPrecisionOperation.MatMul,
-                     GpuPrecisionOperation.Convolution, GpuPrecisionOperation.Reduction, GpuPrecisionOperation.General,
+                     GpuPrecisionOperation.Elementwise, GpuPrecisionOperation.Relu, GpuPrecisionOperation.BatchMatMul,
+                     GpuPrecisionOperation.MatMulTransposed, GpuPrecisionOperation.Convolution,
+                     GpuPrecisionOperation.Reduction, GpuPrecisionOperation.General,
                  })
             Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionPlanner.CreatePlan<double>(backend, operation, "probe").Route);
 
@@ -428,6 +429,208 @@ public class GpuFloat64ResidencyTests
         finally
         {
             gpu.UnregisterPersistentTensor(x);
+        }
+    }
+
+    // --- Matrix multiply -------------------------------------------------------------------------------------------
+
+    private static double[] HostMatMul(double[] a, double[] b, int m, int n, int k)
+    {
+        var c = new double[m * n];
+        for (int i = 0; i < m; i++)
+            for (int p = 0; p < k; p++)
+            {
+                double x = a[i * k + p];
+                for (int j = 0; j < n; j++) c[i * n + j] += x * b[p * n + j];
+            }
+
+        return c;
+    }
+
+    // The device accumulates in another order (and may fuse the multiply-add), so the products agree to rounding of
+    // the sum of magnitudes, not bit for bit.
+    private static void AssertProductClose(double[] a, double[] b, int m, int n, int k, ReadOnlySpan<double> actual)
+    {
+        var expected = HostMatMul(a, b, m, n, k);
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double magnitude = 0.0;
+                for (int p = 0; p < k; p++) magnitude += Math.Abs(a[i * k + p] * b[p * n + j]);
+                double bound = 4.0 * k * 2.220446049250313e-16 * magnitude + 1e-300;
+                Assert.True(Math.Abs(expected[i * n + j] - actual[i * n + j]) <= bound,
+                    $"[{i},{j}] of {m}x{n} (k={k}): host {expected[i * n + j]:R}, device {actual[i * n + j]:R}, bound {bound:E2}.");
+            }
+    }
+
+    [SkippableTheory]
+    [InlineData(1, 1, 1)]
+    [InlineData(3, 5, 7)]
+    [InlineData(33, 65, 17)]
+    [InlineData(100, 257, 64)]
+    [InlineData(64, 1, 300)]
+    [InlineData(1, 300, 64)]
+    public void MatrixMultiplyKernel_AgreesWithTheHost_ToDoubleRounding(int m, int n, int k)
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var backend = device.Value.Backend;
+        Skip.If(backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true }, "No double matrix multiply on this device.");
+        var multiply = (IGpuFloat64MatrixMultiply)backend;
+        var left = Values(m * k, 50);
+        var right = Values(k * n, 51);
+        using var a = backend.AllocateBuffer(m * k, GpuElementType.Float64);
+        using var b = backend.AllocateBuffer(k * n, GpuElementType.Float64);
+        using var c = backend.AllocateBuffer(m * n, GpuElementType.Float64);
+        backend.UploadBuffer<double>(a, left);
+        backend.UploadBuffer<double>(b, right);
+        multiply.MatrixMultiplyFloat64(a, b, c, m, n, k);
+        var actual = new double[m * n];
+        backend.DownloadBuffer<double>(c, actual);
+        AssertProductClose(left, right, m, n, k, actual);
+    }
+
+    [SkippableFact]
+    public void MatrixMultiplyKernel_KeepsThePrecisionAFloatMultiplyLoses_AndRefusesBadOperands()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var backend = device.Value.Backend;
+        Skip.If(backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true }, "No double matrix multiply on this device.");
+        var multiply = (IGpuFloat64MatrixMultiply)backend;
+        // (1 + 2^-40)^2 = 1 + 2^-39 + 2^-80: the 2^-39 term is far below float's resolution and exact in double.
+        double value = 1.0 + Math.Pow(2.0, -40);
+        using var a = backend.AllocateBuffer(1, GpuElementType.Float64);
+        using var c = backend.AllocateBuffer(1, GpuElementType.Float64);
+        using var floats = backend.AllocateBuffer(4);
+        backend.UploadBuffer<double>(a, new[] { value });
+        using var b = backend.AllocateBuffer(1, GpuElementType.Float64);
+        backend.UploadBuffer<double>(b, new[] { value });
+        multiply.MatrixMultiplyFloat64(a, b, c, 1, 1, 1);
+        var product = new double[1];
+        backend.DownloadBuffer<double>(c, product);
+        Assert.Equal(value * value, product[0]);
+        Assert.NotEqual(1.0, product[0]);
+
+        Assert.Throws<ArgumentException>(() => multiply.MatrixMultiplyFloat64(floats, b, c, 1, 1, 1));
+        Assert.Throws<ArgumentException>(() => multiply.MatrixMultiplyFloat64(a, b, a, 1, 1, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => multiply.MatrixMultiplyFloat64(a, b, c, 2, 1, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => multiply.MatrixMultiplyFloat64(a, b, c, 0, 1, 1));
+    }
+
+    [SkippableFact]
+    public void TensorMatMul_OnTheDevice_LeavesTheProductThere_ForRank2_AndLeadingBatchDimensions()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpuEngine = device.Value.Engine;
+        Skip.If(device.Value.Backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true }, "No double matrix multiply on this device.");
+        var gpu = (IEngine)gpuEngine;
+        bool? saved = DirectGpuTensorEngine.Float64MatMulForceDevice;
+        try
+        {
+            DirectGpuTensorEngine.Float64MatMulForceDevice = true;
+            int m = 37, k = 29, n = 41;
+            var left = Values(m * k, 60);
+            var right = Values(k * n, 61);
+            var a = new Tensor<double>(left, new[] { m, k });
+            var b = new Tensor<double>(right, new[] { k, n });
+            long readbacksBefore = GpuLaunchProbe.Readbacks;
+            var product = gpu.TensorMatMul(a, b);
+            Assert.True(gpuEngine.IsFloat64Resident(product), "The product is not resident on the device.");
+            Assert.Equal(readbacksBefore, GpuLaunchProbe.Readbacks);
+            Assert.Equal(new[] { m, n }, product.Shape.ToArray());
+            AssertProductClose(left, right, m, n, k, product.AsSpan());
+
+            // [2, 3, k] x [k, n]: the leading dimensions are rows of one multiply.
+            var batchedLeft = Values(2 * 3 * k, 62);
+            var batched = new Tensor<double>(batchedLeft, new[] { 2, 3, k });
+            var batchedProduct = gpu.TensorMatMul(batched, b);
+            Assert.True(gpuEngine.IsFloat64Resident(batchedProduct));
+            Assert.Equal(new[] { 2, 3, n }, batchedProduct.Shape.ToArray());
+            AssertProductClose(batchedLeft, right, 6, n, k, batchedProduct.AsSpan());
+
+            Assert.Throws<ArgumentException>(() => gpu.TensorMatMul(a, a));
+        }
+        finally
+        {
+            DirectGpuTensorEngine.Float64MatMulForceDevice = saved;
+        }
+    }
+
+    [SkippableFact]
+    public void TensorMatMul_ChoosesARouteByMeasuring_AndIsCorrectOnEither()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpuEngine = device.Value.Engine;
+        var gpu = (IEngine)gpuEngine;
+        bool? saved = DirectGpuTensorEngine.Float64MatMulForceDevice;
+        try
+        {
+            DirectGpuTensorEngine.Float64MatMulForceDevice = null;
+            // Below the floor: the CPU engine, no measurement.
+            var small = new Tensor<double>(Values(16 * 16, 70), new[] { 16, 16 });
+            Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorMatMul(small, small)));
+
+            // Above it the first call of the size class measures both routes and every later call uses the winner:
+            // which one is this machine's business, the product is not.
+            int size = 336; // 336^3 is just over 2^25
+            Assert.True((long)size * size * size >= DirectGpuTensorEngine.Float64MatMulMinWork);
+            var left = Values(size * size, 71);
+            var right = Values(size * size, 72);
+            var a = new Tensor<double>(left, new[] { size, size });
+            var b = new Tensor<double>(right, new[] { size, size });
+            var first = gpu.TensorMatMul(a, b);
+            var second = gpu.TensorMatMul(a, b);
+            Assert.Equal(gpuEngine.IsFloat64Resident(first), gpuEngine.IsFloat64Resident(second));
+            AssertProductClose(left, right, size, size, size, first.AsSpan());
+            AssertProductClose(left, right, size, size, size, second.AsSpan());
+
+            DirectGpuTensorEngine.Float64MatMulForceDevice = false;
+            Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorMatMul(a, b)));
+        }
+        finally
+        {
+            DirectGpuTensorEngine.Float64MatMulForceDevice = saved;
+        }
+    }
+
+    [SkippableFact]
+    public void TensorMatMul_RecordsItsGradient_WhenTheProductIsOnTheDevice()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        Skip.If(device.Value.Backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true }, "No double matrix multiply on this device.");
+        var gpu = (IEngine)device.Value.Engine;
+        var cpu = (IEngine)new CpuEngine();
+        bool? saved = DirectGpuTensorEngine.Float64MatMulForceDevice;
+        try
+        {
+            DirectGpuTensorEngine.Float64MatMulForceDevice = true;
+            int m = 9, k = 7, n = 5;
+            var a = new Tensor<double>(Values(m * k, 80), new[] { m, k });
+            var b = new Tensor<double>(Values(k * n, 81), new[] { k, n });
+
+            Tensor<double> Gradient(IEngine engine)
+            {
+                using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<double>();
+                var product = engine.TensorMatMul(a, b);
+                var loss = engine.ReduceSum(product, null);
+                return tape.ComputeGradients(loss, new[] { a })[a];
+            }
+
+            var expected = Gradient(cpu).AsSpan();
+            var actual = Gradient(gpu).AsSpan();
+            Assert.Equal(expected.Length, actual.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-12 * (1.0 + Math.Abs(expected[i])),
+                    $"Gradient {i}: cpu {expected[i]:R}, device route {actual[i]:R}.");
+        }
+        finally
+        {
+            DirectGpuTensorEngine.Float64MatMulForceDevice = saved;
         }
     }
 }

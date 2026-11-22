@@ -800,3 +800,12 @@ AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.BinaryFloat64(AiDotNet.T
 AiDotNet.Tensors.Engines.Gpu.GpuPrecisionOperation.Subtract = 10 -> AiDotNet.Tensors.Engines.Gpu.GpuPrecisionOperation
 AiDotNet.Tensors.Engines.Gpu.GpuPrecisionOperation.Multiply = 11 -> AiDotNet.Tensors.Engines.Gpu.GpuPrecisionOperation
 AiDotNet.Tensors.Engines.Gpu.GpuPrecisionOperation.Divide = 12 -> AiDotNet.Tensors.Engines.Gpu.GpuPrecisionOperation
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.MatrixMultiplyFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! c, int m, int n, int k) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SupportsFloat64MatrixMultiply.get -> bool
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.MatrixMultiplyFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! c, int m, int n, int k) -> void
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SupportsFloat64MatrixMultiply.get -> bool
+AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64MatrixMultiply
+AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64MatrixMultiply.MatrixMultiplyFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! c, int m, int n, int k) -> void
+AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64MatrixMultiply.SupportsFloat64MatrixMultiply.get -> bool
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.MatrixMultiplyFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! c, int m, int n, int k) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.SupportsFloat64MatrixMultiply.get -> bool

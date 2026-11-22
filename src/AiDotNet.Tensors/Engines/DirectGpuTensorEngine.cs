@@ -25824,6 +25824,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return base.TensorMatMul(a, b);
             }
 
+            if (ndPlan.InputStorage == Gpu.GpuScalarType.Float64)
+            {
+                // Double operands: the double routine over double buffers, or the CPU engine. Never the float path.
+                int leadingRows = 1;
+                for (int d = 0; d < a.Rank - 1; d++) leadingRows *= a.Shape._dims[d];
+                int[] doubleShape = (int[])a.Shape._dims.Clone();
+                doubleShape[a.Rank - 1] = b.Shape._dims[1];
+                if (TryMatMulFloat64(backend, a, b, leadingRows, b.Shape._dims[1], b.Shape._dims[0], doubleShape) is { } ndDoubles)
+                {
+                    Gpu.GpuPrecisionDiagnostics.Publish(ndPlan);
+                    Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", ndDoubles, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                    return ndDoubles;
+                }
+
+                return base.TensorMatMul(a, b);
+            }
+
             try
             {
                 int Kc = a.Shape._dims[a.Rank - 1];
@@ -25923,6 +25940,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (rank2Plan.Route == Gpu.GpuExecutionRoute.Cpu)
         {
             Gpu.GpuPrecisionDiagnostics.Publish(rank2Plan);
+            return base.TensorMatMul(a, b);
+        }
+
+        if (rank2Plan.InputStorage == Gpu.GpuScalarType.Float64)
+        {
+            // Double operands: the double routine over double buffers, or the CPU engine (which also reports a shape
+            // mismatch). Never the float path below.
+            if (a.Shape._dims[1] == b.Shape._dims[0]
+                && TryMatMulFloat64(backend, a, b, a.Shape._dims[0], b.Shape._dims[1], a.Shape._dims[1],
+                    new[] { a.Shape._dims[0], b.Shape._dims[1] }) is { } rank2Doubles)
+            {
+                Gpu.GpuPrecisionDiagnostics.Publish(rank2Plan);
+                Autodiff.DifferentiableOps.RecordBinary("TensorMatMul", rank2Doubles, a, b, Autodiff.BackwardFunctions<T>.MatMulBackward);
+                return rank2Doubles;
+            }
+
             return base.TensorMatMul(a, b);
         }
 

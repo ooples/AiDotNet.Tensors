@@ -165,6 +165,111 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// The least work (m x n x k) at which a double matrix multiply is considered for the device at all. Below it the
+    /// launch alone costs more than the CPU engine's multiply (measured: 256 cubed takes 0.17 ms on the CPU engine and
+    /// 0.36 ms on an OpenCL device with the operands already resident).
+    /// </summary>
+    internal const long Float64MatMulMinWork = 1L << 25;
+
+    /// <summary>Test override: true sends every eligible double matrix multiply to the device, false to the CPU.</summary>
+    internal static bool? Float64MatMulForceDevice;
+
+    // Whether the device won, per (log2 of the work, operands need uploading). Above the floor neither side wins
+    // everywhere: a tuned many-core CPU multiply beats a mid-range GPU's double kernel (measured here: 56 ms against
+    // 110 ms at 2048 cubed) while a vendor dgemm on a workstation GPU beats the CPU several times over. So the first
+    // multiply of each size class runs both and the faster one is used from then on.
+    private readonly Dictionary<(int WorkLog2, bool Uploads), bool> _float64MatMulDeviceWins = new();
+
+    /// <summary>
+    /// <c>a · b</c> for double operands, computed by whichever of the device and the CPU engine is faster for this size
+    /// class. A device product stays on the device. Null when there is no double routine for these operands (the caller
+    /// then takes the CPU engine).
+    /// </summary>
+    private Tensor<T>? TryMatMulFloat64<T>(IDirectGpuBackend backend, Tensor<T> a, Tensor<T> b, int m, int n, int k, int[] shape)
+    {
+        if (a is not Tensor<double> left || b is not Tensor<double> right) return null;
+        if (ResidentStepActive || !IsGpuPrecisionSafe(a, b)) return null;
+        if (backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true } multiply) return null;
+        if (!backend.SupportsElementType(GpuElementType.Float64)) return null;
+        if (m <= 0 || n <= 0 || k <= 0 || left.Length != (long)m * k || right.Length != (long)k * n) return null;
+        long work = (long)m * n * k;
+        long productLength = (long)m * n;
+        if (productLength > int.MaxValue) return null;
+        if (Float64MatMulForceDevice == false || (Float64MatMulForceDevice is null && work < Float64MatMulMinWork)) return null;
+        try
+        {
+            lock (_float64Lock)
+            {
+                CountFloat64Transfers(left, out int uploads, out _);
+                if (!ReferenceEquals(left, right))
+                {
+                    CountFloat64Transfers(right, out int rightUploads, out _);
+                    uploads += rightUploads;
+                }
+
+                if (Float64MatMulForceDevice == true)
+                    return (Tensor<T>)(object)MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
+
+                int workLog2 = 0;
+                for (long remaining = work; remaining > 1; remaining >>= 1) workLog2++;
+                var sizeClass = (workLog2, uploads > 0);
+                if (_float64MatMulDeviceWins.TryGetValue(sizeClass, out bool deviceWins))
+                    return deviceWins ? (Tensor<T>)(object)MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape) : null;
+
+                // First multiply of this size class: run both, twice each (the first run of either pays one-time
+                // costs), and keep the faster. Its product is returned, so nothing is computed a third time.
+                var clock = new System.Diagnostics.Stopwatch();
+                Tensor<double> deviceProduct = MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
+                backend.Synchronize();
+                clock.Restart();
+                deviceProduct = MatMulFloat64OnDevice(backend, multiply, left, right, m, n, k, shape);
+                backend.Synchronize();
+                long deviceTicks = clock.ElapsedTicks;
+
+                Tensor<double> hostProduct;
+                long hostTicks;
+                // Not recorded: the caller records the one product it returns.
+                using (Autodiff.GradientTape<double>.NoGrad())
+                {
+                    hostProduct = base.TensorMatMul(left, right);
+                    clock.Restart();
+                    hostProduct = base.TensorMatMul(left, right);
+                    hostTicks = clock.ElapsedTicks;
+                }
+
+                deviceWins = deviceTicks < hostTicks;
+                _float64MatMulDeviceWins[sizeClass] = deviceWins;
+                return (Tensor<T>)(object)(deviceWins ? deviceProduct : hostProduct);
+            }
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            GpuLaunchProbe.OnFallback("TensorMatMulFloat64", capabilityGap);
+            return null;
+        }
+    }
+
+    // Callers hold _float64Lock.
+    private Tensor<double> MatMulFloat64OnDevice(IDirectGpuBackend backend, IGpuFloat64MatrixMultiply multiply,
+        Tensor<double> left, Tensor<double> right, int m, int n, int k, int[] shape)
+    {
+        using var operandA = ResolveFloat64Operand(backend, left);
+        using var operandB = ReferenceEquals(left, right) ? new OwnedBuffer(operandA.Buffer, ownsBuffer: false) : ResolveFloat64Operand(backend, right);
+        var output = RentFloat64Buffer(backend, m * n, left, right);
+        try
+        {
+            multiply.MatrixMultiplyFloat64(operandA.Buffer, operandB.Buffer, output, m, n, k);
+        }
+        catch
+        {
+            output.Dispose();
+            throw;
+        }
+
+        return RegisterFloat64Result(backend, output, m * n, shape);
+    }
+
     /// <summary>The sum of a double tensor computed on the device, when that is the cheaper route.</summary>
     private bool TrySumFloat64Tensor(Tensor<double> tensor, out double sum)
     {

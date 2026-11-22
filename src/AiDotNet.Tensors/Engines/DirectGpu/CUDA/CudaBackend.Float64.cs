@@ -5,7 +5,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise
+public sealed partial class CudaBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply
 {
     private const int Float64ReductionBlock = 256;
 
@@ -62,6 +62,28 @@ public sealed partial class CudaBackend : IGpuFloat64Reductions, IGpuFloat64Elem
         args[2] = &outputPtr;
         args[3] = &n;
         LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsFloat64MatrixMultiply => IsAvailable && SupportsFloat64Reductions;
+
+    /// <inheritdoc/>
+    public void MatrixMultiplyFloat64(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+    {
+        if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), m, "Matrix dimensions must be positive.");
+        if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), n, "Matrix dimensions must be positive.");
+        if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), k, "Matrix dimensions must be positive.");
+        CheckFloat64Operand(a, checked(m * k), nameof(a));
+        CheckFloat64Operand(b, checked(k * n), nameof(b));
+        CheckFloat64Operand(c, checked(m * n), nameof(c));
+        if (ReferenceEquals(c, a) || ReferenceEquals(c, b))
+            throw new ArgumentException("The product buffer must not be one of the operands.", nameof(c));
+        using var _ = PushContext();
+        double alpha = 1.0;
+        double beta = 0.0;
+        // The BLAS is column-major: for row-major operands compute C^T = B^T * A^T, which swaps the operands and M/N.
+        BlasDgemm(CublasOperation.None, CublasOperation.None, n, m, k, ref alpha, b.Handle, n, a.Handle, k, ref beta,
+            c.Handle, n, "cublasDgemm");
     }
 
     private void CheckFloat64Operand(IGpuBuffer buffer, int size, string name)

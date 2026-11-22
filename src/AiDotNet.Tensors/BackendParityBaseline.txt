@@ -20,3 +20,6 @@ capability IRowConcatBackend WebGpuBackend #1749
 capability IGpuFloat64Elementwise MetalBackend #1799
 capability IGpuFloat64Elementwise VulkanBackend #1799
 capability IGpuFloat64Elementwise WebGpuBackend #1799
+capability IGpuFloat64MatrixMultiply MetalBackend #1799
+capability IGpuFloat64MatrixMultiply VulkanBackend #1799
+capability IGpuFloat64MatrixMultiply WebGpuBackend #1799

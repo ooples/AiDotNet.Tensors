@@ -802,11 +802,13 @@ void XgemmDirectTT(const int kSizeM, const int kSizeN, const int kSizeK,
 // End of the C++11 raw string literal
 """;
 
-        public static string BuildSource(ClBlastXgemmDirectParameters parameters)
+        /// <param name="parameters">The tuned kernel parameters.</param>
+        /// <param name="doublePrecision">Builds the kernels over <c>double</c> (needs fp64) instead of <c>float</c>.</param>
+        public static string BuildSource(ClBlastXgemmDirectParameters parameters, bool doublePrecision = false)
         {
             var sb = new StringBuilder();
             sb.AppendLine("// CLBlast XGEMM direct kernel (Apache 2.0)");
-            sb.AppendLine("#define PRECISION 32");
+            sb.AppendLine(doublePrecision ? "#define PRECISION 64" : "#define PRECISION 32");
             sb.AppendLine($"#define WGD {parameters.Wgd}");
             sb.AppendLine($"#define MDIMCD {parameters.MdimCd}");
             sb.AppendLine($"#define NDIMCD {parameters.NdimCd}");
