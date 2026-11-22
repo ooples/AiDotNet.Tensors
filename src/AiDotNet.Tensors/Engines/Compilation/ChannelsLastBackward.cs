@@ -129,6 +129,6 @@ internal static class ChannelsLastBackward
         }
         if (gradZ is not null) slot.Convolution.Backward(gpu, gradZ, inputs[0], inputs[1], slot, engine, grads);
         if (DifferentiableOps.IsGradientRequired(inputs[2]))
-            DifferentiableOps.AccumulateGrad(grads, inputs[2], new Tensor<float>((int[])inputs[2]._shape.Clone()), engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], engine.TensorZerosLike(inputs[2]), engine);
     }
 }

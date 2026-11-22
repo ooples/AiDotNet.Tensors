@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading;
 using System.Collections.Generic;
 
@@ -414,8 +415,15 @@ public sealed partial class CudaBackend
         var inner = ex;
         while (inner is AggregateException { InnerException: { } aggInner }) inner = aggInner;
         while (inner is System.Reflection.TargetInvocationException { InnerException: { } tieInner }) inner = tieInner;
-        return "the captured step body threw " + inner.GetType().Name + ": " + inner.Message;
+        string description = "the captured step body threw " + inner.GetType().Name + ": " + inner.Message;
+        // The plan's diagnostics promise that AIDOTNET_GRAPH_CAPTURE_DEBUG=1 names the op: the throwing frames do.
+        if (s_captureDebug && inner.StackTrace is { } stack)
+            description += " at " + string.Join(" <- ", stack.Split('\n')
+                .Select(frame => frame.Trim()).Where(frame => frame.StartsWith("at AiDotNet", StringComparison.Ordinal))
+                .Take(12).Select(frame => frame.Substring(3).Split(new[] { " in " }, StringSplitOptions.None)[0]));
+        return description;
     }
+
 
     private IntPtr CaptureGraphOnCurrentStream(Action launch)
     {
