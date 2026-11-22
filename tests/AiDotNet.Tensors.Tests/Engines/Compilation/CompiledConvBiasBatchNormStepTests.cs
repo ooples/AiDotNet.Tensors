@@ -72,7 +72,8 @@ public class CompiledConvBiasBatchNormStepTests : IDisposable
         _ => engine.TensorReLU6(h),
     };
 
-    private static Run Train(IEngine engine, bool onDevice, int batch, int size, int activation)
+    private static Run Train(IEngine engine, bool onDevice, int batch, int size, int activation,
+        AiDotNet.Tensors.Engines.Gpu.PrecisionMode? autocast = null, int steps = Steps)
     {
         AiDotNetEngine.Current = engine;
         var x = Rand([batch, Channels, size, size], 1, 1f);
@@ -109,10 +110,11 @@ public class CompiledConvBiasBatchNormStepTests : IDisposable
         }
 
         using (plan)
+        using (autocast is { } precision ? new AiDotNet.Tensors.Engines.Gpu.AutocastScope(precision) : null)
         {
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.05f);
-            var run = new Run { Losses = new double[Steps] };
-            for (int s = 0; s < Steps; s++)
+            var run = new Run { Losses = new double[steps] };
+            for (int s = 0; s < steps; s++)
             {
                 Rand(x.Shape.ToArray(), 100 + s, 1f).AsSpan().CopyTo(x.AsWritableSpan());
                 Rand(y.Shape.ToArray(), 200 + s, 1f).AsSpan().CopyTo(y.AsWritableSpan());
@@ -124,9 +126,9 @@ public class CompiledConvBiasBatchNormStepTests : IDisposable
             run.RunningMean = runningMean.ToArray();
             if (plan is CompiledTrainingPlan<float> concrete)
             {
-                var steps = (CompiledStep<float>[]?)typeof(CompiledTrainingPlan<float>)
+                var forwardSteps = (CompiledStep<float>[]?)typeof(CompiledTrainingPlan<float>)
                     .GetField("_forwardSteps", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(concrete);
-                run.StepNames = steps?.Select(s => s.OpName).ToArray() ?? Array.Empty<string>();
+                run.StepNames = forwardSteps?.Select(s => s.OpName).ToArray() ?? Array.Empty<string>();
             }
             return run;
         }
@@ -231,6 +233,29 @@ public class CompiledConvBiasBatchNormStepTests : IDisposable
             // The exact gradient of a bias a training BatchNorm cancels is zero: SGD leaves it where it started.
             Assert.Equal(Rand([Channels], 5, 0.5f).ToArray(), fused.Biases[0]);
             Assert.Equal(Rand([Channels], 6, 0.5f).ToArray(), fused.Biases[1]);
+        }
+    }
+
+    // Under BF16 autocast the fused node's backward runs the NCHW path, where the absorbed bias's zero gradient was a
+    // fresh host tensor: its first-write copy uploaded it inside stream capture (CUDA 900), so the step never captured
+    // and the DCGAN step ran eagerly. The zero must be made on the device and the step must replay as a graph.
+    [SkippableFact]
+    public void A_bfloat16_autocast_plan_with_the_fused_conv_bias_batchnorm_captures_its_step()
+    {
+        var gpu = TryGpu();
+        Skip.If(gpu is null, "GPU backend did not resolve.");
+        if (gpu is null) return;
+        using (gpu)
+        {
+            long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
+            var run = Train(gpu, onDevice: true, batch: 4, size: 8, activation: 1,
+                AiDotNet.Tensors.Engines.Gpu.PrecisionMode.BFloat16, steps: 12);
+            Assert.Equal(2, run.StepNames.Count(n => n == "ConvBiasBatchNorm"));
+            Assert.All(run.Losses, loss => Assert.True(double.IsFinite(loss), $"loss {loss}"));
+            Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore,
+                "the BF16 step never replayed as a captured graph (AIDOTNET_GRAPHSTEP_DIAG=1 says why)");
+            Assert.Equal(Rand([Channels], 5, 0.5f).ToArray(), run.Biases[0]);
+            Assert.Equal(Rand([Channels], 6, 0.5f).ToArray(), run.Biases[1]);
         }
     }
 }
