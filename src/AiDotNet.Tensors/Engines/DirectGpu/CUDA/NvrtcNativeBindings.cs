@@ -52,9 +52,18 @@ internal static class NvrtcNativeBindings
         {
             if (_availabilityChecked)
                 return;
-            EnsureCudaOnPath();
-            _api = ResolveApi();
-            _availabilityChecked = true;
+            try
+            {
+                // PATH discovery is best-effort: an I/O error or an over-long PATH must not escape, or every later
+                // IsAvailable call would re-run the probe and rethrow (a skip would turn into a test error).
+                try { EnsureCudaOnPath(); } catch (Exception) { /* fall through to the probe */ }
+                _api = ResolveApi();
+            }
+            finally
+            {
+                // Set last, and even when the probe throws, so the result is computed exactly once.
+                _availabilityChecked = true;
+            }
         }
     }
 

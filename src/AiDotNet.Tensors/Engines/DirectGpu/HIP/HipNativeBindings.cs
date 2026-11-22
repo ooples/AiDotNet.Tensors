@@ -334,39 +334,42 @@ internal static class HipNativeBindings
     {
         get
         {
-            if (!_availabilityChecked)
+            if (_availabilityChecked)
+                return _isAvailable;
             lock (_availabilityLock)
-            if (!_availabilityChecked)
             {
-                // Initialize DLL search path before any P/Invoke calls
-                InitializeDllSearchPath();
+                if (!_availabilityChecked)
+                {
+                    // Initialize DLL search path before any P/Invoke calls
+                    InitializeDllSearchPath();
 
-                try
-                {
-                    int count = 0;
-                    var result = hipGetDeviceCount(ref count);
-                    _isAvailable = result == HipError.Success && count > 0;
-                    LogDiagnostic($"[HIP Diagnostics] hipGetDeviceCount returned: {result}, device count: {count}, available: {_isAvailable}");
+                    try
+                    {
+                        int count = 0;
+                        var result = hipGetDeviceCount(ref count);
+                        _isAvailable = result == HipError.Success && count > 0;
+                        LogDiagnostic($"[HIP Diagnostics] hipGetDeviceCount returned: {result}, device count: {count}, available: {_isAvailable}");
+                    }
+                    catch (DllNotFoundException ex)
+                    {
+                        LogDiagnostic($"[HIP Diagnostics] DllNotFoundException: {ex.Message}");
+                        LogDiagnostic("[HIP Diagnostics] amdhip64.dll not found. AMD HIP SDK is not installed.");
+                        LogDiagnostic("[HIP Diagnostics] To use HIP, install AMD ROCm/HIP SDK from https://rocm.docs.amd.com/");
+                        _isAvailable = false;
+                    }
+                    catch (EntryPointNotFoundException ex)
+                    {
+                        LogDiagnostic($"[HIP Diagnostics] EntryPointNotFoundException: {ex.Message}");
+                        LogDiagnostic("[HIP Diagnostics] HIP DLL found but missing expected function. SDK version mismatch?");
+                        _isAvailable = false;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogDiagnostic($"[HIP Diagnostics] Exception during availability check: {ex.GetType().Name}: {ex.Message}");
+                        _isAvailable = false;
+                    }
+                    _availabilityChecked = true;
                 }
-                catch (DllNotFoundException ex)
-                {
-                    LogDiagnostic($"[HIP Diagnostics] DllNotFoundException: {ex.Message}");
-                    LogDiagnostic("[HIP Diagnostics] amdhip64.dll not found. AMD HIP SDK is not installed.");
-                    LogDiagnostic("[HIP Diagnostics] To use HIP, install AMD ROCm/HIP SDK from https://rocm.docs.amd.com/");
-                    _isAvailable = false;
-                }
-                catch (EntryPointNotFoundException ex)
-                {
-                    LogDiagnostic($"[HIP Diagnostics] EntryPointNotFoundException: {ex.Message}");
-                    LogDiagnostic("[HIP Diagnostics] HIP DLL found but missing expected function. SDK version mismatch?");
-                    _isAvailable = false;
-                }
-                catch (Exception ex)
-                {
-                    LogDiagnostic($"[HIP Diagnostics] Exception during availability check: {ex.GetType().Name}: {ex.Message}");
-                    _isAvailable = false;
-                }
-                _availabilityChecked = true;
             }
             return _isAvailable;
         }
