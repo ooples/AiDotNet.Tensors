@@ -161,18 +161,20 @@ public partial class DirectGpuTensorEngine
     /// The 16-bit route for a convolution under the current autocast scope, or false to keep FP32. Read when the op is
     /// issued (not inside a deferred launch), so a launch that runs later still uses the precision of its scope.
     /// </summary>
-    private static bool TryResolveAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route)
+    private static bool TryResolveAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route,
+        string operation = "Conv2D")
         // Inside a backward that replays a recorded precision, a forward convolution it issues (the input gradient,
         // or any convolution of a create-graph backward) runs in that precision too, not the scope open now.
         => t_backwardConvPrecisionOverride is not null
-            ? TryResolveBackwardAutocastConvRoute(backend, out route)
-            : TryResolveAmbientAutocastConvRoute(backend, out route);
+            ? TryResolveBackwardAutocastConvRoute(backend, out route, operation)
+            : TryResolveAmbientAutocastConvRoute(backend, out route, operation);
 
-    private static bool TryResolveAmbientAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route)
+    private static bool TryResolveAmbientAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route,
+        string operation = "Conv2D")
     {
         route = default;
         if (!(AutocastConvOverride ?? s_autocastConvEnabled)) return false;
-        if (!AutocastScope.ShouldAutocast("Conv2D")) return false;
+        if (!AutocastScope.ShouldAutocast(operation)) return false;
         // An explicit PreserveInputType policy keeps every op in its input type, as GpuPrecisionPlanner does for the
         // other autocast ops.
         if (GpuExecutionPolicyScope.EffectivePolicyFor(typeof(float)).AccuracyMode == GpuAccuracyMode.PreserveInputType)
@@ -196,7 +198,8 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    private static bool TryResolveBackwardAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route)
+    private static bool TryResolveBackwardAutocastConvRoute(IDirectGpuBackend backend, out AutocastConvRoute route,
+        string operation = "Conv2D")
     {
         if (t_backwardConvPrecisionOverride is { } recorded)
         {
@@ -210,7 +213,7 @@ public partial class DirectGpuTensorEngine
             route = recorded.Route;
             return true;
         }
-        return TryResolveAmbientAutocastConvRoute(backend, out route);
+        return TryResolveAmbientAutocastConvRoute(backend, out route, operation);
     }
 
     // Floats of scratch that hold `elements` 16-bit values.
@@ -267,13 +270,18 @@ public partial class DirectGpuTensorEngine
             input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
             kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
             output16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
-            route.Convert.ConvertFloatToFftStorage(input, input16.Buffer, inputCount, route.Storage);
-            route.Convert.ConvertFloatToFftStorage(kernel, kernel16.Buffer, kernelCount, route.Storage);
-            ThrowIfAutocastConvFaultInjected();
-            route.Conv.Conv2DMixed(input16.Buffer, kernel16.Buffer, output16.Buffer,
-                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, route.DataType);
-            route.Convert.ConvertFftStorageToFloat(output16.Buffer, output, outputCount, route.Storage);
+            if (!TryAutocastConvChannelsLast(route, 0, input, kernel, output, input16.Buffer, kernel16.Buffer,
+                    output16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH,
+                    kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            {
+                route.Convert.ConvertFloatToFftStorage(input, input16.Buffer, inputCount, route.Storage);
+                route.Convert.ConvertFloatToFftStorage(kernel, kernel16.Buffer, kernelCount, route.Storage);
+                ThrowIfAutocastConvFaultInjected();
+                route.Conv.Conv2DMixed(input16.Buffer, kernel16.Buffer, output16.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, route.DataType);
+                route.Convert.ConvertFftStorageToFloat(output16.Buffer, output, outputCount, route.Storage);
+            }
         }
         catch (Exception ex) when (IsAutocastConvDecline(ex) && DeclineAutocastConv("AutocastConv2DForward", ex))
         {
@@ -308,13 +316,18 @@ public partial class DirectGpuTensorEngine
             kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
             gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
             gradInput16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
-            route.Convert.ConvertFloatToFftStorage(kernel, kernel16.Buffer, kernelCount, route.Storage);
-            route.Convert.ConvertFloatToFftStorage(gradOutput, gradOutput16.Buffer, outputCount, route.Storage);
-            ThrowIfAutocastConvFaultInjected();
-            route.Conv.Conv2DBackwardDataMixed(kernel16.Buffer, gradOutput16.Buffer, gradInput16.Buffer,
-                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, route.DataType);
-            route.Convert.ConvertFftStorageToFloat(gradInput16.Buffer, gradInput, inputCount, route.Storage);
+            if (!TryAutocastConvChannelsLast(route, 1, kernel, gradOutput, gradInput, kernel16.Buffer,
+                    gradOutput16.Buffer, gradInput16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            {
+                route.Convert.ConvertFloatToFftStorage(kernel, kernel16.Buffer, kernelCount, route.Storage);
+                route.Convert.ConvertFloatToFftStorage(gradOutput, gradOutput16.Buffer, outputCount, route.Storage);
+                ThrowIfAutocastConvFaultInjected();
+                route.Conv.Conv2DBackwardDataMixed(kernel16.Buffer, gradOutput16.Buffer, gradInput16.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, route.DataType);
+                route.Convert.ConvertFftStorageToFloat(gradInput16.Buffer, gradInput, inputCount, route.Storage);
+            }
         }
         catch (Exception ex) when (IsAutocastConvDecline(ex) && DeclineAutocastConv("AutocastConv2DBackwardData", ex))
         {
@@ -348,13 +361,18 @@ public partial class DirectGpuTensorEngine
             input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
             gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
             gradKernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
-            route.Convert.ConvertFloatToFftStorage(input, input16.Buffer, inputCount, route.Storage);
-            route.Convert.ConvertFloatToFftStorage(gradOutput, gradOutput16.Buffer, outputCount, route.Storage);
-            ThrowIfAutocastConvFaultInjected();
-            route.Conv.Conv2DBackwardFilterMixed(input16.Buffer, gradOutput16.Buffer, gradKernel16.Buffer,
-                batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
-                kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, route.DataType);
-            route.Convert.ConvertFftStorageToFloat(gradKernel16.Buffer, gradKernel, kernelCount, route.Storage);
+            if (!TryAutocastConvChannelsLast(route, 2, input, gradOutput, gradKernel, input16.Buffer,
+                    gradOutput16.Buffer, gradKernel16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            {
+                route.Convert.ConvertFloatToFftStorage(input, input16.Buffer, inputCount, route.Storage);
+                route.Convert.ConvertFloatToFftStorage(gradOutput, gradOutput16.Buffer, outputCount, route.Storage);
+                ThrowIfAutocastConvFaultInjected();
+                route.Conv.Conv2DBackwardFilterMixed(input16.Buffer, gradOutput16.Buffer, gradKernel16.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
+                    kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW, route.DataType);
+                route.Convert.ConvertFftStorageToFloat(gradKernel16.Buffer, gradKernel, kernelCount, route.Storage);
+            }
         }
         catch (Exception ex) when (IsAutocastConvDecline(ex) && DeclineAutocastConv("AutocastConv2DBackwardFilter", ex))
         {
@@ -368,5 +386,102 @@ public partial class DirectGpuTensorEngine
         }
         Interlocked.Increment(ref _autocastConvBackwardFilterCount);
         return true;
+    }
+
+    // Shapes whose channels-last 16-bit convolution the backend declined (no kernel for that layout): later calls go
+    // straight to the NCHW route instead of converting their operands first.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<
+        ((int, int, int, int, int, int, int), (int, int, int, int, int, int, int), (int, int, int)), byte>
+        s_channelsLastAutocastDeclined = new();
+
+    /// <summary>
+    /// One autocast convolution pass staged channels-last (<see cref="IChannelsLastMixedConvBackend"/>): the FP32 NCHW
+    /// operands are narrowed into 16-bit NHWC scratch (filters [k, r, s, c]) in one pass each, the convolution runs on
+    /// the layout the backend's 16-bit kernels read natively, and the result is widened back into FP32 NCHW. Operands
+    /// follow the backend's pass convention (0: x, w -> y; 1: w, dy -> dx; 2: x, dy -> dw); the 16-bit scratch is the
+    /// NCHW route's. False when the backend does not stage channels-last or declined the shape; the NCHW route then
+    /// reconverts the operands into the same scratch.
+    /// </summary>
+    private static bool TryAutocastConvChannelsLast(in AutocastConvRoute route, int pass, IGpuBuffer a, IGpuBuffer b,
+        IGpuBuffer c, IGpuBuffer a16, IGpuBuffer b16, IGpuBuffer c16, int batch, int inChannels, int inHeight,
+        int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW,
+        int padH, int padW, int dilationH, int dilationW)
+    {
+        if (route.Conv is not IChannelsLastMixedConvBackend channelsLast
+            || !channelsLast.SupportsChannelsLastMixedConv(route.DataType))
+            return false;
+        var key = ((pass, batch, inChannels, inHeight, inWidth, outChannels, outHeight),
+            (outWidth, kernelH, kernelW, strideH, strideW, padH, padW), (dilationH, dilationW, (int)route.DataType));
+        if (s_channelsLastAutocastDeclined.ContainsKey(key)) return false;
+
+        // Each operand as [outer][channels][spatial]: an activation's outer extent is the batch, a filter's its k.
+        var x = (Outer: batch, Channels: inChannels, Spatial: inHeight * inWidth);
+        var w = (Outer: outChannels, Channels: inChannels, Spatial: kernelH * kernelW);
+        var y = (Outer: batch, Channels: outChannels, Spatial: outHeight * outWidth);
+        var (aShape, bShape, cShape) = pass switch
+        {
+            0 => (x, w, y),
+            1 => (w, y, x),
+            _ => (x, y, w),
+        };
+        var type = route.DataType;
+        channelsLast.NarrowToChannelsLast(a, a16, aShape.Outer, aShape.Channels, aShape.Spatial, type);
+        channelsLast.NarrowToChannelsLast(b, b16, bShape.Outer, bShape.Channels, bShape.Spatial, type);
+        ThrowIfAutocastConvFaultInjected();
+        if (!channelsLast.TryConv2DMixedChannelsLast(pass, a16, b16, c16, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW,
+                type, out bool shapeUnsupported))
+        {
+            if (shapeUnsupported) s_channelsLastAutocastDeclined.TryAdd(key, 0);
+            return false;
+        }
+        channelsLast.WidenFromChannelsLast(c16, c, cShape.Outer, cShape.Channels, cShape.Spatial, type);
+        return true;
+    }
+
+    // A transposed convolution x [n, ci, h, w] -> y [n, co, oh, ow] with kernel [ci, co, kh, kw] is the data gradient of
+    // the convolution y -> x whose filter is that kernel read as [k = ci, c = co, kh, kw]. Its three passes are that
+    // convolution's with the roles swapped: forward = the convolution's data gradient, input gradient = the
+    // convolution's forward, kernel gradient = the convolution's filter gradient with input and output gradient
+    // exchanged. The output padding is implicit in oh / ow (cuDNN reads the extents it is given).
+
+    /// <summary>y = conv_transpose(x, W) in the autocast precision, written as FP32 into <paramref name="output"/>.</summary>
+    private bool TryAutocastConvTranspose2DForward(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer kernel,
+        IGpuBuffer output, int batch, int inChannels, int inHeight, int inWidth, int outChannels, int outHeight,
+        int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW,
+        out AutocastConvRoute executedRoute)
+    {
+        executedRoute = default;
+        if (!TryResolveAutocastConvRoute(backend, out var route, "ConvTranspose2D")) return false;
+        if (!TryAutocastConv2DBackwardData(backend, route, kernel, gradOutput: input, gradInput: output, batch,
+                inChannels: outChannels, inHeight: outHeight, inWidth: outWidth, outChannels: inChannels,
+                outHeight: inHeight, outWidth: inWidth, kernelH, kernelW, strideH, strideW, padH, padW, 1, 1))
+            return false;
+        executedRoute = route;
+        return true;
+    }
+
+    /// <summary>dX of a transposed convolution (the convolution's forward of dY) in the autocast precision.</summary>
+    private bool TryAutocastConvTranspose2DBackwardInput(IDirectGpuBackend backend, IGpuBuffer gradOutput,
+        IGpuBuffer kernel, IGpuBuffer gradInput, int batch, int inChannels, int inHeight, int inWidth, int outChannels,
+        int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
+    {
+        if (!TryResolveBackwardAutocastConvRoute(backend, out var route, "ConvTranspose2D")) return false;
+        using var replay = new BackwardConvPrecisionScope(new RecordedConvPrecision(route));
+        return TryAutocastConv2DForward(backend, gradOutput, kernel, gradInput, batch, inChannels: outChannels,
+            inHeight: outHeight, inWidth: outWidth, outChannels: inChannels, outHeight: inHeight, outWidth: inWidth,
+            kernelH, kernelW, strideH, strideW, padH, padW, 1, 1);
+    }
+
+    /// <summary>dW of a transposed convolution (the convolution's filter gradient, x and dY exchanged).</summary>
+    private bool TryAutocastConvTranspose2DBackwardKernel(IDirectGpuBackend backend, IGpuBuffer input,
+        IGpuBuffer gradOutput, IGpuBuffer gradKernel, int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW, int padH,
+        int padW)
+    {
+        if (!TryResolveBackwardAutocastConvRoute(backend, out var route, "ConvTranspose2D")) return false;
+        return TryAutocastConv2DBackwardFilter(backend, route, input: gradOutput, gradOutput: input, gradKernel, batch,
+            inChannels: outChannels, inHeight: outHeight, inWidth: outWidth, outChannels: inChannels,
+            outHeight: inHeight, outWidth: inWidth, kernelH, kernelW, strideH, strideW, padH, padW, 1, 1);
     }
 }

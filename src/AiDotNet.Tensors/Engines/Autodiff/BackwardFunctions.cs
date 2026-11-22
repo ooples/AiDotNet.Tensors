@@ -4117,6 +4117,9 @@ internal static partial class BackwardFunctions<T>
     {
         int[] stride = (int[])savedState[0];
         int[] padding = (int[])savedState[1];
+        // The forward's autocast precision (recorded by the GPU engine's eager path; a compiled step's backward runs in
+        // the step's own scope).
+        using var precision = DirectGpuTensorEngine.PushBackwardConvPrecision(savedState, engine);
 
         var outputPadding2D = TransposedConvOutputPadding(gradOutput._shape, inputs[0]._shape, inputs[1]._shape, stride, padding);
         if (CreatesGraph && ConvTranspose2DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding, outputPadding2D))
