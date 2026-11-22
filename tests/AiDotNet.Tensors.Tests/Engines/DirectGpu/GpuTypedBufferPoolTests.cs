@@ -141,6 +141,49 @@ public sealed class GpuTypedBufferPoolTests
     }
 
     [Fact]
+    public void A_drained_size_leaves_no_entry_behind()
+    {
+        var backend = Backend();
+        var pool = Pool();
+        for (int length = 1; length <= 8; length++)
+            Assert.True(pool.TryReturn(backend, new TypedBuffer(GpuElementType.Float64, length)));
+        Assert.Equal(8, pool.Sizes);
+
+        Assert.True(pool.TryTake(backend, GpuElementType.Float64, 1, out _));
+        Assert.Equal(7, pool.Sizes);
+
+        // A stack of dead buffers is dropped with them.
+        var dead = new TypedBuffer(GpuElementType.Int8, 3);
+        Assert.True(pool.TryReturn(backend, dead));
+        dead.Release();
+        Assert.False(pool.TryTake(backend, GpuElementType.Int8, 3, out _));
+        Assert.Equal(7, pool.Sizes);
+
+        pool.Trim(GpuElementType.Float64, 4);
+        Assert.Equal(1, pool.Sizes);
+        Assert.Equal(1, pool.Count);
+        pool.Clear();
+        Assert.Equal(0, pool.Sizes);
+    }
+
+    [Fact]
+    public void A_checked_copy_refuses_a_range_outside_either_buffer()
+    {
+        var eight = new TypedBuffer(GpuElementType.Float64, 8);
+        var four = new TypedBuffer(GpuElementType.Float64, 4);
+        Assert.Equal(8, GpuCopyLayout.CheckedElementBytes(eight, 4, four, 0, 4, "Copy"));
+        Assert.Equal(8, GpuCopyLayout.CheckedElementBytes(eight, 8, four, 4, 0, "Copy"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuCopyLayout.CheckedElementBytes(eight, 0, four, 0, 5, "Copy"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuCopyLayout.CheckedElementBytes(eight, 5, four, 0, 4, "Copy"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuCopyLayout.CheckedElementBytes(eight, 0, four, 1, 4, "Copy"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuCopyLayout.CheckedElementBytes(eight, -1, four, 0, 1, "Copy"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuCopyLayout.CheckedElementBytes(eight, 0, four, -1, 1, "Copy"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuCopyLayout.CheckedElementBytes(eight, 0, four, 0, -1, "Copy"));
+        // A count near int.MaxValue does not wrap past the check.
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuCopyLayout.CheckedElementBytes(eight, int.MaxValue, four, 0, int.MaxValue, "Copy"));
+    }
+
+    [Fact]
     public void Arguments_are_checked()
     {
         var pool = Pool();

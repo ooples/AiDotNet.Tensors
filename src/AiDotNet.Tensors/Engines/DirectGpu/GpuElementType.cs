@@ -194,6 +194,29 @@ internal static class GpuCopyLayout
         return from;
     }
 
+    /// <summary>
+    /// <see cref="ElementBytes"/>, after checking that <paramref name="count"/> elements from each offset lie inside
+    /// both buffers. For the backends whose copy is a raw device memcpy, which would otherwise read or write past an
+    /// allocation.
+    /// </summary>
+    public static int CheckedElementBytes(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset,
+        int count, string operation)
+    {
+        int width = ElementBytes(source, destination, operation);
+        if (count < 0) throw new ArgumentOutOfRangeException(nameof(count), count, $"{operation}: the element count must be non-negative.");
+        if (sourceOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(sourceOffset), sourceOffset, $"{operation}: the source offset must be non-negative.");
+        if (destinationOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(destinationOffset), destinationOffset, $"{operation}: the destination offset must be non-negative.");
+        if (((long)sourceOffset + count) * width > source.SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements of {width} bytes from offset {sourceOffset} run past the source's {source.SizeInBytes} bytes.");
+        if (((long)destinationOffset + count) * width > destination.SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements of {width} bytes from offset {destinationOffset} run past the destination's {destination.SizeInBytes} bytes.");
+        return width;
+    }
+
     private static int Width(GpuElementType type)
         => type == GpuElementType.Unspecified ? sizeof(float) : GpuElementTypes.SizeInBytes(type);
 }

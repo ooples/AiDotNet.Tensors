@@ -49,9 +49,16 @@ public readonly struct GpuOperationCapability : IEquatable<GpuOperationCapabilit
 }
 
 /// <summary>
-/// What a backend runs natively, by operation family and element type: it answers "does this op stay on the device for
-/// this type" for a caller deciding where to place data. It reads the same capability members the engine routes on.
+/// What a backend's device runs natively, by operation family and element type: it answers "can this op stay on the
+/// device for this type" for a caller deciding where to place data. It reads the same capability members the engine
+/// routes on.
 /// </summary>
+/// <remarks>
+/// The answer is the physical backend's. A wrapper (a recording or delegating backend) answers for the backend it
+/// wraps, whatever the wrapper itself forwards: inside a recording <c>DeferredScope</c> the engine keeps the typed
+/// routes off the recorder and runs them on the CPU, so "native" there is what the device can do, not where the op
+/// runs in that scope.
+/// </remarks>
 public static class GpuOperationCapabilities
 {
     private static readonly GpuOperationFamily[] Families =
@@ -67,7 +74,7 @@ public static class GpuOperationCapabilities
 
     /// <summary>
     /// Whether <paramref name="backend"/> runs <paramref name="family"/> natively over <paramref name="elementType"/>
-    /// buffers on its current device. A wrapper answers for the backend it wraps.
+    /// buffers on its current device. A wrapper answers for the backend it wraps (see the type's remarks).
     /// </summary>
     public static bool SupportsOperation(this IDirectGpuBackend backend, GpuOperationFamily family, GpuElementType elementType)
     {

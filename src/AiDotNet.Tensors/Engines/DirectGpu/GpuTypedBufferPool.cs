@@ -29,6 +29,9 @@ internal sealed class GpuTypedBufferPool
     /// <summary>Bytes of device memory the idle buffers hold.</summary>
     public long Bytes { get; private set; }
 
+    /// <summary>The number of distinct (type, count) sizes the pool holds buffers of.</summary>
+    public int Sizes => _idle.Count;
+
     /// <summary>The number of idle buffers.</summary>
     public int Count => _idle.Values.Sum(stack => stack.Count);
 
@@ -53,6 +56,8 @@ internal sealed class GpuTypedBufferPool
             if (usable)
             {
                 buffer = stack.Pop();
+                // A drained size leaves no entry behind: the pool holds a key only for sizes it has buffers of.
+                if (stack.Count == 0) _idle.Remove((type, length));
                 return true;
             }
 
@@ -62,6 +67,7 @@ internal sealed class GpuTypedBufferPool
             }
         }
 
+        _idle.Remove((type, length));
         return false;
     }
 
@@ -89,8 +95,11 @@ internal sealed class GpuTypedBufferPool
     /// when both are given (the size a caller is about to ask for again).</summary>
     public void Trim(GpuElementType keepType = GpuElementType.Unspecified, int keepLength = -1)
     {
-        foreach (var entry in _idle.Where(idle => idle.Key != (keepType, keepLength)))
+        // A snapshot: entries are removed as they drain.
+        foreach (var entry in _idle.Where(idle => idle.Key != (keepType, keepLength)).ToArray())
         {
+            // Removed first: a buffer whose free throws leaves no half-drained entry behind.
+            _idle.Remove(entry.Key);
             while (entry.Value.Count > 0)
             {
                 // Accounted before the dispose: a buffer whose free throws is gone from the pool either way.

@@ -11161,7 +11161,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
-        ulong byteSize = (ulong)size * (ulong)GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
+        ulong byteSize = (ulong)size * (ulong)GpuCopyLayout.CheckedElementBytes(source, 0, destination, 0, size, nameof(Copy));
         // #1650/#638 capture: async device->device on the backend's own stream so this op is
         // CAPTURABLE inside a CUDA graph. The synchronous cuMemcpyDtoD throws CUDA 906
         // ("operation not permitted while stream is capturing") and aborts graph capture — it was
@@ -12205,7 +12205,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle,
-                (ulong)size * (ulong)GpuCopyLayout.ElementBytes(source, destination, nameof(CopyBuffer)), _stream),
+                (ulong)size * (ulong)GpuCopyLayout.CheckedElementBytes(source, 0, destination, 0, size, nameof(CopyBuffer)), _stream),
             "cuMemcpyDtoDAsync (CopyBuffer)");
         GpuLaunchProbe.OnLaunch();   // device-side copy IS GPU work — see the note on the 3-arg Copy
     }
@@ -17500,7 +17500,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
-        long width = GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
+        long width = GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, nameof(Copy));
         IntPtr srcPtr = (IntPtr)((long)source.Handle + sourceOffset * width);
         IntPtr dstPtr = (IntPtr)((long)destination.Handle + destinationOffset * width);
         ulong byteSize = (ulong)length * (ulong)width;
