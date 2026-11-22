@@ -164,9 +164,11 @@ public partial class DirectGpuTensorEngine
     }
 
     // Narrows an operand into its pass's scratch, or hands back the copy another pass of the same backward narrowed.
+    // An operand already channels-last (an activation a channels-last plan keeps so) is only cast: a source buffer has
+    // one layout, so a shared copy is the same whichever way it was made.
     private static IGpuBuffer NarrowOperand(IChannelsLastMixedConvBackend channelsLast, IDirectGpuBackend backend,
         IGpuBuffer source, OwnedBuffer scratch, (int Outer, int Channels, int Spatial) shape,
-        GpuMixedPrecisionDataType type)
+        GpuMixedPrecisionDataType type, in AutocastConvRoute route = default, bool sourceChannelsLast = false)
     {
         var share = NarrowedOperandShare.Current;
         if (share?.Find(source, shape.Outer, shape.Channels, shape.Spatial, (int)type) is { } shared)
@@ -174,7 +176,11 @@ public partial class DirectGpuTensorEngine
             Interlocked.Increment(ref s_sharedNarrowings);
             return shared;
         }
-        channelsLast.NarrowToChannelsLast(source, scratch.Buffer, shape.Outer, shape.Channels, shape.Spatial, type);
+        if (sourceChannelsLast)
+            route.Convert.ConvertFloatToFftStorage(source, scratch.Buffer, checked(shape.Outer * shape.Channels * shape.Spatial),
+                route.Storage);
+        else
+            channelsLast.NarrowToChannelsLast(source, scratch.Buffer, shape.Outer, shape.Channels, shape.Spatial, type);
         share?.Adopt(source, shape.Outer, shape.Channels, shape.Spatial, (int)type, scratch, backend);
         return scratch.Buffer;
     }
@@ -474,6 +480,78 @@ public partial class DirectGpuTensorEngine
     /// NCHW route's. False when the backend does not stage channels-last or declined the shape; the NCHW route then
     /// reconverts the operands into the same scratch.
     /// </summary>
+    /// <summary>Whether an autocast scope active now runs this backend's convolutions channels-last in 16 bits.</summary>
+    private static bool AutocastRunsChannelsLast(IDirectGpuBackend backend)
+        => TryResolveAutocastConvRoute(backend, out var route)
+           && route.Conv is IChannelsLastMixedConvBackend channelsLast
+           && channelsLast.SupportsChannelsLastMixedConv(route.DataType);
+
+    /// <summary>Autocast channels-last passes run (tests, diagnostics).</summary>
+    internal static long AutocastChannelsLastLayoutPasses => Interlocked.Read(ref s_autocastChannelsLastLayoutPasses);
+    private static long s_autocastChannelsLastLayoutPasses;
+
+    /// <summary>
+    /// One pass of a channels-last plan's convolution in the autocast precision: each activation operand cast in its
+    /// layout (<paramref name="inputNhwc"/> for x / dx, <paramref name="outputNhwc"/> for y / dy), the filter narrowed and
+    /// transposed, the FP32 result written in its operand's layout (a filter gradient as [k, c, r, s]). False -- nothing
+    /// written -- when no 16-bit route applies or it declined; the caller runs the FP32 pass.
+    /// </summary>
+    private bool TryAutocastConvolutionChannelsLast(IDirectGpuBackend backend, int pass, IGpuBuffer a, IGpuBuffer b,
+        IGpuBuffer c, in ChannelsLastConvGeometry g, bool inputNhwc, bool outputNhwc)
+    {
+        if (pass is < 0 or > 2
+            || !TryResolveAutocastConvRoute(backend, out var route)
+            || route.Conv is not IChannelsLastMixedConvBackend channelsLast
+            || !channelsLast.SupportsChannelsLastMixedConv(route.DataType))
+            return false;
+        var key = ((pass, g.Batch, g.Channels, g.Height, g.Width, g.OutChannels, g.OutHeight),
+            (g.OutWidth, g.KernelH, g.KernelW, g.StrideH, g.StrideW, g.PadH, g.PadW), (g.DilationH, g.DilationW, (int)route.DataType));
+        if (s_channelsLastAutocastDeclined.ContainsKey(key)) return false;
+        var x = (Outer: g.Batch, Channels: g.Channels, Spatial: g.Height * g.Width);
+        var w = (Outer: g.OutChannels, Channels: g.Channels, Spatial: g.KernelH * g.KernelW);
+        var y = (Outer: g.Batch, Channels: g.OutChannels, Spatial: g.OutHeight * g.OutWidth);
+        // Per pass: the operands' shapes and whether each is a channels-last activation (a filter never is).
+        var (aShape, aNhwc, bShape, bNhwc, cShape, cNhwc) = pass switch
+        {
+            0 => (x, inputNhwc, w, false, y, outputNhwc),
+            1 => (w, false, y, outputNhwc, x, inputNhwc),
+            _ => (x, inputNhwc, y, outputNhwc, w, false),
+        };
+        var type = route.DataType;
+        OwnedBuffer a16 = default, b16 = default, c16 = default;
+        try
+        {
+            a16 = AllocateTransientScratch(backend, HalfStorageFloats(aShape.Outer * aShape.Channels * aShape.Spatial), fullyWritten: true);
+            b16 = AllocateTransientScratch(backend, HalfStorageFloats(bShape.Outer * bShape.Channels * bShape.Spatial), fullyWritten: true);
+            int cCount = checked(cShape.Outer * cShape.Channels * cShape.Spatial);
+            c16 = AllocateTransientScratch(backend, HalfStorageFloats(cCount), fullyWritten: true);
+            var aNarrow = NarrowOperand(channelsLast, backend, a, a16, aShape, type, route, aNhwc);
+            var bNarrow = NarrowOperand(channelsLast, backend, b, b16, bShape, type, route, bNhwc);
+            ThrowIfAutocastConvFaultInjected();
+            if (!channelsLast.TryConv2DMixedChannelsLast(pass, aNarrow, bNarrow, c16.Buffer, g.Batch, g.Channels, g.Height,
+                    g.Width, g.OutChannels, g.OutHeight, g.OutWidth, g.KernelH, g.KernelW, g.StrideH, g.StrideW, g.PadH,
+                    g.PadW, g.DilationH, g.DilationW, type, out bool shapeUnsupported))
+            {
+                if (shapeUnsupported) s_channelsLastAutocastDeclined.TryAdd(key, 0);
+                return false;
+            }
+            if (cNhwc) route.Convert.ConvertFftStorageToFloat(c16.Buffer, c, cCount, route.Storage);
+            else channelsLast.WidenFromChannelsLast(c16.Buffer, c, cShape.Outer, cShape.Channels, cShape.Spatial, type);
+        }
+        catch (Exception ex) when (IsAutocastConvDecline(ex) && DeclineAutocastConv("AutocastConvChannelsLast", ex))
+        {
+            return false;
+        }
+        finally
+        {
+            c16.DisposeAfterQueuedUse(backend);
+            b16.DisposeAfterQueuedUse(backend);
+            a16.DisposeAfterQueuedUse(backend);
+        }
+        Interlocked.Increment(ref s_autocastChannelsLastLayoutPasses);
+        return true;
+    }
+
     private static bool TryAutocastConvChannelsLast(IDirectGpuBackend backend, in AutocastConvRoute route, int pass,
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, OwnedBuffer a16Scratch, OwnedBuffer b16Scratch, IGpuBuffer c16, int batch, int inChannels, int inHeight,
         int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW,
