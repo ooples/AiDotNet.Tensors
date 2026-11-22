@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.152.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.152.0...v0.152.1) (2026-11-22)
+
+
+### Bug Fixes
+
+* address code scanning findings in kv cache append and cuda library discovery ([97be5d8](https://github.com/ooples/AiDotNet.Tensors/commit/97be5d80fd0a5c9d5dbb3640c0d084083790651b))
+* **autotune:** restore the 2 s default online tuning budget ([313c13a](https://github.com/ooples/AiDotNet.Tensors/commit/313c13a47f625054740c414b5ca298de59541930))
+* certify only the writes an optimized graph still performs ([f776fc7](https://github.com/ooples/AiDotNet.Tensors/commit/f776fc78f87caef0f910f02c5a652cfc0a207eaa))
+* **compile:** advance every in-place target once at capture and recapture after a reset ([6764d67](https://github.com/ooples/AiDotNet.Tensors/commit/6764d6775b6380105b10d56b8090c40712ee6bff))
+* **compile:** leave the closure untouched when TryRecordCompiledOp declines ([7ef48c4](https://github.com/ooples/AiDotNet.Tensors/commit/7ef48c4ccd32bb36f8bb5b0f1ac09e5c6c7f8e6c))
+* **compile:** restore decode-op state on abandon; snapshot it only when the trace runs the op ([53bbf49](https://github.com/ooples/AiDotNet.Tensors/commit/53bbf49cacf4bcf17319d889208852efcc8e5691))
+* **cuda-tuning:** drop held timing graphs when workspaces or nested decisions change ([01688ba](https://github.com/ooples/AiDotNet.Tensors/commit/01688babc9cdd02cd25e1c17ac798714e85be5ce))
+* **cuda:** check buffer capacity and 64-bit indexing in the decode-step and copy kernels ([20b4284](https://github.com/ooples/AiDotNet.Tensors/commit/20b4284abfc37be0da11f17280f988a21b707bc3))
+* **cuda:** guard conv scratch replacement, offload context liveness and cublas paths ([d7e9852](https://github.com/ooples/AiDotNet.Tensors/commit/d7e9852fe546aa564828f9520963b153e3ed52bd))
+* **cuda:** refuse to free captured clip partials; correct the GDN fallback summary ([0f43618](https://github.com/ooples/AiDotNet.Tensors/commit/0f43618ee05fb2b8c14953579005dd2d2f3cef8c))
+* drop a view's lent gpu buffer once its storage gives the buffer up ([fe4a135](https://github.com/ooples/AiDotNet.Tensors/commit/fe4a1354ea7f73f632f260fe94a1493884868dbb))
+* **engines:** validate GatedDeltaNetStep operand shapes, not just lengths ([2cfa182](https://github.com/ooples/AiDotNet.Tensors/commit/2cfa182a734dc778637020bf00378b9d55298b0b))
+* **gpu:** [#1784](https://github.com/ooples/AiDotNet.Tensors/issues/1784) review follow-ups, cross-backend tensor policy and webgpu transcendental accuracy ([a9241b8](https://github.com/ooples/AiDotNet.Tensors/commit/a9241b808102bbf61373d0b005bcd0cf3bc8019f))
+* **gpu:** close cross-backend migration gaps from review ([1c03119](https://github.com/ooples/AiDotNet.Tensors/commit/1c031191d07d1b2012e94d3100d4faf359961db2))
+* **gpu:** close the cross-backend review gaps in migration, policy and plan state ([a7a9fab](https://github.com/ooples/AiDotNet.Tensors/commit/a7a9fab64180566cf1e8859f605dd4119ec5f69f))
+* **gpu:** compact the device result registry after a garbage collection ([f1fe44e](https://github.com/ooples/AiDotNet.Tensors/commit/f1fe44e9a32ef367c0c4bb69617b5483a2b85283))
+* **gpu:** cross-backend review fixes: views, stale device copies, teardown, launch counts ([8f5b280](https://github.com/ooples/AiDotNet.Tensors/commit/8f5b2803aef3ee2c1984859336286b8eb1b9490c))
+* **gpu:** cross-backend review: wrappers, streams, inputs, views, deferred reads, leases ([e0345ad](https://github.com/ooples/AiDotNet.Tensors/commit/e0345ad1a8021daf9d256a63e8d59e36c1ae1ea0))
+* **gpu:** dispose a popped float64 pool buffer on every path that does not return it ([6c8cab6](https://github.com/ooples/AiDotNet.Tensors/commit/6c8cab6ec015924bf3eece8d9263b04746541f1d))
+* **gpu:** fall back to cpu for double pooling under the type-preserving policy ([292ec21](https://github.com/ooples/AiDotNet.Tensors/commit/292ec21d6a6e5a8d55b8040c47abb05af94eab65))
+* **gpu:** give buffer views and offload wrappers their parent's element type ([e5a7aba](https://github.com/ooples/AiDotNet.Tensors/commit/e5a7ababd2bdfbcae90b0905adcfe052af1eb87b))
+* **gpu:** GPU detection's probe readback is not the first op's; cuBLAS prewarm peeks Current ([885034f](https://github.com/ooples/AiDotNet.Tensors/commit/885034f4e17738737e14676f25356863502db9cc))
+* **gpu:** harden double residency eviction, invalidation and fallbacks ([d01af73](https://github.com/ooples/AiDotNet.Tensors/commit/d01af73704bd4632f8a1ff55527aefd4f7fff468))
+* **gpu:** keep a failing trace listener from escaping the nvrtc and hip probes ([699fca8](https://github.com/ooples/AiDotNet.Tensors/commit/699fca8de32085f0b3ec41de0c57abb0a9d7b095))
+* **gpu:** keep declared write order for a state next that views another state ([a45c5eb](https://github.com/ooples/AiDotNet.Tensors/commit/a45c5eb8ba29e60655eee49a7f4f4892e28c44a7))
+* **gpu:** keep nvrtc and hip availability probes from caching discovery and logging failures ([b1517f8](https://github.com/ooples/AiDotNet.Tensors/commit/b1517f8af9453cdd7fad18c6dfbbc18082ad6ea6))
+* **gpu:** never compute a double op through a float kernel under the type-preserving policy ([b23afbf](https://github.com/ooples/AiDotNet.Tensors/commit/b23afbf9a05100b5c7f2a767c1758798cd4cf6f0))
+* **gpu:** never hand a kernel another backend's buffer; CrossBackendPolicy ([0ba2616](https://github.com/ooples/AiDotNet.Tensors/commit/0ba26164e72cd602c732de9377967030be86ce42))
+* **gpu:** probe CUDA libraries name-first and rank toolkit versions numerically ([c684508](https://github.com/ooples/AiDotNet.Tensors/commit/c684508fbda2e3624ba143a5a2ef283feea8e60d))
+* **gpu:** rehome cross-backend tensors resident; share one CUDA context ([5f6dcbe](https://github.com/ooples/AiDotNet.Tensors/commit/5f6dcbed134ff5f5729648d2229b77b0d68cc3bc))
+* **gpu:** reject duplicate IndexCopy destinations on first use, without a per-replay set ([926eb31](https://github.com/ooples/AiDotNet.Tensors/commit/926eb313d9fe9a4a628cc1ec1ea9d8095bab5dc6))
+* **gpu:** scope-aware rollback, wgsl typing and unexecuted-result tracking from review ([2f946b8](https://github.com/ooples/AiDotNet.Tensors/commit/2f946b86ebcb5661cfd35b863f884c90c929e83a))
+* keep shadowed wgsl builtins and mark compiled graph writes executed ([31523ba](https://github.com/ooples/AiDotNet.Tensors/commit/31523bad56c81ffd3b8532306c706e7bb34a412c))
+* keep trace state snapshots per target and accept a row gate lead ending in one ([5caad89](https://github.com/ooples/AiDotNet.Tensors/commit/5caad89124b37d1a4231a13652903aa4df8ae5bf))
+* **kv-cache:** validate the append position on every backend and surface device faults ([d9a2355](https://github.com/ooples/AiDotNet.Tensors/commit/d9a23553634385e76b1e30f1aca85c6e65571254))
+* make causal decomposed attention capturable in inference graphs ([e564454](https://github.com/ooples/AiDotNet.Tensors/commit/e564454a0db38196f874c4b5ef4d5cee17e35286))
+* make causal decomposed attention capturable in inference graphs ([88de2fb](https://github.com/ooples/AiDotNet.Tensors/commit/88de2fb48d458bb215cd4becf2056a16674f512b))
+* report an oversized kronecker product by name instead of an overflow ([7f35ab4](https://github.com/ooples/AiDotNet.Tensors/commit/7f35ab475fa47c6185ecf363a3ce403b009681b3))
+* state the foreign-buffer preconditions as patterns instead of null-forgiving ([21e416e](https://github.com/ooples/AiDotNet.Tensors/commit/21e416e58b504b6c8812fe6862ed0fc469da959f))
+* **tests,gpu:** suite failures on main: WebGPU fused-epilogue geometry, launch counts, WGSL fragment ([0197d62](https://github.com/ooples/AiDotNet.Tensors/commit/0197d623b8e4a68922dcf6bab650f3005c7daa1e))
+* **topk:** rank NaN above every number on the CPU, as the GPU paths do; test NaN and -0 ([ae7db00](https://github.com/ooples/AiDotNet.Tensors/commit/ae7db0040ef8a1d89d33008a7e60279432fa2cbd))
+* **webgpu:** accurate tanh, log and log2 in every f32 WGSL module ([ff466f0](https://github.com/ooples/AiDotNet.Tensors/commit/ff466f0cff9ec116b263c437b8f5d3070dd31786))
+* **webgpu:** keep the builtin where a scalar f32 helper cannot stand in ([72ec856](https://github.com/ooples/AiDotNet.Tensors/commit/72ec856c5571ef65c30b257faf6c19853ee17505))
+* **webgpu:** read wgsl types and early-evaluated contexts from code, not comments ([27febbe](https://github.com/ooples/AiDotNet.Tensors/commit/27febbea7512de096569539d5c11ffff3a955c9d))
+* **webgpu:** saturate the tanh helper before exp can overflow and read enable directives as tokens ([9c950df](https://github.com/ooples/AiDotNet.Tensors/commit/9c950df00f211c230f16362664c97a81c4490694))
+
+
+### Refactoring
+
+* **gpu:** clear the stale op entry in a static helper and split the wgsl context check ([112d0fb](https://github.com/ooples/AiDotNet.Tensors/commit/112d0fb57b645f9a94f8187d4b2ce58941ad2990))
+* **gpu:** dispose an unusable pooled float64 buffer in a using as it is popped ([1028f71](https://github.com/ooples/AiDotNet.Tensors/commit/1028f7108d9c7877a255feae00e8770ea4c524a0))
+* **gpu:** judge a pooled float64 buffer before it leaves the pool ([a63da73](https://github.com/ooples/AiDotNet.Tensors/commit/a63da73dff2c28beac408d88c97132d3fab1b160))
+* **webgpu:** select scalar-valued calls with explicit filters ([b02c20b](https://github.com/ooples/AiDotNet.Tensors/commit/b02c20b12700d6d721cffe1ba0054d8d0eb5ec3b))
+
+
+### Documentation
+
+* **engines:** flag CausalConv1dStep's newest-first kernel and cross-check it against DepthwiseConv1D ([6998cd2](https://github.com/ooples/AiDotNet.Tensors/commit/6998cd29068ef9213dcbb27eea87c5100bd3712c))
+* **engines:** state GatedDeltaRule.Standard's bound as non-expansive for 0 &lt;= a, b &lt;= 1 ([e3eb7f4](https://github.com/ooples/AiDotNet.Tensors/commit/e3eb7f4af8e402871851d0a570480bf822921c77))
+* record the four abstract IEngine members 0.152.0 added (PR [#1784](https://github.com/ooples/AiDotNet.Tensors/issues/1784)) ([092acfc](https://github.com/ooples/AiDotNet.Tensors/commit/092acfc0e13c397b47ae184cc141bc25ab412418))
+
 ## [0.152.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.151.2...v0.152.0) (2026-11-22)
 
 
