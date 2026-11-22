@@ -60,11 +60,39 @@ fn tanh_derivative(t: f32) -> f32 { return 1.0 - t * t; }
     [InlineData("enable subgroups, f16;\n")]
     [InlineData("enable  f16 ;\n")]
     [InlineData("// header\n/* a /* nested */ comment */\nenable f16;\n")]
+    [InlineData("enable\nf16;\n")]
+    [InlineData("enable\t\tf16;\n")]
+    [InlineData("enable /* half floats */ f16;\n")]
+    [InlineData("enable subgroups, // wide ops\n f16;\n")]
     public void Any_enable_that_lists_f16_keeps_the_builtins(string directives)
     {
         string prepared = WebGpuShaderPrelude.Prepare(directives + Kernel);
         Assert.DoesNotContain("wgsl_tanh", prepared);
         Assert.DoesNotContain("wgsl_log", prepared);
+    }
+
+    // exp(2|x|) overflows f32 past |x| = 44.4 and WGSL leaves an overflowed result indeterminate, so the helper must
+    // answer the saturated value before it evaluates exp; and the cutoff must be one at which tanh already rounds to 1.
+    [Fact]
+    public void The_tanh_helper_saturates_before_its_exponential_can_overflow()
+    {
+        string prepared = WebGpuShaderPrelude.Prepare(Kernel);
+        int helper = prepared.IndexOf("fn wgsl_tanh(", System.StringComparison.Ordinal);
+        int saturate = prepared.IndexOf("if (a >= 9.02) { return select(-1.0, 1.0, x >= 0.0); }", helper, System.StringComparison.Ordinal);
+        int exponential = prepared.IndexOf("exp(2.0 * a)", helper, System.StringComparison.Ordinal);
+        Assert.True(saturate > helper, "The tanh helper has no saturation branch.");
+        Assert.True(exponential > saturate, "The saturation branch must come before exp.");
+        Assert.Equal(1.0f, (float)System.Math.Tanh(9.02));
+        Assert.True(System.Math.Exp(2.0 * 9.02) < float.MaxValue, "exp is still finite at the cutoff.");
+    }
+
+    [Theory]
+    [InlineData("// enable f16;\n")]
+    [InlineData("enable f16x;\n")]
+    [InlineData("enable subgroups;\n")]
+    public void An_enable_that_does_not_list_f16_still_rewrites(string directives)
+    {
+        Assert.Contains("fn wgsl_tanh(", WebGpuShaderPrelude.Prepare(directives + Kernel));
     }
 
     [Fact]

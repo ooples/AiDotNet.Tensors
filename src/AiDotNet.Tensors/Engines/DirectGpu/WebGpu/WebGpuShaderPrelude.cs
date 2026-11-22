@@ -1,5 +1,6 @@
 #if NET7_0_OR_GREATER
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
+using System.Linq;
 using System.Text.RegularExpressions;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
@@ -25,9 +26,13 @@ internal static class WebGpuShaderPrelude
     private const string IsNan = "fn wgsl_is_nan(x: f32) -> bool { return (bitcast<u32>(x) & 0x7FFFFFFFu) > 0x7F800000u; }\n";
 
     // tanh: below 0.55 its odd Taylor series to x^15 (the first omitted term is under 5e-8 of the answer there);
-    // above, 1 - 2 / (exp(2|x|) + 1), whose cancellation is at most a factor of two and whose exp overflow gives 1.
+    // above, 1 - 2 / (exp(2|x|) + 1), whose cancellation is at most a factor of two. From 9.02 up tanh rounds to
+    // exactly one in f32 (1 - tanh(9.02) is under 3e-8, less than half the spacing below one), so the sign is
+    // returned before exp is evaluated: exp(2|x|) overflows past |x| = 44.4 and WGSL leaves an overflowed result
+    // indeterminate. A NaN fails both comparisons and flows through the exp branch as NaN.
     private const string Tanh = @"fn wgsl_tanh(x: f32) -> f32 {
     let a = abs(x);
+    if (a >= 9.02) { return select(-1.0, 1.0, x >= 0.0); }
     if (a < 0.55) {
         let z = x * x;
         let p = -0.3333333333 + z * (0.1333333333 + z * (-0.0539682540 + z * (0.0218694885
@@ -128,8 +133,10 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
             if (semicolon < 0) return end;
             if (enable)
             {
-                foreach (var extension in source.Substring(at + 6, semicolon - at - 6).Split(','))
-                    if (extension.Trim() == "f16") enablesF16 = true;
+                // Tokens, not text: comments and any whitespace may stand between enable, the names and the commas.
+                if (source.Substring(at + 6, semicolon - at - 6).Split(',')
+                    .Any(extension => StartsWord(extension, SkipTrivia(extension, 0), "f16")))
+                    enablesF16 = true;
             }
             end = semicolon + 1;
         }
@@ -215,9 +222,8 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
     private static bool IsVector(string argument, HashSet<string> vectors)
     {
         if (VectorSyntax.IsMatch(argument)) return true;
-        foreach (Match name in Identifier.Matches(argument))
+        foreach (Match name in Identifier.Matches(argument).Cast<Match>().Where(name => vectors.Contains(name.Value)))
         {
-            if (!vectors.Contains(name.Value)) continue;
             int after = SkipTrivia(argument, name.Index + name.Length);
             bool component = after < argument.Length
                 && (argument[after] == '[' || SingleComponent.IsMatch(argument, after));
