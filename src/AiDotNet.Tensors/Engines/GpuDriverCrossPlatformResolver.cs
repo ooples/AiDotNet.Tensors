@@ -64,11 +64,14 @@ internal static class GpuDriverCrossPlatformResolver
                     : candidate)
                 .Where(fileName => !System.IO.Path.IsPathRooted(fileName))
                 .ToArray();
-            foreach (var dir in CuBlasNative.GetCudaBinDirectories())
+            // Name-first: the load order ranks the names (the exact NVRTC name before its older aliases), so an alias
+            // found in an earlier directory (an older NVRTC in bin\x64) must not beat the exact name in a later one.
+            var dirs = CuBlasNative.GetCudaBinDirectories();
+            foreach (var fileName in fileNames)
             {
-                foreach (var path in fileNames.Select(fileName => System.IO.Path.Join(dir, fileName)))
+                foreach (var dir in dirs)
                 {
-                    if (NativeLibrary.TryLoad(path, out var handle))
+                    if (NativeLibrary.TryLoad(System.IO.Path.Join(dir, fileName), out var handle))
                         return handle;
                 }
             }

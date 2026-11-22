@@ -50,5 +50,16 @@ public sealed class GpuDriverCrossPlatformResolverTests
         Assert.DoesNotContain(cublas, GpuDriverCrossPlatformResolver.LoadOrder(cublas));
         Assert.Empty(GpuDriverCrossPlatformResolver.LoadOrder("not-a-gpu-library"));
     }
+
+    [Fact]
+    public void CudaToolkitVersions_AreRankedNumericallyNotOrdinally()
+    {
+        // An ordinal sort ranks v9.2 above v13.0 (and v12.10 below v12.9).
+        var dirs = new[] { "C:/CUDA/v9.2", "C:/CUDA/v13.0", "C:/CUDA/v12.10", "C:/CUDA/v12.9", "C:/CUDA/vnext" };
+        Assert.Equal("C:/CUDA/v13.0", CuBlasNative.NewestVersionDirectory(dirs, "v"));
+        Assert.Equal("C:/CUDA/v12.10", CuBlasNative.NewestVersionDirectory(new[] { "C:/CUDA/v12.9", "C:/CUDA/v12.10" }, "v"));
+        Assert.Equal("/usr/local/cuda-13", CuBlasNative.NewestVersionDirectory(new[] { "/usr/local/cuda-9.2", "/usr/local/cuda-13" }, "cuda-"));
+        Assert.Null(CuBlasNative.NewestVersionDirectory(new[] { "C:/CUDA/vnext" }, "v"));
+    }
 }
 #endif

@@ -46,8 +46,9 @@ internal static class CuRandNative
         foreach (var candidate in candidates)
             if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out var handle))
                 return handle;
-        foreach (var dir in CuBlasNative.GetCudaBinDirectories())
-            foreach (var candidate in candidates)
+        var dirs = CuBlasNative.GetCudaBinDirectories();
+        foreach (var candidate in candidates)
+            foreach (var dir in dirs)
                 if (NativeLibrary.TryLoad(System.IO.Path.Combine(dir, windows ? candidate + ".dll" : candidate), out var handle))
                     return handle;
         return IntPtr.Zero;
