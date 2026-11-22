@@ -83,8 +83,10 @@ public partial class DirectGpuTensorEngine
             var sourceBuffers = sources.Select(s => s.Buffer).ToArray();
             // One launch runs its copies concurrently, so it is only equivalent to the declared-order writes when no
             // copy touches another's buffer: two states sharing one backing array, or a next that is a view of another
-            // state. Those take the ordered per-state path below.
-            ordered = StateCopiesOverlap(sourceBuffers, destinations);
+            // state. Those take the ordered per-state path below. A partial view resolves to a fresh gathered buffer
+            // whose address never matches its base state's, so a next sharing a state's host storage is checked by
+            // storage too: the batch would read the state before its write, the ordered path after it.
+            ordered = StateCopiesOverlap(sourceBuffers, destinations) || NextSharesStateStorage(states, nexts);
             if (!ordered) batched.CopyMany(sourceBuffers, destinations, lengths);
         }
         finally
@@ -101,6 +103,27 @@ public partial class DirectGpuTensorEngine
             states[i].IncrementVersion();
             BindResidentBuffer(states[i], destinations[i], backend);
         }
+    }
+
+    /// <summary>
+    /// Whether some next value shares its backing storage with a state (a view of a state): its copy can then depend on
+    /// whether that state's write has happened, so the writes keep their declared order.
+    /// </summary>
+    internal static bool NextSharesStateStorage<T>(IReadOnlyList<Tensor<T>> states, IReadOnlyList<Tensor<T>> nexts)
+    {
+        for (int i = 0; i < nexts.Count; i++)
+        {
+            var next = nexts[i];
+            var nextArray = next.GetBackingArrayForCacheLookupUnsafe();
+            for (int j = 0; j < states.Count; j++)
+            {
+                var state = states[j];
+                if (ReferenceEquals(next.StorageIdentity, state.StorageIdentity)
+                    || (nextArray is not null && ReferenceEquals(nextArray, state.GetBackingArrayForCacheLookupUnsafe())))
+                    return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>

@@ -39,6 +39,42 @@ public sealed class CompiledStatefulInferenceTests
         Assert.True(DirectGpuTensorEngine.StateCopiesOverlap(new[] { nextA, nextB }, new[] { a, a }));
     }
 
+    // A next that is a partial view of another state resolves to a fresh gathered buffer, so its address never matches
+    // the state's: the batched launch read the state before its write while the ordered per-state path reads it after.
+    // Both now take the declared order: A = [5..8] first, then B = A[0..2] = [5, 6] (the CPU engine's result too).
+    [SkippableFact]
+    public void BatchedStateWrites_OfANextViewingAnotherState_KeepTheDeclaredOrder()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            float[] RunBatched(IEngine engine)
+            {
+                var a = new Tensor<float>([4], new Vector<float>(new[] { 1f, 2f, 3f, 4f }));
+                var b = new Tensor<float>([2], new Vector<float>(new[] { 10f, 20f }));
+                var nextA = new Tensor<float>([4], new Vector<float>(new[] { 5f, 6f, 7f, 8f }));
+                var nextB = a.Slice(0, 0, 2);
+                Assert.True(DirectGpuTensorEngine.NextSharesStateStorage(new[] { a, b }, new[] { nextA, nextB }));
+                if (engine is DirectGpuTensorEngine g) g.AssignStatesInPlace(new[] { a, b }, new[] { nextA, nextB });
+                else
+                {
+                    ((ISignatureTensor)a).CopyLeafFrom(nextA);
+                    ((ISignatureTensor)b).CopyLeafFrom(nextB);
+                }
+                Assert.Equal(new[] { 5f, 6f, 7f, 8f }, a.ToArray());
+                return b.ToArray();
+            }
+            Assert.Equal(new[] { 5f, 6f }, RunBatched(new CpuEngine()));
+            Assert.Equal(new[] { 5f, 6f }, RunBatched(gpu!));
+            // Disjoint nexts still share no storage (the one-launch path stays available).
+            var s0 = new Tensor<float>([2]); var s1 = new Tensor<float>([2]);
+            Assert.False(DirectGpuTensorEngine.NextSharesStateStorage(new[] { s0, s1 }, new[] { new Tensor<float>([2]), new Tensor<float>([2]) }));
+        }
+    }
+
     [Fact]
     public void ReturnedIntermediateAndStateConsumerRefreshIndependently()
     {
