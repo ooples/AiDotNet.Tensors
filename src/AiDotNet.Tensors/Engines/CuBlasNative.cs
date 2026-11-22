@@ -176,7 +176,9 @@ public static class CuBlasNative
         var dirs = new System.Collections.Generic.List<string>();
 
         var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
-        if (string.IsNullOrEmpty(cudaPath))
+        if (string.IsNullOrEmpty(cudaPath) && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.User);
+        if (string.IsNullOrEmpty(cudaPath) && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
             cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
 
         if (string.IsNullOrEmpty(cudaPath))

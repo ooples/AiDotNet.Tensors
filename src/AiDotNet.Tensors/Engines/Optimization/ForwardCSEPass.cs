@@ -1,4 +1,5 @@
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization;
 
@@ -26,16 +27,18 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
 
         var result = new List<CompiledStep<T>>(steps.Length);
         // Map from operation signature hash to the step that computes it
-        var computed = new Dictionary<long, CompiledStep<T>>();
+        var computed = new Dictionary<long, (CompiledStep<T> Step, int Index)>();
         bool anyEliminated = false;
 
         foreach (var step in steps)
         {
             long hash = ComputeStepHash(step);
 
-            if (computed.TryGetValue(hash, out var existing)
-                && InputsMatch(step, existing))
+            if (computed.TryGetValue(hash, out var found)
+                && InputsMatch(step, found.Step)
+                && !StorageRewrittenSince(result, found.Index, found.Step.OutputBuffer))
             {
+                var existing = found.Step;
                 // This step computes the same thing as an existing step.
                 // Replace with a copy from the existing output.
                 // BackwardFn is set to null because the CSE copy does not execute
@@ -47,14 +50,14 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
                     "CSE_Copy",
                     (eng, output) => AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, src, output),
                     dst,
-                    step.Inputs,
+                    new[] { src },
                     null,
                     null));
                 anyEliminated = true;
             }
             else
             {
-                computed[hash] = step;
+                computed[hash] = (step, result.Count);
                 result.Add(step);
             }
         }
@@ -86,6 +89,22 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
         }
 
         return hash;
+    }
+
+    /// <summary>
+    /// This pass runs after memory planning, which reuses a buffer once its last original reader ran. A copy of an
+    /// earlier step's output reads it LATER than any original reader did, so the buffer may already hold a later step's
+    /// result (measured: a recomputed matmul copied from storage memory planning had donated to a step in between).
+    /// The copy is only valid when no step after the source writes its storage.
+    /// </summary>
+    private static bool StorageRewrittenSince<T>(List<CompiledStep<T>> scheduled, int sourceIndex, Tensor<T> source)
+    {
+        for (int i = sourceIndex + 1; i < scheduled.Count; i++)
+        {
+            var written = scheduled[i].OutputBuffer;
+            if (ReferenceEquals(written, source) || ReferenceEquals(written._storage, source._storage)) return true;
+        }
+        return false;
     }
 
     private static bool InputsMatch<T>(CompiledStep<T> a, CompiledStep<T> b)

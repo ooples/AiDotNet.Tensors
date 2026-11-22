@@ -4693,6 +4693,93 @@ public partial interface IEngine
         int numHeads);
 
     /// <summary>
+    /// The fused Gated DeltaNet scan under <paramref name="rule"/>: <see cref="GatedDeltaRule.Standard"/> is the paper's
+    /// <c>S_t = a_t S_{t-1} (I - b_t k_t k_tᵀ) + b_t v_t k_tᵀ</c> with the keys used as given, and
+    /// <see cref="GatedDeltaRule.ScaledKeys"/> the rule of the overload without it. Output <c>o_t = S_t q_t</c>;
+    /// differentiable (forward + analytic BPTT backward).
+    /// </summary>
+    /// <param name="qProj">Queries [batch, seqLen, modelDim].</param>
+    /// <param name="kProj">Keys [batch, seqLen, modelDim].</param>
+    /// <param name="vProj">Values [batch, seqLen, modelDim].</param>
+    /// <param name="alpha">Decay per head [batch, seqLen, numHeads].</param>
+    /// <param name="beta">Write strength per head [batch, seqLen, numHeads].</param>
+    /// <param name="numHeads">Number of heads; modelDim must be divisible by it.</param>
+    /// <param name="rule">The state update.</param>
+    Tensor<T> GatedDeltaNetScanForward<T>(
+        Tensor<T> qProj,
+        Tensor<T> kProj,
+        Tensor<T> vProj,
+        Tensor<T> alpha,
+        Tensor<T> beta,
+        int numHeads,
+        GatedDeltaRule rule);
+
+    /// <summary>
+    /// One decode position of the gated delta rule <paramref name="rule"/>, the step of
+    /// <see cref="GatedDeltaNetScanForward{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, Tensor{T}, int, GatedDeltaRule)"/>,
+    /// per state row r: with <c>k' = c k</c> (<c>c = 1/sqrt(keyDim)</c> under <see cref="GatedDeltaRule.ScaledKeys"/>,
+    /// 1 under <see cref="GatedDeltaRule.Standard"/>), <c>pred = d S k'</c> (<c>d = alpha</c> under Standard, 1 under
+    /// ScaledKeys), <c>delta = beta (v - pred)</c>, <c>S &lt;- alpha S + delta k'^T</c>, <c>o = S q</c>.
+    /// <paramref name="state"/> is updated IN PLACE, so a compiled decode plan keeps it in one persistent buffer; the
+    /// output and the new state come from one pass over the state. Forward only (decoding).
+    /// </summary>
+    /// <param name="state">The memory [rows, valueDim, keyDim], contiguous; written in place.</param>
+    /// <param name="query">This position's queries, rows x keyDim values.</param>
+    /// <param name="key">This position's keys, rows x keyDim values.</param>
+    /// <param name="value">This position's values, rows x valueDim values.</param>
+    /// <param name="alpha">The decay per row (rows values).</param>
+    /// <param name="beta">The write strength per row (rows values).</param>
+    /// <param name="rule">The state update, as the scan's.</param>
+    /// <returns>The output <c>o</c> [rows, valueDim].</returns>
+    Tensor<T> GatedDeltaNetStep<T>(
+        Tensor<T> state,
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        Tensor<T> alpha,
+        Tensor<T> beta,
+        GatedDeltaRule rule);
+
+    /// <summary>
+    /// One decode position of a causal depthwise 1-D convolution of kernel size K, with the K - 1 previous inputs
+    /// carried in <paramref name="history"/>: <c>y = x w[:, 0] + sum_m history[m - 1] w[:, m] + bias</c> (then SiLU when
+    /// <paramref name="silu"/>), and the history shifted IN PLACE (<c>history[m] = history[m - 1]</c>,
+    /// <c>history[0] = x</c>). A zero history is the sequence start (the full convolution's zero padding). Forward only.
+    /// </summary>
+    /// <param name="history">The previous inputs [K - 1, batch, channels], most recent first; written in place.</param>
+    /// <param name="input">This position's input, batch x channels values.</param>
+    /// <param name="weight">The taps [channels, K]: column 0 weights this position, column m the input m positions back.</param>
+    /// <param name="bias">Per-channel bias [channels], or null.</param>
+    /// <param name="silu">Apply SiLU (x sigmoid(x)) to the output.</param>
+    /// <returns>The output [batch, channels].</returns>
+    Tensor<T> CausalConv1dStep<T>(
+        Tensor<T> history,
+        Tensor<T> input,
+        Tensor<T> weight,
+        Tensor<T>? bias,
+        bool silu);
+
+    /// <summary>
+    /// Appends one decode position to a fixed-capacity cache with the write position kept ON THE DEVICE:
+    /// <c>cache[b, p, :] = value[b, :]</c> for the current <c>p = position[0]</c>, then <c>position[0] = p + 1</c>, both
+    /// in place, and returns the additive attention mask over the cache's slots (0 for slots <c>0..p</c>, negative
+    /// infinity after). A compiled decode plan therefore replays every step with no host input but the token: the cache
+    /// and the position stay in persistent buffers. Forward only.
+    /// </summary>
+    /// <param name="cache">The cache [batch, capacity, width], contiguous; written in place.</param>
+    /// <param name="position">One value: the number of positions already cached (an integer held in T); incremented in
+    /// place. Start it at zero.</param>
+    /// <param name="value">This position's entry, batch x width values.</param>
+    /// <returns>The additive mask [capacity] for attending over the cache after this append.</returns>
+    /// <exception cref="InvalidOperationException">The host implementation throws when the cache is full. A device
+    /// kernel cannot report it: past capacity it writes nothing, leaves the position at capacity and returns a mask of
+    /// every slot, so callers bound the number of positions themselves.</exception>
+    Tensor<T> KvCacheAppend<T>(
+        Tensor<T> cache,
+        Tensor<T> position,
+        Tensor<T> value);
+
+    /// <summary>
     /// Fused xLSTM (mLSTM) matrix-memory recurrence over a whole sequence as one differentiable op
     /// (forward + analytic BPTT backward); see <c>CpuEngine.XLstmScan.cs</c> (#1464).
     /// </summary>

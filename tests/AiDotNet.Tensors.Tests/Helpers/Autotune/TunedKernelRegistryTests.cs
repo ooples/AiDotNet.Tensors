@@ -60,6 +60,8 @@ public sealed class TunedKernelRegistryTests : IDisposable
         }
         public float Value { get; set; }
         public bool ThrowOnExecute { get; set; }
+        /// <summary>Host stall of the first execution only: a kernel compiled or loaded on first launch.</summary>
+        public int FirstRunStallMilliseconds { get; set; }
         public bool OutOfDeviceMemoryOnExecute { get; set; }
         public string Id { get; }
         public TunedKernelOrigin Origin => TunedKernelOrigin.Generated;
@@ -71,6 +73,8 @@ public sealed class TunedKernelRegistryTests : IDisposable
         public void Execute(in Args args)
         {
             Executions++;
+            if (Executions == 1 && FirstRunStallMilliseconds > 0)
+                System.Threading.Thread.Sleep(FirstRunStallMilliseconds);
             if (ThrowOnExecute) throw new InvalidOperationException(Id + " failed at dispatch");
             if (OutOfDeviceMemoryOnExecute)
                 throw new AiDotNet.Tensors.Engines.DirectGpu.GpuOutOfMemoryException(Id + " scratch did not fit", 2);
@@ -548,6 +552,41 @@ public sealed class TunedKernelRegistryTests : IDisposable
 
         Assert.Same(reference, slot.Resolve(Shape(cols: 64), NewArgs()));
         Assert.Equal(TunedKernelDecisionReason.OnlyCandidate, Assert.Single(slot.CachedDecisions).Reason);
+    }
+
+    [Fact]
+    public void FirstRunCompilation_IsNotChargedToTheBudget()
+    {
+        // Each candidate compiles on its first launch, a one-time cost every later shape shares. Charging it spent the
+        // whole budget on the first shapes a process met (a model's two-sample warm-up), so its real shapes ran untuned.
+        TunedKernelPolicy.BudgetMilliseconds = 100;
+        var harness = new Harness();
+        var slot = Slot(harness, false,
+            new Fake("ref", 1f, 1.0) { FirstRunStallMilliseconds = 150 },
+            new Fake("fast", 1f, 0.5) { FirstRunStallMilliseconds = 150 });
+
+        Assert.Equal("fast", slot.Resolve(Shape(), NewArgs())?.Id);
+        Assert.True(TunedKernelPolicy.SpentMilliseconds < 100,
+            $"first-run compilation was charged: {TunedKernelPolicy.SpentMilliseconds:F0} ms spent");
+
+        int measured = harness.Measurements;
+        Assert.Equal("fast", slot.Resolve(Shape(cols: 9), NewArgs())?.Id);
+        Assert.True(harness.Measurements > measured, "the second shape is measured, not left to the exhausted budget");
+        Assert.All(slot.CachedDecisions, d => Assert.Equal(TunedKernelDecisionReason.Tuned, d.Reason));
+    }
+
+    [Fact]
+    public void ClearlySlowerCandidate_IsAbandonedAfterThreePairs_AndAFastOneStillWins()
+    {
+        var harness = new Harness();
+        var slow = new Fake("slow", 1f, 4.0);
+        var slot = Slot(harness, false, new Fake("ref", 1f, 1.0), slow, new Fake("fast", 1f, 0.5));
+
+        Assert.Equal("fast", slot.Resolve(Shape(), NewArgs())?.Id);
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Contains(decision.Rejected, r => r.StartsWith("slow: abandoned after 3 pairs", System.StringComparison.Ordinal));
+        // One correctness run, one warm-up timing and three pairs: not the nine pairs a contender gets.
+        Assert.Equal(1 + 1 + 3, slow.Executions);
     }
 
     [Fact]

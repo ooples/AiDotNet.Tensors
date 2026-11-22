@@ -126,3 +126,6 @@ override AiDotNet.Tensors.Engines.DirectGpuTensorEngine.GraphAttentionCsr<T>(AiD
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBuffer.ElementType.get -> AiDotNet.Tensors.Engines.DirectGpu.GpuElementType
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.AllocateBuffer(int size, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.MaxSmallTopK.get -> int
+AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.TopKRowsSmall(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! input, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! values, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! indices, int rows, int cols, int k) -> void
+static AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuInstantNgpKernels.TopKRowsSmall.get -> string!

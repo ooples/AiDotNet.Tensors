@@ -40,7 +40,30 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     private Tensor<T>[] _stateTensors = Array.Empty<Tensor<T>>();
     // The device buffers a capture recorded the states at (the replays write there).
     private Engines.DirectGpu.IGpuBuffer[] _capturedStateBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
+    // Leaves the steps write in place (a static decode cache updated by an in-place op, no declared state), their
+    // captured device buffers, and the versions the last execution left them at.
+    private Tensor<T>[] _inPlaceLeaves = Array.Empty<Tensor<T>>();
+    private Engines.DirectGpu.IGpuBuffer[] _capturedInPlaceBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer>();
+    private int[] _capturedInPlaceVersions = Array.Empty<int>();
     private int[] _capturedStateVersions = Array.Empty<int>();
+    // The host data each captured-graph input buffer last received (bitwise), the buffer it went to and the input's
+    // cache version then: a replay whose input still matches all three skips the upload (a decode step re-feeding
+    // the same id, a constant flag input).
+    private float[]?[] _uploadedInputs = Array.Empty<float[]?>();
+    private IntPtr[] _uploadedInputHandles = Array.Empty<IntPtr>();
+    private int[] _uploadedInputVersions = Array.Empty<int>();
+    private long _inputUploadsSkipped;
+
+    /// <summary>Captured-graph input uploads skipped because the input was unchanged (for tests).</summary>
+    internal long InputUploadsSkipped => Interlocked.Read(ref _inputUploadsSkipped);
+    // The stable buffers the pre-residency pass and the capture draw each step's outputs and temporaries from, keyed by
+    // step (see Engines.StepScratchPool): a capture may not allocate, so an op needing scratch (a two-sided broadcast,
+    // say) otherwise declined to the CPU engine and abandoned the capture. Lives as long as the captured graph.
+    private Engines.StepScratchPool? _captureScratchPool;
+    // The buffer the captured graph writes the output into, recorded at capture: every replay downloads from it. The
+    // output tensor's own binding does not survive the call (its host refresh makes it stale, and a host read or an
+    // engine op over it can drop it), which failed the next replay's download.
+    private Engines.DirectGpu.IGpuBuffer? _capturedOutputBuffer;
     private readonly List<GCHandle> _pinnedHandles = new();
     private TensorStorageLeaseSet? _storageLeases;
 
@@ -254,7 +277,6 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             {
                 var step = steps[i];
                 bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensors, producedStorages);
-                MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
                 var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
                 if (spec != null)
                 {
@@ -873,8 +895,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                     for (int i = 0; i < _stateTensors.Length; i++)
                         if (_stateTensors[i].GpuCacheVersion != _capturedStateVersions[i])
                             throw new InvalidOperationException("A captured state was modified outside the plan.");
+                    for (int i = 0; i < _inPlaceLeaves.Length; i++)
+                        if (_inPlaceLeaves[i].GpuCacheVersion != _capturedInPlaceVersions[i])
+                            throw new InvalidOperationException("A tensor the captured graph writes in place was modified outside the plan.");
                     RefreshInferenceInputsInPlace(cb);
-                    stateLaunchAttempted = _stateTensors.Length != 0;
+                    stateLaunchAttempted = _stateTensors.Length != 0 || _inPlaceLeaves.Length != 0;
                     cb.LaunchCapturedGraph(_graphExec);
                     RearmStates();
                     replayed = RefreshFinalOutputFromResident(); // fresh DtoH into _finalOutput's host storage
@@ -926,6 +951,23 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // engine's transient upload path would otherwise have none).
                             foreach (var input in _compiledInputTensors.Where(input => input is not null))
                                 gte.PinInputResident(input);
+                            // And every other leaf the steps read (constants, weights): read through the transient
+                            // upload path they would be re-uploaded inside the capture.
+                            var producedHere = new HashSet<Tensor<T>>(steps.Select(step => step.OutputBuffer),
+                                ReferenceEqualityComparer<Tensor<T>>.Instance);
+                            // A leaf an in-place step writes (its output is one of its inputs) and no other step
+                            // produces: persistent state the plan advances every execution (a static decode cache).
+                            var producedOutOfPlace = new HashSet<Tensor<T>>(steps.Where(step => !IsInPlaceStep(step)).Select(step => step.OutputBuffer),
+                                ReferenceEqualityComparer<Tensor<T>>.Instance);
+                            _inPlaceLeaves = steps.Where(IsInPlaceStep).Select(step => step.OutputBuffer)
+                                .Where(t => !producedOutOfPlace.Contains(t) && Array.IndexOf(_compiledInputTensors, t) < 0 && Array.IndexOf(_stateTensors, t) < 0)
+                                .Distinct(ReferenceEqualityComparer<Tensor<T>>.Instance).ToArray();
+                            _capturedInPlaceBuffers = _inPlaceLeaves.Select(t => gte.PinInputResident(t)
+                                ?? throw new InvalidOperationException("A tensor written in place could not be made device-resident.")).ToArray();
+                            _capturedInPlaceVersions = new int[_inPlaceLeaves.Length];
+                            foreach (var leaf in steps.SelectMany(step => step.Inputs).Where(leaf => !producedHere.Contains(leaf)
+                                         && Array.IndexOf(_compiledInputTensors, leaf) < 0 && Array.IndexOf(_stateTensors, leaf) < 0))
+                                gte.PinLeafResident(leaf);
                             // Each state too (a host read since the last eager write may have moved its binding):
                             // the capture records its state write into exactly this buffer.
                             var stateBuffers = new Engines.DirectGpu.IGpuBuffer[_stateTensors.Length];
@@ -937,24 +979,54 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                             // A stateful plan's trailing state writes are left out: the launch below performs
                             // this call's one state advance, and the state buffers already exist (the eager
                             // warmup calls wrote them).
-                            for (int i = 0; i < steps.Length - _stateTensors.Length; i++)
-                                steps[i].Execute(engine, steps[i].OutputBuffer);
+                            // The pre-residency pass would advance every in-place leaf once more than this call does
+                            // (the launch below is this call's advance): snapshot them on the device and restore after.
+                            var snapshots = new Engines.DirectGpu.IGpuBuffer?[_inPlaceLeaves.Length];
+                            try
+                            {
+                                for (int i = 0; i < snapshots.Length; i++)
+                                    snapshots[i] = gte.TakeDeviceSnapshot(_capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+                                RunStepsPooled(gte, engine, steps, steps.Length - _stateTensors.Length);
+                            }
+                            catch
+                            {
+                                // A step that threw may follow one that already advanced a leaf. The eager fallback
+                                // advances every leaf once itself, so the leaves go back to their snapshots first; if
+                                // that cannot be done the call fails instead of running the plan on advanced state.
+                                try
+                                {
+                                    RestoreInPlaceLeaves(gte, snapshots);
+                                }
+                                catch
+                                {
+                                    stateLaunchAttempted = true;
+                                    throw;
+                                }
+                                throw;
+                            }
+                            try
+                            {
+                                RestoreInPlaceLeaves(gte, snapshots);
+                            }
+                            catch
+                            {
+                                // The leaves hold this pass's extra advance and cannot be put back.
+                                stateLaunchAttempted = true;
+                                throw;
+                            }
 
                             // Refresh inputs in place OUTSIDE the captured region (an HtoD upload inside
                             // capture is non-capturable), then record the step launches. Capture RECORDS
                             // but does not execute, so launch once afterwards to produce this call's output.
                             RefreshInferenceInputsInPlace(cb);
-                            var exec = cb.CaptureGraph(() =>
-                            {
-                                for (int i = 0; i < steps.Length; i++)
-                                    steps[i].Execute(engine, steps[i].OutputBuffer);
-                            });
+                            var exec = cb.CaptureGraph(() => RunStepsPooled(gte, engine, steps, steps.Length));
                             if (exec != IntPtr.Zero)
                             {
                                 _graphExec = exec;
                                 _graphBackend = cb;
                                 _graphEngine = gte;
-                                stateLaunchAttempted = _stateTensors.Length != 0;
+                                _capturedOutputBuffer = _finalOutput._gpuBuffer;
+                                stateLaunchAttempted = _stateTensors.Length != 0 || _inPlaceLeaves.Length != 0;
                                 cb.LaunchCapturedGraph(exec);
                                 RearmStates();
                                 // Force a fresh DtoH into _finalOutput's host storage (else the returned tensor
@@ -968,6 +1040,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         }
                         // Capture failed (a non-capturable op remains) — disable + resume eviction.
                         _graphCaptureDisabled = true;
+                        UnpinInputs(gte);
                         if (_graphEvictionSuspended)
                         {
                             // Best-effort, so the eager fallback below still runs this call.
@@ -984,6 +1057,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 {
                     TraceGraphTeardownFailure("capture the inference graph; this plan now runs eagerly", ex);
                     _graphCaptureDisabled = true;
+                    UnpinInputs(gte);
                     // A throw after _graphExec was assigned (the first LaunchCapturedGraph or the output
                     // download above) leaves the graph executable allocated — destroy it so it isn't leaked
                     // until Dispose, and HasGraph-style state reflects that capture was abandoned.
@@ -1017,11 +1091,96 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         return _finalOutput;
     }
 
+    // Writes each acquired pre-residency snapshot back into its in-place leaf and releases it. On any failure the
+    // snapshots not yet released are disposed before the error propagates, so none outlives the call.
+    private void RestoreInPlaceLeaves(DirectGpuTensorEngine gte, Engines.DirectGpu.IGpuBuffer?[] snapshots)
+    {
+        try
+        {
+            for (int i = 0; i < snapshots.Length; i++)
+            {
+                if (snapshots[i] is not { } snapshot) continue;
+                if (!ReferenceEquals(_inPlaceLeaves[i]._gpuBuffer, _capturedInPlaceBuffers[i]))
+                    throw new InvalidOperationException("An in-place write moved its tensor to another device buffer; the graph cannot replay it.");
+                snapshots[i] = null;
+                gte.RestoreDeviceSnapshot(snapshot, _capturedInPlaceBuffers[i], _inPlaceLeaves[i].Length);
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < snapshots.Length; i++)
+            {
+                if (snapshots[i] is not { } leftover) continue;
+                snapshots[i] = null;
+                leftover.Dispose();
+            }
+        }
+    }
+
+    // An abandoned capture leaves the plan eager: its input slots, pinned to buffers only a graph replay refreshes,
+    // must go back to the engine's ordinary upload path (SetInputs writes the host copy only).
+    // An in-place step writes the tensor it also reads (see CompiledTrainingPlan.IsInPlaceState).
+    private static bool IsInPlaceStep(CompiledStep<T> step)
+    {
+        foreach (var input in step.Inputs)
+            if (ReferenceEquals(input, step.OutputBuffer)) return true;
+        return false;
+    }
+
+    private void UnpinInputs(DirectGpuTensorEngine gte)
+    {
+        foreach (var input in _compiledInputTensors.Where(input => input is not null))
+            gte.UnpinInput(input);
+    }
+
+    // Runs the first count steps with this plan's scratch pool current, each step its own pool action, so a step's
+    // outputs and temporaries come back at the same addresses on every pooled run (the capture records the
+    // pre-residency pass's buffers).
+    private void RunStepsPooled(DirectGpuTensorEngine gte, IEngine engine, CompiledStep<T>[] steps, int count)
+    {
+        var outer = DirectGpuTensorEngine.EnterScratchPool(_captureScratchPool ??= gte.CreateScratchPool());
+        try
+        {
+            // A full run of a plan with several states writes them together: one copy launch (one captured graph node)
+            // instead of one copy per state. ValidateStateStepsSurvived guarantees the state writes are the last steps.
+            int states = count == steps.Length && _stateTensors.Length >= 2 ? _stateTensors.Length : 0;
+            for (int i = 0; i < count - states; i++)
+            {
+                gte.SetCurrentScratchAction(i);
+                steps[i].Execute(engine, steps[i].OutputBuffer);
+            }
+            if (states > 0)
+            {
+                gte.SetCurrentScratchAction(count - states);
+                var targets = new Tensor<T>[states];
+                var nexts = new Tensor<T>[states];
+                for (int k = 0; k < states; k++)
+                {
+                    var step = steps[count - states + k];
+                    targets[k] = step.OutputBuffer;
+                    nexts[k] = step.Inputs[0];
+                }
+                gte.AssignStatesInPlace(targets, nexts);
+            }
+        }
+        finally
+        {
+            gte.SetCurrentScratchAction(-1);
+            DirectGpuTensorEngine.RestoreScratchPool(outer);
+        }
+    }
+
     // A replayed graph wrote the states on the device without host bookkeeping: re-mark each device-resident so a
     // host read downloads this execution's value.
     private void RearmStates()
     {
-        if (_capturedStateBuffers.Length == 0 || _graphEngine is not { } gte) return;
+        if (_graphEngine is not { } gte) return;
+        for (int i = 0; i < _inPlaceLeaves.Length; i++)
+        {
+            gte.RearmStateAfterReplay(_inPlaceLeaves[i], _capturedInPlaceBuffers[i]);
+            _capturedInPlaceVersions[i] = _inPlaceLeaves[i].GpuCacheVersion;
+        }
+        if (_capturedStateBuffers.Length == 0) return;
         for (int i = 0; i < _stateTensors.Length; i++)
         {
             gte.RearmStateAfterReplay(_stateTensors[i], _capturedStateBuffers[i]);
@@ -1134,8 +1293,30 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 throw new InvalidOperationException(
                     $"Captured-graph input {i} resident buffer (size {buf.Size}) is smaller than its host data " +
                     $"({data.Length}); cannot refresh in place.");
-            cb.UploadBufferInPlace((float[])(object)data, buf);
-            inT._gpuBufferVersion = inT.GpuCacheVersion;
+            if (data is not float[] host)
+                throw new InvalidOperationException($"Captured-graph input {i} is not a float tensor; cannot refresh in place.");
+            if (_uploadedInputs.Length != inputs.Length)
+            {
+                _uploadedInputs = new float[]?[inputs.Length];
+                _uploadedInputHandles = new IntPtr[inputs.Length];
+                _uploadedInputVersions = new int[inputs.Length];
+            }
+            int version = inT.GpuCacheVersion;
+            // Bitwise comparison: host writes through spans do not all advance the version, so the data itself
+            // decides (and -0 vs +0 or one NaN payload vs another is a change).
+            if (_uploadedInputs[i] is { } last && _uploadedInputHandles[i] == buf.Handle && _uploadedInputVersions[i] == version
+                && System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(host.AsSpan())
+                    .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(last.AsSpan())))
+            {
+                Interlocked.Increment(ref _inputUploadsSkipped);
+                continue;
+            }
+            cb.UploadBufferInPlace(host, buf);
+            inT._gpuBufferVersion = version;
+            if (_uploadedInputs[i] is not { } copy || copy.Length != host.Length) _uploadedInputs[i] = copy = new float[host.Length];
+            host.AsSpan().CopyTo(copy);
+            _uploadedInputHandles[i] = buf.Handle;
+            _uploadedInputVersions[i] = version;
         }
     }
 
@@ -1150,7 +1331,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     {
         var eng = _graphEngine ?? _engine.As<DirectGpuTensorEngine>();
         if (eng is null) return false;
-        var data = eng.DownloadResidentBuffer(_finalOutput);
+        var data = _capturedOutputBuffer is { } captured
+            ? eng.DownloadCapturedBuffer(captured, _finalOutput.Length)
+            : eng.DownloadResidentBuffer(_finalOutput);
         if (data is null) return false;
         var src = (T[])(object)data;
         using var dstLease = _finalOutput.LeaseWritable();
@@ -1332,6 +1515,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             var disposedEngine = _graphEngine; BestEffortTeardown(() => disposedEngine.EndGraphLifetime(), "end the graph lifetime on dispose");
             _graphEvictionSuspended = false;
         }
+        if (_captureScratchPool is { } capturePool)
+        {
+            BestEffortTeardown(capturePool.Release, "free the capture scratch pool on dispose");
+            _captureScratchPool = null;
+        }
 
         // Tear down the cached execution stream BEFORE freeing pinned
         // handles — the stream's worker thread might still be draining
@@ -1509,13 +1697,25 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 explicitOutput = last.GetInputsArray()[0];
         }
 
-        var compiler = new LazyGraphCompiler();
-        List<ILazyNode> optimized;
-        var priorDynamic = SparseLinearFusionPattern.t_dynamicLeaves;
+        // A stateful plan reads each next state once more, in its trailing state write (appended after compilation):
+        // fusion must keep those values observable rather than fold them into a consumer.
+        HashSet<ILazyNode>? observableNodes = null;
         if (stateUpdates is { Count: > 0 })
         {
+            observableNodes = new HashSet<ILazyNode>(stateUpdates.Select(update => update.Next?.LazySource).OfType<ILazyNode>());
+        }
+        if (explicitOutput?.LazySource is ILazyNode primaryNode)
+            (observableNodes ??= new HashSet<ILazyNode>()).Add(primaryNode);
+        var compiler = new LazyGraphCompiler(observableOutputs: observableNodes);
+        List<ILazyNode> optimized;
+        var priorDynamic = SparseLinearFusionPattern.t_dynamicLeaves;
+        if (explicitInput is not null || explicitInputs is not null || stateUpdates is { Count: > 0 })
+        {
             var dynamicLeaves = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
-            dynamicLeaves.UnionWith(stateUpdates.Select(update => update.State).Where(state => state is not null));
+            if (priorDynamic is not null) dynamicLeaves.UnionWith(priorDynamic);
+            if (explicitInput is not null) dynamicLeaves.Add(explicitInput);
+            if (explicitInputs is not null) dynamicLeaves.UnionWith(explicitInputs);
+            if (stateUpdates is not null) dynamicLeaves.UnionWith(stateUpdates.Select(update => update.State).Where(state => state is not null));
             SparseLinearFusionPattern.t_dynamicLeaves = dynamicLeaves;
         }
         try { optimized = compiler.Compile(scope.Nodes); }
@@ -1720,7 +1920,6 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             }
 
             bool allowCachedB = !IsMutableSecondMatMulInput(step, mutableInputs, producedStorages);
-            MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
             var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
             if (specialized != null)
             {
@@ -1742,7 +1941,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
 
         // Run CPU-level optimization passes (spectral decomposition, dataflow fusion)
-        var optimizedSteps = hostSpecialize ? RunCpuOptimizationPasses(specializedSteps, engine) : specializedSteps;
+        var optimizedSteps = hostSpecialize ? RunCpuOptimizationPasses(specializedSteps, engine, protectedOutputs) : specializedSteps;
 
         // Clear LazySource on all compiled output tensors to prevent auto-materialization
         // from re-triggering lazy graph execution after compilation
@@ -1969,28 +2168,6 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     }
 
     /// <summary>
-    /// When a compiled matmul's second operand B is a frozen constant weight (not the mutable
-    /// input, i.e. <paramref name="allowCachedB"/> is true), register it in the process-wide
-    /// <see cref="AiDotNet.Tensors.Engines.BlasManaged.FrozenWeightRegistry"/> so the eager
-    /// TensorMatMul path adopts a pre-packed B (via WeightPackCache) instead of re-packing the
-    /// weight on every Execute. Nothing populated that registry before, so TryGetHandle always
-    /// missed and compiled-replay re-packed B per call (~14% of the compiled hot path). Only rank-2
-    /// float/double weights are packable; anything else (or a failure) simply falls back to the
-    /// existing re-pack. B's tensor identity is stable across Execute() calls for a frozen weight,
-    /// which is exactly what the identity-keyed registry needs.
-    /// </summary>
-    private static void MaybeRegisterFrozenMatMulWeight(CompiledStep<T> step, bool allowCachedB)
-    {
-        if (!allowCachedB || step.OpType != OpType.TensorMatMul || step.Inputs.Length < 2) return;
-        var b = step.Inputs[1];
-        if (b is { Rank: 2 } && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
-        {
-            try { AiDotNet.Tensors.Engines.BlasManaged.FrozenWeightRegistry.Register(b); }
-            catch { /* best effort: unregistered B just re-packs, same as before */ }
-        }
-    }
-
-    /// <summary>
     /// Pre-specialization passes: all passes that mutate the step list
     /// (reorder, fuse, eliminate, rebind) must run before specialization
     /// pins raw pointers. Mirrors the same enable flags used by the
@@ -2021,8 +2198,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (reordering.IsEnabled && reordering.TryOptimize(arr, engine) is { } reordered)
             arr = reordered;
 
+        // Memory planning shares host storage between tensors whose lifetimes do not overlap. On the GPU engine that
+        // saves host memory only, and the engine caches device buffers per host backing array, so tenants of one array
+        // can share device state. Measured: with it, a stacked recurrent decode's later layers read an earlier layer's
+        // values (wrong next states); without it, they match the CPU engine. GPU plans skip it.
         var memoryPlanning = new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass();
-        if (memoryPlanning.IsEnabled &&
+        if (memoryPlanning.IsEnabled && !engine.TryGet<DirectGpuTensorEngine>(out _) &&
             memoryPlanning.TryOptimize(arr, engine, protectedOutputs) is { } memoryPlanned)
             arr = memoryPlanned;
 
@@ -2034,7 +2215,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// Currently: spectral decomposition (Phase A) and dataflow fusion (Phase B).
     /// Each pass is independently toggleable via TensorCodecOptions.
     /// </summary>
-    private static CompiledStep<T>[] RunCpuOptimizationPasses(CompiledStep<T>[] steps, IEngine engine)
+    private static CompiledStep<T>[] RunCpuOptimizationPasses(CompiledStep<T>[] steps, IEngine engine, List<Tensor<T>> protectedOutputs)
     {
         // A/B testing showed that optimization passes have net NEGATIVE value for small-to-medium
         // inference plans. The raw compiled plan (direct BLAS/SIMD dispatch) is already 300-4500x
@@ -2075,12 +2256,20 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             new TileSchedulingPass(),     // L1/L2 tile sizing for GEMM/Conv (#182)
         };
 
+        // The fusion passes build host kernels over the steps' host arrays: in a GPU engine's plan those arrays are not
+        // authoritative (a device-resident value, a state the plan writes on the device), so only the device-agnostic
+        // passes, which keep the engine's own steps, run there.
+        bool gpuPlan = engine.TryGet<DirectGpuTensorEngine>(out _);
         var current = steps;
         foreach (var pass in passes)
         {
             if (!pass.IsEnabled) continue;
-            var optimized = pass.TryOptimize(current, engine);
-            if (optimized != null)
+            if (gpuPlan && pass is not (ConstantFoldingPass or ForwardCSEPass)) continue;
+            var optimized = pass is PointwiseFusionPass pointwise
+                ? pointwise.TryOptimize(current, engine, protectedOutputs) : pass.TryOptimize(current, engine);
+            if (optimized != null && protectedOutputs.All(output =>
+                    !current.Any(step => ReferenceEquals(step.OutputBuffer, output))
+                    || optimized.Any(step => ReferenceEquals(step.OutputBuffer, output))))
                 current = optimized;
         }
         return current;

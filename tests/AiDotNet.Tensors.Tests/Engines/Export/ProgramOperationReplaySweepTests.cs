@@ -100,7 +100,7 @@ public class ProgramOperationReplaySweepTests : IDisposable
                 // adjacency, a host object) are outside the closed wire format.
                 // Check that these fail explicitly rather than silently freezing their values into a trace.
                 bool nonPortable = name is "MaxPool2DWithIndices" or "MaxPool3DWithIndices"
-                    or "NativeSpectralFilter" or "NativeSpectralFilterBatch"
+                    or "NativeSpectralFilter" or "NativeSpectralFilterBatch" or "GraphAttentionCsr"
                     || (name == "ReduceMax" && method.GetParameters().Any(p => p.ParameterType.IsByRef))
                     || args.Any(x => x is Tensor<Bit> or CsrGraph);
                 if (nonPortable)

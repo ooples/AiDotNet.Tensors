@@ -28,26 +28,24 @@ public enum NvrtcResult
 
 internal static class NvrtcNativeBindings
 {
-    private static bool _availabilityChecked;
-    private static INvrtcApi? _api;
+    // Probed once under ExecutionAndPublication so concurrent worker threads wait for EnsureCudaOnPath + ResolveApi
+    // rather than observing a null _api while the first caller is still loading nvrtc from disk (rtx1000ada-cuda,
+    // run 44924687443: 23 parallel DirectGpu tests skipped with "NVRTC is not installed" while the remaining 6,634
+    // passed in the same process).
+    private static readonly Lazy<INvrtcApi?> s_api = CreateApiProbe(InitializeApi);
 
-    public static bool IsAvailable
+    internal static Lazy<T> CreateApiProbe<T>(Func<T> probe)
+        => new(probe, System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+
+    public static bool IsAvailable => s_api.Value != null;
+
+    private static INvrtcApi? InitializeApi()
     {
-        get
-        {
-            EnsureInitialized();
-            return _api != null;
-        }
-    }
-
-    private static void EnsureInitialized()
-    {
-        if (_availabilityChecked)
-            return;
-
-        _availabilityChecked = true;
+#if NET5_0_OR_GREATER
+        AiDotNet.Tensors.Engines.GpuDriverCrossPlatformResolver.EnsureRegistered();
+#endif
         EnsureCudaOnPath();
-        _api = ResolveApi();
+        return ResolveApi();
     }
 
     /// <summary>
@@ -68,8 +66,12 @@ internal static class NvrtcNativeBindings
 
         var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
 
-        // On Windows, also check system environment variables directly
-        // (some shells like git bash don't inherit system env vars)
+        // On Windows, also check user and system environment variables directly
+        // (some shells and service hosts don't inherit user/machine env vars)
+        if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.User);
+        }
         if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
@@ -267,14 +269,7 @@ internal static class NvrtcNativeBindings
         }
     }
 
-    private static INvrtcApi Api
-    {
-        get
-        {
-            EnsureInitialized();
-            return _api ?? throw new DllNotFoundException("NVRTC library not found.");
-        }
-    }
+    private static INvrtcApi Api => s_api.Value ?? throw new DllNotFoundException("NVRTC library not found.");
 
     public static NvrtcResult nvrtcVersion(out int major, out int minor)
     {

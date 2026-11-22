@@ -19,10 +19,10 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// The fused Gated DeltaNet BPTT backward of every backend that implements
-/// <see cref="IGatedDeltaNetBackwardBackend"/>, driven directly rather than through whichever backend the engine
-/// picked: all five gradients must match the managed backward, and the launch must move nothing across the
-/// host-device boundary.
+/// The fused Gated DeltaNet scan of every backend that implements <see cref="IGatedDeltaNetBackwardBackend"/> and
+/// <see cref="IGatedDeltaRuleForwardBackend"/>, driven directly rather than through whichever backend the engine picked,
+/// under both <see cref="GatedDeltaRule"/>s: the forward output and all five gradients must match the managed scan, and
+/// the backward launch must move nothing across the host-device boundary.
 /// </summary>
 [Collection("DirectGpuSerial")]
 public sealed class GatedDeltaNetScanBackwardBackendParityTests
@@ -47,15 +47,18 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
         var saved = BlasProvider.GetThreadLocalDeterministicMode();
         try
         {
-            BlasProvider.SetThreadLocalDeterministicMode(false);
-            CheckOnce(backend);
-            BlasProvider.SetThreadLocalDeterministicMode(true);
-            var first = CheckOnce(backend);
-            var second = CheckOnce(backend);
-            for (int g = 0; g < first.Length; g++)
-                for (int i = 0; i < first[g].Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(first[g][i]) == BitConverter.SingleToInt32Bits(second[g][i]),
-                        $"deterministic mode gave gradient {g} element {i} as {first[g][i]:R}, then {second[g][i]:R}");
+            foreach (var rule in new[] { GatedDeltaRule.ScaledKeys, GatedDeltaRule.Standard })
+            {
+                BlasProvider.SetThreadLocalDeterministicMode(false);
+                CheckOnce(backend, rule);
+                BlasProvider.SetThreadLocalDeterministicMode(true);
+                var first = CheckOnce(backend, rule);
+                var second = CheckOnce(backend, rule);
+                for (int g = 0; g < first.Length; g++)
+                    for (int i = 0; i < first[g].Length; i++)
+                        Assert.True(BitConverter.SingleToInt32Bits(first[g][i]) == BitConverter.SingleToInt32Bits(second[g][i]),
+                            $"{rule}: deterministic mode gave gradient {g} element {i} as {first[g][i]:R}, then {second[g][i]:R}");
+            }
         }
         finally
         {
@@ -63,9 +66,13 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
         }
     }
 
-    private static float[][] CheckOnce(IDirectGpuBackend backend)
+    private static float[][] CheckOnce(IDirectGpuBackend backend, GatedDeltaRule rule)
     {
         var gdn = Assert.IsAssignableFrom<IGatedDeltaNetBackwardBackend>(backend);
+        var forward = Assert.IsAssignableFrom<IGatedDeltaRuleForwardBackend>(backend);
+        // The kernels' terms of each rule: the key scale, and whether the prediction reads the decayed state.
+        float keyScale = rule == GatedDeltaRule.Standard ? 1f : GatedDeltaNetBackwardResolver.OriginalKeyScale(HeadDim);
+        bool decayFirst = rule == GatedDeltaRule.Standard;
         int n = Batch * SeqLen * ModelDim, ng = Batch * SeqLen * NumHeads;
         int[] shape = { Batch, SeqLen, ModelDim }, gateShape = { Batch, SeqLen, NumHeads };
         var host = new[]
@@ -79,9 +86,11 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
         var cpu = new CpuEngine();
         var inputs = host.Select((h, i) => new Tensor<float>(h, i < 3 ? shape : gateShape)).ToArray();
         var expected = new float[5][];
+        float[] expectedOut;
         using (var tape = new GradientTape<float>())
         {
-            var output = cpu.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], NumHeads);
+            var output = cpu.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], NumHeads, rule);
+            expectedOut = output.ToArray();
             var loss = cpu.ReduceSum(cpu.TensorMultiply(output, new Tensor<float>(dOut, shape)), null);
             var grads = tape.ComputeGradients(loss, inputs);
             for (int i = 0; i < 5; i++) expected[i] = grads[inputs[i]].ToArray();
@@ -90,14 +99,23 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
         var bufs = host.Select(backend.AllocateBuffer).ToArray();
         using var dOutB = backend.AllocateBuffer(dOut);
         var gradBufs = new[] { n, n, n, ng, ng }.Select(backend.AllocateBuffer).ToArray();
+        using var outB = backend.AllocateBuffer(n);
         try
         {
+            forward.GatedDeltaNetScanForward(bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], outB,
+                Batch, SeqLen, ModelDim, NumHeads, HeadDim, keyScale, decayFirst);
+            var gotOut = backend.DownloadBuffer(outB);
+            double outScale = Math.Max(expectedOut.Max(Math.Abs), 1e-6);
+            for (int i = 0; i < n; i++)
+                Assert.True(Math.Abs(expectedOut[i] - gotOut[i]) <= 2e-4 * outScale,
+                    $"{rule} out[{i}]: cpu {expectedOut[i]}, gpu {gotOut[i]} (scale {outScale})");
+
             GpuResidencyScope scope;
             using (scope = GpuResidencyScope.Begin(captureOperations: true))
             {
                 gdn.GatedDeltaNetScanBackward(dOutB, bufs[0], bufs[1], bufs[2], bufs[3], bufs[4],
                     gradBufs[0], gradBufs[1], gradBufs[2], gradBufs[3], gradBufs[4],
-                    Batch, SeqLen, ModelDim, NumHeads, HeadDim);
+                    Batch, SeqLen, ModelDim, NumHeads, HeadDim, keyScale, decayFirst);
             }
             Assert.True(scope.Uploads + scope.Downloads == 0,
                 "the scan backward crossed the host-device boundary: "
@@ -111,7 +129,7 @@ public sealed class GatedDeltaNetScanBackwardBackendParityTests
                 double scale = Math.Max(expected[g].Max(Math.Abs), 1e-6);
                 for (int i = 0; i < expected[g].Length; i++)
                     Assert.True(Math.Abs(expected[g][i] - actual[i]) <= 2e-4 * scale,
-                        $"{names[g]}[{i}]: cpu {expected[g][i]}, gpu {actual[i]} (scale {scale})");
+                        $"{rule} {names[g]}[{i}]: cpu {expected[g][i]}, gpu {actual[i]} (scale {scale})");
                 results[g] = actual;
             }
             return results;

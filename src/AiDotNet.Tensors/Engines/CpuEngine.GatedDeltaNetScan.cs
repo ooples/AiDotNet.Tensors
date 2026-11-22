@@ -37,6 +37,17 @@ public partial class CpuEngine
     /// <returns>The delta-rule output [batch, seqLen, modelDim].</returns>
     public virtual Tensor<T> GatedDeltaNetScanForward<T>(
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads)
+        => GatedDeltaNetScanForward(qProj, kProj, vProj, alpha, beta, numHeads, GatedDeltaRule.ScaledKeys);
+
+    /// <summary>
+    /// The fused Gated DeltaNet scan under the given <paramref name="rule"/> (see <see cref="GatedDeltaRule"/>):
+    /// <see cref="GatedDeltaRule.Standard"/> is the paper's <c>S_t = a_t S_{t-1} (I - b_t k_t k_tᵀ) + b_t v_t k_tᵀ</c>
+    /// with the keys used as given; <see cref="GatedDeltaRule.ScaledKeys"/> is the rule of the overload without it.
+    /// The output is <c>o_t = S_t q_t</c>; differentiable (forward + analytic BPTT backward).
+    /// </summary>
+    public virtual Tensor<T> GatedDeltaNetScanForward<T>(
+        Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> alpha, Tensor<T> beta, int numHeads,
+        GatedDeltaRule rule)
     {
         if (qProj is null) throw new ArgumentNullException(nameof(qProj));
         if (kProj is null) throw new ArgumentNullException(nameof(kProj));
@@ -44,6 +55,8 @@ public partial class CpuEngine
         if (alpha is null) throw new ArgumentNullException(nameof(alpha));
         if (beta is null) throw new ArgumentNullException(nameof(beta));
         if (numHeads < 1) throw new ArgumentOutOfRangeException(nameof(numHeads));
+        if (rule is not (GatedDeltaRule.ScaledKeys or GatedDeltaRule.Standard))
+            throw new ArgumentOutOfRangeException(nameof(rule), rule, "Unknown GatedDeltaRule.");
         if (qProj.Rank != 3)
             throw new ArgumentException($"GatedDeltaNetScanForward expects rank-3 q/k/v [batch, seqLen, modelDim]; got rank {qProj.Rank}.", nameof(qProj));
 
@@ -68,6 +81,7 @@ public partial class CpuEngine
             var capturedAlpha = alpha;
             var capturedBeta = beta;
             int capturedNumHeads = numHeads;
+            var capturedRule = rule;
             return scope.RecordVariadic(
                 LazyNodeType.Custom,
                 "GatedDeltaNetScan",
@@ -76,14 +90,15 @@ public partial class CpuEngine
                 (eng, output) =>
                 {
                     var result = eng.GatedDeltaNetScanForward(
-                        capturedQ, capturedK, capturedV, capturedAlpha, capturedBeta, capturedNumHeads);
+                        capturedQ, capturedK, capturedV, capturedAlpha, capturedBeta, capturedNumHeads, capturedRule);
                     DirectGpuTensorEngine.CopyResultInto(eng, result, output);
                 },
                 GatedDeltaNetScanBackward<T>,
-                new object[] { numHeads });
+                new object[] { numHeads, rule });
         }
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
+        var (keyScale, decayFirst) = GatedDeltaRuleTerms(rule, headDim);
 
         if (typeof(T) == typeof(double))
         {
@@ -91,7 +106,7 @@ public partial class CpuEngine
                 (double[])(object)qProj.GetDataArray(), (double[])(object)kProj.GetDataArray(),
                 (double[])(object)vProj.GetDataArray(), (double[])(object)alpha.GetDataArray(),
                 (double[])(object)beta.GetDataArray(), (double[])(object)output.GetDataArray(),
-                batch, seqLen, modelDim, numHeads, headDim);
+                batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -99,33 +114,41 @@ public partial class CpuEngine
                 (float[])(object)qProj.GetDataArray(), (float[])(object)kProj.GetDataArray(),
                 (float[])(object)vProj.GetDataArray(), (float[])(object)alpha.GetDataArray(),
                 (float[])(object)beta.GetDataArray(), (float[])(object)output.GetDataArray(),
-                batch, seqLen, modelDim, numHeads, headDim);
+                batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst);
         }
         else
         {
             GatedDeltaForwardGeneric<T>(
                 qProj.GetDataArray(), kProj.GetDataArray(), vProj.GetDataArray(),
                 alpha.GetDataArray(), beta.GetDataArray(), output.GetDataArray(),
-                batch, seqLen, modelDim, numHeads, headDim);
+                batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst);
         }
 
         DifferentiableOps.RecordIfActive<T>(
             "GatedDeltaNetScan", output,
             new[] { qProj, kProj, vProj, alpha, beta },
             GatedDeltaNetScanBackward<T>,
-            savedState: new object[] { numHeads });
+            savedState: new object[] { numHeads, rule });
 
         return output;
     }
+
+    /// <summary>The kernels' two rule terms: the key scale, and whether the prediction reads the decayed state.</summary>
+    internal static (double KeyScale, bool DecayFirst) GatedDeltaRuleTerms(GatedDeltaRule rule, int headDim)
+        => rule == GatedDeltaRule.Standard ? (1.0, true) : (1.0 / Math.Sqrt(headDim), false);
+
+    /// <summary>The rule a recorded scan node saved (a node saved with only the head count is the original rule).</summary>
+    internal static GatedDeltaRule SavedGatedDeltaRule(object[] savedState)
+        => savedState.Length > 1 && savedState[1] is GatedDeltaRule rule ? rule : GatedDeltaRule.ScaledKeys;
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
     [MethodImpl(Hot)]
     private static void GatedDeltaForwardDouble(
         double[] Q, double[] K, double[] V, double[] A, double[] B, double[] outp,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, double keyScale, bool decayFirst)
     {
         int hh = headDim * headDim;
-        double kappa = 1.0 / Math.Sqrt(headDim);
+        double kappa = keyScale;
         // Each (batch, head) pair is independent (private state/scratch, disjoint outputs); parallelize
         // lock-free over the combined (b*numHeads) axis. See GlaForwardDouble.
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
@@ -144,7 +167,7 @@ public partial class CpuEngine
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    double a = A[gIdx], bet = B[gIdx];
+                    double a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : 1.0;
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
 
                     for (int di = 0; di < headDim; di++)
@@ -157,7 +180,7 @@ public partial class CpuEngine
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
-                        double delta = V[baseOff + di] - sK[di];
+                        double delta = V[baseOff + di] - pa * sK[di];
                         double bd = bet * delta;
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = a * S[srow + ki] + bd * kS[ki];
@@ -178,10 +201,10 @@ public partial class CpuEngine
     private static void GatedDeltaBackwardDouble(
         double[] dOut, double[] Q, double[] K, double[] V, double[] A, double[] B,
         double[] dQ, double[] dK, double[] dV, double[] dA, double[] dB,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, double keyScale, bool decayFirst)
     {
         int hh = headDim * headDim;
-        double kappa = 1.0 / Math.Sqrt(headDim);
+        double kappa = keyScale;
         // Lock-free over the independent (b*numHeads) axis with per-chunk scratch; see GlaBackwardDouble.
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
@@ -207,14 +230,14 @@ public partial class CpuEngine
                     Array.Copy(S, 0, Straj, t * hh, hh);
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    double a = A[gIdx], bet = B[gIdx];
+                    double a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : 1.0;
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
                         double s = 0.0;
                         for (int ki = 0; ki < headDim; ki++) s += S[srow + ki] * kS[ki];
-                        double delta = V[baseOff + di] - s;
+                        double delta = V[baseOff + di] - pa * s;
                         double bd = bet * delta;
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = a * S[srow + ki] + bd * kS[ki];
@@ -227,7 +250,7 @@ public partial class CpuEngine
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    double a = A[gIdx], bet = B[gIdx];
+                    double a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : 1.0;
                     var Sp = Straj; int spOff = t * hh; // pre-update state S_{t-1}
 
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
@@ -245,7 +268,7 @@ public partial class CpuEngine
                     {
                         int srow = di * headDim;
                         double dOutVal = dOut[baseOff + di];
-                        double delta = V[baseOff + di] - sK[di];
+                        double delta = V[baseOff + di] - pa * sK[di];
                         double bd = bet * delta;
                         for (int ki = 0; ki < headDim; ki++)
                         {
@@ -263,7 +286,7 @@ public partial class CpuEngine
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
-                        double delta = V[baseOff + di] - sK[di];
+                        double delta = V[baseOff + di] - pa * sK[di];
                         for (int ki = 0; ki < headDim; ki++)
                         {
                             double dSt = dS[srow + ki];
@@ -279,11 +302,12 @@ public partial class CpuEngine
                     {
                         int srow = di * headDim;
                         dV[baseOff + di] += dDelta[di];
-                        double dSk = -dDelta[di];
+                        double dSk = -dDelta[di], dSkP = dSk * pa;
+                        if (decayFirst) dA_acc += dSk * sK[di];
                         for (int kj = 0; kj < headDim; kj++)
                         {
-                            dSp[srow + kj] += dSk * kS[kj];
-                            dKS[kj] += dSk * Sp[spOff + srow + kj];
+                            dSp[srow + kj] += dSkP * kS[kj];
+                            dKS[kj] += dSkP * Sp[spOff + srow + kj];
                         }
                     }
                     // kS[ki] = kappa * K[ki].
@@ -303,10 +327,10 @@ public partial class CpuEngine
     [MethodImpl(Hot)]
     private static void GatedDeltaForwardFloat(
         float[] Q, float[] K, float[] V, float[] A, float[] B, float[] outp,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, double keyScale, bool decayFirst)
     {
         int hh = headDim * headDim;
-        float kappa = (float)(1.0 / Math.Sqrt(headDim));
+        float kappa = (float)keyScale;
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var S = new float[hh];
@@ -323,7 +347,7 @@ public partial class CpuEngine
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    float a = A[gIdx], bet = B[gIdx];
+                    float a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : 1f;
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
 
                     for (int di = 0; di < headDim; di++)
@@ -336,7 +360,7 @@ public partial class CpuEngine
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
-                        float delta = V[baseOff + di] - sK[di];
+                        float delta = V[baseOff + di] - pa * sK[di];
                         float bd = bet * delta;
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = a * S[srow + ki] + bd * kS[ki];
@@ -357,10 +381,10 @@ public partial class CpuEngine
     private static void GatedDeltaBackwardFloat(
         float[] dOut, float[] Q, float[] K, float[] V, float[] A, float[] B,
         float[] dQ, float[] dK, float[] dV, float[] dA, float[] dB,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, double keyScale, bool decayFirst)
     {
         int hh = headDim * headDim;
-        float kappa = (float)(1.0 / Math.Sqrt(headDim));
+        float kappa = (float)keyScale;
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var Straj = new float[(seqLen + 1) * hh];
@@ -384,14 +408,14 @@ public partial class CpuEngine
                     Array.Copy(S, 0, Straj, t * hh, hh);
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    float a = A[gIdx], bet = B[gIdx];
+                    float a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : 1f;
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
                         float s = 0f;
                         for (int ki = 0; ki < headDim; ki++) s += S[srow + ki] * kS[ki];
-                        float delta = V[baseOff + di] - s;
+                        float delta = V[baseOff + di] - pa * s;
                         float bd = bet * delta;
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = a * S[srow + ki] + bd * kS[ki];
@@ -403,7 +427,7 @@ public partial class CpuEngine
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    float a = A[gIdx], bet = B[gIdx];
+                    float a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : 1f;
                     var Sp = Straj; int spOff = t * hh;
 
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = K[baseOff + ki] * kappa;
@@ -419,7 +443,7 @@ public partial class CpuEngine
                     {
                         int srow = di * headDim;
                         float dOutVal = dOut[baseOff + di];
-                        float delta = V[baseOff + di] - sK[di];
+                        float delta = V[baseOff + di] - pa * sK[di];
                         float bd = bet * delta;
                         for (int ki = 0; ki < headDim; ki++)
                         {
@@ -436,7 +460,7 @@ public partial class CpuEngine
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
-                        float delta = V[baseOff + di] - sK[di];
+                        float delta = V[baseOff + di] - pa * sK[di];
                         for (int ki = 0; ki < headDim; ki++)
                         {
                             float dSt = dS[srow + ki];
@@ -451,11 +475,12 @@ public partial class CpuEngine
                     {
                         int srow = di * headDim;
                         dV[baseOff + di] += dDelta[di];
-                        float dSk = -dDelta[di];
+                        float dSk = -dDelta[di], dSkP = dSk * pa;
+                        if (decayFirst) dA_acc += dSk * sK[di];
                         for (int kj = 0; kj < headDim; kj++)
                         {
-                            dSp[srow + kj] += dSk * kS[kj];
-                            dKS[kj] += dSk * Sp[spOff + srow + kj];
+                            dSp[srow + kj] += dSkP * kS[kj];
+                            dKS[kj] += dSkP * Sp[spOff + srow + kj];
                         }
                     }
                     for (int ki = 0; ki < headDim; ki++) dK[baseOff + ki] += dKS[ki] * kappa;
@@ -472,11 +497,11 @@ public partial class CpuEngine
     // ── Generic-T path ───────────────────────────────────────────────────────────────────
     private static void GatedDeltaForwardGeneric<T>(
         T[] Q, T[] K, T[] V, T[] A, T[] B, T[] outp,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, double keyScale, bool decayFirst)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
-        T kappa = ops.FromDouble(1.0 / Math.Sqrt(headDim));
+        T kappa = ops.FromDouble(keyScale);
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
             var S = new T[hh];
@@ -493,7 +518,7 @@ public partial class CpuEngine
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    T a = A[gIdx], bet = B[gIdx];
+                    T a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : ops.One;
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = ops.Multiply(K[baseOff + ki], kappa);
                     for (int di = 0; di < headDim; di++)
                     {
@@ -505,7 +530,7 @@ public partial class CpuEngine
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
-                        T delta = ops.Subtract(V[baseOff + di], sK[di]);
+                        T delta = ops.Subtract(V[baseOff + di], ops.Multiply(pa, sK[di]));
                         T bd = ops.Multiply(bet, delta);
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = ops.Add(ops.Multiply(a, S[srow + ki]), ops.Multiply(bd, kS[ki]));
@@ -525,11 +550,11 @@ public partial class CpuEngine
     private static void GatedDeltaBackwardGeneric<T>(
         T[] dOut, T[] Q, T[] K, T[] V, T[] A, T[] B,
         T[] dQ, T[] dK, T[] dV, T[] dA, T[] dB,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, double keyScale, bool decayFirst)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         int hh = headDim * headDim;
-        T kappa = ops.FromDouble(1.0 / Math.Sqrt(headDim));
+        T kappa = ops.FromDouble(keyScale);
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
             var Straj = new T[(seqLen + 1) * hh];
@@ -552,14 +577,14 @@ public partial class CpuEngine
                     Array.Copy(S, 0, Straj, t * hh, hh);
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    T a = A[gIdx], bet = B[gIdx];
+                    T a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : ops.One;
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = ops.Multiply(K[baseOff + ki], kappa);
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
                         T s = ops.Zero;
                         for (int ki = 0; ki < headDim; ki++) s = ops.Add(s, ops.Multiply(S[srow + ki], kS[ki]));
-                        T delta = ops.Subtract(V[baseOff + di], s);
+                        T delta = ops.Subtract(V[baseOff + di], ops.Multiply(pa, s));
                         T bd = ops.Multiply(bet, delta);
                         for (int ki = 0; ki < headDim; ki++)
                             S[srow + ki] = ops.Add(ops.Multiply(a, S[srow + ki]), ops.Multiply(bd, kS[ki]));
@@ -571,7 +596,7 @@ public partial class CpuEngine
                 {
                     int baseOff = (b * seqLen + t) * modelDim + hOff;
                     int gIdx = (b * seqLen + t) * numHeads + h;
-                    T a = A[gIdx], bet = B[gIdx];
+                    T a = A[gIdx], bet = B[gIdx], pa = decayFirst ? a : ops.One;
                     int spOff = t * hh;
 
                     for (int ki = 0; ki < headDim; ki++) kS[ki] = ops.Multiply(K[baseOff + ki], kappa);
@@ -587,7 +612,7 @@ public partial class CpuEngine
                     {
                         int srow = di * headDim;
                         T dOutVal = dOut[baseOff + di];
-                        T delta = ops.Subtract(V[baseOff + di], sK[di]);
+                        T delta = ops.Subtract(V[baseOff + di], ops.Multiply(pa, sK[di]));
                         T bd = ops.Multiply(bet, delta);
                         for (int ki = 0; ki < headDim; ki++)
                         {
@@ -604,7 +629,7 @@ public partial class CpuEngine
                     for (int di = 0; di < headDim; di++)
                     {
                         int srow = di * headDim;
-                        T delta = ops.Subtract(V[baseOff + di], sK[di]);
+                        T delta = ops.Subtract(V[baseOff + di], ops.Multiply(pa, sK[di]));
                         for (int ki = 0; ki < headDim; ki++)
                         {
                             T dSt = dS[srow + ki];
@@ -619,11 +644,12 @@ public partial class CpuEngine
                     {
                         int srow = di * headDim;
                         dV[baseOff + di] = ops.Add(dV[baseOff + di], dDelta[di]);
-                        T dSk = ops.Negate(dDelta[di]);
+                        T dSk = ops.Negate(dDelta[di]), dSkP = ops.Multiply(dSk, pa);
+                        if (decayFirst) dA_acc = ops.Add(dA_acc, ops.Multiply(dSk, sK[di]));
                         for (int kj = 0; kj < headDim; kj++)
                         {
-                            dSp[srow + kj] = ops.Add(dSp[srow + kj], ops.Multiply(dSk, kS[kj]));
-                            dKS[kj] = ops.Add(dKS[kj], ops.Multiply(dSk, Straj[spOff + srow + kj]));
+                            dSp[srow + kj] = ops.Add(dSp[srow + kj], ops.Multiply(dSkP, kS[kj]));
+                            dKS[kj] = ops.Add(dKS[kj], ops.Multiply(dSkP, Straj[spOff + srow + kj]));
                         }
                     }
                     for (int ki = 0; ki < headDim; ki++) dK[baseOff + ki] = ops.Add(dK[baseOff + ki], ops.Multiply(dKS[ki], kappa));
@@ -646,11 +672,12 @@ public partial class CpuEngine
     /// </summary>
     /// <returns>dQ, dK, dV [batch, seqLen, modelDim] and dAlpha, dBeta [batch, seqLen, numHeads].</returns>
     private static Tensor<T>[] GatedDeltaNetScanGradRecorded<T>(
-        Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads, IEngine engine)
+        Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads, GatedDeltaRule rule, IEngine engine)
     {
         int batch = inputs[0].Shape[0], seqLen = inputs[0].Shape[1], modelDim = inputs[0].Shape[2];
         int headDim = modelDim / numHeads, bh = batch * numHeads;
-        var kappa = MathHelper.GetNumericOperations<T>().FromDouble(1.0 / Math.Sqrt(headDim));
+        var (keyScale, decayFirst) = GatedDeltaRuleTerms(rule, headDim);
+        var kappa = MathHelper.GetNumericOperations<T>().FromDouble(keyScale);
 
         // [batch, seqLen, modelDim] -> [batch*heads, seqLen, headDim]; [batch, seqLen, heads] -> [batch*heads, seqLen].
         Tensor<T> Heads(Tensor<T> x) => engine.Reshape(
@@ -673,11 +700,15 @@ public partial class CpuEngine
         var states = new Tensor<T>[seqLen + 1];
         var keys = new Tensor<T>[seqLen];
         var deltas = new Tensor<T>[seqLen];
+        // reads[t] = S_{t-1} k_t: the prediction, before the Standard rule's decay.
+        var reads = new Tensor<T>[seqLen];
         states[0] = new Tensor<T>(new[] { bh, headDim, headDim });
         for (int t = 0; t < seqLen; t++)
         {
             keys[t] = engine.TensorMultiplyScalar(Column(k, t), kappa);
-            deltas[t] = engine.TensorSubtract(Column(v, t), engine.BatchMatMul(states[t], keys[t]));
+            reads[t] = engine.BatchMatMul(states[t], keys[t]);
+            var prediction = decayFirst ? engine.TensorMultiply(Gate(a, t), reads[t]) : reads[t];
+            deltas[t] = engine.TensorSubtract(Column(v, t), prediction);
             states[t + 1] = engine.TensorAdd(
                 engine.TensorMultiply(Gate(a, t), states[t]),
                 engine.TensorMultiply(Gate(b, t), engine.BatchMatMul(deltas[t], Transposed(keys[t]))));
@@ -705,13 +736,18 @@ public partial class CpuEngine
             dV[t] = dDelta;
             dB[t] = engine.ReduceSum(engine.TensorMultiply(deltas[t], dSk), sumAxes, keepDims: false);
             dA[t] = engine.ReduceSum(engine.TensorMultiply(dS, previous), sumAxes, keepDims: false);
+            // Under the Standard rule the prediction is a S_{t-1} k, so its adjoint -dDelta carries the decay too.
+            var dPrediction = decayFirst ? engine.TensorMultiply(Gate(a, t), dDelta) : dDelta;
+            if (decayFirst)
+                dA[t] = engine.TensorSubtract(dA[t],
+                    engine.ReduceSum(engine.TensorMultiply(dDelta, reads[t]), sumAxes, keepDims: false));
             var dKey = engine.TensorSubtract(
                 engine.TensorMultiply(betaT, engine.BatchMatMul(Transposed(dS), deltas[t])),
-                engine.BatchMatMul(Transposed(previous), dDelta));
+                engine.BatchMatMul(Transposed(previous), dPrediction));
             dK[t] = engine.TensorMultiplyScalar(dKey, kappa);
             dS = engine.TensorSubtract(
                 engine.TensorMultiply(Gate(a, t), dS),
-                engine.BatchMatMul(dDelta, Transposed(keys[t])));
+                engine.BatchMatMul(dPrediction, Transposed(keys[t])));
         }
 
         // [batch*heads, seqLen, headDim] back to [batch, seqLen, modelDim]; [batch*heads, seqLen] to [batch, seqLen, heads].
@@ -736,16 +772,17 @@ public partial class CpuEngine
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
+        var rule = SavedGatedDeltaRule(savedState);
         // Under create-graph the gradients are themselves differentiated (a second-order meta-learner, a gradient
         // penalty), so they have to come from recorded ops: the fused kernels below record nothing.
         if (DifferentiableOps._isBackwardCreateGraph)
         {
-            var recorded = GatedDeltaNetScanGradRecorded(gradOutput, inputs, numHeads, engine);
+            var recorded = GatedDeltaNetScanGradRecorded(gradOutput, inputs, numHeads, rule, engine);
             for (int i = 0; i < 5; i++)
                 DifferentiableOps.AccumulateGrad(grads, inputs[i], recorded[i], engine);
             return;
         }
-        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && gpu.GatedDeltaNetScanBackwardGpu(gradOutput, inputs, numHeads, rule) is { } gpuGrads)
         {
             for (int i = 0; i < 5; i++)
                 DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);
@@ -761,6 +798,7 @@ public partial class CpuEngine
         int seqLen = qProj.Shape[1];
         int modelDim = qProj.Shape[2];
         int headDim = modelDim / numHeads;
+        var (keyScale, decayFirst) = GatedDeltaRuleTerms(rule, headDim);
 
         var dQ = new Tensor<T>(new[] { batch, seqLen, modelDim });
         var dK = new Tensor<T>(new[] { batch, seqLen, modelDim });
@@ -778,7 +816,7 @@ public partial class CpuEngine
                 (double[])(object)dQ.GetDataArray(), (double[])(object)dK.GetDataArray(),
                 (double[])(object)dV.GetDataArray(), (double[])(object)dA.GetDataArray(),
                 (double[])(object)dB.GetDataArray(),
-                batch, seqLen, modelDim, numHeads, headDim);
+                batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst);
         }
         else if (typeof(T) == typeof(float))
         {
@@ -790,7 +828,7 @@ public partial class CpuEngine
                 (float[])(object)dQ.GetDataArray(), (float[])(object)dK.GetDataArray(),
                 (float[])(object)dV.GetDataArray(), (float[])(object)dA.GetDataArray(),
                 (float[])(object)dB.GetDataArray(),
-                batch, seqLen, modelDim, numHeads, headDim);
+                batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst);
         }
         else
         {
@@ -800,7 +838,7 @@ public partial class CpuEngine
                 alpha.GetDataArray(), beta.GetDataArray(),
                 dQ.GetDataArray(), dK.GetDataArray(), dV.GetDataArray(),
                 dA.GetDataArray(), dB.GetDataArray(),
-                batch, seqLen, modelDim, numHeads, headDim);
+                batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst);
         }
 
         DifferentiableOps.AccumulateGrad(grads, qProj, dQ, engine);

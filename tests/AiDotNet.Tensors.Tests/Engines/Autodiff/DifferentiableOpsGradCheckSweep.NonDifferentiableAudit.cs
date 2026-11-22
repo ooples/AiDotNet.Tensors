@@ -124,6 +124,10 @@ public partial class DifferentiableOpsGradCheckSweep
         ["BatchNormInference"] = NoGradientReason.InferenceOnlyFastPath,
         ["FusedHierarchicalSoftmax"] = NoGradientReason.InferenceOnlyFastPath,
         ["FusedLinearMaxout"] = NoGradientReason.InferenceOnlyFastPath,
+        // Decode steps (forward only by contract): one position of a recurrence whose training form is the recorded
+        // whole-sequence op. A training trace that records one is refused (LazyTensorScope.RecordVariadicWritingInPlace).
+        ["GatedDeltaNetStep"] = NoGradientReason.InferenceOnlyFastPath,
+        ["CausalConv1dStep"] = NoGradientReason.InferenceOnlyFastPath,
         ["LstmSequenceForward"] = NoGradientReason.InferenceOnlyFastPath,
         ["MlpForward"] = NoGradientReason.InferenceOnlyFastPath,
         ["MultiHeadAttentionForward"] = NoGradientReason.InferenceOnlyFastPath,
@@ -172,8 +176,34 @@ public partial class DifferentiableOpsGradCheckSweep
         ["TensorMap"] = NotAuditableReason.ArbitraryUserDelegate,
     };
 
+    /// <summary>
+    /// The arguments an op writes in place (its carried state), by position. The audit calls each op many times with the
+    /// same arguments, so it puts these back after every call: otherwise each call would start from the state the
+    /// previous one left, and a deterministic op would look like a random draw.
+    /// </summary>
+    internal static readonly Dictionary<string, int[]> InPlaceArguments = new(StringComparer.Ordinal)
+    {
+        ["GatedDeltaNetStep"] = new[] { 0 },
+        ["CausalConv1dStep"] = new[] { 0 },
+        ["KvCacheAppend"] = new[] { 0, 1 },
+    };
+
     static partial void AddCasesNonDifferentiableAudit(Dictionary<string, Func<Random, object[]>> cases)
     {
+        // state [rows, valueDim, keyDim], then this position's query, key, value, decay and write strength.
+        cases["GatedDeltaNetStep"] = r =>
+            [SafeTensor([2, 3, 4], r), SafeTensor([2, 4], r), SafeTensor([2, 4], r), SafeTensor([2, 3], r), SafeTensor([2], r), SafeTensor([2], r), GatedDeltaRule.Standard];
+        // history [K - 1, batch, channels], input [batch, channels], taps [channels, K], bias [channels].
+        cases["CausalConv1dStep"] = r =>
+            [SafeTensor([2, 2, 3], r), SafeTensor([2, 3], r), SafeTensor([3, 3], r), SafeTensor([3], r), true];
+        // The last free slot of a capacity-2 cache: after the append every slot is attended, so the returned mask is
+        // all zeros (a finite sum the probes can difference) rather than holding negative infinity.
+        cases["KvCacheAppend"] = r =>
+        {
+            var position = new Tensor<double>([1]);
+            position[0] = 1.0;
+            return [SafeTensor([1, 2, 3], r), position, SafeTensor([1, 3], r)];
+        };
         cases["BatchNormInference|T,T,T,T,T,double"] = r =>
             [SafeTensor([2, 3, 2, 2], r), SafeTensor([3], r), SafeTensor([3], r), SafeTensor([3], r), SafeTensor([3], r), 1e-5];
         cases["BatchNormInference|T,T,T,T,T,double,FusedActivationType"] = r =>
@@ -449,6 +479,10 @@ public partial class DifferentiableOpsGradCheckSweep
     // draws do not cancel, or null when it throws.
     private double? Evaluate(MethodInfo m, object[] args)
     {
+        // What the op writes in place goes back after the call, so every call sees the arguments it was given.
+        var written = InPlaceArguments.TryGetValue(m.Name, out var positions)
+            ? positions.Select(index => (Tensor: (Tensor<double>)args[index], Saved: ((Tensor<double>)args[index]).GetFlattenedData().ToArray())).ToArray()
+            : [];
         try
         {
             using var _ = new NoGradScope<double>();
@@ -463,6 +497,11 @@ public partial class DifferentiableOpsGradCheckSweep
                                        or NotSupportedException or IndexOutOfRangeException)
         {
             return null;
+        }
+        finally
+        {
+            foreach (var (tensor, saved) in written)
+                for (int i = 0; i < saved.Length; i++) tensor.SetFlat(i, saved[i]);
         }
     }
 

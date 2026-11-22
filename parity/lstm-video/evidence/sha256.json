@@ -1,0 +1,35 @@
+{
+  "original_files": {
+    "fixture.py": "8b7aded198d9ddb74c3fcc8469333d5fc1f52521eb4e7a46db340138e1c777ad",
+    "Pair.csproj": "85e02b7d512b94864adadeee23dc89418bc3009628aeb70debf7462b55956cbe",
+    "panel.js": "9293393526e73645726af387a4d61b2f06e7ae9e55567acd76e5a82605e13d09",
+    "Program.cs": "cdb1f83112c41457d101931bd38dfec778053e385530d6677996f5cac7775e0e",
+    "record_pair.py": "bfaf8d421188a2f5156f490f7e42321638dd42712f151efe6b12076ce09b4bd9",
+    "torch_train.py": "ca50738ad8d331d8ade148ade22523ac7c848e0cc314b0c4bd6287448cd7973d"
+  },
+  "inputs": {
+    "x.f32": "0e9effc8412001f598fa3e6b2a93d8f752e64bc55a69b56ca5a9a741c27c6040",
+    "y.u8": "3f7e99e196c00b22ffece5607e70fd0fed8950a8eb70aa5c8e19b68723b6f0cf",
+    "lstm.weights.safetensors": "e271d6734912a76b7f18b28fd82552bb23978543cf7bbc226d57900e4a449a28"
+  },
+  "assemblies": {
+    "AiDotNet.Dashboard.dll": "59a00d00a9054ed4c03ed254ee08140f0d3d9c2ef80196af7c4ef61ad8ff3622",
+    "AiDotNet.dll": "b97bf7eeba6ca335548f0cfd3d27fceb65a1ffe0cc7e6308e30cc3ad578bb795",
+    "AiDotNet.Evolution.dll": "e88331586027426352fc8e1f13efa5eb69d645c10e311c5e11fb4a5d6d4bc8e3",
+    "AiDotNet.PyTorchParity.dll": "4874e323211ff8f256133924cf32dc1cbf11e40e93afe81a7ff748d40bd89e1b",
+    "AiDotNet.Tensors.dll": "0fdd1cf33360ee7187f23f68a459057acf062a9da1e0aba51fa943f5b10cda3f"
+  },
+  "evidence": {
+    "ai/done": "ad2a7bc4616cad48430f44a747b9188aee87061f822a48efc2e3cec1af72d941",
+    "ai/live.jsonl": "312638da925bac341979505595378ff2b082af6b21b9f55b2addbf0cc11ac91c",
+    "ai/raw.webm": "c3b47ca7ea95ec6fcb399cbf01ea627b63823fd51fed68fa16b2d60c7f345d3d",
+    "ai/ready": "d03f09158cc5c8dd6fd5205eb05c61c8989e1461202dd0b36d33e2b23a350bc2",
+    "original.mp4": "d00dceaf3895dc2b5268128ac5cfd2e1e265371bbc5942bddae55eb0d078d107",
+    "result.json": "d561d61090138397412bbbb2c241e14411471865ee6f0e60bf29c3b8c61a9aeb",
+    "torch/done": "76cb6ad4cbbeb432ee1b7c7217086b23b3ebd1b61d97a3b7af62e29a462618c8",
+    "torch/live.jsonl": "d222592661a112d0d8643156eec0ec1523fe53ecc5451da4c9c3dc659734a014",
+    "torch/raw.webm": "89605b1aa4712e7b5a445a551cd8d559c0851fe6a2d8bbeb9121a9e32c5ed5d7",
+    "torch/ready": "3cc2722b7a0239e3bfae0ef0ad0c1cbe93d850430efba53e200be07f1eadff02"
+  },
+  "source_result_sha256": "97bffafb85168d350be478d04c9731e39826f60440c339cbd9eb9caec0132c3a"
+}
