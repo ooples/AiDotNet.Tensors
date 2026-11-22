@@ -5262,6 +5262,40 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     /// <returns>This tensor with CPU data synchronized.</returns>
     [MethodImpl(Hot)]
+    /// <summary>
+    /// Brings this tensor's data home from the backend that owns its GPU buffer and drops that binding, so the next
+    /// engine op places it on its own backend (CrossBackendTensors). The buffer is freed when this tensor owns it;
+    /// a storage-owned buffer is freed with the storage.
+    /// </summary>
+    internal void ReleaseForeignGpuBinding()
+    {
+        var owner = _gpuBackend;
+        using var ownerWork = Engines.DirectGpu.GpuOpGate.SuspendOpBackend();
+        try { Cpu(); }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            throw new InvalidOperationException(
+                $"Could not read this tensor back from the {owner?.BackendName ?? "unknown"} backend that owns its GPU buffer "
+                + "(was its engine disposed?), so it cannot be moved to the running operation's backend.", ex);
+        }
+        var buffer = _gpuBuffer;
+        bool owned = _ownsGpuBuffer;
+        Helpers.ResidentHostMirror.Detach(this);
+        _gpuBuffer = null;
+        _gpuBackend = null;
+        _gpuBufferVersion = -1;
+        _ownsGpuBuffer = false;
+        _gpuBufferIsSplitComplex = false;
+        _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
+        _device = TensorDevice.CPU;
+        if (owned && buffer is IDisposable disposable)
+        {
+            try { disposable.Dispose(); }
+            catch (ObjectDisposedException) { /* its backend is already gone */ }
+        }
+    }
+
     public Tensor<T> Cpu()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
