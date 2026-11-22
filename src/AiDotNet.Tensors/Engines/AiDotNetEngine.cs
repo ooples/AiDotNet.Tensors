@@ -460,6 +460,34 @@ public static class AiDotNetEngine
     }
 
     /// <summary>
+    /// Registers the GPU offload allocator for <paramref name="gpuEngine"/> when the registry has none. Adoption does this
+    /// once; <c>WeightRegistry.Reset</c> or a <c>Configure</c> without an allocator removes it for the rest of the
+    /// process, after which pinned tensors silently stay on the host. A caller that needs device-resident weights again
+    /// asks for it here. A usable allocator that is already registered is left alone; one whose context has gone away
+    /// (it shared the context of an engine that was since disposed) is replaced, since it can serve nothing.
+    /// </summary>
+    internal static void EnsureGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine)
+    {
+        if (gpuEngine is null) throw new ArgumentNullException(nameof(gpuEngine));
+        TryRegisterGpuOffloadAllocator(gpuEngine, verbose: false, replaceUnusable: true);
+    }
+
+    /// <summary>
+    /// Why a tensor rented with <c>RentPinnedOnGpu</c> would not be device-resident right now, or "usable". The offload
+    /// allocator is process-wide state with several ways to be out of service; a caller that only sees the CPU fallback
+    /// cannot tell which.
+    /// </summary>
+    internal static string DescribeGpuOffloadAllocatorState()
+    {
+        var allocator = LinearAlgebra.WeightRegistry.OffloadAllocator;
+        if (allocator is null) return "no offload allocator is registered";
+        if (GpuCircuitBroken) return "the GPU circuit breaker is open";
+        string kind = allocator.GetType().Name;
+        if (allocator is not DirectGpu.IGpuDevicePointerWrapper) return kind + " cannot wrap a device pointer";
+        return allocator.IsAvailable ? "usable (" + kind + ")" : kind + " reports unavailable (disposed, or its context is no longer live)";
+    }
+
+    /// <summary>
     /// Auto-registers the GPU offload allocator that matches the adopted backend
     /// so weights/optimizer-moments tagged <see cref="LinearAlgebra.WeightLifetime.GpuPinned"/>
     /// (via <c>TensorAllocator.RentPinnedOnGpu</c>) actually become GPU-resident.
@@ -481,12 +509,12 @@ public static class AiDotNetEngine
     /// Best-effort: any failure leaves the registry unconfigured and GPU compute still works.
     /// </para>
     /// </remarks>
-    private static void TryRegisterGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine, bool verbose)
+    private static void TryRegisterGpuOffloadAllocator(DirectGpuTensorEngine gpuEngine, bool verbose, bool replaceUnusable = false)
     {
         try
         {
-            // Respect an allocator a caller already configured — don't stomp it.
-            if (LinearAlgebra.WeightRegistry.OffloadAllocator is not null)
+            // Respect an allocator a caller already configured — don't stomp it. A dead one is only replaced on request.
+            if (LinearAlgebra.WeightRegistry.OffloadAllocator is { } existing && (!replaceUnusable || existing.IsAvailable))
                 return;
 
             var directGpu = ((IEngine)gpuEngine).DirectGpu;

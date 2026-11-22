@@ -68,13 +68,19 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
         using (activated)
         {
             Assert.Equal(before + 1, backend.ConvBiasResidualVendorLaunchCount);
-            Close(expected.ToArray(), actual.ToArray());
+            // The fused store and the three separate ops add the same terms in a different order, and cuDNN's algorithm
+            // choice varies between runs. Each output sums channels * 3 products of values in (-0.5, 0.5) plus a bias and
+            // a residual, so the terms total at most channels * 3 * 0.25 + 1 in magnitude while the result can cancel
+            // to nearly zero: the rounding difference scales with the terms, not with the result. Eight units in the
+            // last place of that total; a wrong tap, bias or residual is off by orders of magnitude more.
+            float rounding = 8f * 5.9604645e-8f * (channels * 3 * 0.25f + 1f);
+            Close(expected.ToArray(), actual.ToArray(), rounding);
             if (activate)
             {
                 Assert.NotNull(activated);
                 Assert.False(actual.SharesStorageWith(activated));
                 var saved = activated.ToArray();
-                Close(expectedActivated.ToArray(), saved);
+                Close(expectedActivated.ToArray(), saved, rounding);
                 engine.TensorAddInPlace(actual, actual);
                 Assert.Equal(saved, activated.ToArray());
             }
@@ -168,11 +174,11 @@ public sealed class ConvBiasResidualBackendTests : IDisposable
         foreach (Type type in types) Assert.True(typeof(IConvBiasResidualBackend).IsAssignableFrom(type), type.FullName);
     }
 
-    private static void Close(float[] expected, float[] actual)
+    private static void Close(float[] expected, float[] actual, float absolute = 1e-6f)
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-6f + 1e-5f * Math.Abs(expected[i]),
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= absolute + 1e-5f * Math.Abs(expected[i]),
                 $"Output mismatch at {i}: expected {expected[i]:R}, actual {actual[i]:R}.");
     }
 
