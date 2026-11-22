@@ -44,8 +44,45 @@ internal static class NvrtcNativeBindings
 #if NET5_0_OR_GREATER
         AiDotNet.Tensors.Engines.GpuDriverCrossPlatformResolver.EnsureRegistered();
 #endif
-        EnsureCudaOnPath();
-        return ResolveApi();
+        return ProbeAfterBestEffortDiscovery(EnsureCudaOnPath, ResolveApi);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="discovery"/> and then <paramref name="probe"/>. Discovery only widens the search path, so a
+    /// failure in it (an unreadable directory, an over-long PATH) is logged and the probe still runs. Letting it escape
+    /// would be cached by the lazy probe and rethrown from every later availability check, turning "not installed" into
+    /// an error.
+    /// </summary>
+    internal static T ProbeAfterBestEffortDiscovery<T>(Action discovery, Func<T> probe)
+    {
+        try
+        {
+            discovery();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+                                       or NotSupportedException or System.Security.SecurityException)
+        {
+            TraceWarningBestEffort("CUDA library path discovery failed; probing NVRTC on the existing search path. {0}", ex);
+        }
+
+        return probe();
+    }
+
+    /// <summary>
+    /// Writes a warning to the trace listeners without letting a failing listener escape. The callers run inside lazy
+    /// availability probes, which would cache that exception and rethrow it from every later availability check; when
+    /// the trace sink itself is what failed there is nowhere left to report it.
+    /// </summary>
+    internal static void TraceWarningBestEffort(string format, Exception failure)
+    {
+        try
+        {
+            System.Diagnostics.Trace.TraceWarning(format, failure);
+        }
+        catch (Exception listenerFailure) when (listenerFailure is not OutOfMemoryException)
+        {
+            // Deliberately dropped: see the summary.
+        }
     }
 
     /// <summary>
