@@ -293,7 +293,7 @@ public sealed class OpenClTunedKernelTests
         double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
-        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.BudgetMilliseconds = TunedKernelPolicy.SpentMilliseconds + 60_000;   // the budget is per process: headroom past what earlier tests spent
         try
         {
             // A shape no shipped profile covers: the registry must measure it, and the in-place call must not.
@@ -337,7 +337,7 @@ public sealed class OpenClTunedKernelTests
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
         // The budget is a process-wide running total, so tuning in earlier tests must not decide this one.
-        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.BudgetMilliseconds = TunedKernelPolicy.SpentMilliseconds + 60_000;   // the budget is per process: headroom past what earlier tests spent
         TunedKernelPolicy.ResetBudget();
         try
         {
