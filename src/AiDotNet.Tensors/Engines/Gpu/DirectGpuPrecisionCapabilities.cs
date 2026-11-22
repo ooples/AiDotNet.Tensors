@@ -198,7 +198,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
                 GpuPrecisionImplementation.Packed,
                 fp16ReducesStorageBytes: true,
                 fp16OutputStorage: IsFp16Elementwise(operation) ? GpuScalarType.Float16 : GpuScalarType.Float32,
-                fp16MultiplyType: GpuScalarType.Float32);
+                fp16MultiplyType: GpuScalarType.Float32,
+                supportsFloat64: SupportsFloat64(operation));
+
+        // Double add, subtract, multiply, divide and matrix multiply have GLSL double kernels over double buffers on a
+        // device with shaderFloat64.
+        private bool SupportsFloat64(GpuPrecisionOperation operation) => operation switch
+        {
+            GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
+                or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
+            GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            _ => false,
+        };
 
         private bool SupportsFp16(GpuPrecisionOperation operation) => operation switch
         {

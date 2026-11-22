@@ -10,7 +10,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Wraps a Vulkan device-local storage buffer and host-visible staging buffer
 /// as an <see cref="IGpuBuffer"/> for use with <see cref="IDirectGpuBackend"/> operations.
 /// </summary>
-public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer
+public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer,
+    IElementTypedByteBuffer
 {
     internal readonly VulkanBuffer Storage;
     internal readonly VulkanBuffer Staging;
@@ -54,7 +55,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     internal static long DriverAllocations => System.Threading.Interlocked.Read(ref s_driverAllocations);
 
     /// <inheritdoc/>
-    int IPoolableGpuBuffer.Capacity => Size;
+    int IPoolableGpuBuffer.Capacity => WordCount;
 
     /// <inheritdoc/>
     /// <remarks>
@@ -65,6 +66,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     {
         // A recycled allocation is a float buffer again until its new owner says otherwise.
         Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
+        Volatile.Write(ref _declaredCount, -1);
     }
 
     /// <inheritdoc/>
@@ -102,7 +104,30 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     private int _elementType = (int)GpuElementType.Float32;
     public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
     void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
-    public int Size { get; }
+    /// <summary>
+    /// The element count: 4-byte words, or the elements the allocation was declared to hold (a
+    /// <see cref="GpuElementType.Float64"/> buffer of n doubles is 2n words and reports n).
+    /// </summary>
+    public int Size
+    {
+        get
+        {
+            int declared = Volatile.Read(ref _declaredCount);
+            return declared >= 0 ? declared : WordCount;
+        }
+    }
+
+    /// <summary>The 4-byte words the storage holds, whatever they are declared to be.</summary>
+    internal int WordCount { get; }
+    private int _declaredCount = -1;
+
+    void IElementTypedByteBuffer.DeclareElements(GpuElementType type, int count)
+    {
+        if (count < 0 || (long)count * GpuElementTypes.SizeInBytes(type) > SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(count), $"{count} {type} elements do not fit in {SizeInBytes} bytes.");
+        Volatile.Write(ref _elementType, (int)type);
+        Volatile.Write(ref _declaredCount, count);
+    }
 
     /// <inheritdoc/>
     /// <remarks>
@@ -112,7 +137,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
     /// the same but each element is 2 bytes instead of 4; callers should
     /// account for this at a higher level.
     /// </remarks>
-    public long SizeInBytes => (long)Size * sizeof(float);
+    public long SizeInBytes => (long)WordCount * sizeof(float);
 
     /// <inheritdoc/>
     public IntPtr Handle => Storage.Handle;
@@ -123,7 +148,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
         Staging = staging ?? throw new ArgumentNullException(nameof(staging));
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
-        Size = size;
+        WordCount = size;
     }
 
     /// <summary>A view wrapper: holds <paramref name="parent"/> so its finalizer cannot free memory the view still uses.</summary>
@@ -336,7 +361,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
         DeviceMemoryReclaim.OnDeviceFinalized(charge, _reclaimEpoch);
         var storage = Storage;
         var staging = Staging;
-        int size = Size;
+        int size = WordCount;
         if (_viewParent is not null)
         {
             // Keep the view and its parent rooted until the last referencing submission completes.

@@ -89,6 +89,14 @@ internal static class VulkanTorchParityElementwiseKernels
         => Head(int64, preserveDoubleSpecials: true) + declarations + VulkanTorchParityMath.Tables + VulkanTorchParityMath.ElementaryFunctions
             + Conversions + (special ? VulkanTorchParityMath.SpecialFunctionsSource : "") + VulkanTorchParityMath.Doubles(body);
 
+    /// <summary>A double kernel built from <paramref name="declarations"/> and <paramref name="body"/> with the double
+    /// library in scope, cached under <paramref name="key"/>: for kernel sets declared outside this class.</summary>
+    internal static string DoubleKernel(string key, string declarations, string body)
+        => Cached("f64:" + key, () => DoubleShader(declarations, body, special: false));
+
+    /// <summary>The bounds guard every per-element kernel starts with: <c>i</c> is the element, <c>n</c> the count.</summary>
+    internal const string IndexGuard = Index;
+
     // Buffer values cross between float and double by bit pattern: D widens exactly and F rounds to nearest even,
     // both including the subnormal floats a GPU's own conversions flush to zero (logit of 6e-39 must not be -inf).
     private const string Conversions = @"
