@@ -5639,6 +5639,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         using var __gpuOp = EnterGpuOp();
+        // Double operands already on the device stay there, computed in double.
+        if (input is Tensor<double> doubles && TryUnaryFloat64(doubles, callerName) is { } doubleResult)
+            return (Tensor<T>)(object)doubleResult;
         if (!IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend))
             return null;
         var precisionOperation = PrecisionOperationForUnary(callerName);
@@ -5837,6 +5840,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // exact backend route (for example Half ReLU). Only the legacy process-wide FP64 switch
         // must short-circuit before planning.
         => !(DirectGpuEngine.StrictFp64Fallback && typeof(T) == typeof(double));
+
+    /// <summary>
+    /// Whether a float kernel may compute this op for <typeparamref name="T"/>. Float and Half lose nothing in one;
+    /// a wider type runs it only when the precision policy plans a device route (a speed-first scope), and otherwise
+    /// takes the CPU engine, which computes in <typeparamref name="T"/>.
+    /// </summary>
+    private static bool DeviceKeepsPrecision<T>(IDirectGpuBackend backend, string operationName)
+    {
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(Half)) return true;
+        var plan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, Gpu.GpuPrecisionOperation.Elementwise, operationName);
+        if (plan.Route != Gpu.GpuExecutionRoute.Cpu) return plan.InputStorage != Gpu.GpuScalarType.Float64;
+        Gpu.GpuPrecisionDiagnostics.Publish(plan);
+        return false;
+    }
 
     private static Gpu.GpuPrecisionOperation PrecisionOperationForUnary(string operationName)
     {
@@ -24548,7 +24565,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "ReluBackward"))
             {
                 // FP16 Half-native backward: read IsFp16 grad + input directly, FP16-native ReLU backward
                 // (Half grad out), store Half. Parity-equivalent to relu_backward.
@@ -24617,7 +24634,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "SigmoidBackward"))
             {
                 int size = gradOutput.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
@@ -24641,7 +24658,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "TanhBackward"))
             {
                 int size = gradOutput.Length;
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
@@ -24669,7 +24686,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "GeluBackward"))
             {
                 // FP16 Half-native backward: read the IsFp16 grad + input directly, FP16-native GELU backward
                 // (Half grad out), store Half — keeps the backward signal Half (no up-cast). Parity-equivalent
@@ -24715,7 +24732,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "LeakyReluBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24738,7 +24755,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "SwishBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24761,7 +24778,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "MishBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24784,7 +24801,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "SoftplusBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24807,7 +24824,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "HardswishBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24861,7 +24878,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "HardsigmoidBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24884,7 +24901,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "Relu6Backward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24906,7 +24923,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "ThresholdBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -24984,7 +25001,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "VarBackward"))
             {
                 int outerSize = 1;
                 int reduceSize = input.Length;
@@ -25009,7 +25026,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "StdBackward"))
             {
                 int outerSize = 1;
                 int reduceSize = input.Length;
@@ -25181,6 +25198,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorMultiplyScalar<T>(Tensor<T> tensor, T scalar)
     {
         using var __residentOutputOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && scalar is double doubleScalar
+            && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Multiply, nameof(TensorMultiplyScalar)) is { } doubleResult)
+        {
+            var onDevice = (Tensor<T>)(object)doubleResult;
+            Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", onDevice, tensor,
+                Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { doubleScalar });
+            return onDevice;
+        }
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && TryGetBackend(out var residentBackend))
         {
@@ -28059,7 +28084,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var __gpuOp = EnterGpuOp();
-            if (TryGetBackend(out var backend))
+            if (TryGetBackend(out var backend) && DeviceKeepsPrecision<T>(backend, "EluBackward"))
             {
                 using var gBuf = GetOrAllocateBuffer(backend, gradOutput);
                 using var iBuf = GetOrAllocateBuffer(backend, input);
@@ -28850,6 +28875,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
     {
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && scalar is double doubleScalar
+            && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Add, nameof(TensorAddScalar)) is { } doubleResult)
+        {
+            var onDevice = (Tensor<T>)(object)doubleResult;
+            Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+            return onDevice;
+        }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
@@ -28886,6 +28918,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
     {
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && scalar is double doubleScalar
+            && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Subtract, nameof(TensorSubtractScalar)) is { } doubleResult)
+        {
+            var onDevice = (Tensor<T>)(object)doubleResult;
+            Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+            return onDevice;
+        }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
@@ -28922,6 +28961,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && scalar is double doubleScalar
+            && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Divide, nameof(TensorDivideScalar)) is { } doubleResult)
+        {
+            var onDevice = (Tensor<T>)(object)doubleResult;
+            Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", onDevice, tensor,
+                Autodiff.BackwardFunctions<T>.DivideScalarBackward, new object[] { doubleScalar });
+            return onDevice;
+        }
         // Already float-only below; under a tape it now records CpuEngine's node (saved state: the scalar).
         if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
         {

@@ -633,4 +633,286 @@ public class GpuFloat64ResidencyTests
             DirectGpuTensorEngine.Float64MatMulForceDevice = saved;
         }
     }
+
+    // --- Unary and scalar ops ----------------------------------------------------------------------------------------
+
+    private static double HostUnary(GpuFloat64UnaryOperation operation, double x) => operation switch
+    {
+        GpuFloat64UnaryOperation.Negate => -x,
+        GpuFloat64UnaryOperation.Abs => Math.Abs(x),
+        GpuFloat64UnaryOperation.Sqrt => Math.Sqrt(x),
+        GpuFloat64UnaryOperation.Exp => Math.Exp(x),
+        GpuFloat64UnaryOperation.Log => Math.Log(x),
+        GpuFloat64UnaryOperation.Tanh => Math.Tanh(x),
+        GpuFloat64UnaryOperation.Sigmoid => 1.0 / (1.0 + Math.Exp(-x)),
+        GpuFloat64UnaryOperation.Relu => Math.Max(x, 0.0),
+        _ => throw new ArgumentOutOfRangeException(nameof(operation)),
+    };
+
+    private static bool IsSingleIeeeOperation(GpuFloat64UnaryOperation operation)
+        => operation is GpuFloat64UnaryOperation.Negate or GpuFloat64UnaryOperation.Abs
+            or GpuFloat64UnaryOperation.Sqrt or GpuFloat64UnaryOperation.Relu;
+
+    // The library functions are not correctly rounded on either side: a few units in the last place.
+    private static void AssertWithinUlps(ReadOnlySpan<double> expected, ReadOnlySpan<double> actual, string what)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (expected[i].Equals(actual[i])) continue; // also equal infinities, whose difference is NaN
+            double bound = 16.0 * 2.220446049250313e-16 * Math.Abs(expected[i]) + 1e-300;
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= bound, $"{what}[{i}]: expected {expected[i]:R}, actual {actual[i]:R}.");
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(GpuFloat64UnaryOperation.Negate)]
+    [InlineData(GpuFloat64UnaryOperation.Abs)]
+    [InlineData(GpuFloat64UnaryOperation.Sqrt)]
+    [InlineData(GpuFloat64UnaryOperation.Exp)]
+    [InlineData(GpuFloat64UnaryOperation.Log)]
+    [InlineData(GpuFloat64UnaryOperation.Tanh)]
+    [InlineData(GpuFloat64UnaryOperation.Sigmoid)]
+    [InlineData(GpuFloat64UnaryOperation.Relu)]
+    public void UnaryKernel_MatchesTheHost(GpuFloat64UnaryOperation operation)
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var (_, backend, elementwise) = device.Value;
+        const int length = 4099;
+        var input = Values(length, 90 + (int)operation);
+        bool positiveDomain = operation is GpuFloat64UnaryOperation.Sqrt or GpuFloat64UnaryOperation.Log;
+        for (int i = 0; i < length; i++)
+            if (positiveDomain) input[i] = Math.Abs(input[i]) + 1e-3;
+        if (!positiveDomain)
+        {
+            input[0] = 0.0;
+            input[1] = -0.0;
+            input[2] = 1e-300;
+            input[3] = -1e-300;
+        }
+
+        var expected = new double[length];
+        for (int i = 0; i < length; i++) expected[i] = HostUnary(operation, input[i]);
+
+        using var a = backend.AllocateBuffer(length, GpuElementType.Float64);
+        using var output = backend.AllocateBuffer(length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(a, input);
+        elementwise.UnaryFloat64(operation, a, output, length);
+        var actual = new double[length];
+        backend.DownloadBuffer<double>(output, actual);
+        if (IsSingleIeeeOperation(operation)) AssertBitEqual(expected, actual);
+        else AssertWithinUlps(expected, actual, operation.ToString());
+
+        // In place.
+        elementwise.UnaryFloat64(operation, a, a, length);
+        backend.DownloadBuffer<double>(a, actual);
+        if (IsSingleIeeeOperation(operation)) AssertBitEqual(expected, actual);
+        else AssertWithinUlps(expected, actual, operation + " in place");
+    }
+
+    [SkippableFact]
+    public void ReluKernel_PassesNaNThrough_AndClampsNegativeInfinity()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var (_, backend, elementwise) = device.Value;
+        var input = new[] { double.NaN, double.NegativeInfinity, double.PositiveInfinity, -3.5, 3.5 };
+        using var a = backend.AllocateBuffer(input.Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(a, input);
+        elementwise.UnaryFloat64(GpuFloat64UnaryOperation.Relu, a, a, input.Length);
+        var actual = new double[input.Length];
+        backend.DownloadBuffer<double>(a, actual);
+        Assert.True(double.IsNaN(actual[0]));
+        Assert.Equal(0.0, actual[1]);
+        Assert.Equal(double.PositiveInfinity, actual[2]);
+        Assert.Equal(0.0, actual[3]);
+        Assert.Equal(3.5, actual[4]);
+    }
+
+    [SkippableTheory]
+    [InlineData(GpuFloat64BinaryOperation.Add)]
+    [InlineData(GpuFloat64BinaryOperation.Subtract)]
+    [InlineData(GpuFloat64BinaryOperation.Multiply)]
+    [InlineData(GpuFloat64BinaryOperation.Divide)]
+    public void ScalarKernel_EqualsTheHost_BitForBit_WithTheScalarOnTheRight(GpuFloat64BinaryOperation operation)
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var (_, backend, elementwise) = device.Value;
+        const int length = 4099;
+        const double scalar = 1.0 / 3.0 + 1e-9;
+        var input = Values(length, 110 + (int)operation);
+        var expected = new double[length];
+        for (int i = 0; i < length; i++)
+            expected[i] = operation switch
+            {
+                GpuFloat64BinaryOperation.Add => input[i] + scalar,
+                GpuFloat64BinaryOperation.Subtract => input[i] - scalar,
+                GpuFloat64BinaryOperation.Multiply => input[i] * scalar,
+                _ => input[i] / scalar,
+            };
+        using var a = backend.AllocateBuffer(length, GpuElementType.Float64);
+        using var output = backend.AllocateBuffer(length, GpuElementType.Float64);
+        using var floats = backend.AllocateBuffer(length);
+        backend.UploadBuffer<double>(a, input);
+        elementwise.ScalarFloat64(operation, a, scalar, output, length);
+        var actual = new double[length];
+        backend.DownloadBuffer<double>(output, actual);
+        AssertBitEqual(expected, actual);
+
+        Assert.Throws<ArgumentException>(() => elementwise.ScalarFloat64(operation, floats, scalar, output, length));
+        Assert.Throws<ArgumentException>(() => elementwise.UnaryFloat64(GpuFloat64UnaryOperation.Negate, a, floats, length));
+    }
+
+    [SkippableFact]
+    public void UnaryAndScalarOps_OnAResidentOperand_StayOnTheDevice_AndMatchTheHost()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpuEngine = device.Value.Engine;
+        var gpu = (IEngine)gpuEngine;
+        var cpu = (IEngine)new CpuEngine();
+        var (x, y) = PersistentLeaves(gpu, Large, 12);
+        try
+        {
+            long before = GpuLaunchProbe.Readbacks;
+            var negated = gpu.TensorNegate(x);
+            var magnitude = gpu.TensorAbs(negated);
+            var root = gpu.TensorSqrt(magnitude);
+            var shifted = gpu.TensorAddScalar(root, 1.5);
+            var scaled = gpu.TensorMultiplyScalar(shifted, 0.75);
+            var divided = gpu.TensorDivideScalar(scaled, 3.0);
+            var exact = gpu.TensorSubtractScalar(divided, 0.25);
+            var rectified = gpu.TensorReLU(exact);
+            var squashed = gpu.TensorTanh(exact);
+            var logistic = gpu.TensorSigmoid(exact);
+            var exponential = gpu.TensorExp(exact);
+            var logarithm = gpu.TensorLog(shifted);
+            foreach (var result in new[] { negated, magnitude, root, shifted, scaled, divided, exact, rectified, squashed, logistic, exponential, logarithm })
+                Assert.True(gpuEngine.IsFloat64Resident(result), "A result is not resident on the device.");
+            Assert.Equal(before, GpuLaunchProbe.Readbacks);
+
+            var xs = x.AsSpan();
+            var expected = new double[Large];
+            var expectedShifted = new double[Large];
+            for (int i = 0; i < Large; i++)
+            {
+                expectedShifted[i] = Math.Sqrt(Math.Abs(-xs[i])) + 1.5;
+                expected[i] = expectedShifted[i] * 0.75 / 3.0 - 0.25;
+            }
+
+            AssertBitEqual(expected, exact.AsSpan());
+            var hostExact = new Tensor<double>(expected, new[] { Large });
+            AssertBitEqual(cpu.TensorReLU(hostExact).AsSpan(), rectified.AsSpan());
+            AssertWithinUlps(cpu.TensorTanh(hostExact).AsSpan(), squashed.AsSpan(), "tanh");
+            AssertWithinUlps(cpu.TensorSigmoid(hostExact).AsSpan(), logistic.AsSpan(), "sigmoid");
+            AssertWithinUlps(cpu.TensorExp(hostExact).AsSpan(), exponential.AsSpan(), "exp");
+            AssertWithinUlps(cpu.TensorLog(new Tensor<double>(expectedShifted, new[] { Large })).AsSpan(), logarithm.AsSpan(), "log");
+        }
+        finally
+        {
+            gpu.UnregisterPersistentTensor(x);
+            gpu.UnregisterPersistentTensor(y);
+        }
+    }
+
+    [SkippableFact]
+    public void UnaryAndScalarOps_OnAPlainHostOperand_AreComputedOnTheCpu()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpuEngine = device.Value.Engine;
+        var gpu = (IEngine)gpuEngine;
+        var values = Values(Large, 13);
+        var host = new Tensor<double>(values, new[] { Large });
+        var negated = gpu.TensorNegate(host);
+        var scaled = gpu.TensorMultiplyScalar(host, 0.1);
+        Assert.False(gpuEngine.IsFloat64Resident(negated));
+        Assert.False(gpuEngine.IsFloat64Resident(scaled));
+        for (int i = 0; i < Large; i += 997)
+        {
+            Assert.Equal(-values[i], negated.AsSpan()[i]);
+            Assert.Equal(values[i] * 0.1, scaled.AsSpan()[i]);
+        }
+    }
+
+    [SkippableFact]
+    public void UnaryAndScalarOps_RecordTheirGradients_WhenTheResultsAreOnTheDevice()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpuEngine = device.Value.Engine;
+        var gpu = (IEngine)gpuEngine;
+        var cpu = (IEngine)new CpuEngine();
+        var (x, y) = PersistentLeaves(gpu, Large, 14);
+        try
+        {
+            Tensor<double> Gradient(IEngine engine, out bool resident)
+            {
+                using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<double>();
+                var scaled = engine.TensorMultiplyScalar(x, 0.5);
+                var shifted = engine.TensorAddScalar(scaled, 0.125);
+                var squashed = engine.TensorTanh(shifted);
+                var divided = engine.TensorDivideScalar(squashed, 4.0);
+                var negated = engine.TensorNegate(divided);
+                resident = gpuEngine.IsFloat64Resident(negated);
+                var loss = engine.ReduceSum(negated, null);
+                return tape.ComputeGradients(loss, new[] { x })[x];
+            }
+
+            var expected = Gradient(cpu, out _).AsSpan();
+            var actual = Gradient(gpu, out bool onDevice).AsSpan();
+            Assert.True(onDevice, "The chain did not stay on the device under a tape.");
+            Assert.Equal(expected.Length, actual.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-12 * (1.0 + Math.Abs(expected[i])),
+                    $"Gradient {i}: cpu {expected[i]:R}, device route {actual[i]:R}.");
+        }
+        finally
+        {
+            gpu.UnregisterPersistentTensor(x);
+            gpu.UnregisterPersistentTensor(y);
+        }
+    }
+
+    // The float kernels behind these would silently narrow a double gradient: under the type-preserving default
+    // they must be computed in double.
+    [SkippableFact]
+    public void ActivationBackwardOps_KeepDoublePrecision()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpu = (IEngine)device.Value.Engine;
+        var cpu = (IEngine)new CpuEngine();
+        const int length = 4096;
+        var gradient = new double[length];
+        var activation = new double[length];
+        for (int i = 0; i < length; i++)
+        {
+            gradient[i] = 1.0 + (i + 1) * 1e-10; // the 1e-10 steps are below float's resolution
+            activation[i] = 0.05 + 0.9 * i / length + 1e-11;
+        }
+
+        var g = new Tensor<double>(gradient, new[] { length });
+        var a = new Tensor<double>(activation, new[] { length });
+        var cases = new (string Name, Func<IEngine, Tensor<double>> Run)[]
+        {
+            ("TanhBackward", e => e.TanhBackward(g, a)),
+            ("SigmoidBackward", e => e.SigmoidBackward(g, a)),
+            ("ReluBackward", e => e.ReluBackward(g, a)),
+            ("GeluBackward", e => e.GeluBackward(g, a)),
+            ("LeakyReluBackward", e => e.LeakyReluBackward(g, a, 0.01)),
+            ("SwishBackward", e => e.SwishBackward(g, a)),
+            ("MishBackward", e => e.MishBackward(g, a)),
+            ("SoftplusBackward", e => e.SoftplusBackward(g, a)),
+            ("HardswishBackward", e => e.HardswishBackward(g, a)),
+            ("HardsigmoidBackward", e => e.HardsigmoidBackward(g, a)),
+            ("Relu6Backward", e => e.Relu6Backward(g, a)),
+            ("ThresholdBackward", e => e.ThresholdBackward(g, a, 0.5)),
+            ("EluBackward", e => e.EluBackward(g, a, a, 1.0)),
+        };
+        foreach (var (name, run) in cases)
+            AssertWithinUlps(run(cpu).AsSpan(), run(gpu).AsSpan(), name);
+    }
 }

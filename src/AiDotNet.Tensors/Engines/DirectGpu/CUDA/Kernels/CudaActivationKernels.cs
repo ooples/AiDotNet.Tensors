@@ -948,6 +948,33 @@ BINARY_F64(subtract_f64, x - y)
 BINARY_F64(multiply_f64, x * y)
 BINARY_F64(divide_f64, x / y)
 
+#define UNARY_F64(name, expression) \
+extern ""C"" __global__ void name(const double* a, double* output, int size) \
+{ \
+    int i = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (i < size) { const double x = a[i]; output[i] = (expression); } \
+}
+UNARY_F64(negate_f64, -x)
+UNARY_F64(abs_f64, fabs(x))
+UNARY_F64(sqrt_f64, sqrt(x))
+UNARY_F64(exp_f64, exp(x))
+UNARY_F64(log_f64, log(x))
+UNARY_F64(tanh_f64, tanh(x))
+UNARY_F64(sigmoid_f64, 1.0 / (1.0 + exp(-x)))
+UNARY_F64(relu_f64, x > 0.0 ? x : (x != x ? x : 0.0))
+
+// The scalar is the right operand.
+#define SCALAR_F64(name, expression) \
+extern ""C"" __global__ void name(const double* a, double* output, double y, int size) \
+{ \
+    int i = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (i < size) { const double x = a[i]; output[i] = (expression); } \
+}
+SCALAR_F64(add_scalar_f64, x + y)
+SCALAR_F64(subtract_scalar_f64, x - y)
+SCALAR_F64(multiply_scalar_f64, x * y)
+SCALAR_F64(divide_scalar_f64, x / y)
+
 // Double-precision reductions: one partial per block, a shared-memory tree (the block size is a power of two).
 extern ""C"" __global__ __launch_bounds__(256) void reduce_sum_f64(const double* input, double* output, int size)
 {
@@ -1704,6 +1731,18 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "subtract_f64",
                 "multiply_f64",
                 "divide_f64",
+                "negate_f64",
+                "abs_f64",
+                "sqrt_f64",
+                "exp_f64",
+                "log_f64",
+                "tanh_f64",
+                "sigmoid_f64",
+                "relu_f64",
+                "add_scalar_f64",
+                "subtract_scalar_f64",
+                "multiply_scalar_f64",
+                "divide_scalar_f64",
                 "reduce_max",
                 "reduce_min",
                 "squared_deviation_from_mean",

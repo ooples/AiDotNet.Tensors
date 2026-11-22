@@ -29,9 +29,21 @@ public sealed partial class CudaBackend : IGpuFloat64Reductions, IGpuFloat64Elem
     }
 
     /// <inheritdoc/>
-    public bool SupportsFloat64Elementwise
-        => IsAvailable && _kernelCache.ContainsKey("add_f64") && _kernelCache.ContainsKey("subtract_f64")
-            && _kernelCache.ContainsKey("multiply_f64") && _kernelCache.ContainsKey("divide_f64");
+    public bool SupportsFloat64Elementwise => IsAvailable && Float64ElementwiseKernelsLoaded();
+
+    private bool Float64ElementwiseKernelsLoaded()
+    {
+        foreach (var name in Float64ElementwiseKernelNames)
+            if (!_kernelCache.ContainsKey(name)) return false;
+        return true;
+    }
+
+    private static readonly string[] Float64ElementwiseKernelNames =
+    {
+        "add_f64", "subtract_f64", "multiply_f64", "divide_f64",
+        "negate_f64", "abs_f64", "sqrt_f64", "exp_f64", "log_f64", "tanh_f64",
+        "sigmoid_f64", "relu_f64", "add_scalar_f64", "subtract_scalar_f64", "multiply_scalar_f64", "divide_scalar_f64",
+    };
 
     /// <inheritdoc/>
     public unsafe void BinaryFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
@@ -60,6 +72,68 @@ public sealed partial class CudaBackend : IGpuFloat64Reductions, IGpuFloat64Elem
         args[0] = &aPtr;
         args[1] = &bPtr;
         args[2] = &outputPtr;
+        args[3] = &n;
+        LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void UnaryFloat64(GpuFloat64UnaryOperation operation, IGpuBuffer a, IGpuBuffer output, int size)
+    {
+        if (!SupportsFloat64Elementwise)
+            throw new GpuCapabilityUnavailableException("Double-precision element-wise kernels are not available on this device.");
+        CheckFloat64Operand(a, size, nameof(a));
+        CheckFloat64Operand(output, size, nameof(output));
+        if (size == 0) return;
+        IntPtr kernel = _kernelCache[operation switch
+        {
+            GpuFloat64UnaryOperation.Negate => "negate_f64",
+            GpuFloat64UnaryOperation.Abs => "abs_f64",
+            GpuFloat64UnaryOperation.Sqrt => "sqrt_f64",
+            GpuFloat64UnaryOperation.Exp => "exp_f64",
+            GpuFloat64UnaryOperation.Log => "log_f64",
+            GpuFloat64UnaryOperation.Tanh => "tanh_f64",
+            GpuFloat64UnaryOperation.Sigmoid => "sigmoid_f64",
+            GpuFloat64UnaryOperation.Relu => "relu_f64",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+        }];
+        using var _ = PushContext();
+        // Every unary double kernel takes (a, output, size).
+        IntPtr aPtr = a.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[3];
+        args[0] = &aPtr;
+        args[1] = &outputPtr;
+        args[2] = &n;
+        LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
+    }
+
+    /// <inheritdoc/>
+    public unsafe void ScalarFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, double scalar, IGpuBuffer output, int size)
+    {
+        if (!SupportsFloat64Elementwise)
+            throw new GpuCapabilityUnavailableException("Double-precision element-wise kernels are not available on this device.");
+        CheckFloat64Operand(a, size, nameof(a));
+        CheckFloat64Operand(output, size, nameof(output));
+        if (size == 0) return;
+        IntPtr kernel = _kernelCache[operation switch
+        {
+            GpuFloat64BinaryOperation.Add => "add_scalar_f64",
+            GpuFloat64BinaryOperation.Subtract => "subtract_scalar_f64",
+            GpuFloat64BinaryOperation.Multiply => "multiply_scalar_f64",
+            GpuFloat64BinaryOperation.Divide => "divide_scalar_f64",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+        }];
+        using var _ = PushContext();
+        // Every scalar double kernel takes (a, output, y, size).
+        IntPtr aPtr = a.Handle;
+        IntPtr outputPtr = output.Handle;
+        double y = scalar;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr;
+        args[1] = &outputPtr;
+        args[2] = &y;
         args[3] = &n;
         LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
     }

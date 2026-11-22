@@ -55,6 +55,51 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
         }
 
+        /// <inheritdoc/>
+        public void UnaryFloat64(GpuFloat64UnaryOperation operation, IGpuBuffer a, IGpuBuffer output, int size)
+        {
+            var input = Float64Operand(a, size, nameof(a));
+            var destination = Float64Operand(output, size, nameof(output));
+            if (size == 0) return;
+            var kernel = _kernelCache[operation switch
+            {
+                GpuFloat64UnaryOperation.Negate => "negate_f64",
+                GpuFloat64UnaryOperation.Abs => "abs_f64",
+                GpuFloat64UnaryOperation.Sqrt => "sqrt_f64",
+                GpuFloat64UnaryOperation.Exp => "exp_f64",
+                GpuFloat64UnaryOperation.Log => "log_f64",
+                GpuFloat64UnaryOperation.Tanh => "tanh_f64",
+                GpuFloat64UnaryOperation.Sigmoid => "sigmoid_f64",
+                GpuFloat64UnaryOperation.Relu => "relu_f64",
+                _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+            }];
+            kernel.SetArg(0, input.Buffer.Handle);
+            kernel.SetArg(1, destination.Buffer.Handle);
+            kernel.SetArg(2, size);
+            kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+        }
+
+        /// <inheritdoc/>
+        public void ScalarFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, double scalar, IGpuBuffer output, int size)
+        {
+            var input = Float64Operand(a, size, nameof(a));
+            var destination = Float64Operand(output, size, nameof(output));
+            if (size == 0) return;
+            var kernel = _kernelCache[operation switch
+            {
+                GpuFloat64BinaryOperation.Add => "add_scalar_f64",
+                GpuFloat64BinaryOperation.Subtract => "subtract_scalar_f64",
+                GpuFloat64BinaryOperation.Multiply => "multiply_scalar_f64",
+                GpuFloat64BinaryOperation.Divide => "divide_scalar_f64",
+                _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+            }];
+            kernel.SetArg(0, input.Buffer.Handle);
+            kernel.SetArg(1, destination.Buffer.Handle);
+            kernel.SetArg(2, scalar);
+            kernel.SetArg(3, size);
+            kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+        }
+
         // The CLBlast direct GEMM kernels built over double. Compiled on first use; a device without fp64 fails the
         // build and reports the routine unavailable.
         private DirectOpenClKernel? _float64GemmKernel;

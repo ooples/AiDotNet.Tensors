@@ -165,6 +165,75 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    private static GpuFloat64UnaryOperation? Float64UnaryOperationFor(string callerName) => callerName switch
+    {
+        nameof(TensorNegate) => GpuFloat64UnaryOperation.Negate,
+        nameof(TensorAbs) => GpuFloat64UnaryOperation.Abs,
+        nameof(TensorSqrt) => GpuFloat64UnaryOperation.Sqrt,
+        nameof(TensorExp) => GpuFloat64UnaryOperation.Exp,
+        nameof(TensorLog) => GpuFloat64UnaryOperation.Log,
+        nameof(TensorTanh) => GpuFloat64UnaryOperation.Tanh,
+        nameof(TensorSigmoid) or nameof(Sigmoid) => GpuFloat64UnaryOperation.Sigmoid,
+        nameof(TensorReLU) => GpuFloat64UnaryOperation.Relu,
+        _ => null,
+    };
+
+    /// <summary>
+    /// A double unary op on the device, the result left there. Null when the op has no double kernel or the CPU engine
+    /// is the cheaper route (the operand would have to be uploaded).
+    /// </summary>
+    private Tensor<double>? TryUnaryFloat64(Tensor<double> input, string callerName)
+        => Float64UnaryOperationFor(callerName) is { } operation
+            ? TryMapFloat64(input, callerName, (elementwise, a, output, size) => elementwise.UnaryFloat64(operation, a, output, size))
+            : null;
+
+    /// <summary>
+    /// <c>input (op) scalar</c> in double on the device, the result left there. Null when the CPU engine is the cheaper
+    /// route, or under a graph trace or anomaly mode (which keep the CPU engine's path, as the float route does).
+    /// </summary>
+    private Tensor<double>? TryScalarFloat64(Tensor<double> input, double scalar, GpuFloat64BinaryOperation operation, string callerName)
+        => Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive
+            ? null
+            : TryMapFloat64(input, callerName, (elementwise, a, output, size) => elementwise.ScalarFloat64(operation, a, scalar, output, size));
+
+    private Tensor<double>? TryMapFloat64(Tensor<double> input, string callerName, Action<IGpuFloat64Elementwise, IGpuBuffer, IGpuBuffer, int> launch)
+    {
+        int length = input.Length;
+        if (length < Float64ElementwiseMinLength) return null;
+        if (ResidentStepActive || !IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend)) return null;
+        if (backend is not IGpuFloat64Elementwise { SupportsFloat64Elementwise: true } elementwise) return null;
+        if (!backend.SupportsElementType(GpuElementType.Float64)) return null;
+        // Only the type-preserving policy takes this route; a speed-first scope narrows to float on its own path.
+        if (AutocastScope.IsEnabled
+            || GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AccuracyMode != GpuAccuracyMode.PreserveInputType)
+            return null;
+
+        lock (_float64Lock)
+        {
+            CountFloat64Transfers(input, out int uploads, out int downloads);
+            if (uploads > downloads) return null;
+
+            using var a = ResolveFloat64Operand(backend, input);
+            var output = RentFloat64Buffer(backend, length, input, input);
+            try
+            {
+                launch(elementwise, a.Buffer, output, length);
+                return RegisterFloat64Result(backend, output, length, input.Shape.ToArray());
+            }
+            catch (NotSupportedException capabilityGap)
+            {
+                output.Dispose();
+                GpuLaunchProbe.OnFallback(callerName, capabilityGap);
+                return null;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+    }
+
     /// <summary>
     /// The least work (m x n x k) at which a double matrix multiply is considered for the device at all. Below it the
     /// launch alone costs more than the CPU engine's multiply (measured: 256 cubed takes 0.17 ms on the CPU engine and
@@ -430,8 +499,10 @@ public partial class DirectGpuTensorEngine
     {
         long bytes = (long)length * sizeof(double);
         long budget = Float64ResidentBudget(backend);
-        if (TryTakePooledFloat64(backend, length, out var ready)) return ready;
-        // Nothing pooled. Results a chain has dropped are reclaimed only once the collector has noticed them, and it
+        // The fast path: a pooled buffer, while the results on the device fit the budget with it. Past the budget the
+        // dropped results are reclaimed first, pooled buffer or not; they would otherwise be held until the pool ran dry.
+        if (_float64ResidentBytes + bytes <= budget && TryTakePooledFloat64(backend, length, out var ready)) return ready;
+        // Results a chain has dropped are reclaimed only once the collector has noticed them, and it
         // cannot see the device memory they hold: after enough new device memory, ask the cheap generations (a result
         // tensor is a small young object), so a loop reuses its buffers long before it reaches the budget.
         SweepFloat64Residents();
@@ -444,7 +515,18 @@ public partial class DirectGpuTensorEngine
 
         for (int attempt = 0; ; attempt++)
         {
-            if (TryTakePooledFloat64(backend, length, out var pooled)) return pooled;
+            if (TryTakePooledFloat64(backend, length, out var pooled))
+            {
+                // Still over with every dropped result reclaimed: the rest are reachable, so the oldest come down.
+                if (_float64ResidentBytes + bytes > budget)
+                {
+                    DisposeFloat64Pool();
+                    EvictFloat64Residents(budget - bytes, left, right);
+                }
+
+                return pooled;
+            }
+
             if (_float64ResidentBytes + _float64PoolBytes + bytes <= budget) break;
             if (attempt == 0)
             {
