@@ -62,11 +62,45 @@ public partial class CpuEngine
         if (state.Rank != 3) throw new ArgumentException("state must be [rows, valueDim, keyDim].", nameof(state));
         if (!state.IsContiguous) throw new ArgumentException("state is updated in place and must be contiguous.", nameof(state));
         int rows = state.Shape[0], dv = state.Shape[1], dk = state.Shape[2];
-        if (query.Length != rows * dk) throw new ArgumentException($"query must hold rows x keyDim = {rows * dk} values.", nameof(query));
-        if (key.Length != rows * dk) throw new ArgumentException($"key must hold rows x keyDim = {rows * dk} values.", nameof(key));
-        if (value.Length != rows * dv) throw new ArgumentException($"value must hold rows x valueDim = {rows * dv} values.", nameof(value));
-        if (alpha.Length != rows) throw new ArgumentException($"alpha must hold one value per row ({rows}).", nameof(alpha));
-        if (beta.Length != rows) throw new ArgumentException($"beta must hold one value per row ({rows}).", nameof(beta));
+        // q, k are [..., keyDim] and v [..., valueDim] with one shared leading shape that flattens to the rows, so a
+        // transposed [keyDim, rows] query (same length) is rejected instead of being read as [rows, keyDim].
+        var lead = RowLeadingShape(query, dk, rows, nameof(query), "keyDim");
+        if (!LeadingShapeEquals(key, dk, lead)) throw new ArgumentException(
+            $"key must be [{string.Join(", ", lead)}, {dk}] like query; got [{string.Join(", ", key.Shape.ToArray())}].", nameof(key));
+        if (!LeadingShapeEquals(value, dv, lead)) throw new ArgumentException(
+            $"value must be [{string.Join(", ", lead)}, {dv}] (query's leading shape, valueDim last); got [{string.Join(", ", value.Shape.ToArray())}].", nameof(value));
+        ValidateRowGate(alpha, rows, lead, nameof(alpha));
+        ValidateRowGate(beta, rows, lead, nameof(beta));
         return (rows, dv, dk);
+    }
+
+    // The leading shape of a [..., width] per-row tensor whose leading dimensions flatten to rows.
+    private static int[] RowLeadingShape<T>(Tensor<T> x, int width, int rows, string name, string widthName)
+    {
+        if (x.Rank < 1 || x.Shape[x.Rank - 1] != width || x.Length != (long)rows * width)
+            throw new ArgumentException(
+                $"{name} must be [rows, {widthName}] = [{rows}, {width}] (or [..., {width}] with leading dimensions multiplying to {rows}); got [{string.Join(", ", x.Shape.ToArray())}].", name);
+        var lead = new int[x.Rank - 1];
+        for (int i = 0; i < lead.Length; i++) lead[i] = x.Shape[i];
+        return lead;
+    }
+
+    private static bool LeadingShapeEquals<T>(Tensor<T> x, int width, int[] lead)
+    {
+        if (x.Rank != lead.Length + 1 || x.Shape[x.Rank - 1] != width) return false;
+        for (int i = 0; i < lead.Length; i++) if (x.Shape[i] != lead[i]) return false;
+        return true;
+    }
+
+    // A per-row gate is [rows], the query's leading shape, or either with a trailing singleton dimension.
+    private static void ValidateRowGate<T>(Tensor<T> g, int rows, int[] lead, string name)
+    {
+        int rank = g.Rank > 1 && g.Shape[g.Rank - 1] == 1 ? g.Rank - 1 : g.Rank;
+        bool flat = rank == 1 && g.Shape[0] == rows;
+        bool matchesLead = rank == lead.Length;
+        for (int i = 0; matchesLead && i < lead.Length; i++) matchesLead = g.Shape[i] == lead[i];
+        if (!flat && !matchesLead)
+            throw new ArgumentException(
+                $"{name} must hold one value per row: [{rows}] or [{string.Join(", ", lead)}] (optionally with a trailing 1); got [{string.Join(", ", g.Shape.ToArray())}].", name);
     }
 }

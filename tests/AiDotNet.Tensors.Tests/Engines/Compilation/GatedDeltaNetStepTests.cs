@@ -83,6 +83,50 @@ public class GatedDeltaNetStepTests
             }
     }
 
+    // Validation checks shapes, not just lengths: a transposed [keyDim, rows] query holds rows x keyDim values too and
+    // was read as [rows, keyDim]; every per-row operand must now name the state's widths in its last dimension.
+    [Theory]
+    [InlineData("query")]
+    [InlineData("key")]
+    [InlineData("value")]
+    [InlineData("alpha")]
+    [InlineData("beta")]
+    public void A_transposed_or_misshaped_operand_is_rejected(string bad)
+    {
+        const int rows = 3, dv = 2, dk = 4;
+        var engine = new CpuEngine();
+        var state = new Tensor<float>([rows, dv, dk]);
+        var q = new Tensor<float>(bad == "query" ? new[] { dk, rows } : new[] { rows, dk });
+        var k = new Tensor<float>(bad == "key" ? new[] { dk, rows } : new[] { rows, dk });
+        var v = new Tensor<float>(bad == "value" ? new[] { dv, rows } : new[] { rows, dv });
+        // A [1, rows] gate has rows values but is neither [rows] nor the query's leading shape [rows] (+ trailing 1).
+        var a = new Tensor<float>(bad == "alpha" ? new[] { 1, rows } : new[] { rows });
+        var b = new Tensor<float>(bad == "beta" ? new[] { 1, rows } : new[] { rows, 1 });
+        var before = state.ToArray();
+        var ex = Assert.Throws<ArgumentException>(() => engine.GatedDeltaNetStep(state, q, k, v, a, b, GatedDeltaRule.Standard));
+        Assert.Equal(bad, ex.ParamName);
+        Assert.Equal(before, state.ToArray());
+    }
+
+    [Fact]
+    public void Batched_leading_dimensions_that_flatten_to_the_rows_are_accepted()
+    {
+        const int batch = 2, heads = 3, dv = 2, dk = 4, rows = batch * heads;
+        var engine = new CpuEngine();
+        var x = Draw(new Random(11), rows, dv, dk);
+        var flatState = new Tensor<float>([rows, dv, dk]);
+        var batchedState = new Tensor<float>([rows, dv, dk]);
+        var flat = engine.GatedDeltaNetStep(flatState, new Tensor<float>([rows, dk], new Vector<float>(x.Q)), new Tensor<float>([rows, dk], new Vector<float>(x.K)),
+            new Tensor<float>([rows, dv], new Vector<float>(x.V)), new Tensor<float>([rows], new Vector<float>(x.A)), new Tensor<float>([rows], new Vector<float>(x.B)),
+            GatedDeltaRule.Standard).ToArray();
+        var batched = engine.GatedDeltaNetStep(batchedState, new Tensor<float>([batch, heads, dk], new Vector<float>(x.Q)),
+            new Tensor<float>([batch, heads, dk], new Vector<float>(x.K)), new Tensor<float>([batch, heads, dv], new Vector<float>(x.V)),
+            new Tensor<float>([batch, heads], new Vector<float>(x.A)), new Tensor<float>([batch, heads, 1], new Vector<float>(x.B)),
+            GatedDeltaRule.Standard).ToArray();
+        Assert.Equal(flat, batched);
+        Assert.Equal(flatState.ToArray(), batchedState.ToArray());
+    }
+
     [Theory]
     [InlineData(3, 4, 5, GatedDeltaRule.Standard)]
     [InlineData(8, 64, 64, GatedDeltaRule.Standard)]

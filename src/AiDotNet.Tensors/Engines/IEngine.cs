@@ -4724,11 +4724,11 @@ public partial interface IEngine
     /// output and the new state come from one pass over the state. Forward only (decoding).
     /// </summary>
     /// <param name="state">The memory [rows, valueDim, keyDim], contiguous; written in place.</param>
-    /// <param name="query">This position's queries, rows x keyDim values.</param>
-    /// <param name="key">This position's keys, rows x keyDim values.</param>
-    /// <param name="value">This position's values, rows x valueDim values.</param>
-    /// <param name="alpha">The decay per row (rows values).</param>
-    /// <param name="beta">The write strength per row (rows values).</param>
+    /// <param name="query">This position's queries [rows, keyDim], or [..., keyDim] with leading dimensions multiplying to rows.</param>
+    /// <param name="key">This position's keys, the query's shape.</param>
+    /// <param name="value">This position's values, the query's leading shape with valueDim last.</param>
+    /// <param name="alpha">The decay per row: [rows] or the query's leading shape, optionally with a trailing 1.</param>
+    /// <param name="beta">The write strength per row, shaped as <paramref name="alpha"/>.</param>
     /// <param name="rule">The state update, as the scan's.</param>
     /// <returns>The output <c>o</c> [rows, valueDim].</returns>
     Tensor<T> GatedDeltaNetStep<T>(
