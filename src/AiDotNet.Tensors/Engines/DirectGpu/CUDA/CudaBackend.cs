@@ -6775,6 +6775,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
         if ((int)status != 0)
         {
+            NoteTunedWorkspaceReleased();   // a held timing graph may read it
             workspace.Dispose();
             tc.Workspace = null;
         }

@@ -519,8 +519,14 @@ public static class TunedKernelRegistry
     /// </summary>
     internal static event Action? MeasurementSessionEnded;
 
+    private static long s_decisions;
+
+    /// <summary>Counts decisions settled in any slot: a nested slot's choice changes what an outer candidate launches.</summary>
+    internal static long DecisionGeneration => Interlocked.Read(ref s_decisions);
+
     internal static void Record(TunedKernelDecision decision)
     {
+        Interlocked.Increment(ref s_decisions);
         s_log.Enqueue(decision);
         while (s_log.Count > 4096 && s_log.TryDequeue(out _)) { }
         // Trace, not the console: the host routes it (a console or file listener, its logging framework).

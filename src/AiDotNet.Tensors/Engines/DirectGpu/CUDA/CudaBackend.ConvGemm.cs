@@ -29,6 +29,7 @@ public sealed partial class CudaBackend
         {
             if (floats > int.MaxValue || IsStreamCapturing())
                 return null;
+            if (slot is not null) NoteTunedWorkspaceReleased();   // a held timing graph may read the old one
             slot?.Dispose();
             slot = AllocateBuffer((int)floats);
         }
@@ -324,6 +325,7 @@ public sealed partial class CudaBackend
         if (_convOnes is null || _convOnesLength < batch)
         {
             if (IsStreamCapturing()) return false;
+            if (_convOnes is not null) NoteTunedWorkspaceReleased();
             _convOnes?.Dispose();
             _convOnes = AllocateBuffer(batch);
             Fill(_convOnes, 1f, batch);

@@ -328,6 +328,44 @@ public sealed class CudaTunedKernelTests
         }
     }
 
+    // A held timing graph is keyed by (candidate, arguments), which says nothing of the workspaces the candidate's
+    // launch reads or the kernels nested slots chose for it: a workspace released or a decision settled since the
+    // capture must not be replayed.
+    [SkippableFact]
+    public void HeldTimingGraphs_AreDropped_WhenAWorkspaceIsReleasedOrADecisionSettles()
+    {
+        using var backend = RequireBackend();
+        const int count = 2048;
+        using var output = backend.AllocateBuffer(count);
+        var key = new object();
+        void Sample() => backend.MeasureTunedKernelMilliseconds(() => backend.Fill(output, 1f, count), 2, key);
+        TunedKernelRegistry.BeginMeasurement();
+        try
+        {
+            long captured = backend.TuneGraphsCaptured, reused = backend.TuneGraphsReused, dropped = backend.TuneGraphsInvalidated;
+            Sample();
+            Skip.If(backend.TuneGraphsCaptured == captured, "timing graphs are not captured on this device");
+            Sample();
+            Assert.Equal(reused + 1, backend.TuneGraphsReused);   // same key, nothing changed: replayed
+
+            CudaBackend.NoteTunedWorkspaceReleased();
+            Sample();
+            Assert.Equal(captured + 2, backend.TuneGraphsCaptured);   // recaptured after the workspace changed
+            Assert.Equal(dropped + 1, backend.TuneGraphsInvalidated);
+
+            TunedKernelRegistry.Record(new TunedKernelDecision(TunedKernelOp.Softmax, "test", default, "reference",
+                TunedKernelOrigin.Builtin, TunedKernelDecisionReason.ReferenceWon, "reference"));
+            Sample();
+            Assert.Equal(captured + 3, backend.TuneGraphsCaptured);   // recaptured after a decision settled
+            Assert.Equal(reused + 1, backend.TuneGraphsReused);
+        }
+        finally
+        {
+            TunedKernelRegistry.EndMeasurement();
+        }
+        Assert.Equal(0, backend.SessionTuneGraphCount);
+    }
+
     [SkippableFact]
     public void PublicSoftmax_ThroughTheRegistry_MatchesTheReferenceAndCachesADecision()
     {
