@@ -1263,7 +1263,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
     {
-        get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
+        get
+        {
+            if (CoversWholeVector) return _data._deviceState?.Buffer;
+            var view = _viewGpuBuffer;
+            // A buffer the storage lent this view is the view's only while the storage still holds it. The owner frees
+            // it when it migrates to another backend, is released or is uploaded afresh, and nothing else tells the
+            // view: checked here, where every use of the binding starts, so no op reaches a freed handle through it.
+            if (view is not null && _viewGpuBufferIsStorageOrder && !ReferenceEquals(view, _data?._deviceState?.Buffer))
+            {
+                DropLentViewBinding();
+                return null;
+            }
+            return view;
+        }
         set
         {
             if (CoversWholeVector) _data.DeviceState.Buffer = value;
@@ -1274,6 +1287,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                 _viewGpuBufferIsStorageOrder = false;
             }
         }
+    }
+
+    // Forgets a lent buffer the storage no longer holds. Never freed here: the view did not own it, and its owner
+    // brought the data home (or replaced it) before letting the buffer go.
+    private void DropLentViewBinding()
+    {
+        _viewGpuBuffer = null;
+        _viewGpuBufferIsStorageOrder = false;
+        _viewGpuBackend = null;
+        _viewGpuBufferVersion = -1;
+        _viewGpuBufferIsSplitComplex = false;
+        _viewGpuBufferContainsRawInt32 = false;
+        _viewGpuBufferContainsRawInt64 = false;
     }
 
     /// <summary>
