@@ -1,3 +1,4 @@
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
@@ -67,6 +68,73 @@ public class CudaBackendInitializationTests
             using var backend = new CudaBackend();
             listener.Flush();
             Assert.True(backend.IsAvailable, "CudaBackend failed to initialize on a machine with a CUDA device: " + log);
+        }
+        finally
+        {
+            Trace.Listeners.Remove(listener);
+            listener.Dispose();
+        }
+    }
+
+    // A lazy probe caches an exception and rethrows it from every later read, so a failure in the best-effort path
+    // discovery must not escape: the probe still runs, once, and every reader gets its answer.
+    [Theory]
+    [InlineData(typeof(IOException))]
+    [InlineData(typeof(UnauthorizedAccessException))]
+    [InlineData(typeof(ArgumentException))]
+    public void ApiProbe_StillRunsOnce_WhenPathDiscoveryThrows(Type discoveryFailure)
+    {
+        int discoveries = 0;
+        int probes = 0;
+        var expected = new object();
+        var lazy = NvrtcNativeBindings.CreateApiProbe<object?>(() => NvrtcNativeBindings.ProbeAfterBestEffortDiscovery<object?>(
+            () =>
+            {
+                Interlocked.Increment(ref discoveries);
+                throw (Exception)(Activator.CreateInstance(discoveryFailure, "discovery failed")
+                    ?? throw new InvalidOperationException($"Could not create {discoveryFailure}."));
+            },
+            () =>
+            {
+                Interlocked.Increment(ref probes);
+                return expected;
+            }));
+
+        Assert.Same(expected, lazy.Value);
+        Assert.Same(expected, lazy.Value);
+        Assert.Equal(1, discoveries);
+        Assert.Equal(1, probes);
+    }
+
+    // A failure that is not a path-discovery failure is a defect, not "not installed": it is not swallowed.
+    [Fact]
+    public void ApiProbe_DoesNotSwallowUnrelatedDiscoveryFailures()
+    {
+        Assert.Throws<InvalidOperationException>(() => NvrtcNativeBindings.ProbeAfterBestEffortDiscovery<object?>(
+            () => throw new InvalidOperationException("defect"),
+            () => null));
+    }
+
+    private sealed class ThrowingTraceListener : TraceListener
+    {
+        public override void Write(string? message) => throw new IOException("trace sink failed");
+
+        public override void WriteLine(string? message) => throw new IOException("trace sink failed");
+    }
+
+    // Reporting the discovery failure is best-effort too: a trace listener that throws must not skip the probe.
+    [Fact]
+    public void ApiProbe_StillRuns_WhenDiscoveryThrowsAndTheTraceListenerThrows()
+    {
+        var listener = new ThrowingTraceListener();
+        Trace.Listeners.Add(listener);
+        try
+        {
+            var expected = new object();
+            var result = NvrtcNativeBindings.ProbeAfterBestEffortDiscovery<object?>(
+                () => throw new IOException("discovery failed"),
+                () => expected);
+            Assert.Same(expected, result);
         }
         finally
         {
