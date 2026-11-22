@@ -1,0 +1,126 @@
+#if NET7_0_OR_GREATER
+using System.Text.RegularExpressions;
+using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
+
+/// <summary>
+/// The prelude routes an f32 module's builtin tanh, log and log2 to the accurate helpers (Dawn's D3D12 builtins are about
+/// 1e-3 and 2e-5 relative off where the answer is small); WebGpuShaderAccuracyTests checks the helpers' values on Dawn.
+/// </summary>
+public sealed class WebGpuShaderPreludeTests
+{
+    private const string Kernel = @"
+fn fast_tanh(x: f32) -> f32 { return x; }
+fn tanh_derivative(t: f32) -> f32 { return 1.0 - t * t; }
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let a = tanh(1.0) + tanh (2.0) + fast_tanh(3.0) + tanh_derivative(4.0) + log2(5.0) + log(6.0) + log1p(7.0);
+}
+";
+
+    private static int Count(string source, string pattern) => Regex.Matches(source, pattern).Count;
+
+    [Fact]
+    public void Builtin_tanh_log_and_log2_calls_go_to_the_helpers_and_nothing_else_is_renamed()
+    {
+        string prepared = WebGpuShaderPrelude.Prepare(Kernel);
+        Assert.Equal(2, Count(prepared, @"[^\w]wgsl_tanh\s*\(") - 1);   // two call sites plus the helper's declaration
+        Assert.Contains("fn wgsl_tanh(", prepared);
+        Assert.Contains("fn wgsl_log2(", prepared);
+        Assert.Contains("fast_tanh(3.0)", prepared);
+        Assert.Contains("tanh_derivative(4.0)", prepared);
+        Assert.Contains("wgsl_log2(5.0)", prepared);
+        Assert.Contains("wgsl_log(6.0)", prepared);
+        Assert.Contains("log1p(7.0)", prepared);
+        Assert.DoesNotContain("wgsl_log1p", prepared);
+        // The helper's own fallback for zero, negatives and non-finite values is the builtin.
+        Assert.Contains("return log2(x);", prepared);
+        Assert.Contains("return log(x);", prepared);
+    }
+
+    [Fact]
+    public void Preparing_twice_changes_nothing_more()
+    {
+        string once = WebGpuShaderPrelude.Prepare(Kernel);
+        Assert.Equal(once, WebGpuShaderPrelude.Prepare(once));
+    }
+
+    [Fact]
+    public void A_module_that_enables_f16_keeps_the_builtins()
+    {
+        string source = "enable f16;\n" + Kernel;
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.DoesNotContain("wgsl_tanh", prepared);
+        Assert.DoesNotContain("wgsl_log2", prepared);
+        Assert.DoesNotContain("wgsl_log(", prepared);
+    }
+
+    [Theory]
+    [InlineData("enable subgroups, f16;\n")]
+    [InlineData("enable  f16 ;\n")]
+    [InlineData("// header\n/* a /* nested */ comment */\nenable f16;\n")]
+    public void Any_enable_that_lists_f16_keeps_the_builtins(string directives)
+    {
+        string prepared = WebGpuShaderPrelude.Prepare(directives + Kernel);
+        Assert.DoesNotContain("wgsl_tanh", prepared);
+        Assert.DoesNotContain("wgsl_log", prepared);
+    }
+
+    [Fact]
+    public void Mentioning_f16_in_a_comment_does_not_turn_the_rewrite_off()
+    {
+        string prepared = WebGpuShaderPrelude.Prepare("// TODO enable f16 later\n" + Kernel);
+        Assert.Contains("wgsl_tanh(1.0)", prepared);
+    }
+
+    [Fact]
+    public void Helpers_go_after_directives_that_follow_a_comment()
+    {
+        string prepared = WebGpuShaderPrelude.Prepare("// header\nenable subgroups;\n" + Kernel);
+        Assert.True(prepared.IndexOf("enable subgroups;", System.StringComparison.Ordinal)
+                    < prepared.IndexOf("fn wgsl_tanh(", System.StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Vector_arguments_keep_the_builtin_and_their_components_do_not()
+    {
+        const string source = @"
+struct S { pos: vec3<f32>, w: f32 }
+fn dir() -> vec2<f32> { return vec2<f32>(1.0, 2.0); }
+fn f(v: vec4<f32>, s: S) -> f32 {
+    let u = vec3<f32>(1.0);
+    let a = tanh(v) + tanh(v * 2.0) + tanh(vec2<f32>(1.0)) + tanh(u.xy) + tanh(dir()) + tanh(s.pos);
+    return tanh(v.x) + log(v[1]) + log2(s.w) + tanh(u.z);
+}
+";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        foreach (var kept in new[] { "tanh(v)", "tanh(v * 2.0)", "tanh(vec2<f32>(1.0))", "tanh(u.xy)", "tanh(dir())", "tanh(s.pos)" })
+            Assert.Contains(" " + kept, prepared);
+        foreach (var rewritten in new[] { "wgsl_tanh(v.x)", "wgsl_log(v[1])", "wgsl_log2(s.w)", "wgsl_tanh(u.z)" })
+            Assert.Contains(rewritten, prepared);
+    }
+
+    [Fact]
+    public void Constant_declarations_keep_the_builtin()
+    {
+        const string source = @"
+const INV_LN2 = 1.0 / log(2.0);
+@id(0) override SCALE: f32 = tanh(0.5);
+fn f(x: f32) -> f32 { const C = log2(8.0); return tanh(x) * C * INV_LN2 * SCALE; }
+";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.Contains("1.0 / log(2.0)", prepared);
+        Assert.Contains("= tanh(0.5)", prepared);
+        Assert.Contains("= log2(8.0)", prepared);
+        Assert.Contains("return wgsl_tanh(x)", prepared);
+    }
+
+    [Fact]
+    public void A_source_with_none_of_them_is_returned_unchanged()
+    {
+        const string source = "@compute @workgroup_size(1) fn main() { let a = exp(1.0); }";
+        Assert.Same(source, WebGpuShaderPrelude.Prepare(source));
+    }
+}
+#endif

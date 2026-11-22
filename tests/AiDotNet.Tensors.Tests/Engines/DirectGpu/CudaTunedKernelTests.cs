@@ -296,7 +296,7 @@ public sealed class CudaTunedKernelTests
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
         TunedKernelPolicy.IgnoreProfiles = true;
-        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.BudgetMilliseconds = TunedKernelPolicy.SpentMilliseconds + 60_000;   // the budget is per process: headroom past what earlier tests spent
         try
         {
             const int rows = 4096, n = 64;
@@ -378,7 +378,7 @@ public sealed class CudaTunedKernelTests
         double previousBudget = TunedKernelPolicy.BudgetMilliseconds;
         TunedKernelPolicy.ModeOverride = TunedKernelMode.Tune;
         TunedKernelPolicy.PersistDecisions = false;
-        TunedKernelPolicy.BudgetMilliseconds = 60_000;
+        TunedKernelPolicy.BudgetMilliseconds = TunedKernelPolicy.SpentMilliseconds + 60_000;   // the budget is per process: headroom past what earlier tests spent
         try
         {
             const int rows = 8192, n = 32;
