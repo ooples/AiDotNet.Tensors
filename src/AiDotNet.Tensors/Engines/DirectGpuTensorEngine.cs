@@ -757,7 +757,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // it; materializing that would read back data the host already holds.
         // A binding on another backend holds what its owner last wrote: bring it home through the cross-backend
         // policy before the host is treated as authoritative (the branch below would free it unread).
-        CrossBackendTensors.ResolveIfForeign(t, cb);
+        CrossBackendTensors.ResolveIfForeign(t, cb, hostAuthoritative: true);
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         using var dataLease = t.LeaseArray();
         var data = dataLease.Array;

@@ -55,41 +55,75 @@ internal static class CrossBackendTensors
     internal static bool IsForeign(IDirectGpuBackend? owner)
     {
         var consumer = GpuOpGate.CurrentOpBackend;
-        return owner is not null && consumer is not null && !ReferenceEquals(owner, consumer) && !Shares(owner, consumer);
+        return owner is not null && consumer is not null && !ReferenceEquals(owner, consumer)
+               && !SameAddressSpace(owner, consumer);
     }
 
-    // Two backend instances on one address space (CUDA backends on the same live primary context) are not foreign.
-    private static bool Shares(IDirectGpuBackend owner, IDirectGpuBackend consumer)
-        => owner is IGpuSharedAddressSpace shared && shared.SharesAddressSpaceWith(consumer);
+    /// <summary>
+    /// Whether a buffer <paramref name="owner"/> placed is a valid address for <paramref name="consumer"/>'s kernels
+    /// with no synchronization: the same backend seen through any wrapper (a deferred scope's recording backend, a
+    /// tracing wrapper), or two backends that share one address space AND one stream
+    /// (<see cref="IGpuSharedAddressSpace"/>).
+    /// </summary>
+    internal static bool SameAddressSpace(IDirectGpuBackend owner, IDirectGpuBackend consumer)
+    {
+        var o = Unwrap(owner);
+        var c = Unwrap(consumer);
+        return ReferenceEquals(o, c) || (o is IGpuSharedAddressSpace shared && shared.SharesAddressSpaceWith(c));
+    }
+
+    /// <summary>The backend a wrapper (<see cref="Gpu.DelegatingGpuBackend"/> and its subclasses) forwards to.</summary>
+    internal static IDirectGpuBackend Unwrap(IDirectGpuBackend backend)
+    {
+        while (backend is Gpu.DelegatingGpuBackend wrapper) backend = wrapper.InnerBackend;
+        return backend;
+    }
 
     /// <summary>
     /// Applies the policy to a tensor whose buffer belongs to <paramref name="owner"/> while an op on
-    /// <paramref name="consumer"/> asked for it. Migrate brings the data home through its owner and drops the foreign
-    /// binding, so the caller's ordinary upload path places it on its own backend (once: the tensor then belongs
-    /// there); Throw raises.
+    /// <paramref name="consumer"/> asked for it. Throw raises. Migrate reads the data back through its owner, under
+    /// the owning engine's op lease so a concurrent Dispose cannot tear its context down mid-read, and drops the
+    /// foreign binding; a resident tensor is then re-placed on the consumer as Tensor.Gpu() would, so it stays
+    /// resident there. <paramref name="hostAuthoritative"/> is for an external input whose caller writes through the
+    /// host: its device copy is read back only while a device write is still pending, never over newer host data.
     /// </summary>
-    internal static void Resolve<T>(Tensor<T> tensor, IDirectGpuBackend owner, IDirectGpuBackend consumer)
+    internal static void Resolve<T>(Tensor<T> tensor, IDirectGpuBackend owner, IDirectGpuBackend consumer,
+        bool hostAuthoritative = false)
     {
         var policy = AiDotNetEngine.CrossBackendPolicy;
         if (policy == CrossBackendTensorPolicy.Throw)
             throw new InvalidOperationException(
-                $"A tensor of shape [{string.Join(", ", tensor.Shape.ToArray())}] is on the {Describe(owner)} backend, but the "
-                + $"operation runs on {Describe(consumer)}. Move it to the engine's device first (Tensor.To / Tensor.Gpu with that "
-                + "engine as AiDotNetEngine.Current), or set AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn.");
+                $"A tensor of shape [{Shape(tensor)}] is on the {Describe(owner)} backend, but the operation runs on "
+                + $"{Describe(consumer)}. Move it to the engine's device first (Tensor.To, or Tensor.Gpu with that engine as "
+                + "AiDotNetEngine.Current), or set AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn.");
 
         long bytes = (long)tensor.Length * sizeof(float);
         bool wasResident = tensor.IsGpuResident;
-        tensor.ReleaseForeignGpuBinding();
+        // A view onto part of the storage has a binding of its own that the storage's other views do not share: bring
+        // its values home but leave the binding alone. Rebinding the view by itself would split it from its siblings.
+        bool wholeStorage = tensor.CoversWholeVector;
+        var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
+        bool readBack = !hostAuthoritative || Helpers.HostSync.IsPending(key);
+
+        var ownerEngine = DirectGpuTensorEngine.EngineOwning(Unwrap(owner));
+        using (var ownerLease = ownerEngine?.EnterGpuOp() ?? default)
+        {
+            if (readBack && ownerEngine is not null && !ownerLease.Held)
+                throw new InvalidOperationException(
+                    $"A tensor of shape [{Shape(tensor)}] is held on the {Describe(owner)} backend by an engine that is being "
+                    + $"disposed, so it cannot be read back for the operation on {Describe(consumer)}.");
+            tensor.ReleaseForeignGpuBinding(readBack, dropBinding: wholeStorage);
+        }
         // Re-place it on the op's backend exactly as Tensor.Gpu() would have (version-tagged, host-mirrored), so a
         // resident parameter stays resident: left host-only, an on-device optimizer would update a buffer the forward
-        // never reads and training would stall.
-        if (wasResident) tensor.PlaceOn(consumer);
+        // never reads and training would stall. Placed on the real backend, never on a recording wrapper.
+        if (wasResident && wholeStorage) tensor.PlaceOn(Unwrap(consumer));
         Interlocked.Increment(ref s_migrations);
         if (policy == CrossBackendTensorPolicy.MigrateWarn && FirstReport(tensor.StorageIdentity, owner, consumer))
             AiDotNetEngine.LogDiagnostic(
-                $"[AiDotNet] Migrated a tensor of shape [{string.Join(", ", tensor.Shape.ToArray())}] ({bytes:N0} bytes) from the "
-                + $"{Describe(owner)} backend to {Describe(consumer)}: it was placed while another engine was "
-                + "AiDotNetEngine.Current. It now lives on the new backend; place it there directly to avoid the copy, or set "
+                $"[AiDotNet] Migrated a tensor of shape [{Shape(tensor)}] ({bytes:N0} bytes) from the {Describe(owner)} "
+                + $"backend to {Describe(consumer)}: it was placed while another engine was AiDotNetEngine.Current. It now "
+                + "lives on the new backend; place it there directly to avoid the copy, or set "
                 + "AiDotNetEngine.CrossBackendPolicy = Throw to make this an error.");
     }
 
@@ -97,18 +131,20 @@ internal static class CrossBackendTensors
     /// Applies the policy when <paramref name="tensor"/> is bound on a backend other than <paramref name="consumer"/>:
     /// for engine paths that resolve a tensor against an explicit backend instead of through
     /// <see cref="TensorBase{T}.TryGetGpuBuffer"/>, so a foreign binding is migrated (or refused) there too rather
-    /// than re-uploaded from the host on every op, or dropped without reading back what its owner last wrote.
+    /// than re-uploaded from the host on every op, or freed without reading back what its owner last wrote.
     /// </summary>
-    internal static void ResolveIfForeign<T>(Tensor<T> tensor, IDirectGpuBackend consumer)
+    internal static void ResolveIfForeign<T>(Tensor<T> tensor, IDirectGpuBackend consumer, bool hostAuthoritative = false)
     {
         var owner = tensor._gpuBackend;
-        if (tensor._gpuBuffer is null || owner is null || ReferenceEquals(owner, consumer) || Shares(owner, consumer)) return;
-        Resolve(tensor, owner, consumer);
+        if (tensor._gpuBuffer is null || owner is null || SameAddressSpace(owner, consumer)) return;
+        Resolve(tensor, owner, consumer, hostAuthoritative);
     }
+
+    private static string Shape<T>(Tensor<T> tensor) => string.Join(", ", tensor.Shape.ToArray());
 
     private static bool FirstReport(object storage, IDirectGpuBackend owner, IDirectGpuBackend consumer)
     {
-        string pair = owner.GetType().Name + "->" + consumer.GetType().Name;
+        string pair = Unwrap(owner).GetType().Name + "->" + Unwrap(consumer).GetType().Name;
         var seen = s_reported.GetValue(storage, static _ => new HashSet<string>(StringComparer.Ordinal));
         lock (seen) return seen.Add(pair);
     }

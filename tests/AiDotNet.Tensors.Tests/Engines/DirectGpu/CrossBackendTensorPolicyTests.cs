@@ -17,7 +17,15 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// AiDotNetEngine.CrossBackendPolicy instead: migrate once (warning once per tensor and backend pair), migrate
 /// silently, or throw.
 /// </summary>
-[Collection("DirectGpuSerial")]
+// AiDotNetEngine.CrossBackendPolicy and Logger are process-wide: these tests switch them (to Throw, among others), so
+// they run with no other test in parallel rather than only serialized against the other GPU tests.
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class CrossBackendPolicyCollection
+{
+    public const string Name = "CrossBackendPolicySerial";
+}
+
+[Collection(CrossBackendPolicyCollection.Name)]
 public sealed class CrossBackendTensorPolicyTests
 {
     private sealed class EnginePair : IDisposable
@@ -184,6 +192,62 @@ public sealed class CrossBackendTensorPolicyTests
         using var policy = new PolicyScope(CrossBackendTensorPolicy.MigrateWarn);
         Assert.Equal(new[] { 11f, 22f, 33f, 44f }, engines.Consumer.TensorAdd(a, b).ToArray());
         Assert.Equal(2, policy.MigrationLines.Count);
+    }
+
+    [SkippableFact]
+    public void Deferred_result_of_another_backend_is_materialized_before_its_buffer_is_dropped()
+    {
+        using var engines = CreateEngines();
+        var a = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        var b = new Tensor<float>(new[] { 10f, 20f, 30f, 40f }, new[] { 4 });
+        var c = new Tensor<float>(new[] { 100f, 200f, 300f, 400f }, new[] { 4 });
+        Tensor<float> produced;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try { produced = engines.Placer.TensorAdd(a, b); }   // a device result whose host copy is a pending download
+        finally { AiDotNetEngine.Current = previous; }
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        Assert.Equal(new[] { 111f, 222f, 333f, 444f }, engines.Consumer.TensorAdd(produced, c).ToArray());
+        Assert.Equal(new[] { 11f, 22f, 33f, 44f }, produced.ToArray());
+    }
+
+    [SkippableFact]
+    public void External_input_keeps_host_writes_made_after_another_backend_placed_it()
+    {
+        using var engines = CreateEngines();
+        var input = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        PlaceOn(engines.Placer, input);
+        // The caller writes the next batch through the host, as a training loop does for its input tensor.
+        var span = input.AsWritableSpan();
+        for (int i = 0; i < span.Length; i++) span[i] = 50f + i;
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        using (engines.Consumer.EnterGpuOp()) engines.Consumer.EnsureResidentInput(input);
+        var zeros = new Tensor<float>(new float[4], new[] { 4 });
+        Assert.Equal(new[] { 50f, 51f, 52f, 53f }, engines.Consumer.TensorAdd(input, zeros).ToArray());
+    }
+
+    [SkippableFact]
+    public void A_wrapper_around_the_op_backend_is_not_foreign()
+    {
+        using var engines = CreateEngines();
+        var backend = engines.Consumer.QueryBackend!;
+        var wrapper = new AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend(backend);
+        Assert.True(CrossBackendTensors.SameAddressSpace(backend, wrapper));
+        Assert.True(CrossBackendTensors.SameAddressSpace(wrapper, backend));
+        Assert.False(CrossBackendTensors.SameAddressSpace(engines.Placer.QueryBackend!, wrapper));
+    }
+
+    [SkippableFact]
+    public void A_lease_returned_from_another_thread_leaves_no_op_backend_behind()
+    {
+        using var engines = CreateEngines();
+        var gate = new GpuOpGate();
+        var lease = gate.Enter(engines.Consumer.QueryBackend);
+        Assert.Same(engines.Consumer.QueryBackend, GpuOpGate.CurrentOpBackend);
+        var other = new System.Threading.Thread(() => lease.Dispose());   // an async op finishing elsewhere
+        other.Start();
+        other.Join();
+        Assert.Null(GpuOpGate.CurrentOpBackend);
     }
 
     [Fact]

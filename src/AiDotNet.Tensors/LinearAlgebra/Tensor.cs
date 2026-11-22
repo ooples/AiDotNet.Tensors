@@ -5266,29 +5266,40 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>
-    /// Ensures this tensor's data is on the CPU. If the tensor has a pending deferred GPU download,
-    /// materializes it now. Equivalent to PyTorch's <c>tensor.cpu()</c>.
+    /// Releases this tensor's binding to the backend that owns its GPU buffer (CrossBackendTensors).
+    /// <paramref name="readBack"/> first brings the owner's values home (a pending deferred download included);
+    /// <paramref name="dropBinding"/> then detaches and frees the buffer when this tensor owns it (a storage-owned
+    /// buffer is freed with the storage), so the next engine op places the tensor on its own backend. A partial view
+    /// keeps its binding: the caller reads it back without splitting it from its sibling views.
     /// </summary>
-    /// <returns>This tensor with CPU data synchronized.</returns>
-    [MethodImpl(Hot)]
-    /// <summary>
-    /// Brings this tensor's data home from the backend that owns its GPU buffer and drops that binding, so the next
-    /// engine op places it on its own backend (CrossBackendTensors). The buffer is freed when this tensor owns it;
-    /// a storage-owned buffer is freed with the storage.
-    /// </summary>
-    internal void ReleaseForeignGpuBinding()
+    internal void ReleaseForeignGpuBinding(bool readBack, bool dropBinding)
     {
         var owner = _gpuBackend;
-        using var ownerWork = Engines.DirectGpu.GpuOpGate.SuspendOpBackend();
-        try { Cpu(); }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
+        if (readBack)
         {
-            throw new InvalidOperationException(
-                $"Could not read this tensor back from the {owner?.BackendName ?? "unknown"} backend that owns its GPU buffer "
-                + "(was its engine disposed?), so it cannot be moved to the running operation's backend.", ex);
+            // The owner's backend is the one whose buffer this reads: nothing inside is foreign to anything.
+            using var ownerWork = Engines.DirectGpu.GpuOpGate.SuspendOpBackend();
+            try
+            {
+                // A pending deferred download (an intermediate whose host copy has not been materialized yet) must land
+                // before the buffer goes: Cpu() alone returns early for a tensor that is not marked GPU-resident.
+                if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
+                Helpers.HostSync.TryMaterialize(DataVector);
+                Cpu();
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                throw new InvalidOperationException(
+                    $"Could not read this tensor back from the {owner?.BackendName ?? "unknown"} backend that owns its GPU "
+                    + "buffer, so it cannot be moved to the running operation's backend.", ex);
+            }
         }
+        if (!dropBinding) return;
         var buffer = _gpuBuffer;
         bool owned = _ownsGpuBuffer;
+        // Without a read-back the host is authoritative (an external input its caller writes): drop the pending
+        // download so a later host read cannot materialize the abandoned device copy over it.
+        if (!readBack && GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         Helpers.ResidentHostMirror.Detach(this);
         _gpuBuffer = null;
         _gpuBackend = null;
@@ -5305,6 +5316,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
     }
 
+    /// <summary>
+    /// Ensures this tensor's data is on the CPU. If the tensor has a pending deferred GPU download,
+    /// materializes it now. Equivalent to PyTorch's <c>tensor.cpu()</c>.
+    /// </summary>
+    /// <returns>This tensor with CPU data synchronized.</returns>
+    [MethodImpl(Hot)]
     public Tensor<T> Cpu()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
