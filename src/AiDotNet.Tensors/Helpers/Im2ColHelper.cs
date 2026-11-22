@@ -1848,9 +1848,9 @@ internal static class Im2ColHelper
     [MethodImpl(Hot)]
     private static void GatherConvTransposePlane(float[] col, int colStride, int colSample, int oc,
         float[] output, int outBase, int inputHeight, int inputWidth, int kernelH, int kernelW,
-        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth, bool accumulate = false)
     {
-        Array.Clear(output, outBase, outputHeight * outputWidth);
+        if (!accumulate) Array.Clear(output, outBase, outputHeight * outputWidth);
         for (int oh = 0; oh < outputHeight; oh++)
         {
             int rowBase = outBase + oh * outputWidth;
@@ -1880,7 +1880,7 @@ internal static class Im2ColHelper
     private const int ConvTransposePerImageMinPositions = 64;
     private const long ConvTransposePerImageMaxCol = 1L << 18;
 
-    private static bool ConvTransposePerImage(int batch, int hw, int kmkn)
+    internal static bool ConvTransposePerImage(int batch, int hw, int kmkn)
         => hw >= ConvTransposePerImageMinPositions
            && (long)kmkn * hw <= ConvTransposePerImageMaxCol
            && batch >= CpuParallelSettings.MaxDegreeOfParallelism;
@@ -1890,11 +1890,14 @@ internal static class Im2ColHelper
 
     // One worker per image: col[kmkn, hw] = W^T x_b with a sequential GEMM (an L2-sized block), then the image's
     // overlap-add gather. W^T is materialized once per call, so every GEMM is the contiguous no-transpose form. Each
-    // output element comes from one image's GEMM and gather, in the same order at any thread count.
-    private static void ConvTranspose2DPerImageGemm(
+    // output element comes from one image's GEMM and gather, in the same order at any thread count. The operands start
+    // at the given offsets; with accumulate the gather adds to the output instead of overwriting it. A conv's input
+    // gradient is this with x = dy and the conv's [outC, inC, kH, kW] weight (the transposed conv's [in, out, kH, kW]).
+    internal static void ConvTranspose2DPerImageGemm(
         float[] input, float[] kernel, float[] output,
         int batch, int inChannels, int inputHeight, int inputWidth, int outChannels,
-        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+        int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth,
+        int inputOffset = 0, int kernelOffset = 0, int outputOffset = 0, bool accumulate = false)
     {
         int hw = inputHeight * inputWidth;
         int kmkn = outChannels * kernelH * kernelW;
@@ -1906,7 +1909,7 @@ internal static class Im2ColHelper
             // kernel is [Cin, kmkn]; wt = kernel^T, [kmkn, Cin].
             for (int ci = 0; ci < inChannels; ci++)
             {
-                int row = ci * kmkn;
+                int row = kernelOffset + ci * kmkn;
                 for (int j = 0; j < kmkn; j++) wt[j * inChannels + ci] = kernel[row + j];
             }
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * kmkn * inChannels * hw, b =>
@@ -1916,12 +1919,13 @@ internal static class Im2ColHelper
                 {
                     Engines.Simd.SimdGemm.SgemmForAutotune(
                         new ReadOnlySpan<float>(wt, 0, kmkn * inChannels),
-                        new ReadOnlySpan<float>(input, b * inChannels * hw, inChannels * hw),
+                        new ReadOnlySpan<float>(input, inputOffset + b * inChannels * hw, inChannels * hw),
                         new Span<float>(col, 0, kmkn * hw),
                         kmkn, inChannels, hw, Engines.Simd.SgemmExecutionMode.Sequential);
                     for (int oc = 0; oc < outChannels; oc++)
-                        GatherConvTransposePlane(col, hw, 0, oc, output, (b * outChannels + oc) * outPlane,
-                            inputHeight, inputWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputHeight, outputWidth);
+                        GatherConvTransposePlane(col, hw, 0, oc, output, outputOffset + (b * outChannels + oc) * outPlane,
+                            inputHeight, inputWidth, kernelH, kernelW, strideH, strideW, padH, padW, outputHeight, outputWidth,
+                            accumulate);
                 }
                 finally
                 {
