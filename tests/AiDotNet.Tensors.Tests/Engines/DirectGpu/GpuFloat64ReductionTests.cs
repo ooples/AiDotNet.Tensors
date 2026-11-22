@@ -61,6 +61,16 @@ public class GpuFloat64ReductionTests
         backend.UploadBuffer<double>(buffer, values);
         // A single-precision accumulation of a million 0.1f is off by hundreds; double is within rounding of 100000.
         Assert.Equal(100_000.0, reductions.SumFloat64(buffer, size), 6);
+
+        // 100000 is a float: a sum computed in double but returned through one would still pass the line above. The
+        // total here is exact in double and is not a float (it needs 31 significant bits), so it must come back whole.
+        Array.Clear(values, 0, size);
+        values[0] = 1.0;
+        values[size - 1] = 1.0 / (1 << 30);
+        backend.UploadBuffer<double>(buffer, values);
+        double exact = 1.0 + 1.0 / (1 << 30);
+        Assert.NotEqual(exact, (double)(float)exact);
+        Assert.Equal(exact, reductions.SumFloat64(buffer, size));
     }
 
     [SkippableFact]

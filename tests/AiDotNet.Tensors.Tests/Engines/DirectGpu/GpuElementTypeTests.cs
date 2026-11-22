@@ -103,11 +103,13 @@ public class GpuElementTypeTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Tag_RefusesAnElementTypeOfAnotherWidth()
     {
         var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
-        if (gpu?.GetBackend() is not { } backend) return;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
         using var floats = backend.AllocateBuffer(16);
         Assert.Throws<InvalidOperationException>(() => GpuBufferTyping.Tag(floats, GpuElementType.Float64));
         Assert.Equal(GpuElementType.Float32, floats.ElementType);
@@ -131,8 +133,87 @@ public class GpuElementTypeTests
         RoundTrip(backend, GpuElementType.Int8, new sbyte[] { 1, -2, sbyte.MaxValue, sbyte.MinValue, 0 });
         RoundTrip(backend, GpuElementType.UInt8, new byte[] { 1, 2, byte.MaxValue, 0, 128 });
         RoundTrip(backend, GpuElementType.Bool, new[] { true, false, true, true, false });
+#if NET6_0_OR_GREATER
         RoundTrip(backend, GpuElementType.Float16, new[] { (Half)1.5f, (Half)(-2.25f), Half.MaxValue, Half.Epsilon, (Half)0f });
+#else
+        // Without System.Half the Half shim is float-backed: it does not have the two-byte device layout, so a typed
+        // transfer of it is refused rather than reinterpreted.
+        if (backend.SupportsElementType(GpuElementType.Float16))
+        {
+            using var halves = backend.AllocateBuffer(5, GpuElementType.Float16);
+            Assert.Throws<NotSupportedException>(() => backend.UploadBuffer<Half>(halves, new Half[5]));
+            Assert.Throws<NotSupportedException>(() => backend.DownloadBuffer<Half>(halves, new Half[5]));
+        }
+        else
+        {
+            Assert.Throws<NotSupportedException>(() => backend.AllocateBuffer(5, GpuElementType.Float16));
+        }
+#endif
         RoundTrip(backend, GpuElementType.BFloat16, new[] { (BFloat16)1.5f, (BFloat16)(-2.25f), (BFloat16)3f, (BFloat16)0f, (BFloat16)100f });
+    }
+
+    // A view is its parent's memory: it reports the parent's elements, so a typed transfer through it is accepted.
+    [SkippableFact]
+    public void View_OfAnIntBuffer_IsAnIntBuffer()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is not IGpuBufferViews, "This backend has no buffer views.");
+        var views = (IGpuBufferViews)backend!;
+        var values = new int[4096];
+        for (int i = 0; i < values.Length; i++) values[i] = int.MaxValue - i;
+        using var parent = backend.AllocateIntBuffer(values);
+        Assert.Equal(GpuElementType.Int32, parent.ElementType);
+        using var view = views.TryCreateView(parent, 0, 1024);
+        Skip.If(view is null, "The backend declined this view.");
+        Assert.Equal(GpuElementType.Int32, view.ElementType);
+        var back = new int[1024];
+        backend.DownloadBuffer<int>(view, back);
+        for (int i = 0; i < back.Length; i++) Assert.Equal(values[i], back[i]);
+    }
+
+    // The word-addressed backends count a view's offset in 4-byte words: a view of an 8-byte parent would address the
+    // wrong range, so it is declined (or, where views are element-addressed, covers the parent's elements).
+    [SkippableFact]
+    public void View_OfADoubleBuffer_AddressesDoubles_OrIsDeclined()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is not IGpuBufferViews, "This backend has no buffer views.");
+        Skip.If(!backend!.SupportsElementType(GpuElementType.Float64), "No double storage on this device.");
+        var views = (IGpuBufferViews)backend;
+        var values = new double[2048];
+        for (int i = 0; i < values.Length; i++) values[i] = 1.0 / (i + 3);
+        using var parent = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(parent, values);
+        using var view = views.TryCreateView(parent, 1024, 512);
+        if (view is null) return;   // declined: the contract's answer for a parent it cannot address
+        Assert.Equal(GpuElementType.Float64, view.ElementType);
+        Assert.Equal(512L * sizeof(double), view.SizeInBytes);
+        var back = new double[512];
+        backend.DownloadBuffer<double>(view, back);
+        for (int i = 0; i < back.Length; i++) Assert.Equal(values[1024 + i], back[i]);
+    }
+
+    [SkippableFact]
+    public void ByteRead_OfAPrefix_ReturnsThoseBytes()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        var values = new float[1 << 16];
+        for (int i = 0; i < values.Length; i++) values[i] = i * 0.5f - 7f;
+        using var buffer = backend.AllocateBuffer(values);
+        foreach (int count in new[] { 0, 1, 4, 6, 4096 + 3 })
+        {
+            var bytes = backend.DownloadByteBuffer(buffer, count);
+            Assert.Equal(count, bytes.Length);
+            Assert.True(System.Runtime.InteropServices.MemoryMarshal.AsBytes(values.AsSpan()).Slice(0, count)
+                .SequenceEqual(bytes), $"The first {count} bytes differ.");
+        }
     }
 
     [SkippableFact]

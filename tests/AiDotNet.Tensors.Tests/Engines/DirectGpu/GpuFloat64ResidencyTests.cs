@@ -118,13 +118,27 @@ public class GpuFloat64ResidencyTests
         foreach (var operation in new[]
                  {
                      GpuPrecisionOperation.Add, GpuPrecisionOperation.Subtract, GpuPrecisionOperation.Multiply,
-                     GpuPrecisionOperation.Divide, GpuPrecisionOperation.MatMul,
+                     GpuPrecisionOperation.Divide,
                  })
         {
             var plan = GpuPrecisionPlanner.CreatePlan<double>(backend, operation, "probe");
             Assert.Equal(GpuExecutionRoute.Gpu, plan.Route);
             Assert.Equal(GpuScalarType.Float64, plan.InputStorage);
             Assert.Equal(GpuScalarType.Float64, plan.OutputStorage);
+        }
+
+        // The matrix multiply is its own capability (a device can have the element-wise kernels and not the double
+        // GEMM): the plan follows it, on the device in double where it exists and on the CPU where it does not.
+        var matMul = GpuPrecisionPlanner.CreatePlan<double>(backend, GpuPrecisionOperation.MatMul, "probe");
+        if (backend is IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true })
+        {
+            Assert.Equal(GpuExecutionRoute.Gpu, matMul.Route);
+            Assert.Equal(GpuScalarType.Float64, matMul.InputStorage);
+            Assert.Equal(GpuScalarType.Float64, matMul.OutputStorage);
+        }
+        else
+        {
+            Assert.Equal(GpuExecutionRoute.Cpu, matMul.Route);
         }
 
         // No double kernel exists for these, so the default (preserving) policy must keep them exact on the CPU.
@@ -309,6 +323,100 @@ public class GpuFloat64ResidencyTests
         Assert.False(gpuEngine.IsFloat64Resident(y));
         // No longer persistent: two plain host operands again.
         Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorAdd(x, y)));
+    }
+
+    // The registration is the array: a second tensor over the same array has its own kept upload, and a host write
+    // announced through the first must not leave that one serving the old values.
+    [SkippableFact]
+    public void Invalidating_ARegisteredArray_DropsEveryTensorsUploadOfIt()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpuEngine = device.Value.Engine;
+        var gpu = (IEngine)gpuEngine;
+        gpuEngine.ClearFloat64Residents();
+        var array = Values(Large, 33);
+        var first = new Tensor<double>(array, new[] { Large });
+        var second = new Tensor<double>(array, new[] { Large });
+        Skip.If(!ReferenceEquals(first.GetBackingArrayForCacheLookupUnsafe(), second.GetBackingArrayForCacheLookupUnsafe())
+                || ReferenceEquals(first.DataVector, second.DataVector), "The constructor does not share one array between two vectors.");
+        gpu.RegisterPersistentTensor(first, PersistentTensorRole.Weights);
+        try
+        {
+            var before = gpu.TensorNegate(second);
+            Assert.True(gpuEngine.IsFloat64Resident(second), "The second tensor's upload was not kept.");
+            Assert.Equal(-array[5], before[5]);
+
+            array[5] = 1234.5;
+            gpu.InvalidatePersistentTensor(first);
+            Assert.False(gpuEngine.IsFloat64Resident(second), "The stale upload of the same array survived.");
+            Assert.Equal(-1234.5, gpu.TensorNegate(second)[5]);
+        }
+        finally
+        {
+            gpu.UnregisterPersistentTensor(first);
+        }
+    }
+
+    // The kernel maps elements in storage order, so a packed tensor's result is packed the same way.
+    [SkippableFact]
+    public void ElementwiseResults_KeepTheirInputsLayout()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpuEngine = device.Value.Engine;
+        var gpu = (IEngine)gpuEngine;
+        gpuEngine.ClearFloat64Residents();
+        var (x, y) = PersistentLeaves(gpu, Large, 34);
+        try
+        {
+            x.Layout = TensorLayout.Nchwc8;
+            y.Layout = TensorLayout.Nchwc8;
+            var negated = gpu.TensorNegate(x);
+            Assert.True(gpuEngine.IsFloat64Resident(negated));
+            Assert.Equal(TensorLayout.Nchwc8, negated.Layout);
+            var sum = gpu.TensorAdd(x, y);
+            Assert.True(gpuEngine.IsFloat64Resident(sum));
+            Assert.Equal(TensorLayout.Nchwc8, sum.Layout);
+
+            // Operands laid out differently do not meet element for element: not this route.
+            y.Layout = TensorLayout.Nchw;
+            Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorAdd(x, y)));
+        }
+        finally
+        {
+            x.Layout = TensorLayout.Nchw;
+            y.Layout = TensorLayout.Nchw;
+            gpu.UnregisterPersistentTensor(x);
+            gpu.UnregisterPersistentTensor(y);
+        }
+    }
+
+    // These ops fetch their operands outside any try: a double the policy preserves must reach the CPU engine as a
+    // fallback, not as an exception.
+    [SkippableFact]
+    public void OpsThatUploadBeforeTheirTry_FallBackToTheCpu_ForDouble()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision kernels on this host.");
+        var gpu = (IEngine)device.Value.Engine;
+        var cpu = (IEngine)new CpuEngine();
+
+        var image = new Tensor<double>(Values(2 * 3 * 8 * 8, 90), new[] { 2, 3, 8, 8 });
+        var depthwise = new Tensor<double>(Values(3 * 1 * 3 * 3, 91), new[] { 3, 1, 3, 3 });
+        Assert.Equal(cpu.DepthwiseConv2D(image, depthwise, new[] { 1, 1 }, new[] { 1, 1 }).ToArray(),
+            gpu.DepthwiseConv2D(image, depthwise, new[] { 1, 1 }, new[] { 1, 1 }).ToArray());
+
+        var volume = new Tensor<double>(Values(1 * 2 * 4 * 6 * 6, 92), new[] { 1, 2, 4, 6, 6 });
+        var kernel = new Tensor<double>(Values(3 * 2 * 3 * 3 * 3, 93), new[] { 3, 2, 3, 3, 3 });
+        Assert.Equal(
+            cpu.FusedConv3D(volume, kernel, null, 1, 1, 1, 1, 1, 1, 1, 1, 1, FusedActivationType.None).ToArray(),
+            gpu.FusedConv3D(volume, kernel, null, 1, 1, 1, 1, 1, 1, 1, 1, 1, FusedActivationType.None).ToArray());
+
+        // Evaluation dropout is the identity with a mask of ones on either engine.
+        var kept = gpu.Dropout(image, 0.5, training: false, out var mask);
+        Assert.Equal(image.ToArray(), kept.ToArray());
+        Assert.All(mask.ToArray(), one => Assert.Equal(1.0, one));
     }
 
     [SkippableFact]
@@ -564,15 +672,19 @@ public class GpuFloat64ResidencyTests
     {
         var device = Device();
         Skip.If(device is null, "No device with double-precision kernels on this host.");
+        Skip.If(device.Value.Backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true }, "No double matrix multiply on this device.");
         var gpuEngine = device.Value.Engine;
         var gpu = (IEngine)gpuEngine;
         bool? saved = DirectGpuTensorEngine.Float64MatMulForceDevice;
         try
         {
             DirectGpuTensorEngine.Float64MatMulForceDevice = null;
+            gpuEngine.ResetFloat64MatMulDecisions();
+            long measured = gpuEngine.Float64MatMulMeasurements;
             // Below the floor: the CPU engine, no measurement.
             var small = new Tensor<double>(Values(16 * 16, 70), new[] { 16, 16 });
             Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorMatMul(small, small)));
+            Assert.Equal(measured, gpuEngine.Float64MatMulMeasurements);
 
             // Above it the first call of the size class measures both routes and every later call uses the winner:
             // which one is this machine's business, the product is not.
@@ -583,7 +695,11 @@ public class GpuFloat64ResidencyTests
             var a = new Tensor<double>(left, new[] { size, size });
             var b = new Tensor<double>(right, new[] { size, size });
             var first = gpu.TensorMatMul(a, b);
+            // A dispatcher that always answered with the CPU product would pass every check below: the first eligible
+            // multiply must have timed both routes, and the second must reuse that decision without timing again.
+            Assert.Equal(measured + 1, gpuEngine.Float64MatMulMeasurements);
             var second = gpu.TensorMatMul(a, b);
+            Assert.Equal(measured + 1, gpuEngine.Float64MatMulMeasurements);
             Assert.Equal(gpuEngine.IsFloat64Resident(first), gpuEngine.IsFloat64Resident(second));
             AssertProductClose(left, right, size, size, size, first.AsSpan());
             AssertProductClose(left, right, size, size, size, second.AsSpan());
@@ -603,7 +719,8 @@ public class GpuFloat64ResidencyTests
         var device = Device();
         Skip.If(device is null, "No device with double-precision kernels on this host.");
         Skip.If(device.Value.Backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true }, "No double matrix multiply on this device.");
-        var gpu = (IEngine)device.Value.Engine;
+        var gpuEngine = device.Value.Engine;
+        var gpu = (IEngine)gpuEngine;
         var cpu = (IEngine)new CpuEngine();
         bool? saved = DirectGpuTensorEngine.Float64MatMulForceDevice;
         try
@@ -617,6 +734,10 @@ public class GpuFloat64ResidencyTests
             {
                 using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<double>();
                 var product = engine.TensorMatMul(a, b);
+                // The device route under a tape is what this test is about: a CPU fallback would produce the same
+                // gradient and prove nothing.
+                if (ReferenceEquals(engine, gpu))
+                    Assert.True(gpuEngine.IsFloat64Resident(product), "The product under the tape is not on the device.");
                 var loss = engine.ReduceSum(product, null);
                 return tape.ComputeGradients(loss, new[] { a })[a];
             }
@@ -660,6 +781,11 @@ public class GpuFloat64ResidencyTests
         for (int i = 0; i < expected.Length; i++)
         {
             if (expected[i].Equals(actual[i])) continue; // also equal infinities, whose difference is NaN
+            // Unequal with a non-finite side (an infinity against a large finite value, a NaN against a number): the
+            // bound below would itself be infinite or the comparison vacuous, so it is a mismatch outright.
+            bool finite = !double.IsNaN(expected[i]) && !double.IsInfinity(expected[i])
+                          && !double.IsNaN(actual[i]) && !double.IsInfinity(actual[i]);
+            Assert.True(finite, $"{what}[{i}]: expected {expected[i]:R}, actual {actual[i]:R}.");
             double bound = 16.0 * 2.220446049250313e-16 * Math.Abs(expected[i]) + 1e-300;
             Assert.True(Math.Abs(expected[i] - actual[i]) <= bound, $"{what}[{i}]: expected {expected[i]:R}, actual {actual[i]:R}.");
         }

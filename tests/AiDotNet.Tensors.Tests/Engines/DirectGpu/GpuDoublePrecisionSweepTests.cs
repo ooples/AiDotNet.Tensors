@@ -26,6 +26,11 @@ public class GpuDoublePrecisionSweepTests
     public GpuDoublePrecisionSweepTests(ITestOutputHelper output) => _output = output;
 
     // Ops whose result is not a function of the operands alone.
+    // Ops whose result has (operand elements)^2 elements: 512x512 operands would need 2^36, which no engine holds.
+    // They are compared at the small size only.
+    private static readonly string[] QuadraticResult = { "TensorDiag", "TensorKron", "TensorOuterProduct" };
+    private const int QuadraticResultMaxSide = 128;
+
     private static readonly string[] NonDeterministic = { "Random", "Dropout", "Noise", "Gumbel", "Sample", "Shuffle", "Bernoulli", "Multinomial" };
 
     private static Tensor<double> Operand(int side, int seed)
@@ -61,7 +66,12 @@ public class GpuDoublePrecisionSweepTests
         }
     }
 
-    private static double[]? Run(MethodInfo op, IEngine engine, int side)
+    // What an op throws for operands it does not accept (a shape or a domain this fixture does not meet). Anything
+    // else from the CPU engine is a defect in that op, reported by name rather than skipped.
+    private static bool IsFixtureRejection(Exception? thrown)
+        => thrown is ArgumentException or NotSupportedException or NotImplementedException;
+
+    private static double[]? Run(MethodInfo op, IEngine engine, int side, List<string>? unexpected = null)
     {
         var arguments = new object[op.GetParameters().Length];
         for (int i = 0; i < arguments.Length; i++) arguments[i] = Operand(side, i + 1);
@@ -76,9 +86,13 @@ public class GpuDoublePrecisionSweepTests
                 _ => null,
             };
         }
-        catch (TargetInvocationException)
+        catch (TargetInvocationException thrown)
         {
-            return null; // the op does not accept these operands (shape, domain); nothing to compare
+            // The op does not accept these operands: nothing to compare. Any other failure of the reference engine is
+            // recorded, so it fails the sweep instead of silently shrinking it.
+            if (unexpected is not null && !IsFixtureRejection(thrown.InnerException))
+                unexpected.Add($"{op.Name}: {thrown.InnerException?.GetType().Name}: {thrown.InnerException?.Message}");
+            return null;
         }
     }
 
@@ -91,10 +105,12 @@ public class GpuDoublePrecisionSweepTests
         var gpu = AiDotNetEngine.Current;
         var cpu = (IEngine)new CpuEngine();
         var narrowed = new List<string>();
+        var cpuFailures = new List<string>();
         int compared = 0;
         foreach (var op in TensorToTensorOps())
         {
-            var expected = Run(op, cpu, side);
+            if (side > QuadraticResultMaxSide && QuadraticResult.Contains(op.Name)) continue;
+            var expected = Run(op, cpu, side, cpuFailures);
             if (expected is null) continue;
             var actual = Run(op, gpu, side);
             if (actual is null || actual.Length != expected.Length)
@@ -118,6 +134,9 @@ public class GpuDoublePrecisionSweepTests
         }
 
         _output.WriteLine($"Compared {compared} ops at {side}x{side}.");
+        Assert.True(cpuFailures.Count == 0,
+            $"{cpuFailures.Count} op(s) failed on the CPU engine with something other than an operand rejection:\n  "
+            + string.Join("\n  ", cpuFailures));
         Assert.True(compared >= 40, $"Only {compared} ops were compared; the sweep is not reaching the engine surface.");
         Assert.True(narrowed.Count == 0, $"{narrowed.Count} double op(s) lost precision on the GPU engine:\n  " + string.Join("\n  ", narrowed));
     }
