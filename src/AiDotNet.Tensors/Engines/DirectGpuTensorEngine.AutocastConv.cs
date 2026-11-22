@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -97,19 +98,90 @@ public partial class DirectGpuTensorEngine
     {
         private readonly RecordedConvPrecision? _prior;
         private readonly bool _active;
+        private readonly NarrowedOperandShare? _share;
 
-        internal BackwardConvPrecisionScope(RecordedConvPrecision? precision)
+        internal BackwardConvPrecisionScope(RecordedConvPrecision? precision, bool shareNarrowedOperands = false)
         {
             _prior = t_backwardConvPrecisionOverride;
             t_backwardConvPrecisionOverride = precision;
             _active = precision is not null;
+            _share = shareNarrowedOperands ? NarrowedOperandShare.Enter() : null;
         }
 
         public void Dispose()
         {
+            _share?.Exit();
             if (_active) t_backwardConvPrecisionOverride = _prior;
         }
     }
+
+    /// <summary>
+    /// The 16-bit channels-last copies one convolution's backward narrowed, for its other pass to read instead of
+    /// narrowing the same operand again: the data and filter gradients both read dY (a transposed convolution's input
+    /// and kernel gradients too). Lives for one backward function, which reads its operands and writes only its
+    /// gradients, so a copy cannot go stale inside it; and one backward function is one compiled action, whose transient
+    /// scratch rents are distinct slots, so a shared copy is not overwritten by the other pass's scratch either. An owned
+    /// (uncompiled) copy is released when the scope ends.
+    /// </summary>
+    private sealed class NarrowedOperandShare
+    {
+        [ThreadStatic] private static NarrowedOperandShare? t_current;
+
+        private readonly NarrowedOperandShare? _prior;
+        private readonly List<(IGpuBuffer Source, int Outer, int Channels, int Spatial, int Type, OwnedBuffer Copy,
+            IDirectGpuBackend Backend)> _copies = new(2);
+
+        private NarrowedOperandShare(NarrowedOperandShare? prior) => _prior = prior;
+
+        internal static NarrowedOperandShare? Current => t_current;
+
+        internal static NarrowedOperandShare Enter() => t_current = new NarrowedOperandShare(t_current);
+
+        internal void Exit()
+        {
+            t_current = _prior;
+            foreach (var copy in _copies) copy.Copy.DisposeAfterQueuedUse(copy.Backend);
+            _copies.Clear();
+        }
+
+        internal IGpuBuffer? Find(IGpuBuffer source, int outer, int channels, int spatial, int type)
+        {
+            foreach (var copy in _copies)
+                if (ReferenceEquals(copy.Source, source) && copy.Outer == outer && copy.Channels == channels
+                    && copy.Spatial == spatial && copy.Type == type)
+                    return copy.Copy.Buffer;
+            return null;
+        }
+
+        // Takes the copy over from the pass that narrowed it: the pass's own release becomes a no-op.
+        internal void Adopt(IGpuBuffer source, int outer, int channels, int spatial, int type, OwnedBuffer copy,
+            IDirectGpuBackend backend)
+        {
+            var kept = new OwnedBuffer(copy.Buffer, copy.OwnsBuffer);
+            copy.RelinquishOwnership();
+            _copies.Add((source, outer, channels, spatial, type, kept, backend));
+        }
+    }
+
+    // Narrows an operand into its pass's scratch, or hands back the copy another pass of the same backward narrowed.
+    private static IGpuBuffer NarrowOperand(IChannelsLastMixedConvBackend channelsLast, IDirectGpuBackend backend,
+        IGpuBuffer source, OwnedBuffer scratch, (int Outer, int Channels, int Spatial) shape,
+        GpuMixedPrecisionDataType type)
+    {
+        var share = NarrowedOperandShare.Current;
+        if (share?.Find(source, shape.Outer, shape.Channels, shape.Spatial, (int)type) is { } shared)
+        {
+            Interlocked.Increment(ref s_sharedNarrowings);
+            return shared;
+        }
+        channelsLast.NarrowToChannelsLast(source, scratch.Buffer, shape.Outer, shape.Channels, shape.Spatial, type);
+        share?.Adopt(source, shape.Outer, shape.Channels, shape.Spatial, (int)type, scratch, backend);
+        return scratch.Buffer;
+    }
+
+    /// <summary>Narrowings skipped because another pass of the same backward had narrowed that operand.</summary>
+    internal static long SharedNarrowings => Interlocked.Read(ref s_sharedNarrowings);
+    private static long s_sharedNarrowings;
 
     private static RecordedConvPrecision ConsumeLastForwardConvPrecision()
     {
@@ -125,15 +197,15 @@ public partial class DirectGpuTensorEngine
             for (int i = savedState.Length - 1; i >= 0; i--)
             {
                 if (savedState[i] is RecordedConvPrecision recorded)
-                    return new BackwardConvPrecisionScope(recorded);
+                    return new BackwardConvPrecisionScope(recorded, shareNarrowedOperands: true);
             }
         }
         // Eager CpuEngine / fallback forward nodes record [stride, padding, dilation] without RecordedConvPrecision;
         // keep FP32 if an autocast scope is opened later around backward. Symbolic GraphMode / CompiledTrainingPlan
         // nodes run inside ResidentStepActive and resolve the compiled step's active AutocastScope.
         if (!(engine.TryGet<DirectGpuTensorEngine>(out var residentGpu) && residentGpu.ResidentStepActive))
-            return new BackwardConvPrecisionScope(RecordedConvPrecision.Fp32);
-        return default;
+            return new BackwardConvPrecisionScope(RecordedConvPrecision.Fp32, shareNarrowedOperands: true);
+        return new BackwardConvPrecisionScope(null, shareNarrowedOperands: true);
     }
 
     /// <summary>
@@ -270,7 +342,7 @@ public partial class DirectGpuTensorEngine
             input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
             kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
             output16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
-            if (!TryAutocastConvChannelsLast(route, 0, input, kernel, output, input16.Buffer, kernel16.Buffer,
+            if (!TryAutocastConvChannelsLast(backend, route, 0, input, kernel, output, input16, kernel16,
                     output16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH,
                     kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             {
@@ -316,8 +388,8 @@ public partial class DirectGpuTensorEngine
             kernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
             gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
             gradInput16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
-            if (!TryAutocastConvChannelsLast(route, 1, kernel, gradOutput, gradInput, kernel16.Buffer,
-                    gradOutput16.Buffer, gradInput16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            if (!TryAutocastConvChannelsLast(backend, route, 1, kernel, gradOutput, gradInput, kernel16,
+                    gradOutput16, gradInput16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
                     outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             {
                 route.Convert.ConvertFloatToFftStorage(kernel, kernel16.Buffer, kernelCount, route.Storage);
@@ -361,8 +433,8 @@ public partial class DirectGpuTensorEngine
             input16 = AllocateTransientScratch(backend, HalfStorageFloats(inputCount), fullyWritten: true);
             gradOutput16 = AllocateTransientScratch(backend, HalfStorageFloats(outputCount), fullyWritten: true);
             gradKernel16 = AllocateTransientScratch(backend, HalfStorageFloats(kernelCount), fullyWritten: true);
-            if (!TryAutocastConvChannelsLast(route, 2, input, gradOutput, gradKernel, input16.Buffer,
-                    gradOutput16.Buffer, gradKernel16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+            if (!TryAutocastConvChannelsLast(backend, route, 2, input, gradOutput, gradKernel, input16,
+                    gradOutput16, gradKernel16.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
                     outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
             {
                 route.Convert.ConvertFloatToFftStorage(input, input16.Buffer, inputCount, route.Storage);
@@ -402,8 +474,8 @@ public partial class DirectGpuTensorEngine
     /// NCHW route's. False when the backend does not stage channels-last or declined the shape; the NCHW route then
     /// reconverts the operands into the same scratch.
     /// </summary>
-    private static bool TryAutocastConvChannelsLast(in AutocastConvRoute route, int pass, IGpuBuffer a, IGpuBuffer b,
-        IGpuBuffer c, IGpuBuffer a16, IGpuBuffer b16, IGpuBuffer c16, int batch, int inChannels, int inHeight,
+    private static bool TryAutocastConvChannelsLast(IDirectGpuBackend backend, in AutocastConvRoute route, int pass,
+        IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, OwnedBuffer a16Scratch, OwnedBuffer b16Scratch, IGpuBuffer c16, int batch, int inChannels, int inHeight,
         int inWidth, int outChannels, int outHeight, int outWidth, int kernelH, int kernelW, int strideH, int strideW,
         int padH, int padW, int dilationH, int dilationW)
     {
@@ -425,8 +497,9 @@ public partial class DirectGpuTensorEngine
             _ => (x, y, w),
         };
         var type = route.DataType;
-        channelsLast.NarrowToChannelsLast(a, a16, aShape.Outer, aShape.Channels, aShape.Spatial, type);
-        channelsLast.NarrowToChannelsLast(b, b16, bShape.Outer, bShape.Channels, bShape.Spatial, type);
+        // Shared only inside a convolution's backward function (outside one there is no share).
+        var a16 = NarrowOperand(channelsLast, backend, a, a16Scratch, aShape, type);
+        var b16 = NarrowOperand(channelsLast, backend, b, b16Scratch, bShape, type);
         ThrowIfAutocastConvFaultInjected();
         if (!channelsLast.TryConv2DMixedChannelsLast(pass, a16, b16, c16, batch, inChannels, inHeight, inWidth,
                 outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW,
