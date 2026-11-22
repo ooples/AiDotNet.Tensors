@@ -10510,6 +10510,29 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    // A parameter or graph input placed on another backend (Tensor.Gpu() while a different engine was
+    // AiDotNetEngine.Current) is migrated to this plan's backend NOW, under the cross-backend policy, rather than
+    // in the first step: the migration reads the tensor back and re-uploads it, which a captured step cannot do
+    // (it would abort capture and leave the plan eager). Under CrossBackendTensorPolicy.Throw this is where the
+    // mismatch is reported, before anything runs.
+    private static void RehomeForeignLeaves(IEngine engine, LazyTensorScope scope, Tensor<T>[] parameters)
+    {
+        if (!engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return;
+        using var operation = gpuEngine.EnterGpuOp();
+        if (!operation.Held) return;
+        foreach (var parameter in parameters) Probe(parameter);
+        foreach (var node in scope.Nodes.OfType<LazyNode<T>>())
+            foreach (var input in node.GetInputsArray())
+                if (input is not null && input.LazySource is null) Probe(input);
+
+        static void Probe(Tensor<T> tensor)
+        {
+            // Only a buffer bound on another backend is touched; TryGetGpuBuffer applies the policy to it.
+            if (tensor._gpuBuffer is null || !CrossBackendTensors.IsForeign(tensor._gpuBackend)) return;
+            _ = tensor.TryGetGpuBuffer();
+        }
+    }
+
     private static CompiledTrainingPlan<T> CompileCore(
         LazyTensorScope scope, IEngine engine, Tensor<T>[] parameters, Tensor<T>? explicitLoss)
     {
@@ -10541,6 +10564,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 parameters = uniqueParameters.ToArray();
             }
         }
+
+        RehomeForeignLeaves(engine, scope, parameters);
 
         // The loss is the LAST op the caller RECORDED. Take it before the optimization passes: they may reorder
         // nodes, and an unconsumed side branch (a tensor computed but not used by the loss) can then end up last.

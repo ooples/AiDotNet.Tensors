@@ -162,6 +162,26 @@ public static class AiDotNetEngine
     /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException">Thrown when attempting to set to null.</exception>
+
+    /// <summary>
+    /// What an engine op does with a tensor whose GPU buffer belongs to another backend (placed while a different
+    /// engine was <see cref="Current"/>). Default <see cref="CrossBackendTensorPolicy.MigrateWarn"/>: the tensor moves
+    /// to the op's backend once and one line is logged; <see cref="CrossBackendTensorPolicy.Throw"/> gives PyTorch's
+    /// "Expected all tensors to be on the same device" behaviour.
+    /// </summary>
+    public static CrossBackendTensorPolicy CrossBackendPolicy
+    {
+        get => (CrossBackendTensorPolicy)Volatile.Read(ref _crossBackendPolicy);
+        set
+        {
+            if (value is not (CrossBackendTensorPolicy.MigrateWarn or CrossBackendTensorPolicy.Migrate
+                or CrossBackendTensorPolicy.Throw))
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Unknown cross-backend policy.");
+            Volatile.Write(ref _crossBackendPolicy, (int)value);
+        }
+    }
+    private static int _crossBackendPolicy = (int)CrossBackendTensorPolicy.MigrateWarn;
+
     public static IEngine Current
     {
         get

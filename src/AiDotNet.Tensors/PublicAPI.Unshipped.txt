@@ -733,3 +733,9 @@ AiDotNet.Tensors.Engines.Compilation.CompiledModelCache<T>.GetOrCompileInference
 AiDotNet.Tensors.Engines.Compilation.CompiledModelCache<T>.GetOrCompileInference(AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]! inputs, System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>![]!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! forward) -> AiDotNet.Tensors.Engines.Compilation.ICompiledPlan<T>!
 AiDotNet.Tensors.Engines.Compilation.CompiledModelCache<T>.GetOrCompileInference(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! input, System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! forward, AiDotNet.Tensors.Engines.Compilation.SymbolicShape! symbolicShape) -> AiDotNet.Tensors.Engines.Compilation.ICompiledPlan<T>!
 AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.ChannelsLastConvolution = 23 -> AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp
+AiDotNet.Tensors.Engines.CrossBackendTensorPolicy
+AiDotNet.Tensors.Engines.CrossBackendTensorPolicy.Migrate = 1 -> AiDotNet.Tensors.Engines.CrossBackendTensorPolicy
+AiDotNet.Tensors.Engines.CrossBackendTensorPolicy.MigrateWarn = 0 -> AiDotNet.Tensors.Engines.CrossBackendTensorPolicy
+AiDotNet.Tensors.Engines.CrossBackendTensorPolicy.Throw = 2 -> AiDotNet.Tensors.Engines.CrossBackendTensorPolicy
+static AiDotNet.Tensors.Engines.AiDotNetEngine.CrossBackendPolicy.get -> AiDotNet.Tensors.Engines.CrossBackendTensorPolicy
+static AiDotNet.Tensors.Engines.AiDotNetEngine.CrossBackendPolicy.set -> void

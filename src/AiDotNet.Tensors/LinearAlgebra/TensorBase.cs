@@ -1532,6 +1532,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero)
         {
+            // A buffer another backend placed is not an address the running op's backend may dereference (an OpenCL
+            // handle read as a CUDA pointer is a sticky illegal-address fault). Apply the cross-backend policy: the
+            // tensor migrates (its foreign binding is dropped and the caller's upload path places it on the op's
+            // backend) or the op throws.
+            var owner = _gpuBackend;
+            if (Engines.CrossBackendTensors.IsForeign(owner))
+            {
+                if (this is not Tensor<T> tensor)
+                    throw new InvalidOperationException(
+                        "This tensor's GPU buffer belongs to a different backend than the running operation.");
+                Engines.CrossBackendTensors.Resolve(tensor, owner!, Engines.DirectGpu.GpuOpGate.CurrentOpBackend!);
+                return TryGetGpuBuffer();
+            }
             // A released step intermediate still names its old buffer object, which the pool may have re-rented to
             // another tensor: handing it out would read or overwrite someone else's data.
             var array = GetBackingArrayForCacheLookupUnsafe();
