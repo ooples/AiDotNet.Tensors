@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -14014,6 +14014,12 @@ KERNEL VARIANTS (A/B testing):
         public void GatedDeltaNetScanForward(
             IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
             int batch, int seqLen, int modelDim, int numHeads, int headDim)
+            => ((IGatedDeltaRuleForwardBackend)this).GatedDeltaNetScanForward(q, k, v, alpha, beta, output,
+                batch, seqLen, modelDim, numHeads, headDim, GatedDeltaNetBackwardResolver.OriginalKeyScale(headDim), false);
+
+        void IGatedDeltaRuleForwardBackend.GatedDeltaNetScanForward(
+            IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+            int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
         {
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanForward.");
@@ -14037,6 +14043,8 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(8u, modelDim);
             kernel.SetArg(9u, numHeads);
             kernel.SetArg(10u, headDim);
+            kernel.SetArg(11u, keyScale);
+            kernel.SetArg(12u, decayFirst ? 1 : 0);
 
             int total = batch * numHeads * headDim;
             int localSize = CalculateOptimalWorkGroupSize1D(total);
@@ -14047,7 +14055,7 @@ KERNEL VARIANTS (A/B testing):
         void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
             IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
             IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
-            int batch, int seqLen, int modelDim, int numHeads, int headDim)
+            int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
         {
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context is not initialized. Cannot execute GatedDeltaNetScanBackward.");
@@ -14103,6 +14111,8 @@ KERNEL VARIANTS (A/B testing):
             recompute.SetArg(7u, modelDim);
             recompute.SetArg(8u, numHeads);
             recompute.SetArg(9u, headDim);
+            recompute.SetArg(10u, keyScale);
+            recompute.SetArg(11u, decayFirst ? 1 : 0);
             recompute.Execute1D(globalSize, localSize);
 
             using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
@@ -14134,6 +14144,8 @@ KERNEL VARIANTS (A/B testing):
             backward.SetArg(15u, numHeads);
             backward.SetArg(16u, headDim);
             backward.SetArg(17u, det ? 1 : 0);
+            backward.SetArg(18u, keyScale);
+            backward.SetArg(19u, decayFirst ? 1 : 0);
             backward.Execute1D(globalSize, localSize);
 
             if (reduceKernel is not null && partials is not null)

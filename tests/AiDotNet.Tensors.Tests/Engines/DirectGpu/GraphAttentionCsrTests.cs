@@ -167,7 +167,8 @@ public class GraphAttentionCsrTests
             var gradOut = new Tensor<float>(Array.ConvertAll(Gen(wh.Length, 8), x => (float)x), shape);
             const uint seed = 12345u;
 
-            Assert.IsAssignableFrom<IGraphAttentionBackend>(gpu.GetBackend());
+            using (gpu.EnterGpuOp())
+                Assert.IsAssignableFrom<IGraphAttentionBackend>(gpu.GetBackend());
 
             Close(cpu.GraphAttentionCsrForward(wh, attn, g, 0.2, rate, seed).ToArray(),
                 gpu!.GraphAttentionCsrForward(wh, attn, g, 0.2, rate, seed).ToArray(), "forward");

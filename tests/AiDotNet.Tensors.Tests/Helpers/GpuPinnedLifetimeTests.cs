@@ -48,11 +48,14 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
             Skip.If(!HasCoherentPinnedMapping(),
-                "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
             var p = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
             var g = TensorAllocator.RentPinnedOnGpu<float>(new[] { 2 });
             try
@@ -111,9 +114,29 @@ public class GpuPinnedLifetimeTests
         // comes back tagged GpuPinned (not GpuOffload — issue #336 uses
         // the new lifetime tag to distinguish "lives on GPU for the train
         // loop" from "may swap to host for large-model memory pressure").
-        Skip.If(WeightRegistry.OffloadAllocator is null
-            || !WeightRegistry.OffloadAllocator.IsAvailable,
-            "CPU-only host; fallback path is covered by RentPinnedOnGpu_CpuOnlyHost_FallsBackToCpuPinned_NotThrowing.");
+        // The allocator is process-wide and belongs to whichever engine registered it: another collection resets the
+        // registry, and an earlier test's engine takes its context with it. Like the optimizer tests below, this one
+        // brings its own engine and asks for an allocator on it, so it does not depend on what ran before.
+        var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
+        var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
+        AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        try
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
+            Skip.If(WeightRegistry.OffloadAllocator is null
+                || !WeightRegistry.OffloadAllocator.IsAvailable,
+                "CPU-only host; fallback path is covered by RentPinnedOnGpu_CpuOnlyHost_FallsBackToCpuPinned_NotThrowing: "
+                + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
+            AssertRentedTensorIsGpuPinned();
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    private static void AssertRentedTensorIsGpuPinned()
+    {
 
         // PR #345 review: tighten assertion to require GpuPinned exactly.
         // Permitting `Default` masked regressions in the new tagging
@@ -205,6 +228,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -226,13 +251,15 @@ public class GpuPinnedLifetimeTests
                     || g.TryGetGpuBuffer() is null
                     || m.TryGetGpuBuffer() is null
                     || v.TryGetGpuBuffer() is null,
-                    "Pinned tensors did not bind to GPU buffers on this host.");
+                    "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
                 Skip.If(!HasCoherentPinnedMapping(),
-                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 // Initialize values via flat-data span.
                 var pData = p.GetDataArray();
@@ -296,6 +323,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -310,7 +339,8 @@ public class GpuPinnedLifetimeTests
                     || g.TryGetGpuBuffer() is null
                     || m.TryGetGpuBuffer() is null
                     || v.TryGetGpuBuffer() is null)
-                    Skip.If(true, "Pinned tensors did not bind to GPU buffers on this host.");
+                    Skip.If(true, "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 int pVersion = p.Version;
                 int mVersion = m.Version;
@@ -371,6 +401,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -379,13 +411,15 @@ public class GpuPinnedLifetimeTests
             try
             {
                 Skip.If(p.TryGetGpuBuffer() is null || g.TryGetGpuBuffer() is null,
-                    "Pinned tensors did not bind to GPU buffers on this host.");
+                    "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
                 Skip.If(!HasCoherentPinnedMapping(),
-                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 var pData = p.GetDataArray();
                 var gData = g.GetDataArray();
@@ -427,6 +461,8 @@ public class GpuPinnedLifetimeTests
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
+        // Another collection resets the weight registry, which drops the process-wide offload allocator.
+        AiDotNet.Tensors.Engines.AiDotNetEngine.EnsureGpuOffloadAllocator(gpu);
         try
         {
             Skip.If(gpu.GetBackend() is null, "DirectGpu backend is not available.");
@@ -440,13 +476,15 @@ public class GpuPinnedLifetimeTests
                     || g.TryGetGpuBuffer() is null
                     || m.TryGetGpuBuffer() is null
                     || v.TryGetGpuBuffer() is null,
-                    "Pinned tensors did not bind to GPU buffers on this host.");
+                    "Pinned tensors did not bind to GPU buffers on this host: "
+                        + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
                 // Some backends (current OpenCL allocator) return a GPU buffer but
                 // do NOT provide zero-copy host↔device mapping — the optimizer kernel
                 // runs against a separate buffer the host never sees written. Skip
                 // in that case; this gate is independent of the no-GPU skip above.
                 Skip.If(!HasCoherentPinnedMapping(),
-                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend.");
+                    "The GPU pinned allocator cannot hand the kernels a device view of the host data on this backend: "
+                    + AiDotNet.Tensors.Engines.AiDotNetEngine.DescribeGpuOffloadAllocatorState() + ".");
 
                 var pData = p.GetDataArray();
                 var initial = new float[] { 1.0f, 2.0f, 3.0f, 4.0f };

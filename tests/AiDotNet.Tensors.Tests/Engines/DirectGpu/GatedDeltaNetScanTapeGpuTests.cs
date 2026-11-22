@@ -37,10 +37,11 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
     }
 
     private static (Tensor<float> Out, Dictionary<Tensor<float>, Tensor<float>> Grads) Run(
-        IEngine engine, Tensor<float>[] inputs, Tensor<float> r, int numHeads, bool expectOnDevice = false)
+        IEngine engine, Tensor<float>[] inputs, Tensor<float> r, int numHeads, bool expectOnDevice = false,
+        GatedDeltaRule rule = GatedDeltaRule.ScaledKeys)
     {
         using var tape = new GradientTape<float>();
-        var output = engine.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], numHeads);
+        var output = engine.GatedDeltaNetScanForward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], numHeads, rule);
         if (expectOnDevice)
             Assert.True(output.IsGpuResident || output.HasPendingGpuData,
                 "GatedDeltaNetScanForward ran on the host (CPU fallback) under an active tape");
@@ -68,9 +69,11 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
     }
 
     [SkippableTheory]
-    [InlineData(2, 16, 64, 4)]    // headDim 16
-    [InlineData(8, 64, 256, 8)]   // Hybrid 3:1 GDN:MLA LM training shape: batch=8, seq=64, 8 heads x 32 features
-    public void TapeForwardAndGradients_StayOnGpu_AndMatchCpu(int batch, int seqLen, int modelDim, int numHeads)
+    [InlineData(2, 16, 64, 4, GatedDeltaRule.ScaledKeys)]    // headDim 16
+    [InlineData(8, 64, 256, 8, GatedDeltaRule.ScaledKeys)]   // Hybrid 3:1 GDN:MLA LM training shape: batch=8, seq=64, 8 heads x 32 features
+    [InlineData(2, 16, 64, 4, GatedDeltaRule.Standard)]
+    [InlineData(8, 64, 256, 8, GatedDeltaRule.Standard)]
+    public void TapeForwardAndGradients_StayOnGpu_AndMatchCpu(int batch, int seqLen, int modelDim, int numHeads, GatedDeltaRule rule)
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var gpu = _fixture.Engine ?? throw new InvalidOperationException("The GPU fixture reported a device but has no engine.");
@@ -87,17 +90,17 @@ public sealed class GatedDeltaNetScanTapeGpuTests : IClassFixture<DirectGpuTenso
         };
         var r = Rand(shape, 16);
 
-        var (cpuOut, cpuGrads) = Run(cpu, inputs, r, numHeads);
+        var (cpuOut, cpuGrads) = Run(cpu, inputs, r, numHeads, rule: rule);
 
         // Device-only copies, so a host read inside the taped scan cannot be served from a host array: any transfer or
         // CPU fallback in the forward or backward shows up in the scope below.
         var deviceInputs = inputs.Select(t => gpu.UploadToGpu(t, GpuTensorRole.General)).ToArray();
         var deviceR = gpu.UploadToGpu(r, GpuTensorRole.General);
-        Run(gpu, deviceInputs, deviceR, numHeads);   // warm-up: kernel compilation and pooled buffers
+        Run(gpu, deviceInputs, deviceR, numHeads, rule: rule);   // warm-up: kernel compilation and pooled buffers
         GpuResidencyScope scope;
         (Tensor<float> Out, Dictionary<Tensor<float>, Tensor<float>> Grads) measured;
         using (scope = GpuResidencyScope.Begin(captureOperations: true))
-            measured = Run(gpu, deviceInputs, deviceR, numHeads, expectOnDevice: true);
+            measured = Run(gpu, deviceInputs, deviceR, numHeads, expectOnDevice: true, rule: rule);
         Assert.True(scope.Uploads + scope.Downloads == 0,
             "the taped scan crossed the host-device boundary: "
             + string.Join(", ", scope.Events.Select(e => $"{e.Kind} {e.Bytes} B {e.Operation}")));

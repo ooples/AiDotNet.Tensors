@@ -28,43 +28,45 @@ public enum NvrtcResult
 
 internal static class NvrtcNativeBindings
 {
-    // Published only after _api is resolved, under _initLock. Setting the flag first let a concurrent caller (xUnit
-    // starts test classes in parallel) see "checked" with _api still null and report NVRTC missing for good.
-    private static volatile bool _availabilityChecked;
-    private static INvrtcApi? _api;
-    private static readonly object _initLock = new object();
+    // Probed once under ExecutionAndPublication so concurrent worker threads wait for EnsureCudaOnPath + ResolveApi
+    // rather than observing a null _api while the first caller is still loading nvrtc from disk (rtx1000ada-cuda,
+    // run 44924687443: 23 parallel DirectGpu tests skipped with "NVRTC is not installed" while the remaining 6,634
+    // passed in the same process).
+    private static readonly Lazy<INvrtcApi?> s_api = CreateApiProbe(InitializeApi);
 
-    public static bool IsAvailable
+    internal static Lazy<T> CreateApiProbe<T>(Func<T> probe)
+        => new(probe, System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
+
+    public static bool IsAvailable => s_api.Value != null;
+
+    private static INvrtcApi? InitializeApi()
     {
-        get
-        {
-            EnsureInitialized();
-            return _api != null;
-        }
+#if NET5_0_OR_GREATER
+        AiDotNet.Tensors.Engines.GpuDriverCrossPlatformResolver.EnsureRegistered();
+#endif
+        return ProbeAfterBestEffortDiscovery(EnsureCudaOnPath, ResolveApi);
     }
 
-    private static void EnsureInitialized()
+    /// <summary>
+    /// Runs <paramref name="discovery"/> and then <paramref name="probe"/>. Discovery only widens the search path, so a
+    /// failure in it (an unreadable directory, an over-long PATH) is logged and the probe still runs. Letting it escape
+    /// would be cached by the lazy probe and rethrown from every later availability check, turning "not installed" into
+    /// an error.
+    /// </summary>
+    internal static T ProbeAfterBestEffortDiscovery<T>(Action discovery, Func<T> probe)
     {
-        if (_availabilityChecked)
-            return;
-
-        lock (_initLock)
+        try
         {
-            if (_availabilityChecked)
-                return;
-            try
-            {
-                // PATH discovery is best-effort: an I/O error or an over-long PATH must not escape, or every later
-                // IsAvailable call would re-run the probe and rethrow (a skip would turn into a test error).
-                try { EnsureCudaOnPath(); } catch (Exception) { /* fall through to the probe */ }
-                _api = ResolveApi();
-            }
-            finally
-            {
-                // Set last, and even when the probe throws, so the result is computed exactly once.
-                _availabilityChecked = true;
-            }
+            discovery();
         }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
+                                       or NotSupportedException or System.Security.SecurityException)
+        {
+            System.Diagnostics.Trace.TraceWarning(
+                "CUDA library path discovery failed; probing NVRTC on the existing search path. {0}", ex);
+        }
+
+        return probe();
     }
 
     /// <summary>
@@ -85,8 +87,12 @@ internal static class NvrtcNativeBindings
 
         var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
 
-        // On Windows, also check system environment variables directly
-        // (some shells like git bash don't inherit system env vars)
+        // On Windows, also check user and system environment variables directly
+        // (some shells and service hosts don't inherit user/machine env vars)
+        if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.User);
+        }
         if (string.IsNullOrEmpty(cudaPath) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
@@ -284,14 +290,7 @@ internal static class NvrtcNativeBindings
         }
     }
 
-    private static INvrtcApi Api
-    {
-        get
-        {
-            EnsureInitialized();
-            return _api ?? throw new DllNotFoundException("NVRTC library not found.");
-        }
-    }
+    private static INvrtcApi Api => s_api.Value ?? throw new DllNotFoundException("NVRTC library not found.");
 
     public static NvrtcResult nvrtcVersion(out int major, out int minor)
     {

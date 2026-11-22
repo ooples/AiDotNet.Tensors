@@ -175,11 +175,9 @@ internal static class HipNativeBindings
     private const string HipRtcLibrary = RocmNativeLibraryResolver.RuntimeCompilerImportName;
 #endif
 
-    private static bool _isAvailable;
-    // Published only after _isAvailable is set, under _availabilityLock, so a concurrent first caller cannot read
-    // "checked" before the probe has finished and report HIP missing.
-    private static volatile bool _availabilityChecked;
-    private static readonly object _availabilityLock = new object();
+    private static readonly object s_initLock = new();
+    private static readonly Lazy<bool> s_availability = new(ProbeAvailability,
+        System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
     private static bool _dllPathInitialized;
     internal static string? RocmBinPath { get; private set; }
     public static bool EnableDiagnostics { get; set; }
@@ -202,9 +200,16 @@ internal static class HipNativeBindings
     /// </summary>
     private static void InitializeDllSearchPath()
     {
-        if (_dllPathInitialized) return;
-        _dllPathInitialized = true;
+        lock (s_initLock)
+        {
+            if (_dllPathInitialized) return;
+            InitializeDllSearchPathCore();
+            _dllPathInitialized = true;
+        }
+    }
 
+    private static void InitializeDllSearchPathCore()
+    {
         if (RocmNativeLibraryResolver.CurrentOperatingSystem != RocmOperatingSystem.Windows)
         {
             return;
@@ -323,55 +328,54 @@ internal static class HipNativeBindings
 
     private static void LogDiagnostic(string message)
     {
-        if (EnableDiagnostics)
+        if (!EnableDiagnostics) return;
+        // Best-effort: this runs inside the availability probe, whose lazy result would cache an exception from a
+        // closed or failing console and rethrow it from every later IsAvailable.
+        try
+        {
             Console.WriteLine(message);
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+        {
+            System.Diagnostics.Trace.TraceWarning("HIP diagnostic output failed: {0}", ex);
+        }
     }
 
     /// <summary>
     /// Gets whether HIP runtime is available on this system.
     /// </summary>
-    public static bool IsAvailable
-    {
-        get
-        {
-            if (_availabilityChecked)
-                return _isAvailable;
-            lock (_availabilityLock)
-            {
-                if (!_availabilityChecked)
-                {
-                    // Initialize DLL search path before any P/Invoke calls
-                    InitializeDllSearchPath();
+    public static bool IsAvailable => s_availability.Value;
 
-                    try
-                    {
-                        int count = 0;
-                        var result = hipGetDeviceCount(ref count);
-                        _isAvailable = result == HipError.Success && count > 0;
-                        LogDiagnostic($"[HIP Diagnostics] hipGetDeviceCount returned: {result}, device count: {count}, available: {_isAvailable}");
-                    }
-                    catch (DllNotFoundException ex)
-                    {
-                        LogDiagnostic($"[HIP Diagnostics] DllNotFoundException: {ex.Message}");
-                        LogDiagnostic("[HIP Diagnostics] amdhip64.dll not found. AMD HIP SDK is not installed.");
-                        LogDiagnostic("[HIP Diagnostics] To use HIP, install AMD ROCm/HIP SDK from https://rocm.docs.amd.com/");
-                        _isAvailable = false;
-                    }
-                    catch (EntryPointNotFoundException ex)
-                    {
-                        LogDiagnostic($"[HIP Diagnostics] EntryPointNotFoundException: {ex.Message}");
-                        LogDiagnostic("[HIP Diagnostics] HIP DLL found but missing expected function. SDK version mismatch?");
-                        _isAvailable = false;
-                    }
-                    catch (Exception ex)
-                    {
-                        LogDiagnostic($"[HIP Diagnostics] Exception during availability check: {ex.GetType().Name}: {ex.Message}");
-                        _isAvailable = false;
-                    }
-                    _availabilityChecked = true;
-                }
-            }
-            return _isAvailable;
+    private static bool ProbeAvailability()
+    {
+        // Initialize DLL search path before any P/Invoke calls
+        InitializeDllSearchPath();
+
+        try
+        {
+            int count = 0;
+            var result = hipGetDeviceCount(ref count);
+            bool isAvailable = result == HipError.Success && count > 0;
+            LogDiagnostic($"[HIP Diagnostics] hipGetDeviceCount returned: {result}, device count: {count}, available: {isAvailable}");
+            return isAvailable;
+        }
+        catch (DllNotFoundException ex)
+        {
+            LogDiagnostic($"[HIP Diagnostics] DllNotFoundException: {ex.Message}");
+            LogDiagnostic("[HIP Diagnostics] amdhip64.dll not found. AMD HIP SDK is not installed.");
+            LogDiagnostic("[HIP Diagnostics] To use HIP, install AMD ROCm/HIP SDK from https://rocm.docs.amd.com/");
+            return false;
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            LogDiagnostic($"[HIP Diagnostics] EntryPointNotFoundException: {ex.Message}");
+            LogDiagnostic("[HIP Diagnostics] HIP DLL found but missing expected function. SDK version mismatch?");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic($"[HIP Diagnostics] Exception during availability check: {ex.GetType().Name}: {ex.Message}");
+            return false;
         }
     }
 

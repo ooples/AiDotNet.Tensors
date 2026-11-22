@@ -1087,6 +1087,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>Of those, the device-resident inputs skipped on an unchanged storage version alone (tests).</summary>
     internal long StepIoResidentCopiesSkipped { get; private set; }
+
+    /// <summary>Of those, the inputs a device copy had already written into the graph's buffer (tests).</summary>
+    internal long StepIoDeviceWrittenInputsSkipped { get; private set; }
     private bool _stepIoLossCaptured;   // the epilogue publishes the loss
     // The loss-gradient reseed (seed -> destination) the graph being captured makes in its step I/O prologue instead of
     // a copy node: the buffers handed to IGraphStepIo.TrySetPrologueCopy, or null.
@@ -1117,6 +1120,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public uint AgesApplied { get; set; }
         public bool[]? ParameterMembership { get; set; }
         public int[]? ActiveIndices { get; set; }
+
+        // ---- global-norm gradient clip captured ahead of the update (ClipNorm 0: none) ----
+        /// <summary>The clip bound the graph applies; the plan's setting when it was captured.</summary>
+        public double ClipNorm { get; set; }
+        /// <summary>The non-finite policy the captured clip applies.</summary>
+        public Engines.Gpu.NonFiniteGradientPolicy ClipPolicy { get; set; }
 
         // ---- ping-pong (null PingPong: the update runs in place in one graph) ----
         /// <summary>Each parameter's second weight buffer; the parity-1 graph reads the weights from these.</summary>
@@ -1222,6 +1231,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var copiedVersion = _stepIoCopiedVersion!;
         int slot = (int)(replay & 1);
         uint copyMask = 0;
+        var de = _engine.As<Engines.DirectGpuTensorEngine>();
         for (int i = 0; i < leaves.Length; i++)
         {
             var leaf = leaves[i];
@@ -1233,6 +1243,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 copiedSlot[i] = -1;
                 StepIoInputCopiesSkipped++;
+                continue;
+            }
+            if (de is not null && de.ResidentInputHoldsDeviceWrite(leaf))
+            {
+                // A device copy into the graph's own buffer (TensorCopy of a device-resident batch) already holds this
+                // input, and the host copy is a pending download of it: leasing that array downloaded the batch and
+                // staged it straight back, a round trip of every input per step. The buffer no longer mirrors either
+                // staging slot, so the next host-written value is staged again.
+                StepIoInputCopiesSkipped++;
+                StepIoDeviceWrittenInputsSkipped++;
+                copiedSlot[i] = -1;
+                copiedVersion[i] = version;
+                leaf._gpuBufferVersion = version;
                 continue;
             }
             if (leaf.IsGpuResident && copiedSlot[i] >= 0 && copiedVersion[i] == version)
@@ -3523,7 +3546,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private void RetireCapturedOptimizerIfIneligible()
     {
-        if (_capturedOptimizer is not null && (_maxGradNorm > 0.0 || _l2Regularization != 0f))
+        if (_capturedOptimizer is { } captured
+            && (!_l2Regularization.Equals(0f) || !captured.ClipNorm.Equals(_maxGradNorm)
+                || (_maxGradNorm > 0.0 && captured.ClipPolicy != _nonFiniteGradientPolicy)))
             InvalidateCapturedStepGraph();
     }
 
@@ -3652,6 +3677,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         SyncCapturedOptimizerStep();
         _maxGradNorm = source._maxGradNorm;
         _nonFiniteGradientPolicy = source._nonFiniteGradientPolicy;
+        RetireCapturedOptimizerIfIneligible();
         target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
         target.Scalars.DAdaptationEstimate = src.Scalars.DAdaptationEstimate;
         target.Scalars.DAdaptationRAccum = src.Scalars.DAdaptationRAccum;
@@ -3814,6 +3840,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (!Enum.IsDefined(typeof(Engines.Gpu.NonFiniteGradientPolicy), policy))
             throw new ArgumentOutOfRangeException(nameof(policy), policy, "Undefined non-finite gradient policy.");
         _nonFiniteGradientPolicy = policy;
+        RetireCapturedOptimizerIfIneligible();   // a captured clip baked the previous policy in
     }
 
     public void SetMaxGradNorm(double maxNorm)
@@ -8377,8 +8404,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _capturedOptimizerFactory = () =>
         {
             ResolveDeferredFiniteness();
+            // A global-norm clip is captured with the update (its norm, coefficient and scale are device kernels), as
+            // PyTorch's foreach clip_grad_norm_ runs inside a captured step. Refusing it put every clipped model -- a
+            // DCGAN, like PyTorch's twin, clips at 1.0 -- on the eager update after each replay, whose deferred
+            // finiteness read then held the host to one step ahead of the device. Not under the Error policy, which
+            // raises from a host read of the norm record.
+            double clipNorm = _maxGradNorm;
+            var clipPolicy = _nonFiniteGradientPolicy;
             if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
-                || _usesFusedCe || paramCount == 0 || !_l2Regularization.Equals(0f) || _maxGradNorm > 0.0)
+                || _usesFusedCe || paramCount == 0 || !_l2Regularization.Equals(0f))
+                return null;
+            if (clipNorm > 0.0 && (typeof(T) != typeof(float) || clipNorm > float.MaxValue
+                    || clipPolicy == Engines.Gpu.NonFiniteGradientPolicy.Error))
                 return null;
             ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
@@ -8401,15 +8438,23 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 capParams.Add(gp); capGrads.Add(gg); capSizes.Add(lengths[p]);
                 if (adam) { capM.Add(gpuM[p]!); capV.Add(gpuV[p]!); }
             }
-            var pingPong = !adam ? TryAllocatePingPongBuffers(capParams, capSizes, owner) : null;
+            // The ping-pong update prepares its own tables (PrepareSgdPingPong), not the gradient table the clip reads.
+            var pingPong = !adam && clipNorm <= 0.0 ? TryAllocatePingPongBuffers(capParams, capSizes, owner) : null;
+            // The eager clip's kernels (TryClipGradientsGlobalL2Gpu) over the step I/O's own gradient table and scratch,
+            // minus its host bookkeeping: the captured update's guard measures the clipped gradients, which are
+            // non-finite exactly when the originals were unless the policy zeroed their non-finite elements (then the
+            // repaired gradients are what it should measure, as the eager path does).
             var captured = new CapturedOptimizer(lrSchedule, io =>
             {
+                if (clipNorm > 0.0) io.CaptureGlobalNormClip((float)clipNorm, clipPolicy);
                 if (adam) io.CaptureAdamUpdate(optType == OptimizerType.AdamW, capParams, capGrads, capM, capV, capSizes, b1, b2, epsVal, wd);
                 else if (pingPong is not null) io.CaptureSgdPingPongUpdate(0, (float)wd);
                 else io.CaptureSgdUpdate(capParams, capGrads, capSizes, (float)wd);
             });
             captured.ParameterMembership = (bool[])_optimizerGradientMembership.Clone();
             captured.ActiveIndices = capIndices;
+            captured.ClipNorm = clipNorm;
+            captured.ClipPolicy = clipPolicy;
             captured.Prepare = io =>
             {
                 if (pingPong is not null)
@@ -8435,6 +8480,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 var capOffsets = adam ? capIndices.Select(p => _parameterAcceptedUpdates[p] - _optimizerStep).ToArray() : null;
                 io.PrepareOptimizer(capParams, capGrads, adam ? capM : null, adam ? capV : null, capSizes, capOffsets);
+                if (clipNorm > 0.0) io.PrepareGlobalNormClip();
             };
             // Binds every parameter to buffer set `set` (0: the plan's own, 1: the ping-pong second buffers) as the
             // authoritative copy everywhere it is looked up; `from` is the set the persistent weight cache names now.
@@ -9816,6 +9862,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _int8MomentBlockSize = checkpoint.Int8MomentBlockSize;
         _int8MinQuantizedLength = checkpoint.Int8MinQuantizedLength;
         _maxGradNorm = checkpoint.MaxGradNorm;
+        RetireCapturedOptimizerIfIneligible();
 
         var schedules = new LrSchedule[checkpoint.Schedules.Length];
         for (int i = 0; i < schedules.Length; i++)
@@ -12331,8 +12378,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Sub-E (#373): pre-pack B at plan-compile time so the replay
                 // closure routes through BlasManaged.Gemm with the cached handle.
                 // B is constant across inference calls (allowCachedB=true).
-                // Prefer the caller's FrozenWeightRegistry handle so we don't
-                // double-allocate; otherwise pre-pack here.
+                // Prefer a handle the caller registered in FrozenWeightRegistry so
+                // we don't double-allocate; otherwise pre-pack into a handle this
+                // plan owns. Compiling never registers B itself: a registered
+                // weight moves every later EAGER TensorMatMul on it onto this
+                // packed kernel, whose summation order differs, so eager results
+                // would depend on whether some plan had ever been compiled.
                 var capturedB = Engines.BlasManaged.FrozenWeightRegistry.TryGetHandle(inputB)
                     ?? Engines.BlasManaged.BlasManaged.PrePackB<float>(
                         new ReadOnlySpan<float>(cB), N, transB: false, k: K, n: N);

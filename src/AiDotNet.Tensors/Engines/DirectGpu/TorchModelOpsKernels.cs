@@ -45,8 +45,9 @@ internal static class TorchModelOpsKernels
     /// <summary>The grid-index helper for CUDA and HIP, which compile the dialect directly.</summary>
     public const string CudaPrelude = "__device__ __forceinline__ int bx_gid() { return (int)(blockIdx.x * blockDim.x + threadIdx.x); }\n";
 
-    /// <summary>The kernels in the portable dialect.</summary>
-    public const string Source = @"
+    /// <summary>The kernels in the portable dialect. A static field, not a const, so CudaPrelude + Source concatenates
+    /// at run time instead of folding a second full copy of the kernels into the assembly's user-string heap (CS8103).</summary>
+    public static readonly string Source = @"
 // ---- model-op helpers ----
 __device__ __forceinline__ bool mo_isnan(float u) { return (__float_as_uint(u) & 0x7FFFFFFFu) > 0x7F800000u; }
 __device__ __forceinline__ bool mo_isfinite(float u) { return (__float_as_uint(u) & 0x7FFFFFFFu) < 0x7F800000u; }
