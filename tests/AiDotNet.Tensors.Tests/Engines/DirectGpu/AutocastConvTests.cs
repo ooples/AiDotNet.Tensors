@@ -233,6 +233,24 @@ public sealed class AutocastConvTests : IDisposable
 
                 var staged = Run(channelsLast: true);
                 var nchw = Run(channelsLast: false);
+
+                // Inside one backward function the filter gradient reads the dY the data gradient narrowed.
+                AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_channelsLastMixedConv = true;
+                long sharedBefore = DirectGpuTensorEngine.SharedNarrowings;
+                // Resident operands, as a compiled step's are: a host tensor is uploaded afresh by each pass.
+                var gx = engine.UploadToGpu(x, GpuTensorRole.Activation);
+                var gdy = engine.UploadToGpu(dy, GpuTensorRole.Gradient);
+                float[] sharedDx, sharedDw;
+                using (new AutocastScope(precision))
+                using (new DirectGpuTensorEngine.BackwardConvPrecisionScope(null, shareNarrowedOperands: true))
+                {
+                    sharedDx = engine.Conv2DBackwardInputGpu(gdy, w, x._shape, s, p, d).ToArray();
+                    sharedDw = engine.Conv2DBackwardKernelGpu(gdy, gx, w._shape, s, p, d).ToArray();
+                }
+                Assert.Equal(1, DirectGpuTensorEngine.SharedNarrowings - sharedBefore);
+                AssertClose(staged.Dx, sharedDx, precision, $"{precision} shared-dY dX");
+                AssertClose(staged.Dw, sharedDw, precision, $"{precision} shared-dY dW");
+                AssertClose(refDw, sharedDw, precision, $"{precision} shared-dY dW vs reference");
                 _output.WriteLine($"{precision} [{batch},{inC},{size},{size}] k{k} s{stride} p{pad} d{dilation} -> {outC}: " +
                                   $"{staged.Staged} channels-last passes");
                 Assert.Equal(3, staged.Staged);
