@@ -203,6 +203,19 @@ public partial class CpuEngine
         }
     }
 
+    // A per-image column block of at most 1 MB (an L2's worth on the targets measured) and a reduction short enough that
+    // a sequential GEMM per image beats one batch-wide GEMM, with at least one image per worker.
+    private const int PerImageSmallKMaxColH = 256;
+    private const long PerImageSmallKMaxColElements = 1L << 18;
+
+    /// <summary>Forwards that took the per-image small-K route (tests).</summary>
+    internal static long PerImageSmallKForwards;
+
+    private static bool PerImageSmallKForward(int batch, int colH, int colW)
+        => colH <= PerImageSmallKMaxColH
+           && (long)colH * colW <= PerImageSmallKMaxColElements
+           && batch >= CpuParallelSettings.MaxDegreeOfParallelism;
+
     /// <summary>
     /// Forward conv as one GEMM over the batch: out[outC, batch*colW] = W[outC, colH] . cols[colH, batch*colW], then
     /// unpacked to [batch, outC, colW]. Overwrites every element of <paramref name="outputF"/>.
@@ -219,6 +232,37 @@ public partial class CpuEngine
         int colWAll = batch * colW;
         int inputSliceSize = inChannels * height * width;
         var pool = ArrayPool<float>.Shared;
+        if (PerImageSmallKForward(batch, colH, colW))
+        {
+            // A short reduction (an RGB stem: 3 channels x 4x4 = 48) over many images: each image's columns fit in L2,
+            // so one worker per image builds them and runs its own sequential GEMM straight into the image's output.
+            // The whole-batch form wrote and re-read a 25 MB column stack and a 33 MB packed output, and split a K = 48
+            // GEMM in two dimensions: 62-107 ms for DCGAN's batch-128 stem, against oneDNN's 13 ms. Each output
+            // element is one GEMM's, summed in the same order at any thread count.
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * outChannels * colH * colW, b =>
+            {
+                var col = pool.Rent(colH * colW);
+                try
+                {
+                    Im2ColHelper.Im2ColStridedSingleChannelRange(
+                        new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                        new Span<float>(col, 0, colH * colW), colW, 0,
+                        0, inChannels, height, width, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    Simd.SimdGemm.SgemmForAutotune(
+                        new ReadOnlySpan<float>(kernelF, 0, outChannels * colH),
+                        new ReadOnlySpan<float>(col, 0, colH * colW),
+                        new Span<float>(outputF, b * outChannels * colW, outChannels * colW),
+                        outChannels, colH, colW, Simd.SgemmExecutionMode.Sequential);
+                }
+                finally
+                {
+                    pool.Return(col);
+                }
+            }, deterministicSafe: true);
+            System.Threading.Interlocked.Increment(ref PerImageSmallKForwards);
+            return;
+        }
         var cols = pool.Rent(colH * colWAll);
         var packedOut = pool.Rent(outChannels * colWAll);
         try
