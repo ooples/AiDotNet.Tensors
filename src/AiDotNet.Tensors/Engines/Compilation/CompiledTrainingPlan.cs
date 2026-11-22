@@ -10503,12 +10503,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (DirectGpu.GpuOpGate.CurrentOpBackend is not { } consumer) return;
         var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
         foreach (var parameter in parameters) CrossBackendTensors.ResolveIfForeign(parameter, consumer);
-        // A graph input that is not a parameter is an external batch its caller writes through the host: its host copy
-        // is authoritative and the step's pre-pass uploads it (EnsureResidentInput), so it is only detached here.
-        foreach (var node in scope.Nodes.OfType<LazyNode<T>>())
-            foreach (var input in node.GetInputsArray())
-                if (input is not null && input.LazySource is null && !parameterSet.Contains(input))
-                    CrossBackendTensors.ResolveIfForeign(input, consumer, hostAuthoritative: true);
+        // Every other leaf is an input its caller may write through the host (a batch; a span write does not bump the
+        // tensor's version, so a device copy can look current over newer host data): its host copy is authoritative,
+        // its device copy read back only while a device write is still pending (device writes arm that download).
+        // It is re-placed on this backend from the host so it stays resident: detached, every step would upload it.
+        foreach (var node in scope.Nodes)
+        {
+            if (node is LazyNode<T> typed)
+            {
+                foreach (var input in typed.GetInputsArray())
+                    if (input is not null && input.LazySource is null && !parameterSet.Contains(input))
+                        CrossBackendTensors.ResolveIfForeign(input, consumer, hostAuthoritative: true, rePlaceFromHost: true);
+            }
+            else if (node is IForeignLeafSource other)
+            {
+                // A leaf of another element type (integer ids into an embedding): migrated now too, or the first
+                // captured step would do it and abort the capture.
+                other.ResolveForeignLeaves(consumer);
+            }
+        }
     }
 
     private static CompiledTrainingPlan<T> CompileCore(

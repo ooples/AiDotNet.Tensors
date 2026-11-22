@@ -86,10 +86,11 @@ internal static class CrossBackendTensors
     /// context down mid-read, and drops the foreign binding; a resident tensor is then re-placed on the consumer as
     /// Tensor.Gpu() would, so it stays resident there. <paramref name="hostAuthoritative"/> is for an external input
     /// whose caller writes through the host and uploads it itself: its device copy is read back only while a device
-    /// write is still pending, and it is not re-placed.
+    /// write is still pending, and it is not re-placed unless <paramref name="rePlaceFromHost"/> (a compiled plan's
+    /// leaf, re-placed from its host copy so it stays resident).
     /// </summary>
     internal static void Resolve<T>(Tensor<T> tensor, IDirectGpuBackend owner, IDirectGpuBackend consumer,
-        bool hostAuthoritative = false)
+        bool hostAuthoritative = false, bool rePlaceFromHost = false)
     {
         var policy = AiDotNetEngine.CrossBackendPolicy;
         if (policy == CrossBackendTensorPolicy.Throw)
@@ -98,6 +99,20 @@ internal static class CrossBackendTensors
                 + $"{Describe(consumer)}. Move it to the engine's device first (Tensor.To, or Tensor.Gpu with that engine as "
                 + "AiDotNetEngine.Current), or set AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn.");
 
+        // One migration per storage at a time: two ops on two backends can both find a shared weight foreign, and the
+        // second must not take the buffer the first just placed for its own backend as the foreign one and free it.
+        // Inside the lock the binding is looked at again; a migration that already happened leaves nothing to do.
+        lock (tensor.StorageIdentity)
+        {
+            var bound = tensor._gpuBackend;
+            if (tensor._gpuBuffer is null || bound is null || SameAddressSpace(bound, consumer)) return;
+            ResolveLocked(tensor, bound, consumer, hostAuthoritative, rePlaceFromHost, policy);
+        }
+    }
+
+    private static void ResolveLocked<T>(Tensor<T> tensor, IDirectGpuBackend owner, IDirectGpuBackend consumer,
+        bool hostAuthoritative, bool rePlaceFromHost, CrossBackendTensorPolicy policy)
+    {
         long bytes = (long)tensor.Length * sizeof(float);
         bool wasResident = tensor.IsGpuResident;
         // The binding is dropped whatever the tensor's extent: a whole-storage tensor's binding is its storage's (every
@@ -110,24 +125,31 @@ internal static class CrossBackendTensors
         bool pending = (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array && Helpers.HostSync.IsPending(array))
                        || Helpers.HostSync.IsPending(tensor.DataVector);
         bool deviceCurrent = wasResident && tensor._gpuBufferVersion == tensor.GpuCacheVersion;
-        bool readBack = pending || (!hostAuthoritative && deviceCurrent);
+        // A backend whose owning engine was disposed has been freed: nothing on it can be read or freed. Its tensors'
+        // host copies are what is left - current unless a device write was still pending, which is lost.
+        bool retired = DirectGpuTensorEngine.IsRetiredBackend(Unwrap(owner));
+        bool readBack = pending || (!hostAuthoritative && deviceCurrent && !retired);
 
-        var ownerEngine = DirectGpuTensorEngine.EngineOwning(Unwrap(owner));
+        var ownerEngine = retired ? null : DirectGpuTensorEngine.EngineOwning(Unwrap(owner));
         using (var ownerLease = ownerEngine?.EnterGpuOp() ?? default)
         {
-            bool ownerLive = ownerEngine is null || ownerLease.Held;
+            bool ownerLive = !retired && (ownerEngine is null || ownerLease.Held);
             if (readBack && !ownerLive)
                 throw new InvalidOperationException(
-                    $"A tensor of shape [{Shape(tensor)}] is held on the {Describe(owner)} backend by an engine that is being "
-                    + $"disposed, so it cannot be read back for the operation on {Describe(consumer)}.");
-            // An owner mid-teardown frees its own memory with its context: the buffer is detached, not freed here.
-            tensor.ReleaseForeignGpuBinding(readBack, free: ownerLive);
+                    $"A tensor of shape [{Shape(tensor)}] is held on the {Describe(owner)} backend by an engine that is "
+                    + (retired ? "disposed" : "being disposed") + ", with device values not yet brought to the host, so it "
+                    + $"cannot be moved to the operation on {Describe(consumer)}.");
+            // A storage the owning engine handed out as its result owns its buffer whichever alias asks.
+            bool storageOwned = ownerLive && ownerEngine is not null && tensor.CoversWholeVector
+                                && ownerEngine.OwnsDeviceResult(tensor.DataVector);
+            // An owner mid-teardown (or gone) frees its own memory with its context: the buffer is detached, not freed.
+            tensor.ReleaseForeignGpuBinding(readBack, free: ownerLive, storageOwned);
         }
         // Re-place it on the op's backend exactly as Tensor.Gpu() would have (version-tagged, host-mirrored), so a
         // resident parameter stays resident: left host-only, an on-device optimizer would update a buffer the forward
         // never reads and training would stall. Placed on the real backend, never on a recording wrapper. An external
         // input is not: its caller uploads the host data into a binding of its own next.
-        if (wasResident && !hostAuthoritative) tensor.PlaceOn(Unwrap(consumer));
+        if (wasResident && (!hostAuthoritative || rePlaceFromHost)) tensor.PlaceOn(Unwrap(consumer), DirectGpuTensorEngine.EngineOwning(Unwrap(consumer)));
         Interlocked.Increment(ref s_migrations);
         if (policy == CrossBackendTensorPolicy.MigrateWarn && FirstReport(tensor.StorageIdentity, owner, consumer))
             AiDotNetEngine.LogDiagnostic(
@@ -143,11 +165,12 @@ internal static class CrossBackendTensors
     /// <see cref="TensorBase{T}.TryGetGpuBuffer"/>, so a foreign binding is migrated (or refused) there too rather
     /// than re-uploaded from the host on every op, or freed without reading back what its owner last wrote.
     /// </summary>
-    internal static void ResolveIfForeign<T>(Tensor<T> tensor, IDirectGpuBackend consumer, bool hostAuthoritative = false)
+    internal static void ResolveIfForeign<T>(Tensor<T> tensor, IDirectGpuBackend consumer, bool hostAuthoritative = false,
+        bool rePlaceFromHost = false)
     {
         var owner = tensor._gpuBackend;
         if (tensor._gpuBuffer is null || owner is null || SameAddressSpace(owner, consumer)) return;
-        Resolve(tensor, owner, consumer, hostAuthoritative);
+        Resolve(tensor, owner, consumer, hostAuthoritative, rePlaceFromHost);
     }
 
     private static string Shape<T>(Tensor<T> tensor) => string.Join(", ", tensor.Shape.ToArray());

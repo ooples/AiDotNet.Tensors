@@ -25,7 +25,8 @@ internal delegate Tensor<TIn>? CrossTypeBackwardFunction<TIn, TOut>(
 /// <see cref="BackwardFn"/>, the differentiable FP32↔FP16 cast that bridges the two grad spaces in
 /// mixed-precision (#555) training.
 /// </summary>
-internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNode, ICompiledForwardNode, ICrossTypeNodeMetadata
+internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNode, ICompiledForwardNode, ICrossTypeNodeMetadata,
+    IForeignLeafSource
 {
     Type ICrossTypeNodeMetadata.InputElementType => typeof(TIn);
     Type ICrossTypeNodeMetadata.OutputElementType => typeof(TOut);
@@ -78,6 +79,12 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode, ISignableLazyNod
     public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
     public readonly Tensor<TIn> Input;
+
+    /// <inheritdoc/>
+    public void ResolveForeignLeaves(DirectGpu.IDirectGpuBackend consumer)
+    {
+        if (Input is not null && Input.LazySource is null) CrossBackendTensors.ResolveIfForeign(Input, consumer, hostAuthoritative: true, rePlaceFromHost: true);
+    }
     public readonly Tensor<TOut> Output;
     public readonly Action<IEngine, Tensor<TOut>> Execute;
 

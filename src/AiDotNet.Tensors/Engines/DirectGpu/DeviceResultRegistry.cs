@@ -104,6 +104,21 @@ internal sealed class DeviceResultRegistry
     }
 
     /// <summary>The live entries across every thread's shard (a diagnostic for tests).</summary>
+    /// <summary>Whether <paramref name="storage"/> is registered here (a linear scan: for the rare cross-backend
+    /// migration, never an op's hot path).</summary>
+    internal bool Contains(IDeviceResultStorage storage)
+    {
+        foreach (var shard in _shards.Values)
+        {
+            lock (shard)
+            {
+                for (int i = 0; i < shard.Count; i++)
+                    if (ReferenceEquals(shard.Handles[i].Target, storage)) return true;
+            }
+        }
+        return false;
+    }
+
     internal int CountLive()
     {
         int live = 0;

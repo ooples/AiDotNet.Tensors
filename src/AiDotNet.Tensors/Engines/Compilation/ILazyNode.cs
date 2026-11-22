@@ -14,6 +14,13 @@ internal interface IDeviceStateProtectionNode
 }
 
 /// <summary>Describes the gradient boundary of a node crossing element types.</summary>
+/// <summary>A node whose leaf inputs are not of the plan's element type, so the plan's leaf walk cannot see them.</summary>
+internal interface IForeignLeafSource
+{
+    /// <summary>Migrates each leaf input another backend placed to <paramref name="consumer"/> (CrossBackendTensors).</summary>
+    void ResolveForeignLeaves(DirectGpu.IDirectGpuBackend consumer);
+}
+
 internal interface ICrossTypeNodeMetadata
 {
     Type InputElementType { get; }

@@ -283,6 +283,123 @@ public sealed class CrossBackendTensorPolicyTests
         Assert.Null(GpuOpGate.CurrentOpBackend);
     }
 
+    [SkippableFact]
+    public void Raw_int32_indices_placed_elsewhere_reach_the_consumer_as_indices()
+    {
+        using var engines = CreateEngines();
+        var placerBackend = engines.Placer.QueryBackend!;
+        // Raw int32 device storage, as an argmax on the placer's backend produces it.
+        var indices = Tensor<int>.FromGpuBuffer(placerBackend, placerBackend.AllocateIntBuffer(new[] { 3, 0, 2, 1 }),
+            new[] { 4 }, bufferContainsRawInt32: true);
+        var source = new Tensor<float>(new[] { 10f, 20f, 30f, 40f }, new[] { 4 });
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        // Before the fix the raw-int32 marker was read before the migration, which re-uploads the indices as floats:
+        // index 3 arrived as 0x40400000.
+        Assert.Equal(new[] { 40f, 10f, 30f, 20f }, engines.Consumer.TensorTake(source, indices).ToArray());
+        Assert.Equal(new[] { 3, 0, 2, 1 }, indices.ToArray());
+    }
+
+    [SkippableFact]
+    public void A_tensor_whose_engine_was_disposed_moves_from_its_host_copy()
+    {
+        using var engines = CreateEngines();
+        var retiredEngine = new DirectGpuTensorEngine(new DirectGpuEngine(new OpenClBackend()), ownsDirectGpu: true);
+        var retiredBackend = retiredEngine.QueryBackend;
+        var a = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        PlaceOn(retiredEngine, a);
+        retiredEngine.Dispose();
+        Skip.IfNot(DirectGpuTensorEngine.IsRetiredBackend(retiredBackend), "That engine did not own its backend.");
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        // Its device copy is gone with the backend; the host copy is current, so the op reads it and nothing touches
+        // the freed backend (before the fix: a read-back and a free through it).
+        var zeros = new Tensor<float>(new float[4], new[] { 4 });
+        Assert.Equal(new[] { 1f, 2f, 3f, 4f }, engines.Consumer.TensorAdd(a, zeros).ToArray());
+    }
+
+    [SkippableFact]
+    public void Two_threads_migrating_one_tensor_move_it_once_and_both_read_it()
+    {
+        using var engines = CreateEngines();
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        for (int round = 0; round < 20; round++)
+        {
+            var shared = new Tensor<float>(new[] { 1f + round, 2f, 3f, 4f }, new[] { 4 });
+            PlaceOn(engines.Placer, shared);
+            long before = CrossBackendTensors.MigrationCount;
+            var results = new float[2][];
+            using var start = new System.Threading.Barrier(2);
+            var threads = Enumerable.Range(0, 2).Select(t => new System.Threading.Thread(() =>
+            {
+                var zeros = new Tensor<float>(new float[4], new[] { 4 });
+                start.SignalAndWait();
+                results[t] = engines.Consumer.TensorAdd(shared, zeros).ToArray();
+            })).ToArray();
+            foreach (var thread in threads) thread.Start();
+            foreach (var thread in threads) thread.Join();
+            Assert.Equal(1, CrossBackendTensors.MigrationCount - before);
+            Assert.All(results, r => Assert.Equal(new[] { 1f + round, 2f, 3f, 4f }, r));
+            Assert.NotSame(engines.Placer.QueryBackend, shared._gpuBackend);
+        }
+    }
+
+    [SkippableFact]
+    public void Migrating_through_a_non_owning_view_frees_the_result_buffer_it_leaves()
+    {
+        using var engines = CreateEngines();
+        // An engine that owns its backend registers its results as owning their buffers.
+        using var owner = new DirectGpuTensorEngine(new DirectGpuEngine(new OpenClBackend()), ownsDirectGpu: true);
+        var a = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        var b = new Tensor<float>(new[] { 10f, 20f, 30f, 40f }, new[] { 4 });
+        Tensor<float> produced;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = owner;
+        try { produced = owner.TensorAdd(a, b); _ = produced.ToArray(); }
+        finally { AiDotNetEngine.Current = previous; }
+        var old = produced._gpuBuffer;
+        Assert.NotNull(old);
+        Assert.True(owner.OwnsDeviceResult(produced.DataVector));
+        var view = produced.Reshape(2, 2);   // shares the result's storage, owns nothing itself
+        Assert.False(view._ownsGpuBuffer);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zeros = new Tensor<float>(new float[4], new[] { 2, 2 });
+        Assert.Equal(new[] { 11f, 22f, 33f, 44f }, engines.Consumer.TensorAdd(view, zeros).ToArray());
+        Assert.Equal(System.IntPtr.Zero, old!.Handle);   // freed, not leaked to the finalizer
+        Assert.Equal(new[] { 11f, 22f, 33f, 44f }, produced.ToArray());
+    }
+
+    [SkippableFact]
+    public void An_inner_lease_returned_elsewhere_does_not_cost_the_outer_op_its_backend()
+    {
+        using var engines = CreateEngines();
+        var outerGate = new GpuOpGate();
+        var innerGate = new GpuOpGate();
+        using var outer = outerGate.Enter(engines.Consumer.QueryBackend);
+        var middle = outerGate.Enter(engines.Consumer.QueryBackend);
+        var inner = innerGate.Enter(engines.Placer.QueryBackend);
+        var other = new System.Threading.Thread(() => inner.Dispose());   // returned from another thread
+        other.Start();
+        other.Join();
+        middle.Dispose();
+        // Before the fix the middle lease saw the inner entry installed, skipped its restore, and the rest of the outer
+        // op ran with no op backend: the foreign-buffer guard off.
+        Assert.Same(engines.Consumer.QueryBackend, GpuOpGate.CurrentOpBackend);
+    }
+
+    [SkippableFact]
+    public void Compile_re_places_a_leaf_whose_device_copy_is_current()
+    {
+        using var engines = CreateEngines();
+        var input = Seeded(4, 3, 4);
+        var w1 = Seeded(3, 5, 5);
+        var w2 = Seeded(5, 2, 6);
+        var expected = input.ToArray();
+        PlaceOn(engines.Placer, input);   // a frozen leaf: nothing writes it after the placement
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        using var plan = Compile(engines.Consumer, input, w1, w2);
+        Assert.Same(engines.Consumer.QueryBackend, input._gpuBackend);   // still resident, now on the plan's backend
+        Assert.Equal(expected, input.ToArray());
+    }
+
     [Fact]
     public void Policy_rejects_values_outside_the_enum()
     {

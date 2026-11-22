@@ -4750,10 +4750,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // use read the data back to the host and uploaded it again. The buffer is freed with the last reference.
         bool sharedDeviceStateOutlivesThis = CoversWholeVector && _storage.RefCount > 1;
         var storage = _storage;
+        // A buffer the storage itself owns (a placement, FromGpuBuffer, a migration's re-placement) is freed by the
+        // storage with its last reference, the release below: an alias still flagged as owning it must not free it a
+        // second time. Asked before the release, which detaches the storage's owner.
+        bool storageFreesIt = _gpuBuffer is { } bound && storage.OwnsGpuBuffer(bound);
         bool lastReference = storage.Release();
         if (!sharedDeviceStateOutlivesThis)
         {
-            if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+            if (_ownsGpuBuffer && !storageFreesIt && _gpuBuffer is IDisposable disposableBuffer)
             {
                 disposableBuffer.Dispose();
             }

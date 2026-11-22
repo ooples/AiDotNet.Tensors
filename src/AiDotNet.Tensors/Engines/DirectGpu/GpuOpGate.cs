@@ -72,9 +72,11 @@ internal sealed class GpuOpGate
             if (_counter is null) return;
             // Only the thread that installed the op backend restores it: an async op returning its lease from another
             // thread cannot reach that thread's [ThreadStatic] at all. That thread's entry then goes stale, which
-            // CurrentOpBackend detects through the counter (its depth drops to zero below).
-            if (_backend is not null && _threadId == Environment.CurrentManagedThreadId
-                && ReferenceEquals(t_opBackend, _backend))
+            // CurrentOpBackend detects through the counter (its depth drops to zero below). The installing thread
+            // restores unconditionally: its leases nest (using), so whatever is installed now is either this lease's
+            // entry or an inner one returned from another thread, which this pop discards - checking that the entry
+            // is still its own left the enclosing op without an op backend for the rest of its body.
+            if (_backend is not null && _threadId == Environment.CurrentManagedThreadId)
             {
                 t_opBackend = _previousBackend;
                 t_opCounter = _previousCounter;

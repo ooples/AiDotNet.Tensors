@@ -763,7 +763,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var data = dataLease.Array;
         // The same backend seen through a wrapper (a deferred scope's recording backend) reuses the binding too.
         if (t._gpuBuffer is { } existing && t._gpuBackend is { } bound && CrossBackendTensors.SameAddressSpace(bound, cb)
-            && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
+            && AiDotNet.Tensors.Engines.DirectGpu.GpuBufferViewRoot.IsLive(AiDotNet.Tensors.Engines.DirectGpu.GpuBufferViewRoot.Of(existing)) && existing.Size >= t.Length)
         {
             cb.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
@@ -773,7 +773,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Release the previous allocation before overwriting it. The reuse branch above already returned for a
         // same-backend buffer big enough; reaching here means the old buffer is too small or on another backend,
         // so dropping the reference without freeing would leak VRAM across recaptures / shape changes.
-        if (t._gpuBuffer is { } stale && stale.Handle != System.IntPtr.Zero)
+        if (t._gpuBuffer is { } stale && AiDotNet.Tensors.Engines.DirectGpu.GpuBufferViewRoot.IsLive(AiDotNet.Tensors.Engines.DirectGpu.GpuBufferViewRoot.Of(stale)))
             stale.Dispose();
         var buf = cb.AllocateBuffer((float[])(object)data); // sync upload — OK in the non-capturing pre-pass
         t._gpuBuffer = buf;
@@ -1136,10 +1136,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Helpers.PooledArrayRecycling.Register(this);
     }
 
-    public DirectGpuTensorEngine(DirectGpuEngine directGpu)
+    public DirectGpuTensorEngine(DirectGpuEngine directGpu) : this(directGpu, ownsDirectGpu: false)
+    {
+    }
+
+    /// <summary>An engine over <paramref name="directGpu"/> that frees it (and its backend) when it is disposed, as the
+    /// default constructor's engine does with the device it opens.</summary>
+    internal DirectGpuTensorEngine(DirectGpuEngine directGpu, bool ownsDirectGpu)
     {
         _directGpu = directGpu;
-        _ownsDirectGpu = false;
+        _ownsDirectGpu = ownsDirectGpu;
         RegisterAsBackendOwner();
         Helpers.PooledArrayRecycling.Register(this);
     }
@@ -1212,6 +1218,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _registeredBackend = null;
         }
     }
+
+    // Backends an engine that owned them has torn down: their buffers can be neither read nor freed any more.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend, object> s_retiredBackends = new();
+
+    /// <summary>Whether the engine that owned <paramref name="backend"/> was disposed, freeing it.</summary>
+    internal static bool IsRetiredBackend(IDirectGpuBackend? backend)
+        => backend is not null && s_retiredBackends.TryGetValue(backend, out _);
+
+    /// <summary>Every live engine registered on <paramref name="backend"/>, newest first.</summary>
+    internal static System.Collections.Generic.List<DirectGpuTensorEngine> EnginesOn(IDirectGpuBackend? backend)
+    {
+        var live = new System.Collections.Generic.List<DirectGpuTensorEngine>();
+        if (backend is null) return live;
+        lock (s_engineByBackendLock)
+        {
+            if (!s_enginesByBackend.TryGetValue(backend, out var engines)) return live;
+            for (int i = engines.Count - 1; i >= 0; i--)
+                if (engines[i].TryGetTarget(out var engine)) live.Add(engine);
+        }
+        return live;
+    }
+
+    /// <summary>Whether this engine handed <paramref name="vector"/> out as a result whose device buffer it owns.</summary>
+    internal bool OwnsDeviceResult(IDeviceResultStorage vector) => _ownsDirectGpu && _ownedResults.Contains(vector);
 
     /// <summary>The newest live engine that placed data on <paramref name="backend"/>, or null.</summary>
     internal static DirectGpuTensorEngine? EngineOwning(IDirectGpuBackend? backend)
@@ -31444,6 +31474,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (Interlocked.Exchange(ref _disposeState, 1) != 0) return true;
         IsDisposed = true;
         Helpers.PooledArrayRecycling.Unregister(this);
+        // An owned backend is freed below: a tensor still bound to it must not be read or freed through it later.
+        if (_ownsDirectGpu && _registeredBackend is { } retiring)
+            lock (s_engineByBackendLock) s_retiredBackends.AddOrUpdate(retiring, this);
         UnregisterAsBackendOwner();
         // Clear activation cache to free GPU memory from cached activations
         ClearActivationCache();
@@ -32930,6 +32963,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private (OwnedBuffer Real, OwnedBuffer Imaginary) GetOrAllocateSplitComplexBuffers<T>(
         IDirectGpuBackend backend, Tensor<Complex<T>> tensor)
     {
+        // A split-complex result another backend produced is brought home through its owner first (its materializer
+        // rebuilds the complex values), so it is neither read through a foreign handle nor mistaken for host data.
+        CrossBackendTensors.ResolveIfForeign(tensor, backend);
         int n = tensor.Length;
         if (tensor._gpuBufferIsSplitComplex
             && tensor.IsContiguous && tensor._storageOffset == 0

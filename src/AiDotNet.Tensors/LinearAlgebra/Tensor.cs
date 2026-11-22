@@ -5222,19 +5222,25 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 return this;
             backend = directGpu.Backend;
         }
-        return PlaceOn(backend);
+        return PlaceOn(backend, dispatcher);
     }
 
     /// <summary>
     /// Uploads this tensor to <paramref name="backend"/> and binds it there as its resident device copy: the body of
-    /// <see cref="Gpu()"/>, also used to rehome a tensor another backend held (CrossBackendTensors).
+    /// <see cref="Gpu()"/>, also used to rehome a tensor another backend held (CrossBackendTensors). The buffer is the
+    /// tensor's own: a whole-storage binding is owned by the storage (its GPU buffer owner, freed with the last
+    /// reference to it), a partial view's by the view.
     /// </summary>
-    internal Tensor<T> PlaceOn(Engines.DirectGpu.IDirectGpuBackend backend)
+    internal Tensor<T> PlaceOn(Engines.DirectGpu.IDirectGpuBackend backend,
+        Engines.DirectGpuTensorEngine? dispatcher = null)
     {
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
-        _gpuBuffer = backend.AllocateBuffer(floatData);
+        var placed = backend.AllocateBuffer(floatData);
+        _gpuBuffer = placed;
         _gpuBackend = backend;
+        if (!CoversWholeVector) _ownsGpuBuffer = true;
+        else if (!_storage.HasGpuBufferOwner) _storage.AttachGpuBufferOwner(placed);
         // Both layout markers describe the buffer being ATTACHED, so state them rather than letting
         // whatever the previous buffer was carry over. ToFloatArray above is the ordinary
         // one-float-per-element encoding, NOT raw int32 bits: for a Tensor<int> that came from
@@ -5255,11 +5261,13 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // path for the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS != 0), so it silently mistrained on GPU.
         _gpuBufferVersion = GpuCacheVersion;
         _device = backend.DeviceType;   // the backend's typed device, not a match on its name
-        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight. The engine that
-        // owns the backend, not Current: a migration places from inside another engine's op, where reading Current
-        // could run a deferred GPU detection, and that engine is the one whose cache holds the copy.
-        if (Engines.DirectGpuTensorEngine.EngineOwning(backend) is { } owner)
-            owner.DropPersistentCopy(this);
+        // Weight reads now take this buffer; a copy an engine cached earlier is dead weight. Every live engine on the
+        // backend can hold one (several may share a backend), and Tensor.Gpu()'s dispatcher is the one whose reads it
+        // is placing for. Never Current here: a migration places from inside another engine's op, where reading Current
+        // could run a deferred GPU detection.
+        dispatcher?.DropPersistentCopy(this);
+        foreach (var engine in Engines.DirectGpuTensorEngine.EnginesOn(backend))
+            if (!ReferenceEquals(engine, dispatcher)) engine.DropPersistentCopy(this);
         // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
         Helpers.ResidentHostMirror.Attach(this);
 
@@ -5273,7 +5281,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// shared by every alias, a partial view's its own - and the buffer freed when this tensor owns it and
     /// <paramref name="free"/> (false while the owner is tearing down: its context reclaims the memory).
     /// </summary>
-    internal void ReleaseForeignGpuBinding(bool readBack, bool free)
+    internal void ReleaseForeignGpuBinding(bool readBack, bool free, bool storageOwned = false)
     {
         var owner = _gpuBackend;
         if (readBack)
@@ -5296,7 +5304,16 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
         var buffer = _gpuBuffer;
-        bool owned = _ownsGpuBuffer;
+        // Who owns a whole-storage buffer is the storage's business, not this alias's: the alias that triggered the
+        // migration may be a non-owning reshape of the result that owns it. It is owned when this alias says so, when
+        // the storage holds it as its GPU buffer owner (a placement, FromGpuBuffer), or when the owning engine
+        // registered the storage as its result (storageOwned).
+        bool wholeStorage = CoversWholeVector;
+        bool storageHoldsIt = wholeStorage && buffer is not null && _storage.OwnsGpuBuffer(buffer);
+        bool owned = _ownsGpuBuffer || storageHoldsIt || (wholeStorage && storageOwned);
+        // The storage lets go of it here either way, so its last reference cannot free it again (or free it through a
+        // backend that is gone); it is freed once, below, when it may be.
+        if (storageHoldsIt) _storage.DisposeGpuBufferOwner(static _ => { });
         // Without a read-back the host is authoritative (an external input its caller writes): drop the pending
         // download so a later host read cannot materialize the abandoned device copy over it.
         if (!readBack && GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
@@ -5376,7 +5393,11 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_gpuBuffer is not null && _gpuBackend is not null && _device != TensorDevice.CPU)
         {
             float[] floatData = _gpuBackend.DownloadBuffer(_gpuBuffer);
-            var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
+            // A raw-integer buffer holds the integers' bits, not one float per value: decoded as floats, index 3 would
+            // come home as 4.2e-45 and truncate to 0.
+            var converted = _gpuBufferContainsRawInt64 ? DecodeRawInt64(floatData)
+                : _gpuBufferContainsRawInt32 ? DecodeRawInt32(floatData)
+                : Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
             if (IsContiguous)
             {
                 var dst = AsWritableSpan();
@@ -5398,5 +5419,36 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         _gpuBufferContainsRawInt64 = false;
         _device = TensorDevice.CPU;
         return this;
+    }
+
+    // One int32 per element, as raw bits in the float words.
+    [ScalarKernel("Decodes a raw-integer device readback once per host read; integers have no vectorized path to T.")]
+    private T[] DecodeRawInt32(float[] words)
+    {
+        var values = new T[Math.Min(words.Length, Length)];
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < values.Length; i++)
+        {
+            int v = BitConverter.SingleToInt32Bits(words[i]);
+            values[i] = typeof(T) == typeof(int) ? (T)(object)v : ops.FromDouble(v);
+        }
+        return values;
+    }
+
+    // Two words per element, low word first: an int64 (narrower and unsigned integer types widened to it).
+    [ScalarKernel("Decodes a raw-integer device readback once per host read; integers have no vectorized path to T.")]
+    private T[] DecodeRawInt64(float[] words)
+    {
+        var values = new T[Math.Min(words.Length / 2, Length)];
+        var ops = MathHelper.GetNumericOperations<T>();
+        for (int i = 0; i < values.Length; i++)
+        {
+            long v = (uint)BitConverter.SingleToInt32Bits(words[2 * i])
+                     | ((long)BitConverter.SingleToInt32Bits(words[2 * i + 1]) << 32);
+            values[i] = typeof(T) == typeof(long) ? (T)(object)v
+                : typeof(T) == typeof(int) ? (T)(object)(int)v
+                : ops.FromDouble(v);
+        }
+        return values;
     }
 }

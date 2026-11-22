@@ -79,7 +79,9 @@ public class FullParamResidentTrainingReproTests
     // earlier test left an engine on ANOTHER backend installed (an OpenCL engine, in the suite order that failed),
     // the parameters carried an OpenCL buffer into a CUDA engine's compiled step, whose GEMM dereferenced the
     // OpenCL handle as a device pointer: sticky CUDA-700 for the rest of the process. A buffer this engine's
-    // backend does not own must never reach its kernels; the step trains from the host copy instead.
+    // backend does not own must never reach its kernels. Under the default policy (MigrateWarn) the parameters are
+    // migrated to this engine's backend when the plan compiles and stay resident there, where its on-device optimizer
+    // updates them.
     [SkippableFact]
     public void Fp32FusedPath_ParamsPlacedOnAnotherBackend_TrainWithoutForeignPointer()
     {
@@ -105,7 +107,11 @@ public class FullParamResidentTrainingReproTests
                 w1.Gpu(); w2.Gpu();
                 Assert.True(w1.IsGpuResident && w2.IsGpuResident, "the OpenCL engine must have placed the parameters.");
                 AiDotNetEngine.Current = gpu;
+                long migrationsBefore = CrossBackendTensors.MigrationCount;
                 TrainAndAssertLossDrops(gpu, input, w1, w2, "placedOnOpenCl");
+                Assert.True(CrossBackendTensors.MigrationCount - migrationsBefore >= 2, "both parameters were migrated");
+                Assert.Same(gpu.QueryBackend, w1._gpuBackend);
+                Assert.Same(gpu.QueryBackend, w2._gpuBackend);
             }
             finally { AiDotNetEngine.Current = previous; }
         }
