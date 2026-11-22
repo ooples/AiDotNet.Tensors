@@ -161,8 +161,9 @@ public static class CuBlasNative
         {
             foreach (var dir in cudaBinDirs)
             {
-                var ext = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows) ? ".dll" : ".so";
-                var fullPath = System.IO.Path.Combine(dir, candidate + ext);
+                // Windows candidates are bare names; the Linux ones already end in their suffix (libcublas.so.12).
+                bool windows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+                var fullPath = Under(dir, windows ? candidate + ".dll" : candidate);
                 if (NativeLibrary.TryLoad(fullPath, out var handle))
                     return handle;
             }

@@ -343,8 +343,11 @@ public sealed class CudaTunedKernelTests
         try
         {
             long captured = backend.TuneGraphsCaptured, reused = backend.TuneGraphsReused, dropped = backend.TuneGraphsInvalidated;
+            // Skipped only where capture is opted out or the driver has no graphs: where it is on, a first sample that
+            // captures nothing is a capture regression and fails here instead of skipping every assertion below.
+            Skip.IfNot(CudaBackend.TimingGraphCaptureEnabled, "timing graphs are not captured on this device");
             Sample();
-            Skip.If(backend.TuneGraphsCaptured == captured, "timing graphs are not captured on this device");
+            Assert.Equal(captured + 1, backend.TuneGraphsCaptured);
             Sample();
             Assert.Equal(reused + 1, backend.TuneGraphsReused);   // same key, nothing changed: replayed
 

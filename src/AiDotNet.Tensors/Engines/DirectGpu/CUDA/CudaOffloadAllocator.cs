@@ -39,8 +39,16 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
 
     // A CUDA device pointer is valid in the context that allocated it: this allocator's pointers are a CUDA backend's
     // to use only when that backend runs in the same context (the shared-context constructor).
+    // The handle alone is not identity: the driver reuses a destroyed context's handle, so the context must also be
+    // the live registration this allocator was given (IsContextUsableUnderLifecycleLock). The caller is an op on `backend`'s engine
+    // and holds its op lease, which the engine drains before it destroys the context: a context found live here stays
+    // live until that op has finished with the wrapped buffer.
     bool IGpuOffloadBackendAffinity.PointersUsableBy(IDirectGpuBackend backend)
-        => backend is CudaBackend cuda && _context != IntPtr.Zero && cuda.ContextHandle == _context;
+    {
+        if (backend is not CudaBackend cuda || _context == IntPtr.Zero) return false;
+        lock (CudaBackend.ContextLifecycleLock)
+            return IsContextUsableUnderLifecycleLock() && cuda.ContextHandle == _context;
+    }
 
     /// <summary>Standalone offload allocator — lazily creates and owns its own CUDA context.</summary>
     public CudaOffloadAllocator() { }

@@ -278,6 +278,9 @@ public sealed partial class CudaBackend
     private static readonly bool s_tuneInCapturedGraph =
         Environment.GetEnvironmentVariable("AIDOTNET_TUNE_CAPTURED") != "0";
 
+    /// <summary>Whether candidates are timed in a captured graph here: not opted out, and the driver has graphs (tests).</summary>
+    internal static bool TimingGraphCaptureEnabled => s_tuneInCapturedGraph && CudaNativeBindings.SupportsGraphCapture;
+
     /// <summary>
     /// The candidate's repetitions captured into one CUDA graph and timed as a single replay (after one warm replay):
     /// device time with no per-launch host cost between the candidate's kernels, as a compiled training step's captured
