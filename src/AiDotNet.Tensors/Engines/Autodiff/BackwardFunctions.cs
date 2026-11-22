@@ -2225,7 +2225,7 @@ internal static partial class BackwardFunctions<T>
             convBackward(gradZ, new[] { inputs[0], inputs[1] }, z, convSaved, engine, grads);
         }
         if (DifferentiableOps.IsGradientRequired(inputs[2]))
-            DifferentiableOps.AccumulateGrad(grads, inputs[2], new Tensor<T>((int[])inputs[2]._shape.Clone()), engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], engine.TensorZerosLike(inputs[2]), engine);
     }
 
     /// <summary>
