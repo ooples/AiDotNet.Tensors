@@ -293,6 +293,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         view._gpuMaterializerKey = _gpuMaterializerKey;
         view.IsDirty = IsDirty;
         view.Layout = Layout;
+        // After the buffer assignment above, which resets it: a partial view of a whole-storage tensor (or of a view
+        // that itself borrows) holds the storage's buffer, in storage order.
+        if (!view.CoversWholeVector && _gpuBuffer is not null)
+            view._viewGpuBufferIsStorageOrder = CoversWholeVector || _viewGpuBufferIsStorageOrder;
     }
 
     /// <summary>
@@ -5287,10 +5291,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             {
                 // A pending deferred download (an intermediate whose host copy has not been materialized yet) must land
                 // before the buffer goes: Cpu() alone returns early for a tensor that is not marked GPU-resident.
+                // A partial view's own copy that is older than its storage (the host, or the parent's device copy on
+                // another backend, was written since) holds nothing the host lacks: the pending download below brings
+                // the storage's CURRENT values home, and this superseded copy must not then be written over them.
+                bool supersededView = !CoversWholeVector && !downloadBound && _gpuBufferVersion != GpuCacheVersion;
                 if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
                 Helpers.HostSync.TryMaterialize(DataVector);
                 if (downloadBound && !IsGpuResident) DownloadBoundBufferIntoHost();
-                Cpu();
+                if (!supersededView) Cpu();
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -5341,16 +5349,21 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         if (_gpuBuffer is not { } buffer || _gpuBackend is not { } backend) return;
         if (_gpuBufferContainsRawInt32 || _gpuBufferContainsRawInt64) return;
-        float[] floatData = backend.DownloadBuffer(buffer);
-        var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
-        // A partial view that borrows its parent's buffer (a view taken of a placed tensor) holds the WHOLE storage in
-        // storage order, not this view's elements: it lands on the whole storage. Copying its first Length values into
-        // the view would put the parent's leading elements where the view's own belong.
-        if (!CoversWholeVector && !_ownsGpuBuffer && converted.Length == _data.Length)
+        // A partial view taken of a placed tensor carries that tensor's buffer: the WHOLE storage in storage order,
+        // not this view's elements. Decided by the provenance recorded when the buffer was lent, never by ownership
+        // or length (a transposed view uploaded on its own is as long as the storage and is in LOGICAL order).
+        if (!CoversWholeVector && _viewGpuBufferIsStorageOrder)
         {
-            converted.AsSpan().CopyTo(_data.AsWritableSpanUnmarked());
+            // Still the storage's binding: the download is the storage, and lands on all of it. No longer (the parent
+            // moved to another backend, or came home, since the view was taken): the storage's current values were
+            // brought to the host by its own pending download, and this superseded copy must not overwrite them.
+            if (ReferenceEquals(_data._deviceState?.Buffer, buffer))
+                Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(backend.DownloadBuffer(buffer)).AsSpan()
+                    .CopyTo(_data.AsWritableSpanUnmarked());
             return;
         }
+        float[] floatData = backend.DownloadBuffer(buffer);
+        var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
         if (IsContiguous)
         {
             var dst = AsWritableSpan();

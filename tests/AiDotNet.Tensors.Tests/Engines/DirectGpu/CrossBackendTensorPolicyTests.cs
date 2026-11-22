@@ -30,10 +30,25 @@ public sealed class CrossBackendTensorPolicyTests
 {
     private sealed class EnginePair : IDisposable
     {
+        private readonly DirectGpuEngine _placerDevice;
         public DirectGpuTensorEngine Consumer { get; }
         public DirectGpuTensorEngine Placer { get; }
-        public EnginePair(DirectGpuTensorEngine consumer, DirectGpuTensorEngine placer) { Consumer = consumer; Placer = placer; }
-        public void Dispose() { Placer.Dispose(); Consumer.Dispose(); }
+
+        public EnginePair(DirectGpuTensorEngine consumer, DirectGpuTensorEngine placer, DirectGpuEngine placerDevice)
+        {
+            Consumer = consumer;
+            Placer = placer;
+            _placerDevice = placerDevice;
+        }
+
+        // The tensor engine borrows the device engine it was given: the backend (its context and compiled kernels)
+        // is released by disposing that one, after the tensor engine that uses it.
+        public void Dispose()
+        {
+            Placer.Dispose();
+            _placerDevice.Dispose();
+            Consumer.Dispose();
+        }
     }
 
     // The default engine plus an OpenCL engine on its own backend instance (its own context, so its buffers are
@@ -42,22 +57,30 @@ public sealed class CrossBackendTensorPolicyTests
     {
         var consumer = new DirectGpuTensorEngine();
         if (!consumer.IsGpuAvailable) { consumer.Dispose(); Skip.If(true, "No native GPU backend."); }
+        DirectGpuEngine? device = null;
         DirectGpuTensorEngine? placer = null;
-        try { placer = new DirectGpuTensorEngine(new DirectGpuEngine(new OpenClBackend())); }
-        catch (Exception) { placer = null; }
-        if (placer is null || !placer.IsGpuAvailable || placer.QueryBackend is not { } placed
-            || consumer.QueryBackend is not { } consuming || CrossBackendTensors.SameAddressSpace(placed, consuming))
+        try
         {
-            placer?.Dispose();
-            consumer.Dispose();
-            Skip.If(true, "Needs a second GPU backend instance (OpenCL) next to the default one.");
+            device = new DirectGpuEngine(new OpenClBackend());
+            placer = new DirectGpuTensorEngine(device);
         }
-        return new EnginePair(consumer, placer!);
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException or InvalidOperationException
+                                       or NotSupportedException)
+        {
+            // No OpenCL runtime or device here: the test is skipped below.
+        }
+        if (device is not null && placer is not null && placer.IsGpuAvailable && placer.QueryBackend is { } placed
+            && consumer.QueryBackend is { } consuming && !CrossBackendTensors.SameAddressSpace(placed, consuming))
+            return new EnginePair(consumer, placer, device);
+        placer?.Dispose();
+        device?.Dispose();
+        consumer.Dispose();
+        throw new SkipException("Needs a second GPU backend instance (OpenCL) next to the default one.");
     }
 
     private static Tensor<float> Seeded(int rows, int cols, int seed)
     {
-        var random = new Random(seed);
+        var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         return new Tensor<float>(
             Enumerable.Range(0, rows * cols).Select(_ => (float)(random.NextDouble() * 0.2 - 0.1)).ToArray(),
             new[] { rows, cols });
@@ -306,6 +329,64 @@ public sealed class CrossBackendTensorPolicyTests
         Assert.Equal(new[] { 4f, 6f }, engines.Consumer.TensorAdd(x, y).ToArray());
     }
 
+    // The same gate again after its lease was returned from another thread: the entry left on this thread is stale, and
+    // the op starting here is the outermost one. A rejection raised and handled inside it is rethrown when IT ends -
+    // not held for an enclosing op that does not exist, to surface in whatever op the thread runs next.
+    [SkippableFact]
+    public void A_stale_entry_on_the_same_gate_is_not_an_enclosing_op()
+    {
+        using var engines = CreateEngines();
+        var backend = engines.Consumer.QueryBackend;
+        var gate = new GpuOpGate();
+        var first = gate.Enter(backend);
+        var other = new System.Threading.Thread(() => first.Dispose());
+        other.Start();
+        other.Join();
+
+        Assert.Throws<CrossBackendTensorException>(() =>
+        {
+            using (gate.Enter(backend))
+            {
+                Assert.Same(backend, GpuOpGate.CurrentOpBackend);
+                _ = CrossBackendTensors.Reject("raised and handled inside the op");
+            }
+        });
+        Assert.Null(GpuOpGate.CurrentOpBackend);
+        var x = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        var y = new Tensor<float>(new[] { 3f, 4f }, new[] { 2 });
+        Assert.Equal(new[] { 4f, 6f }, engines.Consumer.TensorAdd(x, y).ToArray());
+    }
+
+    // A result a recording-only deferred scope has not run is unwritten memory: another engine may not migrate it.
+    [SkippableFact]
+    public void An_unexecuted_deferred_result_is_not_migrated()
+    {
+        using var engines = CreateEngines();
+        var input = new Tensor<float>(new[] { 0f, 0f }, new[] { 2 });
+        var independent = new Tensor<float>(new[] { 0f, 0f }, new[] { 2 });
+        PlaceOn(engines.Placer, independent);
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try
+        {
+            var scope = engines.Placer.BeginDeferredScope();
+            Skip.If(scope is null, "Backend has no deferred execution");
+            using (scope)
+            using (new PolicyScope(CrossBackendTensorPolicy.Migrate))
+            {
+                var recorded = engines.Placer.TensorSigmoid(input);
+                Skip.If(recorded._gpuBuffer is null, "The op did not record a device result.");
+                var error = Assert.Throws<CrossBackendTensorException>(() => engines.Consumer.TensorSigmoid(recorded));
+                Assert.Contains("not executed", error.Message);
+                // A tensor the scope did not produce still migrates.
+                Assert.Equal(new[] { 0.5f, 0.5f }, engines.Consumer.TensorSigmoid(independent).ToArray());
+                scope.Execute();
+                Assert.Equal(new[] { 0.5f, 0.5f }, recorded.ToArray());
+            }
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
     // A rejection whose op returned its lease from another thread never reached that op's rethrow.
     [SkippableFact]
     public void A_rejection_left_pending_by_an_op_that_ended_elsewhere_does_not_surface_in_the_next_op()
@@ -337,6 +418,64 @@ public sealed class CrossBackendTensorPolicyTests
         CrossBackendTensors.ResolveIfForeign(indices, engines.Consumer.QueryBackend!);
         Assert.NotSame(placer, indices._gpuBackend);
         Assert.Equal(values, indices.ToArray());
+    }
+
+    // A raw int64 buffer holds integer words. Re-placing it goes through the float upload, where 16777217 is not
+    // representable: the tensor comes home exact and stays on the host.
+    [SkippableFact]
+    public void Raw_int64_tensor_placed_elsewhere_keeps_its_exact_values()
+    {
+        using var engines = CreateEngines();
+        Skip.If(engines.Placer.QueryBackend is null || engines.Consumer.QueryBackend is null, "No backend.");
+        var placer = engines.Placer.QueryBackend;
+        var consumer = engines.Consumer.QueryBackend;
+        if (placer is null || consumer is null) return;
+        var values = new[] { 16777217L, -16777219L, 9_007_199_254_740_993L, 42L };
+        var words = new float[values.Length * 2];
+        Buffer.BlockCopy(values, 0, words, 0, values.Length * sizeof(long));
+        Tensor<long> ids;
+        using (engines.Placer.EnterGpuOp())
+            ids = Tensor<long>.FromGpuBuffer(placer, placer.AllocateBuffer(words), new[] { values.Length },
+                bufferContainsRawInt64: true);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        CrossBackendTensors.ResolveIfForeign(ids, consumer);
+        Assert.Null(ids._gpuBuffer);   // not re-placed through the float upload
+        Assert.Equal(values, ids.ToArray());
+        Assert.Equal(values, ids.Cpu().ToArray());
+    }
+
+    // A transposed view placed on its own holds its elements in LOGICAL order in a buffer as long as the storage: it
+    // must be read back as the view, not copied over the storage as if it were the parent's buffer.
+    [SkippableFact]
+    public void Transposed_view_placed_on_its_own_migrates_in_logical_order()
+    {
+        using var engines = CreateEngines();
+        var whole = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 2, 3 });
+        var transposed = whole.Transpose();
+        Skip.If(transposed.CoversWholeVector, "The transpose is not a strided view here.");
+        PlaceOn(engines.Placer, transposed);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zeros = new Tensor<float>(new float[6], new[] { 3, 2 });
+        Assert.Equal(new[] { 1f, 4f, 2f, 5f, 3f, 6f }, engines.Consumer.TensorAdd(transposed, zeros).ToArray());
+        Assert.Equal(new[] { 1f, 2f, 3f, 4f, 5f, 6f }, whole.ToArray());
+    }
+
+    // The parent's host was written after the view borrowed its buffer: the view's superseded device copy must not
+    // come back over the newer host values when the view migrates.
+    [SkippableFact]
+    public void A_view_whose_borrowed_buffer_is_superseded_migrates_the_current_host_values()
+    {
+        using var engines = CreateEngines();
+        var whole = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, new[] { 2, 4 });
+        PlaceOn(engines.Placer, whole);
+        var view = whole.Slice(1);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zeros8 = new Tensor<float>(new float[8], new[] { 2, 4 });
+        Assert.Equal(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, engines.Consumer.TensorAdd(whole, zeros8).ToArray());
+        whole[1, 0] = 100f;   // host write after the parent left the placer
+        var zeros = new Tensor<float>(new float[4], new[] { 4 });
+        Assert.Equal(new[] { 100f, 6f, 7f, 8f }, engines.Consumer.TensorAdd(view, zeros).ToArray());
+        Assert.Equal(new[] { 1f, 2f, 3f, 4f, 100f, 6f, 7f, 8f }, whole.ToArray());
     }
 
     // A view taken of a placed tensor borrows the WHOLE storage's buffer: its own elements are not that buffer's first.

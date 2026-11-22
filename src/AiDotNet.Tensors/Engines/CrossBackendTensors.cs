@@ -109,8 +109,23 @@ internal static class CrossBackendTensors
                 + $"{Describe(consumer)}. Move it to the engine's device first (Tensor.To, or Tensor.Gpu with that engine as "
                 + "AiDotNetEngine.Current), or set AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn.");
 
+        // A result a recording-only deferred scope has recorded and not run is unwritten memory: migrating it would
+        // download that, and executing the scope afterwards could not repair what the consumer computed from it. No
+        // policy can move it; the scope must execute first. Tensors the scope did not produce migrate as usual.
+        if (tensor._gpuBuffer is { } bound && Gpu.DeferredScope.Current is { IsRecording: true } scope
+            && scope.RecordingBackend is Gpu.RecordingGpuBackend recorder && SameAddressSpace(recorder, owner)
+            && recorder.HoldsUnexecutedResult(bound))
+            throw Reject(
+                $"A tensor of shape [{Shape(tensor)}] is the result of an operation a deferred scope on the {Describe(owner)} "
+                + $"backend has recorded but not executed, so it cannot be moved to {Describe(consumer)}. Execute the scope "
+                + "before using its results on another engine.");
+
         long bytes = (long)tensor.Length * sizeof(float);
         bool wasResident = tensor.IsGpuResident;
+        // A raw int32 / int64 buffer holds integer words. Re-placing goes through the float upload, which rounds an
+        // integer past 2^24: such a tensor comes home exact and stays on the host, where the next op that wants it on
+        // the device uploads it by its own (integer) path.
+        bool rawIntegers = tensor._gpuBufferContainsRawInt32 || tensor._gpuBufferContainsRawInt64;
         // The binding is dropped whatever the tensor's extent: a whole-storage tensor's binding is its storage's (every
         // alias of that storage moves with it), a partial view's is the view's own (its siblings keep theirs).
         //
@@ -138,7 +153,7 @@ internal static class CrossBackendTensors
         // resident parameter stays resident: left host-only, an on-device optimizer would update a buffer the forward
         // never reads and training would stall. Placed on the real backend, never on a recording wrapper. An external
         // input is not: its caller uploads the host data into a binding of its own next.
-        if (wasResident && !hostAuthoritative) tensor.PlaceOn(Unwrap(consumer));
+        if (wasResident && !hostAuthoritative && !rawIntegers) tensor.PlaceOn(Unwrap(consumer));
         Interlocked.Increment(ref s_migrations);
         if (policy == CrossBackendTensorPolicy.MigrateWarn && FirstReport(tensor.StorageIdentity, owner, consumer))
             AiDotNetEngine.LogDiagnostic(

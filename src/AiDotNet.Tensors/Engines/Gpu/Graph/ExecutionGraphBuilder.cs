@@ -321,6 +321,15 @@ public sealed class ExecutionGraphBuilder : IDisposable
         }
     }
 
+    /// <summary>
+    /// Whether a recorded node that has not run yet writes <paramref name="buffer"/>: its contents are not the
+    /// recorded result until the graph executes. An upload does not count - the recording backend uploads the data
+    /// when it allocates the buffer and records the transfer for the graph only.
+    /// </summary>
+    internal bool HasUnexecutedWriter(IGpuBuffer buffer)
+        => _lastWriteNode.TryGetValue(buffer, out var writer)
+           && !(writer is TransferNode { TransferType: TransferDirection.HostToDevice });
+
     // RAW: depend on the buffer's last writer; record this node as a reader (for later WAR edges).
     private void AddRawAndRecordReader(ExecutionNode node, IGpuBuffer buffer)
     {

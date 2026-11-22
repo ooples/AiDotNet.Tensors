@@ -93,6 +93,13 @@ public class RecordingGpuBackend : DelegatingGpuBackend, ISparseRoutingBackend
         _graphBuilder = null;
     }
 
+    /// <summary>
+    /// Whether <paramref name="buffer"/> is the output of an op this backend has recorded and not run: recording
+    /// without <see cref="ExecuteWhileRecording"/>, its contents are unwritten until the scope executes.
+    /// </summary>
+    internal bool HoldsUnexecutedResult(IGpuBuffer buffer)
+        => _isRecording && !ExecuteWhileRecording && _graphBuilder is { } builder && builder.HasUnexecutedWriter(buffer);
+
     #region Helper Methods for Recording
 
     /// <summary>

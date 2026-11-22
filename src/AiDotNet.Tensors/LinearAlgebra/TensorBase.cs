@@ -237,6 +237,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         internal long OffloadRegistryHandle = -1;
         internal double? UniformFillValue;
         internal Engines.DirectGpu.IGpuBuffer? ViewGpuBuffer;
+        // The view buffer is its parent storage's shared buffer (whole storage, storage order), not a copy of the view.
+        internal bool ViewGpuBufferIsStorageOrder;
         internal Engines.DirectGpu.IDirectGpuBackend? ViewGpuBackend;
         internal int ViewGpuBufferVersion = -1;
         internal bool ViewGpuBufferIsSplitComplex;
@@ -1265,8 +1267,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         set
         {
             if (CoversWholeVector) _data.DeviceState.Buffer = value;
-            else _viewGpuBuffer = value;
+            else
+            {
+                _viewGpuBuffer = value;
+                // Any new binding is the view's own until the path that lent it says otherwise (ShareGpuStateWith).
+                _viewGpuBufferIsStorageOrder = false;
+            }
         }
+    }
+
+    /// <summary>
+    /// Whether this partial view's buffer was lent by the tensor it views: the WHOLE storage in storage order, not this
+    /// view's elements in logical order. Provenance recorded when the buffer is lent, because nothing about the buffer
+    /// itself tells the two apart (a transposed view uploaded on its own is as long as the storage).
+    /// </summary>
+    internal bool _viewGpuBufferIsStorageOrder
+    {
+        get => _cold?.ViewGpuBufferIsStorageOrder ?? false;
+        set { if (!value && _cold is null) return; Cold().ViewGpuBufferIsStorageOrder = value; }
     }
 
     // A strided/offset view's own contiguous device copy. Such a view does not share the vector's layout, so its
@@ -1771,6 +1789,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // (_gpuBuffer, _gpuBackend, ...) address the vector's shared device state, which describes the same bytes in the
         // same layout and belongs to the source too: clearing through them stripped the source's buffer.
         _viewGpuBuffer = null;
+        _viewGpuBufferIsStorageOrder = false;
         _viewGpuBackend = null;
         _viewGpuBufferVersion = -1;
         _viewGpuBufferIsSplitComplex = false;

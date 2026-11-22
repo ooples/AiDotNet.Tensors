@@ -917,9 +917,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         long epoch = CrossBackendTensors.MigrationCount;
         if (epoch == Volatile.Read(ref _migrationEpochSeen)) return;
-        Volatile.Write(ref _migrationEpochSeen, epoch);
-        if (_optimizerGpuParams is not { } gpuParam || _optimizerGpuBackends is not { } gpuBackends) return;
-        if (!_engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return;
+        // The epoch is acknowledged only once every parameter is bound again (the end of this method): a rebind that
+        // throws, or that could not run because the engine is closing, is retried by the next step instead of leaving
+        // the optimizer on a superseded buffer with nothing left to notice it.
+        if (_optimizerGpuParams is not { } gpuParam || _optimizerGpuBackends is not { } gpuBackends
+            || !_engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
+        {
+            Volatile.Write(ref _migrationEpochSeen, epoch);   // no device optimizer state to repair
+            return;
+        }
         using var operation = gpuEngine.EnterGpuOp();
         if (!operation.Held) return;
         lock (_stepSync)
@@ -951,6 +957,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 gpuParam[p] = current;
             }
         }
+        Volatile.Write(ref _migrationEpochSeen, epoch);
     }
 
     /// <summary>

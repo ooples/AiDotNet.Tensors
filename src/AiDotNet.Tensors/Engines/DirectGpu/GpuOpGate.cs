@@ -55,18 +55,9 @@ internal sealed class GpuOpGate
             _threadId = 0;
             if (backend is not null)
             {
-                // An entry whose lease was returned from another thread is stale (CurrentOpBackend): this op is then the
-                // outermost on its thread, displaces nothing, and starts with nothing pending - a rejection that op left
-                // behind never reached its rethrow and must not surface in this unrelated one.
-                if (CurrentOpBackend is not null)
-                {
-                    _previousBackend = t_opBackend;
-                    _previousCounter = t_opCounter;
-                }
-                else
-                {
-                    t_pendingRejection = null;
-                }
+                // Whatever is installed is a live enclosing op: Enter cleared a stale entry before it took this lease.
+                _previousBackend = t_opBackend;
+                _previousCounter = t_opCounter;
                 _threadId = Environment.CurrentManagedThreadId;
                 t_opBackend = backend;
                 t_opCounter = counter;
@@ -198,6 +189,16 @@ internal sealed class GpuOpGate
     public Lease Enter(IDirectGpuBackend? backend)
     {
         var counter = ReferenceEquals(t_lastGate, this) ? t_lastCounter! : CounterForThisThread(this);
+        // An entry whose lease was returned from another thread is stale: its counter shows no lease held. It is cleared
+        // BEFORE this lease increments a counter - on the same gate that is the very counter the entry is judged by,
+        // and the stale backend would then pass for an enclosing op. The op starting here is the outermost on its
+        // thread and starts with nothing pending: a rejection the other op left behind never reached its rethrow.
+        if (t_opCounter is { } installed && Volatile.Read(ref installed.Depth) == 0)
+        {
+            t_opBackend = null;
+            t_opCounter = null;
+            t_pendingRejection = null;
+        }
         // Full fence: the increment is visible before the state is read, the order the drain relies on.
         Interlocked.Increment(ref counter.Depth);
         if (Volatile.Read(ref _state) != Open)
